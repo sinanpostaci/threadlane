@@ -3793,6 +3793,11 @@ async fn codex_cli_final_candidate_closure_persists_pinned_launch_configuration_
         findings: Vec::new(),
     };
     let payload_str = serde_json::to_string(&payload).expect("serialize codex closure response");
+    let payload_file = fake_codex_exe
+        .parent()
+        .expect("bin dir")
+        .join("codex-closure-last-message.json");
+    std::fs::write(&payload_file, &payload_str).expect("write codex closure last-message fixture");
     let line_thread = serde_json::json!({
         "type": "thread.started",
         "thread_id": "019d8e5f-1111-7222-8333-444455556666"
@@ -3822,16 +3827,29 @@ async fn codex_cli_final_candidate_closure_persists_pinned_launch_configuration_
     .to_string();
     let codex_script = format!(
         "#!/bin/sh\n\
+         set -eu\n\
+         OUT_LAST_MSG=\"\"\n\
+         while [ \"$#\" -gt 0 ]; do\n\
+           case \"$1\" in\n\
+             --output-last-message|-o) OUT_LAST_MSG=\"$2\"; shift 2 ;;\n\
+             --) shift; break ;;\n\
+             *) shift 1 ;;\n\
+           esac\n\
+         done\n\
          echo 1 >> \"{}\"\n\
          printf '%s\\n' '{}'\n\
          printf '%s\\n' '{}'\n\
          printf '%s\\n' '{}'\n\
+         if [ -n \"$OUT_LAST_MSG\" ]; then\n\
+           cp \"{}\" \"$OUT_LAST_MSG\"\n\
+         fi\n\
          printf '%s\\n' '{}'\n\
          exit 0\n",
         fixture.launch_count_file.display(),
         line_thread.replace('\'', "'\\''"),
         line_turn_start.replace('\'', "'\\''"),
         line_item.replace('\'', "'\\''"),
+        payload_file.display(),
         line_turn_done.replace('\'', "'\\''"),
     );
     write_executable_script(&fake_codex_exe, &codex_script);

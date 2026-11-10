@@ -1216,11 +1216,68 @@ fn build_provider_argv_from_resolved(
     }
 }
 
+/// Exact filename inside an invocation-private `0700` supervisor capture directory passed via
+/// `--output-last-message` for structured read-only Codex CLI advisory executions.
+pub const CODEX_ADVISORY_LAST_MESSAGE_FILENAME: &str = "last-message.json";
+
+fn is_valid_codex_prompt_arg(prompt: &str) -> bool {
+    !prompt.trim().is_empty() && !prompt.contains('\0')
+}
+
+fn is_valid_codex_output_last_message_arg(raw_path: &str) -> bool {
+    if raw_path.is_empty()
+        || raw_path.len() > 4096
+        || raw_path.trim() != raw_path
+        || raw_path.chars().any(char::is_control)
+        || !raw_path.starts_with('/')
+        || raw_path.ends_with('/')
+        || raw_path.contains('\\')
+    {
+        return false;
+    }
+    let mut raw_seg_count = 0usize;
+    let mut last_raw_seg = None;
+    for seg in raw_path[1..].split('/') {
+        if seg.is_empty() || seg == "." || seg == ".." {
+            return false;
+        }
+        raw_seg_count += 1;
+        last_raw_seg = Some(seg);
+    }
+    if raw_seg_count < 2 || last_raw_seg != Some(CODEX_ADVISORY_LAST_MESSAGE_FILENAME) {
+        return false;
+    }
+    let path = Path::new(raw_path);
+    if !path.is_absolute() {
+        return false;
+    }
+    if path.file_name().and_then(|name| name.to_str()) != Some(CODEX_ADVISORY_LAST_MESSAGE_FILENAME)
+    {
+        return false;
+    }
+    let mut normal_count = 0usize;
+    for component in path.components() {
+        match component {
+            Component::RootDir | Component::Prefix(_) => {}
+            Component::Normal(seg) => {
+                if seg.is_empty() {
+                    return false;
+                }
+                normal_count += 1;
+            }
+            Component::CurDir | Component::ParentDir => return false,
+        }
+    }
+    normal_count == raw_seg_count && normal_count >= 2
+}
+
 /// Returns `true` if `argv` matches the exact read-only `codex` advisory argument vector
 /// pinned to `resolved` (`--no-daemon exec --json --ephemeral --ignore-user-config --model <model>`,
 /// `-c` overrides for `model_reasoning_effort`, `approval_policy`, `model_provider`,
 /// `default_permissions`, `permissions.threadlane-advisory`, `web_search`, all
-/// [`CODEX_ADVISORY_DISABLED_FEATURES`] `--disable` pairs, `--`, and a non-empty prompt).
+/// [`CODEX_ADVISORY_DISABLED_FEATURES`] `--disable` pairs, an optional invocation-owned
+/// `--output-last-message <canonical_private_dir>/last-message.json` pair, `--`, and a
+/// non-empty prompt).
 #[must_use]
 pub fn is_pinned_codex_read_only_argv(argv: &[String], resolved: &ResolvedModelTarget) -> bool {
     let Some(effort) = resolved.effort.as_deref() else {
@@ -1232,8 +1289,10 @@ pub fn is_pinned_codex_read_only_argv(argv: &[String], resolved: &ResolvedModelT
     {
         return false;
     }
-    let expected_len = 19 + CODEX_ADVISORY_DISABLED_FEATURES.len() * 2 + 2;
-    if argv.len() != expected_len {
+    let sep_idx = 19 + CODEX_ADVISORY_DISABLED_FEATURES.len() * 2;
+    let base_len = sep_idx + 2;
+    let with_output_len = sep_idx + 4;
+    if argv.len() != base_len && argv.len() != with_output_len {
         return false;
     }
     let expected_effort_cfg = format!("model_reasoning_effort=\"{effort}\"");
@@ -1267,10 +1326,66 @@ pub fn is_pinned_codex_read_only_argv(argv: &[String], resolved: &ResolvedModelT
             return false;
         }
     }
+    if argv.len() == base_len {
+        argv[sep_idx] == "--" && is_valid_codex_prompt_arg(&argv[sep_idx + 1])
+    } else {
+        argv[sep_idx] == "--output-last-message"
+            && is_valid_codex_output_last_message_arg(&argv[sep_idx + 1])
+            && argv[sep_idx + 2] == "--"
+            && is_valid_codex_prompt_arg(&argv[sep_idx + 3])
+    }
+}
+
+/// Validates `argv` against [`is_pinned_codex_read_only_argv`] and returns the pinned
+/// `--output-last-message` path slice when present.
+#[must_use]
+pub fn extract_pinned_codex_read_only_output_last_message_path<'a>(
+    argv: &'a [String],
+    resolved: &ResolvedModelTarget,
+) -> Option<&'a str> {
+    if !is_pinned_codex_read_only_argv(argv, resolved) {
+        return None;
+    }
     let sep_idx = 19 + CODEX_ADVISORY_DISABLED_FEATURES.len() * 2;
-    argv[sep_idx] == "--"
-        && !argv[sep_idx + 1].trim().is_empty()
-        && !argv[sep_idx + 1].contains('\0')
+    if argv.len() == sep_idx + 4 {
+        Some(argv[sep_idx + 1].as_str())
+    } else {
+        None
+    }
+}
+
+pub(crate) fn splice_codex_output_last_message_arg(
+    argv: &mut Vec<String>,
+    resolved: &ResolvedModelTarget,
+    output_path: &Path,
+) -> Result<(), WorkerError> {
+    let sep_idx = 19 + CODEX_ADVISORY_DISABLED_FEATURES.len() * 2;
+    if !is_pinned_codex_read_only_argv(argv, resolved) || argv.len() != sep_idx + 2 {
+        return Err(WorkerError::InvalidSpec(
+            "cannot splice --output-last-message into unpinned Codex read-only argv".to_string(),
+        ));
+    }
+    let Some(path_str) = output_path.to_str() else {
+        return Err(WorkerError::InvalidSpec(
+            "Codex --output-last-message path is not valid UTF-8".to_string(),
+        ));
+    };
+    if !is_valid_codex_output_last_message_arg(path_str) {
+        return Err(WorkerError::InvalidSpec(format!(
+            "Codex --output-last-message path failed strict pin validation: {}",
+            output_path.display()
+        )));
+    }
+    argv.splice(
+        sep_idx..sep_idx,
+        ["--output-last-message".to_string(), path_str.to_string()],
+    );
+    if !is_pinned_codex_read_only_argv(argv, resolved) {
+        return Err(WorkerError::InvalidSpec(
+            "Codex read-only argv failed post-splice pin verification".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Validates and extracts the exact repository-relative write scopes from a launch-pinned

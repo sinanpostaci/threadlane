@@ -360,12 +360,30 @@ async fn codex_cli_supervised_advisory_run_captures_large_final_agent_message_an
     )
     .expect("write item line file");
 
+    let payload_file = temp.path().join("codex_final_payload.json");
+    fs::write(&payload_file, &payload_json).expect("write payload file");
     let argv_dump_file = temp.path().join("codex_argv.txt");
     let script = format!(
         r#"#!/usr/bin/env sh
 set -eu
+OUT_LAST_MSG=""
 for arg in "$@"; do
     printf '%s\n' "$arg" >> "{}"
+done
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --output-last-message|-o)
+            OUT_LAST_MSG="$2"
+            shift 2
+            ;;
+        --)
+            shift
+            break
+            ;;
+        *)
+            shift 1
+            ;;
+    esac
 done
 printf '%s\n' '{{"type":"thread.started","thread_id":"019a52d7-7c00-7111-8222-codexthread01"}}'
 printf '%s\n' '{{"type":"turn.started"}}'
@@ -373,11 +391,15 @@ printf '%s\n' '{{"type":"item.completed","item":{{"id":"item_reason_1","type":"r
 printf '%s\n' '{{"type":"item.completed","item":{{"id":"item_cmd_1","type":"command_execution","command":"git status --short","aggregated_output":"{{\"not_the_final_response\":true}}","exit_code":0,"status":"completed"}}}}'
 cat "{}"
 printf '\n'
+if [ -n "$OUT_LAST_MSG" ]; then
+    cp "{}" "$OUT_LAST_MSG"
+fi
 printf '%s\n' '{{"type":"turn.completed","usage":{{"input_tokens":1420,"cached_input_tokens":1024,"cache_write_input_tokens":64,"output_tokens":318,"reasoning_output_tokens":192}}}}'
 exit 0
 "#,
         argv_dump_file.display(),
-        item_line_file.display()
+        item_line_file.display(),
+        payload_file.display(),
     );
     let fake_codex = write_executable_script(&bin_dir, "fake-codex-structured", &script);
     let spec = sample_codex_advisory_spec(
@@ -415,6 +437,20 @@ exit 0
     assert!(structured
         .execution
         .has_pinned_codex_read_only_launch_config());
+    let pinned_capture_path =
+        threadlane_workers::spec::extract_pinned_codex_read_only_output_last_message_path(
+            &structured.execution.constructed_argv,
+            &structured.execution.requested_model,
+        )
+        .expect("supervised Codex advisory argv must pin --output-last-message");
+    assert!(!Path::new(pinned_capture_path).exists());
+    assert!(
+        !Path::new(pinned_capture_path)
+            .parent()
+            .expect("capture parent")
+            .exists(),
+        "invocation-private --output-last-message directory must be removed after completion"
+    );
     assert!(structured
         .execution
         .has_complete_natural_completion_evidence());
@@ -838,6 +874,8 @@ async fn codex_cli_accepts_multiple_ordinary_prose_preambles_and_prose_tools_pro
     fs::create_dir_all(&bin_dir).expect("create bin_dir");
 
     let (expected_payload, payload_json) = build_large_codex_review_payload();
+    let payload_file = temp.path().join("codex_prose_payload.json");
+    fs::write(&payload_file, &payload_json).expect("write payload_file");
     let final_item_line_4 = serde_json::json!({
         "type": "item.completed",
         "item": {
@@ -857,16 +895,28 @@ async fn codex_cli_accepts_multiple_ordinary_prose_preambles_and_prose_tools_pro
     let multi_prose_script = format!(
         r#"#!/usr/bin/env sh
 set -eu
+OUT_LAST_MSG=""
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --output-last-message|-o) OUT_LAST_MSG="$2"; shift 2 ;;
+        --) shift; break ;;
+        *) shift 1 ;;
+    esac
+done
 printf '%s\n' '{{"type":"thread.started","thread_id":"019a52d7-7c00-7111-8222-codexprose01"}}'
 printf '%s\n' '{{"type":"turn.started"}}'
 printf '%s\n' '{{"type":"item.completed","item":{{"id":"item_prose_1","type":"agent_message","text":"I will inspect `docs/ROADMAP.md` and `crates/threadlane-workers/src/advisory_response.rs` [read-only]."}}}}'
 printf '%s\n' '{{"type":"item.completed","item":{{"id":"item_prose_2","type":"agent_message","text":"1. Verified launch flags and workdir rules.\n2. Preparing the final structured review JSON."}}}}'
 cat "{}"
 printf '\n'
+if [ -n "$OUT_LAST_MSG" ]; then
+    cp "{}" "$OUT_LAST_MSG"
+fi
 printf '%s\n' '{{"type":"turn.completed","usage":{{"input_tokens":810,"cached_input_tokens":512,"output_tokens":245}}}}'
 exit 0
 "#,
-        final_line_4_file.display()
+        final_line_4_file.display(),
+        payload_file.display(),
     );
     let fake_multi_prose =
         write_executable_script(&bin_dir, "fake-codex-multi-prose", &multi_prose_script);
@@ -920,6 +970,14 @@ exit 0
     let prose_tools_prose_script = format!(
         r#"#!/usr/bin/env sh
 set -eu
+OUT_LAST_MSG=""
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --output-last-message|-o) OUT_LAST_MSG="$2"; shift 2 ;;
+        --) shift; break ;;
+        *) shift 1 ;;
+    esac
+done
 printf '%s\n' '{{"type":"thread.started","thread_id":"019a52d7-7c00-7111-8222-codexprose02"}}'
 printf '%s\n' '{{"type":"turn.started"}}'
 printf '%s\n' '{{"type":"item.completed","item":{{"id":"item_3","type":"agent_message","text":"I will inspect the repository structure and read the relevant files before producing the plan."}}}}'
@@ -933,10 +991,14 @@ done
 printf '%s\n' '{{"type":"item.completed","item":{{"id":"item_18","type":"agent_message","text":"I have completed the read-only inspection and will now emit the structured JSON response."}}}}'
 cat "{}"
 printf '\n'
+if [ -n "$OUT_LAST_MSG" ]; then
+    cp "{}" "$OUT_LAST_MSG"
+fi
 printf '%s\n' '{{"type":"turn.completed","usage":{{"input_tokens":2048,"cached_input_tokens":1536,"output_tokens":512}}}}'
 exit 0
 "#,
-        final_line_19_file.display()
+        final_line_19_file.display(),
+        payload_file.display(),
     );
     spec.executable = write_executable_script(
         &bin_dir,
@@ -1023,8 +1085,24 @@ exit 0
     )
     .expect("write boundary_32_ndjson");
     let boundary_32_script = format!(
-        "#!/usr/bin/env sh\nset -eu\ncat \"{}\"\nexit 0\n",
-        boundary_32_ndjson.display()
+        r#"#!/usr/bin/env sh
+set -eu
+OUT_LAST_MSG=""
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --output-last-message|-o) OUT_LAST_MSG="$2"; shift 2 ;;
+        --) shift; break ;;
+        *) shift 1 ;;
+    esac
+done
+cat "{}"
+if [ -n "$OUT_LAST_MSG" ]; then
+    cp "{}" "$OUT_LAST_MSG"
+fi
+exit 0
+"#,
+        boundary_32_ndjson.display(),
+        payload_file.display(),
     );
     spec.executable =
         write_executable_script(&bin_dir, "fake-codex-boundary-32", &boundary_32_script);
@@ -1691,4 +1769,926 @@ exit 0
         .expect("malformed stream error");
     assert_eq!(mal_err.code, AdvisoryResponseErrorCode::MalformedStream);
     assert_eq!(mal_err.line_number, Some(4));
+}
+
+#[tokio::test]
+async fn codex_advisory_intermediate_completed_agent_message_with_designated_output_last_message_succeeds(
+) {
+    let temp = TempDir::new().expect("tempdir");
+    let workdir = temp.path().join("workdir");
+    let bin_dir = temp.path().join("bin");
+    fs::create_dir_all(&workdir).expect("create workdir");
+    fs::create_dir_all(workdir.join(".git")).expect("create .git");
+    fs::create_dir_all(&bin_dir).expect("create bin_dir");
+
+    let intermediate_json = r#"{"stage":"repository_inspection","notes":"Checked read-only boundaries before emitting final response."}"#;
+    let final_json = r#"{"outcome":"plan","schema_version":1,"summary":"Verified final response from explicit last-message capture."}"#;
+
+    let intermediate_line = serde_json::to_string(&serde_json::json!({
+        "type": "item.completed",
+        "item": {
+            "id": "msg_intermediate_1",
+            "type": "agent_message",
+            "text": intermediate_json,
+        }
+    }))
+    .expect("serialize intermediate agent_message event");
+    let final_line = serde_json::to_string(&serde_json::json!({
+        "type": "item.completed",
+        "item": {
+            "id": "msg_final_2",
+            "type": "agent_message",
+            "text": final_json,
+        }
+    }))
+    .expect("serialize final agent_message event");
+
+    let stream_file = temp.path().join("designated_final_stream.jsonl");
+    fs::write(
+        &stream_file,
+        format!(
+            "{}\n{}\n{intermediate_line}\n{final_line}\n{}\n",
+            r#"{"type":"thread.started","thread_id":"01972d12-3456-7000-8000-000000000901"}"#,
+            r#"{"type":"turn.started"}"#,
+            r#"{"type":"turn.completed","usage":{"input_tokens":320,"cached_input_tokens":64,"output_tokens":95}}"#,
+        ),
+    )
+    .expect("write stream fixture");
+
+    let final_payload_file = temp.path().join("designated_final_payload.json");
+    fs::write(&final_payload_file, final_json).expect("write final payload fixture");
+
+    let script = format!(
+        r#"#!/usr/bin/env sh
+set -eu
+OUT_LAST_MSG=""
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --output-last-message|-o)
+            OUT_LAST_MSG="$2"
+            shift 2
+            ;;
+        --)
+            shift
+            break
+            ;;
+        *)
+            shift 1
+            ;;
+    esac
+done
+cat "{}"
+if [ -n "$OUT_LAST_MSG" ]; then
+    cp "{}" "$OUT_LAST_MSG"
+fi
+exit 0
+"#,
+        stream_file.display(),
+        final_payload_file.display(),
+    );
+    let fake_codex = write_executable_script(&bin_dir, "fake-codex-designated-final", &script);
+    let spec = AdvisoryWorkerSpec {
+        provider: WorkerProvider::CodexCli,
+        executable: fake_codex,
+        model: "gpt-6.1-sol".to_string(),
+        effort: Some("xhigh".to_string()),
+        allowed_models: BTreeSet::from(["gpt-6.1-sol".to_string()]),
+        session_id: None,
+        standalone: false,
+        working_directory: workdir,
+        allowed_write_paths: BTreeSet::new(),
+        prompt: "Inspect repository and emit structured plan JSON.".to_string(),
+        file_permissions: WorkerFilePermissions::ReadOnly,
+        budgets: ExecutionBudgets::default(),
+    };
+
+    let structured =
+        run_advisory_worker_with_structured_result(&spec, AdvisoryResponseBudget::default())
+            .await
+            .expect("run CodexCli advisory worker with intermediate agent_message");
+
+    assert_eq!(structured.execution.status, WorkerRunStatus::Succeeded);
+    assert!(
+        structured.has_verified_response(),
+        "expected verified final response from designated capture, got response_error={:?}",
+        structured.response_error
+    );
+    assert!(structured.response_error.is_none());
+    assert_eq!(structured.execution.effective_observed_model(), None);
+    assert_eq!(structured.execution.effective_observed_effort(), None);
+
+    let response = structured
+        .verified_response()
+        .expect("verified final advisory response");
+    assert_eq!(response.text, final_json);
+    assert_eq!(response.provider, WorkerProvider::CodexCli);
+    assert_eq!(
+        response.source,
+        AdvisoryResponseSource::CodexAgentMessageTurnCompleted
+    );
+    assert_eq!(response.framing.response_line_number, 4);
+    assert_eq!(response.framing.terminal_line_number, 5);
+    assert_eq!(response.framing.item_id.as_deref(), Some("msg_final_2"));
+    assert_eq!(
+        response.framing.session_id.as_deref(),
+        Some("01972d12-3456-7000-8000-000000000901")
+    );
+    let parsed_obj = response
+        .parse_json_object()
+        .expect("parse verified JSON object");
+    assert_eq!(
+        parsed_obj.get("outcome").and_then(|v| v.as_str()),
+        Some("plan")
+    );
+}
+
+#[tokio::test]
+async fn codex_advisory_output_last_message_accepts_fenced_quoted_and_multi_json_intermediates_and_preserves_legacy_persisted_validation(
+) {
+    let temp = TempDir::new().expect("tempdir");
+    let workdir = temp.path().join("workdir");
+    let bin_dir = temp.path().join("bin");
+    fs::create_dir_all(&workdir).expect("create workdir");
+    fs::create_dir_all(workdir.join(".git")).expect("create .git");
+    fs::create_dir_all(&bin_dir).expect("create bin_dir");
+
+    let (expected_payload, final_json) = build_large_codex_review_payload();
+    let final_file = temp.path().join("rich_final.json");
+    fs::write(&final_file, &final_json).expect("write final_file");
+
+    let mut lines = vec![
+        r#"{"type":"thread.started","thread_id":"01972d12-3456-7000-8000-000000000902"}"#
+            .to_string(),
+        r#"{"type":"turn.started"}"#.to_string(),
+        serde_json::to_string(&serde_json::json!({
+            "type": "item.completed",
+            "item": {
+                "id": "msg_fenced_1",
+                "type": "agent_message",
+                "text": "Inspecting schema note:\n```json\n{\"draft\":true}\n```"
+            }
+        }))
+        .unwrap(),
+        serde_json::to_string(&serde_json::json!({
+            "type": "item.completed",
+            "item": {
+                "id": "msg_quoted_2",
+                "type": "agent_message",
+                "text": "\"Read-only preflight passed; checking workspace files next.\""
+            }
+        }))
+        .unwrap(),
+        serde_json::to_string(&serde_json::json!({
+            "type": "item.completed",
+            "item": {
+                "id": "msg_array_3",
+                "type": "agent_message",
+                "text": "[\"crates/threadlane-workers\",\"docs/CODEX-ADVISORY.md\"]"
+            }
+        }))
+        .unwrap(),
+        serde_json::to_string(&serde_json::json!({
+            "type": "item.completed",
+            "item": {
+                "id": "cmd_inspect_4",
+                "type": "command_execution",
+                "command": "git status --short",
+                "aggregated_output": "",
+                "exit_code": 0,
+                "status": "completed"
+            }
+        }))
+        .unwrap(),
+        serde_json::to_string(&serde_json::json!({
+            "type": "item.completed",
+            "item": {
+                "id": "msg_post_tool_json_5",
+                "type": "agent_message",
+                "text": r#"{"intermediate_checkpoint":"post_tool","final":false}"#
+            }
+        }))
+        .unwrap(),
+    ];
+    // Add 34 commentary items (total completed agent_message items = 3 + 1 + 34 + 1 = 39 <= 64).
+    for idx in 1..=34 {
+        lines.push(
+            serde_json::to_string(&serde_json::json!({
+                "type": "item.completed",
+                "item": {
+                    "id": format!("msg_note_{idx}"),
+                    "type": "agent_message",
+                    "text": format!("Bounded intermediate commentary note #{idx}.")
+                }
+            }))
+            .unwrap(),
+        );
+    }
+    let expected_response_line = lines.len() + 1;
+    lines.push(
+        serde_json::to_string(&serde_json::json!({
+            "type": "item.completed",
+            "item": {
+                "id": "msg_designated_final",
+                "type": "agent_message",
+                "text": final_json
+            }
+        }))
+        .unwrap(),
+    );
+    let expected_terminal_line = lines.len() + 1;
+    lines.push(
+        r#"{"type":"turn.completed","usage":{"input_tokens":980,"cached_input_tokens":256,"output_tokens":410}}"#
+            .to_string(),
+    );
+
+    let stream_path = temp.path().join("rich_stream.jsonl");
+    fs::write(&stream_path, format!("{}\n", lines.join("\n"))).expect("write rich_stream");
+
+    let script = format!(
+        r#"#!/usr/bin/env sh
+set -eu
+OUT_LAST_MSG=""
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --output-last-message|-o) OUT_LAST_MSG="$2"; shift 2 ;;
+        --) shift; break ;;
+        *) shift 1 ;;
+    esac
+done
+cat "{}"
+cp "{}" "$OUT_LAST_MSG"
+exit 0
+"#,
+        stream_path.display(),
+        final_file.display(),
+    );
+    let fake_codex = write_executable_script(&bin_dir, "fake-codex-rich-intermediates", &script);
+    let spec = sample_codex_advisory_spec(fake_codex, workdir, "Emit final review JSON.");
+
+    let structured =
+        run_advisory_worker_with_structured_result(&spec, AdvisoryResponseBudget::default())
+            .await
+            .expect("rich intermediates + designated final should succeed");
+    assert!(structured.has_verified_response());
+    assert_eq!(structured.execution.status, WorkerRunStatus::Succeeded);
+    assert_eq!(structured.execution.effective_observed_model(), None);
+    assert_eq!(structured.execution.effective_observed_effort(), None);
+
+    let resp = structured.verified_response().expect("verified response");
+    assert_eq!(resp.framing.response_line_number, expected_response_line);
+    assert_eq!(resp.framing.terminal_line_number, expected_terminal_line);
+    assert_eq!(
+        resp.framing.item_id.as_deref(),
+        Some("msg_designated_final")
+    );
+    let parsed: SampleCodexReviewPayload = resp.parse_json().expect("parse review payload");
+    assert_eq!(parsed, expected_payload);
+
+    // Live validation requires `--output-last-message` in `constructed_argv`, whereas
+    // `validate_persisted_verified_response` preserves compatibility for pre-repair artifacts.
+    let mut legacy_persisted = structured.clone();
+    let sep_idx = 19 + CODEX_ADVISORY_DISABLED_FEATURES.len() * 2;
+    assert_eq!(
+        legacy_persisted.execution.constructed_argv[sep_idx],
+        "--output-last-message"
+    );
+    legacy_persisted
+        .execution
+        .constructed_argv
+        .drain(sep_idx..sep_idx + 2);
+    assert!(is_pinned_codex_read_only_argv(
+        &legacy_persisted.execution.constructed_argv,
+        &legacy_persisted.execution.requested_model
+    ));
+    assert!(!legacy_persisted.has_verified_response());
+    assert!(legacy_persisted
+        .validate_verified_response(final_json.len())
+        .is_err());
+    let persisted_ok = legacy_persisted
+        .validate_persisted_verified_response(final_json.len())
+        .expect("historical persisted artifact without --output-last-message remains readable");
+    assert_eq!(persisted_ok.text, final_json);
+}
+
+#[tokio::test]
+async fn codex_advisory_output_last_message_rejects_missing_empty_invalid_oversize_stale_duplicate_and_unsafe_captures(
+) {
+    let temp = TempDir::new().expect("tempdir");
+    let workdir = temp.path().join("workdir");
+    let bin_dir = temp.path().join("bin");
+    fs::create_dir_all(&workdir).expect("create workdir");
+    fs::create_dir_all(workdir.join(".git")).expect("create .git");
+    fs::create_dir_all(&bin_dir).expect("create bin_dir");
+
+    let dummy = write_executable_script(&bin_dir, "fake-init-cap", "#!/usr/bin/env sh\nexit 0\n");
+    let mut spec = sample_codex_advisory_spec(dummy, workdir, "capture safety checks");
+
+    let clean_single_stream = r#"{"type":"thread.started","thread_id":"01972d12-3456-7000-8000-000000000910"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"msg_1","type":"agent_message","text":"{\"verdict\":\"approved\",\"schema_version\":1}"}}
+{"type":"turn.completed","usage":{"input_tokens":50,"output_tokens":20}}
+"#;
+    let clean_stream_path = temp.path().join("clean_single_stream.jsonl");
+    fs::write(&clean_stream_path, clean_single_stream).expect("write clean_single_stream");
+
+    // 1. Missing capture on an otherwise clean single-message stream -> `MissingResponseOutput` (no stream fallback!)
+    let missing_cap_script = format!(
+        "#!/usr/bin/env sh\nset -eu\ncat \"{}\"\nexit 0\n",
+        clean_stream_path.display()
+    );
+    spec.executable =
+        write_executable_script(&bin_dir, "fake-codex-missing-cap", &missing_cap_script);
+    let missing_out =
+        run_advisory_worker_with_structured_result(&spec, AdvisoryResponseBudget::default())
+            .await
+            .expect("missing capture run");
+    assert!(!missing_out.has_verified_response());
+    assert_eq!(
+        missing_out.response_error.as_ref().map(|e| e.code),
+        Some(AdvisoryResponseErrorCode::MissingResponseOutput)
+    );
+
+    // 2. Empty / whitespace capture -> `MissingResponseOutput`
+    let empty_cap_script = format!(
+        r#"#!/usr/bin/env sh
+set -eu
+OUT=""
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --output-last-message|-o) OUT="$2"; shift 2 ;;
+        --) shift; break ;;
+        *) shift 1 ;;
+    esac
+done
+cat "{}"
+printf '   \n' > "$OUT"
+exit 0
+"#,
+        clean_stream_path.display()
+    );
+    spec.executable = write_executable_script(&bin_dir, "fake-codex-empty-cap", &empty_cap_script);
+    let empty_out =
+        run_advisory_worker_with_structured_result(&spec, AdvisoryResponseBudget::default())
+            .await
+            .expect("empty capture run");
+    assert!(!empty_out.has_verified_response());
+    assert_eq!(
+        empty_out.response_error.as_ref().map(|e| e.code),
+        Some(AdvisoryResponseErrorCode::MissingResponseOutput)
+    );
+
+    // 3. Invalid UTF-8 bytes in capture -> `InvalidStructuredJson`
+    let bad_utf8_file = temp.path().join("bad_utf8.bin");
+    fs::write(&bad_utf8_file, [0xff_u8, 0xfe, 0xfd]).expect("write bad_utf8");
+    let bad_utf8_script = format!(
+        r#"#!/usr/bin/env sh
+set -eu
+OUT=""
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --output-last-message|-o) OUT="$2"; shift 2 ;;
+        --) shift; break ;;
+        *) shift 1 ;;
+    esac
+done
+cat "{}"
+cp "{}" "$OUT"
+exit 0
+"#,
+        clean_stream_path.display(),
+        bad_utf8_file.display()
+    );
+    spec.executable =
+        write_executable_script(&bin_dir, "fake-codex-bad-utf8-cap", &bad_utf8_script);
+    let bad_utf8_out =
+        run_advisory_worker_with_structured_result(&spec, AdvisoryResponseBudget::default())
+            .await
+            .expect("invalid UTF-8 capture run");
+    assert!(!bad_utf8_out.has_verified_response());
+    assert_eq!(
+        bad_utf8_out.response_error.as_ref().map(|e| e.code),
+        Some(AdvisoryResponseErrorCode::InvalidStructuredJson)
+    );
+
+    // 4. Oversized capture file exceeding `AdvisoryResponseBudget` (even if stream item fit) -> `ResponseTooLarge`
+    let oversized_capture_file = temp.path().join("oversized_capture.json");
+    let big_capture = format!("{{\"verdict\":\"{}\"}}", "x".repeat(300));
+    fs::write(&oversized_capture_file, &big_capture).expect("write oversized_capture_file");
+    let ovf_cap_script = format!(
+        r#"#!/usr/bin/env sh
+set -eu
+OUT=""
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --output-last-message|-o) OUT="$2"; shift 2 ;;
+        --) shift; break ;;
+        *) shift 1 ;;
+    esac
+done
+cat "{}"
+cp "{}" "$OUT"
+exit 0
+"#,
+        clean_stream_path.display(),
+        oversized_capture_file.display()
+    );
+    spec.executable = write_executable_script(&bin_dir, "fake-codex-ovf-cap", &ovf_cap_script);
+    let ovf_cap_out =
+        run_advisory_worker_with_structured_result(&spec, AdvisoryResponseBudget::new(128))
+            .await
+            .expect("oversized capture run");
+    assert!(!ovf_cap_out.has_verified_response());
+    let ovf_err = ovf_cap_out.response_error.expect("oversized capture error");
+    assert_eq!(ovf_err.code, AdvisoryResponseErrorCode::ResponseTooLarge);
+    assert_eq!(ovf_err.max_response_bytes, Some(128));
+    assert!(ovf_err.observed_bytes.unwrap_or(0) > 128);
+
+    // 5. Stale capture (capture matches earlier `msg_1` while stream ended with `msg_2`),
+    //    mismatched capture (capture differs from stream), and trailing prose after JSON -> `ConflictingTerminalOutput` / `InvalidStructuredJson`
+    let two_json_stream = r#"{"type":"thread.started","thread_id":"01972d12-3456-7000-8000-000000000911"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"msg_1","type":"agent_message","text":"{\"verdict\":\"rejected\",\"v\":1}"}}
+{"type":"item.completed","item":{"id":"msg_2","type":"agent_message","text":"{\"verdict\":\"approved\",\"v\":2}"}}
+{"type":"turn.completed","usage":{"input_tokens":50,"output_tokens":20}}
+"#;
+    let two_json_stream_path = temp.path().join("two_json_stream.jsonl");
+    fs::write(&two_json_stream_path, two_json_stream).expect("write two_json_stream");
+
+    for (idx, cap_text) in [
+        r#"{"verdict":"rejected","v":1}"#,
+        r#"{"verdict":"approved","v":999}"#,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let cap_payload = temp.path().join(format!("stale_or_mismatch_{idx}.json"));
+        fs::write(&cap_payload, cap_text).expect("write cap_payload");
+        let stale_script = format!(
+            r#"#!/usr/bin/env sh
+set -eu
+OUT=""
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --output-last-message|-o) OUT="$2"; shift 2 ;;
+        --) shift; break ;;
+        *) shift 1 ;;
+    esac
+done
+cat "{}"
+cp "{}" "$OUT"
+exit 0
+"#,
+            two_json_stream_path.display(),
+            cap_payload.display()
+        );
+        spec.executable =
+            write_executable_script(&bin_dir, &format!("fake-codex-stale-{idx}"), &stale_script);
+        let stale_out =
+            run_advisory_worker_with_structured_result(&spec, AdvisoryResponseBudget::default())
+                .await
+                .expect("stale/mismatched capture run");
+        assert!(!stale_out.has_verified_response());
+        assert_eq!(
+            stale_out.response_error.as_ref().map(|e| e.code),
+            Some(AdvisoryResponseErrorCode::ConflictingTerminalOutput)
+        );
+    }
+
+    // 6. Trailing prose after JSON (`msg_1` JSON, `msg_2` prose): never selects `msg_1` whether `-o` has `msg_1` or `msg_2`.
+    let trailing_prose_stream = r#"{"type":"thread.started","thread_id":"01972d12-3456-7000-8000-000000000912"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"msg_1","type":"agent_message","text":"{\"verdict\":\"approved\"}"}}
+{"type":"item.completed","item":{"id":"msg_2","type":"agent_message","text":"Let me know if you want edits."}}
+{"type":"turn.completed","usage":{"input_tokens":50,"output_tokens":20}}
+"#;
+    let trailing_prose_path = temp.path().join("trailing_prose.jsonl");
+    fs::write(&trailing_prose_path, trailing_prose_stream).expect("write trailing_prose");
+    for (idx, cap_text, expected_code) in [
+        (
+            0usize,
+            r#"{"verdict":"approved"}"#,
+            AdvisoryResponseErrorCode::ConflictingTerminalOutput,
+        ),
+        (
+            1usize,
+            "Let me know if you want edits.",
+            AdvisoryResponseErrorCode::InvalidStructuredJson,
+        ),
+    ] {
+        let cap_file = temp.path().join(format!("trailing_cap_{idx}.txt"));
+        fs::write(&cap_file, cap_text).expect("write trailing_cap");
+        let tp_script = format!(
+            r#"#!/usr/bin/env sh
+set -eu
+OUT=""
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --output-last-message|-o) OUT="$2"; shift 2 ;;
+        --) shift; break ;;
+        *) shift 1 ;;
+    esac
+done
+cat "{}"
+cp "{}" "$OUT"
+exit 0
+"#,
+            trailing_prose_path.display(),
+            cap_file.display()
+        );
+        spec.executable =
+            write_executable_script(&bin_dir, &format!("fake-codex-tp-{idx}"), &tp_script);
+        let tp_out =
+            run_advisory_worker_with_structured_result(&spec, AdvisoryResponseBudget::default())
+                .await
+                .expect("trailing prose run");
+        assert!(!tp_out.has_verified_response());
+        assert_eq!(
+            tp_out.response_error.as_ref().map(|e| e.code),
+            Some(expected_code)
+        );
+    }
+
+    // 7. Duplicate completed final `agent_message` items with identical text matching `--output-last-message` -> `ConflictingTerminalOutput`
+    let dup_final_stream = r#"{"type":"thread.started","thread_id":"01972d12-3456-7000-8000-000000000913"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"msg_dup_1","type":"agent_message","text":"{\"verdict\":\"approved\"}"}}
+{"type":"item.completed","item":{"id":"msg_dup_2","type":"agent_message","text":"{\"verdict\":\"approved\"}"}}
+{"type":"turn.completed","usage":{"input_tokens":50,"output_tokens":20}}
+"#;
+    let dup_final_path = temp.path().join("dup_final.jsonl");
+    fs::write(&dup_final_path, dup_final_stream).expect("write dup_final");
+    let dup_cap_file = temp.path().join("dup_final_cap.json");
+    fs::write(&dup_cap_file, r#"{"verdict":"approved"}"#).expect("write dup_cap_file");
+    let dup_final_script = format!(
+        r#"#!/usr/bin/env sh
+set -eu
+OUT=""
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --output-last-message|-o) OUT="$2"; shift 2 ;;
+        --) shift; break ;;
+        *) shift 1 ;;
+    esac
+done
+cat "{}"
+cp "{}" "$OUT"
+exit 0
+"#,
+        dup_final_path.display(),
+        dup_cap_file.display()
+    );
+    spec.executable = write_executable_script(&bin_dir, "fake-codex-dup-final", &dup_final_script);
+    let dup_final_out =
+        run_advisory_worker_with_structured_result(&spec, AdvisoryResponseBudget::default())
+            .await
+            .expect("duplicate final run");
+    assert!(!dup_final_out.has_verified_response());
+    assert_eq!(
+        dup_final_out.response_error.as_ref().map(|e| e.code),
+        Some(AdvisoryResponseErrorCode::ConflictingTerminalOutput)
+    );
+
+    // 8. Symlink capture -> rejected (`SpoofedOrToolOutput`), foreign target preserved untouched, capture dir cleaned up!
+    let foreign_secret = temp.path().join("foreign_secret.json");
+    let secret_contents = r#"{"verdict":"approved","schema_version":1}"#;
+    fs::write(&foreign_secret, secret_contents).expect("write foreign_secret");
+    let symlink_script = format!(
+        r#"#!/usr/bin/env sh
+set -eu
+OUT=""
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --output-last-message|-o) OUT="$2"; shift 2 ;;
+        --) shift; break ;;
+        *) shift 1 ;;
+    esac
+done
+cat "{}"
+ln -s "{}" "$OUT"
+exit 0
+"#,
+        clean_stream_path.display(),
+        foreign_secret.display()
+    );
+    spec.executable = write_executable_script(&bin_dir, "fake-codex-symlink-cap", &symlink_script);
+    let symlink_out =
+        run_advisory_worker_with_structured_result(&spec, AdvisoryResponseBudget::default())
+            .await
+            .expect("symlink capture run");
+    assert!(!symlink_out.has_verified_response());
+    assert_eq!(
+        symlink_out.response_error.as_ref().map(|e| e.code),
+        Some(AdvisoryResponseErrorCode::SpoofedOrToolOutput)
+    );
+    assert_eq!(
+        fs::read_to_string(&foreign_secret).expect("foreign target must survive untouched"),
+        secret_contents
+    );
+    let symlink_cap_path =
+        threadlane_workers::spec::extract_pinned_codex_read_only_output_last_message_path(
+            &symlink_out.execution.constructed_argv,
+            &symlink_out.execution.requested_model,
+        )
+        .expect("pinned path");
+    assert!(!Path::new(symlink_cap_path).parent().unwrap().exists());
+
+    // 9. Non-regular FIFO capture -> rejected (`SpoofedOrToolOutput`) without blocking!
+    let fifo_script = format!(
+        r#"#!/usr/bin/env sh
+set -eu
+OUT=""
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --output-last-message|-o) OUT="$2"; shift 2 ;;
+        --) shift; break ;;
+        *) shift 1 ;;
+    esac
+done
+cat "{}"
+mkfifo "$OUT"
+exit 0
+"#,
+        clean_stream_path.display()
+    );
+    spec.executable = write_executable_script(&bin_dir, "fake-codex-fifo-cap", &fifo_script);
+    let fifo_out =
+        run_advisory_worker_with_structured_result(&spec, AdvisoryResponseBudget::default())
+            .await
+            .expect("FIFO capture run");
+    assert!(!fifo_out.has_verified_response());
+    assert_eq!(
+        fifo_out.response_error.as_ref().map(|e| e.code),
+        Some(AdvisoryResponseErrorCode::SpoofedOrToolOutput)
+    );
+
+    // 10. World-writable (`0666`) and executable (`0755`) capture permissions -> `SpoofedOrToolOutput`
+    for (idx, bad_mode) in ["0666", "0755"].into_iter().enumerate() {
+        let mode_script = format!(
+            r#"#!/usr/bin/env sh
+set -eu
+OUT=""
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --output-last-message|-o) OUT="$2"; shift 2 ;;
+        --) shift; break ;;
+        *) shift 1 ;;
+    esac
+done
+cat "{}"
+cp "{}" "$OUT"
+chmod {bad_mode} "$OUT"
+exit 0
+"#,
+            clean_stream_path.display(),
+            foreign_secret.display()
+        );
+        spec.executable =
+            write_executable_script(&bin_dir, &format!("fake-codex-mode-{idx}"), &mode_script);
+        let mode_out =
+            run_advisory_worker_with_structured_result(&spec, AdvisoryResponseBudget::default())
+                .await
+                .expect("bad mode capture run");
+        assert!(!mode_out.has_verified_response());
+        assert_eq!(
+            mode_out.response_error.as_ref().map(|e| e.code),
+            Some(AdvisoryResponseErrorCode::SpoofedOrToolOutput)
+        );
+    }
+
+    // 11. Unexpected extra sibling file in private capture directory -> `ConflictingTerminalOutput`
+    let extra_entry_script = format!(
+        r#"#!/usr/bin/env sh
+set -eu
+OUT=""
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --output-last-message|-o) OUT="$2"; shift 2 ;;
+        --) shift; break ;;
+        *) shift 1 ;;
+    esac
+done
+cat "{}"
+cp "{}" "$OUT"
+cp "{}" "$(dirname "$OUT")/extra.json"
+exit 0
+"#,
+        clean_stream_path.display(),
+        foreign_secret.display(),
+        foreign_secret.display()
+    );
+    spec.executable =
+        write_executable_script(&bin_dir, "fake-codex-extra-entry", &extra_entry_script);
+    let extra_out =
+        run_advisory_worker_with_structured_result(&spec, AdvisoryResponseBudget::default())
+            .await
+            .expect("extra entry capture run");
+    assert!(!extra_out.has_verified_response());
+    assert_eq!(
+        extra_out.response_error.as_ref().map(|e| e.code),
+        Some(AdvisoryResponseErrorCode::ConflictingTerminalOutput)
+    );
+    // Verify Drop unlinked the known `last-message.json` leaf while intentionally retaining
+    // unknown `extra.json` inside the private `0700` directory rather than deleting recursively,
+    // then clean up the test's synthetic `extra.json` and directory.
+    let extra_cap_path =
+        threadlane_workers::spec::extract_pinned_codex_read_only_output_last_message_path(
+            &extra_out.execution.constructed_argv,
+            &extra_out.execution.requested_model,
+        )
+        .expect("pinned path on extra-entry run");
+    assert!(!Path::new(extra_cap_path).exists());
+    let extra_dir = Path::new(extra_cap_path).parent().expect("extra_dir");
+    assert!(extra_dir.join("extra.json").exists());
+    fs::remove_file(extra_dir.join("extra.json")).expect("remove extra.json");
+    fs::remove_dir(extra_dir).expect("remove empty extra_dir");
+}
+
+#[tokio::test]
+async fn codex_advisory_output_last_message_rejects_lifecycle_failures_spoofed_tools_and_cleans_up_on_cancellation(
+) {
+    let temp = TempDir::new().expect("tempdir");
+    let workdir = temp.path().join("workdir");
+    let bin_dir = temp.path().join("bin");
+    fs::create_dir_all(&workdir).expect("create workdir");
+    fs::create_dir_all(workdir.join(".git")).expect("create .git");
+    fs::create_dir_all(&bin_dir).expect("create bin_dir");
+
+    let valid_json_file = temp.path().join("valid_cap.json");
+    fs::write(
+        &valid_json_file,
+        r#"{"verdict":"approved","schema_version":1}"#,
+    )
+    .expect("write valid_json_file");
+    let dummy = write_executable_script(&bin_dir, "fake-init-lc", "#!/usr/bin/env sh\nexit 0\n");
+    let mut spec = sample_codex_advisory_spec(dummy, workdir, "lifecycle + cancel checks");
+
+    // 1. Valid `--output-last-message` file cannot rescue `turn.failed`, `error`, missing `turn.completed`, non-zero exit, or trailing events after `turn.completed`.
+    for (idx, stream_body, exit_code, expected_status, expected_err_code) in [
+        (
+            0usize,
+            "{\"type\":\"thread.started\",\"thread_id\":\"t_lc_0\"}\n{\"type\":\"turn.started\"}\n{\"type\":\"item.completed\",\"item\":{\"id\":\"m1\",\"type\":\"agent_message\",\"text\":\"{\\\"verdict\\\":\\\"approved\\\",\\\"schema_version\\\":1}\"}}\n{\"type\":\"turn.failed\",\"error\":{\"message\":\"boom\"}}\n",
+            0,
+            WorkerRunStatus::ProviderError,
+            AdvisoryResponseErrorCode::ProviderError,
+        ),
+        (
+            1usize,
+            "{\"type\":\"thread.started\",\"thread_id\":\"t_lc_1\"}\n{\"type\":\"turn.started\"}\n{\"type\":\"item.completed\",\"item\":{\"id\":\"m1\",\"type\":\"agent_message\",\"text\":\"{\\\"verdict\\\":\\\"approved\\\",\\\"schema_version\\\":1}\"}}\n{\"type\":\"error\",\"message\":\"stream lost\"}\n",
+            0,
+            WorkerRunStatus::ProviderError,
+            AdvisoryResponseErrorCode::ProviderError,
+        ),
+        (
+            2usize,
+            "{\"type\":\"thread.started\",\"thread_id\":\"t_lc_2\"}\n{\"type\":\"turn.started\"}\n{\"type\":\"item.completed\",\"item\":{\"id\":\"m1\",\"type\":\"agent_message\",\"text\":\"{\\\"verdict\\\":\\\"approved\\\",\\\"schema_version\\\":1}\"}}\n",
+            0,
+            WorkerRunStatus::MissingResultEvidence,
+            AdvisoryResponseErrorCode::MissingTerminalFraming,
+        ),
+        (
+            3usize,
+            "{\"type\":\"thread.started\",\"thread_id\":\"t_lc_3\"}\n{\"type\":\"turn.started\"}\n{\"type\":\"item.completed\",\"item\":{\"id\":\"m1\",\"type\":\"agent_message\",\"text\":\"{\\\"verdict\\\":\\\"approved\\\",\\\"schema_version\\\":1}\"}}\n{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}\n",
+            7,
+            WorkerRunStatus::NonZeroExit,
+            AdvisoryResponseErrorCode::WorkerExecutionFailed,
+        ),
+        (
+            4usize,
+            "{\"type\":\"thread.started\",\"thread_id\":\"t_lc_4\"}\n{\"type\":\"turn.started\"}\n{\"type\":\"item.completed\",\"item\":{\"id\":\"m1\",\"type\":\"agent_message\",\"text\":\"{\\\"verdict\\\":\\\"approved\\\",\\\"schema_version\\\":1}\"}}\n{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}\n{\"type\":\"turn.started\"}\n",
+            0,
+            WorkerRunStatus::MissingResultEvidence,
+            AdvisoryResponseErrorCode::ConflictingTerminalOutput,
+        ),
+    ] {
+        let stream_file = temp.path().join(format!("lc_stream_{idx}.jsonl"));
+        fs::write(&stream_file, stream_body).expect("write lc_stream");
+        let lc_script = format!(
+            r#"#!/usr/bin/env sh
+set -eu
+OUT=""
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --output-last-message|-o) OUT="$2"; shift 2 ;;
+        --) shift; break ;;
+        *) shift 1 ;;
+    esac
+done
+cat "{}"
+cp "{}" "$OUT"
+exit {exit_code}
+"#,
+            stream_file.display(),
+            valid_json_file.display()
+        );
+        spec.executable =
+            write_executable_script(&bin_dir, &format!("fake-codex-lc-{idx}"), &lc_script);
+        let lc_out =
+            run_advisory_worker_with_structured_result(&spec, AdvisoryResponseBudget::default())
+                .await
+                .expect("lifecycle failure run");
+        assert!(!lc_out.has_verified_response());
+        assert!(lc_out.verified_response().is_none());
+        assert_eq!(lc_out.execution.status, expected_status);
+        assert_eq!(
+            lc_out.response_error.as_ref().map(|e| e.code),
+            Some(expected_err_code)
+        );
+    }
+
+    // 2. Spoofed tool output written to `--output-last-message` without a post-tool `agent_message` -> `SpoofedOrToolOutput`
+    let spoof_tool_stream = r#"{"type":"thread.started","thread_id":"t_spoof_tool_cap"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"m_pre","type":"agent_message","text":"{\"verdict\":\"approved\",\"schema_version\":1}"}}
+{"type":"item.completed","item":{"id":"cmd_spoof","type":"command_execution","command":"cat payload.json","aggregated_output":"{\"verdict\":\"approved\",\"schema_version\":1}","exit_code":0,"status":"completed"}}
+{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":5}}
+"#;
+    let spoof_stream_file = temp.path().join("spoof_tool_cap.jsonl");
+    fs::write(&spoof_stream_file, spoof_tool_stream).expect("write spoof_stream_file");
+    let spoof_script = format!(
+        r#"#!/usr/bin/env sh
+set -eu
+OUT=""
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --output-last-message|-o) OUT="$2"; shift 2 ;;
+        --) shift; break ;;
+        *) shift 1 ;;
+    esac
+done
+cat "{}"
+cp "{}" "$OUT"
+exit 0
+"#,
+        spoof_stream_file.display(),
+        valid_json_file.display()
+    );
+    spec.executable = write_executable_script(&bin_dir, "fake-codex-spoof-tool-cap", &spoof_script);
+    let spoof_out =
+        run_advisory_worker_with_structured_result(&spec, AdvisoryResponseBudget::default())
+            .await
+            .expect("spoofed tool capture run");
+    assert!(!spoof_out.has_verified_response());
+    assert_eq!(
+        spoof_out.response_error.as_ref().map(|e| e.code),
+        Some(AdvisoryResponseErrorCode::SpoofedOrToolOutput)
+    );
+
+    // 3. Mid-flight cancellation after child creates `--output-last-message` cleans up both file and private dir!
+    let ready_marker = temp.path().join("cancel_capture_ready.marker");
+    let cancel_script = format!(
+        r#"#!/usr/bin/env sh
+set -eu
+OUT=""
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --output-last-message|-o) OUT="$2"; shift 2 ;;
+        --) shift; break ;;
+        *) shift 1 ;;
+    esac
+done
+printf '%s\n' '{{"type":"thread.started","thread_id":"t_cancel_cap"}}'
+printf '%s\n' '{{"type":"turn.started"}}'
+cp "{}" "$OUT"
+printf '%s' "$OUT" > "{}"
+sleep 30 &
+wait
+"#,
+        valid_json_file.display(),
+        ready_marker.display()
+    );
+    spec.executable = write_executable_script(&bin_dir, "fake-codex-cancel-cap", &cancel_script);
+    let (cancel_tx, mut cancel_rx) = watch::channel(false);
+    let ready_for_cancel = ready_marker.clone();
+    let cancel_trigger = tokio::spawn(async move {
+        for _ in 0..200 {
+            if ready_for_cancel.exists() {
+                let _ = cancel_tx.send(true);
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let _ = cancel_tx.send(true);
+    });
+    let cancel_out = run_advisory_worker_with_structured_result_and_cancel(
+        &spec,
+        AdvisoryResponseBudget::default(),
+        &mut cancel_rx,
+    )
+    .await
+    .expect("mid-flight cancelled capture run");
+    cancel_trigger.await.expect("join cancel trigger");
+
+    assert!(!cancel_out.has_verified_response());
+    assert_eq!(cancel_out.execution.status, WorkerRunStatus::Cancelled);
+    assert!(!cancel_out.execution.cleanup_incomplete);
+    let recorded_out_path =
+        PathBuf::from(fs::read_to_string(&ready_marker).expect("read ready_marker"));
+    assert!(
+        !recorded_out_path.exists(),
+        "cancelled run must unlink --output-last-message file"
+    );
+    assert!(
+        !recorded_out_path.parent().unwrap().exists(),
+        "cancelled run must remove private --output-last-message directory"
+    );
 }

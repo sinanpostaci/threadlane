@@ -18,19 +18,20 @@
 //!   with an explicit `step_finish` (`part.type == "step-finish"`, `reason == "stop"`). Partial/delta
 //!   text snapshots, unfinished `part.time` records, duplicate or conflicting text parts in a step,
 //!   tool-result spoofing, and unsupported event shapes are explicitly rejected.
-//! - **Codex CLI (`codex_cli`)**: Captures only from the single final completed
-//!   `type: "item.completed"` event whose `item.type == "agent_message"` contains a non-empty
-//!   UTF-8 top-level JSON object `item.text` inside a `thread.started` -> `turn.started` ->
-//!   `turn.completed` lifecycle. Bounded ordinary prose preamble `agent_message` items
-//!   (up to [`MAX_CODEX_PROSE_PREAMBLES_PER_TURN`]) may precede the final structured JSON object,
-//!   while terminal `turn.failed` and `error` events, missing `thread.started` or `turn.completed`
-//!   framing, conflicting `thread_id` values, duplicate `item.id` values, prior malformed
-//!   JSON-like or non-object JSON candidates, multiple/conflicting structured JSON candidates,
-//!   trailing `agent_message` items after a structured JSON candidate, prose-only turns, and
-//!   tool/command spoofing are rejected. Because `codex exec --json` does not emit runtime model
-//!   or reasoning-effort telemetry on stdout, observed model/effort fields remain `None` unless
-//!   genuinely emitted by the CLI while completion relies on the verified pinned read-only launch
-//!   configuration (`--model` + `-c model_reasoning_effort`).
+//! - **Codex CLI (`codex_cli`)**: Captures from a supervisor-owned, invocation-private
+//!   `--output-last-message` file cross-checked against the terminal completed
+//!   `type: "item.completed"` (`item.type == "agent_message"`) event inside a single verified
+//!   `thread.started` -> `turn.started` -> `turn.completed` lifecycle. With explicit
+//!   `--output-last-message` provenance, bounded intermediate completed `agent_message` items
+//!   (up to [`MAX_CODEX_AGENT_MESSAGES_PER_TURN`]) do not disqualify a distinct designated final
+//!   top-level JSON object response, while missing/stale/mismatched/duplicate/oversized/unsafe
+//!   captures, terminal `turn.failed` and `error` events, missing `thread.started` or
+//!   `turn.completed` framing, conflicting `thread_id` values, duplicate `item.id` values,
+//!   prose-only finals, and tool/command spoofing fail closed without falling back to ambiguous
+//!   stream selection. Because `codex exec --json` does not emit runtime model or reasoning-effort
+//!   telemetry on stdout, observed model/effort fields remain `None` unless genuinely emitted by
+//!   the CLI while completion relies on the verified pinned read-only launch configuration
+//!   (`--model` + `-c model_reasoning_effort`).
 //! - **Untrusted model data**: A verified [`BoundedAdvisoryResponse`] proves only that the supervised
 //!   provider process exited cleanly with matching CLI-reported or launch-pinned evidence
 //!   and emitted a complete UTF-8 JSON object within [`AdvisoryResponseBudget`]. Parsing a valid JSON
@@ -63,8 +64,12 @@ pub const DEFAULT_MAX_ADVISORY_RESPONSE_BYTES: usize = DEFAULT_MAX_LINE_BYTES;
 pub const MAX_ADVISORY_RESPONSE_BYTES: usize = MAX_LINE_BYTES;
 
 /// Maximum number of intermediate ordinary prose `agent_message` preambles permitted before the
-/// single final structured JSON-object `agent_message` in a Codex CLI advisory turn (`32`).
+/// single final structured JSON-object `agent_message` in legacy stream-only Codex CLI parsing (`32`).
 pub const MAX_CODEX_PROSE_PREAMBLES_PER_TURN: usize = 32;
+
+/// Maximum total number of completed `agent_message` items permitted in a single Codex CLI
+/// advisory turn when explicit `--output-last-message` capture is active (`64`).
+pub const MAX_CODEX_AGENT_MESSAGES_PER_TURN: usize = 64;
 
 const fn default_max_advisory_response_bytes() -> usize {
     DEFAULT_MAX_ADVISORY_RESPONSE_BYTES
@@ -675,6 +680,18 @@ impl AdvisoryStructuredExecution {
                         .to_string(),
                 ));
             }
+            if !allow_legacy_codex_advisory
+                && crate::spec::extract_pinned_codex_read_only_output_last_message_path(
+                    &self.execution.constructed_argv,
+                    &self.execution.requested_model,
+                )
+                .is_none()
+            {
+                return Err(WorkerError::InvalidSpec(
+                    "live Codex CLI advisory execution lacks pinned --output-last-message capture provenance"
+                        .to_string(),
+                ));
+            }
             if self.execution.evidence.observed_session_id.is_none() {
                 return Err(WorkerError::InvalidSpec(
                     "Codex CLI advisory execution lacks an observed thread_id in stream evidence"
@@ -746,6 +763,27 @@ struct CapturedCandidate {
     item_id: Option<String>,
 }
 
+/// Outcome of reading the supervisor-owned, invocation-private Codex `--output-last-message` file.
+#[derive(Debug, Clone)]
+pub(crate) enum CodexLastMessageCaptureOutcome {
+    /// Legacy stream-only mode (not used by supervised Codex structured execution).
+    NotConfigured,
+    /// Validated, bounded, owner-only regular file contents captured from `--output-last-message`.
+    Verified(String),
+    /// The `--output-last-message` file was not created by the provider process.
+    Missing,
+    /// The `--output-last-message` file was empty or whitespace-only.
+    Empty,
+    /// The `--output-last-message` file exceeded `max_response_bytes`.
+    TooLarge { observed_bytes: usize },
+    /// The `--output-last-message` file contained invalid UTF-8 bytes.
+    InvalidUtf8,
+    /// The capture directory or file failed symlink/regular-file/owner/permission/link safety checks.
+    Unsafe(String),
+    /// Unexpected extra directory entries were created inside the invocation-private capture directory.
+    AmbiguousExtraEntries,
+}
+
 /// Incremental stdout collector that captures complete terminal advisory output alongside
 /// [`NdjsonStreamParser`](crate::NdjsonStreamParser).
 pub(crate) struct AdvisoryResponseCollector {
@@ -765,13 +803,17 @@ pub(crate) struct AdvisoryResponseCollector {
     oc_step_message_id: Option<String>,
     oc_step_candidate: Option<CapturedCandidate>,
     oc_sealed_candidate: Option<(CapturedCandidate, usize)>,
+    codex_last_message_capture: CodexLastMessageCaptureOutcome,
     codex_saw_thread_started: bool,
     codex_in_turn: bool,
     codex_seen_agent_item_ids: BTreeSet<String>,
+    codex_total_agent_messages: usize,
+    codex_post_tool_messages: Vec<CapturedCandidate>,
+    codex_sealed_turn: Option<(Vec<CapturedCandidate>, usize, Option<StreamTokenUsage>)>,
+    codex_legacy_stream_error: Option<AdvisoryResponseError>,
     codex_prose_preamble_count: usize,
     codex_segment_prose_line: Option<usize>,
     codex_turn_candidate: Option<CapturedCandidate>,
-    codex_sealed_candidate: Option<(CapturedCandidate, usize, Option<StreamTokenUsage>)>,
 }
 
 impl AdvisoryResponseCollector {
@@ -798,19 +840,40 @@ impl AdvisoryResponseCollector {
             oc_step_message_id: None,
             oc_step_candidate: None,
             oc_sealed_candidate: None,
+            codex_last_message_capture: if provider == WorkerProvider::CodexCli {
+                CodexLastMessageCaptureOutcome::Missing
+            } else {
+                CodexLastMessageCaptureOutcome::NotConfigured
+            },
             codex_saw_thread_started: false,
             codex_in_turn: false,
             codex_seen_agent_item_ids: BTreeSet::new(),
+            codex_total_agent_messages: 0,
+            codex_post_tool_messages: Vec::new(),
+            codex_sealed_turn: None,
+            codex_legacy_stream_error: None,
             codex_prose_preamble_count: 0,
             codex_segment_prose_line: None,
             codex_turn_candidate: None,
-            codex_sealed_candidate: None,
         }
+    }
+
+    pub(crate) fn set_codex_last_message_capture(
+        &mut self,
+        outcome: CodexLastMessageCaptureOutcome,
+    ) {
+        self.codex_last_message_capture = outcome;
     }
 
     fn latch_error(&mut self, err: AdvisoryResponseError) {
         if self.latched_error.is_none() {
             self.latched_error = Some(err);
+        }
+    }
+
+    fn record_codex_legacy_stream_error(&mut self, err: AdvisoryResponseError) {
+        if self.codex_legacy_stream_error.is_none() {
+            self.codex_legacy_stream_error = Some(err);
         }
     }
 
@@ -1814,8 +1877,8 @@ impl AdvisoryResponseCollector {
     }
 
     fn ingest_codex_event(&mut self, line_number: usize, obj: &Map<String, Value>) {
-        if self.codex_sealed_candidate.is_some() {
-            self.codex_sealed_candidate = None;
+        if self.codex_sealed_turn.is_some() {
+            self.codex_sealed_turn = None;
             self.latch_error(AdvisoryResponseError::at_line(
                 AdvisoryResponseErrorCode::ConflictingTerminalOutput,
                 line_number,
@@ -1920,7 +1983,17 @@ impl AdvisoryResponseCollector {
                     ));
                     return;
                 }
+                if self.codex_sealed_turn.is_some() {
+                    self.latch_error(AdvisoryResponseError::at_line(
+                        AdvisoryResponseErrorCode::ConflictingTerminalOutput,
+                        line_number,
+                        "Codex CLI stream emitted multiple turns in a single advisory invocation",
+                    ));
+                    return;
+                }
                 self.codex_in_turn = true;
+                self.codex_total_agent_messages = 0;
+                self.codex_post_tool_messages.clear();
                 self.codex_prose_preamble_count = 0;
                 self.codex_segment_prose_line = None;
                 self.codex_turn_candidate = None;
@@ -2084,9 +2157,33 @@ impl AdvisoryResponseCollector {
                             return;
                         }
 
-                        if self.codex_turn_candidate.is_some() {
+                        self.codex_total_agent_messages += 1;
+                        if self.codex_total_agent_messages > MAX_CODEX_AGENT_MESSAGES_PER_TURN {
+                            self.codex_post_tool_messages.clear();
                             self.codex_turn_candidate = None;
                             self.latch_error(AdvisoryResponseError::at_line(
+                                AdvisoryResponseErrorCode::ConflictingTerminalOutput,
+                                line_number,
+                                format!(
+                                    "Codex turn exceeded maximum completed agent_message count ({MAX_CODEX_AGENT_MESSAGES_PER_TURN})"
+                                ),
+                            ));
+                            return;
+                        }
+
+                        let candidate = CapturedCandidate {
+                            text: raw_text.to_string(),
+                            response_line_number: line_number,
+                            session_id: self.observed_session_id.clone(),
+                            message_id: None,
+                            part_id: None,
+                            item_id: Some(item_id.to_string()),
+                        };
+                        self.codex_post_tool_messages.push(candidate.clone());
+
+                        if self.codex_turn_candidate.is_some() {
+                            self.codex_turn_candidate = None;
+                            self.record_codex_legacy_stream_error(AdvisoryResponseError::at_line(
                                 AdvisoryResponseErrorCode::ConflictingTerminalOutput,
                                 line_number,
                                 "Codex turn emitted multiple completed agent_message items",
@@ -2096,33 +2193,28 @@ impl AdvisoryResponseCollector {
 
                         match classify_codex_agent_message_text(raw_text, line_number) {
                             CodexAgentMessageClassification::StructuredJsonObject => {
-                                self.codex_turn_candidate = Some(CapturedCandidate {
-                                    text: raw_text.to_string(),
-                                    response_line_number: line_number,
-                                    session_id: self.observed_session_id.clone(),
-                                    message_id: None,
-                                    part_id: None,
-                                    item_id: Some(item_id.to_string()),
-                                });
+                                self.codex_turn_candidate = Some(candidate);
                             }
                             CodexAgentMessageClassification::OrdinaryProsePreamble => {
                                 self.codex_prose_preamble_count += 1;
                                 if self.codex_prose_preamble_count
                                     > MAX_CODEX_PROSE_PREAMBLES_PER_TURN
                                 {
-                                    self.latch_error(AdvisoryResponseError::at_line(
-                                        AdvisoryResponseErrorCode::ConflictingTerminalOutput,
-                                        line_number,
-                                        format!(
-                                            "Codex turn exceeded maximum ordinary prose preamble agent_message count ({MAX_CODEX_PROSE_PREAMBLES_PER_TURN})"
+                                    self.record_codex_legacy_stream_error(
+                                        AdvisoryResponseError::at_line(
+                                            AdvisoryResponseErrorCode::ConflictingTerminalOutput,
+                                            line_number,
+                                            format!(
+                                                "Codex turn exceeded maximum ordinary prose preamble agent_message count ({MAX_CODEX_PROSE_PREAMBLES_PER_TURN})"
+                                            ),
                                         ),
-                                    ));
+                                    );
                                     return;
                                 }
                                 self.codex_segment_prose_line = Some(line_number);
                             }
                             CodexAgentMessageClassification::InvalidStructuredCandidate(err) => {
-                                self.latch_error(err);
+                                self.record_codex_legacy_stream_error(err);
                             }
                         }
                     }
@@ -2139,8 +2231,9 @@ impl AdvisoryResponseCollector {
                         self.saw_tool_output_candidate = true;
                         // A read-only shell command under the scoped permission profile may precede the
                         // final agent_message, so if an earlier agent_message was buffered in the same
-                        // turn before a tool item completed, clear it so only the final post-tool
-                        // agent_message can seal the turn.
+                        // turn before a tool item completed, clear it so only post-tool completed
+                        // agent_message items can seal the turn.
+                        self.codex_post_tool_messages.clear();
                         self.codex_turn_candidate = None;
                         self.codex_segment_prose_line = None;
                     }
@@ -2213,15 +2306,10 @@ impl AdvisoryResponseCollector {
 
                 self.codex_in_turn = false;
                 let prose_line = self.codex_segment_prose_line.take();
-                let Some(mut candidate) = self.codex_turn_candidate.take() else {
-                    if let Some(prose_line_number) = prose_line {
-                        self.latch_error(AdvisoryResponseError::at_line(
-                            AdvisoryResponseErrorCode::InvalidStructuredJson,
-                            prose_line_number,
-                            "Codex turn completed with ordinary prose agent_message output and no final structured JSON object",
-                        ));
-                        return;
-                    }
+                let legacy_candidate = self.codex_turn_candidate.take();
+
+                let mut post_tool = std::mem::take(&mut self.codex_post_tool_messages);
+                if post_tool.is_empty() {
                     let code = if self.saw_tool_output_candidate {
                         AdvisoryResponseErrorCode::SpoofedOrToolOutput
                     } else {
@@ -2233,20 +2321,36 @@ impl AdvisoryResponseCollector {
                         "Codex turn.completed occurred without a completed final agent_message item",
                     ));
                     return;
-                };
-                if candidate.session_id.is_none() {
-                    candidate.session_id = self.observed_session_id.clone();
                 }
-                if let Err(err) =
-                    validate_structured_json_object(&candidate.text, candidate.response_line_number)
-                {
-                    self.latch_error(err);
-                    return;
+                for cand in &mut post_tool {
+                    if cand.session_id.is_none() {
+                        cand.session_id = self.observed_session_id.clone();
+                    }
                 }
-                self.codex_sealed_candidate = Some((candidate, line_number, usage));
+                match legacy_candidate {
+                    Some(cand) => {
+                        if let Err(err) =
+                            validate_structured_json_object(&cand.text, cand.response_line_number)
+                        {
+                            self.record_codex_legacy_stream_error(err);
+                        }
+                    }
+                    None => {
+                        if let Some(prose_line_number) = prose_line {
+                            self.record_codex_legacy_stream_error(AdvisoryResponseError::at_line(
+                                AdvisoryResponseErrorCode::InvalidStructuredJson,
+                                prose_line_number,
+                                "Codex turn completed with ordinary prose agent_message output and no final structured JSON object",
+                            ));
+                        }
+                    }
+                }
+                self.codex_sealed_turn = Some((post_tool, line_number, usage));
             }
             "turn.failed" | "error" => {
                 self.codex_in_turn = false;
+                self.codex_post_tool_messages.clear();
+                self.codex_sealed_turn = None;
                 self.codex_segment_prose_line = None;
                 self.codex_turn_candidate = None;
                 self.latch_error(AdvisoryResponseError::at_line(
@@ -2345,7 +2449,8 @@ impl AdvisoryResponseCollector {
                         )),
                     };
                 }
-                let Some((cand, term_line, turn_usage)) = self.codex_sealed_candidate else {
+                let Some((post_tool_messages, term_line, turn_usage)) = self.codex_sealed_turn
+                else {
                     let code = if self.saw_tool_output_candidate {
                         AdvisoryResponseErrorCode::SpoofedOrToolOutput
                     } else {
@@ -2360,8 +2465,175 @@ impl AdvisoryResponseCollector {
                         )),
                     };
                 };
+                let last_line = post_tool_messages.last().map(|m| m.response_line_number);
+                let captured_text = match self.codex_last_message_capture {
+                    CodexLastMessageCaptureOutcome::Verified(text) => text,
+                    CodexLastMessageCaptureOutcome::Unsafe(reason) => {
+                        return AdvisoryStructuredExecution {
+                            execution,
+                            response: None,
+                            response_error: Some(AdvisoryResponseError::new(
+                                AdvisoryResponseErrorCode::SpoofedOrToolOutput,
+                                format!(
+                                    "Codex --output-last-message capture failed filesystem safety validation: {reason}"
+                                ),
+                            )),
+                        };
+                    }
+                    CodexLastMessageCaptureOutcome::AmbiguousExtraEntries => {
+                        return AdvisoryStructuredExecution {
+                            execution,
+                            response: None,
+                            response_error: Some(AdvisoryResponseError::new(
+                                AdvisoryResponseErrorCode::ConflictingTerminalOutput,
+                                "Codex --output-last-message capture directory contained unexpected extra entries",
+                            )),
+                        };
+                    }
+                    CodexLastMessageCaptureOutcome::TooLarge { observed_bytes } => {
+                        return AdvisoryStructuredExecution {
+                            execution,
+                            response: None,
+                            response_error: Some(AdvisoryResponseError {
+                                code: AdvisoryResponseErrorCode::ResponseTooLarge,
+                                message: sanitize_and_redact(
+                                    &format!(
+                                        "Codex --output-last-message capture ({observed_bytes} bytes) exceeds max_response_bytes ({})",
+                                        self.budget.max_response_bytes
+                                    ),
+                                    MAX_DIAGNOSTIC_SUMMARY_BYTES,
+                                ),
+                                line_number: last_line,
+                                observed_bytes: Some(observed_bytes),
+                                max_response_bytes: Some(self.budget.max_response_bytes),
+                            }),
+                        };
+                    }
+                    CodexLastMessageCaptureOutcome::Empty => {
+                        return AdvisoryStructuredExecution {
+                            execution,
+                            response: None,
+                            response_error: Some(AdvisoryResponseError::new(
+                                AdvisoryResponseErrorCode::MissingResponseOutput,
+                                "Codex --output-last-message capture file was empty",
+                            )),
+                        };
+                    }
+                    CodexLastMessageCaptureOutcome::InvalidUtf8 => {
+                        return AdvisoryStructuredExecution {
+                            execution,
+                            response: None,
+                            response_error: Some(AdvisoryResponseError::new(
+                                AdvisoryResponseErrorCode::InvalidStructuredJson,
+                                "Codex --output-last-message capture file contained invalid UTF-8 bytes",
+                            )),
+                        };
+                    }
+                    CodexLastMessageCaptureOutcome::Missing
+                    | CodexLastMessageCaptureOutcome::NotConfigured => {
+                        let err = self.codex_legacy_stream_error.unwrap_or_else(|| {
+                            AdvisoryResponseError::new(
+                                AdvisoryResponseErrorCode::MissingResponseOutput,
+                                "Codex --output-last-message capture file was not written",
+                            )
+                        });
+                        return AdvisoryStructuredExecution {
+                            execution,
+                            response: None,
+                            response_error: Some(err),
+                        };
+                    }
+                };
+
+                if captured_text.len() > self.budget.max_response_bytes {
+                    let observed_bytes = captured_text.len();
+                    return AdvisoryStructuredExecution {
+                        execution,
+                        response: None,
+                        response_error: Some(AdvisoryResponseError {
+                            code: AdvisoryResponseErrorCode::ResponseTooLarge,
+                            message: sanitize_and_redact(
+                                &format!(
+                                    "Codex --output-last-message capture ({observed_bytes} bytes) exceeds max_response_bytes ({})",
+                                    self.budget.max_response_bytes
+                                ),
+                                MAX_DIAGNOSTIC_SUMMARY_BYTES,
+                            ),
+                            line_number: last_line,
+                            observed_bytes: Some(observed_bytes),
+                            max_response_bytes: Some(self.budget.max_response_bytes),
+                        }),
+                    };
+                }
+
+                let Some(last_candidate) = post_tool_messages.last().cloned() else {
+                    return AdvisoryStructuredExecution {
+                        execution,
+                        response: None,
+                        response_error: Some(AdvisoryResponseError::new(
+                            AdvisoryResponseErrorCode::MissingResponseOutput,
+                            "Codex turn completed without a post-tool final agent_message item",
+                        )),
+                    };
+                };
+
+                if captured_text != last_candidate.text {
+                    return AdvisoryStructuredExecution {
+                        execution,
+                        response: None,
+                        response_error: Some(AdvisoryResponseError::at_line(
+                            AdvisoryResponseErrorCode::ConflictingTerminalOutput,
+                            last_candidate.response_line_number,
+                            "Codex --output-last-message capture does not match the terminal completed agent_message item",
+                        )),
+                    };
+                }
+
+                let matching_count = post_tool_messages
+                    .iter()
+                    .filter(|cand| cand.text == captured_text)
+                    .count();
+                if matching_count != 1 {
+                    return AdvisoryStructuredExecution {
+                        execution,
+                        response: None,
+                        response_error: Some(AdvisoryResponseError::at_line(
+                            AdvisoryResponseErrorCode::ConflictingTerminalOutput,
+                            last_candidate.response_line_number,
+                            "Codex turn emitted duplicate completed agent_message items matching --output-last-message",
+                        )),
+                    };
+                }
+
+                if let Err(err) = validate_structured_json_object(
+                    &captured_text,
+                    last_candidate.response_line_number,
+                ) {
+                    return AdvisoryStructuredExecution {
+                        execution,
+                        response: None,
+                        response_error: Some(err),
+                    };
+                }
+
+                if crate::spec::extract_pinned_codex_read_only_output_last_message_path(
+                    &execution.constructed_argv,
+                    &execution.requested_model,
+                )
+                .is_none()
+                {
+                    return AdvisoryStructuredExecution {
+                        execution,
+                        response: None,
+                        response_error: Some(AdvisoryResponseError::new(
+                            AdvisoryResponseErrorCode::WorkerExecutionFailed,
+                            "Codex CLI advisory execution lacks pinned --output-last-message launch provenance",
+                        )),
+                    };
+                }
+
                 (
-                    cand,
+                    last_candidate,
                     term_line,
                     AdvisoryResponseSource::CodexAgentMessageTurnCompleted,
                     turn_usage.or_else(|| execution.evidence.observed_usage.clone()),

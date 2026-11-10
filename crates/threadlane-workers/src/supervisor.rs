@@ -26,7 +26,8 @@ use crate::opencode_metadata::{
 use crate::progress_watchdog::{ProgressWatchdog, ProgressWatchdogSnapshot};
 use crate::provider_health::{HealthPublisher, ProviderHealthObserver, ProviderHealthSnapshot};
 use crate::spec::{
-    is_pinned_codex_read_only_argv, is_pinned_codex_task_files_argv, AdvisoryWorkerSpec,
+    extract_pinned_codex_read_only_output_last_message_path, is_pinned_codex_read_only_argv,
+    is_pinned_codex_task_files_argv, splice_codex_output_last_message_arg, AdvisoryWorkerSpec,
     ExecutionBudgets, ResolvedModelTarget, WorkerProvider, WorkerSpec,
 };
 use crate::stream::{
@@ -580,6 +581,11 @@ impl WorkerExecutionReport {
         self.executed_executable.is_none()
             && self.evidence.codex_turn_lifecycle.is_none()
             && self.has_pinned_codex_read_only_launch_config()
+            && extract_pinned_codex_read_only_output_last_message_path(
+                &self.constructed_argv,
+                &self.requested_model,
+            )
+            .is_none()
             && self.status == WorkerRunStatus::Succeeded
             && self.exit_code == Some(0)
             && self.signal.is_none()
@@ -1393,6 +1399,21 @@ where
         }
     }
 
+    let codex_last_message_capture = if provider == WorkerProvider::CodexCli
+        && response_budget.is_some()
+    {
+        let capture =
+            codex_last_message_capture::OwnedCodexLastMessageCapture::create(&canonical_workdir)?;
+        splice_codex_output_last_message_arg(
+            &mut constructed_argv,
+            &resolved_model,
+            capture.output_path(),
+        )?;
+        Some(capture)
+    } else {
+        None
+    };
+
     let mut diagnostic_task = start_owned_capture(
         health_requested && provider == WorkerProvider::Antigravity,
         &mut constructed_argv,
@@ -1580,7 +1601,7 @@ where
     let StdoutDrainOutput {
         bytes_captured: stdout_bytes_captured,
         evidence,
-        response_collector,
+        mut response_collector,
         overflow: stdout_overflow,
         dropped_live_events,
     } = match tokio::time::timeout(
@@ -1641,6 +1662,17 @@ where
 
     let final_overflow = recorded_overflow.or(stdout_overflow).or(stderr_overflow);
     let (exit_code, signal) = extract_exit_code_and_signal(exit_status);
+
+    if let (Some(capture), Some(budget), Some(collector)) = (
+        codex_last_message_capture.as_ref(),
+        response_budget,
+        response_collector.as_mut(),
+    ) {
+        if !cancelled && !timed_out && final_overflow.is_none() && !cleanup_incomplete {
+            let outcome = capture.read_outcome(budget.max_response_bytes);
+            collector.set_codex_last_message_capture(outcome);
+        }
+    }
 
     let mut status = classify_run_status(
         provider,
@@ -2201,6 +2233,458 @@ fn map_collector_error_to_run_status(err: OpenCodeCollectorError) -> WorkerRunSt
         | OpenCodeCollectorError::NonZeroExit
         | OpenCodeCollectorError::InvalidMetadata
         | OpenCodeCollectorError::StaleSession => WorkerRunStatus::NonZeroExit,
+    }
+}
+
+#[cfg(unix)]
+#[allow(unsafe_code)]
+mod codex_last_message_capture {
+    use std::ffi::CString;
+    use std::fs::{self, File};
+    use std::io::{self, Read};
+    use std::mem::MaybeUninit;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    use std::path::{Path, PathBuf};
+
+    use crate::advisory_response::CodexLastMessageCaptureOutcome;
+    use crate::error::WorkerError;
+    use crate::fs_safety::validate_existing_canonical_dir;
+    use crate::spec::CODEX_ADVISORY_LAST_MESSAGE_FILENAME;
+
+    pub(super) struct OwnedCodexLastMessageCapture {
+        directory: PathBuf,
+        directory_name_cstr: CString,
+        output_path: PathBuf,
+        parent_file: File,
+        directory_file: File,
+        dir_dev: libc::dev_t,
+        dir_ino: libc::ino_t,
+        expected_uid: libc::uid_t,
+    }
+
+    fn fstat_fd(fd: libc::c_int) -> io::Result<libc::stat> {
+        let mut st = MaybeUninit::<libc::stat>::zeroed();
+        // SAFETY: `fd` is a valid open file descriptor and `st` points to writable `libc::stat` storage.
+        let rc = unsafe { libc::fstat(fd, st.as_mut_ptr()) };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `fstat` succeeded and initialized `st`.
+        Ok(unsafe { st.assume_init() })
+    }
+
+    fn fstatat_nofollow(dir_fd: libc::c_int, name: &CString) -> io::Result<libc::stat> {
+        let mut st = MaybeUninit::<libc::stat>::zeroed();
+        // SAFETY: `dir_fd` is a valid open directory fd, `name` is a NUL-terminated relative entry name,
+        // and `st` points to writable `libc::stat` storage. `AT_SYMLINK_NOFOLLOW` never follows symlinks.
+        let rc = unsafe {
+            libc::fstatat(
+                dir_fd,
+                name.as_ptr(),
+                st.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `fstatat` succeeded and initialized `st`.
+        Ok(unsafe { st.assume_init() })
+    }
+
+    fn lstat_path(path: &Path) -> io::Result<libc::stat> {
+        let c_path = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "path contains interior NUL")
+        })?;
+        let mut st = MaybeUninit::<libc::stat>::zeroed();
+        // SAFETY: `c_path` is a valid NUL-terminated string and `st` points to writable `libc::stat` storage.
+        let rc = unsafe { libc::lstat(c_path.as_ptr(), st.as_mut_ptr()) };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `lstat` succeeded and initialized `st`.
+        Ok(unsafe { st.assume_init() })
+    }
+
+    fn open_dir_nofollow(path: &Path) -> io::Result<File> {
+        fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)
+    }
+
+    fn entry_cstr() -> CString {
+        CString::new(CODEX_ADVISORY_LAST_MESSAGE_FILENAME)
+            .expect("CODEX_ADVISORY_LAST_MESSAGE_FILENAME is static NUL-free ASCII")
+    }
+
+    impl OwnedCodexLastMessageCapture {
+        pub(super) fn create(canonical_workdir: &Path) -> Result<Self, WorkerError> {
+            let tempdir = tempfile::Builder::new()
+                .prefix("threadlane-codex-last-msg-")
+                .permissions(fs::Permissions::from_mode(0o700))
+                .tempdir()
+                .map_err(WorkerError::Io)?;
+            let leaf_stat = lstat_path(tempdir.path()).map_err(WorkerError::Io)?;
+            if (leaf_stat.st_mode & libc::S_IFMT) != libc::S_IFDIR {
+                return Err(WorkerError::SecurityViolation(format!(
+                    "codex output-last-message capture tempdir leaf is not a directory: {}",
+                    tempdir.path().display()
+                )));
+            }
+            let canonical_candidate = fs::canonicalize(tempdir.path()).map_err(WorkerError::Io)?;
+            let canonical_dir = validate_existing_canonical_dir(
+                &canonical_candidate,
+                "codex output-last-message capture directory",
+            )?;
+            if canonical_dir.starts_with(canonical_workdir)
+                || canonical_workdir.starts_with(&canonical_dir)
+            {
+                return Err(WorkerError::SecurityViolation(format!(
+                    "codex output-last-message capture directory must not overlap working directory: {}",
+                    canonical_dir.display()
+                )));
+            }
+            let Some(parent_dir) = canonical_dir.parent() else {
+                return Err(WorkerError::SecurityViolation(format!(
+                    "codex output-last-message capture directory has no parent: {}",
+                    canonical_dir.display()
+                )));
+            };
+            let Some(dir_name) = canonical_dir.file_name() else {
+                return Err(WorkerError::SecurityViolation(format!(
+                    "codex output-last-message capture directory has no leaf name: {}",
+                    canonical_dir.display()
+                )));
+            };
+            let directory_name_cstr = CString::new(dir_name.as_bytes()).map_err(|_| {
+                WorkerError::InvalidSpec(
+                    "codex output-last-message directory name contains interior NUL".to_string(),
+                )
+            })?;
+
+            let parent_file = open_dir_nofollow(parent_dir).map_err(WorkerError::Io)?;
+            let directory_file = open_dir_nofollow(&canonical_dir).map_err(WorkerError::Io)?;
+
+            // SAFETY: `geteuid` has no preconditions and cannot fail.
+            let expected_uid = unsafe { libc::geteuid() };
+            let dir_stat = fstat_fd(directory_file.as_raw_fd()).map_err(WorkerError::Io)?;
+            let path_stat = lstat_path(&canonical_dir).map_err(WorkerError::Io)?;
+            if (path_stat.st_mode & libc::S_IFMT) != libc::S_IFDIR
+                || path_stat.st_dev != dir_stat.st_dev
+                || path_stat.st_ino != dir_stat.st_ino
+                || leaf_stat.st_dev != dir_stat.st_dev
+                || leaf_stat.st_ino != dir_stat.st_ino
+                || dir_stat.st_uid != expected_uid
+                || (dir_stat.st_mode & 0o7777) != 0o700
+            {
+                return Err(WorkerError::SecurityViolation(format!(
+                    "codex output-last-message capture directory failed ownership or 0700 mode check: {}",
+                    canonical_dir.display()
+                )));
+            }
+
+            if fs::read_dir(&canonical_dir)
+                .map_err(WorkerError::Io)?
+                .next()
+                .is_some()
+            {
+                return Err(WorkerError::SecurityViolation(format!(
+                    "fresh codex output-last-message capture directory was not empty: {}",
+                    canonical_dir.display()
+                )));
+            }
+
+            let output_path = canonical_dir.join(CODEX_ADVISORY_LAST_MESSAGE_FILENAME);
+            match fs::symlink_metadata(&output_path) {
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Ok(_) => {
+                    return Err(WorkerError::SecurityViolation(format!(
+                        "fresh codex output-last-message capture file unexpectedly existed before launch: {}",
+                        output_path.display()
+                    )));
+                }
+                Err(err) => return Err(WorkerError::Io(err)),
+            }
+
+            // Disarm `TempDir` recursive drop now that our descriptor-pinned `Drop` owns cleanup.
+            let _ = tempdir.keep();
+
+            Ok(Self {
+                directory: canonical_dir,
+                directory_name_cstr,
+                output_path,
+                parent_file,
+                directory_file,
+                dir_dev: dir_stat.st_dev,
+                dir_ino: dir_stat.st_ino,
+                expected_uid,
+            })
+        }
+
+        pub(super) fn output_path(&self) -> &Path {
+            &self.output_path
+        }
+
+        pub(super) fn read_outcome(
+            &self,
+            max_response_bytes: usize,
+        ) -> CodexLastMessageCaptureOutcome {
+            let Ok(path_stat) = lstat_path(&self.directory) else {
+                return CodexLastMessageCaptureOutcome::Unsafe(
+                    "capture directory disappeared or failed lstat".to_string(),
+                );
+            };
+            let Ok(fd_stat) = fstat_fd(self.directory_file.as_raw_fd()) else {
+                return CodexLastMessageCaptureOutcome::Unsafe(
+                    "capture directory descriptor failed fstat".to_string(),
+                );
+            };
+            if (path_stat.st_mode & libc::S_IFMT) != libc::S_IFDIR
+                || path_stat.st_dev != self.dir_dev
+                || path_stat.st_ino != self.dir_ino
+                || fd_stat.st_dev != self.dir_dev
+                || fd_stat.st_ino != self.dir_ino
+                || fd_stat.st_uid != self.expected_uid
+                || (fd_stat.st_mode & 0o7777) != 0o700
+            {
+                return CodexLastMessageCaptureOutcome::Unsafe(
+                    "capture directory identity, ownership, or 0700 permissions changed"
+                        .to_string(),
+                );
+            }
+
+            let Ok(entries) = fs::read_dir(&self.directory) else {
+                return CodexLastMessageCaptureOutcome::Unsafe(
+                    "failed to enumerate capture directory".to_string(),
+                );
+            };
+            for entry_res in entries {
+                let Ok(entry) = entry_res else {
+                    return CodexLastMessageCaptureOutcome::Unsafe(
+                        "failed to read capture directory entry".to_string(),
+                    );
+                };
+                if entry.file_name().to_str() != Some(CODEX_ADVISORY_LAST_MESSAGE_FILENAME) {
+                    return CodexLastMessageCaptureOutcome::AmbiguousExtraEntries;
+                }
+            }
+
+            let file_cstr = entry_cstr();
+            let entry_stat = match fstatat_nofollow(self.directory_file.as_raw_fd(), &file_cstr) {
+                Ok(st) => st,
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                    return CodexLastMessageCaptureOutcome::Missing;
+                }
+                Err(err) => {
+                    return CodexLastMessageCaptureOutcome::Unsafe(format!(
+                        "failed to stat capture file: {err}"
+                    ));
+                }
+            };
+
+            let file_type = entry_stat.st_mode & libc::S_IFMT;
+            if file_type == libc::S_IFLNK {
+                return CodexLastMessageCaptureOutcome::Unsafe(
+                    "capture path is a symbolic link".to_string(),
+                );
+            }
+            if file_type != libc::S_IFREG {
+                return CodexLastMessageCaptureOutcome::Unsafe(
+                    "capture path is not a regular file".to_string(),
+                );
+            }
+            if entry_stat.st_uid != self.expected_uid {
+                return CodexLastMessageCaptureOutcome::Unsafe(
+                    "capture file UID does not match supervisor EUID".to_string(),
+                );
+            }
+            if entry_stat.st_nlink != 1 {
+                return CodexLastMessageCaptureOutcome::Unsafe(
+                    "capture file has unexpected hard-link count".to_string(),
+                );
+            }
+            if (entry_stat.st_mode & 0o7113) != 0 || (entry_stat.st_mode & 0o0400) == 0 {
+                return CodexLastMessageCaptureOutcome::Unsafe(
+                    "capture file has unsafe permissions".to_string(),
+                );
+            }
+
+            // SAFETY: `self.directory_file` is a valid open directory fd and `file_cstr` is a
+            // NUL-terminated relative filename. `O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC` prevents
+            // symlink traversal, blocking on FIFOs if raced, and descriptor leakage.
+            let raw_fd = unsafe {
+                libc::openat(
+                    self.directory_file.as_raw_fd(),
+                    file_cstr.as_ptr(),
+                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+                )
+            };
+            if raw_fd < 0 {
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::NotFound {
+                    return CodexLastMessageCaptureOutcome::Missing;
+                }
+                return CodexLastMessageCaptureOutcome::Unsafe(format!(
+                    "openat failed on capture file: {err}"
+                ));
+            }
+            // SAFETY: `raw_fd` is a freshly opened valid file descriptor owned exclusively here.
+            let file = unsafe { File::from_raw_fd(raw_fd) };
+
+            let Ok(opened_stat) = fstat_fd(file.as_raw_fd()) else {
+                return CodexLastMessageCaptureOutcome::Unsafe(
+                    "fstat failed on opened capture file".to_string(),
+                );
+            };
+            if (opened_stat.st_mode & libc::S_IFMT) != libc::S_IFREG
+                || opened_stat.st_dev != entry_stat.st_dev
+                || opened_stat.st_ino != entry_stat.st_ino
+                || opened_stat.st_uid != self.expected_uid
+                || opened_stat.st_nlink != 1
+                || (opened_stat.st_mode & 0o7113) != 0
+                || (opened_stat.st_mode & 0o0400) == 0
+            {
+                return CodexLastMessageCaptureOutcome::Unsafe(
+                    "opened capture file failed post-open identity, ownership, or mode check"
+                        .to_string(),
+                );
+            }
+
+            if opened_stat.st_size < 0 {
+                return CodexLastMessageCaptureOutcome::Unsafe(
+                    "opened capture file reported negative st_size".to_string(),
+                );
+            }
+            let initial_size = usize::try_from(opened_stat.st_size).unwrap_or(usize::MAX);
+            if initial_size > max_response_bytes {
+                return CodexLastMessageCaptureOutcome::TooLarge {
+                    observed_bytes: initial_size,
+                };
+            }
+
+            let read_cap = max_response_bytes.saturating_add(1);
+            let mut bytes = Vec::with_capacity(initial_size.min(read_cap));
+            let Ok(limit_u64) = u64::try_from(read_cap) else {
+                return CodexLastMessageCaptureOutcome::Unsafe(
+                    "response byte cap overflowed u64".to_string(),
+                );
+            };
+            if let Err(err) = (&file).take(limit_u64).read_to_end(&mut bytes) {
+                return CodexLastMessageCaptureOutcome::Unsafe(format!(
+                    "failed reading capture file: {err}"
+                ));
+            }
+            if bytes.len() > max_response_bytes {
+                return CodexLastMessageCaptureOutcome::TooLarge {
+                    observed_bytes: bytes.len(),
+                };
+            }
+
+            let Ok(post_stat) = fstat_fd(file.as_raw_fd()) else {
+                return CodexLastMessageCaptureOutcome::Unsafe(
+                    "post-read fstat failed on capture file".to_string(),
+                );
+            };
+            let post_size = usize::try_from(post_stat.st_size).unwrap_or(usize::MAX);
+            if post_stat.st_dev != opened_stat.st_dev
+                || post_stat.st_ino != opened_stat.st_ino
+                || post_size != bytes.len()
+            {
+                return CodexLastMessageCaptureOutcome::Unsafe(
+                    "capture file mutated concurrently during read".to_string(),
+                );
+            }
+
+            if bytes.is_empty() {
+                return CodexLastMessageCaptureOutcome::Empty;
+            }
+            let Ok(text) = String::from_utf8(bytes) else {
+                return CodexLastMessageCaptureOutcome::InvalidUtf8;
+            };
+            if text.trim().is_empty() {
+                return CodexLastMessageCaptureOutcome::Empty;
+            }
+
+            CodexLastMessageCaptureOutcome::Verified(text)
+        }
+    }
+
+    impl Drop for OwnedCodexLastMessageCapture {
+        fn drop(&mut self) {
+            let Ok(dir_stat) = fstat_fd(self.directory_file.as_raw_fd()) else {
+                return;
+            };
+            if dir_stat.st_dev != self.dir_dev
+                || dir_stat.st_ino != self.dir_ino
+                || dir_stat.st_uid != self.expected_uid
+            {
+                return;
+            }
+
+            let file_cstr = entry_cstr();
+            if let Ok(entry_stat) = fstatat_nofollow(self.directory_file.as_raw_fd(), &file_cstr) {
+                if (entry_stat.st_mode & libc::S_IFMT) != libc::S_IFDIR {
+                    // SAFETY: `self.directory_file` is our verified directory fd and `unlinkat`
+                    // with flags `0` removes only the named non-directory entry inside that
+                    // directory without following symlinks.
+                    let _ = unsafe {
+                        libc::unlinkat(self.directory_file.as_raw_fd(), file_cstr.as_ptr(), 0)
+                    };
+                }
+            }
+
+            if let Ok(parent_entry_stat) =
+                fstatat_nofollow(self.parent_file.as_raw_fd(), &self.directory_name_cstr)
+            {
+                if (parent_entry_stat.st_mode & libc::S_IFMT) == libc::S_IFDIR
+                    && parent_entry_stat.st_dev == self.dir_dev
+                    && parent_entry_stat.st_ino == self.dir_ino
+                    && parent_entry_stat.st_uid == self.expected_uid
+                {
+                    // SAFETY: `self.parent_file` is an open parent directory fd and `AT_REMOVEDIR`
+                    // removes only an empty directory matching our verified `(dev, ino, uid)`.
+                    let _ = unsafe {
+                        libc::unlinkat(
+                            self.parent_file.as_raw_fd(),
+                            self.directory_name_cstr.as_ptr(),
+                            libc::AT_REMOVEDIR,
+                        )
+                    };
+                }
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
+mod codex_last_message_capture {
+    use std::path::Path;
+
+    use crate::advisory_response::CodexLastMessageCaptureOutcome;
+    use crate::error::WorkerError;
+    use crate::fs_safety::ensure_platform_supported;
+
+    pub(super) struct OwnedCodexLastMessageCapture;
+
+    impl OwnedCodexLastMessageCapture {
+        pub(super) fn create(_canonical_workdir: &Path) -> Result<Self, WorkerError> {
+            ensure_platform_supported()?;
+            unreachable!("non-Unix platforms are rejected by ensure_platform_supported")
+        }
+
+        pub(super) fn output_path(&self) -> &Path {
+            Path::new("")
+        }
+
+        pub(super) fn read_outcome(
+            &self,
+            _max_response_bytes: usize,
+        ) -> CodexLastMessageCaptureOutcome {
+            CodexLastMessageCaptureOutcome::Missing
+        }
     }
 }
 

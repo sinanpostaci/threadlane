@@ -15,16 +15,25 @@ if (!stateDir) {
 
 const args = process.argv.slice(3);
 const codexTask = args[0] === "--no-daemon" && args[1] === "exec";
+const codexAdvisory =
+  codexTask && args.includes('default_permissions="threadlane-advisory"');
 let model = "";
 let effort = "";
 let mode = "";
 let prompt = "";
 let diagnosticPath = "";
+let outputLastMessagePath = "";
 
 for (let i = 0; i < args.length; i += 1) {
   const arg = args[i];
-  if (arg === "--log-file" && i + 1 < args.length) {
+  if (arg === "--") {
+    prompt = args[i + 1] ?? "";
+    break;
+  } else if (arg === "--log-file" && i + 1 < args.length) {
     diagnosticPath = args[i + 1];
+    i += 1;
+  } else if ((arg === "--output-last-message" || arg === "-o") && i + 1 < args.length) {
+    outputLastMessagePath = args[i + 1];
     i += 1;
   } else if (arg === "--model" && i + 1 < args.length) {
     model = args[i + 1];
@@ -104,6 +113,47 @@ function extractLineAfterMarker(text, marker) {
 }
 
 function emitPlanModeResponse(sessionId, responseText) {
+  if (codexAdvisory) {
+    if (
+      outputLastMessagePath &&
+      !fs.existsSync(path.join(stateDir, "skip_codex_last_message.gate"))
+    ) {
+      fs.writeFileSync(outputLastMessagePath, responseText, "utf8");
+    }
+    process.stdout.write(
+      `${JSON.stringify({ type: "thread.started", thread_id: sessionId })}\n`,
+    );
+    process.stdout.write(`${JSON.stringify({ type: "turn.started" })}\n`);
+    if (
+      fs.existsSync(
+        path.join(stateDir, "emit_codex_intermediate_message.gate"),
+      )
+    ) {
+      process.stdout.write(
+        `${JSON.stringify({
+          type: "item.completed",
+          item: {
+            id: "msg-intermediate-1",
+            type: "agent_message",
+            text: JSON.stringify({ stage: "inspection", final: false }),
+          },
+        })}\n`,
+      );
+    }
+    process.stdout.write(
+      `${JSON.stringify({
+        type: "item.completed",
+        item: { id: "msg-final-1", type: "agent_message", text: responseText },
+      })}\n`,
+    );
+    process.stdout.write(
+      `${JSON.stringify({
+        type: "turn.completed",
+        usage: { input_tokens: 120, output_tokens: 45 },
+      })}\n`,
+    );
+    return;
+  }
   const initLine = JSON.stringify({
     event: "init",
     init: {
@@ -125,7 +175,7 @@ withStateLock(() => {
   incrementCounterUnlocked("agy_count.txt");
 });
 
-if (mode === "plan") {
+if (mode === "plan" || codexAdvisory) {
   if (prompt.includes("EXPECTED_TASK_REVIEW_IDENTITY_JSON:")) {
     const expectedLine = extractLineAfterMarker(prompt, "EXPECTED_TASK_REVIEW_IDENTITY_JSON:");
     if (!expectedLine) {

@@ -1257,6 +1257,8 @@ async fn codex_recoverable_command_execution_nonzero_exit_preserves_valid_turn_a
     fs::create_dir_all(&bin_dir).expect("create bin_dir");
 
     let (expected_payload, payload_json) = build_large_sample_plan_payload();
+    let payload_raw_file = temp.path().join("codex_final_payload.json");
+    fs::write(&payload_raw_file, &payload_json).expect("write payload_raw_file");
     let final_msg_file = temp.path().join("codex_final_agent_msg.json");
     let final_msg_event = serde_json::json!({
         "type": "item.completed",
@@ -1272,20 +1274,34 @@ async fn codex_recoverable_command_execution_nonzero_exit_preserves_valid_turn_a
     )
     .expect("write final agent_message file");
 
-    // 1. Valid Codex turn with a failing read-only command_execution item (exit_code: 1) before final agent_message.
+    // 1. Valid Codex turn with a failing read-only command_execution item (exit_code: 1)
+    //    and an intermediate completed agent_message before the designated final agent_message.
     let ok_script = format!(
         r#"#!/usr/bin/env sh
 set -eu
+OUT_LAST_MSG=""
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --output-last-message|-o) OUT_LAST_MSG="$2"; shift 2 ;;
+        --) shift; break ;;
+        *) shift 1 ;;
+    esac
+done
 printf '%s\n' '{{"type":"thread.started","thread_id":"thread_codex_rec_1","model":"gpt-6-astra","reasoning_effort":"high"}}'
 printf '%s\n' '{{"type":"turn.started"}}'
 printf '%s\n' '{{"type":"item.started","item":{{"id":"item_cmd_1","type":"command_execution","command":"rg -n missing_symbol src/","status":"in_progress"}}}}'
 printf '%s\n' '{{"type":"item.completed","item":{{"id":"item_cmd_1","type":"command_execution","command":"rg -n missing_symbol src/","aggregated_output":"","exit_code":1,"status":"failed"}}}}'
+printf '%s\n' '{{"type":"item.completed","item":{{"id":"item_msg_intermediate_0","type":"agent_message","text":"{{\"step\":\"no_matches_found\",\"continuing\":true}}"}}}}'
 cat "{}"
 printf '\n'
+if [ -n "$OUT_LAST_MSG" ]; then
+    cp "{}" "$OUT_LAST_MSG"
+fi
 printf '%s\n' '{{"type":"turn.completed","usage":{{"input_tokens":140,"cached_input_tokens":32,"output_tokens":88}}}}'
 exit 0
 "#,
-        final_msg_file.display()
+        final_msg_file.display(),
+        payload_raw_file.display(),
     );
     let fake_codex_ok = write_executable_script(&bin_dir, "fake-codex-rec-ok", &ok_script);
     let mut codex_spec = AdvisoryWorkerSpec {

@@ -405,3 +405,104 @@ fn codex_advisory_workdir_rejects_fifo_and_special_entries_and_invalid_utf8_name
 
     validate_codex_advisory_workdir(&workdir).expect("clean workdir passes after cleanup");
 }
+
+#[test]
+fn codex_advisory_output_last_message_argv_pin_preserves_read_only_permission_profile_and_rejects_unsafe_paths(
+) {
+    let temp = TempDir::new().expect("tempdir");
+    let workdir = temp.path().join("workspace");
+    let bin_dir = temp.path().join("bin");
+    fs::create_dir_all(workdir.join(".git")).expect("create .git");
+    fs::create_dir_all(&bin_dir).expect("create bin_dir");
+
+    let fake_codex = write_executable_script(&bin_dir, "fake-codex", "#!/usr/bin/env sh\nexit 0\n");
+    let spec = sample_codex_advisory_spec(fake_codex, workdir);
+    let validation = spec.validate().expect("validate spec");
+
+    assert!(validation.allowed_write_paths.is_empty());
+    assert!(is_pinned_codex_read_only_argv(
+        &validation.constructed_argv,
+        &validation.resolved_model
+    ));
+    assert_eq!(
+        threadlane_workers::spec::extract_pinned_codex_read_only_output_last_message_path(
+            &validation.constructed_argv,
+            &validation.resolved_model
+        ),
+        None
+    );
+
+    // Splicing the supervisor-owned `--output-last-message` flag before `--` keeps the exact
+    // read-only `CODEX_ADVISORY_PERMISSION_PROFILE_CONFIG` untouched (`"."="read"`, network disabled).
+    let mut spliced_argv = validation.constructed_argv.clone();
+    let sep_idx = spliced_argv.len() - 2;
+    assert_eq!(spliced_argv[sep_idx], "--");
+    let valid_capture_path = "/tmp/threadlane-codex-last-msg-unit/last-message.json";
+    spliced_argv.splice(
+        sep_idx..sep_idx,
+        [
+            "--output-last-message".to_string(),
+            valid_capture_path.to_string(),
+        ],
+    );
+    assert!(is_pinned_codex_read_only_argv(
+        &spliced_argv,
+        &validation.resolved_model
+    ));
+    assert_eq!(
+        threadlane_workers::spec::extract_pinned_codex_read_only_output_last_message_path(
+            &spliced_argv,
+            &validation.resolved_model
+        ),
+        Some(valid_capture_path)
+    );
+    assert!(spliced_argv
+        .iter()
+        .any(|arg| arg == CODEX_ADVISORY_PERMISSION_PROFILE_CONFIG));
+
+    // Unsafe capture paths, wrong flag aliases, extra flags, or tampered permission profiles fail closed.
+    for bad_path in [
+        "relative/last-message.json",
+        "/tmp/threadlane-codex-last-msg-unit/../last-message.json",
+        "/tmp/threadlane-codex-last-msg-unit/./last-message.json",
+        "//tmp/threadlane-codex-last-msg-unit/last-message.json",
+        "/tmp/threadlane-codex-last-msg-unit//last-message.json",
+        "/tmp/threadlane-codex-last-msg-unit/last-message.json/",
+        "/tmp/threadlane-codex-last-msg-unit/.",
+        "/tmp/threadlane-codex-last-msg-unit/other.json",
+        "/last-message.json",
+        "/tmp/threadlane\n/last-message.json",
+    ] {
+        let mut bad_argv = spliced_argv.clone();
+        bad_argv[sep_idx + 1] = bad_path.to_string();
+        assert!(
+            !is_pinned_codex_read_only_argv(&bad_argv, &validation.resolved_model),
+            "expected unsafe capture path `{bad_path}` to be rejected"
+        );
+        assert_eq!(
+            threadlane_workers::spec::extract_pinned_codex_read_only_output_last_message_path(
+                &bad_argv,
+                &validation.resolved_model
+            ),
+            None
+        );
+    }
+
+    let mut short_flag_argv = spliced_argv.clone();
+    short_flag_argv[sep_idx] = "-o".to_string();
+    assert!(!is_pinned_codex_read_only_argv(
+        &short_flag_argv,
+        &validation.resolved_model
+    ));
+
+    let mut tampered_perm_argv = spliced_argv.clone();
+    for arg in &mut tampered_perm_argv {
+        if arg == CODEX_ADVISORY_PERMISSION_PROFILE_CONFIG {
+            *arg = arg.replace("\".\"=\"read\"", "\".\"=\"write\"");
+        }
+    }
+    assert!(!is_pinned_codex_read_only_argv(
+        &tampered_perm_argv,
+        &validation.resolved_model
+    ));
+}

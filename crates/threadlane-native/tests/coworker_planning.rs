@@ -1976,20 +1976,41 @@ c=$((c + 1))
 printf "%s" "$c" > "$COUNT_FILE"
 printf "%s\n" "$@" > "$PROMPTS_DIR/args_$c.txt"
 
+OUT_LAST_MSG=""
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --output-last-message|-o)
+            OUT_LAST_MSG="$2"
+            shift 2
+            ;;
+        --)
+            shift
+            break
+            ;;
+        *)
+            shift 1
+            ;;
+    esac
+done
+
 if [ -f "$PROMPTS_DIR/raw_stream_$c.jsonl" ]; then
     cat "$PROMPTS_DIR/raw_stream_$c.jsonl"
+    if [ -n "$OUT_LAST_MSG" ] && [ -f "$PROMPTS_DIR/last_message_$c.json" ]; then
+        cp "$PROMPTS_DIR/last_message_$c.json" "$OUT_LAST_MSG"
+    fi
     exit 0
 fi
 
 resp_file="$PROMPTS_DIR/resp_$c.json"
-cat <<'EOF' > "$resp_file"
-{{"outcome":"plan","schema_version":1,"summary":"Compile two independent Coder tasks and one dependent exporter Coder task for sample-telemetry-service using read-only Codex Orchestrator advisory execution.","tasks":[{{"task_id":"task_parse","title":"Implement binary frame header parser","description":"Parse binary telemetry frames in src/parser.rs and expose the stable ParsedFrame struct for downstream batch export.","role":"coder","difficulty":"medium","depends_on":[],"allowed_write_paths":["src/parser.rs"],"owned_interfaces":["iface_parsed_frame"],"consumed_interfaces":[]}},{{"task_id":"task_metrics","title":"Add frame counter helper","description":"Update src/metrics.rs to track total parsed telemetry frames without overlapping parser or exporter files.","role":"coder","difficulty":"easy","depends_on":[],"allowed_write_paths":["src/metrics.rs"],"owned_interfaces":[],"consumed_interfaces":[]}},{{"task_id":"task_export","title":"Wire batch exporter to ParsedFrame","description":"Consume iface_parsed_frame in src/exporter.rs and emit framed telemetry batches to the configured sink.","role":"coder","difficulty":"hard","depends_on":["task_parse"],"allowed_write_paths":["src/exporter.rs"],"owned_interfaces":["iface_export_sink"],"consumed_interfaces":["iface_parsed_frame"]}}],"check_suggestions":[{{"check_id":"chk_telemetry_unit","command_summary":"cargo test --workspace","required":true}}],"unconfirmed_proposal_notes":["Keep optional pushgateway exporter out of scope until human approval."],"resolved_open_questions":[],"deferred_proposals":[]}}
-EOF
+printf '%s' '{{"outcome":"plan","schema_version":1,"summary":"Compile two independent Coder tasks and one dependent exporter Coder task for sample-telemetry-service using read-only Codex Orchestrator advisory execution.","tasks":[{{"task_id":"task_parse","title":"Implement binary frame header parser","description":"Parse binary telemetry frames in src/parser.rs and expose the stable ParsedFrame struct for downstream batch export.","role":"coder","difficulty":"medium","depends_on":[],"allowed_write_paths":["src/parser.rs"],"owned_interfaces":["iface_parsed_frame"],"consumed_interfaces":[]}},{{"task_id":"task_metrics","title":"Add frame counter helper","description":"Update src/metrics.rs to track total parsed telemetry frames without overlapping parser or exporter files.","role":"coder","difficulty":"easy","depends_on":[],"allowed_write_paths":["src/metrics.rs"],"owned_interfaces":[],"consumed_interfaces":[]}},{{"task_id":"task_export","title":"Wire batch exporter to ParsedFrame","description":"Consume iface_parsed_frame in src/exporter.rs and emit framed telemetry batches to the configured sink.","role":"coder","difficulty":"hard","depends_on":["task_parse"],"allowed_write_paths":["src/exporter.rs"],"owned_interfaces":["iface_export_sink"],"consumed_interfaces":["iface_parsed_frame"]}}],"check_suggestions":[{{"check_id":"chk_telemetry_unit","command_summary":"cargo test --workspace","required":true}}],"unconfirmed_proposal_notes":["Keep optional pushgateway exporter out of scope until human approval."],"resolved_open_questions":[],"deferred_proposals":[]}}' > "$resp_file"
 
-esc=$(sed 's/\\/\\\\/g; s/"/\\"/g' "$resp_file" | tr '\n' ' ')
+esc=$(sed 's/\\/\\\\/g; s/"/\\"/g' "$resp_file")
 printf '{{"type":"thread.started","thread_id":"01972d12-3456-7000-8000-00000000000%s"}}\n' "$c"
 printf '{{"type":"turn.started"}}\n'
 printf '{{"type":"item.completed","item":{{"id":"item_%s","type":"agent_message","text":"%s"}}}}\n' "$c" "$esc"
+if [ -n "$OUT_LAST_MSG" ]; then
+    cp "$resp_file" "$OUT_LAST_MSG"
+fi
 printf '{{"type":"turn.completed","usage":{{"input_tokens":1420,"cached_input_tokens":320,"output_tokens":410}}}}\n'
 "#,
         count_file = count_file.display(),
@@ -3333,6 +3354,11 @@ async fn codex_planning_accepts_completed_command_jsonl_event_above_256_kib_with
     );
     fs::write(codex_prompts_dir.join("raw_stream_1.jsonl"), &call_1_stream)
         .expect("write raw_stream_1.jsonl");
+    fs::write(
+        codex_prompts_dir.join("last_message_1.json"),
+        orch_round_0_json,
+    )
+    .expect("write last_message_1.json");
 
     // Call 2 (Architect round 1): emits a >256 KiB completed command_execution line and returns StructuredArchitectAdviceOutput.
     let arch_round_1_json = r#"{"schema_version":1,"decision_summary":"Keep ParsedFrame as a fixed-size header struct in src/parser.rs.","rationale":"Decouples frame header validation from exporter buffer lifetimes.","recommended_write_paths":["src/parser.rs","src/exporter.rs"],"interface_contracts":{"iface_parsed_frame":"pub struct ParsedFrame { pub version: u8, pub payload_len: u16 }"},"open_questions":[]}"#;
@@ -3352,6 +3378,11 @@ async fn codex_planning_accepts_completed_command_jsonl_event_above_256_kib_with
     );
     fs::write(codex_prompts_dir.join("raw_stream_2.jsonl"), &call_2_stream)
         .expect("write raw_stream_2.jsonl");
+    fs::write(
+        codex_prompts_dir.join("last_message_2.json"),
+        arch_round_1_json,
+    )
+    .expect("write last_message_2.json");
 
     // Call 3 (Orchestrator round 1): emits seven completed command_execution events including a >256 KiB line,
     // followed by the final valid structured plan and turn.completed.
@@ -3383,6 +3414,11 @@ async fn codex_planning_accepts_completed_command_jsonl_event_above_256_kib_with
     let call_3_stream = format!("{}\n", call_3_lines.join("\n"));
     fs::write(codex_prompts_dir.join("raw_stream_3.jsonl"), &call_3_stream)
         .expect("write raw_stream_3.jsonl");
+    fs::write(
+        codex_prompts_dir.join("last_message_3.json"),
+        orch_round_1_plan_json,
+    )
+    .expect("write last_message_3.json");
 
     let job = fx.create_initial_job(
         "job_codex_large_line_1",
@@ -4173,4 +4209,271 @@ async fn reconciliation_preserves_old_health_owner_without_live_update_or_redisp
             .provider_health,
         history,
     );
+}
+
+#[tokio::test]
+async fn codex_planning_accepts_intermediate_completed_agent_messages_with_designated_last_message_and_rejects_missing_or_mismatched_capture(
+) {
+    use threadlane_native::coworker_workflow::StructuredOrchestratorOutput;
+    use threadlane_native::{
+        EnqueuePlanningCommandRequest, PlanningCommandDriver, PlanningCommandResultRef,
+        PlanningCommandStatus,
+    };
+    use threadlane_workers::{AdvisoryResponseErrorCode, AdvisoryResponseSource, WorkerRunStatus};
+
+    let (fx, codex_count_file, codex_prompts_dir, codex_policy) = setup_codex_planning_fixture();
+    let recorded_grant = create_codex_grant_with_budget(
+        &fx,
+        &codex_policy,
+        "req_grant_codex_designated_final_1",
+        PlanningCallBudget {
+            max_total_calls: 6,
+            max_orchestrator_calls: 4,
+            max_architect_calls: 2,
+            max_timeout_ms_per_call: 60_000,
+            max_output_bytes_per_call: 262_144,
+        },
+    );
+
+    // 1. Orchestrator round 0 -> Architect round 1 -> Orchestrator round 1 with bounded intermediate
+    //    completed `agent_message` items (including intermediate JSON objects and fenced notes) plus
+    //    verified `--output-last-message` outputs.
+    let orch_r0_intermediate = r#"{"stage":"inspecting_repo","final":false}"#;
+    let orch_r0_final = r#"{"outcome":"requires_architect_advice","schema_version":1,"summary":"Consult Architect on ParsedFrame header contract.","questions":[{"question_id":"q_header","question_summary":"Should ParsedFrame expose copyable header fields?","dependency_files":["src/parser.rs","src/exporter.rs"],"interfaces":["iface_parsed_frame"]}]}"#;
+    let call_1_stream = format!(
+        "{}\n{}\n{}\n{}\n{}\n{}\n",
+        r#"{"type":"thread.started","thread_id":"01972d12-3456-7000-8000-000000000951"}"#,
+        r#"{"type":"turn.started"}"#,
+        format_codex_agent_message_line("msg_orch_r0_note", orch_r0_intermediate),
+        format_codex_command_execution_line("cmd_orch_r0", "git status --short", ""),
+        format_codex_agent_message_line("msg_orch_r0_final", orch_r0_final),
+        r#"{"type":"turn.completed","usage":{"input_tokens":420,"cached_input_tokens":100,"output_tokens":110}}"#,
+    );
+    fs::write(codex_prompts_dir.join("raw_stream_1.jsonl"), &call_1_stream).unwrap();
+    fs::write(codex_prompts_dir.join("last_message_1.json"), orch_r0_final).unwrap();
+
+    let arch_r1_note = "Inspecting interface boundaries:\n```json\n{\"draft\":true}\n```";
+    let arch_r1_final = r#"{"schema_version":1,"decision_summary":"Keep ParsedFrame as a fixed-size header struct in src/parser.rs.","rationale":"Avoids coupling frame parsing to exporter batch buffers.","recommended_write_paths":["src/parser.rs","src/exporter.rs"],"interface_contracts":{"iface_parsed_frame":"pub struct ParsedFrame { pub version: u8, pub payload_len: u16 }"},"open_questions":[]}"#;
+    let call_2_stream = format!(
+        "{}\n{}\n{}\n{}\n{}\n",
+        r#"{"type":"thread.started","thread_id":"01972d12-3456-7000-8000-000000000952"}"#,
+        r#"{"type":"turn.started"}"#,
+        format_codex_agent_message_line("msg_arch_r1_note", arch_r1_note),
+        format_codex_agent_message_line("msg_arch_r1_final", arch_r1_final),
+        r#"{"type":"turn.completed","usage":{"input_tokens":510,"cached_input_tokens":128,"output_tokens":140}}"#,
+    );
+    fs::write(codex_prompts_dir.join("raw_stream_2.jsonl"), &call_2_stream).unwrap();
+    fs::write(codex_prompts_dir.join("last_message_2.json"), arch_r1_final).unwrap();
+
+    let orch_r1_draft = r#"{"checkpoint":"post_architect_synthesis","final":false}"#;
+    let orch_r1_final = r#"{"outcome":"plan","schema_version":1,"summary":"Compile parser and exporter DAG from designated Codex final response.","tasks":[{"task_id":"task_parse","title":"Implement ParsedFrame header parser","description":"Define ParsedFrame in src/parser.rs.","role":"coder","difficulty":"medium","depends_on":[],"allowed_write_paths":["src/parser.rs"],"owned_interfaces":["iface_parsed_frame"],"consumed_interfaces":[]},{"task_id":"task_export","title":"Consume ParsedFrame in exporter","description":"Wire src/exporter.rs to iface_parsed_frame.","role":"coder","difficulty":"hard","depends_on":["task_parse"],"allowed_write_paths":["src/exporter.rs"],"owned_interfaces":[],"consumed_interfaces":["iface_parsed_frame"]}],"check_suggestions":[{"check_id":"chk_telemetry_unit","command_summary":"cargo test --workspace","required":true}],"unconfirmed_proposal_notes":[],"resolved_open_questions":["Should ParsedFrame expose copyable header fields?"],"deferred_proposals":[]}"#;
+    let call_3_stream = format!(
+        "{}\n{}\n{}\n{}\n{}\n",
+        r#"{"type":"thread.started","thread_id":"01972d12-3456-7000-8000-000000000953"}"#,
+        r#"{"type":"turn.started"}"#,
+        format_codex_agent_message_line("msg_orch_r1_draft", orch_r1_draft),
+        format_codex_agent_message_line("msg_orch_r1_final", orch_r1_final),
+        r#"{"type":"turn.completed","usage":{"input_tokens":610,"cached_input_tokens":160,"output_tokens":185}}"#,
+    );
+    fs::write(codex_prompts_dir.join("raw_stream_3.jsonl"), &call_3_stream).unwrap();
+    fs::write(codex_prompts_dir.join("last_message_3.json"), orch_r1_final).unwrap();
+
+    let job_ok = fx.create_initial_job(
+        "job_codex_designated_ok",
+        vec![
+            "Implement binary frame header parser in src/parser.rs".to_string(),
+            "Wire batch exporter in src/exporter.rs".to_string(),
+        ],
+        vec!["Should ParsedFrame expose copyable header fields?".to_string()],
+        Vec::new(),
+    );
+    let cmd_store = receipt_command_store(&fx);
+    let driver =
+        PlanningCommandDriver::new(cmd_store.clone(), fx.service.clone()).expect("create driver");
+    let enqueued_ok = cmd_store
+        .enqueue_command(&EnqueuePlanningCommandRequest::from_orchestrator(
+            OrchestratorTestFixture::plan_req(
+                &recorded_grant.grant_id,
+                &job_ok.job_id,
+                "cmd_orch_codex_designated_ok",
+                1,
+            ),
+        ))
+        .expect("enqueue codex designated command");
+    let executed_ok = driver
+        .execute_command(BINDING_ID, THREAD_UUID, &enqueued_ok.command_id)
+        .await
+        .expect("execute codex planning command with intermediate completed agent_messages");
+    assert_eq!(executed_ok.command.status, PlanningCommandStatus::Completed);
+    let Some(PlanningCommandResultRef::OrchestratorPlan {
+        ref planning_result,
+        artifact_verified,
+        ..
+    }) = executed_ok.command.result_ref
+    else {
+        panic!("expected OrchestratorPlan result_ref");
+    };
+    assert!(artifact_verified);
+    assert_eq!(planning_result.architect_advice_ids.len(), 1);
+    let ok_count: u32 = fs::read_to_string(&codex_count_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_eq!(ok_count, 3);
+
+    let ledger_after_ok = fx.store.read_binding_ledger(BINDING_ID).unwrap();
+    let grant_after_ok = ledger_after_ok
+        .planning_grants
+        .iter()
+        .find(|g| g.grant_id == recorded_grant.grant_id)
+        .unwrap();
+    assert_eq!(grant_after_ok.reservations.len(), 3);
+    for (idx, expected_role, expected_final_text) in [
+        (0usize, WorkflowRole::Orchestrator, orch_r0_final),
+        (1usize, WorkflowRole::Architect, arch_r1_final),
+        (2usize, WorkflowRole::Orchestrator, orch_r1_final),
+    ] {
+        assert_eq!(
+            grant_after_ok.reservations[idx].status,
+            PlanningReservationStatus::Completed
+        );
+        let art = fx
+            .service
+            .read_planning_artifact(
+                grant_after_ok.reservations[idx]
+                    .report_artifact_id
+                    .as_deref()
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(art.role, expected_role);
+        assert_eq!(art.execution.status, WorkerRunStatus::Succeeded);
+        assert_eq!(art.execution.effective_observed_model(), None);
+        assert_eq!(art.execution.effective_observed_effort(), None);
+        let verified_response = art
+            .verified_response
+            .as_ref()
+            .expect("successful planning artifact must persist verified_response");
+        assert_eq!(verified_response.text, expected_final_text);
+        assert_eq!(
+            verified_response.source,
+            AdvisoryResponseSource::CodexAgentMessageTurnCompleted
+        );
+        match idx {
+            0 => assert!(matches!(
+                art.outcome,
+                PlanningArtifactOutcomeKind::OrchestratorOutput {
+                    structured_output: StructuredOrchestratorOutput::RequiresArchitectAdvice { .. },
+                    ..
+                }
+            )),
+            1 => assert!(matches!(
+                art.outcome,
+                PlanningArtifactOutcomeKind::ArchitectAdvice { .. }
+            )),
+            2 => assert!(matches!(
+                art.outcome,
+                PlanningArtifactOutcomeKind::OrchestratorOutput {
+                    structured_output: StructuredOrchestratorOutput::Plan { .. },
+                    ..
+                }
+            )),
+            _ => unreachable!(),
+        }
+    }
+
+    // 2. Missing `--output-last-message` (call 4) and stale/mismatched `--output-last-message` (call 5)
+    //    never grant fallback trust, persist `FailedAfterEffect` without `verified_response`, and never auto-replay.
+    let job_fail = fx.create_initial_job(
+        "job_codex_designated_fail",
+        vec!["Implement binary frame header parser in src/parser.rs".to_string()],
+        Vec::new(),
+        Vec::new(),
+    );
+    let call_4_missing_capture_stream = format!(
+        "{}\n{}\n{}\n{}\n",
+        r#"{"type":"thread.started","thread_id":"01972d12-3456-7000-8000-000000000954"}"#,
+        r#"{"type":"turn.started"}"#,
+        format_codex_agent_message_line("msg_only_stream", orch_r1_final),
+        r#"{"type":"turn.completed","usage":{"input_tokens":100,"output_tokens":40}}"#,
+    );
+    fs::write(
+        codex_prompts_dir.join("raw_stream_4.jsonl"),
+        &call_4_missing_capture_stream,
+    )
+    .unwrap();
+
+    let call_5_mismatch_stream = format!(
+        "{}\n{}\n{}\n{}\n{}\n",
+        r#"{"type":"thread.started","thread_id":"01972d12-3456-7000-8000-000000000955"}"#,
+        r#"{"type":"turn.started"}"#,
+        format_codex_agent_message_line("msg_stale_1", orch_r1_draft),
+        format_codex_agent_message_line("msg_final_2", orch_r1_final),
+        r#"{"type":"turn.completed","usage":{"input_tokens":100,"output_tokens":40}}"#,
+    );
+    fs::write(
+        codex_prompts_dir.join("raw_stream_5.jsonl"),
+        &call_5_mismatch_stream,
+    )
+    .unwrap();
+    fs::write(codex_prompts_dir.join("last_message_5.json"), orch_r1_draft).unwrap();
+
+    for (req_key, expected_code, expected_count, res_idx) in [
+        (
+            "orch_codex_missing_cap_4",
+            AdvisoryResponseErrorCode::MissingResponseOutput,
+            4u32,
+            3usize,
+        ),
+        (
+            "orch_codex_mismatch_cap_5",
+            AdvisoryResponseErrorCode::ConflictingTerminalOutput,
+            5u32,
+            4usize,
+        ),
+    ] {
+        let err = fx
+            .service
+            .orchestrate_brief_to_plan(
+                &fx.workflow,
+                &OrchestratorTestFixture::plan_req(
+                    &recorded_grant.grant_id,
+                    &job_fail.job_id,
+                    req_key,
+                    0,
+                ),
+            )
+            .await
+            .expect_err("missing or mismatched --output-last-message must fail closed");
+        assert_eq!(err.code, NativeErrorCode::ValidationFailed);
+        let count_now: u32 = fs::read_to_string(&codex_count_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(count_now, expected_count);
+
+        let ledger_now = fx.store.read_binding_ledger(BINDING_ID).unwrap();
+        let res = &ledger_now
+            .planning_grants
+            .iter()
+            .find(|g| g.grant_id == recorded_grant.grant_id)
+            .unwrap()
+            .reservations[res_idx];
+        assert_eq!(res.status, PlanningReservationStatus::FailedAfterEffect);
+        let art = fx
+            .service
+            .read_planning_artifact(res.report_artifact_id.as_deref().unwrap())
+            .unwrap();
+        assert!(art.verified_response.is_none());
+        let PlanningArtifactOutcomeKind::FailedAfterEffect {
+            response_error: Some(ref resp_err),
+            ..
+        } = art.outcome
+        else {
+            panic!("expected FailedAfterEffect with response_error");
+        };
+        assert_eq!(resp_err.code, expected_code);
+    }
 }

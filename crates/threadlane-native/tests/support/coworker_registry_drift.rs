@@ -2189,6 +2189,7 @@ async fn system_mode_agy_worker_registry_drift_child_probe() {
         fs::write(
             &fake_codex_mjs,
             r#"import { execFileSync } from "node:child_process";
+import { writeFileSync } from "node:fs";
 const roleScript = process.argv[2];
 const stateDir = process.argv[3];
 const args = process.argv.slice(4);
@@ -2201,9 +2202,15 @@ if (args.includes("--ignore-rules")) {
   process.exit(0);
 }
 let model = "gpt-6-astra";
+let outputLastMessagePath = "";
 for (let i = 0; i < args.length; i += 1) {
-  if (args[i] === "--model" && i + 1 < args.length) {
+  if (args[i] === "--") {
+    break;
+  } else if (args[i] === "--model" && i + 1 < args.length) {
     model = args[i + 1];
+    i += 1;
+  } else if ((args[i] === "--output-last-message" || args[i] === "-o") && i + 1 < args.length) {
+    outputLastMessagePath = args[i + 1];
     i += 1;
   }
 }
@@ -2216,6 +2223,9 @@ const out = execFileSync(
 const lines = out.trim().split("\n");
 const last = JSON.parse(lines[lines.length - 1]);
 const responseText = last.result.response;
+if (outputLastMessagePath) {
+  writeFileSync(outputLastMessagePath, responseText, "utf8");
+}
 process.stdout.write(`${JSON.stringify({ type: "thread.started", thread_id: "th-codex-advisory" })}\n`);
 process.stdout.write(`${JSON.stringify({ type: "turn.started" })}\n`);
 process.stdout.write(`${JSON.stringify({ type: "item.completed", item: { id: "msg-1", type: "agent_message", text: responseText } })}\n`);
