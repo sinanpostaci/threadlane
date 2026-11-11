@@ -4477,3 +4477,237 @@ async fn codex_planning_accepts_intermediate_completed_agent_messages_with_desig
         assert_eq!(resp_err.code, expected_code);
     }
 }
+
+#[tokio::test]
+async fn orchestrator_initial_prompt_carries_worker_file_permission_guidance_and_protected_write_scopes_fail_closed_without_publication_retry_or_execution(
+) {
+    use threadlane_native::{
+        EnqueuePlanningCommandRequest, PlanningCommandDriver, PlanningCommandStatus,
+    };
+
+    let fx = OrchestratorTestFixture::new();
+    let grant = fx.create_grant_with_budget(
+        "grant_protected_scope_guard_1",
+        PlanningCallBudget {
+            max_total_calls: 8,
+            max_orchestrator_calls: 6,
+            max_architect_calls: 2,
+            max_timeout_ms_per_call: 30_000,
+            max_output_bytes_per_call: 65_536,
+        },
+        1_800_000_000_000,
+    );
+    let job = fx.create_initial_job(
+        "job_protected_scope_guard_1",
+        vec![
+            "Implement binary frame header parser in src/parser.rs and keep ephemeral test/screenshot outputs out of tracked or protected paths.".to_string(),
+        ],
+        Vec::new(),
+        Vec::new(),
+    );
+
+    let protected_cases = [
+        (
+            1u32,
+            "orch_protected_gitignore_1",
+            r#"{"outcome":"plan","schema_version":1,"summary":"Attempt to add local ignore entry alongside parser.","tasks":[{"task_id":"task_parse","title":"Update parser and gitignore","description":"Implement src/parser.rs and update .gitignore.","role":"coder","difficulty":"easy","depends_on":[],"allowed_write_paths":["src/parser.rs",".gitignore"]}]}"#,
+        ),
+        (
+            2u32,
+            "orch_protected_agents_md_2",
+            r#"{"outcome":"plan","schema_version":1,"summary":"Attempt to rewrite AGENTS.md.","tasks":[{"task_id":"task_agents","title":"Modify repository agent rules","description":"Edit AGENTS.md.","role":"coder","difficulty":"easy","depends_on":[],"allowed_write_paths":["AGENTS.md"]}]}"#,
+        ),
+        (
+            3u32,
+            "orch_protected_opencode_3",
+            r#"{"outcome":"plan","schema_version":1,"summary":"Attempt to write opencode.json.","tasks":[{"task_id":"task_opencode","title":"Modify OpenCode config","description":"Write opencode.json.","role":"coder","difficulty":"easy","depends_on":[],"allowed_write_paths":["opencode.json"]}]}"#,
+        ),
+        (
+            4u32,
+            "orch_protected_codex_dir_4",
+            r#"{"outcome":"plan","schema_version":1,"summary":"Attempt to write .codex control file.","tasks":[{"task_id":"task_codex","title":"Modify .codex config","description":"Write .codex/config.toml.","role":"coder","difficulty":"easy","depends_on":[],"allowed_write_paths":[".codex/config.toml"]}]}"#,
+        ),
+    ];
+
+    for (call_idx, req_key, payload_json) in protected_cases {
+        fx.write_custom_call_response(call_idx, payload_json, false);
+        let req = OrchestratorTestFixture::plan_req(&grant.grant_id, &job.job_id, req_key, 1);
+        let err = fx
+            .service
+            .orchestrate_brief_to_plan(&fx.workflow, &req)
+            .await
+            .expect_err("protected Worker write scope must be rejected before publication");
+        assert_eq!(err.code, NativeErrorCode::ValidationFailed);
+
+        // No automatic model retry or Architect fallback call is triggered on rejection.
+        assert_eq!(fx.invocation_count(), call_idx);
+
+        if call_idx == 1 {
+            let captured_prompt = fx.read_captured_prompt(1);
+            let (_, json_context) = captured_prompt
+                .split_once("Context:\n")
+                .expect("captured Orchestrator prompt must embed Context JSON");
+            let parsed_context: serde_json::Value =
+                serde_json::from_str(json_context.trim()).expect("valid Context JSON");
+            let rules_text =
+                serde_json::to_string(&parsed_context["rules"]).expect("serialize prompt rules");
+
+            for required_token in [
+                "individual repository-relative file paths",
+                ".gitignore",
+                ".git",
+                ".gitmodules",
+                ".gitattributes",
+                "AGENTS.md",
+                "CLAUDE.md",
+                "opencode.json",
+                "opencode.jsonc",
+                "codex.toml",
+                ".codex.toml",
+                ".codex/",
+                ".claude/",
+                ".gemini/",
+                ".opencode/",
+                ".agents/",
+                ".aws/",
+                ".github/",
+                ".cargo/config",
+                ".cargo/config.toml",
+                ".env",
+                ".env.*",
+                "repo/.local/",
+                "outside-repository artifact directories",
+            ] {
+                assert!(
+                    rules_text.contains(required_token),
+                    "captured initial Orchestrator prompt missing `{required_token}`: {rules_text}"
+                );
+            }
+        }
+
+        // Repeating the same failed request_key never re-invokes the model or reserves new budget.
+        let replay_err = fx
+            .service
+            .orchestrate_brief_to_plan(&fx.workflow, &req)
+            .await
+            .expect_err("replaying failed request_key must stay failed without model retry");
+        assert_eq!(replay_err.code, NativeErrorCode::ValidationFailed);
+        assert_eq!(fx.invocation_count(), call_idx);
+
+        assert!(fx
+            .workflow
+            .list_plans(None, None)
+            .expect("list plans")
+            .plans
+            .is_empty());
+
+        let ledger = fx
+            .store
+            .read_binding_ledger(BINDING_ID)
+            .expect("read binding ledger");
+        let stored_grant = ledger
+            .planning_grants
+            .iter()
+            .find(|g| g.grant_id == grant.grant_id)
+            .expect("find standing grant");
+        assert_eq!(stored_grant.usage.reserved_total_calls, call_idx);
+        assert_eq!(stored_grant.usage.reserved_orchestrator_calls, call_idx);
+        assert_eq!(stored_grant.usage.reserved_architect_calls, 0);
+        assert_eq!(stored_grant.usage.completed_calls, 0);
+        assert_eq!(stored_grant.usage.failed_calls, call_idx);
+        assert_eq!(stored_grant.reservations.len(), call_idx as usize);
+
+        let res = &stored_grant.reservations[(call_idx - 1) as usize];
+        assert_eq!(res.status, PlanningReservationStatus::FailedAfterEffect);
+        let art = fx
+            .service
+            .read_planning_artifact(res.report_artifact_id.as_deref().expect("artifact id"))
+            .expect("read FailedAfterEffect artifact");
+        assert!(matches!(
+            art.outcome,
+            PlanningArtifactOutcomeKind::FailedAfterEffect { .. }
+        ));
+    }
+
+    // Exercise command-driver execution as well: protected `codex.toml` output transitions to
+    // `KnownFailed` with a single call, zero published plans, zero new budget beyond that single
+    // reservation, and zero worker code execution.
+    fx.write_custom_call_response(
+        5,
+        r#"{"outcome":"plan","schema_version":1,"summary":"Attempt to modify codex.toml via command driver.","tasks":[{"task_id":"task_codex_toml","title":"Write codex.toml","description":"Modify codex.toml.","role":"coder","difficulty":"easy","depends_on":[],"allowed_write_paths":["codex.toml"]}]}"#,
+        false,
+    );
+    let commands = receipt_command_store(&fx);
+    let command = commands
+        .enqueue_command(&EnqueuePlanningCommandRequest::from_orchestrator(
+            OrchestratorTestFixture::plan_req(
+                &grant.grant_id,
+                &job.job_id,
+                "cmd_protected_codex_toml_5",
+                1,
+            ),
+        ))
+        .expect("enqueue Orchestrator command");
+    let driver =
+        PlanningCommandDriver::new(commands.clone(), fx.service.clone()).expect("command driver");
+    let cmd_err = driver
+        .execute_command(BINDING_ID, THREAD_UUID, &command.command_id)
+        .await
+        .expect_err("command proposing protected codex.toml must fail closed");
+    assert_eq!(cmd_err.code, NativeErrorCode::ValidationFailed);
+    assert_eq!(fx.invocation_count(), 5);
+
+    let stored_cmd = commands
+        .get_command(BINDING_ID, THREAD_UUID, &command.command_id)
+        .expect("query command")
+        .expect("command exists");
+    assert_eq!(stored_cmd.status, PlanningCommandStatus::KnownFailed);
+    assert!(!stored_cmd.pending_reconciliation);
+    assert!(stored_cmd.result_ref.is_none());
+
+    let repeat_cmd_err = driver
+        .execute_command(BINDING_ID, THREAD_UUID, &command.command_id)
+        .await
+        .expect_err("re-executing KnownFailed command must not retry provider");
+    assert_eq!(repeat_cmd_err.code, NativeErrorCode::ValidationFailed);
+    assert_eq!(fx.invocation_count(), 5);
+
+    assert!(fx
+        .workflow
+        .list_plans(None, None)
+        .expect("list plans after command failure")
+        .plans
+        .is_empty());
+    assert!(!fx.authority_dir.join("approvals.json").exists());
+
+    let final_ledger = fx
+        .store
+        .read_binding_ledger(BINDING_ID)
+        .expect("read final ledger");
+    let final_grant = final_ledger
+        .planning_grants
+        .iter()
+        .find(|g| g.grant_id == grant.grant_id)
+        .expect("final grant");
+    assert_eq!(final_grant.usage.reserved_total_calls, 5);
+    assert_eq!(final_grant.usage.reserved_orchestrator_calls, 5);
+    assert_eq!(final_grant.usage.reserved_architect_calls, 0);
+    assert_eq!(final_grant.usage.failed_calls, 5);
+
+    let final_job = final_ledger
+        .jobs
+        .iter()
+        .find(|j| j.job_id == job.job_id)
+        .expect("final job");
+    assert_eq!(final_job.phase, CoworkerJobPhase::Planning);
+    assert_eq!(final_job.job_revision, 1);
+    assert!(final_job.planning_result.is_none());
+    assert!(final_job.approval_linkage.is_none());
+    assert!(final_job.tasks.is_empty());
+    assert!(final_job.outbox.is_empty());
+    assert_eq!(
+        resolve_exact_commit_sha(&fx.repo_dir, "HEAD", DEFAULT_GIT_COMMAND_TIMEOUT_MS)
+            .expect("resolve final HEAD"),
+        fx.project_base.base_commit
+    );
+}

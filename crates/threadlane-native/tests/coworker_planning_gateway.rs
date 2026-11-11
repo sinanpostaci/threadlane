@@ -1040,7 +1040,20 @@ async fn consult_architect_and_request_technical_plan_detached_flow_cli_reopen_a
             .expect("r1 completed command");
         assert_eq!(old.current_plan_status, Some(PlanStatus::Superseded));
         assert_eq!(old.executable, Some(false));
-        assert_eq!(old.result_ref, plan_detail.result_ref);
+        let old_res = old.result_summary.as_ref().expect("r1 result_summary");
+        assert!(old_res.status_projection_only);
+        assert!(!old_res.grants_execution_authority);
+        assert_eq!(
+            old_res.kind,
+            threadlane_native::planning_gateway::CoworkerStatusCommandResultKind::OrchestratorPlan
+        );
+        let old_plan = old_res.plan_result.as_ref().expect("r1 plan_result");
+        assert_eq!(old_plan.plan_id, orch_summary.plan_id);
+        assert_eq!(old_plan.plan_revision, 1);
+        assert_eq!(old_plan.plan_digest, orch_summary.plan_digest);
+        assert_eq!(old_plan.plan_status, PlanStatus::Published);
+        assert_eq!(old_plan.current_plan_status, Some(PlanStatus::Superseded));
+        assert_eq!(old_plan.executable, Some(false));
         let current = status
             .commands
             .iter()

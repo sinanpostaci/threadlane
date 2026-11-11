@@ -160,7 +160,149 @@ fn known_concrete_variant_and_requested_effort_must_agree() {
         Some("high")
     )
     .is_ok());
+    for (model, effort, wrong) in [
+        ("gemini-4-carbon-low", "low", "high"),
+        ("gemini-4-carbon-medium", "medium", "low"),
+        ("gemini-4-carbon-high", "high", "medium"),
+    ] {
+        let ok = resolve_model_target(WorkerProvider::Antigravity, model, Some(effort));
+        assert!(ok.is_ok());
+        let bad = resolve_model_target(WorkerProvider::Antigravity, model, Some(wrong));
+        assert!(bad.is_err());
+        let missing = resolve_model_target(WorkerProvider::Antigravity, model, None);
+        assert!(missing.is_err());
+    }
     assert!(resolve_model_target(WorkerProvider::Antigravity, "unknown-high", None).is_err());
+}
+
+#[test]
+fn actual_agy_1_5_3_carbon_init_schema_verifies_catalog_model_variant_source() {
+    let variants = [
+        ("gemini-4-carbon-low", "low"),
+        ("gemini-4-carbon-medium", "medium"),
+        ("gemini-4-carbon-high", "high"),
+    ];
+    for (model, effort) in variants {
+        let target_res = resolve_model_target(WorkerProvider::Antigravity, model, Some(effort));
+        let resolved = target_res.unwrap();
+        let init = serde_json::json!({
+            "event": "init",
+            "conversation_id": "owned-carbon-conv",
+            "init": {
+                "model": model,
+                "cwd": "/canonical/worktree",
+                "permission_mode": "accept-edits",
+            }
+        })
+        .to_string();
+        let step_update = serde_json::json!({
+            "event": "step_update",
+            "step_update": {
+                "conversation_id": "owned-carbon-conv",
+                "step_index": 1,
+                "state": "DONE",
+                "step_type": "agent_response",
+                "usage": {},
+            }
+        })
+        .to_string();
+        let result = serde_json::json!({
+            "event": "result",
+            "result": {
+                "conversation_id": "owned-carbon-conv",
+                "status": "SUCCESS",
+                "finished_reason": null,
+                "response": "Finished",
+                "num_turns": 1,
+            }
+        })
+        .to_string();
+        let lines = [init.as_str(), step_update.as_str(), result.as_str()];
+
+        let parser = NdjsonStreamParser::new_for_provider(
+            WorkerProvider::Antigravity,
+            resolved.clone(),
+            Some("owned-carbon-conv".to_string()),
+            64,
+        );
+        let evidence = feed(parser, &lines);
+        assert!(evidence.saw_init_event && evidence.saw_result_event);
+        assert_eq!(evidence.malformed_lines_count, 0);
+        assert!(evidence.provider_errors.is_empty());
+        assert_eq!(
+            evidence.model_evidence,
+            FieldEvidence::VerifiedMatch {
+                value: model.to_string()
+            }
+        );
+        assert_eq!(
+            evidence.effort_evidence,
+            FieldEvidence::VerifiedMatch {
+                value: effort.to_string()
+            }
+        );
+        assert_eq!(
+            evidence.session_evidence,
+            FieldEvidence::VerifiedMatch {
+                value: "owned-carbon-conv".to_string()
+            }
+        );
+        assert_eq!(
+            evidence.effort_evidence_source,
+            Some(EffortEvidenceSource::AntigravityCatalogModelVariant)
+        );
+        let wire = serde_json::to_value(&evidence).unwrap();
+        assert_eq!(
+            wire["effort_evidence_source"],
+            "antigravity_catalog_model_variant"
+        );
+
+        let neutral_parser = NdjsonStreamParser::new(resolved.clone(), None, 64);
+        let neutral = feed(neutral_parser, &lines);
+        assert!(matches!(
+            neutral.effort_evidence,
+            FieldEvidence::Missing { .. }
+        ));
+        assert_eq!(neutral.effort_evidence_source, None);
+
+        let other_parser = NdjsonStreamParser::new_for_provider(
+            WorkerProvider::OpenCodeV2,
+            resolved.clone(),
+            Some("owned-carbon-conv".to_string()),
+            64,
+        );
+        let other = feed(other_parser, &lines);
+        assert!(matches!(
+            other.effort_evidence,
+            FieldEvidence::Missing { .. }
+        ));
+        assert_eq!(other.effort_evidence_source, None);
+
+        let timeout_result = serde_json::json!({
+            "event": "result",
+            "result": {
+                "conversation_id": "owned-carbon-conv",
+                "status": "SUCCESS",
+                "finished_reason": "print_timeout",
+            }
+        })
+        .to_string();
+        let timeout_parser = NdjsonStreamParser::new_for_provider(
+            WorkerProvider::Antigravity,
+            resolved,
+            Some("owned-carbon-conv".to_string()),
+            64,
+        );
+        let timeout_lines = [init.as_str(), timeout_result.as_str()];
+        let timeout_ev = feed(timeout_parser, &timeout_lines);
+        assert!(timeout_ev.effort_evidence.is_satisfied());
+        assert!(!timeout_ev.saw_result_event);
+        assert_eq!(timeout_ev.provider_errors.len(), 1);
+        assert_eq!(
+            timeout_ev.provider_errors[0].code.as_deref(),
+            Some("print_timeout")
+        );
+    }
 }
 
 #[test]

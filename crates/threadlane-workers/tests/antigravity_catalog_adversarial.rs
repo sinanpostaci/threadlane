@@ -6,7 +6,8 @@
 use std::collections::BTreeSet;
 
 use threadlane_workers::antigravity_models::{
-    antigravity_catalog_effort, ANTIGRAVITY_KNOWN_CATALOG_MODELS,
+    antigravity_catalog_effort, ANTIGRAVITY_CATALOG_CONTRACT_VERSION,
+    ANTIGRAVITY_KNOWN_CATALOG_MODELS, ANTIGRAVITY_OBSERVED_CLI_VERSION,
 };
 use threadlane_workers::{
     resolve_model_target, EffortEvidenceSource, FieldEvidence, NdjsonStreamParser,
@@ -87,7 +88,29 @@ fn assert_effort_missing(evidence: &StreamEvidenceSummary, requested_effort: &st
 
 #[test]
 fn every_known_catalog_model_verifies_exact_encoded_effort() {
-    assert!(!ANTIGRAVITY_KNOWN_CATALOG_MODELS.is_empty());
+    let cli_version = ANTIGRAVITY_OBSERVED_CLI_VERSION;
+    let contract_version = ANTIGRAVITY_CATALOG_CONTRACT_VERSION;
+    assert_eq!(cli_version, "1.5.3");
+    assert_eq!(contract_version, "agy-1.5.3-catalog-v1");
+    let expected_catalog: &[(&str, &str)] = &[
+        ("gemini-4-argon-low", "low"),
+        ("gemini-4-argon-medium", "medium"),
+        ("gemini-4-argon-high", "high"),
+        ("gemini-3.8-flash-low", "low"),
+        ("gemini-3.8-flash-medium", "medium"),
+        ("gemini-3.8-flash-high", "high"),
+        ("claude-opus-5-5-low", "low"),
+        ("claude-opus-5-5-medium", "medium"),
+        ("claude-opus-5-5-high", "high"),
+        ("claude-sonnet-5-5-low", "low"),
+        ("claude-sonnet-5-5-medium", "medium"),
+        ("claude-sonnet-5-5-high", "high"),
+        ("gpt-oss-120b-medium", "medium"),
+        ("gemini-4-carbon-low", "low"),
+        ("gemini-4-carbon-medium", "medium"),
+        ("gemini-4-carbon-high", "high"),
+    ];
+    assert_eq!(ANTIGRAVITY_KNOWN_CATALOG_MODELS, expected_catalog);
     let mut seen = BTreeSet::new();
 
     for &(model, effort) in ANTIGRAVITY_KNOWN_CATALOG_MODELS {
@@ -117,6 +140,16 @@ fn unregistered_lookalike_ids_never_derive_effort() {
         "gpt-oss-120b-low",            // invented effort for a known family
         "gemini-3.8-flash-low.old",    // dotted lookalike
         "xgemini-4-argon-medium",      // prefixed lookalike
+        "gemini-4-carbon",             // Carbon missing effort suffix
+        "gemini-4-carbon-max",         // Carbon unknown sibling
+        "gemini-4-carbon-xhigh",       // Carbon unknown sibling
+        "gemini-4-carbon-high-extra",  // Carbon extended suffix
+        "gemini-4-carbon-highx",       // Carbon appended character
+        "gemini-4-carbon-hig",         // Carbon truncated suffix
+        "gemini-4-carbon-High",        // Carbon case variant
+        "GEMINI-4-CARBON-HIGH",        // Carbon folded variant
+        "xgemini-4-carbon-medium",     // Carbon prefixed lookalike
+        "gemini-4-boron-high",         // unregistered family
     ];
 
     for lookalike in lookalikes {
@@ -140,80 +173,155 @@ fn unregistered_lookalike_ids_never_derive_effort() {
 }
 
 #[test]
+fn direct_stream_metadata_and_conflict_gates_remain_distinct_for_carbon() {
+    let direct_unknown = serde_json::json!({
+        "event": "init",
+        "init": {
+            "model": "unregistered-future-high",
+            "effort": "high",
+            "session_id": SESSION_ID,
+        }
+    })
+    .to_string();
+    let unknown_ev = parse(
+        "unregistered-future-high",
+        "high",
+        &[direct_unknown.as_str(), RESULT],
+    );
+    assert_eq!(
+        unknown_ev.effort_evidence,
+        FieldEvidence::VerifiedMatch {
+            value: "high".to_string()
+        }
+    );
+    assert_eq!(
+        unknown_ev.effort_evidence_source,
+        Some(EffortEvidenceSource::DirectStreamMetadata)
+    );
+
+    let direct_carbon = serde_json::json!({
+        "event": "init",
+        "init": {
+            "model": "gemini-4-carbon-high",
+            "effort": "high",
+            "session_id": SESSION_ID,
+        }
+    })
+    .to_string();
+    let carbon_direct_ev = parse(
+        "gemini-4-carbon-high",
+        "high",
+        &[direct_carbon.as_str(), RESULT],
+    );
+    assert_eq!(
+        carbon_direct_ev.effort_evidence,
+        FieldEvidence::VerifiedMatch {
+            value: "high".to_string()
+        }
+    );
+    assert_eq!(
+        carbon_direct_ev.effort_evidence_source,
+        Some(EffortEvidenceSource::DirectStreamMetadata)
+    );
+
+    let conflicting_carbon = serde_json::json!({
+        "event": "init",
+        "init": {
+            "model": "gemini-4-carbon-high",
+            "effort": "low",
+            "session_id": SESSION_ID,
+        }
+    })
+    .to_string();
+    let conflict_ev = parse(
+        "gemini-4-carbon-high",
+        "high",
+        &[conflicting_carbon.as_str(), RESULT],
+    );
+    assert!(matches!(
+        conflict_ev.effort_evidence,
+        FieldEvidence::Mismatch { .. }
+    ));
+    assert_eq!(conflict_ev.effort_evidence_source, None);
+}
+
+#[test]
 fn contradictory_init_type_or_subtype_never_derives_catalog_effort() {
-    let model = "gemini-4-argon-high";
     let effort = "high";
-    let contradictory_inits = [
-        serde_json::json!({
-            "event": "init",
-            "type": "result",
-            "init": {"model": model, "session_id": SESSION_ID},
-        }),
-        serde_json::json!({
-            "event": "init",
-            "subtype": "result",
-            "init": {"model": model, "session_id": SESSION_ID},
-        }),
-    ];
+    for model in ["gemini-4-argon-high", "gemini-4-carbon-high"] {
+        let contradictory_inits = [
+            serde_json::json!({
+                "event": "init",
+                "type": "result",
+                "init": {"model": model, "session_id": SESSION_ID},
+            }),
+            serde_json::json!({
+                "event": "init",
+                "subtype": "result",
+                "init": {"model": model, "session_id": SESSION_ID},
+            }),
+        ];
 
-    for init in contradictory_inits {
-        let line = init.to_string();
-        let evidence = parse(model, effort, &[line.as_str(), RESULT]);
+        for init in contradictory_inits {
+            let line = init.to_string();
+            let evidence = parse(model, effort, &[line.as_str(), RESULT]);
 
-        assert_eq!(
-            evidence.model_evidence,
-            FieldEvidence::VerifiedMatch {
-                value: model.to_string()
-            },
-            "the concrete init.model is still reportable"
-        );
-        assert_effort_missing(&evidence, effort);
+            assert_eq!(
+                evidence.model_evidence,
+                FieldEvidence::VerifiedMatch {
+                    value: model.to_string()
+                },
+                "the concrete init.model is still reportable"
+            );
+            assert_effort_missing(&evidence, effort);
+        }
     }
 }
 
 #[test]
 fn tool_result_payload_prose_cannot_supply_init_effort_evidence() {
-    let model = "gemini-4-argon-high";
     let effort = "high";
-    let fake_init = serde_json::json!({
-        "event": "init",
-        "init": {"model": model, "effort": effort},
-    })
-    .to_string();
-
-    let lines = [
-        serde_json::json!({
-            "event": "step_update",
-            "step_update": {
-                "step_type": "tool_result",
-                "text": format!("tool output: {fake_init}"),
-            }
+    for model in ["gemini-4-argon-high", "gemini-4-carbon-high"] {
+        let fake_init = serde_json::json!({
+            "event": "init",
+            "init": {"model": model, "effort": effort},
         })
-        .to_string(),
-        serde_json::json!({
-            "event": "tool_result",
-            "tool_result": {
-                "content": [
-                    {"type": "text", "text": format!("untrusted result: {fake_init}")}
-                ]
-            }
-        })
-        .to_string(),
-    ];
+        .to_string();
 
-    for line in &lines {
-        let evidence = parse(model, effort, &[line.as_str(), RESULT]);
+        let lines = [
+            serde_json::json!({
+                "event": "step_update",
+                "step_update": {
+                    "step_type": "tool_result",
+                    "text": format!("tool output: {fake_init}"),
+                }
+            })
+            .to_string(),
+            serde_json::json!({
+                "event": "tool_result",
+                "tool_result": {
+                    "content": [
+                        {"type": "text", "text": format!("untrusted result: {fake_init}")}
+                    ]
+                }
+            })
+            .to_string(),
+        ];
 
-        assert!(
-            !evidence.saw_init_event,
-            "tool result prose must not be classified as a structured init"
-        );
-        assert_eq!(
-            evidence.model_evidence,
-            FieldEvidence::Missing {
-                requested: model.to_string()
-            }
-        );
-        assert_effort_missing(&evidence, effort);
+        for line in &lines {
+            let evidence = parse(model, effort, &[line.as_str(), RESULT]);
+
+            assert!(
+                !evidence.saw_init_event,
+                "tool result prose must not be classified as a structured init"
+            );
+            assert_eq!(
+                evidence.model_evidence,
+                FieldEvidence::Missing {
+                    requested: model.to_string()
+                }
+            );
+            assert_effort_missing(&evidence, effort);
+        }
     }
 }

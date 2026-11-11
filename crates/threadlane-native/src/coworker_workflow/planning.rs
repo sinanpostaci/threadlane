@@ -5108,6 +5108,9 @@ fn build_orchestrator_prompt(
             "Every implementation task node in `tasks` must have `role: \"coder\"` and a difficulty tier (`\"easy\"`, `\"medium\"`, `\"hard\"`, or `\"extreme\"`).",
             "Never emit `reviewer`, `closure`, `orchestrator`, `architect`, or `follower` as task nodes, and never set `model_override` or `tool_override` (must be omitted).",
             "Parallel tasks without a `depends_on` ordering edge must have disjoint `allowed_write_paths`, and any task consuming an interface in `consumed_interfaces` must depend on the task owning that interface in `owned_interfaces`.",
+            "Each task's `allowed_write_paths` must request clean, normalized, individual repository-relative file paths (for example `\"src/parser.rs\"`; never leading `/`, backslashes `\\`, `.` or `..` traversal components, wildcards/globs `* ? [ ] { } !`, bare existing directory names without trailing `/`, symlinks, or submodule gitlinks at `base_commit`).",
+            "Never propose protected repository control, agent configuration, credential, CI, toolchain, or secret paths in Worker `allowed_write_paths`: `.gitignore`, `.git`, `.gitmodules`, `.gitattributes`, `AGENTS.md` (`agents.md`), `CLAUDE.md` (`claude.md`), `opencode.json`, `opencode.jsonc`, `codex.toml`, `.codex.toml`, agent control or credential directories (`.codex/`, `.claude/`, `.gemini/`, `.opencode/`, `.agents/`, `.aws/`), `.github/`, `.cargo/config`, `.cargo/config.toml`, `.env`, or `.env.*` (at repository root or any subdirectory); plans proposing protected write scopes are rejected by validation before publication.",
+            "Direct any ephemeral test, runtime, or screenshot outputs only to an existing git-ignored `repo/.local/` directory or dedicated outside-repository artifact directories; never propose tracked repository write scopes or protected paths for temporary test, runtime, or screenshot artifacts.",
             "`check_suggestions` are strictly advisory metadata and never authoritative execution commands."
         ],
         "required_response_schema": {
@@ -5124,7 +5127,7 @@ fn build_orchestrator_prompt(
                             "role": "coder",
                             "difficulty": "easy | medium | hard | extreme",
                             "depends_on": ["optional upstream task_id"],
-                            "allowed_write_paths": ["required 1..=64 unique repo-relative write paths"],
+                            "allowed_write_paths": ["required 1..=64 unique clean repo-relative individual file paths (never absolute paths, traversal segments, globs, symlinks, or protected paths such as .gitignore, .git, .gitmodules, .gitattributes, AGENTS.md, CLAUDE.md, opencode.json/jsonc, codex.toml/.codex.toml, .codex, .claude, .gemini, .opencode, .agents, .aws, .github, .cargo/config, .cargo/config.toml, or .env/.env.*)"],
                             "owned_interfaces": ["optional unique interface_id (1..=128 chars) owned by this task"],
                             "consumed_interfaces": ["optional unique interface_id (1..=128 chars) consumed by this task"]
                         }
@@ -5393,6 +5396,173 @@ mod tests {
             assert_eq!(small_exec.max_stdout_bytes, 65_536);
             assert_eq!(small_exec.max_line_bytes, 65_536);
             assert_eq!(small_resp.max_response_bytes, 65_536);
+        }
+    }
+
+    #[test]
+    fn build_orchestrator_prompt_includes_worker_write_scope_constraints_and_validator_rejects_protected_paths(
+    ) {
+        let temp = TempDir::new().expect("create temp dir");
+        let repo_dir = fs::canonicalize(temp.path())
+            .expect("canonicalize temp dir")
+            .join("source-repo");
+        fs::create_dir_all(repo_dir.join("src")).expect("create src dir");
+        fs::write(repo_dir.join(".gitignore"), ".local/\n").expect("write .gitignore");
+        fs::write(
+            repo_dir.join("src/lib.rs"),
+            "pub fn ready() -> bool {\n    true\n}\n",
+        )
+        .expect("write src/lib.rs");
+
+        for args in [
+            &["init", "--quiet"][..],
+            &["config", "user.name", "Threadlane Test"][..],
+            &["config", "user.email", "test@threadlane.local"][..],
+            &["add", ".gitignore", "src/lib.rs"][..],
+            &["commit", "-m", "initial commit", "--quiet"][..],
+        ] {
+            run_sanitized_git(&repo_dir, args, DEFAULT_GIT_COMMAND_TIMEOUT_MS)
+                .expect("init git repo");
+        }
+
+        let base = CanonicalProjectBaseRef::resolve_and_validate(
+            &repo_dir,
+            &resolve_exact_commit_sha(&repo_dir, "HEAD", DEFAULT_GIT_COMMAND_TIMEOUT_MS)
+                .expect("resolve HEAD commit"),
+        )
+        .expect("resolve canonical project base");
+
+        let work_brief = WorkBrief {
+            brief_id: "brf_prompt_guard_unit_1".to_string(),
+            binding_id: "bnd_prompt_guard_unit".to_string(),
+            thread_uuid: "018f5a30-2222-7000-8000-000000000099".to_string(),
+            project_base: base.clone(),
+            kind: crate::coworker_workflow::WorkBriefKind::NewJob,
+            summary: "Verify initial Orchestrator file-permission prompt rules and protected write-scope rejection.".to_string(),
+            confirmed_requirements: vec![
+                "Update src/lib.rs and verify output handling without touching protected repository files.".to_string(),
+            ],
+            proposed_additions: Vec::new(),
+            assumptions: Vec::new(),
+            open_questions: Vec::new(),
+            accepted_architect_decisions: Vec::new(),
+        };
+
+        let prompt = build_orchestrator_prompt(&work_brief, &[])
+            .expect("render initial Orchestrator prompt");
+        assert!(prompt.len() <= MAX_PROMPT_BYTES);
+
+        let (_, json_context) = prompt
+            .split_once("Context:\n")
+            .expect("prompt must embed serialized Context JSON");
+        let parsed_context: serde_json::Value =
+            serde_json::from_str(json_context.trim()).expect("Context must be valid JSON");
+        let rules_text = serde_json::to_string(&parsed_context["rules"]).expect("serialize rules");
+
+        for required_token in [
+            "individual repository-relative file paths",
+            ".gitignore",
+            ".git",
+            ".gitmodules",
+            ".gitattributes",
+            "AGENTS.md",
+            "CLAUDE.md",
+            "opencode.json",
+            "opencode.jsonc",
+            "codex.toml",
+            ".codex.toml",
+            ".codex/",
+            ".claude/",
+            ".gemini/",
+            ".opencode/",
+            ".agents/",
+            ".aws/",
+            ".github/",
+            ".cargo/config",
+            ".cargo/config.toml",
+            ".env",
+            ".env.*",
+            "repo/.local/",
+            "outside-repository artifact directories",
+        ] {
+            assert!(
+                rules_text.contains(required_token),
+                "initial Orchestrator prompt rules missing `{required_token}`: {rules_text}"
+            );
+        }
+
+        let schema_write_paths_desc = parsed_context["required_response_schema"]["one_of_outcomes"]
+            [0]["tasks"][0]["allowed_write_paths"][0]
+            .as_str()
+            .expect("allowed_write_paths schema description");
+        assert!(schema_write_paths_desc.contains("individual file paths"));
+        assert!(schema_write_paths_desc.contains(".gitignore"));
+        assert!(schema_write_paths_desc.contains("AGENTS.md"));
+        assert!(schema_write_paths_desc.contains("opencode.json/jsonc"));
+        assert!(schema_write_paths_desc.contains("codex.toml/.codex.toml"));
+
+        let make_plan_with_path = |write_path: &str| StructuredOrchestratorOutput::Plan {
+            schema_version: COWORKER_PLANNING_SCHEMA_VERSION,
+            summary: "Test write scope validation against base_commit.".to_string(),
+            tasks: vec![StructuredPlannedTask {
+                task_id: "task_check_scope".to_string(),
+                title: "Modify target file".to_string(),
+                description: "Apply implementation edit within declared scope.".to_string(),
+                role: WorkflowRole::Coder,
+                difficulty: Difficulty::Easy,
+                depends_on: Vec::new(),
+                allowed_write_paths: vec![write_path.to_string()],
+                owned_interfaces: Vec::new(),
+                consumed_interfaces: Vec::new(),
+                model_override: None,
+                tool_override: None,
+            }],
+            check_suggestions: Vec::new(),
+            unconfirmed_proposal_notes: Vec::new(),
+            resolved_open_questions: Vec::new(),
+            deferred_proposals: Vec::new(),
+        };
+
+        make_plan_with_path("src/lib.rs")
+            .validate(&base)
+            .expect("clean individual repository-relative file path must pass validation");
+
+        for forbidden_path in [
+            ".gitignore",
+            "src/.gitignore",
+            ".git/config",
+            ".gitmodules",
+            ".gitattributes",
+            "AGENTS.md",
+            "agents.md",
+            "CLAUDE.md",
+            "claude.md",
+            "opencode.json",
+            "opencode.jsonc",
+            "codex.toml",
+            ".codex.toml",
+            ".codex/config.toml",
+            ".claude/settings.json",
+            ".gemini/settings.json",
+            ".opencode/config.json",
+            ".agents/rules.md",
+            ".github/workflows/ci.yml",
+            ".cargo/config",
+            ".cargo/config.toml",
+            ".env",
+            ".env.local",
+            "src",
+        ] {
+            let err = make_plan_with_path(forbidden_path)
+                .validate(&base)
+                .expect_err(
+                    "protected or ambiguous write scope must be rejected before publication",
+                );
+            assert_eq!(
+                err.code,
+                NativeErrorCode::ValidationFailed,
+                "unexpected error code for `{forbidden_path}`: {err:?}"
+            );
         }
     }
 }

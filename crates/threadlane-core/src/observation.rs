@@ -3033,6 +3033,3299 @@ pub fn read_core_state_readonly(
     Ok(snap)
 }
 
+/// Wire schema version for [`WorkspaceSnapshot`] envelopes (`1`).
+pub const WORKSPACE_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
+
+/// Default page limit for paginated [`ObservationRequest`] reads.
+pub const DEFAULT_OBSERVATION_REQUEST_PAGE_LIMIT: usize = 50;
+
+/// Maximum records returned per paginated [`ObservationRequest`] page (`200`).
+pub const MAX_OBSERVATION_REQUEST_PAGE_LIMIT: usize = 200;
+
+/// Maximum [`ObservationJob`] entries projected in a snapshot (`500`).
+pub const MAX_OBSERVATION_JOBS: usize = 500;
+
+/// Maximum [`ObservationRequest`] entries retained in the frontend request window (`1,000`).
+pub const MAX_OBSERVATION_FRONTEND_REQUEST_WINDOW: usize = 1_000;
+
+/// Maximum serialized UTF-8 byte size (`64 KiB`) of a single native sample sidecar file.
+pub const MAX_WORKSPACE_NATIVE_SAMPLE_SIDECAR_BYTES: usize = 64 * 1024;
+
+/// Maximum number of native sample sidecar files retained per observation source (`128`).
+pub const MAX_WORKSPACE_NATIVE_SAMPLES_PER_SOURCE: usize = 128;
+
+/// Maximum number of safe items retained in a [`WorkspaceMessagesWindow`] (`1,000`).
+pub const MAX_WORKSPACE_MESSAGES_WINDOW: usize = 1_000;
+
+/// Maximum structured job history records projected per `(source_id, binding_id)` (`64`),
+/// matching the durable coworker ledger capacity.
+pub const MAX_WORKSPACE_JOBS_PER_BINDING: usize = 64;
+
+/// Maximum tasks projected per [`WorkspaceJobHistory`] (`64`),
+/// matching the durable coworker ledger capacity.
+pub const MAX_WORKSPACE_TASKS_PER_JOB: usize = 64;
+
+/// Maximum attempts projected per [`WorkspaceTaskHistory`] (`16`),
+/// matching the durable coworker ledger capacity.
+pub const MAX_WORKSPACE_ATTEMPTS_PER_TASK: usize = 16;
+
+/// Maximum task candidates projected per [`WorkspaceTaskHistory`] (`16`),
+/// matching the durable coworker ledger capacity.
+pub const MAX_WORKSPACE_CANDIDATES_PER_TASK: usize = 16;
+
+/// Maximum run references projected per [`WorkspaceJobHistory`] (`256`).
+pub const MAX_WORKSPACE_RUNS_PER_JOB: usize = 256;
+
+/// Maximum outbox reservation/dispatch records projected per [`WorkspaceJobHistory`] (`256`),
+/// matching the durable coworker ledger capacity.
+pub const MAX_WORKSPACE_OUTBOX_PER_JOB: usize = 256;
+
+/// Maximum combined integration candidates projected per [`WorkspaceJobHistory`] (`32`),
+/// matching the durable coworker ledger capacity.
+pub const MAX_WORKSPACE_COMBINED_CANDIDATES_PER_JOB: usize = 32;
+
+/// Maximum correlated link identifiers retained per list inside [`WorkspaceRecordLinks`] (`64`).
+pub const MAX_WORKSPACE_RECORD_LINKS_PER_LIST: usize = 64;
+
+/// Initial native observation sampling interval in milliseconds (`2,000 ms` / `2 s`).
+pub const WORKSPACE_SAMPLING_INTERVAL_MS: u64 = 2_000;
+
+/// Native metadata read timeout in milliseconds (`750 ms`).
+pub const WORKSPACE_METADATA_TIMEOUT_MS: u64 = 750;
+
+/// Native sample staleness threshold in milliseconds (`10,000 ms` / `10 s`).
+pub const WORKSPACE_SAMPLE_STALE_THRESHOLD_MS: u64 = 10_000;
+
+const NIL_UUID_HYPHENATED: &str = "00000000-0000-0000-0000-000000000000";
+
+/// Contract validation and bounding errors for workspace observation projections.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum WorkspaceContractError {
+    /// A [`WorkspaceChatIdentity`] component was missing, malformed, or substituted with a
+    /// non-identity token (such as a chat title, `sessionId`, or `job_id`).
+    #[error("invalid workspace chat identity field `{field}`: {reason}")]
+    InvalidChatIdentity {
+        /// Name of the invalid identity field.
+        field: &'static str,
+        /// Human-readable validation failure reason.
+        reason: String,
+    },
+    /// A [`WorkspaceNativeSample`] failed structural validation.
+    #[error("invalid workspace native sample: {0}")]
+    InvalidNativeSample(String),
+    /// A native sample sidecar exceeded [`MAX_WORKSPACE_NATIVE_SAMPLE_SIDECAR_BYTES`].
+    #[error("native sample sidecar size ({actual_bytes} bytes) exceeds {max_bytes}-byte limit")]
+    SidecarTooLarge {
+        /// Serialized byte length of the sidecar payload.
+        actual_bytes: usize,
+        /// Maximum permitted byte length (`65,536`).
+        max_bytes: usize,
+    },
+    /// A `Messages` item attempted to use a forbidden or unrecognized source kind (such as a raw
+    /// transcript or synthetic user message).
+    #[error("forbidden or unrecognized workspace message source kind `{0}`")]
+    ForbiddenMessageSource(String),
+    /// Malformed UTF-8 or JSON payload when decoding a sidecar.
+    #[error("invalid workspace JSON payload: {0}")]
+    InvalidJson(String),
+}
+
+fn deserialize_null_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    T: Default + Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+fn default_unknown_token() -> String {
+    "unknown".to_string()
+}
+
+fn deserialize_non_empty_or_unknown<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<String>::deserialize(deserializer)?;
+    Ok(sanitize_status_token(raw.as_deref()))
+}
+
+fn default_sampling_interval_ms() -> u64 {
+    WORKSPACE_SAMPLING_INTERVAL_MS
+}
+
+fn default_metadata_timeout_ms() -> u64 {
+    WORKSPACE_METADATA_TIMEOUT_MS
+}
+
+fn default_stale_threshold_ms() -> u64 {
+    WORKSPACE_SAMPLE_STALE_THRESHOLD_MS
+}
+
+fn default_max_messages_window() -> usize {
+    MAX_WORKSPACE_MESSAGES_WINDOW
+}
+
+fn default_max_summary_chars() -> usize {
+    MAX_OBSERVATION_SUMMARY_CHARS
+}
+
+fn default_workspace_schema_version() -> u32 {
+    WORKSPACE_SNAPSHOT_SCHEMA_VERSION
+}
+
+fn default_observation_job_state_unknown() -> ObservationJobState {
+    ObservationJobState::Unknown
+}
+
+fn deserialize_workspace_job_state<'de, D>(deserializer: D) -> Result<ObservationJobState, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<String>::deserialize(deserializer)?;
+    let state = match raw.as_deref().map(str::trim) {
+        Some("planning") => ObservationJobState::Planning,
+        Some("ready") => ObservationJobState::Ready,
+        Some("running") => ObservationJobState::Running,
+        Some("reviewing") => ObservationJobState::Reviewing,
+        Some("needs_user") => ObservationJobState::NeedsUser,
+        Some("completed") => ObservationJobState::Completed,
+        Some("failed") => ObservationJobState::Failed,
+        _ => ObservationJobState::Unknown,
+    };
+    Ok(state)
+}
+
+fn default_observation_delivery_stage_unknown() -> ObservationDeliveryStage {
+    ObservationDeliveryStage::Unknown
+}
+
+fn deserialize_workspace_delivery_stage<'de, D>(
+    deserializer: D,
+) -> Result<ObservationDeliveryStage, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<String>::deserialize(deserializer)?;
+    let stage = match raw.as_deref().map(str::trim) {
+        Some("result_ready") => ObservationDeliveryStage::ResultReady,
+        Some("notification_submitted") => ObservationDeliveryStage::NotificationSubmitted,
+        Some("batch_delivered") => ObservationDeliveryStage::BatchDelivered,
+        Some("batch_acknowledged") => ObservationDeliveryStage::BatchAcknowledged,
+        Some("response_returned") => ObservationDeliveryStage::ResponseReturned,
+        Some("failed") => ObservationDeliveryStage::Failed,
+        _ => ObservationDeliveryStage::Unknown,
+    };
+    Ok(stage)
+}
+
+fn default_empty_observation_snapshot() -> ObservationSnapshot {
+    ObservationSnapshot {
+        schema_version: OBSERVATION_SCHEMA_VERSION,
+        generated_at_ms: 0,
+        sources: Vec::new(),
+        jobs: Vec::new(),
+        requests: Vec::new(),
+        next_cursor: None,
+        has_more: false,
+        jobs_has_more: false,
+        warnings: Vec::new(),
+        warning_contexts: Vec::new(),
+    }
+}
+
+fn sanitize_status_token(raw: Option<&str>) -> String {
+    let Some(raw) = raw else {
+        return default_unknown_token();
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed.len() > 64
+        || !trimmed
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+        || contains_sensitive_marker(&trimmed.to_ascii_lowercase())
+    {
+        default_unknown_token()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn clean_opt_id(raw: Option<&str>) -> Option<String> {
+    raw.and_then(validate_correlation_id)
+}
+
+fn clean_opt_summary(raw: Option<&str>) -> Option<String> {
+    raw.map(sanitize_workspace_summary)
+        .filter(|s| !s.is_empty())
+}
+
+fn clean_id_list(items: &[String], max_items: usize) -> Vec<String> {
+    items
+        .iter()
+        .filter_map(|id| validate_correlation_id(id))
+        .take(max_items)
+        .collect()
+}
+
+fn cap_tail<T>(mut items: Vec<T>, max_len: usize) -> (Vec<T>, usize) {
+    let omitted = items.len().saturating_sub(max_len);
+    if omitted > 0 {
+        items.drain(0..omitted);
+    }
+    (items, omitted)
+}
+
+fn is_forbidden_chat_identity_substitute_token(raw: &str) -> bool {
+    let lower = raw.to_ascii_lowercase();
+    lower.starts_with("job_")
+        || lower.starts_with("job-")
+        || lower.starts_with("job:")
+        || lower.starts_with("plan_")
+        || lower.starts_with("plan-")
+        || lower.starts_with("plan:")
+        || lower.starts_with("sess_")
+        || lower.starts_with("sess-")
+        || lower.starts_with("sess:")
+        || lower.starts_with("session_")
+        || lower.starts_with("session-")
+        || lower.starts_with("session:")
+        || lower.starts_with("sessionid")
+}
+
+fn validate_workspace_source_id(raw: &str) -> Result<String, WorkspaceContractError> {
+    if raw.is_empty() || raw.len() > crate::MAX_LABEL_LEN || raw.trim() != raw {
+        return Err(WorkspaceContractError::InvalidChatIdentity {
+            field: "source_id",
+            reason: "must be a non-empty trimmed identifier up to 128 bytes".to_string(),
+        });
+    }
+    if !raw
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+    {
+        return Err(WorkspaceContractError::InvalidChatIdentity {
+            field: "source_id",
+            reason: "must contain only ASCII [A-Za-z0-9_.-] characters".to_string(),
+        });
+    }
+    if contains_sensitive_marker(&raw.to_ascii_lowercase()) {
+        return Err(WorkspaceContractError::InvalidChatIdentity {
+            field: "source_id",
+            reason: "must not contain sensitive markers".to_string(),
+        });
+    }
+    if is_forbidden_chat_identity_substitute_token(raw) {
+        return Err(WorkspaceContractError::InvalidChatIdentity {
+            field: "source_id",
+            reason: "job_id, plan_id, or sessionId cannot replace source_id".to_string(),
+        });
+    }
+    Ok(raw.to_string())
+}
+
+fn validate_workspace_binding_id(raw: &str) -> Result<String, WorkspaceContractError> {
+    let Some(clean) = validate_correlation_id(raw) else {
+        return Err(WorkspaceContractError::InvalidChatIdentity {
+            field: "binding_id",
+            reason: "must be a valid non-empty ASCII identifier up to 128 bytes".to_string(),
+        });
+    };
+    if clean != raw {
+        return Err(WorkspaceContractError::InvalidChatIdentity {
+            field: "binding_id",
+            reason: "must not contain leading or trailing whitespace".to_string(),
+        });
+    }
+    if is_forbidden_chat_identity_substitute_token(&clean) {
+        return Err(WorkspaceContractError::InvalidChatIdentity {
+            field: "binding_id",
+            reason: "job_id, plan_id, or sessionId cannot replace binding_id".to_string(),
+        });
+    }
+    Ok(clean)
+}
+
+fn is_canonical_lowercase_non_nil_uuid(raw: &str) -> bool {
+    if raw.len() != 36 || raw == NIL_UUID_HYPHENATED {
+        return false;
+    }
+    for (idx, b) in raw.bytes().enumerate() {
+        let is_hyphen = matches!(idx, 8 | 13 | 18 | 23);
+        if is_hyphen {
+            if b != b'-' {
+                return false;
+            }
+        } else if !(b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+            return false;
+        }
+    }
+    true
+}
+
+fn validate_workspace_thread_uuid(raw: &str) -> Result<String, WorkspaceContractError> {
+    if !is_canonical_lowercase_non_nil_uuid(raw) {
+        return Err(WorkspaceContractError::InvalidChatIdentity {
+            field: "thread_uuid",
+            reason: "must be a canonical lowercase hyphenated non-nil UUID".to_string(),
+        });
+    }
+    Ok(raw.to_string())
+}
+
+fn validate_canonical_project_scope(raw: &str) -> Result<String, WorkspaceContractError> {
+    if raw.is_empty()
+        || raw.len() > crate::MAX_WORKER_PATH_BYTES
+        || raw.trim() != raw
+        || !raw.starts_with('/')
+        || raw.chars().any(char::is_control)
+    {
+        return Err(WorkspaceContractError::InvalidChatIdentity {
+            field: "canonical_project_scope",
+            reason: "must be a trimmed absolute path up to 512 UTF-8 bytes".to_string(),
+        });
+    }
+    if raw.contains("//")
+        || raw == "/."
+        || raw == "/.."
+        || raw.contains("/./")
+        || raw.contains("/../")
+        || raw.ends_with("/.")
+        || raw.ends_with("/..")
+        || (raw.len() > 1 && raw.ends_with('/'))
+    {
+        return Err(WorkspaceContractError::InvalidChatIdentity {
+            field: "canonical_project_scope",
+            reason: "must not contain '//', '.', '..', or trailing slashes".to_string(),
+        });
+    }
+    if contains_sk_prefix_marker(&raw.to_ascii_lowercase()) {
+        return Err(WorkspaceContractError::InvalidChatIdentity {
+            field: "canonical_project_scope",
+            reason: "must not contain secret-like tokens".to_string(),
+        });
+    }
+    Ok(raw.to_string())
+}
+
+/// Sanitized workspace summary text paired with Unicode-safe truncation and redaction metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceSanitizedSummary {
+    /// Sanitized text guaranteed to contain at most [`MAX_OBSERVATION_SUMMARY_CHARS`] Unicode scalar values.
+    pub summary: String,
+    /// `true` when the normalized text exceeded [`MAX_OBSERVATION_SUMMARY_CHARS`] and was truncated.
+    pub truncated: bool,
+    /// Original character count after control-character/whitespace normalization (or `None` when redacted).
+    pub original_char_count: Option<usize>,
+    /// `true` when sensitive marker detection replaced the text with `[redacted sensitive metadata]`.
+    pub redacted: bool,
+}
+
+/// Sanitizes a workspace summary string, collapsing control characters and whitespace, redacting
+/// secret-like markers, and enforcing a strict Unicode-safe [`MAX_OBSERVATION_SUMMARY_CHARS`]
+/// (`240` scalar values, inclusive of `"..."`) character bound.
+pub fn sanitize_workspace_summary_with_meta(raw: &str) -> WorkspaceSanitizedSummary {
+    let collapsed: String = raw
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    let lower = collapsed.to_ascii_lowercase();
+    if contains_sk_prefix_marker(&lower)
+        || lower.contains("bearer ")
+        || lower.contains("api_key")
+        || lower.contains("apikey")
+        || lower.contains("authorization:")
+        || lower.contains("secret")
+        || lower.contains("password")
+    {
+        return WorkspaceSanitizedSummary {
+            summary: "[redacted sensitive metadata]".to_string(),
+            truncated: false,
+            original_char_count: None,
+            redacted: true,
+        };
+    }
+
+    let char_count = collapsed.chars().count();
+    if char_count <= MAX_OBSERVATION_SUMMARY_CHARS {
+        WorkspaceSanitizedSummary {
+            summary: collapsed,
+            truncated: false,
+            original_char_count: Some(char_count),
+            redacted: false,
+        }
+    } else {
+        let keep = MAX_OBSERVATION_SUMMARY_CHARS.saturating_sub(3);
+        let mut out: String = collapsed.chars().take(keep).collect();
+        out.push_str("...");
+        WorkspaceSanitizedSummary {
+            summary: out,
+            truncated: true,
+            original_char_count: Some(char_count),
+            redacted: false,
+        }
+    }
+}
+
+/// Sanitizes a workspace summary string to at most [`MAX_OBSERVATION_SUMMARY_CHARS`] (`240`)
+/// Unicode scalar values (including `"..."` when truncated).
+pub fn sanitize_workspace_summary(raw: &str) -> String {
+    sanitize_workspace_summary_with_meta(raw).summary
+}
+
+/// Authoritative observational identity for a native conversation.
+///
+/// Always requires all four verified components: `source_id`, `binding_id`, `thread_uuid`, and
+/// `canonical_project_scope`. Display titles (`thread_label`), shared-fork `sessionId` tokens, and
+/// `job_id` / `plan_id` identifiers must never substitute for chat identity.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default)]
+pub struct WorkspaceChatIdentity {
+    /// Validated observation source identifier (`default`, `src_...`, `ctx_...`).
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub source_id: String,
+    /// Validated scoped software `binding_id` (`bnd_...`, `apr_...`).
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub binding_id: String,
+    /// Canonical lowercase hyphenated non-nil native `thread_uuid`.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub thread_uuid: String,
+    /// Verified canonical absolute project path scoping this conversation.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub canonical_project_scope: String,
+}
+
+impl WorkspaceChatIdentity {
+    /// Constructs and validates an authoritative [`WorkspaceChatIdentity`].
+    pub fn new(
+        source_id: &str,
+        binding_id: &str,
+        thread_uuid: &str,
+        canonical_project_scope: &str,
+    ) -> Result<Self, WorkspaceContractError> {
+        let identity = Self {
+            source_id: validate_workspace_source_id(source_id)?,
+            binding_id: validate_workspace_binding_id(binding_id)?,
+            thread_uuid: validate_workspace_thread_uuid(thread_uuid)?,
+            canonical_project_scope: validate_canonical_project_scope(canonical_project_scope)?,
+        };
+        Ok(identity)
+    }
+
+    /// Validates all four components of this [`WorkspaceChatIdentity`].
+    pub fn validate(&self) -> Result<(), WorkspaceContractError> {
+        let _ = validate_workspace_source_id(&self.source_id)?;
+        let _ = validate_workspace_binding_id(&self.binding_id)?;
+        let _ = validate_workspace_thread_uuid(&self.thread_uuid)?;
+        let _ = validate_canonical_project_scope(&self.canonical_project_scope)?;
+        Ok(())
+    }
+
+    /// Returns a collision-free length-prefixed UTF-8 canonical key (`wchat:v1:...`) when valid,
+    /// or `None` if any identity component fails validation.
+    pub fn canonical_key(&self) -> Option<String> {
+        self.validate().ok()?;
+        Some(format!(
+            "wchat:v1:{}:{}:{}:{}:{}:{}:{}:{}",
+            self.source_id.len(),
+            self.source_id,
+            self.binding_id.len(),
+            self.binding_id,
+            self.thread_uuid.len(),
+            self.thread_uuid,
+            self.canonical_project_scope.len(),
+            self.canonical_project_scope,
+        ))
+    }
+}
+
+/// Native sampling and staleness policy carried by [`WorkspaceSnapshot`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceSamplingPolicy {
+    /// Target background sampling interval in milliseconds (`2,000 ms` initial default).
+    #[serde(default = "default_sampling_interval_ms")]
+    pub interval_ms: u64,
+    /// Exact-thread metadata read timeout in milliseconds (`750 ms` default).
+    #[serde(default = "default_metadata_timeout_ms")]
+    pub metadata_timeout_ms: u64,
+    /// Sample age threshold in milliseconds beyond which a live sample degrades to `stale` (`10,000 ms` default).
+    #[serde(default = "default_stale_threshold_ms")]
+    pub stale_threshold_ms: u64,
+    /// Structural invariant: assembling a [`WorkspaceSnapshot`] never resets native sample age (`false`).
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub snapshot_resets_sample_age: bool,
+}
+
+impl Default for WorkspaceSamplingPolicy {
+    fn default() -> Self {
+        Self {
+            interval_ms: WORKSPACE_SAMPLING_INTERVAL_MS,
+            metadata_timeout_ms: WORKSPACE_METADATA_TIMEOUT_MS,
+            stale_threshold_ms: WORKSPACE_SAMPLE_STALE_THRESHOLD_MS,
+            snapshot_resets_sample_age: false,
+        }
+    }
+}
+
+impl WorkspaceSamplingPolicy {
+    /// Normalizes invalid zero intervals/thresholds to contract defaults and forces
+    /// `snapshot_resets_sample_age` to `false`.
+    pub fn normalized(&self) -> Self {
+        Self {
+            interval_ms: if self.interval_ms == 0 {
+                WORKSPACE_SAMPLING_INTERVAL_MS
+            } else {
+                self.interval_ms
+            },
+            metadata_timeout_ms: if self.metadata_timeout_ms == 0 {
+                WORKSPACE_METADATA_TIMEOUT_MS
+            } else {
+                self.metadata_timeout_ms
+            },
+            stale_threshold_ms: if self.stale_threshold_ms == 0 {
+                WORKSPACE_SAMPLE_STALE_THRESHOLD_MS
+            } else {
+                self.stale_threshold_ms
+            },
+            snapshot_resets_sample_age: false,
+        }
+    }
+}
+
+/// Availability state of a native sample, chat projection, or workspace sub-window.
+///
+/// Strictly separated from [`WorkspaceActivityState`] (`working`, `idle`, `waiting_for_approval`,
+/// `waiting_for_input`, `unknown`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceAvailabilityState {
+    /// Source/sample is connected, verified, and within the staleness threshold.
+    Available,
+    /// Native parent/transport route is disconnected.
+    Disconnected,
+    /// Last successful sample age exceeded the staleness threshold (`> 10,000 ms` by default).
+    Stale,
+    /// Sample or sub-window is missing, unverified, unreadable, or unrecognized.
+    #[default]
+    #[serde(other)]
+    Unavailable,
+}
+
+impl WorkspaceAvailabilityState {
+    /// Returns the canonical `snake_case` wire string.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Available => "available",
+            Self::Disconnected => "disconnected",
+            Self::Stale => "stale",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+/// Fine-grained conversational activity state for a verified native chat sample.
+///
+/// Kept strictly separate from [`WorkspaceAvailabilityState`] (`available`, `disconnected`,
+/// `stale`, `unavailable`). When availability is not [`WorkspaceAvailabilityState::Available`],
+/// effective live activity degrades to [`Self::Unknown`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceActivityState {
+    /// Native chat is actively executing a turn or tool call.
+    Working,
+    /// Native chat is connected, verified, and idle between turns.
+    Idle,
+    /// Conversation or bound workflow is waiting on explicit human approval.
+    WaitingForApproval,
+    /// Conversation or bound workflow is waiting on human question/input response.
+    WaitingForInput,
+    /// Conversational activity detail is unknown, unverified, or masked by non-available status.
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
+impl WorkspaceActivityState {
+    /// Returns the canonical `snake_case` wire string.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Working => "working",
+            Self::Idle => "idle",
+            Self::WaitingForApproval => "waiting_for_approval",
+            Self::WaitingForInput => "waiting_for_input",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Transport connection state reported by a [`WorkspaceNativeSample`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceConnectionState {
+    /// Verified native route is connected.
+    Connected,
+    /// Verified native route is disconnected.
+    Disconnected,
+    /// Route is reachable in degraded mode (for example transient metadata timeout).
+    Degraded,
+    /// Connection state is missing, unverified, or unrecognized.
+    #[default]
+    #[serde(other)]
+    Unavailable,
+}
+
+/// Sample freshness state computed relative to `last_success_at_ms` and `stale_threshold_ms`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceFreshnessState {
+    /// Sample succeeded within `stale_threshold_ms`.
+    Fresh,
+    /// Sample age since `last_success_at_ms` exceeded `stale_threshold_ms`.
+    Stale,
+    /// Producer has recorded an attempt without any successful native read yet.
+    NeverSucceeded,
+    /// Freshness cannot be established (missing or invalid timestamps).
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
+/// Tri-state capability support indicator that degrades missing wire fields to `unknown`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceCapabilityState {
+    /// Capability is verified as supported on the active route.
+    Supported,
+    /// Capability is verified as unsupported on the active route.
+    Unsupported,
+    /// Capability support is unknown or omitted.
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
+/// Evidence classification for [`WorkspaceConfiguredSelection`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceSelectionEvidence {
+    /// Read from verified exact-thread native configuration metadata; never runtime execution telemetry.
+    VerifiedConfiguration,
+    /// Configuration selection metadata is unavailable, unverified, or stale.
+    #[default]
+    #[serde(other)]
+    Unavailable,
+}
+
+/// Configured model and reasoning effort from verified exact-thread native metadata.
+///
+/// Explicitly labeled as configuration evidence (`verified_configuration`) and never counted as
+/// runtime execution telemetry (`counts_as_runtime_telemetry` is always `false`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct WorkspaceConfiguredSelection {
+    /// Configured / selected conversational model token, or `None` when unavailable.
+    #[serde(default)]
+    pub selected_model: Option<String>,
+    /// Configured / selected conversational reasoning effort token, or `None` when unavailable.
+    #[serde(default)]
+    pub selected_effort: Option<String>,
+    /// Evidence classification (`verified_configuration` or `unavailable`).
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub evidence: WorkspaceSelectionEvidence,
+    /// Structural invariant flag: configured selection is never runtime execution telemetry (`false`).
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub counts_as_runtime_telemetry: bool,
+}
+
+impl WorkspaceConfiguredSelection {
+    /// Constructs an unavailable selection record with `None` model/effort and `false` telemetry flag.
+    pub const fn unavailable() -> Self {
+        Self {
+            selected_model: None,
+            selected_effort: None,
+            evidence: WorkspaceSelectionEvidence::Unavailable,
+            counts_as_runtime_telemetry: false,
+        }
+    }
+
+    /// Constructs a verified configuration selection from sanitized native metadata tokens.
+    ///
+    /// If both sanitized tokens are `None`, evidence degrades to [`WorkspaceSelectionEvidence::Unavailable`].
+    pub fn verified(selected_model: Option<&str>, selected_effort: Option<&str>) -> Self {
+        let clean_model = sanitize_observation_selection_token(selected_model);
+        let clean_effort = sanitize_observation_selection_token(selected_effort);
+        let evidence = if clean_model.is_some() || clean_effort.is_some() {
+            WorkspaceSelectionEvidence::VerifiedConfiguration
+        } else {
+            WorkspaceSelectionEvidence::Unavailable
+        };
+        Self {
+            selected_model: clean_model,
+            selected_effort: clean_effort,
+            evidence,
+            counts_as_runtime_telemetry: false,
+        }
+    }
+
+    /// Sanitizes tokens, clears unverified selections, and enforces `counts_as_runtime_telemetry = false`.
+    pub fn normalized(&self) -> Self {
+        match self.evidence {
+            WorkspaceSelectionEvidence::VerifiedConfiguration => Self::verified(
+                self.selected_model.as_deref(),
+                self.selected_effort.as_deref(),
+            ),
+            WorkspaceSelectionEvidence::Unavailable => Self::unavailable(),
+        }
+    }
+}
+
+/// Connection and freshness metadata attached to a [`WorkspaceNativeSample`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct WorkspaceSampleConnection {
+    /// Current route connection state.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub state: WorkspaceConnectionState,
+    /// Sample freshness classification.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub freshness: WorkspaceFreshnessState,
+    /// Optional verified route token (such as `managed_linux_desktop` or `paired_mcp`).
+    #[serde(default)]
+    pub route: Option<String>,
+    /// Optional sanitized diagnostic summary (`<= 240` chars).
+    #[serde(default)]
+    pub diagnostic: Option<String>,
+}
+
+impl WorkspaceSampleConnection {
+    /// Sanitizes optional `route` and `diagnostic` fields.
+    pub fn normalized(&self) -> Self {
+        let route = self.route.as_deref().and_then(validate_correlation_id);
+        let diagnostic = self
+            .diagnostic
+            .as_deref()
+            .map(sanitize_workspace_summary)
+            .filter(|s| !s.is_empty());
+        Self {
+            state: self.state,
+            freshness: self.freshness,
+            route,
+            diagnostic,
+        }
+    }
+}
+
+/// Route and backend capabilities reported on a [`WorkspaceNativeSample`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct WorkspaceNativeCapabilities {
+    /// Whether exact-thread metadata read (`thread/read`) is supported.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub exact_thread_read: WorkspaceCapabilityState,
+    /// Whether fine-grained conversational activity detail is supported.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub activity_detail: WorkspaceCapabilityState,
+    /// Whether configured model/effort selection metadata is supported.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub configured_selection: WorkspaceCapabilityState,
+    /// Whether wake-up notice delivery is supported on the bound route.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub wakeup_delivery: WorkspaceCapabilityState,
+    /// Whether per-call native parent/thread identity verification is active.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub per_call_identity: WorkspaceCapabilityState,
+}
+
+/// Point-in-time native conversation sample persisted in a bounded (`<= 64 KiB`) sidecar or
+/// embedded in a [`WorkspaceSnapshot`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct WorkspaceNativeSample {
+    /// Authoritative four-part chat identity (`source_id`, `binding_id`, `thread_uuid`, `canonical_project_scope`).
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub chat_identity: WorkspaceChatIdentity,
+    /// Producer epoch token minted on sampler/backend startup; resets `sequence` across restarts.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub producer_epoch: String,
+    /// Verified OS process instance (`pid`, `boot_id`, `start_ticks`) of the backend/sampler when known.
+    #[serde(default)]
+    pub backend_process_instance: Option<ObservationProcessInstance>,
+    /// Monotonic sequence number within `(producer_epoch, backend_process_instance)`.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub sequence: u64,
+    /// Timestamp (ms since Unix epoch) when this sample observation attempt occurred.
+    #[serde(default, alias = "observed_at")]
+    pub observed_at_ms: Option<i64>,
+    /// Timestamp (ms since Unix epoch) of the most recent successful native read.
+    #[serde(default, alias = "last_success_at")]
+    pub last_success_at_ms: Option<i64>,
+    /// Availability state (`available`, `disconnected`, `stale`, `unavailable`).
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub availability: WorkspaceAvailabilityState,
+    /// Fine-grained activity state (`working`, `idle`, `waiting_for_approval`, `waiting_for_input`, `unknown`).
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub activity: WorkspaceActivityState,
+    /// Connection and freshness details.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub connection: WorkspaceSampleConnection,
+    /// Route and backend capability states.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub capabilities: WorkspaceNativeCapabilities,
+    /// Verified configuration selection (`selected_model` / `selected_effort`), never runtime telemetry.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub configured_selection: WorkspaceConfiguredSelection,
+}
+
+/// Evaluated live status of a [`WorkspaceNativeSample`] at a reference timestamp without mutating
+/// the underlying sample timestamps.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceEvaluatedNativeSample {
+    /// Age in milliseconds since `last_success_at_ms`, or `None` when never succeeded or invalid.
+    pub sample_age_ms: Option<i64>,
+    /// Evaluated freshness state.
+    pub freshness: WorkspaceFreshnessState,
+    /// Effective availability (`available` degrades to `stale` once `sample_age_ms > stale_threshold_ms`).
+    pub effective_availability: WorkspaceAvailabilityState,
+    /// Effective live activity (`unknown` whenever `effective_availability != Available`).
+    pub effective_activity: WorkspaceActivityState,
+    /// Effective configured selection (`unavailable` whenever `effective_availability != Available`).
+    pub effective_configured_selection: WorkspaceConfiguredSelection,
+}
+
+fn is_valid_process_instance_shape(instance: &ObservationProcessInstance) -> bool {
+    instance.pid > 0
+        && !instance.boot_id.is_empty()
+        && instance.boot_id.len() <= crate::MAX_LABEL_LEN
+        && instance.boot_id.trim() == instance.boot_id
+        && instance.boot_id.bytes().all(|b| b.is_ascii_graphic())
+}
+
+impl WorkspaceNativeSample {
+    /// Validates identity, `producer_epoch`, optional `backend_process_instance`, and timestamp ordering.
+    pub fn validate(&self) -> Result<(), WorkspaceContractError> {
+        self.chat_identity.validate()?;
+        let Some(clean_epoch) = validate_correlation_id(&self.producer_epoch) else {
+            return Err(WorkspaceContractError::InvalidNativeSample(
+                "producer_epoch must be a valid non-empty ASCII token up to 128 bytes".to_string(),
+            ));
+        };
+        if clean_epoch != self.producer_epoch {
+            return Err(WorkspaceContractError::InvalidNativeSample(
+                "producer_epoch must not contain leading or trailing whitespace".to_string(),
+            ));
+        }
+        if let Some(instance) = &self.backend_process_instance {
+            if !is_valid_process_instance_shape(instance) {
+                return Err(WorkspaceContractError::InvalidNativeSample(
+                    "backend_process_instance must carry non-zero pid and graphic ASCII boot_id"
+                        .to_string(),
+                ));
+            }
+        }
+        if let (Some(obs), Some(succ)) = (self.observed_at_ms, self.last_success_at_ms) {
+            if succ > obs {
+                return Err(WorkspaceContractError::InvalidNativeSample(
+                    "last_success_at_ms must not exceed observed_at_ms".to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Normalizes untrusted or partial wire fields so invalid or non-available states safely
+    /// degrade to `unknown` / `unavailable` without resetting `observed_at_ms` or `last_success_at_ms`.
+    pub fn normalized(&self) -> Self {
+        let valid_epoch = validate_correlation_id(&self.producer_epoch)
+            .filter(|clean| clean == &self.producer_epoch)
+            .unwrap_or_default();
+        let valid_process = self
+            .backend_process_instance
+            .clone()
+            .filter(is_valid_process_instance_shape);
+        let identity_ok = self.chat_identity.validate().is_ok();
+        let timestamps_consistent = match (self.observed_at_ms, self.last_success_at_ms) {
+            (Some(obs), Some(succ)) => obs > 0 && succ > 0 && succ <= obs,
+            (Some(obs), None) => obs > 0,
+            (None, Some(_)) => false,
+            (None, None) => true,
+        };
+
+        let mut availability = self.availability;
+        if !identity_ok
+            || valid_epoch.is_empty()
+            || !timestamps_consistent
+            || (availability == WorkspaceAvailabilityState::Available
+                && (self.observed_at_ms.is_none() || self.last_success_at_ms.is_none()))
+        {
+            availability = WorkspaceAvailabilityState::Unavailable;
+        }
+
+        let activity = if availability == WorkspaceAvailabilityState::Available {
+            self.activity
+        } else {
+            WorkspaceActivityState::Unknown
+        };
+
+        let configured_selection = if availability == WorkspaceAvailabilityState::Available {
+            self.configured_selection.normalized()
+        } else {
+            WorkspaceConfiguredSelection::unavailable()
+        };
+
+        let mut connection = self.connection.normalized();
+        if availability == WorkspaceAvailabilityState::Disconnected {
+            connection.state = WorkspaceConnectionState::Disconnected;
+        } else if availability == WorkspaceAvailabilityState::Unavailable
+            && connection.state == WorkspaceConnectionState::Connected
+        {
+            connection.state = WorkspaceConnectionState::Unavailable;
+        }
+
+        Self {
+            chat_identity: self.chat_identity.clone(),
+            producer_epoch: valid_epoch,
+            backend_process_instance: valid_process,
+            sequence: self.sequence,
+            observed_at_ms: self.observed_at_ms.filter(|&v| v > 0),
+            last_success_at_ms: if timestamps_consistent {
+                self.last_success_at_ms.filter(|&v| v > 0)
+            } else {
+                None
+            },
+            availability,
+            activity,
+            connection,
+            capabilities: self.capabilities.clone(),
+            configured_selection,
+        }
+    }
+
+    /// Evaluates sample age, staleness, availability, and live activity against `reference_now_ms`
+    /// without modifying `observed_at_ms` or `last_success_at_ms`.
+    pub fn evaluate_at(
+        &self,
+        reference_now_ms: i64,
+        stale_threshold_ms: u64,
+    ) -> WorkspaceEvaluatedNativeSample {
+        let threshold_ms = if stale_threshold_ms == 0 {
+            WORKSPACE_SAMPLE_STALE_THRESHOLD_MS
+        } else {
+            stale_threshold_ms
+        };
+        let norm = self.normalized();
+        if self.validate().is_err() || norm.producer_epoch.is_empty() {
+            return WorkspaceEvaluatedNativeSample {
+                sample_age_ms: None,
+                freshness: WorkspaceFreshnessState::Unknown,
+                effective_availability: WorkspaceAvailabilityState::Unavailable,
+                effective_activity: WorkspaceActivityState::Unknown,
+                effective_configured_selection: WorkspaceConfiguredSelection::unavailable(),
+            };
+        }
+
+        let Some(anchor_ms) = norm.last_success_at_ms else {
+            let freshness = if norm.observed_at_ms.is_some() {
+                WorkspaceFreshnessState::NeverSucceeded
+            } else {
+                WorkspaceFreshnessState::Unknown
+            };
+            let effective_availability = match norm.availability {
+                WorkspaceAvailabilityState::Disconnected => {
+                    WorkspaceAvailabilityState::Disconnected
+                }
+                _ => WorkspaceAvailabilityState::Unavailable,
+            };
+            return WorkspaceEvaluatedNativeSample {
+                sample_age_ms: None,
+                freshness,
+                effective_availability,
+                effective_activity: WorkspaceActivityState::Unknown,
+                effective_configured_selection: WorkspaceConfiguredSelection::unavailable(),
+            };
+        };
+
+        let delta_ms = reference_now_ms.saturating_sub(anchor_ms);
+        let max_skew_ms = i64::try_from(threshold_ms).unwrap_or(i64::MAX);
+        if delta_ms < -max_skew_ms {
+            return WorkspaceEvaluatedNativeSample {
+                sample_age_ms: None,
+                freshness: WorkspaceFreshnessState::Unknown,
+                effective_availability: WorkspaceAvailabilityState::Unavailable,
+                effective_activity: WorkspaceActivityState::Unknown,
+                effective_configured_selection: WorkspaceConfiguredSelection::unavailable(),
+            };
+        }
+
+        let clamped_age_ms = delta_ms.max(0);
+        let is_stale = u64::try_from(clamped_age_ms).unwrap_or(u64::MAX) > threshold_ms;
+        let freshness = if is_stale {
+            WorkspaceFreshnessState::Stale
+        } else {
+            WorkspaceFreshnessState::Fresh
+        };
+
+        let effective_availability = match norm.availability {
+            WorkspaceAvailabilityState::Available => {
+                if is_stale {
+                    WorkspaceAvailabilityState::Stale
+                } else {
+                    WorkspaceAvailabilityState::Available
+                }
+            }
+            WorkspaceAvailabilityState::Disconnected => WorkspaceAvailabilityState::Disconnected,
+            WorkspaceAvailabilityState::Stale => WorkspaceAvailabilityState::Stale,
+            WorkspaceAvailabilityState::Unavailable => WorkspaceAvailabilityState::Unavailable,
+        };
+
+        let effective_activity = if effective_availability == WorkspaceAvailabilityState::Available
+        {
+            norm.activity
+        } else {
+            WorkspaceActivityState::Unknown
+        };
+
+        let effective_configured_selection =
+            if effective_availability == WorkspaceAvailabilityState::Available {
+                norm.configured_selection
+            } else {
+                WorkspaceConfiguredSelection::unavailable()
+            };
+
+        WorkspaceEvaluatedNativeSample {
+            sample_age_ms: Some(clamped_age_ms),
+            freshness,
+            effective_availability,
+            effective_activity,
+            effective_configured_selection,
+        }
+    }
+}
+
+/// Ordering and epoch reconciliation outcome for incoming [`WorkspaceNativeSample`] updates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspaceSampleReconcileDecision {
+    /// Accepted as the first valid sample for this chat identity.
+    AcceptedInitial,
+    /// Accepted because `sequence` strictly increased within the same producer epoch and process instance.
+    AcceptedNextSequence,
+    /// Accepted because `producer_epoch` rotated with a non-older `observed_at_ms`.
+    AcceptedNewEpoch,
+    /// Rejected because `incoming` failed identity, epoch, process-instance, or timestamp validation.
+    RejectedInvalidSample,
+    /// Rejected because `incoming.chat_identity` did not match `current.chat_identity`.
+    RejectedMismatchedIdentity,
+    /// Rejected because `incoming.sequence == current.sequence` within the same epoch.
+    RejectedDuplicateSequence,
+    /// Rejected because `incoming.sequence < current.sequence` within the same epoch.
+    RejectedStaleSequence,
+    /// Rejected because `producer_epoch` changed to an older or missing `observed_at_ms`.
+    RejectedStaleEpoch,
+    /// Rejected because `backend_process_instance` changed without minting a new `producer_epoch`.
+    RejectedEpochProcessMismatch,
+}
+
+impl WorkspaceSampleReconcileDecision {
+    /// Returns `true` when the incoming sample should replace the current sample.
+    pub const fn is_accepted(self) -> bool {
+        matches!(
+            self,
+            Self::AcceptedInitial | Self::AcceptedNextSequence | Self::AcceptedNewEpoch
+        )
+    }
+}
+
+/// Evaluates whether `incoming` supersedes `current` for the same [`WorkspaceChatIdentity`].
+pub fn reconcile_workspace_native_sample(
+    current: Option<&WorkspaceNativeSample>,
+    incoming: &WorkspaceNativeSample,
+) -> WorkspaceSampleReconcileDecision {
+    if incoming.validate().is_err() {
+        return WorkspaceSampleReconcileDecision::RejectedInvalidSample;
+    }
+    let Some(current) = current else {
+        return WorkspaceSampleReconcileDecision::AcceptedInitial;
+    };
+    if current.validate().is_err() {
+        return WorkspaceSampleReconcileDecision::AcceptedInitial;
+    }
+    if current.chat_identity != incoming.chat_identity {
+        return WorkspaceSampleReconcileDecision::RejectedMismatchedIdentity;
+    }
+    if current.producer_epoch == incoming.producer_epoch {
+        if current.backend_process_instance != incoming.backend_process_instance {
+            return WorkspaceSampleReconcileDecision::RejectedEpochProcessMismatch;
+        }
+        return match incoming.sequence.cmp(&current.sequence) {
+            std::cmp::Ordering::Greater => WorkspaceSampleReconcileDecision::AcceptedNextSequence,
+            std::cmp::Ordering::Equal => {
+                WorkspaceSampleReconcileDecision::RejectedDuplicateSequence
+            }
+            std::cmp::Ordering::Less => WorkspaceSampleReconcileDecision::RejectedStaleSequence,
+        };
+    }
+
+    let Some(incoming_obs) = incoming.observed_at_ms else {
+        return WorkspaceSampleReconcileDecision::RejectedStaleEpoch;
+    };
+    if let Some(current_obs) = current.observed_at_ms {
+        if incoming_obs < current_obs {
+            return WorkspaceSampleReconcileDecision::RejectedStaleEpoch;
+        }
+    }
+    WorkspaceSampleReconcileDecision::AcceptedNewEpoch
+}
+
+/// Validates, normalizes, and serializes a [`WorkspaceNativeSample`] sidecar payload, enforcing
+/// [`MAX_WORKSPACE_NATIVE_SAMPLE_SIDECAR_BYTES`] (`64 KiB`).
+pub fn serialize_workspace_native_sample_sidecar(
+    sample: &WorkspaceNativeSample,
+) -> Result<Vec<u8>, WorkspaceContractError> {
+    sample.validate()?;
+    let normalized = sample.normalized();
+    let bytes = serde_json::to_vec(&normalized)
+        .map_err(|err| WorkspaceContractError::InvalidJson(err.to_string()))?;
+    if bytes.len() > MAX_WORKSPACE_NATIVE_SAMPLE_SIDECAR_BYTES {
+        return Err(WorkspaceContractError::SidecarTooLarge {
+            actual_bytes: bytes.len(),
+            max_bytes: MAX_WORKSPACE_NATIVE_SAMPLE_SIDECAR_BYTES,
+        });
+    }
+    Ok(bytes)
+}
+
+/// Parses and normalizes a [`WorkspaceNativeSample`] sidecar byte slice after enforcing the
+/// [`MAX_WORKSPACE_NATIVE_SAMPLE_SIDECAR_BYTES`] (`64 KiB`) cap.
+pub fn parse_workspace_native_sample_sidecar(
+    bytes: &[u8],
+) -> Result<WorkspaceNativeSample, WorkspaceContractError> {
+    if bytes.len() > MAX_WORKSPACE_NATIVE_SAMPLE_SIDECAR_BYTES {
+        return Err(WorkspaceContractError::SidecarTooLarge {
+            actual_bytes: bytes.len(),
+            max_bytes: MAX_WORKSPACE_NATIVE_SAMPLE_SIDECAR_BYTES,
+        });
+    }
+    let parsed: WorkspaceNativeSample = serde_json::from_slice(bytes)
+        .map_err(|err| WorkspaceContractError::InvalidJson(err.to_string()))?;
+    Ok(parsed.normalized())
+}
+
+/// Deduplicates native samples per chat via [`reconcile_workspace_native_sample`] and caps the
+/// retained set at [`MAX_WORKSPACE_NATIVE_SAMPLES_PER_SOURCE`] (`128`) per `source_id`.
+///
+/// Returns `(retained_samples, omitted_count)`.
+pub fn bound_workspace_native_samples_per_source(
+    samples: Vec<WorkspaceNativeSample>,
+) -> (Vec<WorkspaceNativeSample>, usize) {
+    let mut omitted = 0usize;
+    let mut latest_by_chat: std::collections::BTreeMap<String, WorkspaceNativeSample> =
+        std::collections::BTreeMap::new();
+
+    for sample in samples {
+        let Some(chat_key) = sample.chat_identity.canonical_key() else {
+            omitted += 1;
+            continue;
+        };
+        if sample.validate().is_err() {
+            omitted += 1;
+            continue;
+        }
+        let normalized = sample.normalized();
+        match latest_by_chat.get(&chat_key) {
+            None => {
+                latest_by_chat.insert(chat_key, normalized);
+            }
+            Some(existing) => {
+                if reconcile_workspace_native_sample(Some(existing), &normalized).is_accepted() {
+                    latest_by_chat.insert(chat_key, normalized);
+                }
+            }
+        }
+    }
+
+    let mut by_source: std::collections::BTreeMap<String, Vec<(String, WorkspaceNativeSample)>> =
+        std::collections::BTreeMap::new();
+    for (chat_key, sample) in latest_by_chat {
+        by_source
+            .entry(sample.chat_identity.source_id.clone())
+            .or_default()
+            .push((chat_key, sample));
+    }
+
+    let mut retained = Vec::new();
+    for (_source_id, mut group) in by_source {
+        group.sort_by(|(left_key, left), (right_key, right)| {
+            right
+                .observed_at_ms
+                .unwrap_or(i64::MIN)
+                .cmp(&left.observed_at_ms.unwrap_or(i64::MIN))
+                .then_with(|| right.sequence.cmp(&left.sequence))
+                .then_with(|| left_key.cmp(right_key))
+        });
+        if group.len() > MAX_WORKSPACE_NATIVE_SAMPLES_PER_SOURCE {
+            omitted += group.len() - MAX_WORKSPACE_NATIVE_SAMPLES_PER_SOURCE;
+            group.truncate(MAX_WORKSPACE_NATIVE_SAMPLES_PER_SOURCE);
+        }
+        for (_key, sample) in group {
+            retained.push(sample);
+        }
+    }
+
+    (retained, omitted)
+}
+
+/// Summary projection of a canonical conversation in [`WorkspaceSnapshot::chats`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct WorkspaceChatSummary {
+    /// Canonical four-part chat identity (`source_id`, `binding_id`, `thread_uuid`, `canonical_project_scope`).
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub identity: WorkspaceChatIdentity,
+    /// Display-only sanitized chat title (`<= 128` bytes); never part of chat identity.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub thread_label: String,
+    /// Display-only sanitized project label (`<= 128` bytes); never part of chat identity.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub project_label: String,
+    /// Evaluated availability state (`available`, `disconnected`, `stale`, `unavailable`).
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub availability: WorkspaceAvailabilityState,
+    /// Evaluated live activity state (`working`, `idle`, `waiting_for_approval`, `waiting_for_input`, `unknown`).
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub activity: WorkspaceActivityState,
+    /// Verified configured model/effort selection, or `unavailable`.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub configured_selection: WorkspaceConfiguredSelection,
+    /// Count of active jobs associated with this chat.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub active_job_count: usize,
+    /// Count of jobs/tasks currently requiring attention on this chat.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub attention_count: usize,
+    /// Most recent observed update timestamp in milliseconds since Unix epoch.
+    #[serde(default)]
+    pub updated_at_ms: Option<i64>,
+}
+
+impl WorkspaceChatSummary {
+    /// Sanitizes labels and enforces availability/activity/selection separation invariants.
+    pub fn normalized(&self) -> Self {
+        let identity_ok = self.identity.validate().is_ok();
+        let availability = if identity_ok {
+            self.availability
+        } else {
+            WorkspaceAvailabilityState::Unavailable
+        };
+        let activity = if availability == WorkspaceAvailabilityState::Available {
+            self.activity
+        } else {
+            WorkspaceActivityState::Unknown
+        };
+        let configured_selection = if availability == WorkspaceAvailabilityState::Available {
+            self.configured_selection.normalized()
+        } else {
+            WorkspaceConfiguredSelection::unavailable()
+        };
+        Self {
+            identity: self.identity.clone(),
+            thread_label: sanitize_observation_label(&self.thread_label, "Codex chat"),
+            project_label: sanitize_observation_label(&self.project_label, "Project"),
+            availability,
+            activity,
+            configured_selection,
+            active_job_count: self.active_job_count,
+            attention_count: self.attention_count,
+            updated_at_ms: self.updated_at_ms.filter(|&v| v > 0),
+        }
+    }
+}
+
+/// Verification status of a [`WorkspaceAcceptanceProof`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceAcceptanceStatus {
+    /// Verified by structured review/closure receipts; never inferred from worker exit status.
+    VerifiedAccepted,
+    /// Candidate produced and awaiting review or closure verification.
+    PendingReview,
+    /// Candidate was explicitly rejected or requested changes.
+    Rejected,
+    /// No accepted candidate exists yet.
+    NotAccepted,
+    /// Acceptance state is missing, degraded, or lacks required receipt proof.
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
+/// Structured acceptance proof kept strictly separate from worker completion and job result prose.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct WorkspaceAcceptanceProof {
+    /// Current acceptance verification status.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub status: WorkspaceAcceptanceStatus,
+    /// Accepted task-level candidate identifier when applicable.
+    #[serde(default)]
+    pub accepted_candidate_id: Option<String>,
+    /// Integrated job-level combined candidate identifier when applicable.
+    #[serde(default)]
+    pub combined_candidate_id: Option<String>,
+    /// Structured Reviewer verdict identifier when recorded.
+    #[serde(default)]
+    pub review_verdict_id: Option<String>,
+    /// Durable Reviewer receipt identifier when recorded.
+    #[serde(default)]
+    pub review_receipt_id: Option<String>,
+    /// Durable integration receipt identifier when recorded.
+    #[serde(default)]
+    pub integration_receipt_id: Option<String>,
+    /// Single-Closure reservation identifier when recorded.
+    #[serde(default)]
+    pub closure_reservation_id: Option<String>,
+    /// Accepted Closure verdict identifier required for job-level verified acceptance.
+    #[serde(default)]
+    pub closure_verdict_id: Option<String>,
+    /// Timestamp (ms since Unix epoch) when acceptance proof was durably recorded.
+    #[serde(default)]
+    pub verified_at_ms: Option<i64>,
+}
+
+impl WorkspaceAcceptanceProof {
+    /// Returns an `unknown` acceptance proof with no receipt identifiers.
+    pub const fn unknown() -> Self {
+        Self {
+            status: WorkspaceAcceptanceStatus::Unknown,
+            accepted_candidate_id: None,
+            combined_candidate_id: None,
+            review_verdict_id: None,
+            review_receipt_id: None,
+            integration_receipt_id: None,
+            closure_reservation_id: None,
+            closure_verdict_id: None,
+            verified_at_ms: None,
+        }
+    }
+
+    fn cleaned_ids(&self) -> Self {
+        Self {
+            status: self.status,
+            accepted_candidate_id: clean_opt_id(self.accepted_candidate_id.as_deref()),
+            combined_candidate_id: clean_opt_id(self.combined_candidate_id.as_deref()),
+            review_verdict_id: clean_opt_id(self.review_verdict_id.as_deref()),
+            review_receipt_id: clean_opt_id(self.review_receipt_id.as_deref()),
+            integration_receipt_id: clean_opt_id(self.integration_receipt_id.as_deref()),
+            closure_reservation_id: clean_opt_id(self.closure_reservation_id.as_deref()),
+            closure_verdict_id: clean_opt_id(self.closure_verdict_id.as_deref()),
+            verified_at_ms: self.verified_at_ms.filter(|&v| v > 0),
+        }
+    }
+
+    /// Normalizes a task-level acceptance proof: `verified_accepted` requires a valid
+    /// `accepted_candidate_id` plus at least one of `review_verdict_id` or `review_receipt_id`.
+    pub fn normalized_for_task(&self) -> Self {
+        let mut out = self.cleaned_ids();
+        if out.status == WorkspaceAcceptanceStatus::VerifiedAccepted {
+            let has_candidate = out.accepted_candidate_id.is_some();
+            let has_review_proof =
+                out.review_verdict_id.is_some() || out.review_receipt_id.is_some();
+            if !(has_candidate && has_review_proof) {
+                out.status = WorkspaceAcceptanceStatus::Unknown;
+            }
+        }
+        out
+    }
+
+    /// Normalizes a job-level acceptance proof: `verified_accepted` requires both a valid
+    /// `combined_candidate_id` and an accepted `closure_verdict_id`.
+    pub fn normalized_for_job(&self) -> Self {
+        let mut out = self.cleaned_ids();
+        if out.status == WorkspaceAcceptanceStatus::VerifiedAccepted
+            && (out.combined_candidate_id.is_none() || out.closure_verdict_id.is_none())
+        {
+            out.status = WorkspaceAcceptanceStatus::Unknown;
+        }
+        out
+    }
+}
+
+/// Historical failure record kept separate from live [`WorkspaceAttentionState`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct WorkspaceHistoricalFailure {
+    /// Optional durable failure record identifier.
+    #[serde(default)]
+    pub failure_id: Option<String>,
+    /// Lifecycle stage where the failure occurred (`worker_execution`, `verification`, `review`, `integration`, `closure`, `dispatch`, or `unknown`).
+    #[serde(
+        default = "default_unknown_token",
+        deserialize_with = "deserialize_non_empty_or_unknown"
+    )]
+    pub stage: String,
+    /// Timestamp (ms since Unix epoch) when the failure was recorded.
+    #[serde(default)]
+    pub failed_at_ms: Option<i64>,
+    /// Associated `task_id` when task-scoped.
+    #[serde(default)]
+    pub task_id: Option<String>,
+    /// Associated 1-based task attempt number when applicable.
+    #[serde(default)]
+    pub attempt_no: Option<u32>,
+    /// Associated core `run_id` when applicable.
+    #[serde(default)]
+    pub run_id: Option<String>,
+    /// Associated `outbox_id` when applicable.
+    #[serde(default)]
+    pub outbox_id: Option<String>,
+    /// Sanitized failure summary (`<= 240` chars).
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub reason: String,
+    /// Whether a subsequent retry, revision, or operator action moved past this failure while preserving its audit trail.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub superseded_or_resolved: bool,
+}
+
+impl WorkspaceHistoricalFailure {
+    /// Sanitizes identifiers and bounds `reason` to [`MAX_OBSERVATION_SUMMARY_CHARS`].
+    pub fn normalized(&self) -> Self {
+        let clean_reason = sanitize_workspace_summary(&self.reason);
+        Self {
+            failure_id: clean_opt_id(self.failure_id.as_deref()),
+            stage: sanitize_status_token(Some(&self.stage)),
+            failed_at_ms: self.failed_at_ms.filter(|&v| v > 0),
+            task_id: clean_opt_id(self.task_id.as_deref()),
+            attempt_no: self.attempt_no,
+            run_id: clean_opt_id(self.run_id.as_deref()),
+            outbox_id: clean_opt_id(self.outbox_id.as_deref()),
+            reason: if clean_reason.is_empty() {
+                "Historical failure recorded".to_string()
+            } else {
+                clean_reason
+            },
+            superseded_or_resolved: self.superseded_or_resolved,
+        }
+    }
+}
+
+/// Classification of current live operator or coworker attention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceAttentionKind {
+    /// Waiting on explicit human plan/amendment approval.
+    NeedsApproval,
+    /// Waiting on human answer to a pending question.
+    NeedsUserInput,
+    /// Paused behind an active hold boundary.
+    OnHold,
+    /// Blocked on an unresolved outbox or interrupted effect requiring receipt reconciliation.
+    UnresolvedEffect,
+    /// Settled failure fence awaiting correction/replan decision.
+    BlockedFailure,
+    /// Candidate ready and awaiting review action.
+    ReviewRequired,
+    /// Explicitly no live attention needed.
+    None,
+    /// Attention state is unknown or unrecognized.
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
+/// Live attention state kept strictly separate from [`WorkspaceHistoricalFailure`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct WorkspaceAttentionState {
+    /// Current attention category.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub kind: WorkspaceAttentionKind,
+    /// Sanitized reason summary (`<= 240` chars).
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub reason: String,
+    /// Optional safe next-step guidance (`<= 240` chars).
+    #[serde(default)]
+    pub next_step: Option<String>,
+    /// Active hold identifiers blocking advancement.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub blocking_hold_ids: Vec<String>,
+    /// Unresolved outbox identifiers requiring reconciliation.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub blocking_outbox_ids: Vec<String>,
+    /// Active question identifier when waiting on input.
+    #[serde(default)]
+    pub question_id: Option<String>,
+    /// Timestamp (ms since Unix epoch) of the latest attention transition.
+    #[serde(default)]
+    pub updated_at_ms: Option<i64>,
+}
+
+impl WorkspaceAttentionState {
+    /// Sanitizes summaries and bounds blocking ID lists.
+    pub fn normalized(&self) -> Self {
+        Self {
+            kind: self.kind,
+            reason: sanitize_workspace_summary(&self.reason),
+            next_step: clean_opt_summary(self.next_step.as_deref()),
+            blocking_hold_ids: clean_id_list(
+                &self.blocking_hold_ids,
+                MAX_WORKSPACE_RECORD_LINKS_PER_LIST,
+            ),
+            blocking_outbox_ids: clean_id_list(
+                &self.blocking_outbox_ids,
+                MAX_WORKSPACE_RECORD_LINKS_PER_LIST,
+            ),
+            question_id: clean_opt_id(self.question_id.as_deref()),
+            updated_at_ms: self.updated_at_ms.filter(|&v| v > 0),
+        }
+    }
+}
+
+/// Single task execution attempt projected under [`WorkspaceTaskHistory::attempts`] (`<= 16` per task).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct WorkspaceTaskAttempt {
+    /// 1-based attempt number within the task.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub attempt_no: u32,
+    /// Attempt status token (`queued`, `running`, `completed`, `failed`, `cancelled`, `unknown`).
+    #[serde(
+        default = "default_unknown_token",
+        deserialize_with = "deserialize_non_empty_or_unknown"
+    )]
+    pub status: String,
+    /// Correlated core `run_id` when dispatched.
+    #[serde(default)]
+    pub run_id: Option<String>,
+    /// Correlated durable `worker_id` when dispatched.
+    #[serde(default)]
+    pub worker_id: Option<String>,
+    /// Correlated `outbox_id` reservation for this attempt.
+    #[serde(default)]
+    pub outbox_id: Option<String>,
+    /// Requested vs. runtime-observed executor telemetry for this attempt.
+    #[serde(default)]
+    pub executor: Option<ObservationExecutor>,
+    /// Start timestamp in milliseconds since Unix epoch.
+    #[serde(default)]
+    pub started_at_ms: Option<i64>,
+    /// Finish timestamp in milliseconds since Unix epoch.
+    #[serde(default)]
+    pub finished_at_ms: Option<i64>,
+    /// Sanitized attempt summary (`<= 240` chars).
+    #[serde(default)]
+    pub summary: Option<String>,
+}
+
+impl WorkspaceTaskAttempt {
+    /// Sanitizes attempt identifiers and summary text.
+    pub fn normalized(&self) -> Self {
+        Self {
+            attempt_no: self.attempt_no,
+            status: sanitize_status_token(Some(&self.status)),
+            run_id: clean_opt_id(self.run_id.as_deref()),
+            worker_id: clean_opt_id(self.worker_id.as_deref()),
+            outbox_id: clean_opt_id(self.outbox_id.as_deref()),
+            executor: self.executor.clone(),
+            started_at_ms: self.started_at_ms.filter(|&v| v > 0),
+            finished_at_ms: self.finished_at_ms.filter(|&v| v > 0),
+            summary: clean_opt_summary(self.summary.as_deref()),
+        }
+    }
+}
+
+/// Task output candidate projected under [`WorkspaceTaskHistory::candidates`] (`<= 16` per task).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct WorkspaceTaskCandidate {
+    /// Stable candidate identifier (`cand_...`).
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub candidate_id: String,
+    /// Producing attempt number.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub attempt_no: u32,
+    /// Producing durable `worker_id` when applicable.
+    #[serde(default)]
+    pub worker_id: Option<String>,
+    /// Git commit SHA of the candidate worktree head when recorded.
+    #[serde(default)]
+    pub head_commit_sha: Option<String>,
+    /// Git tree SHA of the candidate output when recorded.
+    #[serde(default)]
+    pub tree_sha: Option<String>,
+    /// Whether automated verification gates passed (`None` when not yet run or unknown).
+    #[serde(default)]
+    pub verification_passed: Option<bool>,
+    /// Review status token (`pending`, `accepted`, `changes_requested`, `invalidated`, `unknown`).
+    #[serde(
+        default = "default_unknown_token",
+        deserialize_with = "deserialize_non_empty_or_unknown"
+    )]
+    pub review_status: String,
+    /// Linked Reviewer verdict identifier when reviewed.
+    #[serde(default)]
+    pub review_verdict_id: Option<String>,
+    /// Linked Reviewer receipt identifier when reviewed.
+    #[serde(default)]
+    pub review_receipt_id: Option<String>,
+    /// Timestamp (ms since Unix epoch) when the candidate was sealed.
+    #[serde(default)]
+    pub produced_at_ms: Option<i64>,
+    /// Sanitized candidate summary (`<= 240` chars).
+    #[serde(default)]
+    pub summary: Option<String>,
+}
+
+impl WorkspaceTaskCandidate {
+    /// Sanitizes candidate identifiers and summary text.
+    pub fn normalized(&self) -> Self {
+        Self {
+            candidate_id: validate_correlation_id(&self.candidate_id)
+                .unwrap_or_else(default_unknown_token),
+            attempt_no: self.attempt_no,
+            worker_id: clean_opt_id(self.worker_id.as_deref()),
+            head_commit_sha: clean_opt_id(self.head_commit_sha.as_deref()),
+            tree_sha: clean_opt_id(self.tree_sha.as_deref()),
+            verification_passed: self.verification_passed,
+            review_status: sanitize_status_token(Some(&self.review_status)),
+            review_verdict_id: clean_opt_id(self.review_verdict_id.as_deref()),
+            review_receipt_id: clean_opt_id(self.review_receipt_id.as_deref()),
+            produced_at_ms: self.produced_at_ms.filter(|&v| v > 0),
+            summary: clean_opt_summary(self.summary.as_deref()),
+        }
+    }
+}
+
+/// Structured task history entry inside [`WorkspaceJobHistory::tasks`] (`<= 64` per job).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct WorkspaceTaskHistory {
+    /// Stable task identifier within the job.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub task_id: String,
+    /// Sanitized task title (`<= 128` bytes).
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub title: String,
+    /// Assigned workflow role (`coder`, `reviewer`, etc.).
+    #[serde(default)]
+    pub role: Option<String>,
+    /// Declared task difficulty (`easy`, `medium`, `hard`).
+    #[serde(default)]
+    pub difficulty: Option<String>,
+    /// Current task lifecycle stage (`pending`, `coding`, `verifying`, `reviewing`, `accepted`, `blocked`, `unknown`).
+    #[serde(default)]
+    pub stage: Option<String>,
+    /// Truthful task status (`pending`, `running`, `ready_for_review`, `completed`, `accepted`, `failed`, `unknown`).
+    #[serde(
+        default = "default_unknown_token",
+        deserialize_with = "deserialize_non_empty_or_unknown"
+    )]
+    pub status: String,
+    /// Upstream task IDs that this task depends on (`<= 64`).
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub depends_on: Vec<String>,
+    /// Current 1-based attempt number (`0` before any attempt starts), kept separate from `attempts`.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub current_attempt_no: u32,
+    /// Bounded attempt history (`<= 16` attempts/task).
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub attempts: Vec<WorkspaceTaskAttempt>,
+    /// Bounded candidate history (`<= 16` candidates/task).
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub candidates: Vec<WorkspaceTaskCandidate>,
+    /// Active candidate awaiting verification/review when applicable.
+    #[serde(default)]
+    pub active_candidate_id: Option<String>,
+    /// Accepted candidate identifier when verified.
+    #[serde(default)]
+    pub accepted_candidate_id: Option<String>,
+    /// Historical task failure audit record (distinct from `current_attention`).
+    #[serde(default)]
+    pub historical_failure: Option<WorkspaceHistoricalFailure>,
+    /// Current live task attention state (distinct from `historical_failure`).
+    #[serde(default)]
+    pub current_attention: Option<WorkspaceAttentionState>,
+    /// Verified task acceptance proof (distinct from worker completion).
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub acceptance_proof: WorkspaceAcceptanceProof,
+}
+
+impl WorkspaceTaskHistory {
+    fn normalized_with_omissions(&self) -> (Self, usize, usize) {
+        let all_attempts = self
+            .attempts
+            .iter()
+            .map(WorkspaceTaskAttempt::normalized)
+            .collect();
+        let (attempts, attempts_omitted) = cap_tail(all_attempts, MAX_WORKSPACE_ATTEMPTS_PER_TASK);
+
+        let all_candidates = self
+            .candidates
+            .iter()
+            .map(WorkspaceTaskCandidate::normalized)
+            .collect();
+        let (candidates, candidates_omitted) =
+            cap_tail(all_candidates, MAX_WORKSPACE_CANDIDATES_PER_TASK);
+
+        let normalized = Self {
+            task_id: validate_correlation_id(&self.task_id).unwrap_or_else(default_unknown_token),
+            title: sanitize_observation_label(&self.title, "Task"),
+            role: clean_opt_id(self.role.as_deref()),
+            difficulty: clean_opt_id(self.difficulty.as_deref()),
+            stage: self
+                .stage
+                .as_deref()
+                .map(|s| sanitize_status_token(Some(s))),
+            status: sanitize_status_token(Some(&self.status)),
+            depends_on: clean_id_list(&self.depends_on, MAX_WORKSPACE_TASKS_PER_JOB),
+            current_attempt_no: self.current_attempt_no,
+            attempts,
+            candidates,
+            active_candidate_id: clean_opt_id(self.active_candidate_id.as_deref()),
+            accepted_candidate_id: clean_opt_id(self.accepted_candidate_id.as_deref()),
+            historical_failure: self
+                .historical_failure
+                .as_ref()
+                .map(WorkspaceHistoricalFailure::normalized),
+            current_attention: self
+                .current_attention
+                .as_ref()
+                .map(WorkspaceAttentionState::normalized),
+            acceptance_proof: self.acceptance_proof.normalized_for_task(),
+        };
+        (normalized, attempts_omitted, candidates_omitted)
+    }
+}
+
+/// Core/worker run reference projected under [`WorkspaceJobHistory::runs`] (`<= 256` per job).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct WorkspaceRunRecord {
+    /// Core `run_id`.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub run_id: String,
+    /// Optional durable `worker_id` associated with this run.
+    #[serde(default)]
+    pub worker_id: Option<String>,
+    /// Owning software `binding_id`.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub binding_id: String,
+    /// Correlated `task_id` when bound to a job task.
+    #[serde(default)]
+    pub task_id: Option<String>,
+    /// Correlated 1-based task attempt number when applicable.
+    #[serde(default)]
+    pub attempt_no: Option<u32>,
+    /// Assigned workflow role (`coder`, `reviewer`, `architect`, `orchestrator`, `closure`).
+    #[serde(default)]
+    pub role: Option<String>,
+    /// Truthful run/worker status (`queued`, `claimed`, `running`, `completed`, `failed`, `cancelled`, `timed_out`, `unknown`).
+    #[serde(
+        default = "default_unknown_token",
+        deserialize_with = "deserialize_non_empty_or_unknown"
+    )]
+    pub status: String,
+    /// Requested vs. runtime-observed executor metadata.
+    #[serde(default)]
+    pub executor: Option<ObservationExecutor>,
+    /// Run start timestamp in milliseconds since Unix epoch.
+    #[serde(default)]
+    pub started_at_ms: Option<i64>,
+    /// Run finish timestamp in milliseconds since Unix epoch.
+    #[serde(default)]
+    pub finished_at_ms: Option<i64>,
+    /// Latest run update timestamp in milliseconds since Unix epoch.
+    #[serde(default)]
+    pub updated_at_ms: Option<i64>,
+}
+
+impl WorkspaceRunRecord {
+    /// Sanitizes run identifiers and status token.
+    pub fn normalized(&self) -> Self {
+        Self {
+            run_id: validate_correlation_id(&self.run_id).unwrap_or_else(default_unknown_token),
+            worker_id: self.worker_id.as_deref().and_then(validate_correlation_id),
+            binding_id: validate_correlation_id(&self.binding_id)
+                .unwrap_or_else(default_unknown_token),
+            task_id: self.task_id.as_deref().and_then(validate_correlation_id),
+            attempt_no: self.attempt_no,
+            role: self.role.as_deref().and_then(validate_correlation_id),
+            status: sanitize_status_token(Some(&self.status)),
+            executor: self.executor.clone(),
+            started_at_ms: self.started_at_ms.filter(|&v| v > 0),
+            finished_at_ms: self.finished_at_ms.filter(|&v| v > 0),
+            updated_at_ms: self.updated_at_ms.filter(|&v| v > 0),
+        }
+    }
+}
+
+/// Durable outbox reservation/dispatch entry projected under [`WorkspaceJobHistory::outbox`] (`<= 256` per job).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct WorkspaceOutboxRecord {
+    /// Durable outbox record identifier (`outbox_...`).
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub outbox_id: String,
+    /// Idempotent request/reservation key when recorded.
+    #[serde(default)]
+    pub request_key: Option<String>,
+    /// Outbox effect kind (`coder_dispatch`, `reviewer_dispatch`, `closure_dispatch`, `notification`, `unknown`).
+    #[serde(
+        default = "default_unknown_token",
+        deserialize_with = "deserialize_non_empty_or_unknown"
+    )]
+    pub kind: String,
+    /// Outbox lifecycle status (`reserved`, `dispatched`, `completed`, `failed`, `reconciled`, `unknown`).
+    #[serde(
+        default = "default_unknown_token",
+        deserialize_with = "deserialize_non_empty_or_unknown"
+    )]
+    pub status: String,
+    /// Target `task_id` when task-scoped.
+    #[serde(default)]
+    pub task_id: Option<String>,
+    /// Target 1-based task attempt number when applicable.
+    #[serde(default)]
+    pub attempt_no: Option<u32>,
+    /// Target workflow role when role-scoped.
+    #[serde(default)]
+    pub role: Option<String>,
+    /// Linked `run_id` when dispatched.
+    #[serde(default)]
+    pub run_id: Option<String>,
+    /// Linked `worker_id` when dispatched.
+    #[serde(default)]
+    pub worker_id: Option<String>,
+    /// Durable completion/reconciliation receipt ID when settled.
+    #[serde(default)]
+    pub receipt_id: Option<String>,
+    /// Job revision at which the effect was reserved.
+    #[serde(default)]
+    pub reserved_at_job_revision: Option<u64>,
+    /// Latest job revision that updated this outbox record.
+    #[serde(default)]
+    pub updated_at_job_revision: Option<u64>,
+    /// Sanitized diagnostic summary (`<= 240` chars).
+    #[serde(default)]
+    pub diagnostic: Option<String>,
+}
+
+impl WorkspaceOutboxRecord {
+    /// Sanitizes outbox identifiers and diagnostic text.
+    pub fn normalized(&self) -> Self {
+        Self {
+            outbox_id: validate_correlation_id(&self.outbox_id)
+                .unwrap_or_else(default_unknown_token),
+            request_key: clean_opt_id(self.request_key.as_deref()),
+            kind: sanitize_status_token(Some(&self.kind)),
+            status: sanitize_status_token(Some(&self.status)),
+            task_id: clean_opt_id(self.task_id.as_deref()),
+            attempt_no: self.attempt_no,
+            role: clean_opt_id(self.role.as_deref()),
+            run_id: clean_opt_id(self.run_id.as_deref()),
+            worker_id: clean_opt_id(self.worker_id.as_deref()),
+            receipt_id: clean_opt_id(self.receipt_id.as_deref()),
+            reserved_at_job_revision: self.reserved_at_job_revision,
+            updated_at_job_revision: self.updated_at_job_revision,
+            diagnostic: clean_opt_summary(self.diagnostic.as_deref()),
+        }
+    }
+}
+
+/// Combined integration candidate projected under [`WorkspaceJobHistory::combined_candidates`] (`<= 32` per job).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct WorkspaceCombinedCandidate {
+    /// Combined candidate identifier (`ccand_...`).
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub combined_candidate_id: String,
+    /// Job revision under which integration ran.
+    #[serde(default)]
+    pub job_revision: Option<u64>,
+    /// Combined candidate status (`pending_checks`, `ready_for_closure`, `accepted`, `failed`, `invalidated`, `unknown`).
+    #[serde(
+        default = "default_unknown_token",
+        deserialize_with = "deserialize_non_empty_or_unknown"
+    )]
+    pub status: String,
+    /// Final integrated commit SHA when recorded.
+    #[serde(default)]
+    pub final_commit_sha: Option<String>,
+    /// Final integrated tree SHA when recorded.
+    #[serde(default)]
+    pub final_tree_sha: Option<String>,
+    /// Digest over integrated task candidates when recorded.
+    #[serde(default)]
+    pub candidate_digest: Option<String>,
+    /// Reserved single-Closure identifier bound to this candidate.
+    #[serde(default)]
+    pub closure_reservation_id: Option<String>,
+    /// Count of integrated validation checks recorded on this candidate.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub check_count: usize,
+    /// Timestamp (ms since Unix epoch) when integrated.
+    #[serde(default)]
+    pub produced_at_ms: Option<i64>,
+}
+
+impl WorkspaceCombinedCandidate {
+    /// Sanitizes combined candidate identifiers and status token.
+    pub fn normalized(&self) -> Self {
+        Self {
+            combined_candidate_id: validate_correlation_id(&self.combined_candidate_id)
+                .unwrap_or_else(default_unknown_token),
+            job_revision: self.job_revision,
+            status: sanitize_status_token(Some(&self.status)),
+            final_commit_sha: clean_opt_id(self.final_commit_sha.as_deref()),
+            final_tree_sha: clean_opt_id(self.final_tree_sha.as_deref()),
+            candidate_digest: clean_opt_id(self.candidate_digest.as_deref()),
+            closure_reservation_id: clean_opt_id(self.closure_reservation_id.as_deref()),
+            check_count: self.check_count,
+            produced_at_ms: self.produced_at_ms.filter(|&v| v > 0),
+        }
+    }
+}
+
+/// Safe job result summary kept separate from [`WorkspaceAcceptanceProof`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceJobResult {
+    /// Outcome label (`completed`, `failed`, `stopped`, `ready_for_review`, `unknown`).
+    #[serde(
+        default = "default_unknown_token",
+        deserialize_with = "deserialize_non_empty_or_unknown"
+    )]
+    pub outcome: String,
+    /// Sanitized result summary (`<= 240` chars).
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub summary: String,
+    /// Timestamp (ms since Unix epoch) when the result summary was produced.
+    #[serde(default)]
+    pub produced_at_ms: Option<i64>,
+    /// Delivery/ACK stage of the result (submission/ACK never proves human reading).
+    #[serde(
+        default = "default_observation_delivery_stage_unknown",
+        deserialize_with = "deserialize_workspace_delivery_stage"
+    )]
+    pub delivery_stage: ObservationDeliveryStage,
+    /// Optional Closure verdict identifier that produced the final summary.
+    #[serde(default)]
+    pub closure_verdict_id: Option<String>,
+}
+
+impl Default for WorkspaceJobResult {
+    fn default() -> Self {
+        Self {
+            outcome: default_unknown_token(),
+            summary: String::new(),
+            produced_at_ms: None,
+            delivery_stage: ObservationDeliveryStage::Unknown,
+            closure_verdict_id: None,
+        }
+    }
+}
+
+impl WorkspaceJobResult {
+    /// Sanitizes outcome, summary, and optional `closure_verdict_id`.
+    pub fn normalized(&self) -> Self {
+        Self {
+            outcome: sanitize_status_token(Some(&self.outcome)),
+            summary: sanitize_workspace_summary(&self.summary),
+            produced_at_ms: self.produced_at_ms.filter(|&v| v > 0),
+            delivery_stage: self.delivery_stage,
+            closure_verdict_id: clean_opt_id(self.closure_verdict_id.as_deref()),
+        }
+    }
+}
+
+/// Follow-up lineage and upstream source record links for a [`WorkspaceJobHistory`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct WorkspaceRecordLinks {
+    /// Source `plan_id` from which this job was approved.
+    #[serde(default)]
+    pub source_plan_id: Option<String>,
+    /// Source `plan_revision` frozen by the approval.
+    #[serde(default)]
+    pub source_plan_revision: Option<u64>,
+    /// Exact `approval_id` authorizing execution of this job.
+    #[serde(default)]
+    pub source_approval_id: Option<String>,
+    /// Upstream `work_brief_id` when planned from a structured work brief.
+    #[serde(default)]
+    pub source_work_brief_id: Option<String>,
+    /// Standing `planning_grant_id` used during planning, if any.
+    #[serde(default)]
+    pub planning_grant_id: Option<String>,
+    /// Planning reservation identifier, if any.
+    #[serde(default)]
+    pub planning_reservation_id: Option<String>,
+    /// Prior `job_id` superseded by this job revision/replan.
+    #[serde(default)]
+    pub supersedes_job_id: Option<String>,
+    /// Newer follow-up `job_id` that superseded this job.
+    #[serde(default)]
+    pub superseded_by_job_id: Option<String>,
+    /// Optional parent `job_id` for decomposed follow-up work.
+    #[serde(default)]
+    pub parent_job_id: Option<String>,
+    /// Follow-up `job_id`s linked forward from this job (`<= 64`).
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub follow_up_job_ids: Vec<String>,
+    /// Bounded Architect advice record IDs consulted during planning (`<= 64`).
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub architect_advice_ids: Vec<String>,
+    /// Correlated [`ObservationRequest`] IDs linked to this job (`<= 64`).
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub source_request_ids: Vec<String>,
+}
+
+impl WorkspaceRecordLinks {
+    /// Sanitizes and bounds all link identifiers.
+    pub fn normalized(&self) -> Self {
+        let cap = MAX_WORKSPACE_RECORD_LINKS_PER_LIST;
+        Self {
+            source_plan_id: clean_opt_id(self.source_plan_id.as_deref()),
+            source_plan_revision: self.source_plan_revision,
+            source_approval_id: clean_opt_id(self.source_approval_id.as_deref()),
+            source_work_brief_id: clean_opt_id(self.source_work_brief_id.as_deref()),
+            planning_grant_id: clean_opt_id(self.planning_grant_id.as_deref()),
+            planning_reservation_id: clean_opt_id(self.planning_reservation_id.as_deref()),
+            supersedes_job_id: clean_opt_id(self.supersedes_job_id.as_deref()),
+            superseded_by_job_id: clean_opt_id(self.superseded_by_job_id.as_deref()),
+            parent_job_id: clean_opt_id(self.parent_job_id.as_deref()),
+            follow_up_job_ids: clean_id_list(&self.follow_up_job_ids, cap),
+            architect_advice_ids: clean_id_list(&self.architect_advice_ids, cap),
+            source_request_ids: clean_id_list(&self.source_request_ids, cap),
+        }
+    }
+}
+
+/// Header summary of a job inside [`WorkspaceJobHistory::job`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceJobSummary {
+    /// Observation source identifier scoping `job_id`.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub source_id: String,
+    /// Durable job identifier within `source_id`.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub job_id: String,
+    /// Scoped software `binding_id` when bound.
+    #[serde(default)]
+    pub binding_id: Option<String>,
+    /// Canonical four-part chat identity when all verified components exist; never synthesized from `title`, `sessionId`, or `job_id`.
+    #[serde(default)]
+    pub chat_identity: Option<WorkspaceChatIdentity>,
+    /// Sanitized human-readable job title (`<= 128` bytes).
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub title: String,
+    /// Monotonic job ledger revision number when backed by the coworker job ledger.
+    #[serde(default)]
+    pub job_revision: Option<u64>,
+    /// High-level job lifecycle state (`unknown` when missing/unrecognized).
+    #[serde(
+        default = "default_observation_job_state_unknown",
+        deserialize_with = "deserialize_workspace_job_state"
+    )]
+    pub state: ObservationJobState,
+    /// Optional fine-grained ledger phase (`executing`, `integrating`, `closing`, `completed`, `stopped`, `failed`).
+    #[serde(default)]
+    pub phase: Option<String>,
+    /// Approval status token (`approved`, `pending_approval`, `superseded`, `unknown`, etc.).
+    #[serde(
+        default = "default_unknown_token",
+        deserialize_with = "deserialize_non_empty_or_unknown"
+    )]
+    pub approval_status: String,
+    /// Execution status token (`not_started`, `running`, `ready_for_review`, `completed`, `accepted`, `failed`, `stopped`, `unknown`).
+    #[serde(
+        default = "default_unknown_token",
+        deserialize_with = "deserialize_non_empty_or_unknown"
+    )]
+    pub execution_status: String,
+    /// Review state token when applicable.
+    #[serde(default)]
+    pub review_state: Option<String>,
+    /// Job creation timestamp in milliseconds since Unix epoch.
+    #[serde(default)]
+    pub created_at_ms: Option<i64>,
+    /// Latest job update timestamp in milliseconds since Unix epoch.
+    #[serde(default)]
+    pub updated_at_ms: Option<i64>,
+    /// Sanitized job summary (`<= 240` chars).
+    #[serde(default)]
+    pub summary: Option<String>,
+}
+
+impl Default for WorkspaceJobSummary {
+    fn default() -> Self {
+        Self {
+            source_id: default_unknown_token(),
+            job_id: default_unknown_token(),
+            binding_id: None,
+            chat_identity: None,
+            title: "Job".to_string(),
+            job_revision: None,
+            state: ObservationJobState::Unknown,
+            phase: None,
+            approval_status: default_unknown_token(),
+            execution_status: default_unknown_token(),
+            review_state: None,
+            created_at_ms: None,
+            updated_at_ms: None,
+            summary: None,
+        }
+    }
+}
+
+impl WorkspaceJobSummary {
+    /// Sanitizes identifiers, drops invalid `chat_identity`, and bounds `title` / `summary`.
+    pub fn normalized(&self) -> Self {
+        let valid_source = validate_workspace_source_id(&self.source_id)
+            .unwrap_or_else(|_| default_unknown_token());
+        let valid_job_id =
+            validate_correlation_id(&self.job_id).unwrap_or_else(default_unknown_token);
+        let valid_binding = self
+            .binding_id
+            .as_deref()
+            .and_then(|b| validate_workspace_binding_id(b).ok());
+        let valid_chat = self
+            .chat_identity
+            .clone()
+            .filter(|id| id.validate().is_ok() && id.source_id == valid_source);
+        Self {
+            source_id: valid_source,
+            job_id: valid_job_id,
+            binding_id: valid_binding,
+            chat_identity: valid_chat,
+            title: sanitize_observation_label(&self.title, "Job"),
+            job_revision: self.job_revision,
+            state: self.state,
+            phase: self
+                .phase
+                .as_deref()
+                .map(|p| sanitize_status_token(Some(p))),
+            approval_status: sanitize_status_token(Some(&self.approval_status)),
+            execution_status: sanitize_status_token(Some(&self.execution_status)),
+            review_state: self
+                .review_state
+                .as_deref()
+                .map(|r| sanitize_status_token(Some(r))),
+            created_at_ms: self.created_at_ms.filter(|&v| v > 0),
+            updated_at_ms: self.updated_at_ms.filter(|&v| v > 0),
+            summary: self
+                .summary
+                .as_deref()
+                .map(sanitize_workspace_summary)
+                .filter(|s| !s.is_empty()),
+        }
+    }
+}
+
+/// Explicit per-collection omission accounting when [`WorkspaceJobHistory`] hits ledger bounds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct WorkspaceJobHistoryTruncation {
+    /// Tasks omitted beyond [`MAX_WORKSPACE_TASKS_PER_JOB`] (`64`).
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub tasks_omitted: usize,
+    /// Task attempts omitted across tasks beyond [`MAX_WORKSPACE_ATTEMPTS_PER_TASK`] (`16`/task).
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub attempts_omitted: usize,
+    /// Task candidates omitted across tasks beyond [`MAX_WORKSPACE_CANDIDATES_PER_TASK`] (`16`/task).
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub candidates_omitted: usize,
+    /// Runs omitted beyond [`MAX_WORKSPACE_RUNS_PER_JOB`] (`256`).
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub runs_omitted: usize,
+    /// Outbox records omitted beyond [`MAX_WORKSPACE_OUTBOX_PER_JOB`] (`256`).
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub outbox_omitted: usize,
+    /// Combined candidates omitted beyond [`MAX_WORKSPACE_COMBINED_CANDIDATES_PER_JOB`] (`32`).
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub combined_candidates_omitted: usize,
+}
+
+/// Complete bounded job history projection (`<= 64` jobs/binding, `<= 500` total) with separated
+/// `job`, `tasks` (`current_attempt_no`, `attempts`, `candidates`), `runs`, `outbox`,
+/// `combined_candidates`, `result`, `links`, `historical_failure`, `current_attention`, and
+/// verified `acceptance_proof`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct WorkspaceJobHistory {
+    /// Job header summary.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub job: WorkspaceJobSummary,
+    /// Bounded task projections (`<= 64` tasks/job).
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub tasks: Vec<WorkspaceTaskHistory>,
+    /// Bounded core/worker run references (`<= 256` runs/job).
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub runs: Vec<WorkspaceRunRecord>,
+    /// Bounded durable outbox records (`<= 256` outbox records/job).
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub outbox: Vec<WorkspaceOutboxRecord>,
+    /// Bounded combined integration candidates (`<= 32` combined candidates/job).
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub combined_candidates: Vec<WorkspaceCombinedCandidate>,
+    /// Safe job result summary (distinct from `acceptance_proof`).
+    #[serde(default)]
+    pub result: Option<WorkspaceJobResult>,
+    /// Follow-up lineage and source record links.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub links: WorkspaceRecordLinks,
+    /// Historical job-level failure record (distinct from `current_attention`).
+    #[serde(default)]
+    pub historical_failure: Option<WorkspaceHistoricalFailure>,
+    /// Current live job-level attention state (distinct from `historical_failure`).
+    #[serde(default)]
+    pub current_attention: Option<WorkspaceAttentionState>,
+    /// Verified job-level acceptance proof (requires `combined_candidate_id` + `closure_verdict_id`).
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub acceptance_proof: WorkspaceAcceptanceProof,
+    /// Omission counts recorded when capping child collections.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub truncation: WorkspaceJobHistoryTruncation,
+}
+
+impl WorkspaceJobHistory {
+    /// Enforces all ledger-aligned bounds (`64` tasks/job, `16` attempts/task, `16` candidates/task,
+    /// `256` runs/job, `256` outbox/job, `32` combined candidates/job), sanitizes summaries, and
+    /// validates acceptance proofs.
+    pub fn normalized(&self) -> Self {
+        let tasks_omitted_extra = self.tasks.len().saturating_sub(MAX_WORKSPACE_TASKS_PER_JOB);
+        let mut tasks = Vec::with_capacity(self.tasks.len().min(MAX_WORKSPACE_TASKS_PER_JOB));
+        let mut attempts_omitted_extra = 0usize;
+        let mut candidates_omitted_extra = 0usize;
+        for raw_task in self.tasks.iter().take(MAX_WORKSPACE_TASKS_PER_JOB) {
+            let (norm_task, att_omitted, cand_omitted) = raw_task.normalized_with_omissions();
+            attempts_omitted_extra += att_omitted;
+            candidates_omitted_extra += cand_omitted;
+            tasks.push(norm_task);
+        }
+
+        let all_runs = self
+            .runs
+            .iter()
+            .map(WorkspaceRunRecord::normalized)
+            .collect();
+        let (runs, runs_omitted_extra) = cap_tail(all_runs, MAX_WORKSPACE_RUNS_PER_JOB);
+
+        let all_outbox = self
+            .outbox
+            .iter()
+            .map(WorkspaceOutboxRecord::normalized)
+            .collect();
+        let (outbox, outbox_omitted_extra) = cap_tail(all_outbox, MAX_WORKSPACE_OUTBOX_PER_JOB);
+
+        let all_combined = self
+            .combined_candidates
+            .iter()
+            .map(WorkspaceCombinedCandidate::normalized)
+            .collect();
+        let (combined_candidates, combined_omitted_extra) =
+            cap_tail(all_combined, MAX_WORKSPACE_COMBINED_CANDIDATES_PER_JOB);
+
+        Self {
+            job: self.job.normalized(),
+            tasks,
+            runs,
+            outbox,
+            combined_candidates,
+            result: self.result.as_ref().map(WorkspaceJobResult::normalized),
+            links: self.links.normalized(),
+            historical_failure: self
+                .historical_failure
+                .as_ref()
+                .map(WorkspaceHistoricalFailure::normalized),
+            current_attention: self
+                .current_attention
+                .as_ref()
+                .map(WorkspaceAttentionState::normalized),
+            acceptance_proof: self.acceptance_proof.normalized_for_job(),
+            truncation: WorkspaceJobHistoryTruncation {
+                tasks_omitted: self
+                    .truncation
+                    .tasks_omitted
+                    .saturating_add(tasks_omitted_extra),
+                attempts_omitted: self
+                    .truncation
+                    .attempts_omitted
+                    .saturating_add(attempts_omitted_extra),
+                candidates_omitted: self
+                    .truncation
+                    .candidates_omitted
+                    .saturating_add(candidates_omitted_extra),
+                runs_omitted: self
+                    .truncation
+                    .runs_omitted
+                    .saturating_add(runs_omitted_extra),
+                outbox_omitted: self
+                    .truncation
+                    .outbox_omitted
+                    .saturating_add(outbox_omitted_extra),
+                combined_candidates_omitted: self
+                    .truncation
+                    .combined_candidates_omitted
+                    .saturating_add(combined_omitted_extra),
+            },
+        }
+    }
+}
+
+/// Bounds job history projections to at most [`MAX_WORKSPACE_JOBS_PER_BINDING`] (`64`) per
+/// `(source_id, binding_id)` scope and at most [`MAX_OBSERVATION_JOBS`] (`500`) across the snapshot.
+pub fn bound_workspace_job_histories(
+    histories: Vec<WorkspaceJobHistory>,
+) -> (Vec<WorkspaceJobHistory>, usize) {
+    let mut normalized_all: Vec<WorkspaceJobHistory> = histories
+        .iter()
+        .map(WorkspaceJobHistory::normalized)
+        .collect();
+
+    normalized_all.sort_by(|left, right| {
+        right
+            .job
+            .updated_at_ms
+            .unwrap_or(i64::MIN)
+            .cmp(&left.job.updated_at_ms.unwrap_or(i64::MIN))
+            .then_with(|| left.job.source_id.cmp(&right.job.source_id))
+            .then_with(|| left.job.job_id.cmp(&right.job.job_id))
+    });
+
+    let mut per_binding_counts: std::collections::BTreeMap<(String, String), usize> =
+        std::collections::BTreeMap::new();
+    let mut retained = Vec::new();
+    let mut omitted = 0usize;
+
+    for item in normalized_all {
+        if let Some(binding_id) = &item.job.binding_id {
+            let key = (item.job.source_id.clone(), binding_id.clone());
+            let count = per_binding_counts.entry(key).or_insert(0);
+            if *count >= MAX_WORKSPACE_JOBS_PER_BINDING {
+                omitted += 1;
+                continue;
+            }
+            *count += 1;
+        }
+        if retained.len() >= MAX_OBSERVATION_JOBS {
+            omitted += 1;
+            continue;
+        }
+        retained.push(item);
+    }
+
+    (retained, omitted)
+}
+
+/// Permitted safe source kinds for [`WorkspaceMessageItem`] entries.
+///
+/// `Messages` may only be derived from existing safe summary, result, and question records.
+/// Raw provider transcripts and synthetic user messages are structurally excluded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceMessageSourceKind {
+    /// Safe summary from a durable work brief.
+    WorkBriefSummary,
+    /// Safe summary from a proposed or approved plan revision.
+    PlanSummary,
+    /// Safe prompt summary from a structured run/workflow question.
+    QuestionPrompt,
+    /// Safe answer summary recorded on a structured run/workflow question.
+    QuestionAnswer,
+    /// Safe task candidate/attempt outcome summary.
+    TaskResultSummary,
+    /// Safe Reviewer verdict summary.
+    ReviewVerdictSummary,
+    /// Safe single-Closure completion summary.
+    ClosureSummary,
+    /// Safe job-level outcome/delivery summary.
+    JobResultSummary,
+    /// Safe settled-block or hold attention summary.
+    AttentionSummary,
+    /// Safe `240`-character observation journal summary.
+    JournalSummary,
+    /// Degraded fallback when deserializing an unrecognized wire token (rejected during projection).
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
+impl WorkspaceMessageSourceKind {
+    /// Returns the canonical `snake_case` wire string.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::WorkBriefSummary => "work_brief_summary",
+            Self::PlanSummary => "plan_summary",
+            Self::QuestionPrompt => "question_prompt",
+            Self::QuestionAnswer => "question_answer",
+            Self::TaskResultSummary => "task_result_summary",
+            Self::ReviewVerdictSummary => "review_verdict_summary",
+            Self::ClosureSummary => "closure_summary",
+            Self::JobResultSummary => "job_result_summary",
+            Self::AttentionSummary => "attention_summary",
+            Self::JournalSummary => "journal_summary",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// Returns `true` only for the ten permitted safe summary/result/question sources.
+    pub const fn is_permitted_safe_source(self) -> bool {
+        !matches!(self, Self::Unknown)
+    }
+}
+
+/// Validates a wire string against the closed allowlist of safe `Messages` source kinds.
+///
+/// Explicitly rejects `"transcript"`, `"raw_transcript"`, `"provider_transcript"`,
+/// `"synthetic_user_message"`, `"unknown"`, and any other non-allowlisted kind.
+pub fn validate_safe_workspace_message_source(
+    raw_kind: &str,
+) -> Result<WorkspaceMessageSourceKind, WorkspaceContractError> {
+    match raw_kind.trim() {
+        "work_brief_summary" => Ok(WorkspaceMessageSourceKind::WorkBriefSummary),
+        "plan_summary" => Ok(WorkspaceMessageSourceKind::PlanSummary),
+        "question_prompt" => Ok(WorkspaceMessageSourceKind::QuestionPrompt),
+        "question_answer" => Ok(WorkspaceMessageSourceKind::QuestionAnswer),
+        "task_result_summary" => Ok(WorkspaceMessageSourceKind::TaskResultSummary),
+        "review_verdict_summary" => Ok(WorkspaceMessageSourceKind::ReviewVerdictSummary),
+        "closure_summary" => Ok(WorkspaceMessageSourceKind::ClosureSummary),
+        "job_result_summary" => Ok(WorkspaceMessageSourceKind::JobResultSummary),
+        "attention_summary" => Ok(WorkspaceMessageSourceKind::AttentionSummary),
+        "journal_summary" => Ok(WorkspaceMessageSourceKind::JournalSummary),
+        other => Err(WorkspaceContractError::ForbiddenMessageSource(
+            other.to_string(),
+        )),
+    }
+}
+
+/// Deterministic source ordering tuple for a [`WorkspaceMessageItem`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct WorkspaceMessageSourceOrder {
+    /// Upstream recorded timestamp in milliseconds since Unix epoch, if known.
+    #[serde(default)]
+    pub recorded_at_ms: Option<i64>,
+    /// Monotonic sequence or revision number within the source ledger (`0` when unsequenced).
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub source_seq: u64,
+    /// Secondary sub-record index (for example `0` = question prompt, `1` = question answer).
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub sub_index: u32,
+}
+
+/// Scope metadata binding a [`WorkspaceMessageItem`] to its exact source, chat, job, task, and run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct WorkspaceMessageScope {
+    /// Observation source identifier.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub source_id: String,
+    /// Optional scoped software `binding_id`.
+    #[serde(default)]
+    pub binding_id: Option<String>,
+    /// Optional canonical `thread_uuid`.
+    #[serde(default)]
+    pub thread_uuid: Option<String>,
+    /// Optional verified canonical project scope path.
+    #[serde(default)]
+    pub canonical_project_scope: Option<String>,
+    /// Populated only when all four verified chat identity components are valid.
+    #[serde(default)]
+    pub chat_identity: Option<WorkspaceChatIdentity>,
+    /// Optional correlated `job_id`.
+    #[serde(default)]
+    pub job_id: Option<String>,
+    /// Optional correlated `task_id`.
+    #[serde(default)]
+    pub task_id: Option<String>,
+    /// Optional correlated `run_id`.
+    #[serde(default)]
+    pub run_id: Option<String>,
+    /// Optional correlated 1-based task attempt number.
+    #[serde(default)]
+    pub attempt_no: Option<u32>,
+}
+
+impl WorkspaceMessageScope {
+    /// Normalizes scope identifiers and derives `chat_identity` iff all four canonical fields pass validation.
+    pub fn normalized(&self) -> (Self, Vec<String>) {
+        let mut missing = Vec::new();
+        let source_id = match validate_workspace_source_id(&self.source_id) {
+            Ok(id) => id,
+            Err(_) => {
+                missing.push("source_id".to_string());
+                default_unknown_token()
+            }
+        };
+        let binding_id = match &self.binding_id {
+            Some(raw) => match validate_workspace_binding_id(raw) {
+                Ok(id) => Some(id),
+                Err(_) => {
+                    missing.push("binding_id".to_string());
+                    None
+                }
+            },
+            None => {
+                missing.push("binding_id".to_string());
+                None
+            }
+        };
+        let thread_uuid = match &self.thread_uuid {
+            Some(raw) => match validate_workspace_thread_uuid(raw) {
+                Ok(id) => Some(id),
+                Err(_) => {
+                    missing.push("thread_uuid".to_string());
+                    None
+                }
+            },
+            None => {
+                missing.push("thread_uuid".to_string());
+                None
+            }
+        };
+        let canonical_project_scope = match &self.canonical_project_scope {
+            Some(raw) => match validate_canonical_project_scope(raw) {
+                Ok(path) => Some(path),
+                Err(_) => {
+                    missing.push("canonical_project_scope".to_string());
+                    None
+                }
+            },
+            None => {
+                missing.push("canonical_project_scope".to_string());
+                None
+            }
+        };
+
+        let explicit_valid = self.chat_identity.clone().filter(|id| {
+            id.validate().is_ok()
+                && id.source_id == source_id
+                && binding_id.as_deref() == Some(id.binding_id.as_str())
+                && thread_uuid.as_deref() == Some(id.thread_uuid.as_str())
+                && canonical_project_scope.as_deref() == Some(id.canonical_project_scope.as_str())
+        });
+        let derived_chat = explicit_valid.or_else(|| {
+            match (
+                binding_id.as_deref(),
+                thread_uuid.as_deref(),
+                canonical_project_scope.as_deref(),
+            ) {
+                (Some(b), Some(t), Some(p)) => WorkspaceChatIdentity::new(&source_id, b, t, p).ok(),
+                _ => None,
+            }
+        });
+
+        let scope = Self {
+            source_id,
+            binding_id,
+            thread_uuid,
+            canonical_project_scope,
+            chat_identity: derived_chat,
+            job_id: self.job_id.as_deref().and_then(validate_correlation_id),
+            task_id: self.task_id.as_deref().and_then(validate_correlation_id),
+            run_id: self.run_id.as_deref().and_then(validate_correlation_id),
+            attempt_no: self.attempt_no,
+        };
+        (scope, missing)
+    }
+}
+
+/// Truncation, redaction, and missing-provenance metadata attached to a [`WorkspaceMessageItem`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceMessageCompleteness {
+    /// Whether `summary` was truncated to fit [`MAX_OBSERVATION_SUMMARY_CHARS`] (`240` chars).
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub summary_truncated: bool,
+    /// Original character count prior to truncation when known.
+    #[serde(default)]
+    pub original_char_count: Option<usize>,
+    /// Character cap enforced on `summary` (`240`).
+    #[serde(default = "default_max_summary_chars")]
+    pub max_summary_chars: usize,
+    /// Whether `summary` was replaced due to sensitive marker detection.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub redacted: bool,
+    /// Missing optional scope or ordering field names (`binding_id`, `recorded_at_ms`, etc.).
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub missing_fields: Vec<String>,
+    /// Optional safe explanation when the upstream record was partial or degraded (`<= 240` chars).
+    #[serde(default)]
+    pub incomplete_reason: Option<String>,
+}
+
+impl Default for WorkspaceMessageCompleteness {
+    fn default() -> Self {
+        Self {
+            summary_truncated: false,
+            original_char_count: None,
+            max_summary_chars: MAX_OBSERVATION_SUMMARY_CHARS,
+            redacted: false,
+            missing_fields: Vec::new(),
+            incomplete_reason: None,
+        }
+    }
+}
+
+/// Single safe summary/result/question item projected into [`WorkspaceMessagesWindow::items`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct WorkspaceMessageItem {
+    /// Deterministic item identifier (`wmsg:v1:...`) derived from source scope, kind, and record ID.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub item_id: String,
+    /// Permitted safe source kind (`work_brief_summary`, `question_prompt`, `closure_summary`, etc.).
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub source_kind: WorkspaceMessageSourceKind,
+    /// Stable upstream source record identifier (`brief_id`, `question_id`, `verdict_id`, `record_id`, etc.).
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub source_record_id: String,
+    /// Deterministic ordering coordinates within the source ledger.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub source_order: WorkspaceMessageSourceOrder,
+    /// Scoped provenance (`source_id`, `binding_id`, `thread_uuid`, `canonical_project_scope`, `job_id`, `task_id`, `run_id`).
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub scope: WorkspaceMessageScope,
+    /// Optional safe workflow/actor role token (`coworker`, `orchestrator`, `architect`, `coder`, `reviewer`, `closure`, `operator`); never fabricates a synthetic human transcript turn.
+    #[serde(default)]
+    pub actor_role: Option<String>,
+    /// Sanitized safe summary (`<= 240` Unicode scalar values).
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub summary: String,
+    /// Truncation, redaction, and missing-field metadata.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub completeness: WorkspaceMessageCompleteness,
+}
+
+/// Input specification for projecting a validated [`WorkspaceMessageItem`] from a safe source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceMessageCandidateInput {
+    /// Wire source kind string (validated against [`validate_safe_workspace_message_source`]).
+    pub source_kind: String,
+    /// Stable upstream source record identifier.
+    pub source_record_id: String,
+    /// Ordering metadata from the source record.
+    pub source_order: WorkspaceMessageSourceOrder,
+    /// Scope metadata for this item.
+    pub scope: WorkspaceMessageScope,
+    /// Optional safe workflow/actor role token.
+    pub actor_role: Option<String>,
+    /// Raw summary text to sanitize and bound to `240` chars.
+    pub raw_summary: String,
+    /// Whether the upstream source text was already pre-truncated before reaching this projection.
+    pub upstream_truncated: bool,
+    /// Optional safe reason when upstream data was incomplete.
+    pub incomplete_reason: Option<String>,
+}
+
+fn format_workspace_message_item_id(
+    source_id: &str,
+    source_kind: WorkspaceMessageSourceKind,
+    source_record_id: &str,
+    sub_index: u32,
+) -> String {
+    let kind_str = source_kind.as_str();
+    format!(
+        "wmsg:v1:{}:{}:{}:{}:{}:{}:{}",
+        source_id.len(),
+        source_id,
+        kind_str.len(),
+        kind_str,
+        source_record_id.len(),
+        source_record_id,
+        sub_index,
+    )
+}
+
+fn compare_workspace_messages(
+    left: &WorkspaceMessageItem,
+    right: &WorkspaceMessageItem,
+) -> std::cmp::Ordering {
+    let left_has_ts = left.source_order.recorded_at_ms.is_some();
+    let right_has_ts = right.source_order.recorded_at_ms.is_some();
+    left_has_ts
+        .cmp(&right_has_ts)
+        .then_with(|| {
+            left.source_order
+                .recorded_at_ms
+                .unwrap_or(0)
+                .cmp(&right.source_order.recorded_at_ms.unwrap_or(0))
+        })
+        .then_with(|| {
+            left.source_order
+                .source_seq
+                .cmp(&right.source_order.source_seq)
+        })
+        .then_with(|| {
+            left.source_order
+                .sub_index
+                .cmp(&right.source_order.sub_index)
+        })
+        .then_with(|| left.scope.source_id.cmp(&right.scope.source_id))
+        .then_with(|| left.source_kind.as_str().cmp(right.source_kind.as_str()))
+        .then_with(|| left.source_record_id.cmp(&right.source_record_id))
+        .then_with(|| left.item_id.cmp(&right.item_id))
+}
+
+impl WorkspaceMessageItem {
+    /// Constructs a validated [`WorkspaceMessageItem`] from a safe summary/result/question source.
+    ///
+    /// Rejects raw transcript and synthetic user message kinds as well as invalid `source_record_id`
+    /// or `scope.source_id` values.
+    pub fn from_safe_input(
+        input: WorkspaceMessageCandidateInput,
+    ) -> Result<Self, WorkspaceContractError> {
+        let kind = validate_safe_workspace_message_source(&input.source_kind)?;
+        let _ = validate_workspace_source_id(&input.scope.source_id)?;
+        let Some(clean_record_id) = validate_correlation_id(&input.source_record_id) else {
+            return Err(WorkspaceContractError::InvalidNativeSample(
+                "message source_record_id must be a valid non-empty ASCII identifier".to_string(),
+            ));
+        };
+        let (norm_scope, mut missing_fields) = input.scope.normalized();
+        let recorded_at_ms = input.source_order.recorded_at_ms.filter(|&v| v > 0);
+        if recorded_at_ms.is_none() {
+            missing_fields.push("recorded_at_ms".to_string());
+        }
+        let sanitized = sanitize_workspace_summary_with_meta(&input.raw_summary);
+        let order = WorkspaceMessageSourceOrder {
+            recorded_at_ms,
+            source_seq: input.source_order.source_seq,
+            sub_index: input.source_order.sub_index,
+        };
+        let item_id = format_workspace_message_item_id(
+            &norm_scope.source_id,
+            kind,
+            &clean_record_id,
+            order.sub_index,
+        );
+        let incomplete_reason = input
+            .incomplete_reason
+            .as_deref()
+            .map(sanitize_workspace_summary)
+            .filter(|s| !s.is_empty());
+
+        Ok(Self {
+            item_id,
+            source_kind: kind,
+            source_record_id: clean_record_id,
+            source_order: order,
+            scope: norm_scope,
+            actor_role: input
+                .actor_role
+                .as_deref()
+                .and_then(validate_correlation_id),
+            summary: sanitized.summary,
+            completeness: WorkspaceMessageCompleteness {
+                summary_truncated: sanitized.truncated || input.upstream_truncated,
+                original_char_count: sanitized.original_char_count,
+                max_summary_chars: MAX_OBSERVATION_SUMMARY_CHARS,
+                redacted: sanitized.redacted,
+                missing_fields,
+                incomplete_reason,
+            },
+        })
+    }
+
+    /// Normalizes a deserialized [`WorkspaceMessageItem`], returning `None` if its `source_kind` is
+    /// not a permitted safe source or its `source_record_id` / `scope.source_id` is invalid.
+    pub fn normalized_safe(&self) -> Option<Self> {
+        if !self.source_kind.is_permitted_safe_source() {
+            return None;
+        }
+        let _ = validate_workspace_source_id(&self.scope.source_id).ok()?;
+        let clean_record_id = validate_correlation_id(&self.source_record_id)?;
+        let (norm_scope, mut missing_fields) = self.scope.normalized();
+        for existing in &self.completeness.missing_fields {
+            if let Some(clean_name) = validate_correlation_id(existing) {
+                if !missing_fields.contains(&clean_name) {
+                    missing_fields.push(clean_name);
+                }
+            }
+        }
+        let recorded_at_ms = self.source_order.recorded_at_ms.filter(|&v| v > 0);
+        if recorded_at_ms.is_none() && !missing_fields.iter().any(|f| f == "recorded_at_ms") {
+            missing_fields.push("recorded_at_ms".to_string());
+        }
+        let sanitized = sanitize_workspace_summary_with_meta(&self.summary);
+        let order = WorkspaceMessageSourceOrder {
+            recorded_at_ms,
+            source_seq: self.source_order.source_seq,
+            sub_index: self.source_order.sub_index,
+        };
+        let item_id = format_workspace_message_item_id(
+            &norm_scope.source_id,
+            self.source_kind,
+            &clean_record_id,
+            order.sub_index,
+        );
+        let original_char_count = match (
+            self.completeness.original_char_count,
+            sanitized.original_char_count,
+        ) {
+            (_, None) => None,
+            (Some(prev), Some(curr)) => Some(prev.max(curr)),
+            (None, Some(curr)) => Some(curr),
+        };
+        let incomplete_reason = clean_opt_summary(self.completeness.incomplete_reason.as_deref());
+        Some(Self {
+            item_id,
+            source_kind: self.source_kind,
+            source_record_id: clean_record_id,
+            source_order: order,
+            scope: norm_scope,
+            actor_role: clean_opt_id(self.actor_role.as_deref()),
+            summary: sanitized.summary,
+            completeness: WorkspaceMessageCompleteness {
+                summary_truncated: self.completeness.summary_truncated || sanitized.truncated,
+                original_char_count,
+                max_summary_chars: MAX_OBSERVATION_SUMMARY_CHARS,
+                redacted: self.completeness.redacted || sanitized.redacted,
+                missing_fields,
+                incomplete_reason,
+            },
+        })
+    }
+}
+
+/// Bounded (`<= 1,000` items) safe `Messages` window carried by [`WorkspaceSnapshot::messages`].
+///
+/// Never requires raw provider transcripts (`requires_transcript == false`) and never permits
+/// synthetic user messages (`allows_synthetic_user_messages == false`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceMessagesWindow {
+    /// Window availability (`unavailable` when omitted on legacy snapshots; `available` when projected).
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub availability: WorkspaceAvailabilityState,
+    /// Ordered safe message items (`<= 1,000`).
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub items: Vec<WorkspaceMessageItem>,
+    /// Enforced window cap (`1,000`).
+    #[serde(default = "default_max_messages_window")]
+    pub max_items: usize,
+    /// Count of older or invalid items omitted from `items`.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub omitted_count: usize,
+    /// Whether additional safe items exist outside this window.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub has_more: bool,
+    /// Whether `items` was truncated at `max_items` or omitted unsafe entries.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub truncated: bool,
+    /// Structural invariant: `Messages` never requires raw provider conversation transcripts (`false`).
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub requires_transcript: bool,
+    /// Structural invariant: `Messages` never synthesizes human user messages (`false`).
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub allows_synthetic_user_messages: bool,
+}
+
+impl Default for WorkspaceMessagesWindow {
+    fn default() -> Self {
+        Self {
+            availability: WorkspaceAvailabilityState::Unavailable,
+            items: Vec::new(),
+            max_items: MAX_WORKSPACE_MESSAGES_WINDOW,
+            omitted_count: 0,
+            has_more: false,
+            truncated: false,
+            requires_transcript: false,
+            allows_synthetic_user_messages: false,
+        }
+    }
+}
+
+impl WorkspaceMessagesWindow {
+    /// Normalizes, deduplicates by `item_id`, deterministically orders, and bounds `items` to
+    /// [`MAX_WORKSPACE_MESSAGES_WINDOW`] (`1,000`), forcing transcript/synthetic flags to `false`.
+    pub fn normalized(&self) -> Self {
+        let mut dropped_invalid = 0usize;
+        let mut by_id: std::collections::BTreeMap<String, WorkspaceMessageItem> =
+            std::collections::BTreeMap::new();
+        for raw in &self.items {
+            match raw.normalized_safe() {
+                Some(clean) => {
+                    by_id.insert(clean.item_id.clone(), clean);
+                }
+                None => {
+                    dropped_invalid += 1;
+                }
+            }
+        }
+        let mut ordered: Vec<WorkspaceMessageItem> = by_id.into_values().collect();
+        ordered.sort_by(compare_workspace_messages);
+
+        let window_overflow = ordered.len().saturating_sub(MAX_WORKSPACE_MESSAGES_WINDOW);
+        if window_overflow > 0 {
+            ordered.drain(0..window_overflow);
+        }
+
+        let omitted_count = self
+            .omitted_count
+            .saturating_add(dropped_invalid)
+            .saturating_add(window_overflow);
+        let has_more = self.has_more || window_overflow > 0;
+        let truncated = self.truncated || omitted_count > 0;
+
+        Self {
+            availability: self.availability,
+            items: ordered,
+            max_items: MAX_WORKSPACE_MESSAGES_WINDOW,
+            omitted_count,
+            has_more,
+            truncated,
+            requires_transcript: false,
+            allows_synthetic_user_messages: false,
+        }
+    }
+}
+
+/// Projects a deterministic, bounded (`<= 1,000` items) [`WorkspaceMessagesWindow`] strictly from
+/// safe summary, result, and question sources.
+pub fn project_safe_workspace_messages(
+    inputs: Vec<WorkspaceMessageCandidateInput>,
+) -> Result<WorkspaceMessagesWindow, WorkspaceContractError> {
+    let mut items = Vec::with_capacity(inputs.len());
+    for input in inputs {
+        items.push(WorkspaceMessageItem::from_safe_input(input)?);
+    }
+    let raw_window = WorkspaceMessagesWindow {
+        availability: WorkspaceAvailabilityState::Available,
+        items,
+        max_items: MAX_WORKSPACE_MESSAGES_WINDOW,
+        omitted_count: 0,
+        has_more: false,
+        truncated: false,
+        requires_transcript: false,
+        allows_synthetic_user_messages: false,
+    };
+    Ok(raw_window.normalized())
+}
+
+/// Top-level truncation and bound accounting on [`WorkspaceSnapshot`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct WorkspaceSnapshotBounds {
+    /// Native samples omitted due to validation or the `128`/source cap.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub native_samples_omitted: usize,
+    /// Job history projections omitted due to the `64`/binding or `500`/snapshot cap.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub job_histories_omitted: usize,
+    /// Message items omitted from [`WorkspaceSnapshot::messages`] (`1,000` cap).
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub messages_omitted: usize,
+    /// Whether `observation.requests` was capped at [`MAX_OBSERVATION_REQUEST_PAGE_LIMIT`] (`200`).
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub requests_capped: bool,
+    /// Whether `observation.jobs` was capped at [`MAX_OBSERVATION_JOBS`] (`500`).
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub jobs_capped: bool,
+}
+
+/// Separate read-only workspace observation envelope that embeds [`ObservationSnapshot`] without
+/// altering [`ObservationSnapshot`] or [`ObservationActor`] wire shapes or struct literals.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceSnapshot {
+    /// Wire schema version (`1`).
+    #[serde(default = "default_workspace_schema_version")]
+    pub schema_version: u32,
+    /// Timestamp (ms since Unix epoch) when this envelope was assembled.
+    ///
+    /// Assembling or regenerating a [`WorkspaceSnapshot`] never resets native sample age.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub generated_at_ms: i64,
+    /// Native sampling and staleness policy (`2 s` interval, `750 ms` metadata timeout, `10 s` stale threshold).
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub sampling_policy: WorkspaceSamplingPolicy,
+    /// Preserved backward-compatible [`ObservationSnapshot`] payload.
+    #[serde(default = "default_empty_observation_snapshot")]
+    pub observation: ObservationSnapshot,
+    /// Canonical chat summaries keyed by `(source_id, binding_id, thread_uuid, canonical_project_scope)`.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub chats: Vec<WorkspaceChatSummary>,
+    /// Native conversation samples (`<= 128` per source, each sidecar `<= 64 KiB`).
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub native_samples: Vec<WorkspaceNativeSample>,
+    /// Structured job history projections (`<= 64` per binding, `<= 500` total).
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub job_histories: Vec<WorkspaceJobHistory>,
+    /// Safe `Messages` window (`<= 1,000` items; never requires transcripts or synthetic user messages).
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub messages: WorkspaceMessagesWindow,
+    /// Explicit truncation and bound accounting across all projected windows.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub bounds: WorkspaceSnapshotBounds,
+}
+
+impl WorkspaceSnapshot {
+    /// Creates a minimal normalized [`WorkspaceSnapshot`] around an existing [`ObservationSnapshot`].
+    pub fn new(generated_at_ms: i64, observation: ObservationSnapshot) -> Self {
+        Self {
+            schema_version: WORKSPACE_SNAPSHOT_SCHEMA_VERSION,
+            generated_at_ms,
+            sampling_policy: WorkspaceSamplingPolicy::default(),
+            observation,
+            chats: Vec::new(),
+            native_samples: Vec::new(),
+            job_histories: Vec::new(),
+            messages: WorkspaceMessagesWindow::default(),
+            bounds: WorkspaceSnapshotBounds::default(),
+        }
+        .normalized()
+    }
+
+    /// Upgrades a legacy [`ObservationSnapshot`] into a [`WorkspaceSnapshot`] where missing new
+    /// surfaces (`native_samples`, `messages`, unverified chat/job fields) degrade safely to
+    /// `unknown` / `unavailable`.
+    pub fn from_legacy_observation(observation: ObservationSnapshot) -> Self {
+        let generated_at_ms = observation.generated_at_ms;
+        let mut source_paths: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
+        for src in &observation.sources {
+            if let Some(path) = &src.project_path {
+                if let Ok(clean_path) = validate_canonical_project_scope(path) {
+                    source_paths.insert(src.id.clone(), clean_path);
+                }
+            }
+        }
+
+        let mut chats_by_key: std::collections::BTreeMap<String, WorkspaceChatSummary> =
+            std::collections::BTreeMap::new();
+        let mut histories = Vec::new();
+
+        for job in &observation.jobs {
+            let scope_path = job
+                .project_path
+                .as_deref()
+                .and_then(|p| validate_canonical_project_scope(p).ok())
+                .or_else(|| source_paths.get(&job.source_id).cloned());
+
+            let maybe_identity = match (
+                job.binding_id.as_deref(),
+                job.thread_uuid.as_deref(),
+                scope_path.as_deref(),
+            ) {
+                (Some(b), Some(t), Some(p)) => {
+                    WorkspaceChatIdentity::new(&job.source_id, b, t, p).ok()
+                }
+                _ => None,
+            };
+
+            if let Some(identity) = &maybe_identity {
+                if let Some(key) = identity.canonical_key() {
+                    let is_active = matches!(
+                        job.state,
+                        ObservationJobState::Planning
+                            | ObservationJobState::Ready
+                            | ObservationJobState::Running
+                            | ObservationJobState::Reviewing
+                            | ObservationJobState::NeedsUser
+                    ) || job.active_call_count > 0;
+                    let needs_attention = job.state == ObservationJobState::NeedsUser;
+                    let entry = chats_by_key
+                        .entry(key)
+                        .or_insert_with(|| WorkspaceChatSummary {
+                            identity: identity.clone(),
+                            thread_label: sanitize_observation_label(
+                                job.thread_label.as_deref().unwrap_or("Codex chat"),
+                                "Codex chat",
+                            ),
+                            project_label: sanitize_observation_label(
+                                &job.project_label,
+                                "Project",
+                            ),
+                            availability: WorkspaceAvailabilityState::Unavailable,
+                            activity: WorkspaceActivityState::Unknown,
+                            configured_selection: WorkspaceConfiguredSelection::unavailable(),
+                            active_job_count: 0,
+                            attention_count: 0,
+                            updated_at_ms: job.updated_at_ms,
+                        });
+                    if is_active {
+                        entry.active_job_count += 1;
+                    }
+                    if needs_attention {
+                        entry.attention_count += 1;
+                    }
+                    if let Some(ts) = job.updated_at_ms {
+                        if entry.updated_at_ms.is_none_or(|prev| ts > prev) {
+                            entry.updated_at_ms = Some(ts);
+                        }
+                    }
+                }
+            }
+
+            let tasks = job
+                .tasks
+                .iter()
+                .map(|t| WorkspaceTaskHistory {
+                    task_id: t.id.clone(),
+                    title: t.title.clone(),
+                    status: t.status.clone(),
+                    depends_on: t.depends_on.clone(),
+                    ..WorkspaceTaskHistory::default()
+                })
+                .collect();
+
+            histories.push(WorkspaceJobHistory {
+                job: WorkspaceJobSummary {
+                    source_id: job.source_id.clone(),
+                    job_id: job.id.clone(),
+                    binding_id: job.binding_id.clone(),
+                    chat_identity: maybe_identity,
+                    title: job.title.clone(),
+                    job_revision: None,
+                    state: job.state,
+                    phase: None,
+                    approval_status: job.approval_status.clone(),
+                    execution_status: job.execution_status.clone(),
+                    review_state: job.review_state.clone(),
+                    created_at_ms: None,
+                    updated_at_ms: job.updated_at_ms,
+                    summary: job.summary.clone(),
+                },
+                tasks,
+                links: WorkspaceRecordLinks {
+                    source_plan_id: job.plan_id.clone(),
+                    source_plan_revision: job.plan_revision,
+                    ..WorkspaceRecordLinks::default()
+                },
+                acceptance_proof: WorkspaceAcceptanceProof::unknown(),
+                ..WorkspaceJobHistory::default()
+            });
+        }
+
+        Self {
+            schema_version: WORKSPACE_SNAPSHOT_SCHEMA_VERSION,
+            generated_at_ms,
+            sampling_policy: WorkspaceSamplingPolicy::default(),
+            observation,
+            chats: chats_by_key.into_values().collect(),
+            native_samples: Vec::new(),
+            job_histories: histories,
+            messages: WorkspaceMessagesWindow::default(),
+            bounds: WorkspaceSnapshotBounds::default(),
+        }
+        .normalized()
+    }
+
+    /// Normalizes all nested bounds, chat identities, sample freshness states (at `generated_at_ms`),
+    /// job history projections, and safe `Messages` items without ever mutating
+    /// `native_samples[*].observed_at_ms` or `native_samples[*].last_success_at_ms`.
+    pub fn normalized(&self) -> Self {
+        let policy = self.sampling_policy.normalized();
+
+        let mut observation = self.observation.clone();
+        let mut jobs_capped = false;
+        if observation.jobs.len() > MAX_OBSERVATION_JOBS {
+            observation.jobs.truncate(MAX_OBSERVATION_JOBS);
+            observation.jobs_has_more = true;
+            jobs_capped = true;
+        }
+        let mut requests_capped = false;
+        if observation.requests.len() > MAX_OBSERVATION_REQUEST_PAGE_LIMIT {
+            observation
+                .requests
+                .truncate(MAX_OBSERVATION_REQUEST_PAGE_LIMIT);
+            observation.has_more = true;
+            requests_capped = true;
+        }
+
+        let (native_samples, samples_omitted) =
+            bound_workspace_native_samples_per_source(self.native_samples.clone());
+
+        let mut evaluated_by_chat: std::collections::BTreeMap<
+            String,
+            (&WorkspaceNativeSample, WorkspaceEvaluatedNativeSample),
+        > = std::collections::BTreeMap::new();
+        for sample in &native_samples {
+            if let Some(chat_key) = sample.chat_identity.canonical_key() {
+                let eval = sample.evaluate_at(self.generated_at_ms, policy.stale_threshold_ms);
+                evaluated_by_chat.insert(chat_key, (sample, eval));
+            }
+        }
+
+        let mut chats_by_key: std::collections::BTreeMap<String, WorkspaceChatSummary> =
+            std::collections::BTreeMap::new();
+        for chat in &self.chats {
+            let norm_chat = chat.normalized();
+            let Some(chat_key) = norm_chat.identity.canonical_key() else {
+                continue;
+            };
+            chats_by_key.insert(chat_key, norm_chat);
+        }
+
+        for (chat_key, (sample, eval)) in &evaluated_by_chat {
+            let entry =
+                chats_by_key
+                    .entry(chat_key.clone())
+                    .or_insert_with(|| WorkspaceChatSummary {
+                        identity: sample.chat_identity.clone(),
+                        thread_label: "Codex chat".to_string(),
+                        project_label: "Project".to_string(),
+                        availability: eval.effective_availability,
+                        activity: eval.effective_activity,
+                        configured_selection: eval.effective_configured_selection.clone(),
+                        active_job_count: 0,
+                        attention_count: 0,
+                        updated_at_ms: sample.observed_at_ms,
+                    });
+            entry.availability = eval.effective_availability;
+            entry.activity = eval.effective_activity;
+            entry.configured_selection = eval.effective_configured_selection.clone();
+            if let Some(obs_ms) = sample.observed_at_ms {
+                if entry.updated_at_ms.is_none_or(|prev| obs_ms > prev) {
+                    entry.updated_at_ms = Some(obs_ms);
+                }
+            }
+        }
+
+        let chats: Vec<WorkspaceChatSummary> = chats_by_key.into_values().collect();
+        let (job_histories, jobs_hist_omitted) =
+            bound_workspace_job_histories(self.job_histories.clone());
+        let messages = self.messages.normalized();
+
+        let bounds = WorkspaceSnapshotBounds {
+            native_samples_omitted: self
+                .bounds
+                .native_samples_omitted
+                .saturating_add(samples_omitted),
+            job_histories_omitted: self
+                .bounds
+                .job_histories_omitted
+                .saturating_add(jobs_hist_omitted),
+            messages_omitted: messages.omitted_count,
+            requests_capped: self.bounds.requests_capped || requests_capped,
+            jobs_capped: self.bounds.jobs_capped || jobs_capped,
+        };
+
+        Self {
+            schema_version: WORKSPACE_SNAPSHOT_SCHEMA_VERSION,
+            generated_at_ms: self.generated_at_ms,
+            sampling_policy: policy,
+            observation,
+            chats,
+            native_samples,
+            job_histories,
+            messages,
+            bounds,
+        }
+    }
+
+    /// Re-assembles this [`WorkspaceSnapshot`] at `next_generated_at_ms`, updating `generated_at_ms`
+    /// and re-evaluating sample staleness while preserving every sample's original `observed_at_ms`
+    /// and `last_success_at_ms`.
+    pub fn regenerate_at(&self, next_generated_at_ms: i64) -> Self {
+        let mut next = self.clone();
+        next.generated_at_ms = next_generated_at_ms;
+        next.observation.generated_at_ms = next_generated_at_ms;
+        next.normalized()
+    }
+}
+
+/// Parses either a [`WorkspaceSnapshot`] JSON envelope or a bare legacy [`ObservationSnapshot`]
+/// JSON payload, normalizing missing fields safely to `unknown` / `unavailable`.
+pub fn parse_workspace_snapshot_json(
+    raw_json: &str,
+) -> Result<WorkspaceSnapshot, serde_json::Error> {
+    let value: serde_json::Value = serde_json::from_str(raw_json)?;
+    if let serde_json::Value::Object(ref map) = value {
+        let has_workspace_observation = map
+            .get("observation")
+            .is_some_and(serde_json::Value::is_object);
+        let looks_like_legacy_observation = !has_workspace_observation
+            && (map.contains_key("sources")
+                || map.contains_key("requests")
+                || (map.contains_key("jobs") && !map.contains_key("job_histories")));
+        if looks_like_legacy_observation {
+            let legacy: ObservationSnapshot = serde_json::from_value(value)?;
+            return Ok(WorkspaceSnapshot::from_legacy_observation(legacy));
+        }
+    }
+    let snapshot: WorkspaceSnapshot = serde_json::from_value(value)?;
+    Ok(snapshot.normalized())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

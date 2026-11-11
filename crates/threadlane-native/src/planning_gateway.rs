@@ -35,7 +35,10 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use threadlane_authority::validation::validate_canonical_thread_uuid;
-use threadlane_workflow::{Difficulty, PlanStatus, ToolAdapter, WorkflowRole};
+use threadlane_workflow::{
+    ensure_mcp_response_budget, measure_mcp_response_bytes, Difficulty, PlanStatus, ScopedWorkflow,
+    ToolAdapter, WorkflowError, WorkflowRole, MAX_MCP_RESPONSE_BYTES,
+};
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
@@ -47,12 +50,13 @@ use crate::coworker_workflow::{
     validate_unique_id_list, validate_unique_text_list, verify_grant_registry_dependencies,
     ArchitectAdviceRecord, ArchitectConsultationRequestOutcome, ArchitectContextDependencies,
     ArchitectDecisionStatus, CanonicalProjectBaseRef, CoworkerBindingLedger, CoworkerJobPhase,
-    CoworkerJobRecord, CoworkerPlanningService, CoworkerTaskStage, CoworkerWorkflowStore,
-    CreateCoworkerJobRequest, HumanClarificationRequestOutcome, OrchestrateWorkBriefPlanRequest,
-    PersistedPlanningCallArtifact, PlanningAdviceGrant, PlanningArtifactOutcomeKind,
-    PlanningGrantStatus, PlanningResultRef, PriorArchitectAdviceContext, RunArchitectAdviceRequest,
-    StructuredArchitectAdviceOutput, StructuredOrchestratorOutput, WorkBrief, WorkBriefKind,
-    MAX_ARCHITECT_ADVICE_RECORDS_PER_BINDING, MAX_COWORKER_ID_LEN,
+    CoworkerJobRecord, CoworkerOwnershipSummary, CoworkerPlanningService, CoworkerTaskStage,
+    CoworkerWorkflowStore, CreateCoworkerJobRequest, HumanClarificationRequestOutcome,
+    OrchestrateWorkBriefPlanRequest, PersistedPlanningCallArtifact, PlanningAdviceGrant,
+    PlanningArtifactOutcomeKind, PlanningCallBudget, PlanningGrantStatus, PlanningGrantUsage,
+    PlanningReadOnlyCapabilities, PlanningResultRef, PriorArchitectAdviceContext,
+    RunArchitectAdviceRequest, StructuredArchitectAdviceOutput, StructuredOrchestratorOutput,
+    WorkBrief, WorkBriefKind, MAX_ARCHITECT_ADVICE_RECORDS_PER_BINDING, MAX_COWORKER_ID_LEN,
     MAX_ORCHESTRATOR_ARCHITECT_ROUNDS, MAX_PLANNING_ARTIFACT_BYTES, MAX_TASKS_PER_JOB,
     MAX_WORK_BRIEF_ITEMS,
 };
@@ -470,7 +474,953 @@ impl CoworkerArchitectAdviceSummary {
     }
 }
 
+/// Default dual-envelope (`structuredContent` + escaped `content[0].text`) wire byte budget per
+/// free-form text field in `coworker_status` projections before whole-envelope byte fitting.
+pub const DEFAULT_COWORKER_STATUS_TEXT_WIRE_BUDGET_BYTES: usize = 512;
+
+/// Decreasing dual-envelope wire byte budgets tried per text field if single-row `coworker_status`
+/// projections still approach [`MAX_MCP_RESPONSE_BYTES`].
+const STATUS_TEXT_WIRE_BUDGET_STEPS: [usize; 5] = [
+    DEFAULT_COWORKER_STATUS_TEXT_WIRE_BUDGET_BYTES,
+    256,
+    128,
+    64,
+    0,
+];
+
+/// Explicit row-count and MCP wire-byte-budget omission metadata for one `coworker_status` section.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CoworkerStatusSectionBounds {
+    /// Total matching records present in the scoped binding ledger.
+    pub total_count: usize,
+    /// Number of summary rows returned in this `coworker_status` response.
+    pub returned_count: usize,
+    /// `true` when `returned_count < total_count` (from either `limit` or the 256 KiB MCP wire budget).
+    pub has_more: bool,
+    /// Number of rows omitted because `total_count` exceeded the effective `limit` (`1..=20`).
+    pub omitted_by_limit_count: usize,
+    /// Number of rows omitted after `limit` slicing to keep the `CallToolResult` envelope `<= 262_144` bytes.
+    pub omitted_by_byte_budget_count: usize,
+    /// Number of returned rows in this section where at least one text field was truncated.
+    pub truncated_text_row_count: usize,
+    /// Number of returned rows in this section where nested map/list/health detail was projected to bounded metadata.
+    pub projected_nested_detail_row_count: usize,
+}
+
+/// Status-specific bounded metadata projection of a [`PlanningGrantSummary`].
+///
+/// Preserves grant identity, scope, revisions, policy digest, capabilities, call budgets, usage
+/// counters (including `unknown_effect_calls`), and status while bounding `revoked_reason` with
+/// Unicode-safe, JSON-escape-aware truncation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CoworkerStatusGrantSummary {
+    /// Deterministic grant identifier (`pgr_<32hex>`).
+    pub grant_id: String,
+    /// Idempotent request key that created this grant.
+    pub create_request_key: String,
+    /// Control-plane chat binding identifier.
+    pub binding_id: String,
+    /// Canonical lowercase hyphenated non-nil native Codex thread UUID.
+    pub thread_uuid: String,
+    /// Monotonic per-binding Coworker workflow ledger revision (`>= 1`).
+    pub ledger_revision: u64,
+    /// Canonical repository path and origin base commit/tree metadata.
+    pub project_base: CanonicalProjectBaseRef,
+    /// Pinned workflow profile identifier.
+    pub profile_id: String,
+    /// Pinned workflow registry revision.
+    pub registry_revision: u64,
+    /// Pinned execution policy identifier.
+    pub policy_id: String,
+    /// 64-character lowercase hex SHA-256 digest of the pinned `ExecutionPolicy`.
+    pub policy_digest: String,
+    /// Strictly read-only capability envelope.
+    pub capabilities: PlanningReadOnlyCapabilities,
+    /// Finite call and per-call execution budget.
+    pub budget: PlanningCallBudget,
+    /// Current durable call usage counters (including `unknown_effect_calls`).
+    pub usage: PlanningGrantUsage,
+    /// Current persisted lifecycle status (`Active`, `Exhausted`, `Expired`, or `Revoked`).
+    pub status: PlanningGrantStatus,
+    /// Whether the grant is currently usable at query wall-clock time without pending unknown effects.
+    pub currently_active: bool,
+    /// Creation timestamp (ms since Unix epoch).
+    pub created_at_ms: u64,
+    /// Expiry timestamp (ms since Unix epoch).
+    pub expires_at_ms: u64,
+    /// Optional revocation timestamp (ms since Unix epoch).
+    pub revoked_at_ms: Option<u64>,
+    /// Optional Unicode-safe bounded revocation reason.
+    pub revoked_reason: Option<String>,
+    /// `true` when `revoked_reason` was shortened to fit the status text wire budget.
+    pub revoked_reason_truncated: bool,
+    /// Always `true` on persisted grants: trusted-local operator attestation was supplied.
+    pub operator_attested: bool,
+    /// Always `false`: local grant records never claim verified per-call native identity.
+    pub native_per_call_identity_verified: bool,
+    /// Number of durable call reservations recorded under this grant.
+    pub reservation_count: usize,
+}
+
+impl CoworkerStatusGrantSummary {
+    /// Projects a [`PlanningGrantSummary`] into a wire-bounded [`CoworkerStatusGrantSummary`].
+    #[must_use]
+    pub fn from_summary(
+        grant: &PlanningGrantSummary,
+        currently_active: bool,
+        text_wire_budget: usize,
+    ) -> Self {
+        let (revoked_reason, revoked_reason_truncated) = match grant.revoked_reason.as_deref() {
+            Some(reason) => {
+                let (bounded, truncated) =
+                    truncate_status_text_unicode_safe(reason, text_wire_budget);
+                (Some(bounded), truncated)
+            }
+            None => (None, false),
+        };
+        Self {
+            grant_id: grant.grant_id.clone(),
+            create_request_key: grant.create_request_key.clone(),
+            binding_id: grant.binding_id.clone(),
+            thread_uuid: grant.thread_uuid.clone(),
+            ledger_revision: grant.ledger_revision,
+            project_base: grant.project_base.clone(),
+            profile_id: grant.profile_id.clone(),
+            registry_revision: grant.registry_revision,
+            policy_id: grant.policy_id.clone(),
+            policy_digest: grant.policy_digest.clone(),
+            capabilities: grant.capabilities.clone(),
+            budget: grant.budget.clone(),
+            usage: grant.usage.clone(),
+            status: grant.status,
+            currently_active,
+            created_at_ms: grant.created_at_ms,
+            expires_at_ms: grant.expires_at_ms,
+            revoked_at_ms: grant.revoked_at_ms,
+            revoked_reason,
+            revoked_reason_truncated,
+            operator_attested: grant.operator_attested,
+            native_per_call_identity_verified: grant.native_per_call_identity_verified,
+            reservation_count: grant.reservation_count,
+        }
+    }
+}
+
+/// Non-authoritative, wire-bounded status projection of a [`PlanningResultRef`].
+///
+/// This type intentionally omits full `task_interfaces`, `architect_advice_ids`,
+/// `resolved_open_questions`, and `deferred_proposals` payloads in favor of exact counts and
+/// explicit omission flags, and carries `status_projection_only = true` plus
+/// `grants_execution_authority = false` so it can never be mistaken for or deserialized as a full
+/// [`PlanningResultRef`] or execution approval.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CoworkerStatusPlanResultSummary {
+    /// Always `true`: marks this object as a reduced `coworker_status` metadata projection, never a full [`PlanningResultRef`].
+    pub status_projection_only: bool,
+    /// Always `false`: `coworker_status` projections never grant execution or approval authority.
+    pub grants_execution_authority: bool,
+    /// Standing [`PlanningAdviceGrant::grant_id`] under which the plan was produced.
+    pub grant_id: String,
+    /// Completed Orchestrator `reservation_id`.
+    pub reservation_id: String,
+    /// Idempotent Orchestrator planning `request_key`.
+    pub request_key: String,
+    /// Supervised read-only worker `run_id` that produced the plan.
+    pub run_id: String,
+    /// Persisted private report artifact identifier (`pln_<32hex>`).
+    pub report_artifact_id: String,
+    /// 64-character lowercase hex SHA-256 digest of the verified structured Orchestrator output.
+    pub output_digest: String,
+    /// 64-character lowercase hex SHA-256 digest of the planned [`WorkBrief`].
+    pub work_brief_digest: String,
+    /// Canonical repository and immutable base commit/tree SHA inspected during planning.
+    pub project_base: CanonicalProjectBaseRef,
+    /// Pinned workflow profile identifier from the standing grant.
+    pub profile_id: String,
+    /// Pinned workflow registry revision (`>= 1`) from the standing grant.
+    pub registry_revision: u64,
+    /// 64-character lowercase hex SHA-256 digest of the standing grant's `ExecutionPolicy`.
+    pub policy_digest: String,
+    /// Resolved Orchestrator worker choice that produced the plan.
+    pub selected_choice: SelectedRoleChoice,
+    /// Published workflow `plan_id` in `PlanStore`.
+    pub plan_id: String,
+    /// Published workflow `plan_revision` (`>= 1`) in `PlanStore`.
+    pub plan_revision: u64,
+    /// 64-character lowercase hex SHA-256 `plan_digest` of the published plan revision.
+    pub plan_digest: String,
+    /// Publication-time plan status recorded in [`PlanningResultRef`] (`published`).
+    pub plan_status: PlanStatus,
+    /// Verified live plan status in `PlanStore` when readable (for example `published` or `superseded`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_plan_status: Option<PlanStatus>,
+    /// Explicit non-executable marker (`Some(false)`) when `current_plan_status` is no longer `published`; absence never grants authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executable: Option<bool>,
+    /// Timestamp (ms since Unix epoch) when the planning result was recorded.
+    pub recorded_at_ms: u64,
+    /// Number of task entries in [`PlanningResultRef::task_interfaces`].
+    pub task_interface_task_count: usize,
+    /// Total number of owned interface declarations across `task_interfaces`.
+    pub owned_interface_count: usize,
+    /// Total number of consumed interface declarations across `task_interfaces`.
+    pub consumed_interface_count: usize,
+    /// Number of [`ArchitectAdviceRecord::advice_id`] references on the result.
+    pub architect_advice_id_count: usize,
+    /// Number of `resolved_open_questions` entries on the result.
+    pub resolved_open_question_count: usize,
+    /// Number of `deferred_proposals` entries on the result.
+    pub deferred_proposal_count: usize,
+    /// `true` when non-empty `task_interfaces` map entries were omitted from this status projection.
+    pub omitted_task_interfaces: bool,
+    /// `true` when non-empty `architect_advice_ids` entries were omitted from this status projection.
+    pub omitted_architect_advice_ids: bool,
+    /// `true` when non-empty `resolved_open_questions` strings were omitted from this status projection.
+    pub omitted_resolved_open_questions: bool,
+    /// `true` when non-empty `deferred_proposals` strings were omitted from this status projection.
+    pub omitted_deferred_proposals: bool,
+    /// `true` when any nested collection on [`PlanningResultRef`] was omitted in favor of bounded counts.
+    pub nested_detail_omitted: bool,
+}
+
+impl CoworkerStatusPlanResultSummary {
+    /// Projects a full [`PlanningResultRef`] into a non-authoritative, wire-bounded summary.
+    #[must_use]
+    pub fn from_ref(pr: &PlanningResultRef, current_plan_status: Option<PlanStatus>) -> Self {
+        let owned_interface_count = pr
+            .task_interfaces
+            .values()
+            .map(|spec| spec.owned_interfaces.len())
+            .sum();
+        let consumed_interface_count = pr
+            .task_interfaces
+            .values()
+            .map(|spec| spec.consumed_interfaces.len())
+            .sum();
+        let omitted_task_interfaces = !pr.task_interfaces.is_empty();
+        let omitted_architect_advice_ids = !pr.architect_advice_ids.is_empty();
+        let omitted_resolved_open_questions = !pr.resolved_open_questions.is_empty();
+        let omitted_deferred_proposals = !pr.deferred_proposals.is_empty();
+        let nested_detail_omitted = omitted_task_interfaces
+            || omitted_architect_advice_ids
+            || omitted_resolved_open_questions
+            || omitted_deferred_proposals;
+        let executable = current_plan_status
+            .filter(|status| *status != PlanStatus::Published)
+            .map(|_| false);
+
+        Self {
+            status_projection_only: true,
+            grants_execution_authority: false,
+            grant_id: pr.grant_id.clone(),
+            reservation_id: pr.reservation_id.clone(),
+            request_key: pr.request_key.clone(),
+            run_id: pr.run_id.clone(),
+            report_artifact_id: pr.report_artifact_id.clone(),
+            output_digest: pr.output_digest.clone(),
+            work_brief_digest: pr.work_brief_digest.clone(),
+            project_base: pr.project_base.clone(),
+            profile_id: pr.profile_id.clone(),
+            registry_revision: pr.registry_revision,
+            policy_digest: pr.policy_digest.clone(),
+            selected_choice: pr.selected_choice.clone(),
+            plan_id: pr.plan_id.clone(),
+            plan_revision: pr.plan_revision,
+            plan_digest: pr.plan_digest.clone(),
+            plan_status: pr.plan_status,
+            current_plan_status,
+            executable,
+            recorded_at_ms: pr.recorded_at_ms,
+            task_interface_task_count: pr.task_interfaces.len(),
+            owned_interface_count,
+            consumed_interface_count,
+            architect_advice_id_count: pr.architect_advice_ids.len(),
+            resolved_open_question_count: pr.resolved_open_questions.len(),
+            deferred_proposal_count: pr.deferred_proposals.len(),
+            omitted_task_interfaces,
+            omitted_architect_advice_ids,
+            omitted_resolved_open_questions,
+            omitted_deferred_proposals,
+            nested_detail_omitted,
+        }
+    }
+}
+
+/// Status-specific bounded projection of [`WorkBriefKind`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CoworkerStatusBriefKindSummary {
+    /// Starts an independent new Coworker workflow job.
+    NewJob,
+    /// Amends an existing Coworker workflow job at an exact expected revision with bounded reason text.
+    Amendment {
+        /// Target job identifier being amended.
+        target_job_id: String,
+        /// Expected current `job_revision` of `target_job_id` (`>= 1`).
+        target_job_revision: u64,
+        /// Unicode-safe bounded human-readable reason for the amendment.
+        amendment_reason: String,
+        /// `true` when `amendment_reason` was shortened to fit the status text wire budget.
+        amendment_reason_truncated: bool,
+    },
+}
+
+impl CoworkerStatusBriefKindSummary {
+    /// Projects a [`WorkBriefKind`] into a wire-bounded [`CoworkerStatusBriefKindSummary`].
+    #[must_use]
+    pub fn from_kind(kind: &WorkBriefKind, text_wire_budget: usize) -> Self {
+        match kind {
+            WorkBriefKind::NewJob => Self::NewJob,
+            WorkBriefKind::Amendment {
+                target_job_id,
+                target_job_revision,
+                amendment_reason,
+            } => {
+                let (bounded_reason, truncated) =
+                    truncate_status_text_unicode_safe(amendment_reason, text_wire_budget);
+                Self::Amendment {
+                    target_job_id: target_job_id.clone(),
+                    target_job_revision: *target_job_revision,
+                    amendment_reason: bounded_reason,
+                    amendment_reason_truncated: truncated,
+                }
+            }
+        }
+    }
+
+    const fn has_truncated_text(&self) -> bool {
+        match self {
+            Self::NewJob => false,
+            Self::Amendment {
+                amendment_reason_truncated,
+                ..
+            } => *amendment_reason_truncated,
+        }
+    }
+}
+
+/// Status-specific, wire-bounded summary of a [`CoworkerJobRecord`].
+///
+/// Preserves job identity, revision, brief digest, phase, readiness flags, hold/outbox reconciliation
+/// counts, and bounded non-authoritative plan linkage while truncating free-form text on UTF-8
+/// codepoint boundaries and omitting nested task/interface collections.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CoworkerStatusJobSummary {
+    /// Deterministic job identifier (`job_<32hex>`).
+    pub job_id: String,
+    /// Monotonically increasing 1-based job revision.
+    pub job_revision: u64,
+    /// Control-plane chat binding identifier.
+    pub binding_id: String,
+    /// Canonical lowercase hyphenated non-nil native Codex thread UUID.
+    pub thread_uuid: String,
+    /// Idempotent request key that created this job.
+    pub create_request_key: String,
+    /// Current lifecycle phase of the job.
+    pub phase: CoworkerJobPhase,
+    /// Deterministic [`WorkBrief::brief_id`].
+    pub brief_id: String,
+    /// 64-character lowercase hex SHA-256 digest of the job's [`WorkBrief`].
+    pub work_brief_digest: String,
+    /// Bounded new-job or amendment classification.
+    pub kind: CoworkerStatusBriefKindSummary,
+    /// Canonical repository path and base commit/tree SHA.
+    pub project_base: CanonicalProjectBaseRef,
+    /// Unicode-safe bounded summary of the job's [`WorkBrief`].
+    pub summary: String,
+    /// `true` when `summary` was shortened to fit the status text wire budget.
+    pub summary_truncated: bool,
+    /// Count of confirmed requirements in the brief.
+    pub confirmed_requirement_count: usize,
+    /// Count of unconfirmed proposed additions in the brief.
+    pub proposed_addition_count: usize,
+    /// Count of assumptions in the brief.
+    pub assumption_count: usize,
+    /// Count of unresolved open questions in the brief.
+    pub open_question_count: usize,
+    /// Count of accepted architect decisions in the brief.
+    pub accepted_architect_decision_count: usize,
+    /// Whether the brief is ready for Orchestrator technical planning.
+    pub ready_for_execution_planning: bool,
+    /// Whether the brief alone has zero open questions and zero proposed additions.
+    pub ready_for_execution_approval: bool,
+    /// Whether the brief plus recorded `planning_result` has resolved/deferred all open items for approval.
+    pub ready_for_execution_approval_with_planning: bool,
+    /// Superseded job identifier when `kind` is [`CoworkerStatusBriefKindSummary::Amendment`].
+    pub supersedes_job_id: Option<String>,
+    /// Non-authoritative bounded projection of the job's [`PlanningResultRef`], if planned.
+    pub planning_result: Option<CoworkerStatusPlanResultSummary>,
+    /// Linked operator `approval_id` when execution has been approved.
+    pub approval_id: Option<String>,
+    /// Always `false`: status projections never confer execution or controller authority.
+    pub grants_execution_authority: bool,
+    /// Total number of task runtime records on the job.
+    pub task_count: usize,
+    /// Number of currently active `WorkflowHoldRecord`s on the job.
+    pub active_hold_count: usize,
+    /// Number of unresolved (`ReservedBeforeEffect` or `EffectUnknown`) outbox records on the job.
+    pub unresolved_outbox_count: usize,
+    /// `true` when non-empty [`WorkBrief`] requirement/proposal/question lists were projected to counts.
+    pub omitted_brief_item_lists: bool,
+    /// `true` when non-empty runtime task, hold, outbox, or combined-candidate records were projected to counts.
+    pub omitted_runtime_task_details: bool,
+}
+
+impl CoworkerStatusJobSummary {
+    /// Projects a [`CoworkerJobRecord`] into a wire-bounded [`CoworkerStatusJobSummary`].
+    #[must_use]
+    pub fn from_record(
+        job: &CoworkerJobRecord,
+        current_plan_status: Option<PlanStatus>,
+        text_wire_budget: usize,
+    ) -> Self {
+        let active_hold_count = job.holds.iter().filter(|h| h.active).count();
+        let unresolved_outbox_count = job
+            .outbox
+            .iter()
+            .filter(|o| o.status.blocks_replay_and_new_dispatch())
+            .count();
+        let (summary, summary_truncated) =
+            truncate_status_text_unicode_safe(&job.work_brief.summary, text_wire_budget);
+        let kind =
+            CoworkerStatusBriefKindSummary::from_kind(&job.work_brief.kind, text_wire_budget);
+        let omitted_brief_item_lists = !job.work_brief.confirmed_requirements.is_empty()
+            || !job.work_brief.proposed_additions.is_empty()
+            || !job.work_brief.assumptions.is_empty()
+            || !job.work_brief.open_questions.is_empty()
+            || !job.work_brief.accepted_architect_decisions.is_empty();
+        let omitted_runtime_task_details = !job.tasks.is_empty()
+            || !job.holds.is_empty()
+            || !job.outbox.is_empty()
+            || !job.combined_candidates.is_empty();
+
+        Self {
+            job_id: job.job_id.clone(),
+            job_revision: job.job_revision,
+            binding_id: job.binding_id.clone(),
+            thread_uuid: job.thread_uuid.clone(),
+            create_request_key: job.create_request_key.clone(),
+            phase: job.phase,
+            brief_id: job.work_brief.brief_id.clone(),
+            work_brief_digest: job.work_brief_digest.clone(),
+            kind,
+            project_base: job.work_brief.project_base.clone(),
+            summary,
+            summary_truncated,
+            confirmed_requirement_count: job.work_brief.confirmed_requirements.len(),
+            proposed_addition_count: job.work_brief.proposed_additions.len(),
+            assumption_count: job.work_brief.assumptions.len(),
+            open_question_count: job.work_brief.open_questions.len(),
+            accepted_architect_decision_count: job.work_brief.accepted_architect_decisions.len(),
+            ready_for_execution_planning: job.work_brief.is_ready_for_execution_planning(),
+            ready_for_execution_approval: job.work_brief.is_ready_for_execution_approval(),
+            ready_for_execution_approval_with_planning: job
+                .work_brief
+                .is_ready_for_execution_approval_with_planning(job.planning_result.as_ref()),
+            supersedes_job_id: job.supersedes_job_id.clone(),
+            planning_result: job
+                .planning_result
+                .as_ref()
+                .map(|pr| CoworkerStatusPlanResultSummary::from_ref(pr, current_plan_status)),
+            approval_id: job.approval_linkage.as_ref().map(|a| a.approval_id.clone()),
+            grants_execution_authority: false,
+            task_count: job.tasks.len(),
+            active_hold_count,
+            unresolved_outbox_count,
+            omitted_brief_item_lists,
+            omitted_runtime_task_details,
+        }
+    }
+
+    fn has_truncated_text(&self) -> bool {
+        self.summary_truncated || self.kind.has_truncated_text()
+    }
+
+    fn has_projected_nested_detail(&self) -> bool {
+        self.omitted_brief_item_lists
+            || self.omitted_runtime_task_details
+            || self
+                .planning_result
+                .as_ref()
+                .is_some_and(|pr| pr.nested_detail_omitted)
+    }
+}
+
+/// Status-specific, wire-bounded summary of a stored [`ArchitectAdviceRecord`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CoworkerStatusArchitectAdviceSummary {
+    /// Deterministic advice identifier (`adv_<32hex>`).
+    pub advice_id: String,
+    /// Standing [`PlanningAdviceGrant::grant_id`] that authorized the call.
+    pub grant_id: String,
+    /// Completed `reservation_id`.
+    pub reservation_id: String,
+    /// Idempotent request key for the advice record.
+    pub request_key: String,
+    /// Headless worker choice that produced the advice.
+    pub selected_choice: SelectedRoleChoice,
+    /// 64-character lowercase hex SHA-256 digest of the bound [`ArchitectContextDependencies`].
+    pub context_digest: String,
+    /// Unicode-safe bounded architectural decision summary.
+    pub decision_summary: String,
+    /// `true` when `decision_summary` was shortened to fit the status text wire budget.
+    pub decision_summary_truncated: bool,
+    /// 64-character lowercase hex SHA-256 digest of the structured architectural decision.
+    pub decision_digest: String,
+    /// Persisted planning artifact identifier (`pln_<32hex>`), if recorded.
+    pub report_artifact_id: Option<String>,
+    /// Current lifecycle status of the architectural decision (`proposed`, `accepted_into_brief`, etc.).
+    pub status: ArchitectDecisionStatus,
+    /// Creation timestamp in milliseconds since the Unix epoch.
+    pub created_at_ms: u64,
+    /// Count of dependency file blob entries bound in `context_dependencies`.
+    pub dependency_file_count: usize,
+    /// Count of interface ownership digest entries bound in `context_dependencies`.
+    pub interface_digest_count: usize,
+    /// Count of accepted predecessor tree entries bound in `context_dependencies`.
+    pub predecessor_tree_count: usize,
+    /// `true` when non-empty `context_dependencies` maps were projected to counts.
+    pub omitted_context_dependency_maps: bool,
+}
+
+impl CoworkerStatusArchitectAdviceSummary {
+    /// Projects an [`ArchitectAdviceRecord`] into a wire-bounded [`CoworkerStatusArchitectAdviceSummary`].
+    #[must_use]
+    pub fn from_record(record: &ArchitectAdviceRecord, text_wire_budget: usize) -> Self {
+        let (decision_summary, decision_summary_truncated) =
+            truncate_status_text_unicode_safe(&record.decision_summary, text_wire_budget);
+        let dependency_file_count = record.context_dependencies.dependency_file_blobs.len();
+        let interface_digest_count = record
+            .context_dependencies
+            .interface_ownership_digests
+            .len();
+        let predecessor_tree_count = record.context_dependencies.accepted_predecessor_trees.len();
+        let omitted_context_dependency_maps =
+            dependency_file_count > 0 || interface_digest_count > 0 || predecessor_tree_count > 0;
+        Self {
+            advice_id: record.advice_id.clone(),
+            grant_id: record.grant_id.clone(),
+            reservation_id: record.reservation_id.clone(),
+            request_key: record.request_key.clone(),
+            selected_choice: record.selected_choice.clone(),
+            context_digest: record.context_digest.clone(),
+            decision_summary,
+            decision_summary_truncated,
+            decision_digest: record.decision_digest.clone(),
+            report_artifact_id: record.report_artifact_id.clone(),
+            status: record.status,
+            created_at_ms: record.created_at_ms,
+            dependency_file_count,
+            interface_digest_count,
+            predecessor_tree_count,
+            omitted_context_dependency_maps,
+        }
+    }
+}
+
+/// Bounded summary of provider health telemetry attached to a [`CoworkerStatusCommandSummary`].
+///
+/// Full per-invocation `provider_health` and `provider_health_views` entries remain available via
+/// `planning_command(command_id)`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CoworkerStatusProviderHealthSummary {
+    /// Number of reservation-scoped provider health entries recorded on the command.
+    pub invocation_count: usize,
+    /// Number of currently live diagnostic sources verified by physical ownership lock inspection.
+    pub live_count: usize,
+    /// Number of entries that have already observed terminal invocation completion.
+    pub terminal_observed_count: usize,
+    /// Sum of observed provider retry hints across recorded invocations.
+    pub total_retry_count: u64,
+    /// `true` when at least one recorded invocation currently reports an unrecovered failure hint.
+    pub has_current_failure: bool,
+    /// `true` when full `provider_health` / `provider_health_views` vectors were omitted from status.
+    pub omitted_records: bool,
+}
+
+/// Kind of verified result projected on a completed [`CoworkerStatusCommandSummary`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CoworkerStatusCommandResultKind {
+    /// Completed `Architect` advice result.
+    ArchitectAdvice,
+    /// Completed `Orchestrator` published plan result.
+    OrchestratorPlan,
+    /// Completed `Orchestrator` result requesting human clarification.
+    OrchestratorRequiresHumanClarification,
+    /// Completed `Orchestrator` result requesting Architect consultation.
+    OrchestratorRequiresArchitectAdvice,
+}
+
+/// Non-authoritative, wire-bounded status projection of a [`PlanningCommandResultRef`].
+///
+/// Full structured advice, plan task details, clarification question lists, and consultation
+/// question lists remain available via `planning_command(command_id)`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CoworkerStatusCommandResultSummary {
+    /// Always `true`: marks this object as a reduced `coworker_status` projection, never a full [`PlanningCommandResultRef`].
+    pub status_projection_only: bool,
+    /// Always `false`: status projections never confer execution or approval authority.
+    pub grants_execution_authority: bool,
+    /// Variant tag of the underlying verified [`PlanningCommandResultRef`].
+    pub kind: CoworkerStatusCommandResultKind,
+    /// `true` only when the persisted planning report artifact was directly validated on disk.
+    pub artifact_verified: bool,
+    /// Completed grant `reservation_id`.
+    pub reservation_id: String,
+    /// Persisted private report artifact identifier (`pln_<32hex>`).
+    pub report_artifact_id: String,
+    /// Target `job_id` for Orchestrator command outcomes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_id: Option<String>,
+    /// Recorded `advice_id` for `ArchitectAdvice` outcomes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advice_id: Option<String>,
+    /// Whether an existing verified `ArchitectAdviceRecord` was reused without a new call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reused_existing: Option<bool>,
+    /// 64-character lowercase hex SHA-256 `context_digest` for `ArchitectAdvice` outcomes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_digest: Option<String>,
+    /// 64-character lowercase hex SHA-256 `decision_digest` for `ArchitectAdvice` outcomes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_digest: Option<String>,
+    /// 64-character lowercase hex SHA-256 `output_digest` for Orchestrator outcomes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_digest: Option<String>,
+    /// Bounded non-authoritative plan result summary when `kind` is [`CoworkerStatusCommandResultKind::OrchestratorPlan`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_result: Option<CoworkerStatusPlanResultSummary>,
+    /// Unicode-safe bounded outcome summary for clarification or consultation outcomes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    /// `true` when `summary` was shortened to fit the status text wire budget.
+    pub summary_truncated: bool,
+    /// Number of clarification or Architect consultation questions in the outcome.
+    pub question_count: usize,
+    /// Number of referenced or dependency files across the clarification/consultation outcome.
+    pub referenced_file_count: usize,
+    /// `true` when nested question lists, file lists, or plan interface/question/proposal lists were omitted.
+    pub omitted_nested_detail: bool,
+}
+
+impl CoworkerStatusCommandResultSummary {
+    /// Projects a verified [`PlanningCommandResultRef`] into a wire-bounded status summary.
+    #[must_use]
+    pub fn from_ref(
+        result_ref: &PlanningCommandResultRef,
+        current_plan_status: Option<PlanStatus>,
+        text_wire_budget: usize,
+    ) -> Self {
+        match result_ref {
+            PlanningCommandResultRef::ArchitectAdvice {
+                advice_id,
+                reservation_id,
+                report_artifact_id,
+                context_digest,
+                decision_digest,
+                reused_existing,
+                artifact_verified,
+            } => Self {
+                status_projection_only: true,
+                grants_execution_authority: false,
+                kind: CoworkerStatusCommandResultKind::ArchitectAdvice,
+                artifact_verified: *artifact_verified,
+                reservation_id: reservation_id.clone(),
+                report_artifact_id: report_artifact_id.clone(),
+                job_id: None,
+                advice_id: Some(advice_id.clone()),
+                reused_existing: Some(*reused_existing),
+                context_digest: Some(context_digest.clone()),
+                decision_digest: Some(decision_digest.clone()),
+                output_digest: None,
+                plan_result: None,
+                summary: None,
+                summary_truncated: false,
+                question_count: 0,
+                referenced_file_count: 0,
+                omitted_nested_detail: false,
+            },
+            PlanningCommandResultRef::OrchestratorPlan {
+                job_id,
+                planning_result,
+                artifact_verified,
+            } => {
+                let projected_plan =
+                    CoworkerStatusPlanResultSummary::from_ref(planning_result, current_plan_status);
+                let omitted_nested_detail = projected_plan.nested_detail_omitted;
+                Self {
+                    status_projection_only: true,
+                    grants_execution_authority: false,
+                    kind: CoworkerStatusCommandResultKind::OrchestratorPlan,
+                    artifact_verified: *artifact_verified,
+                    reservation_id: planning_result.reservation_id.clone(),
+                    report_artifact_id: planning_result.report_artifact_id.clone(),
+                    job_id: Some(job_id.clone()),
+                    advice_id: None,
+                    reused_existing: None,
+                    context_digest: None,
+                    decision_digest: None,
+                    output_digest: Some(planning_result.output_digest.clone()),
+                    plan_result: Some(projected_plan),
+                    summary: None,
+                    summary_truncated: false,
+                    question_count: 0,
+                    referenced_file_count: 0,
+                    omitted_nested_detail,
+                }
+            }
+            PlanningCommandResultRef::OrchestratorRequiresHumanClarification {
+                job_id,
+                reservation_id,
+                report_artifact_id,
+                output_digest,
+                clarification,
+                artifact_verified,
+            } => {
+                let (bounded_summary, summary_truncated) =
+                    truncate_status_text_unicode_safe(&clarification.summary, text_wire_budget);
+                let question_count = clarification.questions.len();
+                let referenced_file_count = clarification.referenced_files.len();
+                Self {
+                    status_projection_only: true,
+                    grants_execution_authority: false,
+                    kind: CoworkerStatusCommandResultKind::OrchestratorRequiresHumanClarification,
+                    artifact_verified: *artifact_verified,
+                    reservation_id: reservation_id.clone(),
+                    report_artifact_id: report_artifact_id.clone(),
+                    job_id: Some(job_id.clone()),
+                    advice_id: None,
+                    reused_existing: None,
+                    context_digest: None,
+                    decision_digest: None,
+                    output_digest: Some(output_digest.clone()),
+                    plan_result: None,
+                    summary: Some(bounded_summary),
+                    summary_truncated,
+                    question_count,
+                    referenced_file_count,
+                    omitted_nested_detail: question_count > 0 || referenced_file_count > 0,
+                }
+            }
+            PlanningCommandResultRef::OrchestratorRequiresArchitectAdvice {
+                job_id,
+                reservation_id,
+                report_artifact_id,
+                output_digest,
+                consultation,
+                artifact_verified,
+            } => {
+                let (bounded_summary, summary_truncated) =
+                    truncate_status_text_unicode_safe(&consultation.summary, text_wire_budget);
+                let question_count = consultation.questions.len();
+                let referenced_file_count = consultation
+                    .questions
+                    .iter()
+                    .map(|q| q.dependency_files.len())
+                    .sum();
+                Self {
+                    status_projection_only: true,
+                    grants_execution_authority: false,
+                    kind: CoworkerStatusCommandResultKind::OrchestratorRequiresArchitectAdvice,
+                    artifact_verified: *artifact_verified,
+                    reservation_id: reservation_id.clone(),
+                    report_artifact_id: report_artifact_id.clone(),
+                    job_id: Some(job_id.clone()),
+                    advice_id: None,
+                    reused_existing: None,
+                    context_digest: None,
+                    decision_digest: None,
+                    output_digest: Some(output_digest.clone()),
+                    plan_result: None,
+                    summary: Some(bounded_summary),
+                    summary_truncated,
+                    question_count,
+                    referenced_file_count,
+                    omitted_nested_detail: question_count > 0,
+                }
+            }
+        }
+    }
+}
+
+/// Status-specific, wire-bounded summary of a [`PlanningCommandSummary`].
+///
+/// Preserves command identity, scope, digests, `status`, `pending_reconciliation`,
+/// `current_plan_status`, `executable`, and `owner_summary`, while bounding `diagnostic` text and
+/// projecting `result_ref` and `provider_health` into compact metadata summaries. Full command
+/// details remain available via `planning_command(command_id)`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CoworkerStatusCommandSummary {
+    /// Deterministic command identifier (`pcm_<32hex>`).
+    pub command_id: String,
+    /// Idempotent caller request key.
+    pub command_key: String,
+    /// Frozen internal service request key (`psr_<32hex>`).
+    pub service_request_key: String,
+    /// Control-plane chat binding identifier.
+    pub binding_id: String,
+    /// Canonical lowercase hyphenated non-nil native Codex thread UUID.
+    pub thread_uuid: String,
+    /// Standing [`PlanningAdviceGrant::grant_id`] authorizing this command.
+    pub grant_id: String,
+    /// Target `job_id` when applicable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_id: Option<String>,
+    /// Target or published workflow `plan_id` when applicable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_id: Option<String>,
+    /// Primary planning role (`architect` or `orchestrator`).
+    pub role: WorkflowRole,
+    /// Resolved headless worker choice verified against the grant profile and policy at enqueue.
+    pub selected_choice: SelectedRoleChoice,
+    /// Canonical repository and immutable base commit/tree verified at enqueue.
+    pub call_project_base: CanonicalProjectBaseRef,
+    /// 64-character lowercase hex SHA-256 context digest for the command.
+    pub context_digest: String,
+    /// 64-character lowercase hex SHA-256 digest of the caller's semantic request body.
+    pub request_body_digest: String,
+    /// 64-character lowercase hex SHA-256 digest of the immutable command fields and frozen payload.
+    pub command_digest: String,
+    /// Current command status (`queued`, `running`, `completed`, `known_failed`, or `unknown`).
+    pub status: PlanningCommandStatus,
+    /// Explicit marker that the command outcome is uncertain and requires artifact/receipt reconciliation.
+    pub pending_reconciliation: bool,
+    /// Public ownership summary bound when claimed by a live `CoworkerJobOwnershipGuard`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_summary: Option<CoworkerOwnershipSummary>,
+    /// Bounded provider health count and liveness summary (`planning_command` exposes full records).
+    pub provider_health_summary: CoworkerStatusProviderHealthSummary,
+    /// Bounded non-authoritative result projection when `status == Completed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_summary: Option<CoworkerStatusCommandResultSummary>,
+    /// Current persisted status of a verified Orchestrator plan, separate from its frozen result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_plan_status: Option<PlanStatus>,
+    /// Explicit non-executable marker for a plan that is no longer `Published`; absence never grants authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executable: Option<bool>,
+    /// Unicode-safe bounded diagnostic message when `KnownFailed` or `Unknown`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostic: Option<String>,
+    /// `true` when `diagnostic` was shortened to fit the status text wire budget.
+    pub diagnostic_truncated: bool,
+    /// Local wall-clock timestamp (ms since Unix epoch) when the command was enqueued.
+    pub enqueued_at_ms: u64,
+    /// Local wall-clock timestamp (ms since Unix epoch) when claimed for `Running`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at_ms: Option<u64>,
+    /// Local wall-clock timestamp (ms since Unix epoch) when last updated.
+    pub updated_at_ms: u64,
+    /// Local wall-clock timestamp (ms since Unix epoch) when `Completed` or `KnownFailed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at_ms: Option<u64>,
+}
+
+impl CoworkerStatusCommandSummary {
+    /// Projects a verified [`PlanningCommandSummary`] into a wire-bounded [`CoworkerStatusCommandSummary`].
+    #[must_use]
+    pub fn from_summary(summary: &PlanningCommandSummary, text_wire_budget: usize) -> Self {
+        let provider_health_summary = CoworkerStatusProviderHealthSummary {
+            invocation_count: summary.provider_health.len(),
+            live_count: summary
+                .provider_health_views
+                .iter()
+                .filter(|v| v.live)
+                .count(),
+            terminal_observed_count: summary
+                .provider_health
+                .iter()
+                .filter(|h| h.terminal_observed)
+                .count(),
+            total_retry_count: summary
+                .provider_health
+                .iter()
+                .map(|h| u64::from(h.snapshot.retry_count))
+                .sum(),
+            has_current_failure: summary
+                .provider_health
+                .iter()
+                .any(|h| h.snapshot.current_failure.is_some()),
+            omitted_records: !summary.provider_health.is_empty(),
+        };
+        let result_summary = summary.result_ref.as_ref().map(|res| {
+            CoworkerStatusCommandResultSummary::from_ref(
+                res,
+                summary.current_plan_status,
+                text_wire_budget,
+            )
+        });
+        let (diagnostic, diagnostic_truncated) = match summary.diagnostic.as_deref() {
+            Some(diag) => {
+                let (bounded, truncated) =
+                    truncate_status_text_unicode_safe(diag, text_wire_budget);
+                (Some(bounded), truncated)
+            }
+            None => (None, false),
+        };
+
+        Self {
+            command_id: summary.command_id.clone(),
+            command_key: summary.command_key.clone(),
+            service_request_key: summary.service_request_key.clone(),
+            binding_id: summary.binding_id.clone(),
+            thread_uuid: summary.thread_uuid.clone(),
+            grant_id: summary.grant_id.clone(),
+            job_id: summary.job_id.clone(),
+            plan_id: summary.plan_id.clone(),
+            role: summary.role,
+            selected_choice: summary.selected_choice.clone(),
+            call_project_base: summary.call_project_base.clone(),
+            context_digest: summary.context_digest.clone(),
+            request_body_digest: summary.request_body_digest.clone(),
+            command_digest: summary.command_digest.clone(),
+            status: summary.status,
+            pending_reconciliation: summary.pending_reconciliation,
+            owner_summary: summary.owner_summary.clone(),
+            provider_health_summary,
+            result_summary,
+            current_plan_status: summary.current_plan_status,
+            executable: summary.executable,
+            diagnostic,
+            diagnostic_truncated,
+            enqueued_at_ms: summary.enqueued_at_ms,
+            started_at_ms: summary.started_at_ms,
+            updated_at_ms: summary.updated_at_ms,
+            completed_at_ms: summary.completed_at_ms,
+        }
+    }
+
+    fn has_truncated_text(&self) -> bool {
+        self.diagnostic_truncated
+            || self
+                .result_summary
+                .as_ref()
+                .is_some_and(|res| res.summary_truncated)
+    }
+
+    fn has_projected_nested_detail(&self) -> bool {
+        self.provider_health_summary.omitted_records
+            || self
+                .result_summary
+                .as_ref()
+                .is_some_and(|res| res.omitted_nested_detail)
+    }
+}
+
 /// Bounded, prompt-redacted response returned by `coworker_status`.
+///
+/// Guaranteed to serialize inside [`MAX_MCP_RESPONSE_BYTES`] (`262_144` bytes) across the full
+/// `rmcp` `CallToolResult` envelope (including both `structuredContent` and escaped JSON text in
+/// `content`). Status entries are bounded projections and never grant execution authority.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CoworkerStatusResponse {
@@ -482,24 +1432,56 @@ pub struct CoworkerStatusResponse {
     pub workflow_ledger_revision: u64,
     /// Current revision of the per-binding planning command ledger (`0` when uninitialized).
     pub command_ledger_revision: u64,
-    /// Latest currently active, non-expired, non-revoked standing [`PlanningGrantSummary`], if any.
-    pub active_grant: Option<PlanningGrantSummary>,
-    /// Bounded list (`<= 20`) of currently active standing [`PlanningGrantSummary`] records.
-    pub active_grants: Vec<PlanningGrantSummary>,
-    /// Bounded list (`<= 20`) of standing [`PlanningGrantSummary`] records in this binding and thread scope.
-    pub grants: Vec<PlanningGrantSummary>,
-    /// Bounded list (`<= 20`) of compact [`CoworkerJobSummary`] records in this binding and thread scope.
-    pub jobs: Vec<CoworkerJobSummary>,
-    /// Bounded list (`<= 20`) of compact [`CoworkerArchitectAdviceSummary`] records in this binding and thread scope.
-    pub architect_advice: Vec<CoworkerArchitectAdviceSummary>,
-    /// Bounded list (`<= 20`) of prompt-redacted [`PlanningCommandSummary`] records in this binding and thread scope.
-    pub commands: Vec<PlanningCommandSummary>,
-    /// `true` if more grants exist beyond `limit`.
+    /// Effective per-section row limit applied before wire-budget fitting (`1..=20`, default `20`).
+    pub effective_limit: usize,
+    /// Exact `grant_id` of the latest currently active standing grant, preserved even under extreme byte pressure.
+    pub active_grant_id: Option<String>,
+    /// Latest currently active, non-expired, non-revoked standing [`CoworkerStatusGrantSummary`], if any.
+    pub active_grant: Option<CoworkerStatusGrantSummary>,
+    /// `true` only if `active_grant_id` is `Some(_)` and `active_grant` had to be omitted to fit [`MAX_MCP_RESPONSE_BYTES`].
+    pub active_grant_omitted_by_byte_budget: bool,
+    /// Bounded list (`<= 20`) of currently active standing [`CoworkerStatusGrantSummary`] records.
+    pub active_grants: Vec<CoworkerStatusGrantSummary>,
+    /// Bounded list (`<= 20`) of standing [`CoworkerStatusGrantSummary`] records in this binding and thread scope.
+    pub grants: Vec<CoworkerStatusGrantSummary>,
+    /// Bounded list (`<= 20`) of compact [`CoworkerStatusJobSummary`] records in this binding and thread scope.
+    pub jobs: Vec<CoworkerStatusJobSummary>,
+    /// Bounded list (`<= 20`) of compact [`CoworkerStatusArchitectAdviceSummary`] records in this binding and thread scope.
+    pub architect_advice: Vec<CoworkerStatusArchitectAdviceSummary>,
+    /// Bounded list (`<= 20`) of prompt-redacted [`CoworkerStatusCommandSummary`] records in this binding and thread scope.
+    pub commands: Vec<CoworkerStatusCommandSummary>,
+    /// `true` if more currently active grants exist beyond `active_grants` (due to `limit` or byte budget).
+    pub has_more_active_grants: bool,
+    /// `true` if more grants exist beyond `grants` (due to `limit` or byte budget).
     pub has_more_grants: bool,
-    /// `true` if more jobs exist beyond `limit`.
+    /// `true` if more jobs exist beyond `jobs` (due to `limit` or byte budget).
     pub has_more_jobs: bool,
-    /// `true` if more commands exist beyond `limit`.
+    /// `true` if more Architect advice records exist beyond `architect_advice` (due to `limit` or byte budget).
+    pub has_more_architect_advice: bool,
+    /// `true` if more commands exist beyond `commands` (due to `limit` or byte budget).
     pub has_more_commands: bool,
+    /// `true` when at least one row (or `active_grant`) was omitted after `limit` slicing to stay within [`MAX_MCP_RESPONSE_BYTES`].
+    pub rows_omitted_by_byte_budget: bool,
+    /// `true` when any row, text field, or nested detail in this response was omitted or truncated for bounded status projection.
+    pub details_omitted_or_truncated_by_byte_budget: bool,
+    /// Scope-wide reconciliation flag across all grants, jobs, and commands in `(binding_id, thread_uuid)` (never hidden by pagination).
+    pub pending_reconciliation: bool,
+    /// Total `unknown_effect_calls` across all standing grants in `(binding_id, thread_uuid)`.
+    pub unknown_effect_reservation_count: u32,
+    /// Total unresolved (`ReservedBeforeEffect` or `EffectUnknown`) outbox records across all jobs in `(binding_id, thread_uuid)`.
+    pub unresolved_job_outbox_count: usize,
+    /// Total planning commands with `pending_reconciliation == true` across all commands in `(binding_id, thread_uuid)`.
+    pub pending_reconciliation_command_count: usize,
+    /// Count and byte-budget omission breakdown for `active_grants`.
+    pub active_grants_bounds: CoworkerStatusSectionBounds,
+    /// Count and byte-budget omission breakdown for `grants`.
+    pub grants_bounds: CoworkerStatusSectionBounds,
+    /// Count and byte-budget omission breakdown for `jobs`.
+    pub jobs_bounds: CoworkerStatusSectionBounds,
+    /// Count and byte-budget omission breakdown for `architect_advice`.
+    pub architect_advice_bounds: CoworkerStatusSectionBounds,
+    /// Count and byte-budget omission breakdown for `commands`.
+    pub commands_bounds: CoworkerStatusSectionBounds,
 }
 
 /// Compact response returned by `prepare_work`.
@@ -780,7 +1762,8 @@ impl CoworkerPlanningGateway {
     }
 
     /// Executes the read-only `coworker_status` query without creating directories, state files,
-    /// or lockfiles.
+    /// or lockfiles, while guaranteeing that the serialized `rmcp` `CallToolResult` envelope stays
+    /// within [`MAX_MCP_RESPONSE_BYTES`] (`262_144` bytes).
     pub fn coworker_status(
         &self,
         params: &CoworkerStatusParams,
@@ -790,69 +1773,337 @@ impl CoworkerPlanningGateway {
 
         let workflow_store = CoworkerWorkflowStore::new(&self.plans_dir)?;
         let wf_ledger = workflow_store.read_binding_ledger(&self.binding_id)?;
+        if wf_ledger.binding_id != self.binding_id {
+            return Err(NativeError::new(
+                NativeErrorCode::SecurityViolation,
+                "Coworker workflow ledger binding_id does not match verified binding_id",
+            ));
+        }
         ensure_ledger_matches_thread(&wf_ledger, &self.thread_uuid)?;
 
         let scope = TrustedGrantScope::new(self.binding_id.clone(), self.thread_uuid.clone())?;
-        let all_grants = list_planning_grant_summaries(&workflow_store, &scope)?;
-        let active_grants_all: Vec<PlanningGrantSummary> = all_grants
+        let all_grants: Vec<(PlanningGrantSummary, bool)> =
+            list_planning_grant_summaries(&workflow_store, &scope)?
+                .into_iter()
+                .map(|g| {
+                    let active = is_grant_summary_currently_active(&g, now_ms);
+                    (g, active)
+                })
+                .collect();
+        let active_grants_all: Vec<(PlanningGrantSummary, bool)> = all_grants
             .iter()
-            .filter(|g| is_grant_summary_currently_active(g, now_ms))
+            .filter(|(_, active)| *active)
             .cloned()
             .collect();
-        let active_grant = active_grants_all.last().cloned();
-        let active_grants: Vec<PlanningGrantSummary> = active_grants_all
-            .into_iter()
-            .rev()
-            .take(limit)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect();
 
-        let has_more_grants = all_grants.len() > limit;
-        let grants = take_tail_bounded(&all_grants, limit);
+        let mut scoped_jobs: Vec<(&CoworkerJobRecord, Option<PlanStatus>)> =
+            Vec::with_capacity(wf_ledger.jobs.len());
+        for job in &wf_ledger.jobs {
+            job.validate()?;
+            if job.binding_id != self.binding_id || job.thread_uuid != self.thread_uuid {
+                return Err(NativeError::new(
+                    NativeErrorCode::SecurityViolation,
+                    "CoworkerJobRecord scope does not match verified binding_id and thread_uuid",
+                ));
+            }
+            let current_plan_status = job.planning_result.as_ref().and_then(|pr| {
+                ScopedWorkflow::read_plan_summary_readonly_at(
+                    &self.registry_dir,
+                    &self.plans_dir,
+                    &self.binding_id,
+                    &pr.plan_id,
+                    pr.plan_revision,
+                )
+                .ok()
+                .map(|header| header.status)
+            });
+            scoped_jobs.push((job, current_plan_status));
+        }
 
-        let all_jobs: Vec<CoworkerJobSummary> = wf_ledger
-            .jobs
-            .iter()
-            .filter(|j| j.binding_id == self.binding_id && j.thread_uuid == self.thread_uuid)
-            .map(CoworkerJobSummary::from_record)
-            .collect();
-        let has_more_jobs = all_jobs.len() > limit;
-        let jobs = take_tail_bounded(&all_jobs, limit);
-
-        let all_advice: Vec<CoworkerArchitectAdviceSummary> = wf_ledger
-            .architect_advice
-            .iter()
-            .filter(|a| a.binding_id == self.binding_id && a.thread_uuid == self.thread_uuid)
-            .map(CoworkerArchitectAdviceSummary::from_record)
-            .collect();
-        let architect_advice = take_tail_bounded(&all_advice, limit);
+        let mut scoped_advice: Vec<&ArchitectAdviceRecord> =
+            Vec::with_capacity(wf_ledger.architect_advice.len());
+        for advice in &wf_ledger.architect_advice {
+            advice.validate()?;
+            if advice.binding_id != self.binding_id || advice.thread_uuid != self.thread_uuid {
+                return Err(NativeError::new(
+                    NativeErrorCode::SecurityViolation,
+                    "ArchitectAdviceRecord scope does not match verified binding_id and thread_uuid",
+                ));
+            }
+            scoped_advice.push(advice);
+        }
 
         let cmd_page = list_planning_command_summaries_readonly(
             &self.plans_dir,
             &self.registry_dir,
             &self.binding_id,
             &self.thread_uuid,
-            limit,
+            usize::MAX,
             None,
         )?;
+        let all_commands = cmd_page.commands;
 
-        Ok(CoworkerStatusResponse {
-            binding_id: self.binding_id.clone(),
-            thread_uuid: self.thread_uuid.clone(),
-            workflow_ledger_revision: wf_ledger.ledger_revision,
-            command_ledger_revision: cmd_page.ledger_revision,
-            active_grant,
-            active_grants,
-            grants,
-            jobs,
-            architect_advice,
-            has_more_commands: cmd_page.next_cursor.is_some(),
-            commands: cmd_page.commands,
-            has_more_grants,
-            has_more_jobs,
-        })
+        let unknown_effect_reservation_count = all_grants.iter().fold(0u32, |acc, (g, _)| {
+            acc.saturating_add(g.usage.unknown_effect_calls)
+        });
+        let unresolved_job_outbox_count: usize = scoped_jobs
+            .iter()
+            .map(|(job, _)| {
+                job.outbox
+                    .iter()
+                    .filter(|o| o.status.blocks_replay_and_new_dispatch())
+                    .count()
+            })
+            .sum();
+        let pending_reconciliation_command_count = all_commands
+            .iter()
+            .filter(|cmd| cmd.pending_reconciliation)
+            .count();
+        let pending_reconciliation = unknown_effect_reservation_count > 0
+            || unresolved_job_outbox_count > 0
+            || pending_reconciliation_command_count > 0;
+
+        let latest_active_grant = active_grants_all.last().cloned();
+        let active_grant_id = latest_active_grant
+            .as_ref()
+            .map(|(g, _)| g.grant_id.clone());
+
+        let mut active_grants_cap = active_grants_all.len().min(limit);
+        let mut grants_cap = all_grants.len().min(limit);
+        let mut jobs_cap = scoped_jobs.len().min(limit);
+        let mut advice_cap = scoped_advice.len().min(limit);
+        let mut commands_cap = all_commands.len().min(limit);
+        let mut text_budget_idx = 0usize;
+        let mut include_active_grant = latest_active_grant.is_some();
+
+        loop {
+            let text_wire_budget = STATUS_TEXT_WIRE_BUDGET_STEPS[text_budget_idx];
+            let selected_active_grants = select_tail_preserving_attention(
+                &active_grants_all,
+                active_grants_cap,
+                |(g, _)| g.usage.unknown_effect_calls > 0,
+            );
+            let selected_grants =
+                select_tail_preserving_attention(&all_grants, grants_cap, |(g, _)| {
+                    g.usage.unknown_effect_calls > 0
+                });
+            let selected_jobs =
+                select_tail_preserving_attention(&scoped_jobs, jobs_cap, |(job, _)| {
+                    job.outbox
+                        .iter()
+                        .any(|o| o.status.blocks_replay_and_new_dispatch())
+                });
+            let selected_advice =
+                select_tail_preserving_attention(&scoped_advice, advice_cap, |_| false);
+            let selected_commands =
+                select_tail_preserving_attention(&all_commands, commands_cap, |cmd| {
+                    cmd.pending_reconciliation
+                });
+
+            let active_grant = if include_active_grant {
+                latest_active_grant.as_ref().map(|(g, active)| {
+                    CoworkerStatusGrantSummary::from_summary(g, *active, text_wire_budget)
+                })
+            } else {
+                None
+            };
+            let active_grant_omitted_by_byte_budget =
+                latest_active_grant.is_some() && !include_active_grant;
+
+            let active_grants: Vec<CoworkerStatusGrantSummary> = selected_active_grants
+                .iter()
+                .map(|(g, active)| {
+                    CoworkerStatusGrantSummary::from_summary(g, *active, text_wire_budget)
+                })
+                .collect();
+            let grants: Vec<CoworkerStatusGrantSummary> = selected_grants
+                .iter()
+                .map(|(g, active)| {
+                    CoworkerStatusGrantSummary::from_summary(g, *active, text_wire_budget)
+                })
+                .collect();
+            let jobs: Vec<CoworkerStatusJobSummary> = selected_jobs
+                .iter()
+                .map(|(job, plan_status)| {
+                    CoworkerStatusJobSummary::from_record(job, *plan_status, text_wire_budget)
+                })
+                .collect();
+            let architect_advice: Vec<CoworkerStatusArchitectAdviceSummary> = selected_advice
+                .iter()
+                .map(|record| {
+                    CoworkerStatusArchitectAdviceSummary::from_record(record, text_wire_budget)
+                })
+                .collect();
+            let commands: Vec<CoworkerStatusCommandSummary> = selected_commands
+                .iter()
+                .map(|cmd| CoworkerStatusCommandSummary::from_summary(cmd, text_wire_budget))
+                .collect();
+
+            let active_grants_bounds = build_section_bounds(
+                active_grants_all.len(),
+                limit,
+                active_grants.len(),
+                active_grants
+                    .iter()
+                    .filter(|g| g.revoked_reason_truncated)
+                    .count(),
+                0,
+            );
+            let grants_bounds = build_section_bounds(
+                all_grants.len(),
+                limit,
+                grants.len(),
+                grants.iter().filter(|g| g.revoked_reason_truncated).count(),
+                0,
+            );
+            let jobs_bounds = build_section_bounds(
+                scoped_jobs.len(),
+                limit,
+                jobs.len(),
+                jobs.iter().filter(|j| j.has_truncated_text()).count(),
+                jobs.iter()
+                    .filter(|j| j.has_projected_nested_detail())
+                    .count(),
+            );
+            let architect_advice_bounds = build_section_bounds(
+                scoped_advice.len(),
+                limit,
+                architect_advice.len(),
+                architect_advice
+                    .iter()
+                    .filter(|a| a.decision_summary_truncated)
+                    .count(),
+                architect_advice
+                    .iter()
+                    .filter(|a| a.omitted_context_dependency_maps)
+                    .count(),
+            );
+            let commands_bounds = build_section_bounds(
+                all_commands.len(),
+                limit,
+                commands.len(),
+                commands.iter().filter(|c| c.has_truncated_text()).count(),
+                commands
+                    .iter()
+                    .filter(|c| c.has_projected_nested_detail())
+                    .count(),
+            );
+
+            let rows_omitted_by_byte_budget = active_grant_omitted_by_byte_budget
+                || active_grants_bounds.omitted_by_byte_budget_count > 0
+                || grants_bounds.omitted_by_byte_budget_count > 0
+                || jobs_bounds.omitted_by_byte_budget_count > 0
+                || architect_advice_bounds.omitted_by_byte_budget_count > 0
+                || commands_bounds.omitted_by_byte_budget_count > 0;
+            let details_omitted_or_truncated_by_byte_budget = rows_omitted_by_byte_budget
+                || text_budget_idx > 0
+                || active_grant
+                    .as_ref()
+                    .is_some_and(|g| g.revoked_reason_truncated)
+                || active_grants_bounds.truncated_text_row_count > 0
+                || grants_bounds.truncated_text_row_count > 0
+                || jobs_bounds.truncated_text_row_count > 0
+                || jobs_bounds.projected_nested_detail_row_count > 0
+                || architect_advice_bounds.truncated_text_row_count > 0
+                || architect_advice_bounds.projected_nested_detail_row_count > 0
+                || commands_bounds.truncated_text_row_count > 0
+                || commands_bounds.projected_nested_detail_row_count > 0;
+
+            let candidate = CoworkerStatusResponse {
+                binding_id: self.binding_id.clone(),
+                thread_uuid: self.thread_uuid.clone(),
+                workflow_ledger_revision: wf_ledger.ledger_revision,
+                command_ledger_revision: cmd_page.ledger_revision,
+                effective_limit: limit,
+                active_grant_id: active_grant_id.clone(),
+                active_grant,
+                active_grant_omitted_by_byte_budget,
+                has_more_active_grants: active_grants_bounds.has_more,
+                has_more_grants: grants_bounds.has_more,
+                has_more_jobs: jobs_bounds.has_more,
+                has_more_architect_advice: architect_advice_bounds.has_more,
+                has_more_commands: commands_bounds.has_more,
+                rows_omitted_by_byte_budget,
+                details_omitted_or_truncated_by_byte_budget,
+                pending_reconciliation,
+                unknown_effect_reservation_count,
+                unresolved_job_outbox_count,
+                pending_reconciliation_command_count,
+                active_grants,
+                grants,
+                jobs,
+                architect_advice,
+                commands,
+                active_grants_bounds,
+                grants_bounds,
+                jobs_bounds,
+                architect_advice_bounds,
+                commands_bounds,
+            };
+
+            let wire_bytes =
+                measure_mcp_response_bytes(&self.binding_id, "coworker_status", &candidate)
+                    .map_err(map_status_wire_budget_error)?;
+
+            if wire_bytes <= MAX_MCP_RESPONSE_BYTES {
+                ensure_mcp_response_budget(&self.binding_id, "coworker_status", &candidate)
+                    .map_err(map_status_wire_budget_error)?;
+                return Ok(candidate);
+            }
+
+            let max_cap = active_grants_cap
+                .max(grants_cap)
+                .max(commands_cap)
+                .max(jobs_cap)
+                .max(advice_cap);
+            if max_cap > 1 {
+                if active_grants_cap == max_cap {
+                    active_grants_cap -= 1;
+                } else if grants_cap == max_cap {
+                    grants_cap -= 1;
+                } else if commands_cap == max_cap {
+                    commands_cap -= 1;
+                } else if jobs_cap == max_cap {
+                    jobs_cap -= 1;
+                } else {
+                    advice_cap -= 1;
+                }
+                continue;
+            }
+
+            if text_budget_idx + 1 < STATUS_TEXT_WIRE_BUDGET_STEPS.len() {
+                text_budget_idx += 1;
+                continue;
+            }
+            if active_grants_cap > 0 {
+                active_grants_cap = 0;
+                continue;
+            }
+            if advice_cap > 0 {
+                advice_cap = 0;
+                continue;
+            }
+            if grants_cap > 0 {
+                grants_cap = 0;
+                continue;
+            }
+            if jobs_cap > 0 {
+                jobs_cap = 0;
+                continue;
+            }
+            if commands_cap > 0 {
+                commands_cap = 0;
+                continue;
+            }
+            if include_active_grant {
+                include_active_grant = false;
+                continue;
+            }
+
+            ensure_mcp_response_budget(&self.binding_id, "coworker_status", &candidate)
+                .map_err(map_status_wire_budget_error)?;
+            return Ok(candidate);
+        }
     }
 
     /// Executes `prepare_work` under an existing active [`PlanningAdviceGrant`], deterministically
@@ -2103,11 +3354,99 @@ fn validate_status_limit(limit: Option<usize>) -> Result<usize, NativeError> {
     Ok(resolved)
 }
 
-fn take_tail_bounded<T: Clone>(items: &[T], limit: usize) -> Vec<T> {
-    if items.len() <= limit {
-        items.to_vec()
-    } else {
-        items[items.len() - limit..].to_vec()
+/// Truncates `input` on an exact UTF-8 codepoint boundary so its dual-envelope JSON representation
+/// across `CallToolResult.structured_content` and escaped `CallToolResult.content[0].text` uses at
+/// most `max_dual_wire_bytes` bytes.
+///
+/// Returns `(bounded_text, was_truncated)`.
+#[must_use]
+pub fn truncate_status_text_unicode_safe(
+    input: &str,
+    max_dual_wire_bytes: usize,
+) -> (String, bool) {
+    let mut used_wire_bytes = 0usize;
+    for (byte_idx, ch) in input.char_indices() {
+        let ch_cost = dual_envelope_wire_bytes_for_char(ch);
+        if used_wire_bytes.saturating_add(ch_cost) > max_dual_wire_bytes {
+            return (input[..byte_idx].to_string(), true);
+        }
+        used_wire_bytes += ch_cost;
+    }
+    (input.to_string(), false)
+}
+
+const fn dual_envelope_wire_bytes_for_char(ch: char) -> usize {
+    match ch {
+        // `\"` in structuredContent (2 bytes) + `\\\"` in content[0].text (4 bytes) = 6 wire bytes.
+        '"' | '\\' => 6,
+        // `\n` in structuredContent (2 bytes) + `\\n` in content[0].text (3 bytes) = 5 wire bytes.
+        '\n' | '\r' | '\t' | '\u{0008}' | '\u{000c}' => 5,
+        // `\u00XX` in structuredContent (6 bytes) + `\\u00XX` in content[0].text (7 bytes) = 13 wire bytes.
+        c if (c as u32) < 0x20 => 13,
+        // Unescaped UTF-8 codepoint serialized once in structuredContent and once in content[0].text.
+        c => c.len_utf8() * 2,
+    }
+}
+
+fn select_tail_preserving_attention<T: Clone, F: Fn(&T) -> bool>(
+    items: &[T],
+    count: usize,
+    needs_attention: F,
+) -> Vec<T> {
+    if count == 0 || items.is_empty() {
+        return Vec::new();
+    }
+    if items.len() <= count {
+        return items.to_vec();
+    }
+    let attention_indices: Vec<usize> = items
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, item)| needs_attention(item).then_some(idx))
+        .collect();
+    if attention_indices.len() >= count {
+        return attention_indices[attention_indices.len() - count..]
+            .iter()
+            .map(|&idx| items[idx].clone())
+            .collect();
+    }
+    let mut selected: BTreeSet<usize> = attention_indices.into_iter().collect();
+    for idx in (0..items.len()).rev() {
+        if selected.len() == count {
+            break;
+        }
+        selected.insert(idx);
+    }
+    selected.into_iter().map(|idx| items[idx].clone()).collect()
+}
+
+fn build_section_bounds(
+    total_count: usize,
+    limit: usize,
+    returned_count: usize,
+    truncated_text_row_count: usize,
+    projected_nested_detail_row_count: usize,
+) -> CoworkerStatusSectionBounds {
+    let after_limit_count = total_count.min(limit);
+    let omitted_by_limit_count = total_count.saturating_sub(after_limit_count);
+    let omitted_by_byte_budget_count = after_limit_count.saturating_sub(returned_count);
+    CoworkerStatusSectionBounds {
+        total_count,
+        returned_count,
+        has_more: returned_count < total_count,
+        omitted_by_limit_count,
+        omitted_by_byte_budget_count,
+        truncated_text_row_count,
+        projected_nested_detail_row_count,
+    }
+}
+
+fn map_status_wire_budget_error(err: WorkflowError) -> NativeError {
+    match err {
+        WorkflowError::ResponseTooLarge(msg) => {
+            NativeError::new(NativeErrorCode::OutputOverflow, msg)
+        }
+        other => NativeError::new(NativeErrorCode::ProtocolError, other.safe_message()),
     }
 }
 
