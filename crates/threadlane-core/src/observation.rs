@@ -1608,32 +1608,188 @@ pub fn validate_existing_private_file_readonly(
     Ok(post_meta)
 }
 
-static JOURNAL_APPEND_LOCK: Mutex<()> = Mutex::new(());
+const MAX_ACTIVE_JOURNAL_APPEND_LOCKS: usize = 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum JournalIdentityKey {
+    #[cfg(unix)]
+    UnixDir(u64, u64),
+    #[cfg(not(unix))]
+    CanonicalDir(PathBuf),
+}
+
+fn derive_journal_identity_key(
+    dir: &Path,
+    dir_meta: &fs::Metadata,
+) -> Result<JournalIdentityKey, ObservationJournalError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let _ = dir;
+        Ok(JournalIdentityKey::UnixDir(dir_meta.dev(), dir_meta.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir_meta;
+        let canonical = fs::canonicalize(dir)?;
+        verify_private_dir_metadata(&fs::symlink_metadata(&canonical)?)?;
+        Ok(JournalIdentityKey::CanonicalDir(canonical))
+    }
+}
+
+type JournalLockMap = std::collections::BTreeMap<JournalIdentityKey, std::sync::Weak<Mutex<()>>>;
+
+struct JournalAppendLockRegistry {
+    entries: Mutex<JournalLockMap>,
+    max_active: usize,
+}
+
+impl JournalAppendLockRegistry {
+    const fn new(max_active: usize) -> Self {
+        Self {
+            entries: Mutex::new(std::collections::BTreeMap::new()),
+            max_active,
+        }
+    }
+
+    fn lock_entries(&self) -> std::sync::MutexGuard<'_, JournalLockMap> {
+        match self.entries.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    fn lookup_or_insert(
+        &self,
+        key: &JournalIdentityKey,
+    ) -> Result<std::sync::Arc<Mutex<()>>, ObservationJournalError> {
+        let mut entries = self.lock_entries();
+
+        if let Some(existing) = entries.get(key).and_then(std::sync::Weak::upgrade) {
+            return Ok(existing);
+        }
+
+        entries.retain(|_, weak| weak.strong_count() > 0);
+
+        if entries.len() >= self.max_active {
+            return Err(ObservationJournalError::Io(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                format!(
+                    "active observation journal append lock registry capacity ({}) exceeded",
+                    self.max_active
+                ),
+            )));
+        }
+
+        let lock = std::sync::Arc::new(Mutex::new(()));
+        entries.insert(key.clone(), std::sync::Arc::downgrade(&lock));
+        Ok(lock)
+    }
+
+    fn prune_if_dead(&self, key: &JournalIdentityKey) {
+        let mut entries = self.lock_entries();
+        if let Some(weak) = entries.get(key) {
+            if weak.strong_count() == 0 {
+                entries.remove(key);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn contains_key(&self, key: &JournalIdentityKey) -> bool {
+        self.lock_entries().contains_key(key)
+    }
+
+    #[cfg(test)]
+    fn tracked_entry_count(&self) -> usize {
+        self.lock_entries().len()
+    }
+}
+
+struct JournalRegistryCleanupGuard<'a> {
+    registry: &'a JournalAppendLockRegistry,
+    key: JournalIdentityKey,
+}
+
+impl Drop for JournalRegistryCleanupGuard<'_> {
+    fn drop(&mut self) {
+        self.registry.prune_if_dead(&self.key);
+    }
+}
+
+static JOURNAL_APPEND_LOCKS: JournalAppendLockRegistry =
+    JournalAppendLockRegistry::new(MAX_ACTIVE_JOURNAL_APPEND_LOCKS);
+
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct TestJournalLockingStageKey {
+    dir: PathBuf,
+    record_id: String,
+}
+
+#[cfg(test)]
+type TestJournalLockingStageHookMap =
+    std::collections::BTreeMap<TestJournalLockingStageKey, std::sync::mpsc::Sender<()>>;
+
+#[cfg(test)]
+static TEST_JOURNAL_LOCKING_STAGE_HOOKS: Mutex<TestJournalLockingStageHookMap> =
+    Mutex::new(std::collections::BTreeMap::new());
+
+#[cfg(test)]
+fn notify_test_journal_locking_stage(dir: &Path, record_id: &str) {
+    let mut hooks = match TEST_JOURNAL_LOCKING_STAGE_HOOKS.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if hooks.is_empty() {
+        return;
+    }
+    let key = TestJournalLockingStageKey {
+        dir: dir.to_path_buf(),
+        record_id: record_id.to_string(),
+    };
+    if let Some(tx) = hooks.remove(&key) {
+        let _ = tx.send(());
+    }
+}
 
 /// Appends a single JSONL [`ObservationJournalRecord`] to `<dir>/observation-journal.jsonl`.
 ///
 /// Requires `dir` to be an existing `0700` non-symlink directory. On Unix, opens a verified
 /// parent-directory handle with `O_NOFOLLOW`, keeps it alive across the append, and revalidates
 /// the directory path and handle identity (`dev+ino`, owner, and `0700` mode) before writing and
-/// before completion so directory substitution is rejected. Serializes the complete JSONL line
-/// first, opens or creates the journal file with `0600` permissions and `O_APPEND | O_NOFOLLOW`,
-/// verifies `fstat` regular file / owner / `0600` mode / matching `dev+ino`, acquires an exclusive
-/// cross-process lock, repairs any missing trailing newline from an interrupted prior write,
-/// writes the complete record line, flushes, syncs file data (`sync_data`), and on Unix syncs
-/// parent directory metadata (`sync_all`, even when the journal preexisted) before releasing the
-/// lock and returning `Ok(())`. Non-Unix targets preserve file-data sync without directory-handle
-/// sync. These OS sync primitives provide software-level crash/power-loss durability guarantees
-/// where honored by the underlying kernel and storage stack (not verified by hardware power-cut
-/// testing).
+/// before completion so directory substitution is rejected. In-process append serialization is
+/// scoped per verified journal directory identity (`dev+ino` on Unix; canonical directory path on
+/// non-Unix) via a short-held, bounded weak registry so lock contention or `fsync` latency on one
+/// journal never blocks appends to unrelated private journals, failing closed if active registry
+/// capacity is exceeded rather than falling back to process-global serialization. Serializes the
+/// complete JSONL line first, opens or creates the journal file with `0600` permissions and
+/// `O_APPEND | O_NOFOLLOW`, verifies `fstat` regular file / owner / `0600` mode / matching
+/// `dev+ino`, acquires an exclusive cross-process lock, repairs any missing trailing newline from
+/// an interrupted prior write, writes the complete record line, flushes, syncs file data
+/// (`sync_data`), and on Unix syncs parent directory metadata (`sync_all`, even when the journal
+/// preexisted) before releasing the lock and returning `Ok(())`. Non-Unix targets preserve
+/// file-data sync without directory-handle sync. These OS sync primitives provide software-level
+/// crash/power-loss durability guarantees where honored by the underlying kernel and storage stack
+/// (not verified by hardware power-cut testing or macOS/Windows platform acceptance).
 pub fn append_journal_record(
     dir: &Path,
     record: &ObservationJournalRecord,
+) -> Result<(), ObservationJournalError> {
+    append_journal_record_with_locks(dir, record, &JOURNAL_APPEND_LOCKS)
+}
+
+fn append_journal_record_with_locks(
+    dir: &Path,
+    record: &ObservationJournalRecord,
+    locks: &JournalAppendLockRegistry,
 ) -> Result<(), ObservationJournalError> {
     let dir_meta = validate_private_dir_metadata(dir)?;
     #[cfg(unix)]
     let dir_file = Some(open_verified_private_dir(dir, &dir_meta)?);
     #[cfg(not(unix))]
     let dir_file: Option<File> = None;
+    let journal_key = derive_journal_identity_key(dir, &dir_meta)?;
 
     let mut line = serde_json::to_vec(record)?;
     line.push(b'\n');
@@ -1641,7 +1797,15 @@ pub fn append_journal_record(
         return Err(ObservationJournalError::RecordTooLarge);
     }
 
-    let _in_process_guard = JOURNAL_APPEND_LOCK
+    // Reverse declaration drop order releases `file` and `_in_process_guard`, drops the strong
+    // `Arc` in `journal_mutex`, prunes any dead weak entry via `_registry_cleanup`, and closes
+    // `dir_file` last so `(dev, ino)` remains pinned in the kernel while `journal_mutex` is live.
+    let _registry_cleanup = JournalRegistryCleanupGuard {
+        registry: locks,
+        key: journal_key,
+    };
+    let journal_mutex = locks.lookup_or_insert(&_registry_cleanup.key)?;
+    let _in_process_guard = journal_mutex
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
 
@@ -1674,6 +1838,9 @@ pub fn append_journal_record(
     if let Some(pre) = &pre_meta {
         verify_same_file_identity(pre, &post_meta, "observation journal")?;
     }
+
+    #[cfg(test)]
+    notify_test_journal_locking_stage(dir, &record.record_id);
 
     file.lock_exclusive()?;
 
@@ -7793,5 +7960,618 @@ mod tests {
         let round_trip: ObservationSnapshot =
             serde_json::from_str(&round_trip_json).expect("deserialize snapshot with contexts");
         assert_eq!(round_trip.warning_contexts, with_context.warning_contexts);
+    }
+
+    struct JournalConcurrencyFixture {
+        hook_keys: Vec<TestJournalLockingStageKey>,
+        held_flocks: Vec<Option<File>>,
+        threads: std::collections::VecDeque<std::thread::JoinHandle<()>>,
+    }
+
+    impl JournalConcurrencyFixture {
+        fn new() -> Self {
+            Self {
+                hook_keys: Vec::new(),
+                held_flocks: Vec::new(),
+                threads: std::collections::VecDeque::new(),
+            }
+        }
+
+        fn register_locking_stage_hook(
+            &mut self,
+            dir: &Path,
+            record_id: &str,
+        ) -> std::sync::mpsc::Receiver<()> {
+            let key = TestJournalLockingStageKey {
+                dir: dir.to_path_buf(),
+                record_id: record_id.to_string(),
+            };
+            let (tx, rx) = std::sync::mpsc::channel();
+            let mut hooks = match TEST_JOURNAL_LOCKING_STAGE_HOOKS.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            hooks.insert(key.clone(), tx);
+            drop(hooks);
+            self.hook_keys.push(key);
+            rx
+        }
+
+        fn hold_exclusive_flock(&mut self, journal_path: &Path) -> usize {
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(journal_path)
+                .expect("open existing journal file for exclusive flock");
+            file.lock_exclusive().expect("lock journal file");
+            let idx = self.held_flocks.len();
+            self.held_flocks.push(Some(file));
+            idx
+        }
+
+        fn release_flock(&mut self, idx: usize) {
+            if let Some(file) = self.held_flocks.get_mut(idx).and_then(Option::take) {
+                let _ = file.unlock();
+                drop(file);
+            }
+        }
+
+        fn release_resources(&mut self) {
+            let mut hooks = match TEST_JOURNAL_LOCKING_STAGE_HOOKS.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            while let Some(key) = self.hook_keys.pop() {
+                hooks.remove(&key);
+            }
+            drop(hooks);
+            for maybe_file in &mut self.held_flocks {
+                if let Some(file) = maybe_file.take() {
+                    let _ = file.unlock();
+                    drop(file);
+                }
+            }
+        }
+
+        fn spawn<F>(&mut self, f: F)
+        where
+            F: FnOnce() + Send + 'static,
+        {
+            self.threads.push_back(std::thread::spawn(f));
+        }
+
+        fn join_all(&mut self) {
+            self.release_resources();
+            let mut first_panic: Option<Box<dyn std::any::Any + Send + 'static>> = None;
+            while let Some(handle) = self.threads.pop_front() {
+                if let Err(payload) = handle.join() {
+                    if first_panic.is_none() {
+                        first_panic = Some(payload);
+                    }
+                }
+            }
+            if let Some(payload) = first_panic {
+                std::panic::resume_unwind(payload);
+            }
+        }
+    }
+
+    impl Drop for JournalConcurrencyFixture {
+        fn drop(&mut self) {
+            self.release_resources();
+            while let Some(handle) = self.threads.pop_front() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    fn journal_registry_contains_dir(locks: &JournalAppendLockRegistry, dir: &Path) -> bool {
+        let dir_meta = validate_private_dir_metadata(dir).expect("valid test dir");
+        let key = derive_journal_identity_key(dir, &dir_meta).expect("key");
+        locks.contains_key(&key)
+    }
+
+    fn append_for_channel(dir: &Path, record: &ObservationJournalRecord) -> Result<(), String> {
+        match append_journal_record(dir, record) {
+            Ok(()) => Ok(()),
+            Err(err) => Err(err.to_string()),
+        }
+    }
+
+    fn append_with_locks_for_channel(
+        dir: &Path,
+        record: &ObservationJournalRecord,
+        locks: &JournalAppendLockRegistry,
+    ) -> Result<(), String> {
+        match append_journal_record_with_locks(dir, record, locks) {
+            Ok(()) => Ok(()),
+            Err(err) => Err(err.to_string()),
+        }
+    }
+
+    #[test]
+    fn blocked_journal_flock_allows_unrelated_private_journal_append_before_release() {
+        let dir_a = ScopedPrivateDir::new("flock-isolated-a");
+        let dir_b = ScopedPrivateDir::new("flock-isolated-b");
+        let mut fixture = JournalConcurrencyFixture::new();
+
+        let seed_a = sample_journal_record(
+            "obsrec_iso_a_seed",
+            "obsreq_iso_a_seed",
+            ObservationRecordPhase::Entry,
+            ObservationCallState::Running,
+        );
+        append_journal_record(&dir_a.path, &seed_a).expect("seed journal A");
+
+        let journal_a_path = dir_a.path.join(OBSERVATION_JOURNAL_FILE_NAME);
+        let flock_a = fixture.hold_exclusive_flock(&journal_a_path);
+
+        let rec_a = sample_journal_record(
+            "obsrec_iso_a_blocked",
+            "obsreq_iso_a_blocked",
+            ObservationRecordPhase::Finish,
+            ObservationCallState::Completed,
+        );
+        let entered_locking_a_rx =
+            fixture.register_locking_stage_hook(&dir_a.path, &rec_a.record_id);
+
+        let (done_a_tx, done_a_rx) = std::sync::mpsc::channel();
+        let dir_a_path = dir_a.path.clone();
+        let rec_a_clone = rec_a.clone();
+        fixture.spawn(move || {
+            let _ = done_a_tx.send(append_for_channel(&dir_a_path, &rec_a_clone));
+        });
+
+        let stage_timeout = std::time::Duration::from_secs(5);
+        entered_locking_a_rx
+            .recv_timeout(stage_timeout)
+            .expect("appender A must enter locking stage before journal B starts");
+        assert_eq!(
+            done_a_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        );
+
+        let rec_b = sample_journal_record(
+            "obsrec_iso_b_independent",
+            "obsreq_iso_b_independent",
+            ObservationRecordPhase::Entry,
+            ObservationCallState::Running,
+        );
+        let (done_b_tx, done_b_rx) = std::sync::mpsc::channel();
+        let dir_b_path = dir_b.path.clone();
+        let rec_b_clone = rec_b.clone();
+        fixture.spawn(move || {
+            let _ = done_b_tx.send(append_for_channel(&dir_b_path, &rec_b_clone));
+        });
+
+        let b_timeout = std::time::Duration::from_secs(2);
+        let b_result = done_b_rx
+            .recv_timeout(b_timeout)
+            .expect("unrelated journal B append must complete before journal A flock release");
+        assert_eq!(b_result, Ok(()));
+
+        let (records_b, warnings_b) =
+            read_journal_records_readonly(&dir_b.path).expect("read journal B while A is locked");
+        assert!(warnings_b.is_empty(), "unexpected warnings: {warnings_b:?}");
+        assert_eq!(records_b.len(), 1);
+        assert_eq!(records_b[0].record_id, "obsrec_iso_b_independent");
+
+        assert_eq!(
+            done_a_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        );
+
+        fixture.release_flock(flock_a);
+
+        let a_result = done_a_rx
+            .recv_timeout(stage_timeout)
+            .expect("appender A must complete after journal A flock is released");
+        assert_eq!(a_result, Ok(()));
+        fixture.join_all();
+
+        let (records_a, warnings_a) =
+            read_journal_records_readonly(&dir_a.path).expect("read journal A after release");
+        assert!(warnings_a.is_empty(), "unexpected warnings: {warnings_a:?}");
+        assert_eq!(records_a.len(), 2);
+        assert_eq!(records_a[0].record_id, "obsrec_iso_a_seed");
+        assert_eq!(records_a[1].record_id, "obsrec_iso_a_blocked");
+    }
+
+    #[test]
+    fn same_journal_multiwriter_repairs_missing_newline_and_serializes_aliased_paths() {
+        let dir = ScopedPrivateDir::new("same-journal-alias-repair");
+        let mut fixture = JournalConcurrencyFixture::new();
+
+        let seed = sample_journal_record(
+            "obsrec_same_seed",
+            "obsreq_same_seed",
+            ObservationRecordPhase::Entry,
+            ObservationCallState::Running,
+        );
+        append_journal_record(&dir.path, &seed).expect("append seed");
+
+        let journal_path = dir.path.join(OBSERVATION_JOURNAL_FILE_NAME);
+        {
+            let mut file = OpenOptions::new()
+                .append(true)
+                .open(&journal_path)
+                .expect("open journal for partial tail");
+            file.write_all(b"{\"record_id\":\"truncated_missing_newline\"")
+                .expect("write partial tail without trailing newline");
+        }
+
+        let mut alias_os = dir.path.as_os_str().to_os_string();
+        alias_os.push(std::path::MAIN_SEPARATOR_STR);
+        let alias_dir = PathBuf::from(alias_os);
+
+        let threads = 6usize;
+        let per_thread = 20usize;
+        let barrier = Arc::new(std::sync::Barrier::new(threads));
+
+        for t in 0..threads {
+            let target_dir = if t % 2 == 0 {
+                dir.path.clone()
+            } else {
+                alias_dir.clone()
+            };
+            let start_gate = Arc::clone(&barrier);
+            fixture.spawn(move || {
+                start_gate.wait();
+                for i in 0..per_thread {
+                    let rec_id = format!("obsrec_same_t{t}_i{i}");
+                    let req_id = format!("obsreq_same_t{t}_i{i}");
+                    let mut rec = sample_journal_record(
+                        &rec_id,
+                        &req_id,
+                        ObservationRecordPhase::Progress,
+                        ObservationCallState::Running,
+                    );
+                    rec.summary = Some(format!("Alias writer {t} row {i} pad {}", "y".repeat(120)));
+                    append_journal_record(&target_dir, &rec).expect("append");
+                }
+            });
+        }
+        fixture.join_all();
+
+        let raw = fs::read_to_string(&journal_path).expect("read raw");
+        assert!(raw.ends_with('\n'));
+        let raw_lines: Vec<&str> = raw.lines().collect();
+        assert_eq!(raw_lines.len(), 2 + threads * per_thread);
+        serde_json::from_str::<ObservationJournalRecord>(raw_lines[0])
+            .expect("seed line must remain valid JSON");
+        assert_eq!(raw_lines[1], "{\"record_id\":\"truncated_missing_newline\"");
+        for line in &raw_lines[2..] {
+            serde_json::from_str::<ObservationJournalRecord>(line)
+                .expect("every repaired concurrent line must parse cleanly");
+        }
+
+        let held_flock = fixture.hold_exclusive_flock(&journal_path);
+        let held_rec_1 = sample_journal_record(
+            "obsrec_same_held_1",
+            "obsreq_same_held_1",
+            ObservationRecordPhase::Entry,
+            ObservationCallState::Running,
+        );
+        let held_rec_2 = sample_journal_record(
+            "obsrec_same_held_2",
+            "obsreq_same_held_2",
+            ObservationRecordPhase::Finish,
+            ObservationCallState::Completed,
+        );
+        let entered_rx = fixture.register_locking_stage_hook(&dir.path, &held_rec_1.record_id);
+
+        let (done_1_tx, done_1_rx) = std::sync::mpsc::channel();
+        let p1 = dir.path.clone();
+        fixture.spawn(move || {
+            let _ = done_1_tx.send(append_for_channel(&p1, &held_rec_1));
+        });
+
+        let timeout = std::time::Duration::from_secs(5);
+        entered_rx
+            .recv_timeout(timeout)
+            .expect("first same-journal writer must enter locking stage before second writer");
+
+        let (done_2_tx, done_2_rx) = std::sync::mpsc::channel();
+        let p2 = alias_dir;
+        fixture.spawn(move || {
+            let _ = done_2_tx.send(append_for_channel(&p2, &held_rec_2));
+        });
+
+        assert_eq!(
+            done_2_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        );
+
+        fixture.release_flock(held_flock);
+        assert_eq!(done_1_rx.recv_timeout(timeout).expect("w1"), Ok(()));
+        assert_eq!(done_2_rx.recv_timeout(timeout).expect("w2"), Ok(()));
+        fixture.join_all();
+
+        let (records, warnings) =
+            read_journal_records_readonly(&dir.path).expect("read repaired same-journal records");
+        assert_eq!(warnings.len(), 1);
+        let expected_valid = 3 + threads * per_thread;
+        assert_eq!(records.len(), expected_valid);
+        let unique_ids: BTreeSet<String> = records.into_iter().map(|r| r.record_id).collect();
+        assert_eq!(unique_ids.len(), expected_valid);
+        assert!(unique_ids.contains("obsrec_same_held_1"));
+        assert!(unique_ids.contains("obsrec_same_held_2"));
+    }
+
+    #[test]
+    fn journal_append_lock_registry_prunes_dead_entries_and_fails_closed_at_active_capacity() {
+        let probe_dir = ScopedPrivateDir::new("registry-prune-global");
+        let probe_rec = sample_journal_record(
+            "obsrec_prune_global",
+            "obsreq_prune_global",
+            ObservationRecordPhase::Entry,
+            ObservationCallState::Running,
+        );
+        append_journal_record(&probe_dir.path, &probe_rec).expect("probe");
+        let has_probe = journal_registry_contains_dir(&JOURNAL_APPEND_LOCKS, &probe_dir.path);
+        assert!(!has_probe);
+
+        let bounded = Arc::new(JournalAppendLockRegistry::new(2));
+        for idx in 0..5 {
+            let seq_dir = ScopedPrivateDir::new(&format!("registry-seq-{idx}"));
+            let seq_rec = sample_journal_record(
+                &format!("obsrec_seq_{idx}"),
+                &format!("obsreq_seq_{idx}"),
+                ObservationRecordPhase::Entry,
+                ObservationCallState::Running,
+            );
+            append_journal_record_with_locks(&seq_dir.path, &seq_rec, &bounded)
+                .expect("sequential distinct journal append must prune dead entries");
+            assert_eq!(bounded.tracked_entry_count(), 0);
+        }
+
+        let dir_1 = ScopedPrivateDir::new("registry-cap-1");
+        let dir_2 = ScopedPrivateDir::new("registry-cap-2");
+        let dir_3 = ScopedPrivateDir::new("registry-cap-3");
+        let mut fixture = JournalConcurrencyFixture::new();
+
+        let seed_1 = sample_journal_record(
+            "obsrec_cap_seed_1",
+            "obsreq_cap_seed_1",
+            ObservationRecordPhase::Entry,
+            ObservationCallState::Running,
+        );
+        let seed_2 = sample_journal_record(
+            "obsrec_cap_seed_2",
+            "obsreq_cap_seed_2",
+            ObservationRecordPhase::Entry,
+            ObservationCallState::Running,
+        );
+        append_journal_record_with_locks(&dir_1.path, &seed_1, &bounded)
+            .expect("seed journal 1 for bounded registry capacity test");
+        append_journal_record_with_locks(&dir_2.path, &seed_2, &bounded)
+            .expect("seed journal 2 for bounded registry capacity test");
+
+        let journal_1 = dir_1.path.join(OBSERVATION_JOURNAL_FILE_NAME);
+        let journal_2 = dir_2.path.join(OBSERVATION_JOURNAL_FILE_NAME);
+        let flock_1 = fixture.hold_exclusive_flock(&journal_1);
+        let flock_2 = fixture.hold_exclusive_flock(&journal_2);
+
+        let rec_1 = sample_journal_record(
+            "obsrec_cap_active_1",
+            "obsreq_cap_active_1",
+            ObservationRecordPhase::Finish,
+            ObservationCallState::Completed,
+        );
+        let rec_2 = sample_journal_record(
+            "obsrec_cap_active_2",
+            "obsreq_cap_active_2",
+            ObservationRecordPhase::Finish,
+            ObservationCallState::Completed,
+        );
+        let entered_1_rx = fixture.register_locking_stage_hook(&dir_1.path, &rec_1.record_id);
+        let entered_2_rx = fixture.register_locking_stage_hook(&dir_2.path, &rec_2.record_id);
+
+        let (done_1_tx, done_1_rx) = std::sync::mpsc::channel();
+        let p1 = dir_1.path.clone();
+        let b1 = Arc::clone(&bounded);
+        fixture.spawn(move || {
+            let _ = done_1_tx.send(append_with_locks_for_channel(&p1, &rec_1, &b1));
+        });
+
+        let (done_2_tx, done_2_rx) = std::sync::mpsc::channel();
+        let p2 = dir_2.path.clone();
+        let b2 = Arc::clone(&bounded);
+        fixture.spawn(move || {
+            let _ = done_2_tx.send(append_with_locks_for_channel(&p2, &rec_2, &b2));
+        });
+
+        let timeout = std::time::Duration::from_secs(5);
+        entered_1_rx
+            .recv_timeout(timeout)
+            .expect("first active journal writer must enter locking stage before capacity check");
+        entered_2_rx
+            .recv_timeout(timeout)
+            .expect("second active journal writer must enter locking stage before capacity check");
+        assert_eq!(bounded.tracked_entry_count(), 2);
+
+        let rec_3 = sample_journal_record(
+            "obsrec_cap_overflow_3",
+            "obsreq_cap_overflow_3",
+            ObservationRecordPhase::Entry,
+            ObservationCallState::Running,
+        );
+        let overflow_err = append_journal_record_with_locks(&dir_3.path, &rec_3, &bounded)
+            .expect_err("third distinct active journal must fail closed at capacity");
+        let is_would_block = match overflow_err {
+            ObservationJournalError::Io(ref io_err) => {
+                io_err.kind() == std::io::ErrorKind::WouldBlock
+            }
+            _ => false,
+        };
+        assert!(is_would_block, "unexpected error: {overflow_err:?}");
+        assert!(list_dir_names(&dir_3.path).is_empty());
+
+        fixture.release_flock(flock_1);
+        assert_eq!(done_1_rx.recv_timeout(timeout).expect("a1"), Ok(()));
+        let has_dir_1 = journal_registry_contains_dir(&bounded, &dir_1.path);
+        assert!(!has_dir_1);
+        assert_eq!(bounded.tracked_entry_count(), 1);
+
+        append_journal_record_with_locks(&dir_3.path, &rec_3, &bounded)
+            .expect("third journal must succeed once an active slot is freed");
+
+        fixture.release_flock(flock_2);
+        assert_eq!(done_2_rx.recv_timeout(timeout).expect("a2"), Ok(()));
+        fixture.join_all();
+        assert_eq!(bounded.tracked_entry_count(), 0);
+    }
+
+    fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+        if let Some(msg) = payload.downcast_ref::<&str>() {
+            (*msg).to_string()
+        } else if let Some(msg) = payload.downcast_ref::<String>() {
+            msg.clone()
+        } else {
+            "<non-string panic payload>".to_string()
+        }
+    }
+
+    #[test]
+    fn journal_concurrency_fixture_joins_all_children_and_preserves_first_panic() {
+        use std::sync::atomic::AtomicBool;
+
+        let dir = ScopedPrivateDir::new("fixture-panic-join");
+        let seed = sample_journal_record(
+            "obsrec_fix_seed",
+            "obsreq_fix_seed",
+            ObservationRecordPhase::Entry,
+            ObservationCallState::Running,
+        );
+        append_journal_record(&dir.path, &seed).expect("seed fixture");
+        let journal_path = dir.path.join(OBSERVATION_JOURNAL_FILE_NAME);
+        let wait = std::time::Duration::from_secs(5);
+
+        let worker_lifetime = Arc::new(());
+        let second_completed = Arc::new(AtomicBool::new(false));
+        let third_ran = Arc::new(AtomicBool::new(false));
+
+        let dir_for_join = dir.path.clone();
+        let journal_for_join = journal_path.clone();
+        let lifetime_for_join = Arc::clone(&worker_lifetime);
+        let second_done_for_join = Arc::clone(&second_completed);
+        let third_ran_for_join = Arc::clone(&third_ran);
+
+        let join_unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let mut fixture = JournalConcurrencyFixture::new();
+            let _held_flock = fixture.hold_exclusive_flock(&journal_for_join);
+
+            let rec_2 = sample_journal_record(
+                "obsrec_fix_child_2",
+                "obsreq_fix_child_2",
+                ObservationRecordPhase::Progress,
+                ObservationCallState::Running,
+            );
+            let entered_child_2_rx =
+                fixture.register_locking_stage_hook(&dir_for_join, &rec_2.record_id);
+
+            let (panic_1_tx, panic_1_rx) = std::sync::mpsc::channel();
+            let life_1 = Arc::clone(&lifetime_for_join);
+            fixture.spawn(move || {
+                let _guard = life_1;
+                let _ = panic_1_rx.recv_timeout(wait);
+                panic!("first worker intentional panic");
+            });
+
+            let life_2 = Arc::clone(&lifetime_for_join);
+            let done_2 = Arc::clone(&second_done_for_join);
+            let p2 = dir_for_join;
+            fixture.spawn(move || {
+                let _guard = life_2;
+                append_journal_record(&p2, &rec_2).expect("child 2");
+                done_2.store(true, Ordering::SeqCst);
+            });
+
+            let (panic_3_tx, panic_3_rx) = std::sync::mpsc::channel();
+            let life_3 = lifetime_for_join;
+            let ran_3 = third_ran_for_join;
+            fixture.spawn(move || {
+                let _guard = life_3;
+                let _ = panic_3_rx.recv_timeout(wait);
+                ran_3.store(true, Ordering::SeqCst);
+                panic!("third worker secondary panic");
+            });
+
+            entered_child_2_rx
+                .recv_timeout(wait)
+                .expect("later child must enter locking stage while flock is held");
+            assert!(!second_done_for_join.load(Ordering::SeqCst));
+
+            let _ = panic_1_tx.send(());
+            let _ = panic_3_tx.send(());
+            fixture.join_all();
+        }));
+
+        let payload = join_unwind.expect_err("first panic");
+        assert_eq!(
+            panic_payload_message(payload.as_ref()),
+            "first worker intentional panic"
+        );
+        assert!(second_completed.load(Ordering::SeqCst));
+        assert!(third_ran.load(Ordering::SeqCst));
+        assert_eq!(Arc::strong_count(&worker_lifetime), 1);
+
+        let drop_lifetime = Arc::new(());
+        let drop_child_completed = Arc::new(AtomicBool::new(false));
+        let dir_for_drop = dir.path.clone();
+        let journal_for_drop = journal_path;
+        let life_for_drop = Arc::clone(&drop_lifetime);
+        let done_for_drop = Arc::clone(&drop_child_completed);
+
+        let drop_unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let mut fixture = JournalConcurrencyFixture::new();
+            let _held_flock = fixture.hold_exclusive_flock(&journal_for_drop);
+
+            let rec_b = sample_journal_record(
+                "obsrec_fix_drop_child",
+                "obsreq_fix_drop_child",
+                ObservationRecordPhase::Finish,
+                ObservationCallState::Completed,
+            );
+            let entered_drop_rx =
+                fixture.register_locking_stage_hook(&dir_for_drop, &rec_b.record_id);
+
+            let life_a = Arc::clone(&life_for_drop);
+            fixture.spawn(move || {
+                let _guard = life_a;
+                panic!("child panic during drop cleanup");
+            });
+
+            let life_b = life_for_drop;
+            let done_b = Arc::clone(&done_for_drop);
+            let pb = dir_for_drop;
+            fixture.spawn(move || {
+                let _guard = life_b;
+                append_journal_record(&pb, &rec_b).expect("drop append");
+                done_b.store(true, Ordering::SeqCst);
+            });
+
+            entered_drop_rx
+                .recv_timeout(wait)
+                .expect("drop child must enter locking stage before caller panic");
+            assert!(!done_for_drop.load(Ordering::SeqCst));
+            panic!("caller panic before join_all");
+        }));
+
+        let drop_payload = drop_unwind.expect_err("caller panic");
+        assert_eq!(
+            panic_payload_message(drop_payload.as_ref()),
+            "caller panic before join_all"
+        );
+        assert!(drop_child_completed.load(Ordering::SeqCst));
+        assert_eq!(Arc::strong_count(&drop_lifetime), 1);
+
+        let (records, warnings) =
+            read_journal_records_readonly(&dir.path).expect("read journal after fixture cleanup");
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0].record_id, "obsrec_fix_seed");
+        assert_eq!(records[1].record_id, "obsrec_fix_child_2");
+        assert_eq!(records[2].record_id, "obsrec_fix_drop_child");
     }
 }

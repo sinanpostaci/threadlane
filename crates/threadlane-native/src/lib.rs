@@ -70,6 +70,8 @@ pub mod host_launcher;
 pub mod identity_matcher;
 /// Paired MCP stdio server delegating to [`threadlane::ThreadlaneMcpServer`] after enrollment.
 pub mod mcp_pair;
+/// Continuous `connect_current_chat`-gated native chat observation sampler and bounded `WorkspaceNativeSample` sidecar store.
+pub mod native_chat_observation;
 /// Common validation, live-binding verification, and bounded I/O helpers for trusted local operator CLIs.
 pub mod operator_cli;
 /// Private operator connection-epoch pairing store and verification gate types.
@@ -103,8 +105,8 @@ pub use approved_mcp::{
 };
 pub use client::{
     NativeClient, NativeConfig, NativeDiagnosticReport, NativeLoadedThreadPage,
-    NativeMcpServerStatus, NativeMcpToolCallResult, NativeThread, NativeThreadPage,
-    NativeTransport,
+    NativeMcpServerStatus, NativeMcpToolCallResult, NativeThread, NativeThreadMetadata,
+    NativeThreadPage, NativeThreadStatusDetail, NativeTransport,
 };
 pub use codex_setup::{
     apply_codex_mcp_setup, build_desired_mcp_args, check_codex_mcp_setup, resolve_codex_home,
@@ -221,6 +223,15 @@ pub use mcp_pair::{
     WorkflowTaskParams, NATIVE_OPERATOR_DOC_PATH, OPERATING_GUIDE_CLI_COMMAND,
     OPERATING_GUIDE_DOC_PATH, OPERATING_GUIDE_MARKDOWN, OPERATING_GUIDE_TOOL,
     OPERATING_GUIDE_VERSION, PAIRED_MCP_STARTUP_INSTRUCTIONS, SCOPED_MCP_STARTUP_INSTRUCTIONS,
+};
+pub use native_chat_observation::{
+    compute_observation_source_id, generate_sample_producer_epoch, native_chat_sample_filename,
+    native_chat_sample_path, native_chat_samples_dir, prove_native_thread_activity,
+    read_backend_process_instance, read_workspace_native_sample_readonly,
+    read_workspace_native_samples_readonly, write_workspace_native_sample_sidecar,
+    ManagedParentConnectionConfig, NativeChatSampleReadEntry, NativeChatSamplesReadReport,
+    WorkspaceSampleWriteOutcome, NATIVE_CHAT_SAMPLES_DIR_NAME, NATIVE_CHAT_SAMPLES_LOCK_FILENAME,
+    NATIVE_CHAT_SAMPLE_FILE_PREFIX, NATIVE_CHAT_SAMPLE_ROUTE,
 };
 pub use pairing::{
     ConnectionEpochState, ConnectionIdentity, EnrollmentRecord, NativeVerificationStatus,

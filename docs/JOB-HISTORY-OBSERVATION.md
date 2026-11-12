@@ -1,0 +1,47 @@
+# Scoped Workspace Job History Observation
+
+`crates/threadlane-native/src/coworker_observation/workspace_history.rs` (re-exported through `threadlane_native::coworker_observation`) projects typed native Coworker workflow and controller records into the bounded `threadlane_core::observation` workspace history contracts and performs read-only historical acceptance verification without introducing a parallel JSON schema, cache, or execution state machine.
+
+## Exposed Read-Only API
+
+- `WorkspaceHistoryStores<'a>`: Bundles an existing private (`0700`) `plans_dir` together with optional read-only `PlanStore`, `AuthorityStore` / `authority_dir`, and `sessions_dir` inputs.
+- `read_scoped_workspace_job_histories(&WorkspaceChatIdentity, &WorkspaceHistoryStores<'_>) -> Result<WorkspaceScopedHistoryRead, WorkspaceHistoryDiagnostic>`: Validates the requested four-part chat scope and canonical repository directory on disk, opens stores exclusively through pure read-only entry points, rejects/omits out-of-scope records with sanitized diagnostics, verifies store-backed historical acceptance chains for completed jobs, and bounds the returned `WorkspaceJobHistory` slice via `bound_workspace_job_histories`.
+- `project_coworker_job_record` / `project_coworker_job_history`: Pure in-memory projection helpers converting a typed `CoworkerJobRecord`, optional `ControllerJobRuntimeState`, and optional `WorkspaceJobLineageContext` into a normalized `WorkspaceJobHistory`. Without store-backed receipt and Closure ledger verification, `acceptance_proof` always remains `WorkspaceAcceptanceProof::unknown()`.
+
+## Core Invariants
+
+### 1. Strict Four-Part Chat, Repository, and Frozen Approval Scope Verification
+
+- Every projection requires a valid `WorkspaceChatIdentity` (`source_id`, `binding_id`, `thread_uuid`, and `canonical_project_scope`).
+- On disk reads, `canonical_project_scope` must be an existing, absolute, non-symlink directory matching `fs::canonicalize`. Repository scope is verified against `job.work_brief.project_base.repository_path` and never inferred from chat summaries, titles, or thread metadata alone.
+- Companion records (`PlanningResultRef`, `FrozenApprovalLinkage`, `CombinedCandidateIdentity`, `PlanRevision`, `ApprovalRecord`, and `ControllerJobRuntimeState`) must match the owning job's binding, thread UUID, canonical project base, frozen plan/profile tuple, and policy/subject digests. Unapproved jobs cannot project executable tasks, outbox dispatches, combined candidates, or controller runtime state.
+- When `sessions_dir` is configured, host session ownership is verified read-only against `<sessions_dir>/<approval_id>` (`verify_existing_session_dir`, `read_host_manifest_optional`) and the approval's canonical `work-area` subdirectory (`threadlane_host::WORK_AREA_SUBDIR`).
+
+### 2. Zero Side Effects and Transcript Exclusion on Read
+
+- Store inspection uses pure read-only helpers (`CoworkerWorkflowStore::new` + `read_binding_ledger`, `ControllerPolicyStore::new` + `get_job_runtime_readonly` + `load_closure_execution_artifact_for_record`, `FinalCandidateClosureStore::open` + `inspect_ledger_readonly`, `PlanStore::read_snapshot_readonly_at`, `AuthorityStore::snapshot_readonly` / `read_snapshot_readonly_at`, `load_review_receipt`, `load_integration_receipt`, `inspect_job_integration_intent_readonly`, `read_persisted_candidate_check_report`, and `read_persisted_job_integration_report`).
+- Reading workspace history never creates directories, lockfiles (`coworker-workflow-*.lock`, `coworker-job-ownership-*.lock`, `plans.lock`, `authority.lock`, `host.lock`), WAL/SHM files, reservations, reconciliations, worker dispatches, sidecar caches, or repair writes.
+- Provider transcripts, raw worker `stdout`/`stderr` logs, and full task instruction prompts are never loaded or surfaced in projections.
+- Missing store directories or missing `ControllerJobRuntimeState` for executed jobs degrade honestly (`degraded = true`, `ObservationJobState::Unknown`, `"unknown"` execution/task/attempt status where live evidence is absent) and never fabricate completion or acceptance.
+
+### 3. Task, Attempt, Candidate, Outbox, Run, and Lineage Projection
+
+- Projects per-task `current_attempt_no`, `WorkspaceTaskAttempt` entries (correlated with `OutboxDispatchRecord`, `TaskAttemptExecutionArtifacts`, and `PendingControllerEffect`), `WorkspaceTaskCandidate` pointers and check/review summaries, job-level `WorkspaceRunRecord` and `WorkspaceOutboxRecord` lists, `WorkspaceCombinedCandidate` entries, and `WorkspaceRecordLinks` (`supersedes_job_id`, `superseded_by_job_id`, `follow_up_job_ids`, plan/approval/grant/architect-advice links).
+- Unstarted tasks map explicitly to `"not_started"`, cancelled stages map to `"cancelled"`, and unknown/unreconciled dispatches remain `"unknown"`.
+- Enforces all `threadlane_core::observation` collection and string caps via `WorkspaceJobHistory::normalized` and `bound_workspace_job_histories`, recording exact omission counts in `WorkspaceJobHistoryTruncation` and `WorkspaceScopedHistoryRead::jobs_omitted`.
+
+### 4. Separation of Historical Failure and Live Attention
+
+- Past failed attempts, check failures, dispatch refusals, and `CorrectInScope` / rejected review verdicts remain visible in `WorkspaceHistoricalFailure` (`superseded_or_resolved = true`) even after a subsequent retry advances or completes.
+- A superseded historical failure alone never produces live `WorkspaceAttentionState` or `WorkspaceAttentionKind::NeedsApproval`.
+- When store-backed historical acceptance is verified for a completed job, `current_attention` is cleared while earlier failed attempts and `historical_failure` summaries remain preserved.
+- For non-accepted jobs, live `current_attention` is derived strictly from active workflow holds (`NeedsUserInput`, `UnresolvedEffect`, `OnHold`), unresolved `EffectUnknown` outbox/controller effects, open briefing questions, `AwaitingApproval` phase without frozen approval linkage, active failure/stop fences (`BlockedFailure`), or pending review/closure boundaries (`ReviewRequired`).
+
+### 5. Store-Backed Historical Acceptance Verification and Survival Across Later Edits
+
+`WorkspaceAcceptanceStatus::VerifiedAccepted`, populated `accepted_candidate_id` / receipt / Closure proof identifiers, and green `ObservationJobState::Completed` (`execution_status = "completed"`) are derived exclusively through a private internal proof minted by `read_scoped_workspace_job_histories` (never via caller-supplied booleans or unverified ledger string IDs):
+
+- **Immutable candidate subject and Closure ledger proof**: Requires `CoworkerJobPhase::Completed` with no active holds, stop fences, or unresolved outbox/controller effects; a unique `CombinedCandidateStatus::ClosureAccepted` candidate matching frozen approval/plan/policy digests; `FinalCandidateSubject::verify_integrity` and `verify_legacy_base_closure_insufficient`; a unique terminal `ClosureVerdictKind::Accepted` record in `FinalCandidateClosureStore::inspect_ledger_readonly` passing `ClosureVerdict::verify_against_subject`; and an unfenced `ClosureExecutionArtifactRecord` (`fenced_from_promotion == false`, `response_error.is_none()`, `WorkerRunStatus::Succeeded`, matching advisory response SHA-256).
+- **Verified candidate check reports**: Requires passing `TestEvidenceSummary::validate(true)` on `FinalCandidateSubject` and persisted `FrozenCheckExecutionReport` artifacts (`validate_integrity`, `passed`, `verify_against_context`, `verify_candidate_check_evidence`) covering all `CandidateCheckEvidence` entries and all `required_for_candidate_closure` check commands in the frozen envelope.
+- **1-to-1 task review and integration receipt chain**: Requires every approved task to be `CoworkerTaskStage::Integrated` with a valid `StructuredReviewVerdict::validate` (`Accept`) explicitly correlated to the task candidate's commits, tree, diff digest, review subject digest, and frozen policy digest; verified on-disk `ReviewReceipt` (`load_review_receipt`, `verify_integrity`, `ReviewPolicyBinding`, passing `TestEvidenceSummary`) and original per-worker `IntegrationReceipt` (`load_integration_receipt`, `verify_integrity`); and, when `JobAggregation` was confirmed, a verified `JobIntegrationIntent` (`Completed`) and `JobIntegrationReport` (`job_scope` provenance and aggregated `IntegrationReceipt` chain), rejecting any duplicate candidate, verdict, or receipt reference.
+- **Historical durability across later repository, plan, and profile changes**: Verification binds strictly to stored cryptographic digests, commits, trees, and the job's original frozen `ApprovalRecord` (`verify_approval_record_integrity`) and `PlanRevision` snapshot rather than calling live `verify_final_candidate_subject_readonly` or `verify_accepted_closure_verdict_readonly`. Subsequent primary Git `HEAD` advances, newly published plan revisions, and later `RegistryStore` profile/model edits never invalidate a genuinely accepted historical job, while missing, tampered, foreign, duplicate, failed-check, or promotion-fenced evidence fails closed to `WorkspaceAcceptanceStatus::Unknown` and `ObservationJobState::Unknown`.

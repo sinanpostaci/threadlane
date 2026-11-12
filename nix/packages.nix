@@ -15,9 +15,12 @@ let
   # Recompute only when apps/desktop/package-lock.json changes.
   desktopNpmDepsHash = "sha256-jtrBh3znCB27fwtgbv0AYW67itZ59ZiqOqomfzKzNiY=";
 
+  desktopWebkitgtk = import ./webkitgtk.nix { inherit pkgs; };
+
   desktopLibs = with pkgs; [
     gtk3
-    webkitgtk_4_1
+    gtk-layer-shell
+    desktopWebkitgtk
     libsoup_3
     openssl
     librsvg
@@ -50,6 +53,26 @@ let
 
     meta = {
       description = "Compiled Vite frontend assets for the Threadlane desktop panel";
+      license = with lib.licenses; [ mit asl20 ];
+    };
+  };
+
+  desktopNpmModules = pkgs.buildNpmPackage {
+    pname = "threadlane-desktop-node-modules";
+    inherit version;
+    src = source + "/apps/desktop";
+    npmDepsHash = desktopNpmDepsHash;
+    dontNpmBuild = true;
+
+    installPhase = ''
+      runHook preInstall
+      mkdir -p "$out/lib"
+      cp -r node_modules "$out/lib/node_modules"
+      runHook postInstall
+    '';
+
+    meta = {
+      description = "Locked npm dependency tree for Threadlane desktop browser acceptance";
       license = with lib.licenses; [ mit asl20 ];
     };
   };
@@ -129,6 +152,100 @@ let
     };
   };
 
+  desktopPlaywright = pkgs.writeShellApplication {
+    name = "threadlane-desktop-playwright";
+    runtimeInputs = [
+      pkgs.coreutils
+      pkgs.findutils
+      pkgs.git
+      pkgs.nodejs
+      pkgs.playwright-test
+      pkgs.python3
+    ];
+    text = ''
+      desktop_src="''${THREADLANE_DESKTOP_SOURCE_DIR:-${source}/apps/desktop}"
+      export THREADLANE_DESKTOP_SOURCE_DIR="$desktop_src"
+
+      stage_dir="$(python3 "${source}/scripts/desktop-acceptance.py" --prepare-playwright-stage)"
+
+      for item in index.html package.json tsconfig.json vite.config.ts playwright.config.ts src tests public; do
+        if [ -e "$desktop_src/$item" ]; then
+          cp -rL "$desktop_src/$item" "$stage_dir/$item"
+          chmod -R u+w "$stage_dir/$item"
+        fi
+      done
+
+      required_icon="src-tauri/icons/icon.svg"
+      if [ ! -f "$desktop_src/$required_icon" ]; then
+        echo "error: required desktop icon asset missing: $desktop_src/$required_icon" >&2
+        exit 1
+      fi
+      mkdir -p "$stage_dir/src-tauri/icons"
+      cp -L "$desktop_src/$required_icon" "$stage_dir/$required_icon"
+      chmod -R u+w "$stage_dir/src-tauri"
+
+      for entry in "${desktopNpmModules}/lib/node_modules"/* "${desktopNpmModules}/lib/node_modules"/.[!.]*; do
+        if [ ! -e "$entry" ]; then
+          continue
+        fi
+        name="$(basename "$entry")"
+        case "$name" in
+          .vite)
+            continue
+            ;;
+          @*)
+            mkdir -p "$stage_dir/node_modules/$name"
+            for scoped in "$entry"/*; do
+              if [ -e "$scoped" ]; then
+                ln -sfn "$scoped" "$stage_dir/node_modules/$name/$(basename "$scoped")"
+              fi
+            done
+            ;;
+          *)
+            ln -sfn "$entry" "$stage_dir/node_modules/$name"
+            ;;
+        esac
+      done
+
+      link_pw_pkg() {
+        local pkg_rel="$1"
+        local direct="${pkgs.playwright-test}/lib/node_modules/$pkg_rel"
+        local found=""
+        if [ -d "$direct" ]; then
+          found="$direct"
+        else
+          found="$(find -L "${pkgs.playwright-test}/lib/node_modules" -maxdepth 5 -type d -path "*/node_modules/$pkg_rel" -print -quit)"
+        fi
+        if [ -z "$found" ]; then
+          echo "error: unable to locate $pkg_rel inside ${pkgs.playwright-test}" >&2
+          exit 1
+        fi
+        mkdir -p "$(dirname "$stage_dir/node_modules/$pkg_rel")"
+        ln -sfn "$found" "$stage_dir/node_modules/$pkg_rel"
+      }
+
+      link_pw_pkg "@playwright/test"
+      link_pw_pkg "playwright"
+      link_pw_pkg "playwright-core"
+
+      export PLAYWRIGHT_BROWSERS_PATH="${pkgs.playwright-driver.browsers}"
+      export PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD="1"
+      export PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS="true"
+
+      cd "$stage_dir"
+      exec "${pkgs.playwright-test}/bin/playwright" test --config playwright.config.ts "$@"
+    '';
+  };
+
+  desktopAcceptanceVm = import ./desktop-acceptance.nix {
+    inherit
+      pkgs
+      lib
+      threadlane
+      threadlaneDesktop
+      ;
+  };
+
 in
 {
   inherit threadlane;
@@ -136,4 +253,6 @@ in
 }
 // lib.optionalAttrs pkgs.stdenv.isLinux {
   "threadlane-desktop" = threadlaneDesktop;
+  "threadlane-desktop-playwright" = desktopPlaywright;
+  "desktop-acceptance-vm" = desktopAcceptanceVm;
 }

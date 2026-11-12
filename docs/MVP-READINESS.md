@@ -27,7 +27,7 @@ Linux release. Historical pilot reports remain evidence for their exact scope.
 | Parallel with 1 and 2 | Complete normal validation | Every frontend test file is discovered, failures propagate, and zero discovered tests fail. Standalone desktop Rust tests and Clippy have explicit validation commands. |
 | 3 | Persistence and interruption safety | Directory-sync failures are not silently reported as success. Post-rename uncertainty preserves visible state and stops effectful advancement. Restart reuses proven receipts and never blindly repeats provider calls. |
 | 4 | Installed workflow acceptance | The exact installed package and approved profile complete a small real job, including parallel roots, a dependent task, verification, review, integration and one Closure. Results return to the original chat. |
-| 5 | Fresh-chat and observation acceptance | A new native chat connects and reads its guide/profile without manual role instructions. Activity and Plans show the real job, role/model, state, duration, actual usage or unknown, and delivery/ACK evidence. |
+| 5 | Fresh-chat and observation acceptance | A new native chat connects and reads its guide/profile without manual role instructions. Desktop `Projects` (`Active` / `Archive`, with `Messages`, `Jobs`, and `Activity` tabs) shows the real chat/job, independent Coworker state and verified configured model, Worker role/model, state, duration, actual usage or unknown, bounded omissions, and delivery/ACK evidence without treating MCP call completion as chat completion. |
 
 Status, notification and test-command changes use independent worktrees. Shared
 persistence semantics are integrated before the final combined validation. Each
@@ -85,3 +85,26 @@ Early hardening after acceptance includes receipt-preserving history archival
 and capacity visibility, complete automatic Linux PR checks, reservation-aware
 aggregate budgets, and privacy-safe backup/restore. Current bounded ledgers must
 never be described as unlimited long-session storage.
+
+## Current integration and remaining acceptance gates (2026-11-11)
+
+- **Production desktop entry wired in source**: `apps/desktop/index.html` →
+  `apps/desktop/src/main.ts` → `apps/desktop/src/app.tsx` connects
+  `DesktopAppCoordinator` (`desktop_workspace_snapshot`) and `WorkspaceChatPanels`
+  (`Messages` default, `Jobs`, and `Activity` tabs), `Projects/Active` and
+  `Projects/Archive` submenus with persisted per-chat archive/restore, explicit
+  bounded-data omission visibility (with legacy `6h`/`24h` window filters,
+  `Older (6h+)`, `Load older activity`, and bulk cutoff archive controls removed),
+  titlebar-only sidebar toggle (wide collapse + `<= 760px` Radix `Dialog` drawer),
+  preserved `?surface=tray` route, and preserved `Tools`, `Profiles`, and
+  `Settings` surfaces.
+- **Pending combined validation and acceptance gates**: Overall MVP delivery is
+  **not** complete until the combined checkout passes checkout-local Cargo
+  formatting/tests/Clippy, frontend tests/typecheck/build, wide and narrow
+  Playwright browser verification, isolated NixOS Wayland VM system-tray and
+  `Open in Codex` routing acceptance (preserving host Codex sessions and host
+  configuration), explicitly authorized live workflow qualification (independent
+  roots, dependent task, real scoped receipts, check/review/integration, and one
+  accepted `Closure`—never replaying or marking an earlier failed native job
+  accepted), and the single authorized `gpt-6-astra` (`high`) package-closing
+  review prior to `main` publication.

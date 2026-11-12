@@ -30,6 +30,8 @@ use threadlane_core::observation::{
     validate_existing_private_dir_readonly, validate_existing_private_file_readonly,
 };
 use threadlane_core::observation::{ObservationSource, ObservationSourceAvailability};
+#[cfg(unix)]
+use threadlane_native::native_chat_observation::compute_observation_source_id;
 
 #[cfg(unix)]
 const MAX_CONTEXT_FILE_BYTES: u64 = 1024 * 1024;
@@ -573,7 +575,16 @@ fn validate_default_source(
         });
     }
 
-    let source_id = compute_stable_source_id(&plans_dir, &authority_dir, &sessions_dir);
+    let source_id = compute_observation_source_id(&plans_dir, &authority_dir, &sessions_dir)
+        .map_err(|_| UnavailableDefaultSource {
+            source_id: compute_stable_source_id_from_canonical_paths(
+                &plans_dir,
+                &authority_dir,
+                &sessions_dir,
+            ),
+            warning: "Local Threadlane durable stores failed private directory validation."
+                .to_string(),
+        })?;
 
     let mut runtime_state_dir = None;
     let mut runtime_warning = None;
@@ -686,7 +697,8 @@ fn validate_linked_context(
         return Err(ObservationSourceError::ProjectRootOverlapsStore);
     }
 
-    let source_id = compute_stable_source_id(&plans_dir, &authority_dir, &sessions_dir);
+    let source_id = compute_observation_source_id(&plans_dir, &authority_dir, &sessions_dir)
+        .map_err(|_| ObservationSourceError::InvalidStoreDirectory)?;
 
     Ok(ValidatedLinkedContext {
         context_path: canonical_context_path,
@@ -1038,6 +1050,17 @@ fn validate_non_nil_thread_uuid(raw: &str) -> Result<String, ObservationSourceEr
 
 #[cfg(unix)]
 fn compute_stable_source_id(plans_dir: &Path, authority_dir: &Path, sessions_dir: &Path) -> String {
+    compute_observation_source_id(plans_dir, authority_dir, sessions_dir).unwrap_or_else(|_| {
+        compute_stable_source_id_from_canonical_paths(plans_dir, authority_dir, sessions_dir)
+    })
+}
+
+#[cfg(unix)]
+fn compute_stable_source_id_from_canonical_paths(
+    plans_dir: &Path,
+    authority_dir: &Path,
+    sessions_dir: &Path,
+) -> String {
     use std::os::unix::ffi::OsStrExt;
 
     let mut hasher = Sha256::new();
@@ -1069,7 +1092,11 @@ fn compute_fallback_source_id(
         fs::canonicalize(authority_dir).unwrap_or_else(|_| authority_dir.to_path_buf());
     let canonical_sessions =
         fs::canonicalize(sessions_dir).unwrap_or_else(|_| sessions_dir.to_path_buf());
-    compute_stable_source_id(&canonical_plans, &canonical_authority, &canonical_sessions)
+    compute_stable_source_id_from_canonical_paths(
+        &canonical_plans,
+        &canonical_authority,
+        &canonical_sessions,
+    )
 }
 
 #[cfg(unix)]
@@ -1735,3 +1762,87 @@ impl<'de> Deserialize<'de> for RawPrivateContextStores {
 #[cfg(all(test, unix))]
 #[path = "sources_tests.rs"]
 mod sources_tests;
+
+#[cfg(all(test, unix))]
+mod native_source_id_unification_tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    fn make_private_dir(root: &Path, name: &str) -> PathBuf {
+        let dir = root.join(name);
+        fs::create_dir_all(&dir).expect("create private store dir");
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).expect("chmod 0700 store dir");
+        dir
+    }
+
+    #[test]
+    fn compute_stable_source_id_matches_native_producer_without_changing_legacy_results() {
+        let base = fs::canonicalize(std::env::temp_dir()).unwrap_or_else(|_| std::env::temp_dir());
+        let unique = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let root = base.join(format!(
+            "threadlane-source-id-parity-{}-{unique}",
+            std::process::id()
+        ));
+        if root.exists() {
+            let _ = fs::remove_dir_all(&root);
+        }
+        fs::create_dir_all(&root).expect("create test root");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).expect("chmod 0700 root");
+
+        let registry_dir = make_private_dir(&root, "registry");
+        let plans_dir = make_private_dir(&root, "plans-türkçe-α");
+        let authority_dir = make_private_dir(&root, "authority store");
+        let sessions_dir = make_private_dir(&root, "sessions");
+        let app_data_dir = make_private_dir(&root, "app-data");
+
+        let legacy_digest = compute_stable_source_id_from_canonical_paths(
+            &plans_dir,
+            &authority_dir,
+            &sessions_dir,
+        );
+        let unified_stable = compute_stable_source_id(&plans_dir, &authority_dir, &sessions_dir);
+        let native_id = compute_observation_source_id(&plans_dir, &authority_dir, &sessions_dir)
+            .expect("native source id computation must succeed");
+
+        assert_eq!(unified_stable, legacy_digest);
+        assert_eq!(native_id, legacy_digest);
+        assert!(is_valid_source_id(&native_id));
+
+        let alias_plans = root.join("plans-link");
+        symlink(&plans_dir, &alias_plans).expect("create plans symlink");
+        let fallback_via_symlink =
+            compute_fallback_source_id(&alias_plans, &authority_dir, &sessions_dir);
+        assert_eq!(fallback_via_symlink, legacy_digest);
+
+        let registry = ObservationSourceRegistry::new(ObservationSourceConfig {
+            runtime_state_dir: None,
+            registry_dir,
+            plans_dir: plans_dir.clone(),
+            authority_dir: authority_dir.clone(),
+            sessions_dir: sessions_dir.clone(),
+            app_data_dir,
+        });
+        let inventory = registry.inventory();
+        assert_eq!(inventory.sources.len(), 1);
+        assert_eq!(inventory.sources[0].id, native_id);
+        assert_eq!(
+            inventory.sources[0].availability,
+            ObservationSourceAvailability::Available
+        );
+
+        let missing_plans = root.join("missing-plans");
+        let missing_authority = root.join("missing-authority");
+        let missing_sessions = root.join("missing-sessions");
+        assert_eq!(
+            compute_stable_source_id(&missing_plans, &missing_authority, &missing_sessions),
+            compute_stable_source_id_from_canonical_paths(
+                &missing_plans,
+                &missing_authority,
+                &missing_sessions,
+            )
+        );
+        assert!(!missing_plans.exists());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+}

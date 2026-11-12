@@ -5069,27 +5069,52 @@ async fn codex_first_held_intent_lock_bounds_wait_and_prevents_late_spawn_after_
         "timed-out pre-lock request must not write a late launch intent after unlock"
     );
 
-    // 2. Cancel/drop the request future while `.launch-intents/<approval_id>.lock` is held, then
-    //    release the lock: zero late process spawns or launch intent writes may occur.
+    // Section 1 above verified the strict 250ms `startup_timeout` deadline bound and zero late
+    // effects after unlock. `PairedMcpServer::start_approved_task` computes `startup_deadline`
+    // before paired observation journaling and filesystem dispatch-guard prechecks, which can
+    // legitimately consume 250ms under full-suite parallel I/O contention before yielding
+    // `Pending` at the held launch-intent lock. Reattach a separate finite 4s test policy on the
+    // same enrolled `mcp` instance (preserving `connection_nonce`, `epoch_id`, `pairing_store`
+    // enrollment, workflow/host stores, `spy_exe`, binding, and approval without fabricating a
+    // ready host) so the orthogonal caller-cancellation (section 2) and enrollment-revocation
+    // (section 3) checks are isolated from that 250ms precheck deadline race.
+    let enrolled_nonce = mcp.connection_nonce().to_string();
+    let enrolled_epoch = mcp.epoch_id().to_string();
+    let policy_4s = ApprovedHostLauncherPolicy::new(&spy_exe)
+        .expect("valid policy")
+        .with_startup_timeout(Duration::from_secs(4))
+        .expect("4s startup timeout");
+    mcp = mcp.with_host_launcher_policy(policy_4s).unwrap();
+    assert_eq!(mcp.connection_nonce(), enrolled_nonce);
+    assert_eq!(mcp.epoch_id(), enrolled_epoch);
+
+    // 2. Poll the request future once to `Pending` and drop the owned future while
+    //    `.launch-intents/<approval_id>.lock` is still held, then release the lock: zero late
+    //    process spawns or launch intent writes may occur.
     let held_lock_2 =
         HostLaunchIntentLock::acquire_blocking(&canonical_sessions_root, &approval.approval_id)
             .expect("re-acquire launch intent lock for cancel test");
-    let cancel_res = tokio::time::timeout(
-        Duration::from_millis(60),
-        mcp.invoke_tool_json(
-            "start_approved_task",
-            json!({
-                "approval_id": approval.approval_id,
-                "task_id": "task-root-agy"
-            }),
-            None,
-        ),
-    )
-    .await;
-    assert!(
-        cancel_res.is_err(),
-        "caller future must be cancelled/dropped while launch-intent lock is held"
+    let cancelled_call = mcp.invoke_tool_json(
+        "start_approved_task",
+        json!({
+            "approval_id": approval.approval_id,
+            "task_id": "task-root-agy"
+        }),
+        None,
     );
+    let mut cancelled_call = Box::pin(cancelled_call);
+    let cancelled_first_poll = futures_util::poll!(&mut cancelled_call);
+    assert!(
+        cancelled_first_poll.is_pending(),
+        "start_approved_task must yield Pending while launch-intent lock is held: {cancelled_first_poll:?}"
+    );
+    assert!(
+        HostLaunchIntentLock::try_acquire(&canonical_sessions_root, &approval.approval_id)
+            .expect("try_acquire while cancelled request is pending")
+            .is_none(),
+        "try_acquire must return Ok(None) while test still owns launch-intent lock"
+    );
+    drop(cancelled_call);
     drop(held_lock_2);
     tokio::time::sleep(Duration::from_millis(80)).await;
     assert_eq!(
@@ -5111,22 +5136,31 @@ async fn codex_first_held_intent_lock_bounds_wait_and_prevents_late_spawn_after_
         HostLaunchIntentLock::acquire_blocking(&canonical_sessions_root, &approval.approval_id)
             .expect("re-acquire launch intent lock for revocation test");
     let mcp_call = mcp.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        mcp.restart_epoch()
-            .expect("rotate connection epoch while waiting on launch-intent lock");
-        drop(held_lock_3);
-    });
+    let revoked_call = mcp_call.invoke_tool_json(
+        "start_approved_task",
+        json!({
+            "approval_id": approval.approval_id,
+            "task_id": "task-root-agy"
+        }),
+        None,
+    );
+    let mut revoked_call = std::pin::pin!(revoked_call);
+    let revoked_first_poll = futures_util::poll!(&mut revoked_call);
+    assert!(
+        revoked_first_poll.is_pending(),
+        "start_approved_task must yield Pending while launch-intent lock is held: {revoked_first_poll:?}"
+    );
+    assert!(
+        HostLaunchIntentLock::try_acquire(&canonical_sessions_root, &approval.approval_id)
+            .expect("try_acquire while request is pending")
+            .is_none(),
+        "try_acquire must return Ok(None) while test still owns launch-intent lock"
+    );
+    mcp.restart_epoch()
+        .expect("rotate connection epoch while waiting on launch-intent lock");
+    drop(held_lock_3);
 
-    let revoked_err = mcp_call
-        .invoke_tool_json(
-            "start_approved_task",
-            json!({
-                "approval_id": approval.approval_id,
-                "task_id": "task-root-agy"
-            }),
-            None,
-        )
+    let revoked_err = revoked_call
         .await
         .expect_err("revoked enrollment before lock release must fail closed");
     assert_eq!(

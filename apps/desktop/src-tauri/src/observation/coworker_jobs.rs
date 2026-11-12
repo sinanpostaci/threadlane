@@ -5,9 +5,13 @@ use std::path::Path;
 use threadlane_core::observation::{
     sanitize_observation_summary, validate_existing_private_dir_readonly, ObservationCall,
     ObservationCallState, ObservationJob, ObservationJobState, ObservationJournalRecord,
-    ObservationRecordPhase, ObservationTask, ReadonlyCoreStateSnapshot,
+    ObservationRecordPhase, ObservationTask, ReadonlyCoreStateSnapshot, WorkspaceAcceptanceStatus,
+    WorkspaceChatIdentity,
 };
-use threadlane_native::coworker_observation::is_coworker_workflow_operation;
+use threadlane_native::coworker_observation::{
+    is_coworker_workflow_operation, read_scoped_workspace_job_histories, WorkspaceHistoryStores,
+    WorkspaceScopedHistoryRead,
+};
 use threadlane_native::coworker_workflow::{
     CombinedCandidateStatus, ControllerJobRuntimeState, ControllerPolicyStore,
     CoworkerBindingLedger, CoworkerJobLockState, CoworkerJobOwnershipKey,
@@ -129,7 +133,7 @@ pub(super) fn project_coworker_jobs_and_dedupe_plans(
             let runtime_state = if controller_ledger_corrupt {
                 Err(())
             } else if let Some(ref ps) = policy_store {
-                match ps.read_job_runtime(&ledger.binding_id, &job.job_id) {
+                match ps.get_job_runtime_readonly(&ledger.binding_id, &job.job_id) {
                     Ok(opt) => Ok(opt),
                     Err(_) => {
                         push_unique_warning(warnings, WARN_COWORKER_CONTROLLER_INVALID);
@@ -176,7 +180,7 @@ struct ProjectedCoworkerJobOutcome {
     deduped_legacy_plan_id: Option<String>,
 }
 
-fn load_verified_coworker_ledgers(
+pub(super) fn load_verified_coworker_ledgers(
     plans_dir: &Path,
     warnings: &mut Vec<String>,
 ) -> Vec<CoworkerBindingLedger> {
@@ -316,7 +320,7 @@ fn is_valid_tagged_ledger_filename(file_name: &str, prefix: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-fn inspect_controller_ledger_corrupt(
+pub(super) fn inspect_controller_ledger_corrupt(
     plans_dir: &Path,
     policy_store: Option<&ControllerPolicyStore>,
     binding_id: &str,
@@ -589,6 +593,8 @@ fn project_single_coworker_job(
     update_job_timestamp_from_ledger(ledger, job, &mut max_updated_at_ms);
 
     let (has_active_job_lock, has_stale_unlocked_job_lock) = inspect_job_ownership_locks(spec, job);
+    let job_completion_verified = job.phase == CoworkerJobPhase::Completed
+        && verify_job_closure_completion_proof(spec, job, runtime_state.as_ref());
 
     let task_list = build_observation_tasks(
         job,
@@ -596,6 +602,7 @@ fn project_single_coworker_job(
         &legacy_task_titles,
         &legacy_live_running_tasks,
         has_stale_unlocked_job_lock,
+        job_completion_verified,
     );
 
     let (mut state, approval_status, mut execution_status, review_state, allows_live_calls) =
@@ -605,6 +612,7 @@ fn project_single_coworker_job(
             has_active_job_lock,
             has_stale_unlocked_job_lock,
             legacy_active_calls > 0,
+            job_completion_verified,
             warnings,
         );
 
@@ -821,6 +829,7 @@ fn build_observation_tasks(
     legacy_task_titles: &BTreeMap<String, String>,
     legacy_live_running_tasks: &BTreeSet<String>,
     has_stale_unlocked_job_lock: bool,
+    job_completion_verified: bool,
 ) -> Vec<ObservationTask> {
     if !job.tasks.is_empty() {
         return job
@@ -836,6 +845,7 @@ fn build_observation_tasks(
                     task,
                     legacy_live_running_tasks.contains(&task.task_id),
                     has_stale_unlocked_job_lock,
+                    job_completion_verified,
                 );
                 ObservationTask {
                     id: task.task_id.clone(),
@@ -876,7 +886,11 @@ fn map_coworker_task_status(
     task: &CoworkerTaskRecord,
     legacy_live_running: bool,
     has_stale_unlocked_job_lock: bool,
+    job_completion_verified: bool,
 ) -> String {
+    if job_phase == CoworkerJobPhase::Completed && !job_completion_verified {
+        return "unknown".to_string();
+    }
     if task.unresolved_outbox_id.is_some() && has_stale_unlocked_job_lock {
         return "unknown".to_string();
     }
@@ -913,7 +927,7 @@ fn map_coworker_task_status(
             }
         }
         CoworkerTaskStage::Integrated => {
-            if job_phase == CoworkerJobPhase::Completed {
+            if job_phase == CoworkerJobPhase::Completed && job_completion_verified {
                 "completed".to_string()
             } else {
                 "accepted".to_string()
@@ -932,6 +946,7 @@ fn evaluate_coworker_job_lifecycle(
     has_active_job_lock: bool,
     has_stale_unlocked_job_lock: bool,
     has_legacy_live_calls: bool,
+    job_completion_verified: bool,
     warnings: &mut Vec<String>,
 ) -> (ObservationJobState, String, String, Option<String>, bool) {
     let approval_status = if job.approval_linkage.is_some() {
@@ -959,7 +974,7 @@ fn evaluate_coworker_job_lifecycle(
     let has_orphaned_pending_effects =
         runtime_state.is_some_and(|rt| !rt.pending_effects.is_empty()) && !has_active_job_lock;
 
-    let review_state = derive_coworker_review_state(job, runtime_state);
+    let review_state = derive_coworker_review_state(job, job_completion_verified);
 
     match job.phase {
         CoworkerJobPhase::Briefing | CoworkerJobPhase::Planning => {
@@ -1023,7 +1038,7 @@ fn evaluate_coworker_job_lifecycle(
             false,
         ),
         CoworkerJobPhase::Completed => {
-            if verify_job_closure_completion_proof(job, runtime_state) {
+            if job_completion_verified {
                 (
                     ObservationJobState::Completed,
                     "approved".to_string(),
@@ -1223,12 +1238,14 @@ fn evaluate_coworker_job_lifecycle(
 
 fn derive_coworker_review_state(
     job: &CoworkerJobRecord,
-    runtime_state: Option<&ControllerJobRuntimeState>,
+    job_completion_verified: bool,
 ) -> Option<String> {
-    if job.phase == CoworkerJobPhase::Completed
-        && verify_job_closure_completion_proof(job, runtime_state)
-    {
-        return Some("review_passed".to_string());
+    if job.phase == CoworkerJobPhase::Completed {
+        return if job_completion_verified {
+            Some("review_passed".to_string())
+        } else {
+            Some("unknown".to_string())
+        };
     }
     if job
         .tasks
@@ -1267,8 +1284,39 @@ fn derive_coworker_review_state(
 }
 
 fn verify_job_closure_completion_proof(
+    spec: &SourceSpec,
     job: &CoworkerJobRecord,
     runtime_state: Option<&ControllerJobRuntimeState>,
+) -> bool {
+    let Some(rt) = runtime_state else {
+        return false;
+    };
+    if !has_structural_closure_completion_preconditions(job, rt) {
+        return false;
+    }
+
+    let Ok(chat_identity) = WorkspaceChatIdentity::new(
+        &spec.source.id,
+        &job.binding_id,
+        &job.thread_uuid,
+        &job.work_brief.project_base.repository_path,
+    ) else {
+        return false;
+    };
+
+    let stores = WorkspaceHistoryStores::new(&spec.plans_dir)
+        .with_authority_dir(&spec.authority_dir)
+        .with_sessions_dir(&spec.sessions_dir);
+    let Ok(scoped_read) = read_scoped_workspace_job_histories(&chat_identity, &stores) else {
+        return false;
+    };
+
+    has_verified_scoped_job_completion_proof(&chat_identity, job, Some(rt), &scoped_read)
+}
+
+fn has_structural_closure_completion_preconditions(
+    job: &CoworkerJobRecord,
+    rt: &ControllerJobRuntimeState,
 ) -> bool {
     if job.phase != CoworkerJobPhase::Completed
         || job.approval_linkage.is_none()
@@ -1289,24 +1337,85 @@ fn verify_job_closure_completion_proof(
         return false;
     };
 
-    if let Some(rt) = runtime_state {
-        if rt.closure_verdict_id.is_none() {
-            return false;
-        }
-        let Some(ref attempt_id) = rt.closure_attempt_id else {
-            return false;
-        };
-        let Some(closure_art) = rt.closure_artifacts.get(attempt_id) else {
-            return false;
-        };
-        if closure_art.fenced_from_promotion
-            || closure_art.candidate_tree_sha != accepted_candidate.final_tree_sha
-        {
+    if rt.closure_verdict_id.is_none() {
+        return false;
+    }
+    let Some(ref attempt_id) = rt.closure_attempt_id else {
+        return false;
+    };
+    let Some(closure_art) = rt.closure_artifacts.get(attempt_id) else {
+        return false;
+    };
+    !closure_art.fenced_from_promotion
+        && closure_art.candidate_tree_sha == accepted_candidate.final_tree_sha
+}
+
+fn has_verified_scoped_job_completion_proof(
+    chat_identity: &WorkspaceChatIdentity,
+    job: &CoworkerJobRecord,
+    runtime_state: Option<&ControllerJobRuntimeState>,
+    scoped_read: &WorkspaceScopedHistoryRead,
+) -> bool {
+    let Some(rt) = runtime_state else {
+        return false;
+    };
+    if !has_structural_closure_completion_preconditions(job, rt) {
+        return false;
+    }
+    if scoped_read.degraded || &scoped_read.chat_identity != chat_identity {
+        return false;
+    }
+
+    let Some(accepted_candidate) = job.combined_candidates.iter().find(|c| {
+        c.status == CombinedCandidateStatus::ClosureAccepted
+            && c.closure_reservation_id.is_some()
+            && c.validate().is_ok()
+    }) else {
+        return false;
+    };
+
+    let Some(projected_job) = scoped_read
+        .jobs
+        .iter()
+        .find(|entry| entry.job.job_id == job.job_id)
+    else {
+        return false;
+    };
+
+    if projected_job.job.chat_identity.as_ref() != Some(chat_identity)
+        || projected_job.job.state != ObservationJobState::Completed
+        || projected_job.tasks.is_empty()
+        || projected_job.truncation.tasks_omitted > 0
+    {
+        return false;
+    }
+
+    let job_proof = projected_job.acceptance_proof.normalized_for_job();
+    if job_proof.status != WorkspaceAcceptanceStatus::VerifiedAccepted
+        || job_proof.combined_candidate_id.as_deref()
+            != Some(accepted_candidate.combined_candidate_id.as_str())
+        || job_proof.closure_verdict_id.as_deref() != rt.closure_verdict_id.as_deref()
+    {
+        return false;
+    }
+    if let Some(ref proof_res_id) = job_proof.closure_reservation_id {
+        if Some(proof_res_id.as_str()) != accepted_candidate.closure_reservation_id.as_deref() {
             return false;
         }
     }
 
-    true
+    job.tasks.iter().all(|raw_task| {
+        projected_job
+            .tasks
+            .iter()
+            .find(|pt| pt.task_id == raw_task.task_id)
+            .is_some_and(|pt| {
+                let task_proof = pt.acceptance_proof.normalized_for_task();
+                task_proof.status == WorkspaceAcceptanceStatus::VerifiedAccepted
+                    && task_proof.accepted_candidate_id.as_deref()
+                        == raw_task.accepted_candidate_id.as_deref()
+            })
+    })
 }
 
 /// Validates `coworker.*` and deduplicated plan-result journal records against
@@ -1650,5 +1759,522 @@ pub(crate) fn finalize_projected_coworker_requests(
         if let Some(&max_req_ts) = max_ts_by_job.get(&job.id) {
             job.updated_at_ms = Some(job.updated_at_ms.unwrap_or(max_req_ts).max(max_req_ts));
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod completion_proof_tests {
+    use super::*;
+    use std::fs::DirBuilder;
+    use std::os::unix::fs::DirBuilderExt;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use threadlane_core::observation::{
+        ObservationSource, ObservationSourceAvailability, WorkspaceAcceptanceProof,
+        WorkspaceJobHistory, WorkspaceJobHistoryTruncation, WorkspaceJobSummary,
+        WorkspaceRecordLinks, WorkspaceTaskHistory,
+    };
+    use threadlane_native::coworker_workflow::{
+        AcceptedPredecessorReceiptRef, CandidateCheckEvidence, CanonicalProjectBaseRef,
+        CombinedCandidateIdentity, FrozenApprovalLinkage, WorkBrief, WorkBriefKind,
+    };
+    use threadlane_native::profile_flow::{RoleExecutionRoute, SelectedRoleChoice};
+    use threadlane_plans::{Difficulty, WorkflowRole};
+
+    static PROOF_FIXTURE_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+    struct ProofFixtureDir {
+        root: PathBuf,
+    }
+
+    impl ProofFixtureDir {
+        fn new(label: &str) -> Self {
+            let base =
+                fs::canonicalize(std::env::temp_dir()).unwrap_or_else(|_| std::env::temp_dir());
+            let pid = std::process::id();
+            for attempt in 0..1024u32 {
+                let seq = PROOF_FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed);
+                let nanos = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0);
+                let candidate =
+                    base.join(format!("tl-cw-proof-{label}-{pid}-{seq}-{nanos}-{attempt}"));
+                match DirBuilder::new().mode(0o700).create(&candidate) {
+                    Ok(()) => {
+                        let root = fs::canonicalize(&candidate).unwrap_or(candidate);
+                        return Self { root };
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(err) => panic!("failed to create proof fixture dir: {err}"),
+                }
+            }
+            panic!("exhausted proof fixture retries");
+        }
+
+        fn subdir(&self, name: &str) -> PathBuf {
+            let dir = self.root.join(name);
+            DirBuilder::new()
+                .mode(0o700)
+                .create(&dir)
+                .expect("create private 0700 subdir");
+            dir
+        }
+    }
+
+    impl Drop for ProofFixtureDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn sample_completed_coworker_job(
+        repo_path: &Path,
+        binding_id: &str,
+        thread_uuid: &str,
+    ) -> (CoworkerJobRecord, String, String, String) {
+        let project_base = CanonicalProjectBaseRef {
+            repository_path: repo_path.to_string_lossy().into_owned(),
+            base_commit: "a".repeat(40),
+            base_tree_sha: "b".repeat(40),
+        };
+        let work_brief = WorkBrief {
+            brief_id: "brf_00000000000000000000000000000001".to_string(),
+            binding_id: binding_id.to_string(),
+            thread_uuid: thread_uuid.to_string(),
+            project_base: project_base.clone(),
+            kind: WorkBriefKind::NewJob,
+            summary: "Implement scoped workspace snapshot".to_string(),
+            confirmed_requirements: vec!["Preserve read-only invariant".to_string()],
+            proposed_additions: Vec::new(),
+            assumptions: Vec::new(),
+            open_questions: Vec::new(),
+            accepted_architect_decisions: Vec::new(),
+        };
+        let work_brief_digest = work_brief.digest().expect("brief digest");
+
+        let cand_id = "cnd_00000000000000000000000000000001".to_string();
+        let combined_id = "cmb_00000000000000000000000000000001".to_string();
+        let closure_res_id = "cls_00000000000000000000000000000001".to_string();
+        let final_tree_sha = "e".repeat(40);
+
+        let mut combined = CombinedCandidateIdentity {
+            combined_candidate_id: combined_id.clone(),
+            request_key: "req_cmb_1".to_string(),
+            job_id: "job_00000000000000000000000000000001".to_string(),
+            job_revision: 4,
+            project_base: project_base.clone(),
+            final_commit_sha: Some("f".repeat(40)),
+            final_tree_sha: final_tree_sha.clone(),
+            plan_id: "plan_1".to_string(),
+            plan_revision: 1,
+            plan_digest: "1".repeat(64),
+            approval_id: "apr_00000000000000000000000000000001".to_string(),
+            approval_subject_digest: "2".repeat(64),
+            scope_policy_revision: 1,
+            policy_id: "pol_1".to_string(),
+            policy_digest: "3".repeat(64),
+            accepted_predecessor_receipts: vec![AcceptedPredecessorReceiptRef {
+                task_id: "task_1".to_string(),
+                candidate_id: cand_id.clone(),
+                head_commit: "c".repeat(40),
+                tree_sha: "d".repeat(40),
+                review_subject_digest: "4".repeat(64),
+                review_receipt_id: "rev_00000000000000000000000000000001".to_string(),
+                integration_receipt_id: "int_00000000000000000000000000000001".to_string(),
+            }],
+            check_evidence: vec![CandidateCheckEvidence {
+                check_id: "cargo_test".to_string(),
+                command_summary: "cargo test".to_string(),
+                passed: true,
+                exit_code: 0,
+                evidence_digest: "5".repeat(64),
+            }],
+            candidate_digest: String::new(),
+            closure_reservation_id: Some(closure_res_id.clone()),
+            status: CombinedCandidateStatus::ClosureAccepted,
+        };
+        combined.candidate_digest = combined
+            .compute_candidate_digest()
+            .expect("compute combined candidate digest");
+
+        let job = CoworkerJobRecord {
+            job_id: "job_00000000000000000000000000000001".to_string(),
+            job_revision: 5,
+            create_request_key: "req_create_1".to_string(),
+            binding_id: binding_id.to_string(),
+            thread_uuid: thread_uuid.to_string(),
+            phase: CoworkerJobPhase::Completed,
+            work_brief,
+            work_brief_digest,
+            supersedes_job_id: None,
+            planning_result: None,
+            approval_linkage: Some(FrozenApprovalLinkage {
+                approval_id: "apr_00000000000000000000000000000001".to_string(),
+                approval_subject_digest: "2".repeat(64),
+                plan_id: "plan_1".to_string(),
+                plan_revision: 1,
+                plan_digest: "1".repeat(64),
+                project_base,
+                profile_id: "profile_1".to_string(),
+                registry_revision: 1,
+                policy_id: "pol_1".to_string(),
+                policy_digest: "3".repeat(64),
+                approved_task_ids: vec!["task_1".to_string()],
+                approved_write_paths: vec!["src/lib.rs".to_string()],
+                controller_envelope: None,
+            }),
+            tasks: vec![CoworkerTaskRecord {
+                task_id: "task_1".to_string(),
+                task_digest: "6".repeat(64),
+                role: WorkflowRole::Coder,
+                difficulty: Difficulty::Hard,
+                selected_choice: SelectedRoleChoice {
+                    matched_difficulty: Some(Difficulty::Hard),
+                    tool_id: "tool_agy".to_string(),
+                    adapter: threadlane_registry::ToolAdapter::Antigravity,
+                    route: RoleExecutionRoute::HeadlessWorker,
+                    model_id: "model_argon".to_string(),
+                    model_arg: "gemini-4-argon-high".to_string(),
+                    effort: Some("high".to_string()),
+                },
+                depends_on: Vec::new(),
+                write_paths: vec!["src/lib.rs".to_string()],
+                owned_interfaces: Vec::new(),
+                consumed_interfaces: Vec::new(),
+                stage: CoworkerTaskStage::Integrated,
+                stage_before_hold: None,
+                current_attempt_no: 1,
+                active_candidate_id: Some(cand_id.clone()),
+                accepted_candidate_id: Some(cand_id.clone()),
+                dependency_input_commit: None,
+                dependency_input_tree_sha: None,
+                accepted_predecessor_receipts: Vec::new(),
+                attempts: Vec::new(),
+                candidates: Vec::new(),
+                active_hold_ids: Vec::new(),
+                unresolved_outbox_id: None,
+            }],
+            holds: Vec::new(),
+            outbox: Vec::new(),
+            combined_candidates: vec![combined],
+        };
+
+        (job, cand_id, combined_id, closure_res_id)
+    }
+
+    fn forged_runtime_state(
+        job_id: &str,
+        final_tree_sha: &str,
+        closure_verdict_id: &str,
+    ) -> ControllerJobRuntimeState {
+        let choice = SelectedRoleChoice {
+            matched_difficulty: None,
+            tool_id: "tool_agy".to_string(),
+            adapter: threadlane_registry::ToolAdapter::Antigravity,
+            route: RoleExecutionRoute::HeadlessWorker,
+            model_id: "model_argon".to_string(),
+            model_arg: "gemini-4-argon-high".to_string(),
+            effort: Some("high".to_string()),
+        };
+        let mut closure_artifacts = BTreeMap::new();
+        closure_artifacts.insert(
+            "cat_00000000000000000000000000000001".to_string(),
+            threadlane_native::coworker_workflow::ClosureExecutionArtifactRecord {
+                attempt_id: "cat_00000000000000000000000000000001".to_string(),
+                command_key: "cmd_cls_1".to_string(),
+                subject_digest: "a".repeat(64),
+                candidate_tree_sha: final_tree_sha.to_string(),
+                artifact_ref: None,
+                execution_report: None,
+                advisory_response: None,
+                response_error: None,
+                observed_model: None,
+                observed_effort: None,
+                fenced_from_promotion: false,
+                diagnostic: None,
+                recorded_at_ms: 1_700_000_005_000,
+            },
+        );
+        ControllerJobRuntimeState {
+            job_id: job_id.to_string(),
+            runtime_revision: 3,
+            envelope: threadlane_native::coworker_workflow::FrozenControllerExecutionEnvelope {
+                schema_version: CONTROLLER_POLICY_SCHEMA_VERSION,
+                envelope_id: "env_00000000000000000000000000000001".to_string(),
+                binding_id: "bnd_proof_1".to_string(),
+                thread_uuid: "0196ed00-0000-7000-8000-000000000099".to_string(),
+                job_id: job_id.to_string(),
+                work_brief_id: "brf_00000000000000000000000000000001".to_string(),
+                work_brief_digest: "8".repeat(64),
+                approval_id: "apr_00000000000000000000000000000001".to_string(),
+                approval_subject_digest: "2".repeat(64),
+                plan_id: "plan_1".to_string(),
+                plan_revision: 1,
+                plan_digest: "1".repeat(64),
+                profile_id: "profile_1".to_string(),
+                registry_revision: 1,
+                project_base: CanonicalProjectBaseRef {
+                    repository_path: "/tmp/repo".to_string(),
+                    base_commit: "a".repeat(40),
+                    base_tree_sha: "b".repeat(40),
+                },
+                policy: threadlane_native::profile_flow::ExecutionPolicy {
+                    schema_version: 1,
+                    policy_id: "pol_1".to_string(),
+                    allow_rules: Vec::new(),
+                },
+                policy_digest: "3".repeat(64),
+                task_coder_choices: BTreeMap::new(),
+                reviewer_choice: choice.clone(),
+                closure_choice: choice,
+                role_budgets: BTreeMap::new(),
+                max_in_scope_corrections_per_task: 0,
+                max_total_corrections_per_job: 0,
+                max_total_task_attempts_per_job: 4,
+                check_commands: BTreeMap::new(),
+                allow_task_worktree_commits: true,
+                allow_run_integration_execution: true,
+                allow_check_failure_corrections: false,
+                default_integration_strategy: serde_json::from_str("\"fast_forward_only\"")
+                    .expect("deserialize fast_forward_only IntegrationStrategy"),
+                independence_completeness_receipt: None,
+                shadow_jev_policy: None,
+                created_at_ms: 1_700_000_000_000,
+                operator_attested: true,
+                native_per_call_identity_verified: false,
+                capability_envelope_digest: "9".repeat(64),
+                envelope_digest: "7".repeat(64),
+            },
+            lease: None,
+            role_usage: BTreeMap::new(),
+            total_task_attempts_reserved: 1,
+            total_corrections_reserved: 0,
+            derived_attempts: Vec::new(),
+            attempt_artifacts: BTreeMap::new(),
+            pending_effects: BTreeMap::new(),
+            provider_health: BTreeMap::new(),
+            original_worker_provider_health: BTreeMap::new(),
+            candidate_check_evidence: Vec::new(),
+            final_candidate_subject: None,
+            closure_attempt_id: Some("cat_00000000000000000000000000000001".to_string()),
+            closure_verdict_id: Some(closure_verdict_id.to_string()),
+            closure_artifacts,
+            shadow_jev_observations: Vec::new(),
+            synced_change_revision: 0,
+            stop_requested: false,
+            stop_or_block_reason: None,
+        }
+    }
+
+    #[test]
+    fn missing_runtime_or_unverified_ids_never_produce_completed_done_state() {
+        let fixture = ProofFixtureDir::new("missing-runtime");
+        let repo_dir = fixture.subdir("repo");
+        let plans_dir = fixture.subdir("plans");
+        let authority_dir = fixture.subdir("authority");
+        let sessions_dir = fixture.subdir("sessions");
+        let registry_dir = fixture.subdir("registry");
+
+        let source_id = threadlane_native::native_chat_observation::compute_observation_source_id(
+            &plans_dir,
+            &authority_dir,
+            &sessions_dir,
+        )
+        .expect("compute source_id");
+
+        let spec = SourceSpec {
+            source: ObservationSource {
+                id: source_id.clone(),
+                label: "Proof Source".to_string(),
+                project_path: None,
+                availability: ObservationSourceAvailability::Available,
+                message: None,
+            },
+            registry_dir,
+            plans_dir,
+            authority_dir,
+            sessions_dir,
+            runtime_state_dirs: Vec::new(),
+            project_root_hint: None,
+            binding_id_hint: None,
+            thread_uuid_hint: None,
+        };
+
+        let thread_uuid = "0196ed00-0000-7000-8000-000000000099";
+        let (job, cand_id, combined_id, closure_res_id) =
+            sample_completed_coworker_job(&repo_dir, "bnd_proof_1", thread_uuid);
+
+        // 1. Missing runtime state (None) MUST fail completion proof and degrade job/task to Unknown.
+        assert!(!verify_job_closure_completion_proof(&spec, &job, None));
+        let mut warnings = Vec::new();
+        let (state_none, approval_none, exec_none, rev_none, _) =
+            evaluate_coworker_job_lifecycle(&job, None, false, false, false, false, &mut warnings);
+        assert_eq!(state_none, ObservationJobState::Unknown);
+        assert_eq!(approval_none, "unknown");
+        assert_eq!(exec_none, "unknown");
+        assert_eq!(rev_none.as_deref(), Some("unknown"));
+        assert!(!warnings.is_empty());
+        assert_eq!(
+            map_coworker_task_status(
+                CoworkerJobPhase::Completed,
+                &job.tasks[0],
+                false,
+                false,
+                false,
+            ),
+            "unknown"
+        );
+
+        // 2. Runtime state with plausible IDs on disk/memory, but without verified scoped receipt proof,
+        // MUST also fail completion proof.
+        let rt = forged_runtime_state(&job.job_id, &"e".repeat(40), "cvd_forged_1");
+        assert!(has_structural_closure_completion_preconditions(&job, &rt));
+        assert!(!verify_job_closure_completion_proof(&spec, &job, Some(&rt)));
+
+        let chat_identity = WorkspaceChatIdentity::new(
+            &source_id,
+            &job.binding_id,
+            &job.thread_uuid,
+            repo_dir.to_string_lossy().as_ref(),
+        )
+        .expect("chat identity");
+
+        let base_projected_job = WorkspaceJobHistory {
+            job: WorkspaceJobSummary {
+                source_id: source_id.clone(),
+                job_id: job.job_id.clone(),
+                binding_id: Some(job.binding_id.clone()),
+                chat_identity: Some(chat_identity.clone()),
+                title: "Scoped snapshot".to_string(),
+                job_revision: Some(job.job_revision),
+                state: ObservationJobState::Unknown,
+                phase: Some("completed".to_string()),
+                approval_status: "approved".to_string(),
+                execution_status: "unknown".to_string(),
+                review_state: Some("unknown".to_string()),
+                created_at_ms: None,
+                updated_at_ms: Some(1_700_000_005_000),
+                summary: None,
+            },
+            tasks: vec![WorkspaceTaskHistory {
+                task_id: "task_1".to_string(),
+                title: "Task 1".to_string(),
+                role: Some("coder".to_string()),
+                difficulty: Some("hard".to_string()),
+                stage: Some("integrated".to_string()),
+                status: "unknown".to_string(),
+                depends_on: Vec::new(),
+                current_attempt_no: 1,
+                attempts: Vec::new(),
+                candidates: Vec::new(),
+                active_candidate_id: Some(cand_id.clone()),
+                accepted_candidate_id: Some(cand_id.clone()),
+                historical_failure: None,
+                current_attention: None,
+                acceptance_proof: WorkspaceAcceptanceProof::unknown(),
+            }],
+            runs: Vec::new(),
+            outbox: Vec::new(),
+            combined_candidates: Vec::new(),
+            result: None,
+            links: WorkspaceRecordLinks::default(),
+            historical_failure: None,
+            current_attention: None,
+            acceptance_proof: WorkspaceAcceptanceProof::unknown(),
+            truncation: WorkspaceJobHistoryTruncation::default(),
+        };
+
+        let unknown_scoped = WorkspaceScopedHistoryRead {
+            chat_identity: chat_identity.clone(),
+            jobs: vec![base_projected_job.clone()],
+            jobs_omitted: 0,
+            rejected_scope_count: 0,
+            degraded: false,
+            diagnostics: Vec::new(),
+        };
+        assert!(!has_verified_scoped_job_completion_proof(
+            &chat_identity,
+            &job,
+            Some(&rt),
+            &unknown_scoped,
+        ));
+
+        // 3. VerifiedAccepted with matching job + task receipt correlation succeeds, EXCEPT when
+        // degraded, truncated, or mismatched IDs are present.
+        let mut verified_job_hist = base_projected_job;
+        verified_job_hist.job.state = ObservationJobState::Completed;
+        verified_job_hist.job.execution_status = "completed".to_string();
+        verified_job_hist.acceptance_proof = WorkspaceAcceptanceProof {
+            status: WorkspaceAcceptanceStatus::VerifiedAccepted,
+            accepted_candidate_id: None,
+            combined_candidate_id: Some(combined_id),
+            review_verdict_id: None,
+            review_receipt_id: None,
+            integration_receipt_id: None,
+            closure_reservation_id: Some(closure_res_id),
+            closure_verdict_id: Some("cvd_forged_1".to_string()),
+            verified_at_ms: Some(1_700_000_006_000),
+        };
+        verified_job_hist.tasks[0].status = "completed".to_string();
+        verified_job_hist.tasks[0].acceptance_proof = WorkspaceAcceptanceProof {
+            status: WorkspaceAcceptanceStatus::VerifiedAccepted,
+            accepted_candidate_id: Some(cand_id),
+            combined_candidate_id: None,
+            review_verdict_id: Some("vrd_1".to_string()),
+            review_receipt_id: Some("rev_00000000000000000000000000000001".to_string()),
+            integration_receipt_id: Some("int_00000000000000000000000000000001".to_string()),
+            closure_reservation_id: None,
+            closure_verdict_id: None,
+            verified_at_ms: Some(1_700_000_005_500),
+        };
+
+        let verified_scoped = WorkspaceScopedHistoryRead {
+            chat_identity: chat_identity.clone(),
+            jobs: vec![verified_job_hist.clone()],
+            jobs_omitted: 0,
+            rejected_scope_count: 0,
+            degraded: false,
+            diagnostics: Vec::new(),
+        };
+        assert!(has_verified_scoped_job_completion_proof(
+            &chat_identity,
+            &job,
+            Some(&rt),
+            &verified_scoped,
+        ));
+
+        // Degraded read rejects completion even if proof fields look populated.
+        let mut degraded_scoped = verified_scoped.clone();
+        degraded_scoped.degraded = true;
+        assert!(!has_verified_scoped_job_completion_proof(
+            &chat_identity,
+            &job,
+            Some(&rt),
+            &degraded_scoped,
+        ));
+
+        // Truncated tasks reject job-wide completion proof.
+        let mut truncated_scoped = verified_scoped.clone();
+        truncated_scoped.jobs[0].truncation.tasks_omitted = 1;
+        assert!(!has_verified_scoped_job_completion_proof(
+            &chat_identity,
+            &job,
+            Some(&rt),
+            &truncated_scoped,
+        ));
+
+        // Mismatched closure_verdict_id rejects completion proof.
+        let mut wrong_verdict_scoped = verified_scoped;
+        wrong_verdict_scoped.jobs[0]
+            .acceptance_proof
+            .closure_verdict_id = Some("cvd_other".to_string());
+        assert!(!has_verified_scoped_job_completion_proof(
+            &chat_identity,
+            &job,
+            Some(&rt),
+            &wrong_verdict_scoped,
+        ));
     }
 }

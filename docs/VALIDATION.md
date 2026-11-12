@@ -3,6 +3,50 @@
 Verified on 2026-10-29 on Linux/NixOS. This is a checkpoint report, not a claim
 that every milestone or platform is supported.
 
+## Desktop workspace production integration status (2026-11-11 — pending integrated gates)
+
+Production React entry wiring (`apps/desktop/index.html` → `apps/desktop/src/main.ts`
+→ `apps/desktop/src/app.tsx`) now connects `DesktopAppCoordinator` and
+`ipcWorkspaceSnapshot` (`desktop_workspace_snapshot`) to `WorkspaceChatPanels`
+while preserving the `?surface=tray` route, `ToolsPanel`, `ProfilesPanel`, and
+`SettingsPanel`. `Projects` exposes separate `Active` and `Archive` submenus with
+persisted per-chat archive/restore (`threadlane.desktop.workspace.chatArchive.v1`)
+and visible storage-failure alerts; legacy `6h` / `24h` time-window filters,
+`Older (6h+)`, `Load older activity`, bulk `Archive history`, and `Show archived`
+controls are removed in favor of explicit bounded-snapshot omission notices. The
+sidebar toggle lives solely in the titlebar (collapsing on wide windows and
+opening the Radix `Dialog` modal drawer at `<= 760px`), and selected chat panels
+derive raw `WorkspaceChatSummary` and `WorkspaceNativeSample` strictly by full
+four-part canonical `WorkspaceChatIdentity` (`Messages` default, `Jobs`, and
+`Activity` tabs).
+
+Source wiring alone is not final delivery proof. After merging the qualified
+concurrent coordinator/IPC dependencies into the combined checkout, the following
+gates remain pending to be executed and recorded with actual artifacts:
+
+- **Combined workspace & desktop checks**: Checkout-local `CARGO_TARGET_DIR`
+  formatting, behavioral tests, and Clippy (`-D warnings`) across the root Cargo
+  workspace and `apps/desktop/src-tauri`, plus frontend unit/contract tests,
+  TypeScript typechecking, and Vite production build.
+- **Real browser wide/narrow verification**: Playwright checks against the merged
+  production entry across wide (`> 760px` collapsible sidebar) and narrow
+  (`<= 760px` Radix `Dialog` drawer) viewports, verifying `Projects/Active` and
+  `Projects/Archive`, per-chat archive/restore, `Messages` / `Jobs` / `Activity`
+  tabs, scroll following / `New messages` jump behavior, and centered
+  `ActivitySpinner` alignment.
+- **Isolated NixOS Wayland VM acceptance**: Launching the integrated package in an
+  isolated NixOS Wayland VM (preserving host Codex sessions and host system
+  configuration) to verify real system tray interaction and `Open in Codex`
+  routing (`desktop_open_codex_chat`).
+- **Authorized live workflow qualification**: Only when fresh, explicit human
+  execution authorization is present, running controlled workflow qualification
+  covering independent root tasks, a dependent task, real scoped receipts,
+  check/review/integration, and the single required `Closure` chain without
+  replaying uncertain effects or replaying/promoting any earlier failed native job.
+- **Single package-closing review & publication**: Passing the single authorized
+  `gpt-6-astra` (`high`) package-closing review as a separate gate before any
+  `main` publication.
+
 ## Packaged operator context checkpoint (2026-10-31)
 
 The context command package passed **360 workspace tests** with the existing

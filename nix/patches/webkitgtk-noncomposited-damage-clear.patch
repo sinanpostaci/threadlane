@@ -1,0 +1,69 @@
+From bfae1a7b27ec99a467d0669299465491ecfa4611 Mon Sep 17 00:00:00 2001
+From: Mariyan Borisov <1923263+mariyan-borisov@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 11:20:16 +0000
+Subject: [PATCH] [Damage][Skia] Clip the non-composited clear to the damage
+ that is repainted
+
+Upstream WebKit bug: https://bugs.webkit.org/show_bug.cgi?id=324543
+Upstream commit: bfae1a7b27ec99a467d0669299465491ecfa4611 (324966@main)
+Upstream URL: https://github.com/WebKit/WebKit/commit/bfae1a7b27ec99a467d0669299465491ecfa4611
+Canonical link: https://commits.webkit.org/324966@main
+Based on: https://github.com/WebKit/WebKit/pull/74339 (Thomas Devoogdt)
+Reviewed by: Carlos Garcia Campos <cgarcia@igalia.com>
+
+Backport adaptation to WebKitGTK 2.54.1:
+WebKitGTK 2.54.1 calls m_surface->clear({ }) immediately before
+canvas->save() rather than calling canvas->clear(*clearColor) immediately
+after canvas->save(). Remove that early m_surface->clear({ }) call and
+apply the upstream per-damage-rect SkPaint (SkBlendMode::kSrc) clear using
+m_surface->skiaClearColor({ }) immediately before repainting each
+scaledRect, while preserving full-canvas canvas->clear(*clearColor) when
+repainting the whole view in both fallback branches.
+---
+ .../CoordinatedGraphics/NonCompositedFrameRenderer.cpp   | 20 +++++++++++++++++---
+ 1 file changed, 17 insertions(+), 3 deletions(-)
+
+diff --git a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/NonCompositedFrameRenderer.cpp b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/NonCompositedFrameRenderer.cpp
+--- a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/NonCompositedFrameRenderer.cpp
++++ b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/NonCompositedFrameRenderer.cpp
+@@ -216,8 +216,6 @@ void NonCompositedFrameRenderer::updateRendering()
+         if (m_context)
+             PlatformDisplay::sharedDisplay().skiaGLContext()->makeContextCurrent();
+ 
+-        m_surface->clear({ });
+-
+         canvas->save();
+         GraphicsContextSkia graphicsContext(*canvas, m_context ? RenderingMode::Accelerated : RenderingMode::Unaccelerated, RenderingPurpose::DOM);
+         graphicsContext.applyDeviceScaleFactor(webPage->deviceScaleFactor());
+@@ -248,14 +246,30 @@ void NonCompositedFrameRenderer::updateRendering()
+ 
+ #if ENABLE(DAMAGE_TRACKING)
+         if (auto& renderTargetDamage = m_surface->renderTargetDamage()) {
++            // Only the damaged rects are repainted, so the clear has to be limited to them,
++            // otherwise a non-opaque clear color wipes the rest of the target.
++            SkPaint clearPaint;
++            auto clearColor = m_surface->skiaClearColor({ });
++            if (clearColor) {
++                clearPaint.setColor(*clearColor);
++                clearPaint.setBlendMode(SkBlendMode::kSrc);
++            }
++
+             for (const auto& rect : *renderTargetDamage) {
+                 auto scaledRect = rect;
+                 scaledRect.scale(1 / webPage->deviceScaleFactor());
++                if (clearColor)
++                    canvas->drawRect(SkRect::MakeXYWH(scaledRect.x(), scaledRect.y(), scaledRect.width(), scaledRect.height()), clearPaint);
+                 drawRect(scaledRect);
+             }
+-        } else
++        } else {
++            if (auto clearColor = m_surface->skiaClearColor({ }))
++                canvas->clear(*clearColor);
+             drawRect(webPage->bounds());
++        }
+ #else
++        if (auto clearColor = m_surface->skiaClearColor({ }))
++            canvas->clear(*clearColor);
+         drawRect(webPage->bounds());
+ #endif
+ 

@@ -63,6 +63,7 @@ pub(crate) struct JobProjection {
     pub(crate) worker_links: Vec<WorkerObservationLink>,
     pub(crate) core_states: Vec<ReadonlyCoreStateSnapshot>,
     pub(crate) coworker_scopes: BTreeMap<String, VerifiedCoworkerJobScope>,
+    pub(crate) latest_plans: BTreeMap<String, PlanRevision>,
     pub(crate) warnings: Vec<String>,
     pub(crate) jobs_has_more: bool,
 }
@@ -193,6 +194,7 @@ pub(crate) fn project_jobs(spec: &SourceSpec) -> JobProjection {
         &mut projection.coworker_scopes,
         &mut projection.warnings,
     );
+    projection.latest_plans = latest_plans;
 
     if all_jobs.is_empty() {
         return projection;

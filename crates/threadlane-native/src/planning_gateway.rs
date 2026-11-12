@@ -71,8 +71,10 @@ use crate::planning_commands::{
 };
 use crate::planning_driver::{
     enqueue_planning_command_summary, get_planning_command_summary_readonly,
-    list_planning_command_summaries_readonly, planning_artifacts_dir, planning_commands_dir,
-    PlanningCommandStartOutcome, PlanningCommandStartStatus, PlanningCommandSummary,
+    planning_artifacts_dir, planning_commands_dir, read_planning_commands_for_status_readonly,
+    PlanningCommandEvidenceStatus, PlanningCommandStartOutcome, PlanningCommandStartStatus,
+    PlanningCommandStatusObservation, PlanningCommandSummary, PlanningCommandVerificationIssue,
+    PlanningCommandVerificationIssueKind,
 };
 use crate::profile_flow::{
     preflight, PreflightRequest, RoleExecutionRoute, RolePreflightRequest, SelectedRoleChoice,
@@ -1251,12 +1253,60 @@ impl CoworkerStatusCommandResultSummary {
     }
 }
 
+/// Bounded, non-authoritative status diagnostic for a recorded `Completed` planning command whose
+/// persisted report artifact could not be proven during read-only status inspection.
+///
+/// Strictly separate from `Unknown` (`pending_reconciliation`) command state: this diagnostic
+/// never relabels a recorded `Completed` command as `Running`, `Unknown`, awaiting approval, or
+/// verified success, never exposes raw artifact text or filesystem paths, and cannot dispatch,
+/// reconcile, or repair any state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CoworkerStatusCommandVerificationIssue {
+    /// Always `true`: marks this entry as a status-only read-only diagnostic.
+    pub status_diagnostic_only: bool,
+    /// Always `false`: degraded historical observations never grant execution or approval authority.
+    pub grants_execution_authority: bool,
+    /// Evidence verification status (`verification_failed` or `unavailable`), separate from the
+    /// command's recorded `status`.
+    pub evidence_status: PlanningCommandEvidenceStatus,
+    /// Fixed, bounded reason category for the persisted artifact failure.
+    pub kind: PlanningCommandVerificationIssueKind,
+    /// Underlying strict verifier error code (`validation_failed`, `protocol_error`, or `output_overflow`).
+    pub error_code: NativeErrorCode,
+    /// Validated grant `reservation_id` referenced by the recorded command outcome.
+    pub reservation_id: String,
+    /// Validated persisted report artifact identifier (`pln_<32hex>`) referenced by the recorded command outcome.
+    pub report_artifact_id: String,
+    /// Fixed, software-owned diagnostic description free of untrusted artifact text or private paths.
+    pub message: String,
+}
+
+impl CoworkerStatusCommandVerificationIssue {
+    /// Projects a [`PlanningCommandVerificationIssue`] into a wire-bounded status diagnostic.
+    #[must_use]
+    pub fn from_issue(issue: &PlanningCommandVerificationIssue) -> Self {
+        Self {
+            status_diagnostic_only: true,
+            grants_execution_authority: false,
+            evidence_status: issue.evidence_status,
+            kind: issue.kind,
+            error_code: issue.error_code,
+            reservation_id: issue.reservation_id.clone(),
+            report_artifact_id: issue.report_artifact_id.clone(),
+            message: issue.message.clone(),
+        }
+    }
+}
+
 /// Status-specific, wire-bounded summary of a [`PlanningCommandSummary`].
 ///
 /// Preserves command identity, scope, digests, `status`, `pending_reconciliation`,
 /// `current_plan_status`, `executable`, and `owner_summary`, while bounding `diagnostic` text and
-/// projecting `result_ref` and `provider_health` into compact metadata summaries. Full command
-/// details remain available via `planning_command(command_id)`.
+/// projecting `result_ref` and `provider_health` into compact metadata summaries. When a recorded
+/// `Completed` command's persisted report artifact fails verification or is unavailable, exposes
+/// `verification_issue` with `result_summary == None` and `executable == Some(false)`. Full command
+/// details and strict verification remain available via `planning_command(command_id)`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CoworkerStatusCommandSummary {
@@ -1299,13 +1349,18 @@ pub struct CoworkerStatusCommandSummary {
     pub owner_summary: Option<CoworkerOwnershipSummary>,
     /// Bounded provider health count and liveness summary (`planning_command` exposes full records).
     pub provider_health_summary: CoworkerStatusProviderHealthSummary,
-    /// Bounded non-authoritative result projection when `status == Completed`.
+    /// Bounded non-authoritative result projection when `status == Completed` and evidence is verified.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result_summary: Option<CoworkerStatusCommandResultSummary>,
+    /// Bounded historical artifact verification diagnostic when `status == Completed` but persisted
+    /// report evidence failed verification or was unavailable (`result_summary` is `None` and
+    /// `executable` is `Some(false)`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification_issue: Option<CoworkerStatusCommandVerificationIssue>,
     /// Current persisted status of a verified Orchestrator plan, separate from its frozen result.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_plan_status: Option<PlanStatus>,
-    /// Explicit non-executable marker for a plan that is no longer `Published`; absence never grants authority.
+    /// Explicit non-executable marker for a plan that is no longer `Published` or a degraded historical row; absence never grants authority.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executable: Option<bool>,
     /// Unicode-safe bounded diagnostic message when `KnownFailed` or `Unknown`.
@@ -1388,6 +1443,7 @@ impl CoworkerStatusCommandSummary {
             owner_summary: summary.owner_summary.clone(),
             provider_health_summary,
             result_summary,
+            verification_issue: None,
             current_plan_status: summary.current_plan_status,
             executable: summary.executable,
             diagnostic,
@@ -1397,6 +1453,26 @@ impl CoworkerStatusCommandSummary {
             updated_at_ms: summary.updated_at_ms,
             completed_at_ms: summary.completed_at_ms,
         }
+    }
+
+    /// Projects a status-only [`PlanningCommandStatusObservation`] into a wire-bounded
+    /// [`CoworkerStatusCommandSummary`], enforcing non-authoritative fields whenever
+    /// `verification_issue` is present.
+    #[must_use]
+    pub fn from_status_observation(
+        observation: &PlanningCommandStatusObservation,
+        text_wire_budget: usize,
+    ) -> Self {
+        let mut projected = Self::from_summary(&observation.summary, text_wire_budget);
+        if let Some(ref issue) = observation.verification_issue {
+            projected.pending_reconciliation = false;
+            projected.result_summary = None;
+            projected.current_plan_status = None;
+            projected.executable = Some(false);
+            projected.verification_issue =
+                Some(CoworkerStatusCommandVerificationIssue::from_issue(issue));
+        }
+        projected
     }
 
     fn has_truncated_text(&self) -> bool {
@@ -1472,6 +1548,12 @@ pub struct CoworkerStatusResponse {
     pub unresolved_job_outbox_count: usize,
     /// Total planning commands with `pending_reconciliation == true` across all commands in `(binding_id, thread_uuid)`.
     pub pending_reconciliation_command_count: usize,
+    /// Scope-wide historical command evidence integrity flag across all commands in `(binding_id, thread_uuid)`
+    /// (never hidden by `limit` pagination or byte-budget omission, and strictly separate from `pending_reconciliation`).
+    pub historical_integrity_attention: bool,
+    /// Total recorded `Completed` planning commands in `(binding_id, thread_uuid)` whose persisted report
+    /// artifact failed verification or was unavailable (`verification_issue.is_some()`).
+    pub degraded_completed_command_count: usize,
     /// Count and byte-budget omission breakdown for `active_grants`.
     pub active_grants_bounds: CoworkerStatusSectionBounds,
     /// Count and byte-budget omission breakdown for `grants`.
@@ -1833,15 +1915,13 @@ impl CoworkerPlanningGateway {
             scoped_advice.push(advice);
         }
 
-        let cmd_page = list_planning_command_summaries_readonly(
+        let cmd_report = read_planning_commands_for_status_readonly(
             &self.plans_dir,
             &self.registry_dir,
             &self.binding_id,
             &self.thread_uuid,
-            usize::MAX,
-            None,
         )?;
-        let all_commands = cmd_page.commands;
+        let all_commands = cmd_report.commands;
 
         let unknown_effect_reservation_count = all_grants.iter().fold(0u32, |acc, (g, _)| {
             acc.saturating_add(g.usage.unknown_effect_calls)
@@ -1857,11 +1937,16 @@ impl CoworkerPlanningGateway {
             .sum();
         let pending_reconciliation_command_count = all_commands
             .iter()
-            .filter(|cmd| cmd.pending_reconciliation)
+            .filter(|obs| obs.summary.pending_reconciliation)
             .count();
         let pending_reconciliation = unknown_effect_reservation_count > 0
             || unresolved_job_outbox_count > 0
             || pending_reconciliation_command_count > 0;
+        let degraded_completed_command_count = all_commands
+            .iter()
+            .filter(|obs| obs.verification_issue.is_some())
+            .count();
+        let historical_integrity_attention = degraded_completed_command_count > 0;
 
         let latest_active_grant = active_grants_all.last().cloned();
         let active_grant_id = latest_active_grant
@@ -1896,8 +1981,8 @@ impl CoworkerPlanningGateway {
             let selected_advice =
                 select_tail_preserving_attention(&scoped_advice, advice_cap, |_| false);
             let selected_commands =
-                select_tail_preserving_attention(&all_commands, commands_cap, |cmd| {
-                    cmd.pending_reconciliation
+                select_tail_preserving_attention(&all_commands, commands_cap, |obs| {
+                    obs.summary.pending_reconciliation
                 });
 
             let active_grant = if include_active_grant {
@@ -1936,7 +2021,9 @@ impl CoworkerPlanningGateway {
                 .collect();
             let commands: Vec<CoworkerStatusCommandSummary> = selected_commands
                 .iter()
-                .map(|cmd| CoworkerStatusCommandSummary::from_summary(cmd, text_wire_budget))
+                .map(|obs| {
+                    CoworkerStatusCommandSummary::from_status_observation(obs, text_wire_budget)
+                })
                 .collect();
 
             let active_grants_bounds = build_section_bounds(
@@ -2013,7 +2100,7 @@ impl CoworkerPlanningGateway {
                 binding_id: self.binding_id.clone(),
                 thread_uuid: self.thread_uuid.clone(),
                 workflow_ledger_revision: wf_ledger.ledger_revision,
-                command_ledger_revision: cmd_page.ledger_revision,
+                command_ledger_revision: cmd_report.ledger_revision,
                 effective_limit: limit,
                 active_grant_id: active_grant_id.clone(),
                 active_grant,
@@ -2029,6 +2116,8 @@ impl CoworkerPlanningGateway {
                 unknown_effect_reservation_count,
                 unresolved_job_outbox_count,
                 pending_reconciliation_command_count,
+                historical_integrity_attention,
+                degraded_completed_command_count,
                 active_grants,
                 grants,
                 jobs,

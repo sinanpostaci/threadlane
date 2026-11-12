@@ -2297,6 +2297,171 @@ exit 0
     host_handle.shutdown().await.expect("shutdown host");
 }
 
+#[tokio::test]
+async fn task_correction_reconciles_over_64kib_tracked_diff_and_reopens_idempotently() {
+    let fixture = setup_fixture();
+    let root_dir = fixture.agy_count_file.parent().expect("fixture root dir");
+    let large_corr_path = root_dir.join("large_corr_src_a.rs");
+    let corr_source = build_large_rust_source(3_000, "a", 101);
+    fs::write(&large_corr_path, corr_source.as_bytes())
+        .expect("write >64KiB correction src/a.rs payload");
+
+    let orig_script = fs::read_to_string(&fixture.fake_agy_exe).expect("read fake-agy");
+    let replacement = [
+        "            case \"$PROMPT\" in".to_string(),
+        "                *LARGE_CORR_DIFF_180K*)".to_string(),
+        format!(
+            "                    cp \"{}\" \"src/a.rs\"",
+            large_corr_path.display(),
+        ),
+        "                    ;;".to_string(),
+        "                *)".to_string(),
+        "                    printf \"pub fn a() -> u32 { 101 }\\n\" > \"src/a.rs\"".to_string(),
+        "                    ;;".to_string(),
+        "            esac".to_string(),
+    ]
+    .join("\n");
+    let updated_script = orig_script.replacen(
+        "            printf \"pub fn a() -> u32 { 101 }\\n\" > \"src/a.rs\"",
+        &replacement,
+        1,
+    );
+    assert_ne!(updated_script, orig_script);
+    write_executable_script(&fixture.fake_agy_exe, &updated_script);
+
+    let required_fixes = vec![
+        "LARGE_CORR_DIFF_180K Expand src/a.rs in-scope definitions".to_string(),
+        "Update src/a.rs::a() to return 101".to_string(),
+    ];
+    let PreparedCorrectionFixtureTask {
+        job,
+        approval_id,
+        approval_before,
+        approved_task_before: _,
+        host_handle,
+        session,
+        step_ts,
+        verify_1,
+        review_subject_1: _,
+        policy_digest: _,
+        review_1: _,
+        art_key_1: _,
+        art_1_before: _,
+        task_manifest,
+        prep_outcome: _,
+        receipt: _,
+        expected_req_key: _,
+        expected_eff_id,
+        expected_report_id: _,
+    } = Box::pin(prepare_task_for_derived_correction(
+        &fixture,
+        "brf_corr_diff_180k",
+        "plan-corr-diff-180k",
+        "task-corr-diff-180k",
+        required_fixes,
+    ))
+    .await;
+
+    let correction_exec_service =
+        CoworkerTaskCorrectionExecutionService::new(fixture.controller.clone());
+    let exec_req = CoworkerTaskCorrectionExecuteRequest {
+        binding_id: BINDING_A.to_string(),
+        thread_uuid: THREAD_UUID_A.to_string(),
+        job_id: job.job_id.clone(),
+        task_id: "task-corr-diff-180k".to_string(),
+        prior_attempt_no: 1,
+        now_ms: step_ts + 300,
+    };
+    let exec_outcome =
+        Box::pin(correction_exec_service.execute_task_correction(session.guard(), &exec_req))
+            .await
+            .expect("execute >64KiB derived correction");
+
+    assert_eq!(
+        exec_outcome.status,
+        CoworkerTaskCorrectionExecuteStatus::ReadyForVerification
+    );
+    assert_eq!(exec_outcome.task_stage, CoworkerTaskStage::ReadyForReview);
+    assert!(!exec_outcome.reused_existing);
+    assert_eq!(read_invocation_count(&fixture.agy_count_file), 2);
+
+    let legacy_inc_diff = run_sanitized_git(
+        &task_manifest.checkout_path,
+        &["diff", "--binary", &verify_1.committed_head_commit, "--"],
+        DEFAULT_GIT_COMMAND_TIMEOUT_MS,
+    );
+    assert!(legacy_inc_diff.is_err());
+    let legacy_base_diff = run_sanitized_git(
+        &task_manifest.checkout_path,
+        &["diff", "--binary", &fixture.base_commit, "--"],
+        DEFAULT_GIT_COMMAND_TIMEOUT_MS,
+    );
+    assert!(legacy_base_diff.is_err());
+
+    let raw_inc_diff = run_sanitized_git_bytes(
+        &task_manifest.checkout_path,
+        &["diff", "--binary", &verify_1.committed_head_commit, "--"],
+        DEFAULT_MAX_GIT_OUTPUT_BYTES,
+        DEFAULT_GIT_COMMAND_TIMEOUT_MS,
+    )
+    .expect("4 MiB raw incremental diff");
+    let raw_base_diff = run_sanitized_git_bytes(
+        &task_manifest.checkout_path,
+        &["diff", "--binary", &fixture.base_commit, "--"],
+        DEFAULT_MAX_GIT_OUTPUT_BYTES,
+        DEFAULT_GIT_COMMAND_TIMEOUT_MS,
+    )
+    .expect("4 MiB raw base diff");
+    assert!(raw_inc_diff.stdout_bytes.len() > 180_000);
+    assert!(raw_base_diff.stdout_bytes.len() > 180_000);
+
+    let report = exec_outcome
+        .report
+        .as_ref()
+        .expect("persisted derived execution report");
+    report
+        .validate_integrity()
+        .expect("validate persisted derived report integrity");
+    let loaded_report =
+        read_persisted_derived_task_execution_report(&fixture.plans_dir, &expected_eff_id)
+            .expect("load persisted derived report")
+            .expect("persisted derived report exists");
+    assert_eq!(&loaded_report, report);
+
+    session.release().expect("release session");
+    let reopened_session = fixture
+        .controller
+        .open_owned_session(BINDING_A, THREAD_UUID_A, &job.job_id, step_ts + 400)
+        .expect("reopen session");
+    let reopened_outcome = Box::pin(correction_exec_service.execute_task_correction(
+        reopened_session.guard(),
+        &CoworkerTaskCorrectionExecuteRequest {
+            now_ms: step_ts + 500,
+            ..exec_req
+        },
+    ))
+    .await
+    .expect("reopen >64KiB derived correction idempotently");
+    assert_eq!(
+        reopened_outcome.status,
+        CoworkerTaskCorrectionExecuteStatus::ReadyForVerification
+    );
+    assert!(reopened_outcome.reused_existing);
+    assert_eq!(reopened_outcome.report, exec_outcome.report);
+    assert_eq!(read_invocation_count(&fixture.agy_count_file), 2);
+
+    let approval_after = fixture
+        .authority
+        .get_for_operator(&approval_id)
+        .expect("load ApprovalRecord");
+    assert_eq!(approval_after, approval_before);
+
+    reopened_session
+        .release()
+        .expect("release reopened session");
+    host_handle.shutdown().await.expect("shutdown host");
+}
+
 /// Adds only a deterministic unverified diagnostic fixture to an already-created fake executable.
 fn install_owned_health_fixture(fixture: &ControllerTestFixture) {
     let original = fs::read_to_string(&fixture.fake_agy_exe).expect("read disposable role fixture");

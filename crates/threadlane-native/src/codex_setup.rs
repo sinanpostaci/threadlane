@@ -2611,10 +2611,17 @@ OTHER_TOKEN = "secret-other-token-999"
             .join(CODEX_SETUP_RECEIPT_FILENAME)
             .exists());
 
+        // Explicitly unlock the raw test FD before closing it (matching SetupLockGuard::drop)
+        // so an inherited open-file description in a concurrent pre-exec child cannot retain flock.
+        fs2::FileExt::unlock(&held_lock).expect("unlock exclusive lock in test");
         drop(held_lock);
 
         let after_release = apply_codex_mcp_setup(&req);
-        assert_eq!(after_release.state, CodexSetupState::Registered);
+        assert_eq!(
+            after_release.state,
+            CodexSetupState::Registered,
+            "setup after releasing the held lock returned: {after_release:?}"
+        );
         assert!(after_release.registered);
         assert!(after_release.config_modified);
     }

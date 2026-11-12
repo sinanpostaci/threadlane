@@ -1534,15 +1534,18 @@ where
     run_within_startup_deadline(startup_deadline, approval_id, last_observed_phase, fut).await
 }
 
-async fn run_enrollment_recheck_within_deadline<F>(
+async fn run_enrollment_recheck_within_deadline<T, B, V>(
     startup_deadline: Instant,
     trusted_binding_id: &str,
     approval_id: &str,
     last_observed_phase: Option<HostPhase>,
-    recheck_enrollment: &Arc<F>,
+    blocking_recheck: &Arc<B>,
+    verify_on_task: &V,
 ) -> Result<(), CallToolResult>
 where
-    F: Fn() -> Result<(), CallToolResult> + Send + Sync + 'static,
+    T: Send + 'static,
+    B: Fn() -> Result<T, CallToolResult> + Send + Sync + 'static,
+    V: Fn(T) -> Result<(), CallToolResult>,
 {
     let Some(remaining) = startup_deadline.checked_duration_since(Instant::now()) else {
         return Err(format_start_host_error(
@@ -1550,7 +1553,7 @@ where
             &startup_timeout_error(approval_id, last_observed_phase),
         ));
     };
-    let recheck = Arc::clone(recheck_enrollment);
+    let recheck = Arc::clone(blocking_recheck);
     let check_res =
         match tokio::time::timeout(remaining, tokio::task::spawn_blocking(move || recheck())).await
         {
@@ -1571,7 +1574,8 @@ where
                 ));
             }
         };
-    check_res?;
+    let value = check_res?;
+    verify_on_task(value)?;
     if Instant::now() >= startup_deadline {
         return Err(format_start_host_error(
             trusted_binding_id,
@@ -1864,14 +1868,19 @@ where
         launcher,
         None,
         recheck_enrollment,
+        |()| Ok(()),
     )
     .await
 }
 
 /// Executes `start_approved_task` with optional initial fresh-only host auto-start bounded by
 /// `startup_deadline` (or `Instant::now() + launcher.policy().startup_timeout()` when `None`).
+///
+/// Offloads `blocking_recheck` onto `spawn_blocking` under `startup_deadline`, then executes
+/// `verify_on_task` directly on the caller's async task so task-local native chat identity
+/// (`CALL_THREAD_HINT`) is verified without loss or bypass.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn execute_start_approved_task_with_launcher_until<F>(
+pub(crate) async fn execute_start_approved_task_with_launcher_until<T, B, V>(
     authority: Arc<AuthorityStore>,
     sessions_dir: PathBuf,
     trusted_binding_id: String,
@@ -1879,10 +1888,13 @@ pub(crate) async fn execute_start_approved_task_with_launcher_until<F>(
     params: StartApprovedTaskParams,
     launcher: Option<Arc<ApprovedHostLauncher>>,
     startup_deadline: Option<Instant>,
-    recheck_enrollment: F,
+    blocking_recheck: B,
+    verify_on_task: V,
 ) -> Result<CallToolResult, CallToolResult>
 where
-    F: Fn() -> Result<(), CallToolResult> + Send + Sync + 'static,
+    T: Send + 'static,
+    B: Fn() -> Result<T, CallToolResult> + Send + Sync + 'static,
+    V: Fn(T) -> Result<(), CallToolResult>,
 {
     let Some(launcher) = launcher else {
         return execute_start_approved_task(
@@ -1897,7 +1909,7 @@ where
 
     let startup_deadline =
         startup_deadline.unwrap_or_else(|| Instant::now() + launcher.policy().startup_timeout());
-    let recheck_enrollment = Arc::new(recheck_enrollment);
+    let blocking_recheck = Arc::new(blocking_recheck);
 
     // 1. Validate approval, caller scope (binding_id + thread_uuid), sessions_dir, and that the
     //    requested task exists, is a root worker task, and is not a manual Codex route BEFORE
@@ -1948,7 +1960,8 @@ where
         &trusted_binding_id,
         &record.approval_id,
         None,
-        &recheck_enrollment,
+        &blocking_recheck,
+        &verify_on_task,
     )
     .await?;
 
@@ -2080,7 +2093,8 @@ where
                     &trusted_binding_id,
                     &record.approval_id,
                     None,
-                    &recheck_enrollment,
+                    &blocking_recheck,
+                    &verify_on_task,
                 )
                 .await?;
 
@@ -2118,7 +2132,8 @@ where
                             &trusted_binding_id,
                             &record.approval_id,
                             None,
-                            &recheck_enrollment,
+                            &blocking_recheck,
+                            &verify_on_task,
                         )
                         .await?;
                         let Some(remaining) =
@@ -2160,7 +2175,8 @@ where
                             &trusted_binding_id,
                             &record.approval_id,
                             None,
-                            &recheck_enrollment,
+                            &blocking_recheck,
+                            &verify_on_task,
                         )
                         .await
                         {
@@ -2200,7 +2216,8 @@ where
                             &trusted_binding_id,
                             &record.approval_id,
                             None,
-                            &recheck_enrollment,
+                            &blocking_recheck,
+                            &verify_on_task,
                         )
                         .await
                         {
@@ -2327,7 +2344,8 @@ where
         &trusted_binding_id,
         &record.approval_id,
         Some(HostPhase::Ready),
-        &recheck_enrollment,
+        &blocking_recheck,
+        &verify_on_task,
     )
     .await?;
 

@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use threadlane_authority::validation::validate_canonical_thread_uuid;
@@ -217,26 +217,96 @@ pub struct FrozenCheckCommandSpec {
     pub required_for_candidate_closure: bool,
 }
 
-impl FrozenCheckCommandSpec {
-    /// Validates executable safety, argument bounds, working-directory containment, and finite budgets.
-    pub fn validate(&self) -> Result<(), NativeError> {
-        validate_bounded_identifier(
-            &self.check_id,
-            "check_commands.check_id",
-            MAX_COWORKER_ID_LEN,
-        )?;
-        let canonical_exe = validate_executable_file(&self.executable).map_err(|_| {
-            NativeError::new(
-                NativeErrorCode::SecurityViolation,
-                "FrozenCheckCommandSpec.executable must be an existing canonical non-symlink executable file.",
-            )
-        })?;
-        if canonical_exe != self.executable {
-            return Err(NativeError::new(
-                NativeErrorCode::SecurityViolation,
-                "FrozenCheckCommandSpec.executable must match its canonical path.",
-            ));
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CheckValidationMode {
+    Live,
+    Historical,
+}
+
+fn validate_normalized_absolute_executable_path_data(path: &Path) -> Result<(), NativeError> {
+    ensure_platform_supported()?;
+    let Some(raw) = path.to_str() else {
+        return Err(NativeError::new(
+            NativeErrorCode::SecurityViolation,
+            "FrozenCheckCommandSpec.executable must be valid UTF-8.",
+        ));
+    };
+    if raw.is_empty() || raw.chars().any(char::is_control) {
+        return Err(NativeError::new(
+            NativeErrorCode::SecurityViolation,
+            "FrozenCheckCommandSpec.executable must be non-empty and free of control characters.",
+        ));
+    }
+    if !path.is_absolute() {
+        return Err(NativeError::new(
+            NativeErrorCode::SecurityViolation,
+            "FrozenCheckCommandSpec.executable must be a normalized absolute file path.",
+        ));
+    }
+
+    let mut normalized = PathBuf::new();
+    let mut saw_normal = false;
+    for comp in path.components() {
+        match comp {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(comp.as_os_str()),
+            Component::Normal(part) => {
+                if part.is_empty() {
+                    return Err(NativeError::new(
+                        NativeErrorCode::SecurityViolation,
+                        "FrozenCheckCommandSpec.executable contains an empty path component.",
+                    ));
+                }
+                saw_normal = true;
+                normalized.push(part);
+            }
+            Component::CurDir | Component::ParentDir => {
+                return Err(NativeError::new(
+                    NativeErrorCode::SecurityViolation,
+                    "FrozenCheckCommandSpec.executable must not contain `.` or `..` traversal components.",
+                ));
+            }
         }
+    }
+    if !saw_normal || normalized.file_name().is_none() {
+        return Err(NativeError::new(
+            NativeErrorCode::SecurityViolation,
+            "FrozenCheckCommandSpec.executable must name an executable file path, not root.",
+        ));
+    }
+    if normalized.to_str() != Some(raw) {
+        return Err(NativeError::new(
+            NativeErrorCode::SecurityViolation,
+            "FrozenCheckCommandSpec.executable must be in canonical normalized path form.",
+        ));
+    }
+    Ok(())
+}
+
+fn build_frozen_check_command_summary(spec: &FrozenCheckCommandSpec) -> String {
+    let exe_name = spec
+        .executable
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("check");
+    let joined_args = if spec.argv.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", spec.argv.join(" "))
+    };
+    let raw = format!(
+        "{} ({}): {}{} [cwd={}]",
+        spec.check_id,
+        spec.kind.as_str(),
+        exe_name,
+        joined_args,
+        spec.repo_relative_cwd
+    );
+    sanitize_diagnostic_text(&raw)
+}
+
+impl FrozenCheckCommandSpec {
+    fn validate_common_fields_and_wrapper(&self) -> Result<(), NativeError> {
         let exe_name = self
             .executable
             .file_name()
@@ -320,9 +390,7 @@ impl FrozenCheckCommandSpec {
         Ok(())
     }
 
-    /// Computes a deterministic 64-character lowercase hex SHA-256 digest of this check spec.
-    pub fn spec_digest(&self) -> Result<String, NativeError> {
-        self.validate()?;
+    fn compute_spec_digest_from_fields(&self) -> Result<String, NativeError> {
         let executable_str = self.executable.to_string_lossy();
         let seed = (
             "threadlane-native:frozen_check_command_spec:v1",
@@ -344,6 +412,166 @@ impl FrozenCheckCommandSpec {
             )
         })?;
         Ok(sha256_hex(&bytes))
+    }
+
+    /// Validates executable safety, argument bounds, working-directory containment, and finite budgets.
+    pub fn validate(&self) -> Result<(), NativeError> {
+        validate_bounded_identifier(
+            &self.check_id,
+            "check_commands.check_id",
+            MAX_COWORKER_ID_LEN,
+        )?;
+        let canonical_exe = validate_executable_file(&self.executable).map_err(|_| {
+            NativeError::new(
+                NativeErrorCode::SecurityViolation,
+                "FrozenCheckCommandSpec.executable must be an existing canonical non-symlink executable file.",
+            )
+        })?;
+        if canonical_exe != self.executable {
+            return Err(NativeError::new(
+                NativeErrorCode::SecurityViolation,
+                "FrozenCheckCommandSpec.executable must match its canonical path.",
+            ));
+        }
+        self.validate_common_fields_and_wrapper()
+    }
+
+    /// Read-only historical structural validation of a stored check command specification.
+    ///
+    /// Enforces identical identifier, normalized canonical absolute executable path data,
+    /// disallowed-wrapper, argument, working-directory, budget, and stage-applicability rules as
+    /// [`Self::validate`], without requiring `self.executable` to still exist on disk after past
+    /// execution has already completed. Never grants execution or launch authority.
+    pub(crate) fn validate_readonly_historical(&self) -> Result<(), NativeError> {
+        validate_bounded_identifier(
+            &self.check_id,
+            "check_commands.check_id",
+            MAX_COWORKER_ID_LEN,
+        )?;
+        validate_normalized_absolute_executable_path_data(&self.executable)?;
+        self.validate_common_fields_and_wrapper()
+    }
+
+    /// Computes a deterministic 64-character lowercase hex SHA-256 digest of this check spec.
+    pub fn spec_digest(&self) -> Result<String, NativeError> {
+        self.validate()?;
+        self.compute_spec_digest_from_fields()
+    }
+
+    /// Computes the deterministic SHA-256 digest of this stored check spec for read-only
+    /// historical verification without requiring `self.executable` to currently exist on disk.
+    pub(crate) fn spec_digest_readonly_historical(&self) -> Result<String, NativeError> {
+        self.validate_readonly_historical()?;
+        self.compute_spec_digest_from_fields()
+    }
+
+    /// Read-only historical verification that a persisted [`FrozenCheckExecutionReport`] passes
+    /// cryptographic integrity checks and matches `expected_subject` and `self` without requiring
+    /// `self.executable` to currently exist on disk.
+    pub(crate) fn verify_historical_execution_report_readonly(
+        &self,
+        report: &FrozenCheckExecutionReport,
+        expected_subject: &FrozenCheckSubject,
+    ) -> Result<(), NativeError> {
+        report.validate_integrity()?;
+        expected_subject.validate()?;
+        self.validate_readonly_historical()?;
+
+        if !expected_subject.target_kind.is_spec_applicable(self) {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                format!(
+                    "FrozenCheckCommandSpec `{}` is not applicable to target_kind `{}`.",
+                    self.check_id,
+                    expected_subject.target_kind.as_str()
+                ),
+            ));
+        }
+
+        if &report.subject != expected_subject {
+            return Err(NativeError::new(
+                NativeErrorCode::SecurityViolation,
+                "FrozenCheckExecutionReport.subject does not match expected check subject context.",
+            ));
+        }
+
+        let expected_spec_digest = self.spec_digest_readonly_historical()?;
+        if report.check_id != self.check_id
+            || report.kind != self.kind
+            || !constant_time_str_eq(&report.spec_digest, &expected_spec_digest)
+            || report.executable != self.executable
+            || report.argv != self.argv
+            || report.repo_relative_cwd != self.repo_relative_cwd
+            || report.timeout_ms != self.timeout_ms
+            || report.max_stdout_bytes != self.max_stdout_bytes
+            || report.max_stderr_bytes != self.max_stderr_bytes
+        {
+            return Err(NativeError::new(
+                NativeErrorCode::SecurityViolation,
+                "FrozenCheckExecutionReport does not match expected FrozenCheckCommandSpec or spec_digest.",
+            ));
+        }
+
+        let expected_summary = build_frozen_check_command_summary(self);
+        if report.command_summary != expected_summary {
+            return Err(NativeError::new(
+                NativeErrorCode::SecurityViolation,
+                "FrozenCheckExecutionReport.command_summary does not match expected FrozenCheckCommandSpec summary.",
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// Read-only historical verification that a [`CandidateCheckEvidence`] record matches an
+    /// authentic, passing [`FrozenCheckExecutionReport`] for `expected_subject` and `self` without
+    /// requiring `self.executable` to currently exist on disk.
+    pub(crate) fn verify_historical_candidate_check_evidence_readonly(
+        &self,
+        evidence: &CandidateCheckEvidence,
+        report: &FrozenCheckExecutionReport,
+        expected_subject: &FrozenCheckSubject,
+    ) -> Result<(), NativeError> {
+        evidence.validate_passed()?;
+        self.verify_historical_execution_report_readonly(report, expected_subject)?;
+        if !report.passed() {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                format!(
+                    "Cannot promote check `{}` with status `{}` to passing CandidateCheckEvidence.",
+                    report.check_id,
+                    report.status.as_str()
+                ),
+            ));
+        }
+
+        let expected_evidence = CandidateCheckEvidence {
+            check_id: report.check_id.clone(),
+            command_summary: report.command_summary.clone(),
+            passed: true,
+            exit_code: 0,
+            evidence_digest: report.evidence_digest.clone(),
+        };
+        expected_evidence.validate_passed()?;
+
+        if evidence.check_id != expected_evidence.check_id
+            || evidence.command_summary != expected_evidence.command_summary
+            || evidence.passed != expected_evidence.passed
+            || evidence.exit_code != expected_evidence.exit_code
+            || !constant_time_str_eq(
+                &evidence.evidence_digest,
+                &expected_evidence.evidence_digest,
+            )
+        {
+            return Err(NativeError::new(
+                NativeErrorCode::SecurityViolation,
+                format!(
+                    "CandidateCheckEvidence `{}` does not match verified FrozenCheckExecutionReport proof.",
+                    evidence.check_id
+                ),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -1269,9 +1497,24 @@ impl FrozenControllerExecutionEnvelope {
     /// an attested record request (`true`) over identical authority parameters share the exact
     /// same `envelope_digest`.
     pub fn compute_digest(&self) -> Result<String, NativeError> {
+        self.compute_digest_with_mode(CheckValidationMode::Live)
+    }
+
+    /// Computes the canonical 64-character lowercase hex SHA-256 authority digest of this envelope
+    /// for read-only historical verification without requiring frozen check executables to
+    /// currently exist on disk.
+    pub(crate) fn compute_digest_readonly_historical(&self) -> Result<String, NativeError> {
+        self.compute_digest_with_mode(CheckValidationMode::Historical)
+    }
+
+    fn compute_digest_with_mode(&self, mode: CheckValidationMode) -> Result<String, NativeError> {
         let mut check_digests = BTreeMap::new();
         for (cid, spec) in &self.check_commands {
-            check_digests.insert(cid.as_str(), spec.spec_digest()?);
+            let digest = match mode {
+                CheckValidationMode::Live => spec.spec_digest()?,
+                CheckValidationMode::Historical => spec.spec_digest_readonly_historical()?,
+            };
+            check_digests.insert(cid.as_str(), digest);
         }
         let seed = (
             (
@@ -1343,6 +1586,14 @@ impl FrozenControllerExecutionEnvelope {
     /// Validates all structural, policy, model-choice, command-spec, budget, and digest invariants
     /// of this execution envelope against `job`.
     pub fn validate_against_job(&self, job: &CoworkerJobRecord) -> Result<(), NativeError> {
+        self.validate_against_job_with_mode(job, CheckValidationMode::Live)
+    }
+
+    fn validate_against_job_with_mode(
+        &self,
+        job: &CoworkerJobRecord,
+        mode: CheckValidationMode,
+    ) -> Result<(), NativeError> {
         if self.schema_version != CONTROLLER_POLICY_SCHEMA_VERSION {
             return Err(NativeError::new(
                 NativeErrorCode::ValidationFailed,
@@ -1573,7 +1824,10 @@ impl FrozenControllerExecutionEnvelope {
                     ),
                 ));
             }
-            spec.validate()?;
+            match mode {
+                CheckValidationMode::Live => spec.validate()?,
+                CheckValidationMode::Historical => spec.validate_readonly_historical()?,
+            }
             if spec.required_for_task_review {
                 has_task_check = true;
             }
@@ -1617,7 +1871,7 @@ impl FrozenControllerExecutionEnvelope {
             jev.validate()?;
         }
 
-        let computed = self.compute_digest()?;
+        let computed = self.compute_digest_with_mode(mode)?;
         if !constant_time_str_eq(&computed, &self.envelope_digest) {
             return Err(NativeError::new(
                 NativeErrorCode::ValidationFailed,
@@ -1638,6 +1892,23 @@ impl FrozenControllerExecutionEnvelope {
             ));
         }
         self.validate_against_job(job)
+    }
+
+    /// Read-only historical verification that this attested execution envelope matches `job`'s
+    /// immutable scope, approval/plan/policy/capability bindings, model choices, budgets, frozen
+    /// check command specifications, and canonical `envelope_digest` without requiring frozen
+    /// check executables to still exist on disk. Never grants live execution authority.
+    pub(crate) fn verify_matches_job_readonly_historical(
+        &self,
+        job: &CoworkerJobRecord,
+    ) -> Result<(), NativeError> {
+        if !self.operator_attested {
+            return Err(NativeError::new(
+                NativeErrorCode::UnauthorizedOperator,
+                "FrozenControllerExecutionEnvelope requires operator_attested = true for execution.",
+            ));
+        }
+        self.validate_against_job_with_mode(job, CheckValidationMode::Historical)
     }
 
     /// Returns the frozen [`ControllerRoleExecutionBudget`] for `role`.

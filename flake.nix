@@ -28,6 +28,7 @@
       devShells = forAllSystems (system:
         let
           pkgs = import nixpkgs { inherit system; };
+          desktopWebkitgtk = import ./nix/webkitgtk.nix { inherit pkgs; };
         in
         {
           default = pkgs.mkShell {
@@ -57,7 +58,8 @@
               nodejs
             ]) ++ pkgs.lib.optionals pkgs.stdenv.isLinux (with pkgs; [
               gtk3
-              webkitgtk_4_1
+              gtk-layer-shell
+              desktopWebkitgtk
               libsoup_3
               openssl
               librsvg

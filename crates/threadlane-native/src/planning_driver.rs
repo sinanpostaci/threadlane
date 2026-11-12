@@ -9,11 +9,13 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use serde::{Deserialize, Serialize};
+use threadlane_authority::validation::validate_canonical_thread_uuid;
 use threadlane_workflow::{PlanStatus, ScopedWorkflow, WorkflowRole};
 
 use crate::coworker_workflow::{
-    verify_grant_registry_dependencies, ArchitectConsultationRequestOutcome,
-    CanonicalProjectBaseRef, CoworkerJobLockState, CoworkerJobOwnershipGuard,
+    verify_grant_registry_dependencies, verify_recovery_command_context,
+    ArchitectConsultationRequestOutcome, ArchitectDecisionStatus, CanonicalProjectBaseRef,
+    CoworkerBindingLedger, CoworkerJobLockState, CoworkerJobOwnershipGuard,
     CoworkerOwnershipSummary, CoworkerPlanningService, CoworkerWorkflowStore,
     HumanClarificationRequestOutcome, OrchestrateWorkBriefPlanOutcome,
     OrchestratorPlanningDecision, PersistedPlanningCallArtifact, PlanningAdviceGrant,
@@ -31,6 +33,7 @@ use crate::mcp_pair::open_workflow_stores;
 use crate::planning_commands::{
     current_wall_clock_ms, EnqueuePlanningCommandRequest, PlanningCommandPayload,
     PlanningCommandRecord, PlanningCommandResultRef, PlanningCommandStatus, PlanningCommandStore,
+    PlanningRecoveryTarget,
 };
 use crate::profile_flow::SelectedRoleChoice;
 use crate::role_flow::read_registry_snapshot_readonly;
@@ -200,6 +203,159 @@ pub struct PlanningCommandPage {
     pub commands: Vec<PlanningCommandSummary>,
     /// Opaque pagination cursor (`command_id` of the last returned row) when more rows exist.
     pub next_cursor: Option<String>,
+}
+
+/// Evidence verification outcome for a recorded `Completed` command during status-only inspection.
+///
+/// Kept strictly separate from [`PlanningCommandStatus`]: a recorded `Completed` command whose
+/// persisted report artifact is missing or fails proof verification is never relabeled as
+/// `Running`, `Unknown`, `Queued`, or verified authoritative success.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanningCommandEvidenceStatus {
+    /// Persisted report artifact was present (or exceeded size bounds) and failed strict proof verification.
+    VerificationFailed,
+    /// Persisted planning artifacts directory or referenced report artifact file was absent on disk.
+    Unavailable,
+}
+
+/// Fixed, bounded classification of an isolated historical artifact verification failure on a
+/// validated `Completed` [`PlanningCommandRecord`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanningCommandVerificationIssueKind {
+    /// Private `coworker-planning-artifacts` directory does not exist on disk.
+    ArtifactDirectoryUnavailable,
+    /// Referenced `<report_artifact_id>.json` file does not exist in `coworker-planning-artifacts`.
+    ArtifactMissing,
+    /// Referenced `<report_artifact_id>.json` file exceeds [`MAX_PLANNING_ARTIFACT_BYTES`].
+    ArtifactOversize,
+    /// Referenced `<report_artifact_id>.json` file is corrupt or invalid JSON.
+    ArtifactCorruptJson,
+    /// Persisted artifact failed full `BoundedAdvisoryResponse` verification under `max_output_bytes_per_call`.
+    BoundedAdvisoryResponseVerificationFailed,
+    /// Persisted artifact failed schema, digest, or grant validation.
+    ArtifactGrantVerificationFailed,
+    /// Persisted artifact metadata or structured outcome failed cross-verification against the command linkage.
+    ArtifactRecordLinkageMismatch,
+}
+
+impl PlanningCommandVerificationIssueKind {
+    /// Returns the [`PlanningCommandEvidenceStatus`] corresponding to this issue kind.
+    #[must_use]
+    pub const fn evidence_status(self) -> PlanningCommandEvidenceStatus {
+        match self {
+            Self::ArtifactDirectoryUnavailable | Self::ArtifactMissing => {
+                PlanningCommandEvidenceStatus::Unavailable
+            }
+            Self::ArtifactOversize
+            | Self::ArtifactCorruptJson
+            | Self::BoundedAdvisoryResponseVerificationFailed
+            | Self::ArtifactGrantVerificationFailed
+            | Self::ArtifactRecordLinkageMismatch => {
+                PlanningCommandEvidenceStatus::VerificationFailed
+            }
+        }
+    }
+
+    /// Returns a fixed, software-owned diagnostic description free of untrusted artifact text,
+    /// filesystem paths, prompts, or secrets.
+    #[must_use]
+    pub const fn fixed_message(self) -> &'static str {
+        match self {
+            Self::ArtifactDirectoryUnavailable => {
+                "Persisted planning artifacts directory is unavailable; historical command result cannot be verified."
+            }
+            Self::ArtifactMissing => {
+                "Referenced persisted planning report artifact is missing; historical command result cannot be verified."
+            }
+            Self::ArtifactOversize => {
+                "Persisted planning report artifact exceeds maximum private artifact byte bounds."
+            }
+            Self::ArtifactCorruptJson => {
+                "Persisted planning report artifact JSON is corrupt or does not match the schema."
+            }
+            Self::BoundedAdvisoryResponseVerificationFailed => {
+                "Persisted planning report artifact failed full BoundedAdvisoryResponse verification under max_output_bytes_per_call."
+            }
+            Self::ArtifactGrantVerificationFailed => {
+                "Persisted planning report artifact failed verification against the standing planning grant."
+            }
+            Self::ArtifactRecordLinkageMismatch => {
+                "Persisted planning report artifact metadata or outcome does not match the recorded command linkage."
+            }
+        }
+    }
+}
+
+/// Bounded, status-only observation describing why a validated `Completed` planning command's
+/// persisted report artifact could not be proven during a read-only status scan.
+///
+/// Never exposes raw artifact text, filesystem paths, prompts, or credentials, and never confers
+/// execution or approval authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlanningCommandVerificationIssue {
+    /// Evidence verification classification (`verification_failed` or `unavailable`), strictly
+    /// separate from the command's recorded [`PlanningCommandStatus`].
+    pub evidence_status: PlanningCommandEvidenceStatus,
+    /// Fixed, bounded reason category for the persisted artifact failure.
+    pub kind: PlanningCommandVerificationIssueKind,
+    /// Underlying strict verifier [`NativeErrorCode`].
+    pub error_code: NativeErrorCode,
+    /// Validated grant `reservation_id` referenced by the recorded command outcome.
+    pub reservation_id: String,
+    /// Validated persisted report artifact identifier (`pln_<32hex>`) referenced by the recorded command outcome.
+    pub report_artifact_id: String,
+    /// Fixed, software-owned diagnostic description free of untrusted artifact text or private paths.
+    pub message: String,
+}
+
+impl PlanningCommandVerificationIssue {
+    fn from_kind(
+        kind: PlanningCommandVerificationIssueKind,
+        error_code: NativeErrorCode,
+        reservation_id: String,
+        report_artifact_id: String,
+    ) -> Self {
+        Self {
+            evidence_status: kind.evidence_status(),
+            kind,
+            error_code,
+            reservation_id,
+            report_artifact_id,
+            message: kind.fixed_message().to_string(),
+        }
+    }
+}
+
+/// Single status-only command observation returned by [`read_planning_commands_for_status_readonly`].
+///
+/// When `verification_issue` is `Some(_)`, `summary.status` preserves the recorded
+/// [`PlanningCommandStatus::Completed`] state (`pending_reconciliation == false`), while
+/// `summary.result_ref` is stripped (`None`), `summary.current_plan_status` is `None`, and
+/// `summary.executable` is explicitly `Some(false)`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlanningCommandStatusObservation {
+    /// Prompt-redacted command summary with unverified `result_ref` removed when `verification_issue` is present.
+    pub summary: PlanningCommandSummary,
+    /// Present only when a validated `Completed` command's persisted report artifact failed proof
+    /// verification or was unavailable on disk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification_issue: Option<PlanningCommandVerificationIssue>,
+}
+
+/// Complete status-only read-only snapshot of scoped planning commands for `(binding_id, thread_uuid)`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlanningCommandStatusReadReport {
+    /// Verified control-plane chat binding identifier.
+    pub binding_id: String,
+    /// Current [`crate::planning_commands::PlanningCommandBindingLedger::revision`] (`0` when uninitialized).
+    pub ledger_revision: u64,
+    /// Ordered status-only command observations across the entire binding and thread scope.
+    pub commands: Vec<PlanningCommandStatusObservation>,
 }
 
 /// Prompt-redacted summary of [`PlanningCommandExecutionOutcome`].
@@ -1593,6 +1749,645 @@ pub fn list_planning_command_summaries_readonly(
         commands: page_items,
         next_cursor,
     })
+}
+
+/// Separate status-only read-only command reader for `coworker_status`.
+///
+/// Validates private store directories, shared workflow and command ledger headers, every
+/// [`PlanningCommandRecord`], and `(binding_id, thread_uuid)` scope up front—failing closed on any
+/// shared ledger corruption, scope mismatch, tampered record digest, or unsafe store/file path.
+/// For each `Completed` command, attempts the full strict proof verifier first and contains only
+/// an isolated persisted planning report artifact failure (`unavailable` or `verification_failed`)
+/// into [`PlanningCommandVerificationIssue`] while stripping `result_ref` and setting
+/// `executable = Some(false)`.
+///
+/// Strict callers (`get_planning_command_summary_readonly`, `list_planning_command_summaries_readonly`,
+/// `planning_command`, completion, and reconciliation) must never use this status-only projection.
+pub fn read_planning_commands_for_status_readonly(
+    plans_dir: &Path,
+    registry_dir: &Path,
+    binding_id: &str,
+    thread_uuid: &str,
+) -> Result<PlanningCommandStatusReadReport, NativeError> {
+    read_planning_commands_for_status_readonly_with_hooks(
+        plans_dir,
+        registry_dir,
+        binding_id,
+        thread_uuid,
+        |_, _| Ok(()),
+        |_, _| Ok(()),
+    )
+}
+
+/// Deterministic hook variant of [`read_planning_commands_for_status_readonly`] for status
+/// snapshot-coherence and race-window isolation tests without global test serialization.
+#[doc(hidden)]
+#[allow(clippy::too_many_lines)]
+pub fn read_planning_commands_for_status_readonly_with_hooks<AfterLedger, BeforeIsolation>(
+    plans_dir: &Path,
+    registry_dir: &Path,
+    binding_id: &str,
+    thread_uuid: &str,
+    mut after_ledger_snapshot: AfterLedger,
+    mut before_artifact_isolation: BeforeIsolation,
+) -> Result<PlanningCommandStatusReadReport, NativeError>
+where
+    AfterLedger: FnMut(u64, usize) -> Result<(), NativeError>,
+    BeforeIsolation: FnMut(&str, &NativeError) -> Result<(), NativeError>,
+{
+    ensure_platform_supported()?;
+    validate_bounded_identifier(binding_id, "binding_id", MAX_COWORKER_ID_LEN)?;
+    validate_canonical_thread_uuid("thread_uuid", thread_uuid).map_err(|_| {
+        NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            "thread_uuid must be a canonical lowercase hyphenated non-nil UUID",
+        )
+    })?;
+    let clean_plans_dir = validate_absolute_no_symlink_components(plans_dir, "plans_dir")?;
+    let _ = validate_absolute_no_symlink_components(registry_dir, "registry_dir")?;
+
+    let workflow_store = CoworkerWorkflowStore::new(&clean_plans_dir)?;
+    let wf_ledger = workflow_store.read_binding_ledger(binding_id)?;
+    if wf_ledger.binding_id != binding_id {
+        return Err(NativeError::new(
+            NativeErrorCode::SecurityViolation,
+            "Coworker workflow ledger binding_id does not match verified binding_id",
+        ));
+    }
+    if let Some(ref wf_pinned) = wf_ledger.thread_uuid {
+        if wf_pinned != thread_uuid {
+            return Err(NativeError::new(
+                NativeErrorCode::SecurityViolation,
+                "thread_uuid does not match the thread pinned to this binding's workflow ledger",
+            ));
+        }
+    }
+
+    let commands_dir = planning_commands_dir(&clean_plans_dir);
+    if !inspect_existing_private_subdir_readonly(&commands_dir, "planning_commands_dir")? {
+        return Ok(PlanningCommandStatusReadReport {
+            binding_id: binding_id.to_string(),
+            ledger_revision: 0,
+            commands: Vec::new(),
+        });
+    }
+
+    let mut command_store =
+        PlanningCommandStore::open_existing(&commands_dir, workflow_store, registry_dir)?;
+    let artifacts_dir = planning_artifacts_dir(&clean_plans_dir);
+    let artifacts_dir_present =
+        inspect_existing_private_subdir_readonly(&artifacts_dir, "planning_artifacts_dir")?;
+    if artifacts_dir_present {
+        command_store = command_store.with_artifacts_dir(&artifacts_dir)?;
+    }
+
+    let ledger = command_store.read_binding_ledger(binding_id)?;
+    if ledger.binding_id != binding_id {
+        return Err(NativeError::new(
+            NativeErrorCode::SecurityViolation,
+            "planning command ledger binding_id does not match verified binding_id",
+        ));
+    }
+    if let Some(ref pinned) = ledger.thread_uuid {
+        if pinned != thread_uuid {
+            return Err(NativeError::new(
+                NativeErrorCode::SecurityViolation,
+                "thread_uuid does not match the thread pinned to this binding's command ledger",
+            ));
+        }
+    }
+
+    let ledger_revision = ledger.revision;
+    let records = ledger.commands;
+    after_ledger_snapshot(ledger_revision, records.len())?;
+
+    for cmd in &records {
+        cmd.validate()?;
+        if cmd.binding_id != binding_id || cmd.thread_uuid != thread_uuid {
+            return Err(NativeError::new(
+                NativeErrorCode::SecurityViolation,
+                "planning command scope does not match requested binding_id and thread_uuid",
+            ));
+        }
+    }
+
+    let mut observations = Vec::with_capacity(records.len());
+    for mut cmd in records {
+        if cmd.status != PlanningCommandStatus::Completed {
+            let summary = verified_command_summary_readonly(&command_store, cmd)?;
+            observations.push(PlanningCommandStatusObservation {
+                summary,
+                verification_issue: None,
+            });
+            continue;
+        }
+
+        let result_ref = cmd.result_ref.clone().ok_or_else(|| {
+            NativeError::new(
+                NativeErrorCode::ProtocolError,
+                "Completed planning command is missing result_ref",
+            )
+        })?;
+        let current_plan_status =
+            verify_historical_plan_for_store_readonly(&command_store, &cmd, &result_ref)?;
+        let allow_historical_job_link = current_plan_status == Some(PlanStatus::Superseded);
+        let strict_verify = if allow_historical_job_link {
+            command_store.verify_completed_command_readonly(&cmd)
+        } else {
+            command_store.verify_completed_command(&cmd)
+        };
+
+        match strict_verify {
+            Ok(verified_ref) => {
+                cmd.result_ref = Some(verified_ref);
+                let mut summary = PlanningCommandSummary::from_record(&cmd);
+                summary.current_plan_status = current_plan_status;
+                summary.executable = current_plan_status
+                    .filter(|status| *status != PlanStatus::Published)
+                    .map(|_| false);
+                observations.push(PlanningCommandStatusObservation {
+                    summary,
+                    verification_issue: None,
+                });
+            }
+            Err(strict_err) => {
+                before_artifact_isolation(&cmd.command_id, &strict_err)?;
+                let issue = isolate_completed_artifact_issue_for_status(
+                    &wf_ledger,
+                    &artifacts_dir,
+                    artifacts_dir_present,
+                    &cmd,
+                    &result_ref,
+                    allow_historical_job_link,
+                    strict_err,
+                )?;
+                cmd.result_ref = None;
+                let mut summary = PlanningCommandSummary::from_record(&cmd);
+                summary.current_plan_status = None;
+                summary.executable = Some(false);
+                observations.push(PlanningCommandStatusObservation {
+                    summary,
+                    verification_issue: Some(issue),
+                });
+            }
+        }
+    }
+
+    Ok(PlanningCommandStatusReadReport {
+        binding_id: binding_id.to_string(),
+        ledger_revision,
+        commands: observations,
+    })
+}
+
+const fn is_fatal_status_isolation_error(code: NativeErrorCode) -> bool {
+    matches!(
+        code,
+        NativeErrorCode::SecurityViolation
+            | NativeErrorCode::InvalidConfig
+            | NativeErrorCode::UnsupportedPlatform
+            | NativeErrorCode::IoError
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn isolate_completed_artifact_issue_for_status(
+    wf_ledger: &CoworkerBindingLedger,
+    artifacts_dir: &Path,
+    artifacts_dir_present: bool,
+    cmd: &PlanningCommandRecord,
+    result_ref: &PlanningCommandResultRef,
+    allow_historical_job_link: bool,
+    strict_err: NativeError,
+) -> Result<PlanningCommandVerificationIssue, NativeError> {
+    if is_fatal_status_isolation_error(strict_err.code) {
+        return Err(strict_err);
+    }
+
+    let (artifact_grant, reservation_id, report_artifact_id) =
+        match verify_completed_command_ledger_linkage_for_status(
+            wf_ledger,
+            cmd,
+            result_ref,
+            allow_historical_job_link,
+        ) {
+            Ok(linkage) => linkage,
+            Err(linkage_err) => {
+                if is_fatal_status_isolation_error(linkage_err.code) {
+                    return Err(linkage_err);
+                }
+                return Err(strict_err);
+            }
+        };
+
+    if !artifacts_dir_present {
+        return Ok(PlanningCommandVerificationIssue::from_kind(
+            PlanningCommandVerificationIssueKind::ArtifactDirectoryUnavailable,
+            strict_err.code,
+            reservation_id,
+            report_artifact_id,
+        ));
+    }
+
+    let artifact_path = artifacts_dir.join(format!("{report_artifact_id}.json"));
+    let bytes = match read_private_file_bounded(
+        &artifact_path,
+        MAX_PLANNING_ARTIFACT_BYTES,
+        "planning_call_artifact",
+    ) {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => {
+            return Ok(PlanningCommandVerificationIssue::from_kind(
+                PlanningCommandVerificationIssueKind::ArtifactMissing,
+                strict_err.code,
+                reservation_id,
+                report_artifact_id,
+            ));
+        }
+        Err(err) if err.code == NativeErrorCode::OutputOverflow => {
+            return Ok(PlanningCommandVerificationIssue::from_kind(
+                PlanningCommandVerificationIssueKind::ArtifactOversize,
+                NativeErrorCode::OutputOverflow,
+                reservation_id,
+                report_artifact_id,
+            ));
+        }
+        Err(err) => return Err(err),
+    };
+
+    let Ok(artifact) = serde_json::from_slice::<PersistedPlanningCallArtifact>(&bytes) else {
+        return Ok(PlanningCommandVerificationIssue::from_kind(
+            PlanningCommandVerificationIssueKind::ArtifactCorruptJson,
+            NativeErrorCode::ProtocolError,
+            reservation_id,
+            report_artifact_id,
+        ));
+    };
+
+    if let Err(art_err) = artifact.validate_against_grant(&report_artifact_id, artifact_grant) {
+        if is_fatal_status_isolation_error(art_err.code) {
+            return Err(art_err);
+        }
+        let kind = if art_err.message.contains(
+            "artifact failed full BoundedAdvisoryResponse verification under max_output_bytes_per_call",
+        ) {
+            PlanningCommandVerificationIssueKind::BoundedAdvisoryResponseVerificationFailed
+        } else {
+            PlanningCommandVerificationIssueKind::ArtifactGrantVerificationFailed
+        };
+        return Ok(PlanningCommandVerificationIssue::from_kind(
+            kind,
+            art_err.code,
+            reservation_id,
+            report_artifact_id,
+        ));
+    }
+
+    Ok(PlanningCommandVerificationIssue::from_kind(
+        PlanningCommandVerificationIssueKind::ArtifactRecordLinkageMismatch,
+        strict_err.code,
+        reservation_id,
+        report_artifact_id,
+    ))
+}
+
+#[allow(clippy::too_many_lines)]
+fn verify_completed_command_ledger_linkage_for_status<'a>(
+    wf_ledger: &'a CoworkerBindingLedger,
+    cmd: &PlanningCommandRecord,
+    result_ref: &PlanningCommandResultRef,
+    allow_historical_job_link: bool,
+) -> Result<(&'a PlanningAdviceGrant, String, String), NativeError> {
+    let grant = wf_ledger
+        .planning_grants
+        .iter()
+        .find(|g| g.grant_id == cmd.grant_id)
+        .ok_or_else(|| {
+            NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "standing grant referenced by command was not found in binding ledger",
+            )
+        })?;
+    grant.validate()?;
+    if grant.binding_id != cmd.binding_id || grant.thread_uuid != cmd.thread_uuid {
+        return Err(NativeError::new(
+            NativeErrorCode::SecurityViolation,
+            "standing grant scope does not match command scope",
+        ));
+    }
+
+    match (&cmd.payload, result_ref) {
+        (
+            PlanningCommandPayload::Architect(req),
+            PlanningCommandResultRef::ArchitectAdvice {
+                advice_id,
+                reservation_id,
+                report_artifact_id,
+                context_digest,
+                decision_digest,
+                reused_existing,
+                ..
+            },
+        ) => {
+            let stored_adv = wf_ledger
+                .architect_advice
+                .iter()
+                .find(|a| &a.advice_id == advice_id)
+                .ok_or_else(|| {
+                    NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        "ArchitectAdviceRecord referenced by Completed result was not found in binding ledger",
+                    )
+                })?;
+            stored_adv.validate()?;
+            if stored_adv.binding_id != cmd.binding_id
+                || stored_adv.thread_uuid != cmd.thread_uuid
+                || stored_adv.reservation_id != *reservation_id
+                || stored_adv.report_artifact_id.as_deref() != Some(report_artifact_id.as_str())
+                || stored_adv.selected_choice != cmd.selected_choice
+                || stored_adv.context_dependencies != req.context_dependencies
+                || !constant_time_str_eq(&stored_adv.context_digest, &cmd.context_digest)
+                || !constant_time_str_eq(&stored_adv.context_digest, context_digest)
+                || !constant_time_str_eq(&stored_adv.decision_digest, decision_digest)
+            {
+                return Err(NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "Completed ArchitectAdvice result_ref does not match stored ArchitectAdviceRecord or command scope",
+                ));
+            }
+            let adv_grant = wf_ledger
+                .planning_grants
+                .iter()
+                .find(|g| g.grant_id == stored_adv.grant_id)
+                .ok_or_else(|| {
+                    NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        "grant for stored ArchitectAdviceRecord was not found",
+                    )
+                })?;
+            adv_grant.validate()?;
+            if adv_grant.binding_id != cmd.binding_id
+                || adv_grant.thread_uuid != cmd.thread_uuid
+                || adv_grant.profile_id != grant.profile_id
+                || adv_grant.registry_revision != grant.registry_revision
+                || !constant_time_str_eq(&adv_grant.policy_digest, &grant.policy_digest)
+            {
+                return Err(NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "ArchitectAdviceRecord grant provenance does not match command standing grant",
+                ));
+            }
+            let res = adv_grant
+                .reservations
+                .iter()
+                .find(|r| r.reservation_id == *reservation_id)
+                .ok_or_else(|| {
+                    NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        "PlanningCallReservation referenced by ArchitectAdvice result was not found",
+                    )
+                })?;
+            if res.role != WorkflowRole::Architect
+                || res.status != PlanningReservationStatus::Completed
+                || res.selected_choice != cmd.selected_choice
+                || res.call_project_base.as_ref() != Some(&cmd.call_project_base)
+                || !constant_time_str_eq(&res.context_digest, &cmd.context_digest)
+                || res.report_artifact_id.as_deref() != Some(report_artifact_id.as_str())
+                || res.request_key != stored_adv.request_key
+            {
+                return Err(NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "ArchitectAdvice reservation is not Completed or does not match command scope",
+                ));
+            }
+            let produced_by_this_cmd = stored_adv.grant_id == cmd.grant_id
+                && stored_adv.request_key == cmd.service_request_key
+                && res.request_key == cmd.service_request_key;
+            if produced_by_this_cmd {
+                if *reused_existing {
+                    return Err(NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        "ArchitectAdviceRecord produced by this command's service_request_key cannot claim reused_existing = true",
+                    ));
+                }
+                if req.accept_into_brief
+                    && stored_adv.status != ArchitectDecisionStatus::AcceptedIntoBrief
+                {
+                    return Err(NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        "ArchitectAdviceRecord status does not match accept_into_brief = true",
+                    ));
+                }
+            } else {
+                if !*reused_existing {
+                    return Err(NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        "non-reused ArchitectAdviceRecord must bind command grant_id and frozen service_request_key",
+                    ));
+                }
+                if !stored_adv.can_reuse_for(&req.context_dependencies)? {
+                    return Err(NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        "reused ArchitectAdviceRecord is not eligible for reuse under command context_dependencies",
+                    ));
+                }
+            }
+            Ok((
+                adv_grant,
+                reservation_id.clone(),
+                report_artifact_id.clone(),
+            ))
+        }
+        (
+            PlanningCommandPayload::Orchestrator(req),
+            PlanningCommandResultRef::OrchestratorPlan {
+                job_id,
+                planning_result,
+                ..
+            },
+        ) => {
+            if job_id != &req.job_id {
+                return Err(NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "OrchestratorPlan result job_id does not match command job_id",
+                ));
+            }
+            let job = wf_ledger
+                .jobs
+                .iter()
+                .find(|j| j.job_id == *job_id)
+                .ok_or_else(|| {
+                    NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        "CoworkerJobRecord referenced by OrchestratorPlan was not found",
+                    )
+                })?;
+            job.validate()?;
+            if job.binding_id != cmd.binding_id || job.thread_uuid != cmd.thread_uuid {
+                return Err(NativeError::new(
+                    NativeErrorCode::SecurityViolation,
+                    "CoworkerJobRecord scope does not match command scope",
+                ));
+            }
+            let recovered_plan = req
+                .plan_id
+                .as_ref()
+                .is_some_and(|id| id != &planning_result.plan_id);
+            if recovered_plan {
+                verify_recovery_command_context(cmd, wf_ledger, grant, job)?;
+            }
+            let job_pr = job.planning_result.as_ref().ok_or_else(|| {
+                NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "CoworkerJobRecord has no recorded PlanningResultRef",
+                )
+            })?;
+            let historical_job_link = allow_historical_job_link
+                && job_pr.plan_id == planning_result.plan_id
+                && job_pr.plan_revision > planning_result.plan_revision;
+            if (job_pr != planning_result.as_ref() && !historical_job_link)
+                || planning_result.grant_id != cmd.grant_id
+                || !is_valid_orchestrator_round_key(
+                    &planning_result.request_key,
+                    &cmd.service_request_key,
+                    req.max_architect_rounds,
+                )
+                || planning_result.selected_choice != cmd.selected_choice
+                || planning_result.project_base != cmd.call_project_base
+                || planning_result.profile_id != grant.profile_id
+                || planning_result.registry_revision != grant.registry_revision
+                || !constant_time_str_eq(&planning_result.policy_digest, &grant.policy_digest)
+                || !constant_time_str_eq(&planning_result.work_brief_digest, &job.work_brief_digest)
+                || (req
+                    .plan_id
+                    .as_ref()
+                    .is_some_and(|expected_pid| &planning_result.plan_id != expected_pid)
+                    && !PlanningRecoveryTarget::derive(
+                        cmd,
+                        wf_ledger,
+                        &planning_result.report_artifact_id,
+                        &planning_result.output_digest,
+                    )
+                    .is_some_and(|target| {
+                        target.plan_id == planning_result.plan_id
+                            && planning_result.plan_revision == 1
+                            && planning_result.request_key == cmd.service_request_key
+                    }))
+            {
+                return Err(NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "OrchestratorPlan PlanningResultRef does not match job.planning_result or command service_request_key/scope",
+                ));
+            }
+            let res = grant
+                .reservations
+                .iter()
+                .find(|r| r.reservation_id == planning_result.reservation_id)
+                .ok_or_else(|| {
+                    NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        "PlanningCallReservation referenced by PlanningResultRef was not found on grant",
+                    )
+                })?;
+            if res.role != WorkflowRole::Orchestrator
+                || res.status != PlanningReservationStatus::Completed
+                || res.request_key != planning_result.request_key
+                || res.selected_choice != cmd.selected_choice
+                || res.call_project_base.as_ref() != Some(&cmd.call_project_base)
+                || res.run_id.as_deref() != Some(planning_result.run_id.as_str())
+                || res.report_artifact_id.as_deref()
+                    != Some(planning_result.report_artifact_id.as_str())
+                || res.output_digest.as_deref() != Some(planning_result.output_digest.as_str())
+                || (res.request_key == cmd.service_request_key
+                    && !constant_time_str_eq(&res.context_digest, &cmd.context_digest))
+            {
+                return Err(NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "OrchestratorPlan reservation does not match PlanningResultRef or command scope",
+                ));
+            }
+            Ok((
+                grant,
+                planning_result.reservation_id.clone(),
+                planning_result.report_artifact_id.clone(),
+            ))
+        }
+        (
+            PlanningCommandPayload::Orchestrator(req),
+            PlanningCommandResultRef::OrchestratorRequiresHumanClarification {
+                job_id,
+                reservation_id,
+                report_artifact_id,
+                output_digest,
+                ..
+            }
+            | PlanningCommandResultRef::OrchestratorRequiresArchitectAdvice {
+                job_id,
+                reservation_id,
+                report_artifact_id,
+                output_digest,
+                ..
+            },
+        ) => {
+            if job_id != &req.job_id {
+                return Err(NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "Orchestrator result job_id does not match command job_id",
+                ));
+            }
+            let job = wf_ledger
+                .jobs
+                .iter()
+                .find(|j| j.job_id == *job_id)
+                .ok_or_else(|| {
+                    NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        "CoworkerJobRecord referenced by Orchestrator result was not found",
+                    )
+                })?;
+            job.validate()?;
+            if job.binding_id != cmd.binding_id || job.thread_uuid != cmd.thread_uuid {
+                return Err(NativeError::new(
+                    NativeErrorCode::SecurityViolation,
+                    "CoworkerJobRecord scope does not match command scope",
+                ));
+            }
+            let res = grant
+                .reservations
+                .iter()
+                .find(|r| r.reservation_id == *reservation_id)
+                .ok_or_else(|| {
+                    NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        "PlanningCallReservation referenced by Orchestrator result was not found on grant",
+                    )
+                })?;
+            if res.role != WorkflowRole::Orchestrator
+                || res.status != PlanningReservationStatus::Completed
+                || !is_valid_orchestrator_round_key(
+                    &res.request_key,
+                    &cmd.service_request_key,
+                    req.max_architect_rounds,
+                )
+                || res.selected_choice != cmd.selected_choice
+                || res.call_project_base.as_ref() != Some(&cmd.call_project_base)
+                || res.report_artifact_id.as_deref() != Some(report_artifact_id.as_str())
+                || res.output_digest.as_deref() != Some(output_digest.as_str())
+                || (res.request_key == cmd.service_request_key
+                    && !constant_time_str_eq(&res.context_digest, &cmd.context_digest))
+            {
+                return Err(NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "Orchestrator reservation metadata does not match Completed result_ref or command service_request_key",
+                ));
+            }
+            Ok((grant, reservation_id.clone(), report_artifact_id.clone()))
+        }
+        _ => Err(NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            "PlanningCommandResultRef variant does not match PlanningCommandPayload role",
+        )),
+    }
 }
 
 /// Validates a planning command under `(binding_id, thread_uuid, command_id)` and, when `Queued`,

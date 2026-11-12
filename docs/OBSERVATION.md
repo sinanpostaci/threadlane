@@ -1,30 +1,54 @@
 # Desktop observation
 
-The desktop is an optional observer. Keep planning, questions, scope approvals,
-work dispatch, and follow-up in Codex. Opening Activity or Plans does not start a
-worker, select a model, approve a task, consume an event batch, or replay work.
+The desktop is an optional, read-only observer. Keep planning, questions, scope
+approvals, work dispatch, and follow-up in native Codex. Opening **Projects**
+(`Messages`, `Jobs`, or `Activity`) does not start a worker, select a model,
+approve a task, consume a native follower event batch, write Codex configuration,
+or replay work.
 
-## Activity: what Threadlane was asked to do
+## Chat-scoped workspace surfaces: `Messages`, `Jobs`, and `Activity`
 
-Activity is a chronological request feed across the configured observation
-sources. The most recently updated requests appear first. Progress updates the
-existing request and its causal calls instead of creating a new row for each
-output fragment.
+Production observation reads one bounded `WorkspaceSnapshot` per refresh via
+`desktop_workspace_snapshot` and groups conversations by canonical project scope
+under **Projects / Active** and **Projects / Archive**. Every chat is identified
+strictly by its verified four-part `WorkspaceChatIdentity` (`source_id`,
+`binding_id`, `thread_uuid`, `canonical_project_scope`). Records lacking a
+verified four-part identity or conflicting with a chat's scope are withheld and
+counted as bounded omissions rather than guessed from titles, project labels, or
+`source_id` alone.
 
-A collapsed row identifies the project and job, operation, known requester,
-executor, model/effort, elapsed time, and reported usage. Open it to inspect child
-calls and the return timeline. Provider icons identify the executing tool;
-spinners are reserved for calls with current execution evidence. The requester
-is separate from the executor. Configuration can identify an intended follower
-without proving that model made a particular request.
+Within a selected chat, `WorkspaceChatPanels` separates three distinct surfaces:
 
-`View job` opens the exact source/job pair in Plans. `View activity` in Plans
-applies the inverse filter. Two jobs in the same chat, or identical IDs in
-different sources, remain separate. Expanding a row or refreshing a page does
-not change workflow state.
+1. **Messages (default tab):** chronological safe records (`work_brief_summary`,
+   `plan_summary`, `question_prompt`, `question_answer`, `task_result_summary`,
+   `review_verdict_summary`, `closure_summary`, `job_result_summary`,
+   `attention_summary`, and `journal_summary`). It never reads raw provider
+   transcripts, never fabricates synthetic user turns, and includes no message
+   composer. User and agent text is rendered verbatim in its original language
+   while UI chrome stays compact, neutral, and English.
+2. **Jobs:** durable ledger of jobs, tasks, attempts, task candidates, combined
+   candidates, attention holds, historical failures, and backend-verified
+   acceptance proofs. Several jobs can exist in one chat without merging their
+   lifecycles.
+3. **Activity:** chronological audit feed of requests, causal child calls, and
+   result-delivery timelines for the selected chat (with optional job scoping via
+   `View activity` / `View job` across tabs). Progress updates the existing
+   request and child calls in place rather than creating rows per stream chunk.
 
-### Evidence labels
+### Independent Coworker state, configured selection, and execution evidence
 
+- **Live Coworker state vs Worker execution:** native chat sampling reports
+  whether the conversational Coworker is `working`, `idle`,
+  `waiting_for_approval`, or `waiting_for_input` independently of background
+  Worker runs. If a native sample exceeds the freshness threshold or disconnects,
+  live Coworker activity and selected model are withheld as `Stale` or
+  `Unavailable`.
+- **Configured chat model vs runtime telemetry:** a verified native sample can
+  display the chat's currently configured model/effort selection, explicitly
+  distinguished from per-call runtime execution telemetry.
+- **MCP calls never complete a chat or job:** local Threadlane MCP reads and
+  mutations appear in `Activity` as audit records; a completed MCP call never
+  marks the conversation or any job `Completed`.
 - **Requested / observed model and effort:** a profile or approval records the
   request; only a runtime/provider receipt establishes what actually executed.
 - **Not reported:** the source did not report a value. It is not zero. Token
@@ -35,61 +59,73 @@ not change workflow state.
 - **Unknown:** execution or delivery evidence is missing or interrupted. A saved
   running row or a reused PID is insufficient to prove a process remains live.
   Observation does not restart it.
-- **Ready for review / accepted:** producing output is different from accepting
-  the current candidate. Reviews require the matching task/candidate receipt.
+- **Ready for review / verified accepted:** producing output is distinct from
+  accepting a candidate. Authoritative task and job acceptance labels require
+  backend-verified acceptance proof (`review_verdict_id` / `review_receipt_id`
+  for tasks; `combined_candidate_id` + `closure_verdict_id` for jobs).
 
 ### Result delivery is a timeline
 
-The feed distinguishes result ready, notification submitted, batch delivered,
-and batch acknowledged. A synchronous API/CLI return is separately recorded as
-response returned. Notification submission does not prove a chat read it. An ACK
-proves acknowledgement of the recorded batch; it does not prove a human saw the
-result or that a particular model explained it. A reviewer status does not
-itself dispatch a reviewer.
+`Activity` distinguishes `result_ready`, `notification_submitted`,
+`batch_delivered`, `batch_acknowledged`, and synchronous `response_returned`.
+Notification submission does not prove a chat read it. An ACK proves
+acknowledgement of the recorded batch; it does not prove a human saw the result
+or that a particular model explained it. A reviewer status does not itself
+dispatch a reviewer.
 
-## Plans: independent work, with less machinery in the foreground
+## Navigation, Settings, and source connections
 
-Plans groups independent jobs by project. A job shows its intended outcome,
-current lifecycle, steps and dependencies, approval/execution/review state, and
-recorded activity. Several jobs can be active in one project or chat.
+Top-level navigation is **Projects** (with **Active** and **Archive** submenus),
+**Tools**, **Profiles**, and **Settings**. Tools owns executable paths,
+credentials, and model catalogs. Profiles owns role/model/effort assignments and
+the optional Decision advisor. Settings owns appearance, window close behavior,
+explicit Codex setup status/apply controls, linked observation sources, and
+contextual diagnostics.
 
-Technical identifiers and revisions are behind disclosure controls. Advanced
-plan controls preserve the existing explicit approval and execution guards;
-opening the simple overview is read-only. Partial, failed, and stopped work
-remain inspectable when their durable records are available.
+The workspace snapshot reads configured local stores and explicitly linked
+private Threadlane contexts. Linking registers a read-only observation reference;
+it does not pair a new chat, enroll an MCP connection, mutate an existing
+context, or start a host, and it never scans raw provider conversation histories.
+A failing source is reported alongside healthy sources instead of hiding their
+work. Linked contexts must pass the same private path and file-mode checks used
+for local observation; never paste credentials or raw conversations into the
+context path field.
 
-## Settings and source connections
+## Bounded data and verification boundaries
 
-Navigation is Activity, Plans, Tools, Profiles, and Settings. The previous Chats
-linking and setup controls are under **Settings → Connections**. Tools owns
-executable paths, credentials, and model catalogs. Profiles owns role/model/effort
-assignments and the optional Decision advisor. Settings has no separate synthetic
-Decision test panel or duplicate advisor selection.
+New requests are recorded at supported Threadlane CLI/MCP/API boundaries;
+Threadlane is not a global monitor of arbitrary AGY, OpenCode, or Codex processes
+outside Threadlane. Production `Projects` loads one bounded `WorkspaceSnapshot`
+without interactive `Load older activity` paging or `6h` / `24h` recency filters.
+When messages (`<= 1,000`), job histories, child calls, activity requests, or
+native samples are capped—or when journal history falls outside the trailing
+16 MiB reader window—the UI keeps those omissions explicitly visible rather than
+implying complete lifetime history.
 
-The feed reads the configured local stores and explicitly linked private
-Threadlane contexts. Linking registers an observation reference; it does not pair
-a new chat, enroll an MCP connection, change an existing context, or start a
-host. It does not scan provider conversation histories. A failing source is
-reported alongside healthy sources instead of hiding their work.
+### Journal durability and cross-journal append isolation
 
-A linked context must pass the same private path/file checks used for local
-observation. Never paste a credential or a raw provider conversation into the
-context path field. The context's executable pin is not run to read history.
+`append_journal_record` scopes in-process append serialization to each verified
+private journal directory identity (`dev+ino` from the `O_NOFOLLOW`-verified
+`0700` parent directory handle on Unix; canonical verified directory path on
+non-Unix shared builds) through a short-held, bounded weak lock registry
+(`<= 1,024` simultaneously active journals). Dead weak entries are pruned on
+guard drop and before insertion; if active capacity is exceeded, the lookup fails
+closed with an I/O error rather than falling back to process-global
+serialization. The registry mutex is never held while waiting on a per-journal
+mutex, acquiring the cross-process `fs2` exclusive file lock (`lock_exclusive`),
+or executing file/directory sync I/O, so lock contention or `fsync` latency on
+one store's `observation-journal.jsonl` does not block appends to unrelated
+private stores.
 
-## Retention and limits
+Same-journal writers across threads and processes preserve `O_NOFOLLOW`
+parent/file opens, `0700`/`0600` mode, owner, and `dev+ino` revalidation before
+and after locking and before completion, interrupted trailing-newline repair,
+`flush` + `sync_data`, and Unix parent-directory `sync_all`. These OS sync
+primitives provide software-level crash durability only where honored by the
+kernel and storage stack; hardware power-cut testing and macOS/Windows platform
+acceptance are not claimed.
 
-New requests are recorded at supported Threadlane CLI/MCP/API boundaries. This
-is not a global monitor of arbitrary AGY, OpenCode, or Codex work outside
-Threadlane. Older worker artifacts can supply historical execution evidence,
-not an invented historical follower request.
-
-Reads are bounded. Request history is paginated; job/history caps and unreadable
-or partial sources produce visible warnings. The journal reader uses a trailing
-16 MiB window and warns when older journal records are outside that window.
-Records are retained on disk; this release does not provide an archive browser
-for every byte of older journal history. Missing usage, caller identity, or
-provider effort stays explicitly unknown.
-
-Linux fixture tests and browser component checks do not establish macOS/Windows
-native file security, keychain, rendering, or live provider compatibility. Native
-visual and end-to-end acceptance must be reported separately from fixture checks.
+Source wiring and component fixture tests do not substitute for integrated
+combined-checkout checks, wide/narrow Playwright runs, isolated NixOS Wayland VM
+tray and Codex navigation acceptance, authorized live workflow qualification, or
+macOS/Windows platform verification.

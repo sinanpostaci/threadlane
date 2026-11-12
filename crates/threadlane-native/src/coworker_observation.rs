@@ -51,6 +51,15 @@ use crate::coworker_workflow::{
 };
 use crate::profile_flow::SelectedRoleChoice;
 
+/// Scoped read-only workspace job history projection and store reader (Phase 1).
+pub mod workspace_history;
+
+pub use workspace_history::{
+    project_coworker_job_history, project_coworker_job_record, read_scoped_workspace_job_histories,
+    WorkspaceHistoryDiagnostic, WorkspaceHistoryDiagnosticKind, WorkspaceHistoryStores,
+    WorkspaceJobLineageContext, WorkspaceScopedHistoryRead,
+};
+
 /// Canonical observation operation name for headless `Orchestrator` technical planning calls.
 pub const COWORKER_OBS_OP_PLANNING_ORCHESTRATOR: &str = "coworker.planning.orchestrator";
 

@@ -1397,3 +1397,125 @@ async fn managed_ws_refuses_mismatched_process_peer_and_non_private_endpoints() 
     assert_eq!(peer_err.code, NativeErrorCode::SecurityViolation);
     assert_redacted_diagnostic(&peer_err.message, &env);
 }
+
+#[tokio::test]
+async fn managed_ws_thread_metadata_preserves_active_flags_and_legacy_thread_contract() {
+    let env = WsTestEnv::new();
+    let (listener, _session_dir) = env.publish_symlinked_session("thread-metadata-flags");
+    let client = env.client();
+    let project_cwd_str = env.project_root.to_string_lossy().into_owned();
+
+    let server_task = tokio::spawn(async move {
+        let statuses = [
+            json!({ "type": "active", "activeFlags": ["waitingOnApproval"] }),
+            json!({ "type": "active", "activeFlags": ["waitingOnUserInput"] }),
+            json!("active"),
+            json!({ "type": "idle" }),
+        ];
+
+        for status_payload in statuses {
+            let (stream, _) = listener.accept().await.expect("accept unix stream");
+            let mut ws = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("accept websocket handshake");
+
+            let _init = ws.next().await.expect("init").expect("init ok");
+            ws.send(Message::Text(
+                json!({
+                    "id": 1u64,
+                    "result": {
+                        "userAgent": "codex-app-server/0.165.0",
+                        "codexHome": "/tmp/codex-home",
+                        "platformFamily": "unix",
+                        "platformOs": "linux"
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .expect("send init response");
+
+            let _initialized = ws
+                .next()
+                .await
+                .expect("initialized")
+                .expect("initialized ok");
+
+            let req_msg = ws.next().await.expect("req").expect("req ok");
+            let Message::Text(req_text) = req_msg else {
+                panic!("expected text frame for thread/read");
+            };
+            let req_val: Value = serde_json::from_str(&req_text).expect("parse req");
+            assert_eq!(req_val["method"], "thread/read");
+            assert_eq!(req_val["params"]["threadId"], TEST_THREAD_A);
+            assert_eq!(req_val["params"]["includeTurns"], false);
+
+            ws.send(Message::Text(
+                json!({
+                    "id": 2u64,
+                    "result": {
+                        "thread": {
+                            "id": TEST_THREAD_A,
+                            "projectId": "proj_ws",
+                            "name": "Metadata Flag Chat",
+                            "cwd": project_cwd_str,
+                            "status": status_payload,
+                            "model": "gpt-5.4",
+                            "reasoningEffort": "high",
+                            "canAcceptDirectInput": true
+                        }
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .expect("send thread/read response");
+
+            let _ = ws.next().await;
+        }
+    });
+
+    let approval_meta = client
+        .thread_metadata(TEST_THREAD_A)
+        .await
+        .expect("waitingOnApproval metadata");
+    assert_eq!(approval_meta.thread.status, "active");
+    assert!(approval_meta.status_detail.tagged);
+    assert!(approval_meta.status_detail.active_flags_present);
+    assert_eq!(
+        approval_meta.status_detail.active_flags,
+        vec!["waitingOnApproval"]
+    );
+    assert!(!approval_meta.status_detail.has_invalid_active_flags);
+
+    let input_meta = client
+        .thread_metadata(TEST_THREAD_A)
+        .await
+        .expect("waitingOnUserInput metadata");
+    assert_eq!(
+        input_meta.status_detail.active_flags,
+        vec!["waitingOnUserInput"]
+    );
+
+    let plain_meta = client
+        .thread_metadata(TEST_THREAD_A)
+        .await
+        .expect("plain active metadata");
+    assert_eq!(plain_meta.thread.status, "active");
+    assert!(!plain_meta.status_detail.tagged);
+    assert!(!plain_meta.status_detail.active_flags_present);
+    assert!(plain_meta.status_detail.active_flags.is_empty());
+
+    let legacy_thread = client
+        .thread(TEST_THREAD_A)
+        .await
+        .expect("legacy NativeClient::thread");
+    assert_eq!(legacy_thread.id, TEST_THREAD_A);
+    assert_eq!(legacy_thread.status, "idle");
+    assert_eq!(legacy_thread.model.as_deref(), Some("gpt-5.4"));
+    assert_eq!(legacy_thread.effort.as_deref(), Some("high"));
+
+    server_task.await.expect("server task completed");
+}

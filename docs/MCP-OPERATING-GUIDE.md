@@ -73,6 +73,19 @@ Version: `2026-11-09.v1`
     untrusted; automatic notices never accept advice into the brief or grant
     execution approval. Authorized execution can drive the full automatic pipeline
     described below.
+  - Treat `coworker_status` as a bounded, non-authoritative read-only overview,
+    never as proof that every historical row is verified or executable. If an older
+    recorded `completed` planning command has a missing or corrupted persisted
+    artifact, `coworker_status` isolates that row with `verification_issue`
+    (`evidence_status: "verification_failed"` or `"unavailable"`, `executable: false`,
+    and `result_summary` omitted) and sets scope-wide
+    `historical_integrity_attention` / `degraded_completed_command_count`
+    (even when `limit` or the wire byte budget omits the affected row), kept
+    strictly separate from `unknown` `pending_reconciliation` counters; degraded
+    historical observations cannot dispatch, reconcile, or repair anything. Always
+    call `planning_command` on the specific `command_id` (and `get_plan` when
+    inspecting a plan) for strict full-artifact verification before relying on any
+    planning outcome.
 - When `connect_current_chat` succeeds on the verified managed desktop route with
   all five private stores configured, it returns additive `operator_context`
   bootstrap metadata (`available: true`, `context_path`, `context_router_executable`,

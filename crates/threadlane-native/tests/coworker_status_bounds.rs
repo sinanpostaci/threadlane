@@ -10,7 +10,7 @@
 //! wire envelope (`structuredContent` + escaped `content[0].text`) never exceeds
 //! `MAX_MCP_RESPONSE_BYTES` (`262_144` bytes).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -23,20 +23,30 @@ use threadlane::{
     Supervisor, SupervisorClient, SupervisorConfig, SupervisorHandle, ThreadlaneMcpServer,
 };
 use threadlane_authority::{AuthorityStore, OperatorApprovalRequest};
+use threadlane_core::observation::{
+    read_journal_records_readonly, validate_correlation_id, ObservationCallState,
+    ObservationJournalRecord, ObservationRecordPhase, MAX_OBSERVATION_JOURNAL_BYTES,
+    MAX_OBSERVATION_RECORD_LINE_BYTES, OBSERVATION_JOURNAL_FILE_NAME,
+};
 use threadlane_native::coworker_grants::{list_planning_grant_summaries, TrustedGrantScope};
 use threadlane_native::coworker_workflow::{
     sha256_hex, ArchitectContextDependencies, ArchitectDecisionStatus, BindJobApprovalRequest,
     CanonicalProjectBaseRef, CoworkerJobOwnershipKey, CoworkerJobOwnershipStore,
     CoworkerPlanningService, CoworkerWorkflowStore, CreateCoworkerJobRequest,
     CreatePlanningGrantRequest, FinalizePlanningCallRequest, OrchestrateWorkBriefPlanRequest,
-    OutboxDispatchKind, PlanningCallBudget, PlanningReadOnlyCapabilities,
-    PlanningReservationStatus, PlanningResultRef, RecordArchitectAdviceRequest,
-    ReservePlanningCallRequest, ReserveTaskOutboxRequest, RevokePlanningGrantRequest,
-    RunArchitectAdviceRequest, WorkBrief, WorkBriefKind,
+    OutboxDispatchKind, PersistedPlanningCallArtifact, PlanningCallBudget,
+    PlanningReadOnlyCapabilities, PlanningReservationStatus, PlanningResultRef,
+    RecordArchitectAdviceRequest, ReservePlanningCallRequest, ReserveTaskOutboxRequest,
+    RevokePlanningGrantRequest, RunArchitectAdviceRequest, WorkBrief, WorkBriefKind,
+};
+use threadlane_native::planning_driver::{
+    get_planning_command_summary_readonly, read_planning_commands_for_status_readonly,
+    read_planning_commands_for_status_readonly_with_hooks, PlanningCommandEvidenceStatus,
+    PlanningCommandVerificationIssueKind,
 };
 use threadlane_native::planning_gateway::{
     truncate_status_text_unicode_safe, CoworkerArchitectAdviceSummary, CoworkerJobSummary,
-    CoworkerStatusBriefKindSummary, CoworkerStatusCommandResultKind,
+    CoworkerStatusBriefKindSummary, CoworkerStatusCommandResultKind, PlanningCommandParams,
     DEFAULT_COWORKER_STATUS_TEXT_WIRE_BUDGET_BYTES,
 };
 use threadlane_native::profile_flow::{
@@ -47,10 +57,11 @@ use threadlane_native::{
     list_planning_command_summaries_readonly, planning_artifacts_dir, planning_commands_dir,
     CoworkerPlanningGateway, CoworkerStatusParams, CoworkerStatusResponse,
     EnqueuePlanningCommandRequest, ExecutionPolicy, NativeErrorCode, OperatorEnrollRequest,
-    PairedMcpServer, PairingStore, PlanStatus, PlanningCommandDriver, PlanningCommandStatus,
-    PlanningCommandStore, PlanningCommandSummary, PlanningGrantSummary, PolicyAllowRule,
-    RegistryStore, ToolAdapter, WorkflowProfile, WorkflowRole, DEFAULT_COWORKER_STATUS_LIMIT,
-    EXECUTION_POLICY_SCHEMA_VERSION, MAX_COWORKER_STATUS_LIMIT,
+    PairedMcpServer, PairingStore, PlanStatus, PlanningCommandDetailResponse,
+    PlanningCommandDriver, PlanningCommandResultRef, PlanningCommandStatus, PlanningCommandStore,
+    PlanningCommandSummary, PlanningGrantSummary, PolicyAllowRule, RegistryStore, ToolAdapter,
+    WorkflowProfile, WorkflowRole, DEFAULT_COWORKER_STATUS_LIMIT, EXECUTION_POLICY_SCHEMA_VERSION,
+    MAX_COWORKER_STATUS_LIMIT,
 };
 use threadlane_workers::{
     resolve_exact_commit_sha, resolve_exact_tree_sha, run_sanitized_git, ExecutionBudgets,
@@ -2290,6 +2301,1416 @@ async fn coworker_status_rejects_wrong_binding_wrong_thread_and_invalid_limits_w
         binding_mismatch_code,
         NativeErrorCode::ProtocolError | NativeErrorCode::SecurityViolation
     ));
+
+    assert_eq!(fx.worker_invocation_count(), 0);
+    fx.shutdown().await;
+}
+
+fn snapshot_tree_bytes(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    fn walk(base: &Path, dir: &Path, out: &mut BTreeMap<PathBuf, Vec<u8>>) {
+        if !dir.exists() {
+            return;
+        }
+        let mut entries: Vec<_> = fs::read_dir(dir)
+            .expect("read_dir snapshot")
+            .map(|e| e.expect("dir entry"))
+            .collect();
+        entries.sort_by_key(|e| e.file_name());
+        for entry in entries {
+            let path = entry.path();
+            let meta = fs::symlink_metadata(&path).expect("symlink_metadata");
+            if meta.file_type().is_dir() {
+                walk(base, &path, out);
+            } else if meta.file_type().is_file() {
+                let rel = path.strip_prefix(base).expect("strip_prefix").to_path_buf();
+                out.insert(rel, fs::read(&path).expect("read snapshot file"));
+            }
+        }
+    }
+
+    let mut out = BTreeMap::new();
+    walk(root, root, &mut out);
+    out
+}
+
+fn copy_private_tree(src: &Path, dst: &Path) {
+    create_private_dir(dst);
+    let mut entries: Vec<_> = fs::read_dir(src)
+        .expect("read_dir copy")
+        .map(|e| e.expect("copy entry"))
+        .collect();
+    entries.sort_by_key(|e| e.file_name());
+    for entry in entries {
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+        let meta = fs::symlink_metadata(&src_path).expect("symlink_metadata copy");
+        if meta.file_type().is_dir() {
+            copy_private_tree(&src_path, &dst_path);
+        } else if meta.file_type().is_file() {
+            fs::copy(&src_path, &dst_path).expect("copy file");
+            fs::set_permissions(&dst_path, fs::Permissions::from_mode(0o600))
+                .expect("chmod 0600 copied file");
+        }
+    }
+}
+
+fn first_diff_byte_offset(left: &[u8], right: &[u8]) -> usize {
+    left.iter()
+        .zip(right.iter())
+        .position(|(a, b)| a != b)
+        .unwrap_or_else(|| left.len().min(right.len()))
+}
+
+fn assert_tree_bytes_identical(
+    before: &BTreeMap<PathBuf, Vec<u8>>,
+    after: &BTreeMap<PathBuf, Vec<u8>>,
+    stage_label: &str,
+) {
+    let all_paths: BTreeSet<&PathBuf> = before.keys().chain(after.keys()).collect();
+    let mut diffs = Vec::new();
+    for rel in all_paths {
+        match (before.get(rel), after.get(rel)) {
+            (Some(b_bytes), Some(a_bytes)) if b_bytes == a_bytes => {}
+            (Some(b_bytes), Some(a_bytes)) => {
+                let offset = first_diff_byte_offset(b_bytes, a_bytes);
+                let b_hash = sha256_hex(b_bytes);
+                let a_hash = sha256_hex(a_bytes);
+                diffs.push(format!(
+                    "modified path={} before_len={} before_sha256={} after_len={} after_sha256={} first_diff_offset={offset}",
+                    rel.display(),
+                    b_bytes.len(),
+                    b_hash,
+                    a_bytes.len(),
+                    a_hash
+                ));
+            }
+            (Some(b_bytes), None) => {
+                let b_hash = sha256_hex(b_bytes);
+                diffs.push(format!(
+                    "missing_after path={} before_len={} before_sha256={b_hash}",
+                    rel.display(),
+                    b_bytes.len()
+                ));
+            }
+            (None, Some(a_bytes)) => {
+                let a_hash = sha256_hex(a_bytes);
+                diffs.push(format!(
+                    "unexpected_added path={} after_len={} after_sha256={a_hash}",
+                    rel.display(),
+                    a_bytes.len()
+                ));
+            }
+            (None, None) => unreachable!(),
+        }
+    }
+    if !diffs.is_empty() {
+        let total = diffs.len();
+        let preview: Vec<&str> = diffs.iter().take(16).map(String::as_str).collect();
+        panic!(
+            "[{stage_label}] expected byte-identical directory tree, found {total} file difference(s): {}",
+            preview.join("; ")
+        );
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ExpectedPairedMcpJournalCall<'a> {
+    tool_name: &'static str,
+    finish_state: ObservationCallState,
+    finish_job_id: Option<&'a str>,
+    finish_plan_id: Option<&'a str>,
+}
+
+impl ExpectedPairedMcpJournalCall<'_> {
+    const fn status_ok() -> Self {
+        Self {
+            tool_name: "coworker_status",
+            finish_state: ObservationCallState::Completed,
+            finish_job_id: None,
+            finish_plan_id: None,
+        }
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn assert_plans_tree_after_paired_mcp_calls(
+    plans_dir: &Path,
+    plans_before: &BTreeMap<PathBuf, Vec<u8>>,
+    journal_records_before: &[ObservationJournalRecord],
+    binding_id: &str,
+    thread_uuid: &str,
+    expected_calls: &[ExpectedPairedMcpJournalCall<'_>],
+    stage_label: &str,
+) -> BTreeMap<PathBuf, Vec<u8>> {
+    let plans_after = snapshot_tree_bytes(plans_dir);
+    let journal_rel = PathBuf::from(OBSERVATION_JOURNAL_FILE_NAME);
+
+    let mut non_journal_before = plans_before.clone();
+    non_journal_before.remove(&journal_rel);
+    let mut non_journal_after = plans_after.clone();
+    non_journal_after.remove(&journal_rel);
+    assert_tree_bytes_identical(
+        &non_journal_before,
+        &non_journal_after,
+        &format!("{stage_label}:non_journal_plans"),
+    );
+
+    let prior_bytes = plans_before
+        .get(&journal_rel)
+        .expect("prior observation-journal.jsonl must exist");
+    let after_bytes = plans_after
+        .get(&journal_rel)
+        .expect("after observation-journal.jsonl must exist");
+    assert!(
+        (after_bytes.len() as u64) <= MAX_OBSERVATION_JOURNAL_BYTES,
+        "[{stage_label}] observation journal exceeded MAX_OBSERVATION_JOURNAL_BYTES"
+    );
+    if !after_bytes.starts_with(prior_bytes) {
+        let offset = first_diff_byte_offset(prior_bytes, after_bytes);
+        panic!(
+            "[{stage_label}] observation-journal.jsonl did not preserve prior prefix: prior_len={} prior_sha256={} after_len={} after_sha256={} first_diff_offset={offset}",
+            prior_bytes.len(),
+            sha256_hex(prior_bytes),
+            after_bytes.len(),
+            sha256_hex(after_bytes)
+        );
+    }
+
+    let full_journal_str = std::str::from_utf8(after_bytes).expect("journal UTF-8");
+    assert!(
+        !full_journal_str.contains(SECRET_SENTINEL),
+        "[{stage_label}] observation journal leaked SECRET_SENTINEL"
+    );
+
+    let appended_bytes = &after_bytes[prior_bytes.len()..];
+    assert!(
+        !appended_bytes.is_empty() && appended_bytes.ends_with(b"\n"),
+        "[{stage_label}] appended journal bytes must be non-empty newline-terminated JSONL"
+    );
+    let appended_str = std::str::from_utf8(appended_bytes).expect("tail UTF-8");
+    let appended_lines: Vec<&str> = appended_str
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    assert_eq!(appended_lines.len(), expected_calls.len() * 2);
+    for line in &appended_lines {
+        assert!(line.len() <= MAX_OBSERVATION_RECORD_LINE_BYTES);
+    }
+
+    let (records_after, warnings_after) = read_journal_records_readonly(plans_dir).unwrap();
+    assert!(
+        warnings_after.is_empty(),
+        "[{stage_label}] unexpected observation journal warnings: {warnings_after:?}"
+    );
+    assert_eq!(
+        records_after.len(),
+        journal_records_before.len() + expected_calls.len() * 2
+    );
+    if &records_after[..journal_records_before.len()] != journal_records_before {
+        panic!(
+            "[{stage_label}] prior {} observation journal record(s) were mutated",
+            journal_records_before.len()
+        );
+    }
+
+    let mut seen_record_ids: BTreeSet<String> = journal_records_before
+        .iter()
+        .map(|rec| rec.record_id.clone())
+        .collect();
+    let mut seen_request_ids: BTreeSet<String> = journal_records_before
+        .iter()
+        .map(|rec| rec.request_id.clone())
+        .collect();
+    assert_eq!(seen_record_ids.len(), journal_records_before.len());
+
+    let new_records = &records_after[journal_records_before.len()..];
+    let call_pairs = new_records.as_chunks::<2>().0.iter().zip(expected_calls);
+    for (pair_idx, (pair, expected)) in call_pairs.enumerate() {
+        let entry = &pair[0];
+        let finish = &pair[1];
+        let expected_op = format!("mcp.paired.{}", expected.tool_name);
+
+        assert_eq!(entry.phase, ObservationRecordPhase::Entry);
+        assert_eq!(finish.phase, ObservationRecordPhase::Finish);
+        assert_eq!(entry.operation, expected_op);
+        assert_eq!(finish.operation, expected_op);
+        assert_eq!(entry.binding_id.as_deref(), Some(binding_id));
+        assert_eq!(finish.binding_id.as_deref(), Some(binding_id));
+        assert_eq!(entry.thread_uuid.as_deref(), Some(thread_uuid));
+        assert_eq!(finish.thread_uuid.as_deref(), Some(thread_uuid));
+
+        assert!(validate_correlation_id(&entry.record_id).is_some());
+        assert!(
+            seen_record_ids.insert(entry.record_id.clone()),
+            "[{stage_label}] duplicate entry record_id at pair {pair_idx}"
+        );
+        assert!(validate_correlation_id(&finish.record_id).is_some());
+        assert!(
+            seen_record_ids.insert(finish.record_id.clone()),
+            "[{stage_label}] duplicate finish record_id at pair {pair_idx}"
+        );
+        assert!(validate_correlation_id(&entry.request_id).is_some());
+        assert!(
+            seen_request_ids.insert(entry.request_id.clone()),
+            "[{stage_label}] duplicate request_id at pair {pair_idx}"
+        );
+        assert_eq!(finish.request_id, entry.request_id);
+
+        assert_eq!(entry.state, ObservationCallState::Running);
+        assert_eq!(finish.state, expected.finish_state);
+        assert_ne!(finish.state, ObservationCallState::Unknown);
+        if let Some(expected_job_id) = expected.finish_job_id {
+            assert_eq!(finish.job_id.as_deref(), Some(expected_job_id));
+        }
+        if let Some(expected_plan_id) = expected.finish_plan_id {
+            assert_eq!(finish.plan_id.as_deref(), Some(expected_plan_id));
+        }
+    }
+
+    plans_after
+}
+
+#[tokio::test]
+async fn coworker_status_isolates_corrupted_historical_completed_artifact_without_weakening_strict_verifiers_or_scope_guards(
+) {
+    let mut fx = StatusBoundsFixture::start().await;
+    let now_ms = threadlane_native::current_wall_clock_ms().expect("wall clock");
+    let wf_store = fx.workflow_store();
+    let cmd_store = fx.command_store();
+    let driver = fx.driver();
+
+    let grant_id = fx.create_grant(
+        "grant_history_isolation_1",
+        now_ms.saturating_sub(15_000),
+        now_ms + 3_600_000,
+        16,
+        262_144,
+    );
+
+    // 1. Create three scoped jobs: older completed job, queued sibling job, and healthy current job.
+    let job_old = wf_store
+        .create_or_amend_job(&CreateCoworkerJobRequest {
+            binding_id: fx.binding_id.clone(),
+            thread_uuid: THREAD_UUID.to_string(),
+            request_key: "job_hist_old".to_string(),
+            expected_ledger_revision: None,
+            work_brief: WorkBrief {
+                brief_id: "brf_hist_old".to_string(),
+                binding_id: fx.binding_id.clone(),
+                thread_uuid: THREAD_UUID.to_string(),
+                project_base: fx.project_base.clone(),
+                kind: WorkBriefKind::NewJob,
+                summary: "Historical parser job".to_string(),
+                confirmed_requirements: vec!["Update src/parser.rs".to_string()],
+                proposed_additions: Vec::new(),
+                assumptions: Vec::new(),
+                open_questions: Vec::new(),
+                accepted_architect_decisions: Vec::new(),
+            },
+            amended_target_task_ids: Vec::new(),
+            amended_write_paths: Vec::new(),
+            amended_interfaces: Vec::new(),
+        })
+        .expect("create job_old");
+
+    let job_queued = wf_store
+        .create_or_amend_job(&CreateCoworkerJobRequest {
+            binding_id: fx.binding_id.clone(),
+            thread_uuid: THREAD_UUID.to_string(),
+            request_key: "job_hist_queued".to_string(),
+            expected_ledger_revision: None,
+            work_brief: WorkBrief {
+                brief_id: "brf_hist_queued".to_string(),
+                binding_id: fx.binding_id.clone(),
+                thread_uuid: THREAD_UUID.to_string(),
+                project_base: fx.project_base.clone(),
+                kind: WorkBriefKind::NewJob,
+                summary: "Queued metrics sibling job".to_string(),
+                confirmed_requirements: vec!["Update src/metrics.rs".to_string()],
+                proposed_additions: Vec::new(),
+                assumptions: Vec::new(),
+                open_questions: Vec::new(),
+                accepted_architect_decisions: Vec::new(),
+            },
+            amended_target_task_ids: Vec::new(),
+            amended_write_paths: Vec::new(),
+            amended_interfaces: Vec::new(),
+        })
+        .expect("create job_queued");
+
+    let job_current = wf_store
+        .create_or_amend_job(&CreateCoworkerJobRequest {
+            binding_id: fx.binding_id.clone(),
+            thread_uuid: THREAD_UUID.to_string(),
+            request_key: "job_hist_current".to_string(),
+            expected_ledger_revision: None,
+            work_brief: WorkBrief {
+                brief_id: "brf_hist_current".to_string(),
+                binding_id: fx.binding_id.clone(),
+                thread_uuid: THREAD_UUID.to_string(),
+                project_base: fx.project_base.clone(),
+                kind: WorkBriefKind::NewJob,
+                summary: "Current healthy exporter job".to_string(),
+                confirmed_requirements: vec!["Update src/exporter.rs".to_string()],
+                proposed_additions: Vec::new(),
+                assumptions: Vec::new(),
+                open_questions: Vec::new(),
+                accepted_architect_decisions: Vec::new(),
+            },
+            amended_target_task_ids: Vec::new(),
+            amended_write_paths: Vec::new(),
+            amended_interfaces: Vec::new(),
+        })
+        .expect("create job_current");
+
+    // Execute older command (index 0, outside usual `limit: 1` tail selection).
+    let old_plan_resp = json!({
+        "outcome": "plan",
+        "schema_version": 1,
+        "summary": "Historical parser plan",
+        "tasks": [{
+            "task_id": "task_hist_parser",
+            "title": "Historical parser update",
+            "description": "Implement historical parser logic in src/parser.rs",
+            "role": "coder",
+            "difficulty": "medium",
+            "depends_on": [],
+            "allowed_write_paths": ["src/parser.rs"],
+            "owned_interfaces": ["iface_hist_parser"],
+            "consumed_interfaces": []
+        }],
+        "check_suggestions": [],
+        "unconfirmed_proposal_notes": [],
+        "resolved_open_questions": [],
+        "deferred_proposals": []
+    });
+    fs::write(
+        &fx.response_json_path,
+        serde_json::to_vec(&old_plan_resp).unwrap(),
+    )
+    .unwrap();
+
+    let cmd_old = cmd_store
+        .enqueue_command(&EnqueuePlanningCommandRequest::from_orchestrator(
+            OrchestrateWorkBriefPlanRequest {
+                binding_id: fx.binding_id.clone(),
+                thread_uuid: THREAD_UUID.to_string(),
+                grant_id: grant_id.clone(),
+                job_id: job_old.job_id.clone(),
+                request_key: "cmd_hist_old_corrupted".to_string(),
+                expected_ledger_revision: None,
+                difficulty: None,
+                architect_difficulty: None,
+                plan_id: None,
+                expected_plan_revision: 0,
+                architect_advice_ids: Vec::new(),
+                max_architect_rounds: 0,
+                current_time_ms: now_ms,
+            },
+        ))
+        .expect("enqueue cmd_old");
+    driver
+        .execute_command(&fx.binding_id, THREAD_UUID, &cmd_old.command_id)
+        .await
+        .expect("execute cmd_old");
+
+    let old_completed_record = cmd_store
+        .get_command(&fx.binding_id, THREAD_UUID, &cmd_old.command_id)
+        .expect("read cmd_old")
+        .expect("cmd_old exists");
+    let (old_reservation_id, old_artifact_id) = match old_completed_record.result_ref.as_ref() {
+        Some(PlanningCommandResultRef::OrchestratorPlan {
+            planning_result, ..
+        }) => (
+            planning_result.reservation_id.clone(),
+            planning_result.report_artifact_id.clone(),
+        ),
+        other => panic!("expected OrchestratorPlan result_ref, got {other:?}"),
+    };
+
+    // Corrupt ONLY the older completed command's persisted artifact semantically on the typed
+    // `PersistedPlanningCallArtifact` (`verified_response.text`) so JSON schema deserialization
+    // still succeeds while full `BoundedAdvisoryResponse` verification fails with the exact
+    // umbrella error, embedding `SECRET_SENTINEL` to prove raw artifact text never leaks.
+    let old_artifact_path =
+        planning_artifacts_dir(&fx.plans_dir).join(format!("{old_artifact_id}.json"));
+    let valid_old_artifact: PersistedPlanningCallArtifact =
+        serde_json::from_slice(&fs::read(&old_artifact_path).expect("read old artifact"))
+            .expect("deserialize valid PersistedPlanningCallArtifact");
+    let mut corrupted_old_artifact = valid_old_artifact.clone();
+    corrupted_old_artifact
+        .verified_response
+        .as_mut()
+        .expect("completed artifact has verified_response")
+        .text = format!("{{\"corrupted_advisory\":\"{SECRET_SENTINEL}\"}}");
+    fs::write(
+        &old_artifact_path,
+        serde_json::to_vec_pretty(&corrupted_old_artifact).unwrap(),
+    )
+    .expect("overwrite corrupted historical artifact");
+    fs::set_permissions(&old_artifact_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let persisted_corrupted_bytes =
+        fs::read(&old_artifact_path).expect("read corrupted historical artifact bytes");
+    assert!(
+        String::from_utf8_lossy(&persisted_corrupted_bytes).contains(SECRET_SENTINEL),
+        "corrupted artifact on disk must contain SECRET_SENTINEL before status checks"
+    );
+    let reparsed_corrupted_artifact: PersistedPlanningCallArtifact =
+        serde_json::from_slice(&persisted_corrupted_bytes)
+            .expect("corrupted artifact deserializes as PersistedPlanningCallArtifact");
+    assert_eq!(reparsed_corrupted_artifact.artifact_id, old_artifact_id);
+
+    let strict_err = fx
+        .gateway()
+        .planning_command(&PlanningCommandParams {
+            command_id: cmd_old.command_id.clone(),
+        })
+        .expect_err(
+            "strict planning_command must reject corrupted BoundedAdvisoryResponse artifact",
+        );
+    assert_eq!(strict_err.code, NativeErrorCode::ProtocolError);
+    assert_eq!(
+        strict_err.message,
+        "OrchestratorOutput artifact failed full BoundedAdvisoryResponse verification under max_output_bytes_per_call"
+    );
+    assert!(!strict_err.message.contains(SECRET_SENTINEL));
+
+    // Enqueue a Queued sibling (index 1), then enqueue and execute a healthy current Completed
+    // command (index 2).
+    let cmd_queued = cmd_store
+        .enqueue_command(&EnqueuePlanningCommandRequest::from_orchestrator(
+            OrchestrateWorkBriefPlanRequest {
+                binding_id: fx.binding_id.clone(),
+                thread_uuid: THREAD_UUID.to_string(),
+                grant_id: grant_id.clone(),
+                job_id: job_queued.job_id.clone(),
+                request_key: "cmd_hist_queued_sibling".to_string(),
+                expected_ledger_revision: None,
+                difficulty: None,
+                architect_difficulty: None,
+                plan_id: None,
+                expected_plan_revision: 0,
+                architect_advice_ids: Vec::new(),
+                max_architect_rounds: 0,
+                current_time_ms: now_ms + 10,
+            },
+        ))
+        .expect("enqueue cmd_queued");
+
+    let current_plan_resp = json!({
+        "outcome": "plan",
+        "schema_version": 1,
+        "summary": "Healthy current exporter plan",
+        "tasks": [{
+            "task_id": "task_current_exporter",
+            "title": "Healthy exporter update",
+            "description": "Implement exporter changes in src/exporter.rs",
+            "role": "coder",
+            "difficulty": "medium",
+            "depends_on": [],
+            "allowed_write_paths": ["src/exporter.rs"],
+            "owned_interfaces": ["iface_current_exporter"],
+            "consumed_interfaces": []
+        }],
+        "check_suggestions": [],
+        "unconfirmed_proposal_notes": [],
+        "resolved_open_questions": [],
+        "deferred_proposals": []
+    });
+    fs::write(
+        &fx.response_json_path,
+        serde_json::to_vec(&current_plan_resp).unwrap(),
+    )
+    .unwrap();
+
+    let cmd_current_healthy = cmd_store
+        .enqueue_command(&EnqueuePlanningCommandRequest::from_orchestrator(
+            OrchestrateWorkBriefPlanRequest {
+                binding_id: fx.binding_id.clone(),
+                thread_uuid: THREAD_UUID.to_string(),
+                grant_id: grant_id.clone(),
+                job_id: job_current.job_id.clone(),
+                request_key: "cmd_hist_current_healthy".to_string(),
+                expected_ledger_revision: None,
+                difficulty: None,
+                architect_difficulty: None,
+                plan_id: None,
+                expected_plan_revision: 0,
+                architect_advice_ids: Vec::new(),
+                max_architect_rounds: 0,
+                current_time_ms: now_ms + 20,
+            },
+        ))
+        .expect("enqueue cmd_current_healthy");
+    driver
+        .execute_command(&fx.binding_id, THREAD_UUID, &cmd_current_healthy.command_id)
+        .await
+        .expect("execute cmd_current_healthy");
+
+    // Stage A: `[cmd_old (corrupted), cmd_queued, cmd_current_healthy]`.
+    // Verify `{}`, `limit: 20`, and `limit: 1` over PairedMcpServer before adding an Unknown sibling:
+    // `limit: 1` selects `cmd_current_healthy` (omitting `cmd_old`) while keeping overall
+    // `historical_integrity_attention` visible and `pending_reconciliation == false`!
+    fx.reset_worker_invocations();
+    let stage_a_plans = snapshot_tree_bytes(&fx.plans_dir);
+    let (stage_a_journal, stage_a_warnings) = read_journal_records_readonly(&fx.plans_dir).unwrap();
+    assert!(stage_a_warnings.is_empty());
+    let stage_a_direct = fx
+        .gateway()
+        .coworker_status(&CoworkerStatusParams::default())
+        .expect("stage_a direct gateway coworker_status");
+    assert_tree_bytes_identical(
+        &stage_a_plans,
+        &snapshot_tree_bytes(&fx.plans_dir),
+        "stage_a_direct_gateway_plans",
+    );
+    let mcp = fx.enrolled_mcp();
+
+    let (stage_a_default, _, _) =
+        invoke_status_and_verify_wire_envelope(&mcp, &fx.binding_id, json!({})).await;
+    let (stage_a_20, _, _) =
+        invoke_status_and_verify_wire_envelope(&mcp, &fx.binding_id, json!({ "limit": 20 })).await;
+    let (stage_a_1, _, _) =
+        invoke_status_and_verify_wire_envelope(&mcp, &fx.binding_id, json!({ "limit": 1 })).await;
+
+    assert_eq!(stage_a_default, stage_a_direct);
+    assert_eq!(stage_a_default, stage_a_20);
+    assert_eq!(stage_a_default.commands.len(), 3);
+    assert_eq!(stage_a_default.commands_bounds.total_count, 3);
+    assert_eq!(stage_a_default.commands_bounds.returned_count, 3);
+    assert_eq!(stage_a_default.commands_bounds.omitted_by_limit_count, 0);
+    assert!(!stage_a_default.has_more_commands);
+    assert!(stage_a_default.historical_integrity_attention);
+    assert_eq!(stage_a_default.degraded_completed_command_count, 1);
+    assert!(!stage_a_default.pending_reconciliation);
+    assert_eq!(stage_a_default.pending_reconciliation_command_count, 0);
+
+    assert_eq!(stage_a_1.commands.len(), 1);
+    assert_eq!(
+        stage_a_1.commands[0].command_id,
+        cmd_current_healthy.command_id
+    );
+    assert!(stage_a_1.commands[0].verification_issue.is_none());
+    assert!(stage_a_1.commands[0].result_summary.is_some());
+    assert_eq!(stage_a_1.commands_bounds.total_count, 3);
+    assert_eq!(stage_a_1.commands_bounds.returned_count, 1);
+    assert_eq!(stage_a_1.commands_bounds.omitted_by_limit_count, 2);
+    assert!(stage_a_1.has_more_commands);
+    assert!(stage_a_1.historical_integrity_attention);
+    assert_eq!(stage_a_1.degraded_completed_command_count, 1);
+    assert!(!stage_a_1.pending_reconciliation);
+    assert_eq!(stage_a_1.pending_reconciliation_command_count, 0);
+    let _ = assert_plans_tree_after_paired_mcp_calls(
+        &fx.plans_dir,
+        &stage_a_plans,
+        &stage_a_journal,
+        &fx.binding_id,
+        THREAD_UUID,
+        &[
+            ExpectedPairedMcpJournalCall::status_ok(),
+            ExpectedPairedMcpJournalCall::status_ok(),
+            ExpectedPairedMcpJournalCall::status_ok(),
+        ],
+        "stage_a_paired_mcp",
+    );
+    assert_eq!(fx.worker_invocation_count(), 0);
+    let stage_a_coherence_plans = fx.root.join("plans-stage-a-coherence");
+    copy_private_tree(&fx.plans_dir, &stage_a_coherence_plans);
+
+    // Stage B: Add an `Unknown` (`pending_reconciliation == true`) sibling so the binding holds
+    // `[cmd_old (corrupted), cmd_queued, cmd_current_healthy, cmd_unknown]`.
+    let dep_blobs = CoworkerPlanningService::compute_dependency_file_blobs(
+        &fx.project_base,
+        &["src/lib.rs".to_string()],
+    )
+    .expect("dep blobs");
+    let policy_digest = default_planning_policy().digest().expect("policy digest");
+    let cmd_unknown = cmd_store
+        .enqueue_command(&EnqueuePlanningCommandRequest::from_architect(
+            RunArchitectAdviceRequest {
+                binding_id: fx.binding_id.clone(),
+                thread_uuid: THREAD_UUID.to_string(),
+                grant_id: grant_id.clone(),
+                request_key: "cmd_hist_unknown_sibling".to_string(),
+                expected_ledger_revision: None,
+                difficulty: None,
+                context_dependencies: ArchitectContextDependencies {
+                    project_base: fx.project_base.clone(),
+                    work_brief_digest: job_current.work_brief_digest.clone(),
+                    plan_digest: None,
+                    policy_digest,
+                    dependency_file_blobs: dep_blobs,
+                    interface_ownership_digests: BTreeMap::new(),
+                    accepted_predecessor_trees: BTreeMap::new(),
+                },
+                question_summary: "Verify exporter trait boundary".to_string(),
+                prior_advice_context: Vec::new(),
+                accept_into_brief: false,
+                current_time_ms: now_ms + 30,
+            },
+        ))
+        .expect("enqueue cmd_unknown");
+    let unknown_guard = cmd_store
+        .ownership_store()
+        .try_acquire_job(
+            &cmd_unknown.ownership_key().expect("ownership key"),
+            threadlane_native::current_wall_clock_ms().expect("clock"),
+        )
+        .expect("acquire ownership")
+        .into_guard()
+        .expect("ownership guard");
+    cmd_store
+        .claim_running(
+            &unknown_guard,
+            &fx.binding_id,
+            THREAD_UUID,
+            &cmd_unknown.command_id,
+            None,
+        )
+        .expect("claim_running cmd_unknown");
+    cmd_store
+        .record_unknown(
+            &unknown_guard,
+            &fx.binding_id,
+            THREAD_UUID,
+            &cmd_unknown.command_id,
+            "Interrupted before provider receipt",
+            None,
+        )
+        .expect("record_unknown cmd_unknown");
+    drop(unknown_guard);
+
+    // Snapshot all stored bytes, ledger revisions, grant usage/reservations, and provider call
+    // counts BEFORE exercising `coworker_status` and strict read verifiers.
+    fx.reset_worker_invocations();
+    let plans_before = snapshot_tree_bytes(&fx.plans_dir);
+    let (journal_before, journal_warnings_before) =
+        read_journal_records_readonly(&fx.plans_dir).unwrap();
+    assert!(journal_warnings_before.is_empty());
+    let reg_before = snapshot_tree_bytes(&fx.registry_dir);
+    let auth_before = snapshot_tree_bytes(&fx.authority_dir);
+    let sess_before = snapshot_tree_bytes(&fx.sessions_dir);
+    let wf_before = wf_store
+        .read_binding_ledger(&fx.binding_id)
+        .expect("wf_before");
+    let cmd_before = cmd_store
+        .read_binding_ledger(&fx.binding_id)
+        .expect("cmd_before");
+
+    let (status_default, _, wire_default) =
+        invoke_status_and_verify_wire_envelope(&mcp, &fx.binding_id, json!({})).await;
+    let (status_20, _, wire_20) =
+        invoke_status_and_verify_wire_envelope(&mcp, &fx.binding_id, json!({ "limit": 20 })).await;
+    let (status_2, _, wire_2) =
+        invoke_status_and_verify_wire_envelope(&mcp, &fx.binding_id, json!({ "limit": 2 })).await;
+    let (status_1, _, wire_1) =
+        invoke_status_and_verify_wire_envelope(&mcp, &fx.binding_id, json!({ "limit": 1 })).await;
+
+    assert!(wire_default <= MAX_MCP_RESPONSE_BYTES);
+    assert!(wire_20 <= MAX_MCP_RESPONSE_BYTES);
+    assert!(wire_2 <= MAX_MCP_RESPONSE_BYTES);
+    assert!(wire_1 <= MAX_MCP_RESPONSE_BYTES);
+    assert_eq!(status_default, status_20);
+    let plans_before_direct_gw = snapshot_tree_bytes(&fx.plans_dir);
+    assert_eq!(
+        fx.gateway()
+            .coworker_status(&CoworkerStatusParams::default())
+            .expect("direct gateway coworker_status"),
+        status_default
+    );
+    assert_tree_bytes_identical(
+        &plans_before_direct_gw,
+        &snapshot_tree_bytes(&fx.plans_dir),
+        "stage_b_direct_gateway_plans",
+    );
+
+    // Verify full 4-command accounting, degraded row isolation, and strict separation from Unknown!
+    assert_eq!(
+        status_default.effective_limit,
+        DEFAULT_COWORKER_STATUS_LIMIT
+    );
+    assert_eq!(status_default.commands.len(), 4);
+    assert_eq!(status_default.commands_bounds.total_count, 4);
+    assert_eq!(status_default.commands_bounds.returned_count, 4);
+    assert_eq!(status_default.commands_bounds.omitted_by_limit_count, 0);
+    assert_eq!(
+        status_default.commands_bounds.omitted_by_byte_budget_count,
+        0
+    );
+    assert!(!status_default.has_more_commands);
+    assert!(status_default.historical_integrity_attention);
+    assert_eq!(status_default.degraded_completed_command_count, 1);
+    assert!(status_default.pending_reconciliation);
+    assert_eq!(status_default.pending_reconciliation_command_count, 1);
+    assert_eq!(status_default.unknown_effect_reservation_count, 0);
+    assert_eq!(status_default.unresolved_job_outbox_count, 0);
+
+    let row_old = &status_default.commands[0];
+    assert_eq!(row_old.command_id, old_completed_record.command_id);
+    assert_eq!(row_old.command_key, old_completed_record.command_key);
+    assert_eq!(
+        row_old.service_request_key,
+        old_completed_record.service_request_key
+    );
+    assert_eq!(row_old.binding_id, fx.binding_id);
+    assert_eq!(row_old.thread_uuid, THREAD_UUID);
+    assert_eq!(row_old.grant_id, grant_id);
+    assert_eq!(row_old.context_digest, old_completed_record.context_digest);
+    assert_eq!(
+        row_old.request_body_digest,
+        old_completed_record.request_body_digest
+    );
+    assert_eq!(row_old.command_digest, old_completed_record.command_digest);
+    assert_eq!(row_old.status, PlanningCommandStatus::Completed);
+    assert!(!row_old.pending_reconciliation);
+    assert_eq!(row_old.executable, Some(false));
+    assert!(row_old.result_summary.is_none());
+    assert!(row_old.current_plan_status.is_none());
+    let issue = row_old
+        .verification_issue
+        .as_ref()
+        .expect("degraded historical row must carry verification_issue");
+    assert!(issue.status_diagnostic_only);
+    assert!(!issue.grants_execution_authority);
+    assert_eq!(
+        issue.evidence_status,
+        PlanningCommandEvidenceStatus::VerificationFailed
+    );
+    assert_eq!(
+        issue.kind,
+        PlanningCommandVerificationIssueKind::BoundedAdvisoryResponseVerificationFailed
+    );
+    assert_eq!(issue.error_code, NativeErrorCode::ProtocolError);
+    assert_eq!(issue.reservation_id, old_reservation_id);
+    assert_eq!(issue.report_artifact_id, old_artifact_id);
+    assert!(!issue.message.contains(SECRET_SENTINEL));
+    assert!(!issue.message.contains(&*fx.root.to_string_lossy()));
+
+    let row_queued = &status_default.commands[1];
+    assert_eq!(row_queued.command_id, cmd_queued.command_id);
+    assert_eq!(row_queued.status, PlanningCommandStatus::Queued);
+    assert!(!row_queued.pending_reconciliation);
+    assert!(row_queued.verification_issue.is_none());
+    assert!(row_queued.result_summary.is_none());
+
+    let row_healthy = &status_default.commands[2];
+    assert_eq!(row_healthy.command_id, cmd_current_healthy.command_id);
+    assert_eq!(row_healthy.status, PlanningCommandStatus::Completed);
+    assert!(!row_healthy.pending_reconciliation);
+    assert!(row_healthy.verification_issue.is_none());
+    assert_eq!(row_healthy.current_plan_status, Some(PlanStatus::Published));
+    assert_eq!(row_healthy.executable, None);
+    let healthy_res = row_healthy
+        .result_summary
+        .as_ref()
+        .expect("healthy completed row must expose bounded result_summary");
+    assert!(healthy_res.status_projection_only);
+    assert!(!healthy_res.grants_execution_authority);
+    assert!(healthy_res.artifact_verified);
+    assert_eq!(
+        healthy_res.kind,
+        CoworkerStatusCommandResultKind::OrchestratorPlan
+    );
+
+    let row_unknown = &status_default.commands[3];
+    assert_eq!(row_unknown.command_id, cmd_unknown.command_id);
+    assert_eq!(row_unknown.status, PlanningCommandStatus::Unknown);
+    assert!(row_unknown.pending_reconciliation);
+    assert!(row_unknown.verification_issue.is_none());
+    assert!(row_unknown.result_summary.is_none());
+
+    // At `limit: 2`, `cmd_old` and `cmd_queued` are omitted, returning `[cmd_current_healthy, cmd_unknown]`
+    // while scope-wide integrity attention remains visible!
+    assert_eq!(status_2.commands.len(), 2);
+    assert_eq!(
+        status_2.commands[0].command_id,
+        cmd_current_healthy.command_id
+    );
+    assert_eq!(status_2.commands[1].command_id, cmd_unknown.command_id);
+    assert_eq!(status_2.commands_bounds.total_count, 4);
+    assert_eq!(status_2.commands_bounds.omitted_by_limit_count, 2);
+    assert!(status_2.has_more_commands);
+    assert!(status_2.historical_integrity_attention);
+    assert_eq!(status_2.degraded_completed_command_count, 1);
+    assert_eq!(status_2.pending_reconciliation_command_count, 1);
+
+    // At `limit: 1`, `cmd_old` is omitted and `cmd_unknown` + latest healthy job row are returned,
+    // while scope-wide `historical_integrity_attention` and `degraded_completed_command_count` stay visible!
+    assert_eq!(status_1.effective_limit, 1);
+    assert_eq!(status_1.commands.len(), 1);
+    assert_eq!(status_1.commands[0].command_id, cmd_unknown.command_id);
+    assert!(status_1.commands[0].verification_issue.is_none());
+    assert_eq!(status_1.jobs.len(), 1);
+    assert_eq!(status_1.jobs[0].job_id, job_current.job_id);
+    assert_eq!(status_1.commands_bounds.total_count, 4);
+    assert_eq!(status_1.commands_bounds.returned_count, 1);
+    assert_eq!(status_1.commands_bounds.omitted_by_limit_count, 3);
+    assert!(status_1.has_more_commands);
+    assert!(status_1.historical_integrity_attention);
+    assert_eq!(status_1.degraded_completed_command_count, 1);
+    assert!(status_1.pending_reconciliation);
+    assert_eq!(status_1.pending_reconciliation_command_count, 1);
+
+    // Strict MCP `planning_command`, strict `get_planning_command_summary_readonly`, strict
+    // `list_planning_command_summaries_readonly`, and `driver.execute_command` MUST still reject
+    // the corrupted artifact, while `planning_command` on `cmd_current_healthy` succeeds!
+    assert_eq!(
+        invoke_mcp_err_code(
+            &mcp,
+            "planning_command",
+            json!({ "command_id": cmd_old.command_id }),
+        )
+        .await,
+        "protocol_error"
+    );
+    let healthy_detail_res = mcp
+        .invoke_tool_json(
+            "planning_command",
+            json!({ "command_id": cmd_current_healthy.command_id }),
+            None,
+        )
+        .await
+        .expect("planning_command on healthy current command");
+    let healthy_detail: PlanningCommandDetailResponse = serde_json::from_value(
+        healthy_detail_res
+            .structured_content
+            .expect("structured_content")["data"]
+            .clone(),
+    )
+    .expect("deserialize PlanningCommandDetailResponse");
+    assert_eq!(healthy_detail.status, PlanningCommandStatus::Completed);
+    assert!(healthy_detail.orchestrator_plan_summary.is_some());
+    let returned_job_id = healthy_detail.job_id.as_deref();
+    let returned_plan_id = healthy_detail
+        .orchestrator_plan_summary
+        .as_ref()
+        .map(|summary| summary.plan_id.as_str());
+    assert!(returned_job_id.is_some());
+    assert!(returned_plan_id.is_some());
+
+    let plans_after_mcp = assert_plans_tree_after_paired_mcp_calls(
+        &fx.plans_dir,
+        &plans_before,
+        &journal_before,
+        &fx.binding_id,
+        THREAD_UUID,
+        &[
+            ExpectedPairedMcpJournalCall::status_ok(),
+            ExpectedPairedMcpJournalCall::status_ok(),
+            ExpectedPairedMcpJournalCall::status_ok(),
+            ExpectedPairedMcpJournalCall::status_ok(),
+            ExpectedPairedMcpJournalCall {
+                tool_name: "planning_command",
+                finish_state: ObservationCallState::Failed,
+                finish_job_id: None,
+                finish_plan_id: None,
+            },
+            ExpectedPairedMcpJournalCall {
+                tool_name: "planning_command",
+                finish_state: ObservationCallState::Completed,
+                finish_job_id: returned_job_id,
+                finish_plan_id: returned_plan_id,
+            },
+        ],
+        "stage_b_paired_mcp",
+    );
+
+    assert_eq!(
+        get_planning_command_summary_readonly(
+            &fx.plans_dir,
+            &fx.registry_dir,
+            &fx.binding_id,
+            THREAD_UUID,
+            &cmd_old.command_id,
+        )
+        .expect_err("strict get_planning_command_summary_readonly must reject corrupted artifact")
+        .code,
+        NativeErrorCode::ProtocolError
+    );
+    assert_eq!(
+        list_planning_command_summaries_readonly(
+            &fx.plans_dir,
+            &fx.registry_dir,
+            &fx.binding_id,
+            THREAD_UUID,
+            1,
+            None,
+        )
+        .expect_err(
+            "strict list_planning_command_summaries_readonly must reject corrupted artifact",
+        )
+        .code,
+        NativeErrorCode::ProtocolError
+    );
+    assert_eq!(
+        driver
+            .execute_command(&fx.binding_id, THREAD_UUID, &cmd_old.command_id)
+            .await
+            .expect_err("driver.execute_command must reject corrupted completed artifact")
+            .code,
+        NativeErrorCode::ProtocolError
+    );
+
+    // Wrong thread scope still fails closed on both gateway and status-only driver reader.
+    assert_eq!(
+        fx.gateway_for_scope(&fx.binding_id, OTHER_THREAD_UUID)
+            .coworker_status(&CoworkerStatusParams::default())
+            .expect_err("wrong thread_uuid must fail closed")
+            .code,
+        NativeErrorCode::SecurityViolation
+    );
+    assert_eq!(
+        read_planning_commands_for_status_readonly(
+            &fx.plans_dir,
+            &fx.registry_dir,
+            &fx.binding_id,
+            OTHER_THREAD_UUID,
+        )
+        .expect_err("status-only reader wrong thread_uuid must fail closed")
+        .code,
+        NativeErrorCode::SecurityViolation
+    );
+
+    // Byte-for-byte immutability proof across all stores, revisions, receipts, and provider calls!
+    assert_tree_bytes_identical(
+        &plans_after_mcp,
+        &snapshot_tree_bytes(&fx.plans_dir),
+        "stage_b_direct_strict_and_scope_plans",
+    );
+    assert_tree_bytes_identical(
+        &reg_before,
+        &snapshot_tree_bytes(&fx.registry_dir),
+        "stage_b_registry",
+    );
+    assert_tree_bytes_identical(
+        &auth_before,
+        &snapshot_tree_bytes(&fx.authority_dir),
+        "stage_b_authority",
+    );
+    assert_tree_bytes_identical(
+        &sess_before,
+        &snapshot_tree_bytes(&fx.sessions_dir),
+        "stage_b_sessions",
+    );
+    assert_eq!(
+        wf_store
+            .read_binding_ledger(&fx.binding_id)
+            .expect("wf_after"),
+        wf_before
+    );
+    assert_eq!(
+        cmd_store
+            .read_binding_ledger(&fx.binding_id)
+            .expect("cmd_after"),
+        cmd_before
+    );
+    assert_eq!(fx.worker_invocation_count(), 0);
+
+    // Isolated scratch copies prove shared ledger corruption, record digest tampering, and unsafe
+    // file permissions still fail closed, while a missing artifact surfaces `Unavailable`.
+    let cmd_ledger_rel = cmd_store
+        .ledger_path_for_binding(&fx.binding_id)
+        .unwrap()
+        .strip_prefix(&fx.plans_dir)
+        .unwrap()
+        .to_path_buf();
+
+    // (a) Corrupt shared command ledger JSON -> fail closed (`ProtocolError`).
+    let corrupt_ledger_plans = fx.root.join("plans-corrupt-cmd-ledger");
+    copy_private_tree(&fx.plans_dir, &corrupt_ledger_plans);
+    let corrupt_cmd_ledger_path = corrupt_ledger_plans.join(&cmd_ledger_rel);
+    fs::write(&corrupt_cmd_ledger_path, b"{corrupt-shared-ledger").unwrap();
+    fs::set_permissions(&corrupt_cmd_ledger_path, fs::Permissions::from_mode(0o600)).unwrap();
+    let gw_corrupt_ledger = CoworkerPlanningGateway::new(
+        &fx.state_dir,
+        &fx.registry_dir,
+        &corrupt_ledger_plans,
+        &fx.authority_dir,
+        &fx.sessions_dir,
+        &fx.binding_id,
+        THREAD_UUID,
+    )
+    .unwrap();
+    assert_eq!(
+        gw_corrupt_ledger
+            .coworker_status(&CoworkerStatusParams::default())
+            .expect_err("corrupt shared command ledger must fail closed")
+            .code,
+        NativeErrorCode::ProtocolError
+    );
+
+    // (b) Tampered `command_digest` on `Completed` command record -> fail closed (`ProtocolError`).
+    let tampered_record_plans = fx.root.join("plans-tampered-cmd-record");
+    copy_private_tree(&fx.plans_dir, &tampered_record_plans);
+    let tampered_cmd_ledger_path = tampered_record_plans.join(&cmd_ledger_rel);
+    let mut tampered_ledger_val: Value =
+        serde_json::from_slice(&fs::read(&tampered_cmd_ledger_path).unwrap()).unwrap();
+    tampered_ledger_val["commands"][0]["command_digest"] = json!("0".repeat(64));
+    fs::write(
+        &tampered_cmd_ledger_path,
+        serde_json::to_vec_pretty(&tampered_ledger_val).unwrap(),
+    )
+    .unwrap();
+    fs::set_permissions(&tampered_cmd_ledger_path, fs::Permissions::from_mode(0o600)).unwrap();
+    let gw_tampered_record = CoworkerPlanningGateway::new(
+        &fx.state_dir,
+        &fx.registry_dir,
+        &tampered_record_plans,
+        &fx.authority_dir,
+        &fx.sessions_dir,
+        &fx.binding_id,
+        THREAD_UUID,
+    )
+    .unwrap();
+    assert_eq!(
+        gw_tampered_record
+            .coworker_status(&CoworkerStatusParams::default())
+            .expect_err("tampered command_digest must fail closed")
+            .code,
+        NativeErrorCode::ProtocolError
+    );
+
+    // (c) Insecure `0644` permissions on persisted artifact file -> fail closed (`SecurityViolation`).
+    let unsafe_perm_plans = fx.root.join("plans-unsafe-artifact-perms");
+    copy_private_tree(&fx.plans_dir, &unsafe_perm_plans);
+    let unsafe_art_path =
+        planning_artifacts_dir(&unsafe_perm_plans).join(format!("{old_artifact_id}.json"));
+    fs::set_permissions(&unsafe_art_path, fs::Permissions::from_mode(0o644)).unwrap();
+    let gw_unsafe_perm = CoworkerPlanningGateway::new(
+        &fx.state_dir,
+        &fx.registry_dir,
+        &unsafe_perm_plans,
+        &fx.authority_dir,
+        &fx.sessions_dir,
+        &fx.binding_id,
+        THREAD_UUID,
+    )
+    .unwrap();
+    assert_eq!(
+        gw_unsafe_perm
+            .coworker_status(&CoworkerStatusParams::default())
+            .expect_err("insecure 0644 artifact permissions must fail closed")
+            .code,
+        NativeErrorCode::SecurityViolation
+    );
+
+    // (d) Missing persisted artifact file -> isolated `Unavailable` (`ArtifactMissing`) observation.
+    let missing_art_plans = fx.root.join("plans-missing-artifact");
+    copy_private_tree(&fx.plans_dir, &missing_art_plans);
+    fs::remove_file(
+        planning_artifacts_dir(&missing_art_plans).join(format!("{old_artifact_id}.json")),
+    )
+    .unwrap();
+    let gw_missing_art = CoworkerPlanningGateway::new(
+        &fx.state_dir,
+        &fx.registry_dir,
+        &missing_art_plans,
+        &fx.authority_dir,
+        &fx.sessions_dir,
+        &fx.binding_id,
+        THREAD_UUID,
+    )
+    .unwrap();
+    let missing_status = gw_missing_art
+        .coworker_status(&CoworkerStatusParams::default())
+        .expect("missing artifact on old completed command must isolate in coworker_status");
+    assert!(missing_status.historical_integrity_attention);
+    assert_eq!(missing_status.degraded_completed_command_count, 1);
+    assert_eq!(missing_status.pending_reconciliation_command_count, 1);
+    let missing_issue = missing_status.commands[0]
+        .verification_issue
+        .as_ref()
+        .expect("missing artifact must produce verification_issue");
+    assert_eq!(
+        missing_issue.evidence_status,
+        PlanningCommandEvidenceStatus::Unavailable
+    );
+    assert_eq!(
+        missing_issue.kind,
+        PlanningCommandVerificationIssueKind::ArtifactMissing
+    );
+    assert!(missing_status.commands[0].result_summary.is_none());
+    assert_eq!(missing_status.commands[0].executable, Some(false));
+
+    // (e) Single-ledger-snapshot coherence, append order, and `Running` -> `Unknown` projection
+    // without global test serialization: an enqueue after the initial ledger snapshot advances the
+    // on-disk command ledger to `R + 1`, while the in-flight status read still returns revision `R`
+    // with ONLY revision `R`'s 3 rows (never tagging newer rows with an older revision).
+    let coherence_wf_store =
+        CoworkerWorkflowStore::new(&stage_a_coherence_plans).expect("coherence_wf_store");
+    let coherence_cmds_dir = planning_commands_dir(&stage_a_coherence_plans);
+    let coherence_arts_dir = planning_artifacts_dir(&stage_a_coherence_plans);
+    let coherence_cmd_store = PlanningCommandStore::open_existing(
+        &coherence_cmds_dir,
+        coherence_wf_store,
+        &fx.registry_dir,
+    )
+    .expect("coherence_cmd_store")
+    .with_artifacts_dir(&coherence_arts_dir)
+    .expect("coherence artifacts_dir");
+    let initial_coherence_rev = coherence_cmd_store
+        .read_binding_ledger(&fx.binding_id)
+        .expect("initial coherence ledger")
+        .revision;
+    let coherence_dep_blobs = CoworkerPlanningService::compute_dependency_file_blobs(
+        &fx.project_base,
+        &["src/lib.rs".to_string()],
+    )
+    .expect("coherence dep blobs");
+    let coherence_enqueue_req =
+        EnqueuePlanningCommandRequest::from_architect(RunArchitectAdviceRequest {
+            binding_id: fx.binding_id.clone(),
+            thread_uuid: THREAD_UUID.to_string(),
+            grant_id: grant_id.clone(),
+            request_key: "cmd_hist_coherence_concurrent".to_string(),
+            expected_ledger_revision: None,
+            difficulty: None,
+            context_dependencies: ArchitectContextDependencies {
+                project_base: fx.project_base.clone(),
+                work_brief_digest: job_current.work_brief_digest.clone(),
+                plan_digest: None,
+                policy_digest: default_planning_policy().digest().expect("policy digest"),
+                dependency_file_blobs: coherence_dep_blobs,
+                interface_ownership_digests: BTreeMap::new(),
+                accepted_predecessor_trees: BTreeMap::new(),
+            },
+            question_summary: "Verify single-snapshot status coherence".to_string(),
+            prior_advice_context: Vec::new(),
+            accept_into_brief: false,
+            current_time_ms: now_ms + 40,
+        });
+    let mut enqueued_mid_read = None;
+    let coherent_report = read_planning_commands_for_status_readonly_with_hooks(
+        &stage_a_coherence_plans,
+        &fx.registry_dir,
+        &fx.binding_id,
+        THREAD_UUID,
+        |observed_rev, observed_len| {
+            assert_eq!(observed_rev, initial_coherence_rev);
+            assert_eq!(observed_len, 3);
+            let cmd_concurrent = coherence_cmd_store
+                .enqueue_command(&coherence_enqueue_req)
+                .expect("enqueue concurrent command during status read");
+            let bumped = coherence_cmd_store
+                .read_binding_ledger(&fx.binding_id)
+                .expect("read bumped ledger");
+            assert_eq!(bumped.revision, initial_coherence_rev + 1);
+            assert_eq!(bumped.commands.len(), 4);
+            enqueued_mid_read = Some(cmd_concurrent);
+            Ok(())
+        },
+        |_, _| Ok(()),
+    )
+    .expect("coherent status read across concurrent enqueue");
+    let cmd_concurrent = enqueued_mid_read.expect("hook enqueued concurrent command");
+    assert_eq!(coherent_report.ledger_revision, initial_coherence_rev);
+    assert_eq!(coherent_report.commands.len(), 3);
+    assert_eq!(
+        coherent_report.commands[0].summary.command_id,
+        cmd_old.command_id
+    );
+    assert!(coherent_report.commands[0].verification_issue.is_some());
+    assert_eq!(
+        coherent_report.commands[1].summary.command_id,
+        cmd_queued.command_id
+    );
+    assert_eq!(
+        coherent_report.commands[2].summary.command_id,
+        cmd_current_healthy.command_id
+    );
+    assert!(coherent_report.commands[2].verification_issue.is_none());
+
+    let post_enqueue_report = read_planning_commands_for_status_readonly(
+        &stage_a_coherence_plans,
+        &fx.registry_dir,
+        &fx.binding_id,
+        THREAD_UUID,
+    )
+    .expect("post-enqueue status read");
+    assert_eq!(
+        post_enqueue_report.ledger_revision,
+        initial_coherence_rev + 1
+    );
+    assert_eq!(post_enqueue_report.commands.len(), 4);
+    assert_eq!(
+        post_enqueue_report.commands[3].summary.command_id,
+        cmd_concurrent.command_id
+    );
+    assert_eq!(
+        post_enqueue_report.commands[3].summary.status,
+        PlanningCommandStatus::Queued
+    );
+
+    let live_running_guard = coherence_cmd_store
+        .ownership_store()
+        .try_acquire_job(
+            &cmd_concurrent.ownership_key().expect("ownership key"),
+            threadlane_native::current_wall_clock_ms().expect("clock"),
+        )
+        .expect("acquire concurrent ownership")
+        .into_guard()
+        .expect("concurrent ownership guard");
+    coherence_cmd_store
+        .claim_running(
+            &live_running_guard,
+            &fx.binding_id,
+            THREAD_UUID,
+            &cmd_concurrent.command_id,
+            None,
+        )
+        .expect("claim_running cmd_concurrent");
+    let running_report = read_planning_commands_for_status_readonly(
+        &stage_a_coherence_plans,
+        &fx.registry_dir,
+        &fx.binding_id,
+        THREAD_UUID,
+    )
+    .expect("status read while Running owner is active");
+    assert_eq!(running_report.ledger_revision, initial_coherence_rev + 2);
+    assert_eq!(
+        running_report.commands[3].summary.status,
+        PlanningCommandStatus::Running
+    );
+    assert!(!running_report.commands[3].summary.pending_reconciliation);
+    assert!(running_report.commands[3].summary.owner_summary.is_some());
+    drop(live_running_guard);
+
+    let abandoned_report = read_planning_commands_for_status_readonly(
+        &stage_a_coherence_plans,
+        &fx.registry_dir,
+        &fx.binding_id,
+        THREAD_UUID,
+    )
+    .expect("status read after Running owner dropped");
+    assert_eq!(abandoned_report.ledger_revision, initial_coherence_rev + 2);
+    assert_eq!(
+        abandoned_report.commands[3].summary.status,
+        PlanningCommandStatus::Unknown
+    );
+    assert!(abandoned_report.commands[3].summary.pending_reconciliation);
+
+    // (f) Policy-invalid typed artifact replacement after initial `ProtocolError` failure ->
+    // `isolate_completed_artifact_issue_for_status` must enforce the fatal category guard on
+    // reread `validate_against_grant` (`SecurityViolation`) and fail closed without leaking secrets
+    // or private paths, while strict detail/get/list verifiers remain fail-closed as well.
+    const POLICY_SECRET_MODEL_ID: &str = "model-unpermitted-secret-token-771";
+    let stored_grant = wf_store
+        .read_binding_ledger(&fx.binding_id)
+        .expect("read workflow ledger for grant")
+        .planning_grants
+        .into_iter()
+        .find(|g| g.grant_id == grant_id)
+        .expect("standing grant exists");
+    let mut policy_invalid_artifact = valid_old_artifact.clone();
+    policy_invalid_artifact.selected_choice.model_id = POLICY_SECRET_MODEL_ID.to_string();
+    policy_invalid_artifact
+        .validate(&old_artifact_id)
+        .expect("policy_invalid_artifact stays structurally valid");
+    let direct_policy_err = policy_invalid_artifact
+        .validate_against_grant(&old_artifact_id, &stored_grant)
+        .expect_err("unpermitted choice must fail validate_against_grant");
+    assert_eq!(direct_policy_err.code, NativeErrorCode::SecurityViolation);
+    assert_eq!(
+        direct_policy_err.message,
+        "persisted planning artifact selected_choice is not permitted by the standing grant ExecutionPolicy"
+    );
+
+    let policy_swap_plans = fx.root.join("plans-policy-invalid-swap");
+    copy_private_tree(&fx.plans_dir, &policy_swap_plans);
+    let policy_swap_art_path =
+        planning_artifacts_dir(&policy_swap_plans).join(format!("{old_artifact_id}.json"));
+    let policy_invalid_bytes = serde_json::to_vec_pretty(&policy_invalid_artifact).unwrap();
+    let _: PersistedPlanningCallArtifact = serde_json::from_slice(&policy_invalid_bytes)
+        .expect("policy_invalid_artifact bytes deserialize cleanly");
+
+    let mut saw_initial_protocol_failure = false;
+    let swap_err = read_planning_commands_for_status_readonly_with_hooks(
+        &policy_swap_plans,
+        &fx.registry_dir,
+        &fx.binding_id,
+        THREAD_UUID,
+        |_, _| Ok(()),
+        |failed_cmd_id, initial_strict_err| {
+            assert_eq!(failed_cmd_id, cmd_old.command_id);
+            assert_eq!(initial_strict_err.code, NativeErrorCode::ProtocolError);
+            assert_eq!(
+                initial_strict_err.message,
+                "OrchestratorOutput artifact failed full BoundedAdvisoryResponse verification under max_output_bytes_per_call"
+            );
+            saw_initial_protocol_failure = true;
+            fs::write(&policy_swap_art_path, &policy_invalid_bytes)
+                .expect("swap policy-invalid artifact");
+            let mode_600 = fs::Permissions::from_mode(0o600);
+            fs::set_permissions(&policy_swap_art_path, mode_600).unwrap();
+            Ok(())
+        },
+    )
+    .expect_err("policy-invalid artifact must fail closed");
+    assert!(saw_initial_protocol_failure);
+    assert_eq!(swap_err.code, NativeErrorCode::SecurityViolation);
+    assert_eq!(
+        swap_err.message,
+        "persisted planning artifact selected_choice is not permitted by the standing grant ExecutionPolicy"
+    );
+    let root_str = fx.root.to_string_lossy();
+    let swap_root_str = policy_swap_plans.to_string_lossy();
+    assert!(!swap_err.message.contains(POLICY_SECRET_MODEL_ID));
+    assert!(!swap_err.message.contains(SECRET_SENTINEL));
+    assert!(!swap_err.message.contains(&*root_str));
+    assert!(!swap_err.message.contains(&*swap_root_str));
+
+    let gw_policy_swap = CoworkerPlanningGateway::new(
+        &fx.state_dir,
+        &fx.registry_dir,
+        &policy_swap_plans,
+        &fx.authority_dir,
+        &fx.sessions_dir,
+        &fx.binding_id,
+        THREAD_UUID,
+    )
+    .unwrap();
+    let gw_swap_err = gw_policy_swap
+        .coworker_status(&CoworkerStatusParams::default())
+        .expect_err("gateway status must fail closed on policy violation");
+    assert_eq!(gw_swap_err.code, NativeErrorCode::SecurityViolation);
+    assert!(!gw_swap_err.message.contains(POLICY_SECRET_MODEL_ID));
+    assert!(!gw_swap_err.message.contains(&*root_str));
+
+    assert_eq!(
+        gw_policy_swap
+            .planning_command(&PlanningCommandParams {
+                command_id: cmd_old.command_id.clone(),
+            })
+            .expect_err("strict planning_command must fail closed")
+            .code,
+        NativeErrorCode::SecurityViolation
+    );
+    assert_eq!(
+        get_planning_command_summary_readonly(
+            &policy_swap_plans,
+            &fx.registry_dir,
+            &fx.binding_id,
+            THREAD_UUID,
+            &cmd_old.command_id,
+        )
+        .expect_err("strict get summary must fail closed")
+        .code,
+        NativeErrorCode::SecurityViolation
+    );
+    assert_eq!(
+        list_planning_command_summaries_readonly(
+            &policy_swap_plans,
+            &fx.registry_dir,
+            &fx.binding_id,
+            THREAD_UUID,
+            1,
+            None,
+        )
+        .expect_err("strict list summaries must fail closed")
+        .code,
+        NativeErrorCode::SecurityViolation
+    );
 
     assert_eq!(fx.worker_invocation_count(), 0);
     fx.shutdown().await;

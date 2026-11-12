@@ -1,4 +1,4 @@
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod chat_navigation;
@@ -27,7 +27,7 @@ use threadlane_connectors::{
     ToolProbe, ToolVersionInspection,
 };
 use threadlane_core::observation::{
-    ObservationSnapshot, ObservationSnapshotRequest, ObservationSource,
+    ObservationSnapshot, ObservationSnapshotRequest, ObservationSource, WorkspaceSnapshot,
 };
 use threadlane_decisions::{
     DecisionAdvice, DecisionClient, DecisionError, DecisionProvider, DecisionRequest,
@@ -1352,6 +1352,17 @@ async fn desktop_observation_snapshot(
 }
 
 #[tauri::command]
+async fn desktop_workspace_snapshot(
+    request: Option<ObservationSnapshotRequest>,
+    state: State<'_, ObservationService>,
+) -> Result<WorkspaceSnapshot, AppError> {
+    let service = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || service.workspace_snapshot(request))
+        .await
+        .map_err(|_| AppError::internal_join_error())?
+}
+
+#[tauri::command]
 async fn desktop_observation_sources(
     state: State<'_, ObservationService>,
 ) -> Result<Vec<ObservationSource>, AppError> {
@@ -1521,6 +1532,7 @@ fn main() -> ExitCode {
             desktop_approved_activity,
             desktop_native_threads,
             desktop_observation_snapshot,
+            desktop_workspace_snapshot,
             desktop_observation_sources,
             desktop_link_observation_context,
             desktop_codex_setup_status,

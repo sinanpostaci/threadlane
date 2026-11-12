@@ -2,53 +2,90 @@
 
 ## Current desktop workspace
 
-The production entry point uses React and Radix Themes. Projects groups actual
-observation records by project and chat; selecting a chat shows its activity and
-compact, initially closed job summaries. Expand a job to inspect task states and
-technical details. Working calls and human-attention counts are independent: one
-chat may have both. A finished Worker is not an accepted job. Missing usage stays
-unknown and unavailable observations retain an explicit stale/unavailable state.
-Interface labels are English. Observed chat/job titles, summaries and task text
-are content, rendered in their source language without translating fixed UI labels.
+The production entry point (`apps/desktop/index.html` → `apps/desktop/src/main.ts`
+→ `apps/desktop/src/app.tsx`) uses React and Radix Themes while preserving the
+`?surface=tray` route (`apps/desktop/src/tray.tsx`) for the compact tray popover.
+`DesktopAppCoordinator` loads a single bounded `WorkspaceSnapshot` via
+`desktop_workspace_snapshot` (`ipcWorkspaceSnapshot`) and projects chat-first
+workspace state through `projectWorkspaceSnapshot`. Interface chrome is compact,
+neutral, and English; observed chat titles, job titles, summaries, questions, and
+results are rendered verbatim in their original language without translating UI
+controls.
 
-The sidebar collapses on wide windows. At 760 px and below it becomes a modal
-navigation drawer; the minimum native window is 360 × 500 px and the initial
-window is 1040 × 760 px. Tools retains its catalog/model-family editor. Profiles
-shows the saved profile list, five roles, four difficulty overrides and explicit
-reset controls. Dirty drafts survive section changes; external changes and stale
-saves require reconciliation rather than a silent overwrite or automatic retry.
-Saving configuration grants no planning or execution permission.
+`Projects` provides two explicit navigation submenus—**Active** (`Projects/Active`)
+and **Archive** (`Projects/Archive`)—both in the desktop sidebar and in the
+responsive drawer. Each chat row is keyed by its verified four-part
+`WorkspaceChatIdentity` (`source_id`, `binding_id`, `thread_uuid`,
+`canonical_project_scope`) and offers per-chat **Archive** and **Restore** actions
+persisted locally (`threadlane.desktop.workspace.chatArchive.v1`). Archiving is a
+local visibility preference that never deletes backend records; storage write
+failures surface as explicit alerts, and active human blockers inside
+`Projects/Archive` remain surfaced in `Projects/Active` so blocked conversations
+are never silently buried. Legacy `6h` / `24h` time-window toggles, `Older (6h+)`
+badges, `Load older activity` paging controls, bulk `Archive history`, and `Show
+archived` cutoff buttons are removed from production `Projects`; bounded snapshot
+omissions remain explicitly visible in the UI.
 
-Archive history stores a local visibility cutoff, without deleting backend
-records. It hides older inactive history, including pending historical items;
-working records remain visible. Show archived removes that cutoff. A time window
-alone retains unresolved work. Storage failures are reported rather than
-pretending that archival or restoration succeeded.
+Selecting a chat derives the raw `WorkspaceChatSummary` and matching
+`WorkspaceNativeSample` strictly by full four-part canonical chat identity
+equality, with no source-only fallback or cross-chat data spill, and mounts
+`WorkspaceChatPanels` with three separate tabs:
+
+- **Messages** (default): bounded, read-only timeline of safe recorded summaries,
+  questions, answers, review verdicts, and job results, with automatic bottom
+  following, reading-position preservation on upward scroll, and a floating
+  jump-to-latest indicator when new messages arrive. No raw provider transcript is
+  read and no message composer is offered.
+- **Jobs**: durable per-chat job, task, attempt, candidate, and backend-verified
+  acceptance-proof ledger.
+- **Activity**: chronological request, child-call, and result-delivery audit feed
+  with centered live `ActivitySpinner` alignment and cross-tab job filtering.
+
+Live Coworker state and verified configured model selection are displayed
+independently of Worker execution telemetry; stale or disconnected native samples
+withhold live claims rather than guessing. Neither a finished Worker run nor any
+completed MCP tool call ever marks a conversation or job `Completed`; authoritative
+completion requires backend-verified acceptance proof.
+
+The sidebar toggle button resides exclusively in the custom titlebar: on wide
+windows (`> 760px`) it collapses and expands the sidebar, and on narrow windows
+(`<= 760px`) it opens and closes an accessible Radix `Dialog` modal navigation
+drawer with keyboard focus restoration and `Escape` dismissal. The minimum native
+window is 360 × 500 px and the initial window is 1040 × 760 px. `Tools` retains
+its catalog/model-family editor; `Profiles` retains the saved profile list, five
+roles, four difficulty overrides, explicit reset controls, and instance-preserved
+dirty drafts across section changes; `Settings` retains appearance, window close
+behavior, explicit Codex setup controls (never auto-written on UI startup), and
+linked observation sources. Saving configuration grants no planning or execution
+permission.
 
 When a system tray is available, closing the main window hides it by default.
 Settings → Window close behavior can select Quit instead. The tray offers Open
 and Quit, and its small popover displays a bounded observation summary. Quit is
 required to fully restart a hidden app after an update. If tray creation fails,
-the window remains the available control surface. Watcher disappearance after
-startup and real desktop tray interaction require separate host qualification.
-An isolated test launch may use `--no-codex-startup-setup` to avoid modifying
-Codex setup; it must use separate XDG/runtime directories.
+the window remains the available control surface. An isolated test launch may use
+`--no-codex-startup-setup` to avoid modifying Codex setup; it must use separate
+XDG/runtime directories.
 
-Open in Codex submits only a canonical `codex://threads/<uuid>` URL. A narrow
-Rust command revalidates the source, thread and optional job against bounded
-read-only observation data before invoking the OS opener. It accepts no arbitrary
-URL, command or executable, and has no frontend shell/opener capability. A
+Open in Codex submits only a canonical `codex://threads/<uuid>` URL through
+`desktop_open_codex_chat`. The Rust backend independently revalidates the workspace
+chat identity (`source_id`, `thread_uuid`, and optional `job_id`) against bounded
+read-only observation data before invoking the OS opener. Unsupported environments
+return an explicit error with no arbitrary URL, launcher, or shell fallback. A
 successful submission does not prove that Codex displayed the chat or that the
 human read or approved anything. System notifications are separate future work.
 
 Linux is the current qualification target. macOS has shared source preparation
 only; native macOS tray/navigation and packaging are unverified. Windows is
-deferred. Browser fixtures exercise the real components through an isolated IPC
-stub; they do not prove native WebKit rendering, real tray clicks, OS navigation,
-or an installed end-to-end provider workflow.
+deferred. Browser fixtures exercise the real React components through an isolated
+IPC stub; integrated combined-checkout checks, wide/narrow Playwright runs on the
+merged production bundle, isolated NixOS Wayland VM tray and Codex routing
+acceptance, authorized live workflow qualification, and the single `gpt-6-astra`
+(`high`) package-closing review remain separate gates tracked in
+[validation](VALIDATION.md) and [MVP readiness](MVP-READINESS.md).
 
-For the current [Projects view](PROJECTS-VIEW.md) of projects, chats, calls, and
-inline plan summaries, plus linked sources and Settings → Connections, also read
+For the current [Projects view](PROJECTS-VIEW.md) contract, read-only observation
+semantics, and explicit Codex setup boundaries, also read
 [desktop observation](OBSERVATION.md) and [Codex MCP startup setup](CODEX-SETUP.md).
 
 The historical Milestone 3A description below predates the durable read model.

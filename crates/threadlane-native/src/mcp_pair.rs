@@ -1,7 +1,10 @@
 use std::borrow::Cow;
+use std::collections::{BTreeMap, VecDeque};
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -43,7 +46,9 @@ use crate::approved_mcp::{
     ApprovedSessionParams, ApprovedTaskParams, CancelApprovedTaskParams, ListApprovalsParams,
     StartApprovedTaskParams, HOST_NOT_CONFIGURED_MESSAGE,
 };
-use crate::auto_pair::{parse_thread_hint, AutomaticPairing, CALL_THREAD_HINT};
+use crate::auto_pair::{
+    parse_thread_hint, AutomaticPairing, AutomaticPairingRuntime, CALL_THREAD_HINT,
+};
 use crate::error::{NativeError, NativeErrorCode};
 use crate::execution_gateway::{
     CoworkerExecutionGateway, ExecutionStatusParams, PreviewExecutionParams, StartExecutionParams,
@@ -53,6 +58,10 @@ use crate::fs_safety::{constant_time_str_eq, ensure_platform_supported};
 use crate::host_launcher::{
     execute_start_approved_task_with_launcher_until, validate_host_executable_path,
     ApprovedHostLauncher, ApprovedHostLauncherPolicy,
+};
+use crate::native_chat_observation::{
+    resolve_native_sample_store_scope, ManagedParentConnectionConfig, ManagedParentEnvironment,
+    NativeChatSamplerOwner,
 };
 use crate::pairing::{
     ConnectionIdentity, EnrollmentRecord, PairingStore, CONNECTION_IDENTITY_TOOL,
@@ -64,6 +73,11 @@ use crate::planning_gateway::{
 
 const WORKFLOW_NOT_CONFIGURED_MESSAGE: &str =
     "Workflow registry and plan stores are not configured for this MCP server.";
+const PAIRING_STORE_DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
+const OBSERVATION_JOURNAL_DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_OBSERVATION_JOURNAL_CAPACITY: usize = 256;
+const HOST_NOT_READY_STARTUP_TIMEOUT_MESSAGE: &str =
+    "Approved host session is not running or has not reached authenticated ready state.";
 
 /// Parameters for the bootstrap `connection_identity` MCP tool (accepts no arguments).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -358,10 +372,986 @@ struct CachedScopedWorkflow {
     workflow: ScopedWorkflow,
 }
 
-#[derive(Debug, Clone)]
-struct PairedObservationHandle {
+type BoxedTaskLocalFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestSlotState {
+    EntryQueued,
+    EntryRunning,
+    EntryPersisted,
+    FinishQueuedWhileEntryRunning,
+    FinishQueuedAfterPersistedEntry,
+    FinishRunning,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EntryAppendOutcome {
+    Persisted,
+    SkippedOrFailed,
+    DeadlineElapsed,
+}
+
+#[derive(Debug)]
+struct FallbackFinishTemplate {
+    dir: PathBuf,
     request_id: String,
     matched_context: Option<VerifiedMcpObservationContext>,
+    binding_id: String,
+    thread_uuid: String,
+    tool_name: &'static str,
+    job_id: Option<String>,
+    approval_id: Option<String>,
+    task_id: Option<String>,
+    in_flight_body: bool,
+}
+
+impl FallbackFinishTemplate {
+    fn into_fallback_record(self) -> (PathBuf, Box<ObservationJournalRecord>) {
+        let Self {
+            dir,
+            request_id,
+            matched_context: matched,
+            binding_id,
+            thread_uuid,
+            tool_name,
+            job_id,
+            approval_id,
+            task_id,
+            in_flight_body,
+        } = self;
+        let finished_at_ms = current_observation_time_ms();
+        let op = format!("mcp.paired.{tool_name}");
+        let title = format!("mcp paired {}", tool_name.replace('_', " "));
+        let (state, summary_detail) = if in_flight_body {
+            (ObservationCallState::Unknown, format!("Interrupted {op}"))
+        } else {
+            (ObservationCallState::Cancelled, format!("Cancelled {op}"))
+        };
+        let actor = matched
+            .as_ref()
+            .map(|ctx| ctx.actor.clone())
+            .unwrap_or_else(|| ObservationActor::unknown(Some("paired_mcp".to_string())));
+        let record = Box::new(ObservationJournalRecord {
+            record_id: generate_observation_id("obsrec"),
+            request_id,
+            parent_request_id: None,
+            call_id: None,
+            phase: ObservationRecordPhase::Finish,
+            at_ms: finished_at_ms,
+            pid: Some(std::process::id()),
+            process_instance: current_process_instance(),
+            project_label: matched.as_ref().map(|ctx| ctx.project_label.clone()),
+            project_path: matched.as_ref().and_then(|ctx| ctx.project_path.clone()),
+            binding_id: Some(binding_id.clone()),
+            thread_uuid: Some(thread_uuid),
+            thread_label: matched.as_ref().map(|ctx| ctx.thread_label.clone()),
+            job_id,
+            plan_id: None,
+            task_id,
+            approval_id,
+            operation: op,
+            title,
+            state,
+            actor: Some(actor),
+            executor: Some(ObservationExecutor::local_mcp()),
+            usage: None,
+            delivery: vec![ObservationDelivery {
+                stage: ObservationDeliveryStage::Unknown,
+                at_ms: Some(finished_at_ms),
+                summary: summary_detail.clone(),
+                recipient: Some(binding_id),
+            }],
+            summary: Some(summary_detail),
+        });
+        (dir, record)
+    }
+
+    fn into_explicit_finish_record(
+        self,
+        result: &Result<CallToolResult, CallToolResult>,
+    ) -> (PathBuf, Box<ObservationJournalRecord>) {
+        let Self {
+            dir,
+            request_id,
+            matched_context: matched,
+            binding_id,
+            thread_uuid,
+            tool_name,
+            job_id: initial_correlated_job_id,
+            approval_id,
+            task_id,
+            in_flight_body: _,
+        } = self;
+        let plan_id = observation_result_plan_id(tool_name, &binding_id, result);
+        let job_id = observation_result_job_id(tool_name, &binding_id, result)
+            .or_else(|| plan_id.clone())
+            .or(initial_correlated_job_id);
+        let fallback_id = || observation_result_approval_id(tool_name, &binding_id, result);
+        let resolved_approval_id = approval_id.or_else(fallback_id);
+        let finished_at_ms = current_observation_time_ms();
+        let op = format!("mcp.paired.{tool_name}");
+        let title = format!("mcp paired {}", tool_name.replace('_', " "));
+        let (state, stage, summary_detail) = match result {
+            Ok(_) => (
+                ObservationCallState::Completed,
+                ObservationDeliveryStage::ResponseReturned,
+                format!("Completed {op}"),
+            ),
+            Err(_) => (
+                ObservationCallState::Failed,
+                ObservationDeliveryStage::Failed,
+                format!("Failed {op}"),
+            ),
+        };
+        let actor = matched
+            .as_ref()
+            .map(|ctx| ctx.actor.clone())
+            .unwrap_or_else(|| ObservationActor::unknown(Some("paired_mcp".to_string())));
+        let record = Box::new(ObservationJournalRecord {
+            record_id: generate_observation_id("obsrec"),
+            request_id,
+            parent_request_id: None,
+            call_id: None,
+            phase: ObservationRecordPhase::Finish,
+            at_ms: finished_at_ms,
+            pid: Some(std::process::id()),
+            process_instance: current_process_instance(),
+            project_label: matched.as_ref().map(|ctx| ctx.project_label.clone()),
+            project_path: matched.as_ref().and_then(|ctx| ctx.project_path.clone()),
+            binding_id: Some(binding_id.clone()),
+            thread_uuid: Some(thread_uuid),
+            thread_label: matched.as_ref().map(|ctx| ctx.thread_label.clone()),
+            job_id,
+            plan_id,
+            task_id,
+            approval_id: resolved_approval_id,
+            operation: op,
+            title,
+            state,
+            actor: Some(actor),
+            executor: Some(ObservationExecutor::local_mcp()),
+            usage: None,
+            delivery: vec![ObservationDelivery {
+                stage,
+                at_ms: Some(finished_at_ms),
+                summary: summary_detail.clone(),
+                recipient: Some(binding_id),
+            }],
+            summary: Some(summary_detail),
+        });
+        (dir, record)
+    }
+}
+
+#[derive(Debug)]
+struct ArmedObservationSlot {
+    slot_id: u64,
+    fallback: FallbackFinishTemplate,
+}
+
+fn build_explicit_finish_from_slot(
+    armed: Box<ArmedObservationSlot>,
+    result: &Result<CallToolResult, CallToolResult>,
+) -> (u64, PathBuf, Box<ObservationJournalRecord>) {
+    let ArmedObservationSlot { slot_id, fallback } = *armed;
+    let (dir, record) = fallback.into_explicit_finish_record(result);
+    (slot_id, dir, record)
+}
+
+#[derive(Debug)]
+enum QueuedJournalWork {
+    Entry {
+        slot_id: u64,
+        dir: PathBuf,
+        record: Box<ObservationJournalRecord>,
+        done_tx: tokio::sync::oneshot::Sender<
+            Result<(), threadlane_core::observation::ObservationJournalError>,
+        >,
+    },
+    Finish {
+        slot_id: u64,
+        dir: PathBuf,
+        record: Box<ObservationJournalRecord>,
+        done_tx: Option<
+            tokio::sync::oneshot::Sender<
+                Result<(), threadlane_core::observation::ObservationJournalError>,
+            >,
+        >,
+    },
+}
+
+impl QueuedJournalWork {
+    fn slot_id(&self) -> u64 {
+        match self {
+            Self::Entry { slot_id, .. } | Self::Finish { slot_id, .. } => *slot_id,
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+enum BeforeFinishSignal {
+    Unit(tokio::sync::oneshot::Sender<()>),
+    PreFinishResult(tokio::sync::oneshot::Sender<Result<(), String>>),
+}
+
+#[cfg(test)]
+fn summarize_pre_finish_result(
+    result: &Result<CallToolResult, CallToolResult>,
+) -> Result<(), String> {
+    match result {
+        Ok(ok_res) if ok_res.is_error != Some(true) => Ok(()),
+        Ok(err_res) => {
+            let detail = &err_res.structured_content;
+            Err(format!("tool returned is_error=true: {detail:?}"))
+        }
+        Err(err_res) => {
+            let detail = &err_res.structured_content;
+            Err(format!("tool returned Err: {detail:?}"))
+        }
+    }
+}
+
+#[cfg(test)]
+impl BeforeFinishSignal {
+    fn notify(self, result: &Result<CallToolResult, CallToolResult>) {
+        match self {
+            Self::Unit(tx) => {
+                let _ = tx.send(());
+            }
+            Self::PreFinishResult(tx) => {
+                let _ = tx.send(summarize_pre_finish_result(result));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct BeforeFinishBarrier {
+    signal: BeforeFinishSignal,
+    resume_rx: tokio::sync::oneshot::Receiver<()>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TestFinishAckOutcome {
+    NotAwaited,
+    Persisted,
+    JournalFailed,
+    Closed,
+    TimedOut,
+}
+
+#[cfg(not(test))]
+type FinishAckReturn = ();
+#[cfg(test)]
+type FinishAckReturn = TestFinishAckOutcome;
+
+#[derive(Debug)]
+struct ObservationJournalQueueState {
+    max_capacity: usize,
+    next_slot_id: u64,
+    slots: BTreeMap<u64, RequestSlotState>,
+    queue: VecDeque<QueuedJournalWork>,
+    worker_running: bool,
+    #[cfg(test)]
+    force_worker_spawn_failure: bool,
+    #[cfg(test)]
+    entry_started_waiters: Vec<tokio::sync::oneshot::Sender<()>>,
+    #[cfg(test)]
+    idle_waiters: Vec<tokio::sync::oneshot::Sender<()>>,
+    #[cfg(test)]
+    before_finish_barrier: Option<BeforeFinishBarrier>,
+}
+
+impl Default for ObservationJournalQueueState {
+    fn default() -> Self {
+        Self {
+            max_capacity: DEFAULT_OBSERVATION_JOURNAL_CAPACITY,
+            next_slot_id: 1,
+            slots: BTreeMap::new(),
+            queue: VecDeque::new(),
+            worker_running: false,
+            #[cfg(test)]
+            force_worker_spawn_failure: false,
+            #[cfg(test)]
+            entry_started_waiters: Vec::new(),
+            #[cfg(test)]
+            idle_waiters: Vec::new(),
+            #[cfg(test)]
+            before_finish_barrier: None,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct AsyncObservationJournal {
+    state: Arc<Mutex<ObservationJournalQueueState>>,
+}
+
+#[derive(Debug)]
+struct OwnedObservationSlotGuard {
+    journal: Arc<AsyncObservationJournal>,
+    armed: Option<Box<ArmedObservationSlot>>,
+}
+
+impl OwnedObservationSlotGuard {
+    fn disarmed(journal: Arc<AsyncObservationJournal>) -> Self {
+        Self {
+            journal,
+            armed: None,
+        }
+    }
+
+    fn is_armed(&self) -> bool {
+        self.armed.is_some()
+    }
+
+    fn disarm(&mut self) {
+        self.armed = None;
+    }
+
+    fn mark_in_flight_body(&mut self) {
+        if let Some(armed) = self.armed.as_mut() {
+            armed.fallback.in_flight_body = true;
+        }
+    }
+
+    fn cancel_if_queued_or_already_failed(&mut self) {
+        let Some(slot_id) = self.armed.as_ref().map(|armed| armed.slot_id) else {
+            return;
+        };
+        if self.journal.cancel_slot_if_queued_or_gone(slot_id) {
+            self.disarm();
+        }
+    }
+
+    fn cleanup_after_closed_channel(&mut self) {
+        let Some(armed) = self.armed.take() else {
+            return;
+        };
+        self.journal.force_release_unconfirmed_slot(armed.slot_id);
+    }
+
+    async fn submit_explicit_finish_within_budget(
+        mut self,
+        result: &Result<CallToolResult, CallToolResult>,
+        wait_budget: Duration,
+    ) -> FinishAckReturn {
+        let Some(armed) = self.armed.take() else {
+            #[cfg(test)]
+            return TestFinishAckOutcome::NotAwaited;
+            #[cfg(not(test))]
+            return;
+        };
+        let (slot_id, dir, record) = build_explicit_finish_from_slot(armed, result);
+        let want_ack = !wait_budget.is_zero();
+        let done_rx = self
+            .journal
+            .enqueue_finish_for_slot(slot_id, dir, record, want_ack);
+        let Some(done_rx) = done_rx else {
+            #[cfg(test)]
+            return TestFinishAckOutcome::NotAwaited;
+            #[cfg(not(test))]
+            return;
+        };
+        #[cfg(not(test))]
+        {
+            let _ = tokio::time::timeout(wait_budget, done_rx).await;
+        }
+        #[cfg(test)]
+        {
+            match tokio::time::timeout(wait_budget, done_rx).await {
+                Ok(Ok(Ok(()))) => TestFinishAckOutcome::Persisted,
+                Ok(Ok(Err(_))) => TestFinishAckOutcome::JournalFailed,
+                Ok(Err(_)) => TestFinishAckOutcome::Closed,
+                Err(_) => TestFinishAckOutcome::TimedOut,
+            }
+        }
+    }
+}
+
+impl Drop for OwnedObservationSlotGuard {
+    fn drop(&mut self) {
+        let Some(armed) = self.armed.take() else {
+            return;
+        };
+        self.journal.finalize_slot_on_drop(armed);
+    }
+}
+
+#[derive(Debug)]
+struct WorkerLaunchGuard {
+    state: Option<Arc<Mutex<ObservationJournalQueueState>>>,
+}
+
+impl WorkerLaunchGuard {
+    fn disarm_and_take(&mut self) -> Option<Arc<Mutex<ObservationJournalQueueState>>> {
+        self.state.take()
+    }
+}
+
+impl Drop for WorkerLaunchGuard {
+    fn drop(&mut self) {
+        if let Some(state) = self.state.take() {
+            AsyncObservationJournal::abort_unlaunched_worker(&state);
+        }
+    }
+}
+
+impl AsyncObservationJournal {
+    fn abort_unlaunched_worker(state: &Mutex<ObservationJournalQueueState>) {
+        let aborted_work: Vec<QueuedJournalWork>;
+        #[cfg(test)]
+        let aborted_entry_waiters: Vec<tokio::sync::oneshot::Sender<()>>;
+        #[cfg(test)]
+        let idle_waiters: Vec<tokio::sync::oneshot::Sender<()>>;
+        {
+            let mut guard = state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            aborted_work = guard.queue.drain(..).collect();
+            for work in &aborted_work {
+                guard.slots.remove(&work.slot_id());
+            }
+            guard
+                .slots
+                .retain(|_, slot_state| matches!(slot_state, RequestSlotState::EntryPersisted));
+            guard.worker_running = false;
+            #[cfg(test)]
+            {
+                aborted_entry_waiters = std::mem::take(&mut guard.entry_started_waiters);
+                idle_waiters = std::mem::take(&mut guard.idle_waiters);
+            }
+        }
+        drop(aborted_work);
+        #[cfg(test)]
+        {
+            drop(aborted_entry_waiters);
+            for tx in idle_waiters {
+                let _ = tx.send(());
+            }
+        }
+    }
+
+    fn spawn_worker(state: Arc<Mutex<ObservationJournalQueueState>>) {
+        #[cfg(test)]
+        if state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .force_worker_spawn_failure
+        {
+            Self::abort_unlaunched_worker(&state);
+            return;
+        }
+
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let mut launch_guard = WorkerLaunchGuard { state: Some(state) };
+            drop(handle.spawn_blocking(move || {
+                if let Some(worker_state) = launch_guard.disarm_and_take() {
+                    Self::run_worker_loop(worker_state);
+                }
+            }));
+            return;
+        }
+
+        let worker_state = Arc::clone(&state);
+        if std::thread::Builder::new()
+            .name("threadlane-obs-journal".to_string())
+            .spawn(move || Self::run_worker_loop(worker_state))
+            .is_err()
+        {
+            Self::abort_unlaunched_worker(&state);
+        }
+    }
+
+    fn run_worker_loop(state: Arc<Mutex<ObservationJournalQueueState>>) {
+        loop {
+            let next_work = {
+                let mut guard = state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let popped = loop {
+                    let Some(work) = guard.queue.pop_front() else {
+                        break None;
+                    };
+                    match &work {
+                        QueuedJournalWork::Entry { slot_id, .. } => {
+                            if guard.slots.get(slot_id) == Some(&RequestSlotState::EntryQueued) {
+                                guard.slots.insert(*slot_id, RequestSlotState::EntryRunning);
+                                #[cfg(test)]
+                                for tx in guard.entry_started_waiters.drain(..) {
+                                    let _ = tx.send(());
+                                }
+                                break Some(work);
+                            }
+                        }
+                        QueuedJournalWork::Finish { slot_id, .. } => {
+                            if guard.slots.get(slot_id)
+                                == Some(&RequestSlotState::FinishQueuedAfterPersistedEntry)
+                            {
+                                guard
+                                    .slots
+                                    .insert(*slot_id, RequestSlotState::FinishRunning);
+                                break Some(work);
+                            }
+                            guard.slots.remove(slot_id);
+                        }
+                    }
+                };
+                let Some(work) = popped else {
+                    guard.worker_running = false;
+                    #[cfg(test)]
+                    for tx in guard.idle_waiters.drain(..) {
+                        let _ = tx.send(());
+                    }
+                    break;
+                };
+                work
+            };
+
+            match next_work {
+                QueuedJournalWork::Entry {
+                    slot_id,
+                    dir,
+                    record,
+                    done_tx,
+                } => {
+                    let res = append_journal_record(&dir, &record);
+                    let entry_persisted = res.is_ok();
+                    {
+                        let mut guard = state
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        match guard.slots.get(&slot_id).copied() {
+                            Some(RequestSlotState::EntryRunning) => {
+                                if entry_persisted {
+                                    guard
+                                        .slots
+                                        .insert(slot_id, RequestSlotState::EntryPersisted);
+                                } else {
+                                    guard.slots.remove(&slot_id);
+                                }
+                            }
+                            Some(RequestSlotState::FinishQueuedWhileEntryRunning) => {
+                                if entry_persisted {
+                                    guard.slots.insert(
+                                        slot_id,
+                                        RequestSlotState::FinishQueuedAfterPersistedEntry,
+                                    );
+                                } else {
+                                    guard.slots.remove(&slot_id);
+                                    guard.queue.retain(|item| item.slot_id() != slot_id);
+                                }
+                            }
+                            _ => {
+                                guard.slots.remove(&slot_id);
+                                if !entry_persisted {
+                                    guard.queue.retain(|item| item.slot_id() != slot_id);
+                                }
+                            }
+                        }
+                    }
+                    let _ = done_tx.send(res);
+                }
+                QueuedJournalWork::Finish {
+                    slot_id,
+                    dir,
+                    record,
+                    done_tx,
+                } => {
+                    let res = append_journal_record(&dir, &record);
+                    {
+                        let mut guard = state
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        guard.slots.remove(&slot_id);
+                    }
+                    if let Some(tx) = done_tx {
+                        let _ = tx.send(res);
+                    }
+                }
+            }
+        }
+    }
+
+    fn try_admit_entry(
+        self: &Arc<Self>,
+        dir: PathBuf,
+        record: Box<ObservationJournalRecord>,
+        mut armed_slot: Box<ArmedObservationSlot>,
+    ) -> Option<(
+        OwnedObservationSlotGuard,
+        tokio::sync::oneshot::Receiver<
+            Result<(), threadlane_core::observation::ObservationJournalError>,
+        >,
+    )> {
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let (slot_id, should_spawn) = {
+            let mut guard = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if guard.slots.len() >= guard.max_capacity {
+                return None;
+            }
+            let slot_id = guard.next_slot_id;
+            guard.next_slot_id += 1;
+            guard.slots.insert(slot_id, RequestSlotState::EntryQueued);
+            guard.queue.push_back(QueuedJournalWork::Entry {
+                slot_id,
+                dir,
+                record,
+                done_tx,
+            });
+            let spawn = !guard.worker_running;
+            if spawn {
+                guard.worker_running = true;
+            }
+            (slot_id, spawn)
+        };
+        if should_spawn {
+            Self::spawn_worker(Arc::clone(&self.state));
+        }
+        armed_slot.slot_id = slot_id;
+        Some((
+            OwnedObservationSlotGuard {
+                journal: Arc::clone(self),
+                armed: Some(armed_slot),
+            },
+            done_rx,
+        ))
+    }
+
+    fn cancel_slot_if_queued_or_gone(&self, slot_id: u64) -> bool {
+        let mut guard = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match guard.slots.get(&slot_id).copied() {
+            Some(RequestSlotState::EntryQueued) => {
+                guard.slots.remove(&slot_id);
+                guard.queue.retain(|item| item.slot_id() != slot_id);
+                true
+            }
+            None => true,
+            Some(_) => false,
+        }
+    }
+
+    fn force_release_unconfirmed_slot(&self, slot_id: u64) {
+        let mut guard = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.slots.remove(&slot_id);
+        guard.queue.retain(|item| item.slot_id() != slot_id);
+    }
+
+    fn enqueue_finish_for_slot(
+        &self,
+        slot_id: u64,
+        dir: PathBuf,
+        record: Box<ObservationJournalRecord>,
+        want_ack: bool,
+    ) -> Option<
+        tokio::sync::oneshot::Receiver<
+            Result<(), threadlane_core::observation::ObservationJournalError>,
+        >,
+    > {
+        let (done_tx, done_rx) = if want_ack {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
+        let should_spawn = {
+            let mut guard = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let next_state = match guard.slots.get(&slot_id).copied() {
+                Some(RequestSlotState::EntryRunning) => {
+                    RequestSlotState::FinishQueuedWhileEntryRunning
+                }
+                Some(RequestSlotState::EntryPersisted) => {
+                    RequestSlotState::FinishQueuedAfterPersistedEntry
+                }
+                Some(RequestSlotState::EntryQueued) => {
+                    guard.slots.remove(&slot_id);
+                    guard.queue.retain(|item| item.slot_id() != slot_id);
+                    return None;
+                }
+                None
+                | Some(
+                    RequestSlotState::FinishQueuedWhileEntryRunning
+                    | RequestSlotState::FinishQueuedAfterPersistedEntry
+                    | RequestSlotState::FinishRunning,
+                ) => {
+                    return None;
+                }
+            };
+            guard.slots.insert(slot_id, next_state);
+            guard.queue.push_back(QueuedJournalWork::Finish {
+                slot_id,
+                dir,
+                record,
+                done_tx,
+            });
+            let spawn = !guard.worker_running;
+            if spawn {
+                guard.worker_running = true;
+            }
+            spawn
+        };
+        if should_spawn {
+            Self::spawn_worker(Arc::clone(&self.state));
+        }
+        done_rx
+    }
+
+    fn finalize_slot_on_drop(&self, armed: Box<ArmedObservationSlot>) {
+        let slot_id = armed.slot_id;
+        {
+            let mut guard = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match guard.slots.get(&slot_id).copied() {
+                Some(RequestSlotState::EntryQueued) => {
+                    guard.slots.remove(&slot_id);
+                    guard.queue.retain(|item| item.slot_id() != slot_id);
+                    return;
+                }
+                Some(RequestSlotState::EntryRunning | RequestSlotState::EntryPersisted) => {}
+                None
+                | Some(
+                    RequestSlotState::FinishQueuedWhileEntryRunning
+                    | RequestSlotState::FinishQueuedAfterPersistedEntry
+                    | RequestSlotState::FinishRunning,
+                ) => {
+                    return;
+                }
+            }
+        }
+        let ArmedObservationSlot { slot_id, fallback } = *armed;
+        let (dir, record) = fallback.into_fallback_record();
+        let _ = self.enqueue_finish_for_slot(slot_id, dir, record, false);
+    }
+
+    async fn append_entry_within_budget(
+        self: &Arc<Self>,
+        dir: PathBuf,
+        record: Box<ObservationJournalRecord>,
+        armed_slot: Box<ArmedObservationSlot>,
+        deadline: Option<Instant>,
+    ) -> (OwnedObservationSlotGuard, EntryAppendOutcome) {
+        let wait_budget = match deadline {
+            Some(dl) => {
+                let Some(rem) = dl.checked_duration_since(Instant::now()) else {
+                    return (
+                        OwnedObservationSlotGuard::disarmed(Arc::clone(self)),
+                        EntryAppendOutcome::DeadlineElapsed,
+                    );
+                };
+                if rem.is_zero() {
+                    return (
+                        OwnedObservationSlotGuard::disarmed(Arc::clone(self)),
+                        EntryAppendOutcome::DeadlineElapsed,
+                    );
+                }
+                rem.min(OBSERVATION_JOURNAL_DEFAULT_TIMEOUT)
+            }
+            None => OBSERVATION_JOURNAL_DEFAULT_TIMEOUT,
+        };
+
+        let Some((mut slot_guard, done_rx)) = self.try_admit_entry(dir, record, armed_slot) else {
+            let outcome = if deadline.is_some_and(|dl| Instant::now() >= dl) {
+                EntryAppendOutcome::DeadlineElapsed
+            } else {
+                EntryAppendOutcome::SkippedOrFailed
+            };
+            return (
+                OwnedObservationSlotGuard::disarmed(Arc::clone(self)),
+                outcome,
+            );
+        };
+
+        match tokio::time::timeout(wait_budget, done_rx).await {
+            Ok(Ok(Ok(()))) => {
+                if deadline.is_some_and(|dl| Instant::now() >= dl) {
+                    (slot_guard, EntryAppendOutcome::DeadlineElapsed)
+                } else {
+                    slot_guard.mark_in_flight_body();
+                    (slot_guard, EntryAppendOutcome::Persisted)
+                }
+            }
+            Ok(Ok(Err(_journal_err))) => {
+                slot_guard.disarm();
+                let outcome = if deadline.is_some_and(|dl| Instant::now() >= dl) {
+                    EntryAppendOutcome::DeadlineElapsed
+                } else {
+                    EntryAppendOutcome::SkippedOrFailed
+                };
+                (slot_guard, outcome)
+            }
+            Ok(Err(_closed)) => {
+                slot_guard.cleanup_after_closed_channel();
+                let outcome = if deadline.is_some_and(|dl| Instant::now() >= dl) {
+                    EntryAppendOutcome::DeadlineElapsed
+                } else {
+                    EntryAppendOutcome::SkippedOrFailed
+                };
+                (slot_guard, outcome)
+            }
+            Err(_elapsed) => {
+                slot_guard.cancel_if_queued_or_already_failed();
+                if let Some(dl) = deadline {
+                    if Instant::now() >= dl {
+                        (slot_guard, EntryAppendOutcome::DeadlineElapsed)
+                    } else {
+                        slot_guard.mark_in_flight_body();
+                        (slot_guard, EntryAppendOutcome::SkippedOrFailed)
+                    }
+                } else {
+                    slot_guard.mark_in_flight_body();
+                    (slot_guard, EntryAppendOutcome::SkippedOrFailed)
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn set_max_capacity_for_test(&self, max_capacity: usize) {
+        let mut guard = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.max_capacity = max_capacity.max(1);
+    }
+
+    #[cfg(test)]
+    fn set_fail_worker_spawn_for_test(&self, fail: bool) {
+        let mut guard = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.force_worker_spawn_failure = fail;
+    }
+
+    #[cfg(test)]
+    fn active_slot_count_for_test(&self) -> usize {
+        let guard = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.slots.len()
+    }
+
+    #[cfg(test)]
+    fn arm_entry_started_signal_for_test(&self) -> tokio::sync::oneshot::Receiver<()> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let mut guard = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.entry_started_waiters.push(tx);
+        rx
+    }
+
+    #[cfg(test)]
+    fn arm_before_finish_barrier_for_test(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+        let mut guard = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.before_finish_barrier = Some(BeforeFinishBarrier {
+            signal: BeforeFinishSignal::Unit(entered_tx),
+            resume_rx,
+        });
+        (entered_rx, resume_tx)
+    }
+
+    #[cfg(test)]
+    fn arm_before_finish_result_barrier_for_test(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<Result<(), String>>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+        let mut guard = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.before_finish_barrier = Some(BeforeFinishBarrier {
+            signal: BeforeFinishSignal::PreFinishResult(entered_tx),
+            resume_rx,
+        });
+        (entered_rx, resume_tx)
+    }
+
+    #[cfg(test)]
+    fn take_finish_barrier(&self) -> Option<BeforeFinishBarrier> {
+        let mut guard = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.before_finish_barrier.take()
+    }
+
+    #[cfg(test)]
+    async fn wait_for_idle_for_test(&self) {
+        let rx = {
+            let mut guard = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !guard.worker_running && guard.queue.is_empty() {
+                return;
+            }
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            guard.idle_waiters.push(tx);
+            rx
+        };
+        let _ = rx.await;
+    }
+}
+
+#[derive(Debug)]
+struct PairedObservationHandle {
+    slot_guard: OwnedObservationSlotGuard,
+}
+
+impl PairedObservationHandle {
+    #[cfg(test)]
+    fn request_id(&self) -> &str {
+        self.slot_guard
+            .armed
+            .as_deref()
+            .map(|armed| armed.fallback.request_id.as_str())
+            .expect("armed PairedObservationHandle must retain request_id")
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct TestPairedObservationHandle(PairedObservationHandle);
+
+#[cfg(test)]
+impl TestPairedObservationHandle {
+    pub(crate) fn request_id(&self) -> &str {
+        self.0.request_id()
+    }
 }
 
 /// Paired stdio MCP server that starts `Unbound` with a unique connection nonce/epoch and
@@ -378,8 +1368,11 @@ pub struct PairedMcpServer {
     host_launcher: Option<Arc<ApprovedHostLauncher>>,
     sibling_anchor_exe: Option<PathBuf>,
     coworker_native_notices: bool,
+    managed_parent_config: Option<ManagedParentConnectionConfig>,
     cached_workflow: Arc<Mutex<Option<CachedScopedWorkflow>>>,
     automatic_pairing: AutomaticPairing,
+    sampler_owner: Arc<NativeChatSamplerOwner>,
+    observation_journal: Arc<AsyncObservationJournal>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -416,10 +1409,68 @@ impl PairedMcpServer {
             host_launcher: None,
             sibling_anchor_exe: None,
             coworker_native_notices: false,
+            managed_parent_config: None,
             cached_workflow: Arc::new(Mutex::new(None)),
             automatic_pairing: AutomaticPairing::default(),
+            sampler_owner: Arc::new(NativeChatSamplerOwner::default()),
+            observation_journal: Arc::new(AsyncObservationJournal::default()),
             tool_router: Self::tool_router(),
         })
+    }
+
+    /// Overrides the managed-parent discovery and sampling configuration used by
+    /// `connect_current_chat` (used for isolated Unix WebSocket behavioral tests without mutating
+    /// global working directories or user runtime sockets).
+    #[must_use]
+    pub fn with_managed_parent_config(mut self, config: ManagedParentConnectionConfig) -> Self {
+        self.managed_parent_config = Some(config);
+        self
+    }
+
+    /// Returns `true` when a background native chat observation sampler is actively running for
+    /// this server's verified `connect_current_chat` session.
+    #[must_use]
+    pub fn has_active_native_chat_sampler(&self) -> bool {
+        self.sampler_owner.has_active_sampler()
+    }
+
+    /// Returns the active `producer_epoch` token when a native chat observation sampler is running.
+    #[must_use]
+    pub fn active_native_chat_producer_epoch(&self) -> Option<String> {
+        self.sampler_owner.active_producer_epoch()
+    }
+
+    /// Stops any active background native chat observation sampler owned by this server.
+    pub fn stop_native_chat_sampler(&self) {
+        self.sampler_owner.stop_active_sampler();
+    }
+
+    /// Resolves the canonical observation `source_id` (`src_<64hex>` or `"default"`) for this
+    /// server's configured private store scope and `verified_project_root`.
+    pub fn resolve_observation_source_id(
+        &self,
+        verified_project_root: &Path,
+    ) -> Result<String, NativeError> {
+        let context_config = crate::context_export::OperatorContextServerConfig {
+            pairing_dir: self.pairing_store.dir(),
+            state_dir: &self.state_dir,
+            workflow_stores: self
+                .workflow_stores
+                .as_ref()
+                .map(|w| (w.registry.config_dir(), w.plans.dir())),
+            host_stores: self
+                .host_stores
+                .as_ref()
+                .map(|h| (h.authority.dir(), h.sessions_dir.as_path())),
+            sibling_anchor_exe: self.sibling_anchor_exe.as_deref(),
+        };
+        let (_, source_id, _) =
+            resolve_native_sample_store_scope(&context_config, verified_project_root)?;
+        Ok(source_id)
+    }
+
+    fn managed_parent_environment(&self) -> ManagedParentEnvironment {
+        ManagedParentEnvironment::from_optional(self.managed_parent_config.clone())
     }
 
     /// Enables or disables operator-opted-in native coworker milestone notices for `start_execution`.
@@ -632,6 +1683,7 @@ impl PairedMcpServer {
         if let Ok(mut guard) = self.cached_workflow.lock() {
             *guard = None;
         }
+        self.sampler_owner.stop_active_sampler();
         self.automatic_pairing.clear_observation_context();
         let next = self
             .pairing_store
@@ -667,19 +1719,44 @@ impl PairedMcpServer {
         arguments: Value,
         _untrusted_meta: Option<Value>,
     ) -> Result<CallToolResult, CallToolResult> {
-        // Explicitly ignore `_untrusted_meta`: caller metadata is never trusted for chat identity
-        // or enrollment authority.
+        self.invoke_tool_json_boxed(tool_name, arguments, _untrusted_meta)
+            .await
+    }
+
+    fn invoke_tool_json_boxed<'a>(
+        &'a self,
+        tool_name: &'a str,
+        arguments: Value,
+        untrusted_meta: Option<Value>,
+    ) -> BoxedTaskLocalFuture<'a, Result<CallToolResult, CallToolResult>> {
+        Box::pin(async move {
+            let fut = self.prepare_tool_json_future(tool_name, arguments, untrusted_meta)?;
+            fut.await
+        })
+    }
+
+    fn prepare_tool_json_future<'a>(
+        &'a self,
+        tool_name: &'a str,
+        arguments: Value,
+        untrusted_meta: Option<Value>,
+    ) -> Result<BoxedTaskLocalFuture<'a, Result<CallToolResult, CallToolResult>>, CallToolResult>
+    {
+        // Explicitly ignore `untrusted_meta` for enrolled tools: caller metadata is never trusted
+        // for chat identity or enrollment authority.
         match tool_name {
             "connect_current_chat" => {
-                let params: ConnectionIdentityParams = Self::parse_tool_params(tool_name, arguments)?;
-                let meta = _untrusted_meta.and_then(|value| serde_json::from_value(value).ok())
-                    .unwrap_or_default();
-                self.connect_current_chat(Parameters(params), meta).await
-            }
-            CONNECTION_IDENTITY_TOOL => {
                 let params: ConnectionIdentityParams =
                     Self::parse_tool_params(tool_name, arguments)?;
-                self.connection_identity(Parameters(params)).await
+                let meta = untrusted_meta
+                    .and_then(|value| serde_json::from_value(value).ok())
+                    .unwrap_or_default();
+                Ok(self.connect_current_chat_boxed(params, meta))
+            }
+            CONNECTION_IDENTITY_TOOL => {
+                let _: ConnectionIdentityParams = Self::parse_tool_params(tool_name, arguments)?;
+                let res = self.connection_identity_sync();
+                Ok(Box::pin(std::future::ready(res)))
             }
             "enroll" | "bind" | "rebind" | "set_binding" => Err(Self::format_pairing_error(
                 tool_name,
@@ -712,240 +1789,126 @@ impl PairedMcpServer {
                     ),
                 ))
             }
+            "status"
+            | OPERATING_GUIDE_TOOL
+            | "get_run"
+            | "list_runs"
+            | "list_run_revisions"
+            | "list_run_questions"
+            | "list_activity"
+            | "start_demo"
+            | "pull_events"
+            | "ack_events"
+            | "answer"
+            | "steer"
+            | "cancel"
+            | "start_worker"
+            | "get_worker"
+            | "cancel_worker" => self.prepare_delegated_tool_json_future(tool_name, arguments),
+            "catalog"
+            | "list_plans"
+            | "get_plan"
+            | "save_draft"
+            | "publish"
+            | "list_approvals"
+            | "approved_session"
+            | "start_approved_task"
+            | "approved_task"
+            | "cancel_approved_task"
+            | "approved_activity"
+            | "approved_pull_events"
+            | "approved_ack_events" => {
+                self.prepare_workflow_or_approved_tool_json_future(tool_name, arguments)
+            }
+            "coworker_status"
+            | "prepare_work"
+            | "consult_architect"
+            | "request_technical_plan"
+            | "planning_command"
+            | "preview_execution"
+            | "start_execution"
+            | "execution_status"
+            | "stop_execution" => self.prepare_coworker_tool_json_future(tool_name, arguments),
+            _ => Err(Self::format_pairing_error(
+                tool_name,
+                NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "unknown MCP tool requested",
+                ),
+            )),
+        }
+    }
+
+    fn prepare_delegated_tool_json_future<'a>(
+        &'a self,
+        tool_name: &'a str,
+        arguments: Value,
+    ) -> Result<BoxedTaskLocalFuture<'a, Result<CallToolResult, CallToolResult>>, CallToolResult>
+    {
+        match tool_name {
             "status" => {
-                Self::ensure_no_rebind_keys(tool_name, &arguments)?;
-                let _ = self.verify_enrolled_binding_for_tool(tool_name)?;
-                let params: StatusParams = Self::parse_tool_params(tool_name, arguments)?;
-                self.status(Parameters(params)).await
+                let params = self.parse_enrolled_tool_params(tool_name, arguments)?;
+                Ok(self.status_boxed(params))
             }
             OPERATING_GUIDE_TOOL => {
-                Self::ensure_no_rebind_keys(tool_name, &arguments)?;
-                let _ = self.verify_enrolled_binding_for_tool(tool_name)?;
-                let params: OperatingGuideParams = Self::parse_tool_params(tool_name, arguments)?;
-                self.operating_guide(Parameters(params)).await
+                let params = self.parse_enrolled_tool_params(tool_name, arguments)?;
+                Ok(self.operating_guide_boxed(params))
             }
             "get_run" => {
-                Self::ensure_no_rebind_keys(tool_name, &arguments)?;
-                let _ = self.verify_enrolled_binding_for_tool(tool_name)?;
-                let params: GetRunParams = Self::parse_tool_params(tool_name, arguments)?;
-                self.get_run(Parameters(params)).await
+                let params = self.parse_enrolled_tool_params(tool_name, arguments)?;
+                Ok(self.get_run_boxed(params))
             }
             "list_runs" => {
-                Self::ensure_no_rebind_keys(tool_name, &arguments)?;
-                let _ = self.verify_enrolled_binding_for_tool(tool_name)?;
-                let params: ListRunsParams = Self::parse_tool_params(tool_name, arguments)?;
-                self.list_runs(Parameters(params)).await
+                let params = self.parse_enrolled_tool_params(tool_name, arguments)?;
+                Ok(self.list_runs_boxed(params))
             }
             "list_run_revisions" => {
-                Self::ensure_no_rebind_keys(tool_name, &arguments)?;
-                let _ = self.verify_enrolled_binding_for_tool(tool_name)?;
-                let params: ListRunRevisionsParams = Self::parse_tool_params(tool_name, arguments)?;
-                self.list_run_revisions(Parameters(params)).await
+                let params = self.parse_enrolled_tool_params(tool_name, arguments)?;
+                Ok(self.list_run_revisions_boxed(params))
             }
             "list_run_questions" => {
-                Self::ensure_no_rebind_keys(tool_name, &arguments)?;
-                let _ = self.verify_enrolled_binding_for_tool(tool_name)?;
-                let params: ListRunQuestionsParams = Self::parse_tool_params(tool_name, arguments)?;
-                self.list_run_questions(Parameters(params)).await
+                let params = self.parse_enrolled_tool_params(tool_name, arguments)?;
+                Ok(self.list_run_questions_boxed(params))
             }
             "list_activity" => {
-                Self::ensure_no_rebind_keys(tool_name, &arguments)?;
-                let _ = self.verify_enrolled_binding_for_tool(tool_name)?;
-                let params: ListActivityParams = Self::parse_tool_params(tool_name, arguments)?;
-                self.list_activity(Parameters(params)).await
+                let params = self.parse_enrolled_tool_params(tool_name, arguments)?;
+                Ok(self.list_activity_boxed(params))
             }
             "start_demo" => {
-                Self::ensure_no_rebind_keys(tool_name, &arguments)?;
-                let _ = self.verify_enrolled_binding_for_tool(tool_name)?;
-                let params: StartDemoParams = Self::parse_tool_params(tool_name, arguments)?;
-                self.start_demo(Parameters(params)).await
+                let params = self.parse_enrolled_tool_params(tool_name, arguments)?;
+                Ok(self.start_demo_boxed(params))
             }
             "pull_events" => {
-                Self::ensure_no_rebind_keys(tool_name, &arguments)?;
-                let _ = self.verify_enrolled_binding_for_tool(tool_name)?;
-                let params: PullEventsParams = Self::parse_tool_params(tool_name, arguments)?;
-                self.pull_events(Parameters(params)).await
+                let params = self.parse_enrolled_tool_params(tool_name, arguments)?;
+                Ok(self.pull_events_boxed(params))
             }
             "ack_events" => {
-                Self::ensure_no_rebind_keys(tool_name, &arguments)?;
-                let _ = self.verify_enrolled_binding_for_tool(tool_name)?;
-                let params: AckEventsParams = Self::parse_tool_params(tool_name, arguments)?;
-                self.ack_events(Parameters(params)).await
+                let params = self.parse_enrolled_tool_params(tool_name, arguments)?;
+                Ok(self.ack_events_boxed(params))
             }
             "answer" => {
-                Self::ensure_no_rebind_keys(tool_name, &arguments)?;
-                let _ = self.verify_enrolled_binding_for_tool(tool_name)?;
-                let params: AnswerParams = Self::parse_tool_params(tool_name, arguments)?;
-                self.answer(Parameters(params)).await
+                let params = self.parse_enrolled_tool_params(tool_name, arguments)?;
+                Ok(self.answer_boxed(params))
             }
             "steer" => {
-                Self::ensure_no_rebind_keys(tool_name, &arguments)?;
-                let _ = self.verify_enrolled_binding_for_tool(tool_name)?;
-                let params: SteerParams = Self::parse_tool_params(tool_name, arguments)?;
-                self.steer(Parameters(params)).await
+                let params = self.parse_enrolled_tool_params(tool_name, arguments)?;
+                Ok(self.steer_boxed(params))
             }
             "cancel" => {
-                Self::ensure_no_rebind_keys(tool_name, &arguments)?;
-                let _ = self.verify_enrolled_binding_for_tool(tool_name)?;
-                let params: CancelParams = Self::parse_tool_params(tool_name, arguments)?;
-                self.cancel(Parameters(params)).await
+                let params = self.parse_enrolled_tool_params(tool_name, arguments)?;
+                Ok(self.cancel_boxed(params))
             }
             "start_worker" => {
-                Self::ensure_no_rebind_keys(tool_name, &arguments)?;
-                let _ = self.verify_enrolled_binding_for_tool(tool_name)?;
-                let params: StartWorkerParams = Self::parse_tool_params(tool_name, arguments)?;
-                self.start_worker(Parameters(params)).await
+                let params = self.parse_enrolled_tool_params(tool_name, arguments)?;
+                Ok(self.start_worker_boxed(params))
             }
             "get_worker" => {
-                Self::ensure_no_rebind_keys(tool_name, &arguments)?;
-                let _ = self.verify_enrolled_binding_for_tool(tool_name)?;
-                let params: GetWorkerParams = Self::parse_tool_params(tool_name, arguments)?;
-                self.get_worker(Parameters(params)).await
+                let params = self.parse_enrolled_tool_params(tool_name, arguments)?;
+                Ok(self.get_worker_boxed(params))
             }
             "cancel_worker" => {
-                Self::ensure_no_rebind_keys(tool_name, &arguments)?;
-                let _ = self.verify_enrolled_binding_for_tool(tool_name)?;
-                let params: CancelWorkerParams = Self::parse_tool_params(tool_name, arguments)?;
-                self.cancel_worker(Parameters(params)).await
-            }
-            "catalog" => {
-                Self::ensure_no_rebind_keys(tool_name, &arguments)?;
-                let _ = self.verify_enrolled_binding_for_tool(tool_name)?;
-                let params: CatalogParams = Self::parse_tool_params(tool_name, arguments)?;
-                self.catalog(Parameters(params)).await
-            }
-            "list_plans" => {
-                Self::ensure_no_rebind_keys(tool_name, &arguments)?;
-                let _ = self.verify_enrolled_binding_for_tool(tool_name)?;
-                let params: ListPlansParams = Self::parse_tool_params(tool_name, arguments)?;
-                self.list_plans(Parameters(params)).await
-            }
-            "get_plan" => {
-                Self::ensure_no_rebind_keys(tool_name, &arguments)?;
-                let _ = self.verify_enrolled_binding_for_tool(tool_name)?;
-                let params: GetPlanParams = Self::parse_tool_params(tool_name, arguments)?;
-                self.get_plan(Parameters(params)).await
-            }
-            "save_draft" => {
-                Self::ensure_no_rebind_keys(tool_name, &arguments)?;
-                let _ = self.verify_enrolled_binding_for_tool(tool_name)?;
-                let params: SaveDraftParams = Self::parse_tool_params(tool_name, arguments)?;
-                self.save_draft(Parameters(params)).await
-            }
-            "publish" => {
-                Self::ensure_no_rebind_keys(tool_name, &arguments)?;
-                let _ = self.verify_enrolled_binding_for_tool(tool_name)?;
-                let params: PublishParams = Self::parse_tool_params(tool_name, arguments)?;
-                self.publish(Parameters(params)).await
-            }
-            "list_approvals" => {
-                Self::ensure_no_rebind_keys(tool_name, &arguments)?;
-                let _ = self.verify_enrolled_binding_for_tool(tool_name)?;
-                let params: ListApprovalsParams = Self::parse_tool_params(tool_name, arguments)?;
-                self.list_approvals(Parameters(params)).await
-            }
-            "approved_session" => {
-                Self::ensure_no_rebind_keys(tool_name, &arguments)?;
-                let _ = self.verify_enrolled_binding_for_tool(tool_name)?;
-                let params: ApprovedSessionParams = Self::parse_tool_params(tool_name, arguments)?;
-                self.approved_session(Parameters(params)).await
-            }
-            "start_approved_task" => {
-                Self::ensure_no_rebind_keys(tool_name, &arguments)?;
-                let _ = self.verify_enrolled_binding_for_tool(tool_name)?;
-                let params: StartApprovedTaskParams =
-                    Self::parse_tool_params(tool_name, arguments)?;
-                self.start_approved_task(Parameters(params)).await
-            }
-            "approved_task" => {
-                Self::ensure_no_rebind_keys(tool_name, &arguments)?;
-                let _ = self.verify_enrolled_binding_for_tool(tool_name)?;
-                let params: ApprovedTaskParams = Self::parse_tool_params(tool_name, arguments)?;
-                self.approved_task(Parameters(params)).await
-            }
-            "cancel_approved_task" => {
-                Self::ensure_no_rebind_keys(tool_name, &arguments)?;
-                let _ = self.verify_enrolled_binding_for_tool(tool_name)?;
-                let params: CancelApprovedTaskParams =
-                    Self::parse_tool_params(tool_name, arguments)?;
-                self.cancel_approved_task(Parameters(params)).await
-            }
-            "approved_activity" => {
-                Self::ensure_no_rebind_keys(tool_name, &arguments)?;
-                let _ = self.verify_enrolled_binding_for_tool(tool_name)?;
-                let params: ApprovedActivityParams =
-                    Self::parse_tool_params(tool_name, arguments)?;
-                self.approved_activity(Parameters(params)).await
-            }
-            "approved_pull_events" => {
-                Self::ensure_no_rebind_keys(tool_name, &arguments)?;
-                let _ = self.verify_enrolled_binding_for_tool(tool_name)?;
-                let params: ApprovedPullEventsParams =
-                    Self::parse_tool_params(tool_name, arguments)?;
-                self.approved_pull_events(Parameters(params)).await
-            }
-            "approved_ack_events" => {
-                Self::ensure_no_rebind_keys(tool_name, &arguments)?;
-                let _ = self.verify_enrolled_binding_for_tool(tool_name)?;
-                let params: ApprovedAckEventsParams =
-                    Self::parse_tool_params(tool_name, arguments)?;
-                self.approved_ack_events(Parameters(params)).await
-            }
-            "coworker_status" => {
-                Self::ensure_no_rebind_keys(tool_name, &arguments)?;
-                let _ = self.verify_enrolled_binding_for_tool(tool_name)?;
-                let params: CoworkerStatusParams = Self::parse_tool_params(tool_name, arguments)?;
-                self.coworker_status(Parameters(params)).await
-            }
-            "prepare_work" => {
-                Self::ensure_no_rebind_keys(tool_name, &arguments)?;
-                let _ = self.verify_enrolled_binding_for_tool(tool_name)?;
-                let params: PrepareWorkParams = Self::parse_tool_params(tool_name, arguments)?;
-                self.prepare_work(Parameters(params)).await
-            }
-            "consult_architect" => {
-                Self::ensure_no_rebind_keys(tool_name, &arguments)?;
-                let _ = self.verify_enrolled_binding_for_tool(tool_name)?;
-                let params: ConsultArchitectParams =
-                    Self::parse_tool_params(tool_name, arguments)?;
-                self.consult_architect(Parameters(params)).await
-            }
-            "request_technical_plan" => {
-                Self::ensure_no_rebind_keys(tool_name, &arguments)?;
-                let _ = self.verify_enrolled_binding_for_tool(tool_name)?;
-                let params: RequestTechnicalPlanParams =
-                    Self::parse_tool_params(tool_name, arguments)?;
-                self.request_technical_plan(Parameters(params)).await
-            }
-            "planning_command" => {
-                Self::ensure_no_rebind_keys(tool_name, &arguments)?;
-                let _ = self.verify_enrolled_binding_for_tool(tool_name)?;
-                let params: PlanningCommandParams = Self::parse_tool_params(tool_name, arguments)?;
-                self.planning_command(Parameters(params)).await
-            }
-            "preview_execution" => {
-                Self::ensure_no_rebind_keys(tool_name, &arguments)?;
-                let _ = self.verify_enrolled_binding_for_tool(tool_name)?;
-                let params: PreviewExecutionParams = Self::parse_tool_params(tool_name, arguments)?;
-                self.preview_execution(Parameters(params)).await
-            }
-            "start_execution" => {
-                Self::ensure_no_rebind_keys(tool_name, &arguments)?;
-                let _ = self.verify_enrolled_binding_for_tool(tool_name)?;
-                let params: StartExecutionParams = Self::parse_tool_params(tool_name, arguments)?;
-                self.start_execution(Parameters(params)).await
-            }
-            "execution_status" => {
-                Self::ensure_no_rebind_keys(tool_name, &arguments)?;
-                let _ = self.verify_enrolled_binding_for_tool(tool_name)?;
-                let params: ExecutionStatusParams = Self::parse_tool_params(tool_name, arguments)?;
-                self.execution_status(Parameters(params)).await
-            }
-            "stop_execution" => {
-                Self::ensure_no_rebind_keys(tool_name, &arguments)?;
-                let _ = self.verify_enrolled_binding_for_tool(tool_name)?;
-                let params: StopExecutionParams = Self::parse_tool_params(tool_name, arguments)?;
-                self.stop_execution(Parameters(params)).await
+                let params = self.parse_enrolled_tool_params(tool_name, arguments)?;
+                Ok(self.cancel_worker_boxed(params))
             }
             _ => Err(Self::format_pairing_error(
                 tool_name,
@@ -955,6 +1918,154 @@ impl PairedMcpServer {
                 ),
             )),
         }
+    }
+
+    fn prepare_workflow_or_approved_tool_json_future<'a>(
+        &'a self,
+        tool_name: &'a str,
+        arguments: Value,
+    ) -> Result<BoxedTaskLocalFuture<'a, Result<CallToolResult, CallToolResult>>, CallToolResult>
+    {
+        match tool_name {
+            "catalog" => {
+                let params = self.parse_enrolled_tool_params(tool_name, arguments)?;
+                Ok(self.catalog_boxed(params))
+            }
+            "list_plans" => {
+                let params = self.parse_enrolled_tool_params(tool_name, arguments)?;
+                Ok(self.list_plans_boxed(params))
+            }
+            "get_plan" => {
+                let params = self.parse_enrolled_tool_params(tool_name, arguments)?;
+                Ok(self.get_plan_boxed(params))
+            }
+            "save_draft" => {
+                let params = self.parse_enrolled_tool_params(tool_name, arguments)?;
+                Ok(self.save_draft_boxed(params))
+            }
+            "publish" => {
+                let params = self.parse_enrolled_tool_params(tool_name, arguments)?;
+                Ok(self.publish_boxed(params))
+            }
+            "list_approvals" => {
+                let params = self.parse_enrolled_tool_params(tool_name, arguments)?;
+                Ok(self.list_approvals_boxed(params))
+            }
+            "approved_session" => {
+                let params = self.parse_enrolled_tool_params(tool_name, arguments)?;
+                Ok(self.approved_session_boxed(params))
+            }
+            "start_approved_task" => {
+                Self::ensure_no_rebind_keys(tool_name, &arguments)?;
+                Ok(Box::pin(async move {
+                    let startup_deadline = self
+                        .host_launcher
+                        .as_ref()
+                        .map(|launcher| Instant::now() + launcher.policy().startup_timeout());
+                    let enrollment = self
+                        .verify_enrolled_binding_for_tool_until(tool_name, startup_deadline)
+                        .await?;
+                    let params: StartApprovedTaskParams =
+                        Self::parse_tool_params(tool_name, arguments)?;
+                    self.start_approved_task_with_deadline(
+                        params,
+                        startup_deadline,
+                        Some(enrollment),
+                    )
+                    .await
+                }))
+            }
+            "approved_task" => {
+                let params = self.parse_enrolled_tool_params(tool_name, arguments)?;
+                Ok(self.approved_task_boxed(params))
+            }
+            "cancel_approved_task" => {
+                let params = self.parse_enrolled_tool_params(tool_name, arguments)?;
+                Ok(self.cancel_approved_task_boxed(params))
+            }
+            "approved_activity" => {
+                let params = self.parse_enrolled_tool_params(tool_name, arguments)?;
+                Ok(self.approved_activity_boxed(params))
+            }
+            "approved_pull_events" => {
+                let params = self.parse_enrolled_tool_params(tool_name, arguments)?;
+                Ok(self.approved_pull_events_boxed(params))
+            }
+            "approved_ack_events" => {
+                let params = self.parse_enrolled_tool_params(tool_name, arguments)?;
+                Ok(self.approved_ack_events_boxed(params))
+            }
+            _ => Err(Self::format_pairing_error(
+                tool_name,
+                NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "unknown MCP tool requested",
+                ),
+            )),
+        }
+    }
+
+    fn prepare_coworker_tool_json_future<'a>(
+        &'a self,
+        tool_name: &'a str,
+        arguments: Value,
+    ) -> Result<BoxedTaskLocalFuture<'a, Result<CallToolResult, CallToolResult>>, CallToolResult>
+    {
+        match tool_name {
+            "coworker_status" => {
+                let params = self.parse_enrolled_tool_params(tool_name, arguments)?;
+                Ok(self.coworker_status_boxed(params))
+            }
+            "prepare_work" => {
+                let params = self.parse_enrolled_tool_params(tool_name, arguments)?;
+                Ok(self.prepare_work_boxed(params))
+            }
+            "consult_architect" => {
+                let params = self.parse_enrolled_tool_params(tool_name, arguments)?;
+                Ok(self.consult_architect_boxed(params))
+            }
+            "request_technical_plan" => {
+                let params = self.parse_enrolled_tool_params(tool_name, arguments)?;
+                Ok(self.request_technical_plan_boxed(params))
+            }
+            "planning_command" => {
+                let params = self.parse_enrolled_tool_params(tool_name, arguments)?;
+                Ok(self.planning_command_boxed(params))
+            }
+            "preview_execution" => {
+                let params = self.parse_enrolled_tool_params(tool_name, arguments)?;
+                Ok(self.preview_execution_boxed(params))
+            }
+            "start_execution" => {
+                let params = self.parse_enrolled_tool_params(tool_name, arguments)?;
+                Ok(self.start_execution_boxed(params))
+            }
+            "execution_status" => {
+                let params = self.parse_enrolled_tool_params(tool_name, arguments)?;
+                Ok(self.execution_status_boxed(params))
+            }
+            "stop_execution" => {
+                let params = self.parse_enrolled_tool_params(tool_name, arguments)?;
+                Ok(self.stop_execution_boxed(params))
+            }
+            _ => Err(Self::format_pairing_error(
+                tool_name,
+                NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "unknown MCP tool requested",
+                ),
+            )),
+        }
+    }
+
+    fn parse_enrolled_tool_params<T: for<'de> Deserialize<'de>>(
+        &self,
+        tool_name: &str,
+        arguments: Value,
+    ) -> Result<T, CallToolResult> {
+        Self::ensure_no_rebind_keys(tool_name, &arguments)?;
+        let _ = self.verify_enrolled_binding_for_tool(tool_name)?;
+        Self::parse_tool_params(tool_name, arguments)
     }
 
     fn ensure_no_rebind_keys(tool_name: &str, arguments: &Value) -> Result<(), CallToolResult> {
@@ -1047,14 +2158,12 @@ impl PairedMcpServer {
         })
     }
 
-    fn verify_enrolled_binding_for_tool(
+    fn revalidate_enrollment_record_on_task(
         &self,
         tool_name: &str,
+        store_result: Result<EnrollmentRecord, NativeError>,
     ) -> Result<EnrollmentRecord, CallToolResult> {
-        let enrollment = match self
-            .pairing_store
-            .verify_enrolled_binding(&self.connection_nonce, &self.epoch_id)
-        {
+        let enrollment = match store_result {
             Ok(record) => record,
             Err(err) => {
                 if let Ok(mut guard) = self.cached_workflow.lock() {
@@ -1089,6 +2198,94 @@ impl PairedMcpServer {
         Ok(enrollment)
     }
 
+    fn verify_enrolled_binding_for_tool(
+        &self,
+        tool_name: &str,
+    ) -> Result<EnrollmentRecord, CallToolResult> {
+        self.automatic_pairing
+            .verify_call_hint_present_if_required()
+            .map_err(|err| Self::format_pairing_error(tool_name, err))?;
+        let store_result = self
+            .pairing_store
+            .verify_enrolled_binding(&self.connection_nonce, &self.epoch_id);
+        self.revalidate_enrollment_record_on_task(tool_name, store_result)
+    }
+
+    async fn verify_enrolled_binding_for_tool_until(
+        &self,
+        tool_name: &str,
+        deadline: Option<Instant>,
+    ) -> Result<EnrollmentRecord, CallToolResult> {
+        self.automatic_pairing
+            .verify_call_hint_present_if_required()
+            .map_err(|err| Self::format_pairing_error(tool_name, err))?;
+
+        let wait_budget = match deadline {
+            Some(dl) => {
+                let Some(rem) = dl.checked_duration_since(Instant::now()) else {
+                    return Err(Self::format_unscoped_tool_error(
+                        tool_name,
+                        "host_not_ready",
+                        HOST_NOT_READY_STARTUP_TIMEOUT_MESSAGE,
+                    ));
+                };
+                rem
+            }
+            None => PAIRING_STORE_DEFAULT_TIMEOUT,
+        };
+
+        let pairing_store = self.pairing_store.clone();
+        let nonce = self.connection_nonce.clone();
+        let epoch = self.epoch_id.clone();
+        let store_result = match tokio::time::timeout(
+            wait_budget,
+            tokio::task::spawn_blocking(move || {
+                pairing_store.verify_enrolled_binding(&nonce, &epoch)
+            }),
+        )
+        .await
+        {
+            Ok(Ok(res)) => res,
+            Ok(Err(_join_err)) => {
+                return Err(Self::format_pairing_error(
+                    tool_name,
+                    NativeError::new(
+                        NativeErrorCode::IoError,
+                        "pairing store background verification task failed to complete",
+                    ),
+                ));
+            }
+            Err(_elapsed) => {
+                return Err(match deadline {
+                    Some(_) => Self::format_unscoped_tool_error(
+                        tool_name,
+                        "host_not_ready",
+                        HOST_NOT_READY_STARTUP_TIMEOUT_MESSAGE,
+                    ),
+                    None => Self::format_pairing_error(
+                        tool_name,
+                        NativeError::new(
+                            NativeErrorCode::TimedOut,
+                            "pairing store verification timed out",
+                        ),
+                    ),
+                });
+            }
+        };
+
+        let enrollment = self.revalidate_enrollment_record_on_task(tool_name, store_result)?;
+        if let Some(dl) = deadline {
+            if Instant::now() >= dl {
+                return Err(Self::format_unscoped_tool_error(
+                    tool_name,
+                    "host_not_ready",
+                    HOST_NOT_READY_STARTUP_TIMEOUT_MESSAGE,
+                ));
+            }
+        }
+        Ok(enrollment)
+    }
+
     fn observation_journal_dir(&self) -> PathBuf {
         self.workflow_stores
             .as_ref()
@@ -1115,13 +2312,24 @@ impl PairedMcpServer {
         binding_id: &str,
         thread_uuid: &str,
     ) -> Option<VerifiedMcpObservationContext> {
+        self.refreshed_observation_context_until(binding_id, thread_uuid, None)
+            .await
+    }
+
+    async fn refreshed_observation_context_until(
+        &self,
+        binding_id: &str,
+        thread_uuid: &str,
+        deadline: Option<Instant>,
+    ) -> Option<VerifiedMcpObservationContext> {
         self.automatic_pairing
-            .refresh_observation_context_for_call(
+            .refresh_observation_context_for_call_until(
                 &self.connection_nonce,
                 &self.epoch_id,
                 self.server_pid,
                 binding_id,
                 thread_uuid,
+                deadline,
             )
             .await
     }
@@ -1162,14 +2370,112 @@ impl PairedMcpServer {
             .set_test_metadata_refresher(refresher);
     }
 
-    async fn begin_paired_observation(
+    #[cfg(test)]
+    pub(crate) fn set_test_observation_journal_capacity(&self, max_capacity: usize) {
+        self.observation_journal
+            .set_max_capacity_for_test(max_capacity);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_test_observation_journal_fail_worker_spawn(&self, fail: bool) {
+        self.observation_journal
+            .set_fail_worker_spawn_for_test(fail);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_observation_journal_slot_count_for_test(&self) -> usize {
+        self.observation_journal.active_slot_count_for_test()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn arm_test_observation_entry_started_signal(
         &self,
-        binding_id: &str,
-        thread_uuid: &str,
+    ) -> tokio::sync::oneshot::Receiver<()> {
+        self.observation_journal.arm_entry_started_signal_for_test()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn arm_test_observation_before_finish_barrier(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        self.observation_journal
+            .arm_before_finish_barrier_for_test()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn arm_test_observation_before_finish_result_barrier(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<Result<(), String>>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        self.observation_journal
+            .arm_before_finish_result_barrier_for_test()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn wait_for_observation_journal_idle_for_test(&self) {
+        self.observation_journal.wait_for_idle_for_test().await;
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn begin_persisted_paired_observation_for_test(
+        &self,
         tool_name: &'static str,
         approval_id: Option<&str>,
         task_id: Option<&str>,
-    ) -> PairedObservationHandle {
+    ) -> TestPairedObservationHandle {
+        let enrollment = self
+            .verify_enrolled_binding_for_tool(tool_name)
+            .expect("verify enrolled binding for test observation Entry");
+        let (handle, outcome) = self
+            .begin_paired_observation_core_with_outcome(
+                &enrollment.binding_id,
+                &enrollment.thread_id,
+                tool_name,
+                None,
+                approval_id,
+                task_id,
+                None,
+            )
+            .await;
+        assert_eq!(
+            outcome,
+            EntryAppendOutcome::Persisted,
+            "test observation Entry must persist before Finish fault injection"
+        );
+        assert!(
+            handle.slot_guard.is_armed(),
+            "persisted test observation Entry must leave slot guard armed"
+        );
+        TestPairedObservationHandle(handle)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn finish_paired_observation_until_for_test(
+        &self,
+        observation: TestPairedObservationHandle,
+        deadline: Option<Instant>,
+        result: &Result<CallToolResult, CallToolResult>,
+    ) -> TestFinishAckOutcome {
+        if !observation.0.slot_guard.is_armed() {
+            return TestFinishAckOutcome::NotAwaited;
+        }
+        self.finish_paired_observation_armed(observation.0.slot_guard, deadline, result)
+            .await
+    }
+
+    fn begin_paired_observation<'a>(
+        &'a self,
+        binding_id: &'a str,
+        thread_uuid: &'a str,
+        tool_name: &'static str,
+        approval_id: Option<&'a str>,
+        task_id: Option<&'a str>,
+    ) -> BoxedTaskLocalFuture<'a, PairedObservationHandle> {
         self.begin_paired_observation_with_job(
             binding_id,
             thread_uuid,
@@ -1178,10 +2484,59 @@ impl PairedMcpServer {
             approval_id,
             task_id,
         )
-        .await
     }
 
-    async fn begin_paired_observation_with_job(
+    fn begin_paired_observation_with_job<'a>(
+        &'a self,
+        binding_id: &'a str,
+        thread_uuid: &'a str,
+        tool_name: &'static str,
+        job_id: Option<&'a str>,
+        approval_id: Option<&'a str>,
+        task_id: Option<&'a str>,
+    ) -> BoxedTaskLocalFuture<'a, PairedObservationHandle> {
+        Box::pin(async move {
+            match self
+                .begin_paired_observation_core(
+                    binding_id,
+                    thread_uuid,
+                    tool_name,
+                    job_id,
+                    approval_id,
+                    task_id,
+                    None,
+                )
+                .await
+            {
+                Ok(handle) | Err(handle) => handle,
+            }
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn begin_paired_observation_until<'a>(
+        &'a self,
+        binding_id: &'a str,
+        thread_uuid: &'a str,
+        tool_name: &'static str,
+        job_id: Option<&'a str>,
+        approval_id: Option<&'a str>,
+        task_id: Option<&'a str>,
+        deadline: Option<Instant>,
+    ) -> BoxedTaskLocalFuture<'a, Result<PairedObservationHandle, PairedObservationHandle>> {
+        Box::pin(self.begin_paired_observation_core(
+            binding_id,
+            thread_uuid,
+            tool_name,
+            job_id,
+            approval_id,
+            task_id,
+            deadline,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_paired_entry_payload(
         &self,
         binding_id: &str,
         thread_uuid: &str,
@@ -1189,188 +2544,206 @@ impl PairedMcpServer {
         job_id: Option<&str>,
         approval_id: Option<&str>,
         task_id: Option<&str>,
-    ) -> PairedObservationHandle {
+        matched: Option<VerifiedMcpObservationContext>,
+    ) -> (
+        PathBuf,
+        Box<ObservationJournalRecord>,
+        Box<ArmedObservationSlot>,
+    ) {
         let request_id = generate_observation_id("obsreq");
         let dir = self.observation_journal_dir();
         let started_at_ms = current_observation_time_ms();
         let op = format!("mcp.paired.{tool_name}");
         let title = format!("mcp paired {}", tool_name.replace('_', " "));
-        let matched = self
-            .refreshed_observation_context(binding_id, thread_uuid)
-            .await;
         let actor = matched
             .as_ref()
             .map(|ctx| ctx.actor.clone())
             .unwrap_or_else(|| ObservationActor::unknown(Some("paired_mcp".to_string())));
         let correlated_job_id =
             job_id.and_then(threadlane_core::observation::validate_correlation_id);
-        let _ = append_journal_record(
-            &dir,
-            &ObservationJournalRecord {
-                record_id: generate_observation_id("obsrec"),
-                request_id: request_id.clone(),
-                parent_request_id: None,
-                call_id: None,
-                phase: ObservationRecordPhase::Entry,
-                at_ms: started_at_ms,
-                pid: Some(std::process::id()),
-                process_instance: current_process_instance(),
-                project_label: matched.as_ref().map(|ctx| ctx.project_label.clone()),
-                project_path: matched.as_ref().and_then(|ctx| ctx.project_path.clone()),
-                binding_id: Some(binding_id.to_string()),
-                thread_uuid: Some(thread_uuid.to_string()),
-                thread_label: matched.as_ref().map(|ctx| ctx.thread_label.clone()),
+        let record = Box::new(ObservationJournalRecord {
+            record_id: generate_observation_id("obsrec"),
+            request_id: request_id.clone(),
+            parent_request_id: None,
+            call_id: None,
+            phase: ObservationRecordPhase::Entry,
+            at_ms: started_at_ms,
+            pid: Some(std::process::id()),
+            process_instance: current_process_instance(),
+            project_label: matched.as_ref().map(|ctx| ctx.project_label.clone()),
+            project_path: matched.as_ref().and_then(|ctx| ctx.project_path.clone()),
+            binding_id: Some(binding_id.to_string()),
+            thread_uuid: Some(thread_uuid.to_string()),
+            thread_label: matched.as_ref().map(|ctx| ctx.thread_label.clone()),
+            job_id: correlated_job_id.clone(),
+            plan_id: None,
+            task_id: task_id.map(str::to_string),
+            approval_id: approval_id.map(str::to_string),
+            operation: op.clone(),
+            title,
+            state: ObservationCallState::Running,
+            actor: Some(actor),
+            executor: Some(ObservationExecutor::local_mcp()),
+            usage: None,
+            delivery: Vec::new(),
+            summary: Some(format!("MCP tool {op}")),
+        });
+        let armed = Box::new(ArmedObservationSlot {
+            slot_id: 0,
+            fallback: FallbackFinishTemplate {
+                dir: dir.clone(),
+                request_id,
+                matched_context: matched,
+                binding_id: binding_id.to_string(),
+                thread_uuid: thread_uuid.to_string(),
+                tool_name,
                 job_id: correlated_job_id,
-                plan_id: None,
-                task_id: task_id.map(str::to_string),
                 approval_id: approval_id.map(str::to_string),
-                operation: op.clone(),
-                title,
-                state: ObservationCallState::Running,
-                actor: Some(actor),
-                executor: Some(ObservationExecutor::local_mcp()),
-                usage: None,
-                delivery: Vec::new(),
-                summary: Some(format!("MCP tool {op}")),
+                task_id: task_id.map(str::to_string),
+                in_flight_body: false,
             },
-        );
-        PairedObservationHandle {
-            request_id,
-            matched_context: matched,
+        });
+        (dir, record, armed)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn begin_paired_observation_core(
+        &self,
+        binding_id: &str,
+        thread_uuid: &str,
+        tool_name: &'static str,
+        job_id: Option<&str>,
+        approval_id: Option<&str>,
+        task_id: Option<&str>,
+        deadline: Option<Instant>,
+    ) -> Result<PairedObservationHandle, PairedObservationHandle> {
+        let (handle, outcome) = self
+            .begin_paired_observation_core_with_outcome(
+                binding_id,
+                thread_uuid,
+                tool_name,
+                job_id,
+                approval_id,
+                task_id,
+                deadline,
+            )
+            .await;
+        match outcome {
+            EntryAppendOutcome::DeadlineElapsed => Err(handle),
+            EntryAppendOutcome::Persisted | EntryAppendOutcome::SkippedOrFailed => Ok(handle),
         }
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn finish_paired_observation(
+    async fn begin_paired_observation_core_with_outcome(
         &self,
-        observation: PairedObservationHandle,
         binding_id: &str,
         thread_uuid: &str,
         tool_name: &'static str,
+        job_id: Option<&str>,
         approval_id: Option<&str>,
         task_id: Option<&str>,
-        result: &Result<CallToolResult, CallToolResult>,
-    ) {
-        self.finish_paired_observation_with_job(
-            observation,
+        deadline: Option<Instant>,
+    ) -> (PairedObservationHandle, EntryAppendOutcome) {
+        let matched = self
+            .refreshed_observation_context_until(binding_id, thread_uuid, deadline)
+            .await;
+        let (dir, record, armed) = self.build_paired_entry_payload(
             binding_id,
             thread_uuid,
             tool_name,
-            None,
+            job_id,
             approval_id,
             task_id,
-            result,
+            matched,
         );
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn finish_paired_observation_with_job(
-        &self,
-        observation: PairedObservationHandle,
-        binding_id: &str,
-        thread_uuid: &str,
-        tool_name: &'static str,
-        initial_job_id: Option<&str>,
-        approval_id: Option<&str>,
-        task_id: Option<&str>,
-        result: &Result<CallToolResult, CallToolResult>,
-    ) {
-        let PairedObservationHandle {
-            request_id,
-            matched_context: matched,
-        } = observation;
-        let plan_id = observation_result_plan_id(tool_name, binding_id, result);
-        let job_id = observation_result_job_id(tool_name, binding_id, result)
-            .or_else(|| plan_id.clone())
-            .or_else(|| {
-                initial_job_id.and_then(threadlane_core::observation::validate_correlation_id)
-            });
-        let resolved_approval_id = approval_id
-            .map(str::to_string)
-            .or_else(|| observation_result_approval_id(tool_name, binding_id, result));
-        let dir = self.observation_journal_dir();
-        let finished_at_ms = current_observation_time_ms();
-        let op = format!("mcp.paired.{tool_name}");
-        let title = format!("mcp paired {}", tool_name.replace('_', " "));
-        let (state, stage, summary_detail) = match result {
-            Ok(_) => (
-                ObservationCallState::Completed,
-                ObservationDeliveryStage::ResponseReturned,
-                format!("Completed {op}"),
-            ),
-            Err(_) => (
-                ObservationCallState::Failed,
-                ObservationDeliveryStage::Failed,
-                format!("Failed {op}"),
-            ),
-        };
-        let actor = matched
-            .as_ref()
-            .map(|ctx| ctx.actor.clone())
-            .unwrap_or_else(|| ObservationActor::unknown(Some("paired_mcp".to_string())));
-        let _ = append_journal_record(
-            &dir,
-            &ObservationJournalRecord {
-                record_id: generate_observation_id("obsrec"),
-                request_id,
-                parent_request_id: None,
-                call_id: None,
-                phase: ObservationRecordPhase::Finish,
-                at_ms: finished_at_ms,
-                pid: Some(std::process::id()),
-                process_instance: current_process_instance(),
-                project_label: matched.as_ref().map(|ctx| ctx.project_label.clone()),
-                project_path: matched.as_ref().and_then(|ctx| ctx.project_path.clone()),
-                binding_id: Some(binding_id.to_string()),
-                thread_uuid: Some(thread_uuid.to_string()),
-                thread_label: matched.as_ref().map(|ctx| ctx.thread_label.clone()),
-                job_id,
-                plan_id,
-                task_id: task_id.map(str::to_string),
-                approval_id: resolved_approval_id,
-                operation: op,
-                title,
-                state,
-                actor: Some(actor),
-                executor: Some(ObservationExecutor::local_mcp()),
-                usage: None,
-                delivery: vec![ObservationDelivery {
-                    stage,
-                    at_ms: Some(finished_at_ms),
-                    summary: summary_detail.clone(),
-                    recipient: Some(binding_id.to_string()),
-                }],
-                summary: Some(summary_detail),
-            },
-        );
-    }
-
-    async fn enrolled_delegate(
-        &self,
-        tool_name: &str,
-    ) -> Result<ThreadlaneMcpServer, CallToolResult> {
-        let enrollment = self.verify_enrolled_binding_for_tool(tool_name)?;
-        let matched = self
-            .refreshed_observation_context(&enrollment.binding_id, &enrollment.thread_id)
+        let (slot_guard, outcome) = self
+            .observation_journal
+            .append_entry_within_budget(dir, record, armed, deadline)
             .await;
+        (PairedObservationHandle { slot_guard }, outcome)
+    }
 
-        let scoped_client = ScopedClient::from_state_dir_lazy(
-            &self.state_dir,
-            &enrollment.binding_id,
-        )
-        .map_err(|err| {
-            Self::format_pairing_error(
-                tool_name,
-                NativeError::new(
-                    NativeErrorCode::InvalidConfig,
-                    format!("failed to construct scoped client for enrolled binding: {err}"),
-                ),
-            )
-        })?;
+    fn finish_paired_observation<'a>(
+        &'a self,
+        observation: PairedObservationHandle,
+        result: &'a Result<CallToolResult, CallToolResult>,
+    ) -> BoxedTaskLocalFuture<'a, ()> {
+        self.finish_paired_observation_until(observation, None, result)
+    }
 
-        Ok(ThreadlaneMcpServer::new(scoped_client)
-            .with_paired_observation(enrollment.thread_id, self.observation_journal_dir())
-            .with_paired_observation_context(matched))
+    fn finish_paired_observation_until<'a>(
+        &'a self,
+        observation: PairedObservationHandle,
+        deadline: Option<Instant>,
+        result: &'a Result<CallToolResult, CallToolResult>,
+    ) -> BoxedTaskLocalFuture<'a, ()> {
+        if !observation.slot_guard.is_armed() {
+            return Box::pin(std::future::ready(()));
+        }
+        Box::pin(async move {
+            let slot_guard = observation.slot_guard;
+            #[cfg(not(test))]
+            self.finish_paired_observation_armed(slot_guard, deadline, result)
+                .await;
+            #[cfg(test)]
+            let _: TestFinishAckOutcome = self
+                .finish_paired_observation_armed(slot_guard, deadline, result)
+                .await;
+        })
+    }
+
+    async fn finish_paired_observation_armed(
+        &self,
+        slot_guard: OwnedObservationSlotGuard,
+        deadline: Option<Instant>,
+        result: &Result<CallToolResult, CallToolResult>,
+    ) -> FinishAckReturn {
+        #[cfg(test)]
+        if let Some(barrier) = self.observation_journal.take_finish_barrier() {
+            barrier.signal.notify(result);
+            let _ = barrier.resume_rx.await;
+        }
+        let wait_budget = match deadline {
+            Some(dl) => dl
+                .checked_duration_since(Instant::now())
+                .unwrap_or(Duration::ZERO)
+                .min(OBSERVATION_JOURNAL_DEFAULT_TIMEOUT),
+            None => OBSERVATION_JOURNAL_DEFAULT_TIMEOUT,
+        };
+        slot_guard
+            .submit_explicit_finish_within_budget(result, wait_budget)
+            .await
+    }
+
+    fn enrolled_delegate<'a>(
+        &'a self,
+        tool_name: &'a str,
+    ) -> BoxedTaskLocalFuture<'a, Result<ThreadlaneMcpServer, CallToolResult>> {
+        Box::pin(async move {
+            let enrollment = self.verify_enrolled_binding_for_tool(tool_name)?;
+            let matched = self
+                .refreshed_observation_context(&enrollment.binding_id, &enrollment.thread_id)
+                .await;
+
+            let scoped_client =
+                ScopedClient::from_state_dir_lazy(&self.state_dir, &enrollment.binding_id)
+                    .map_err(|err| {
+                        Self::format_pairing_error(
+                            tool_name,
+                            NativeError::new(
+                                NativeErrorCode::InvalidConfig,
+                                format!(
+                                    "failed to construct scoped client for enrolled binding: {err}"
+                                ),
+                            ),
+                        )
+                    })?;
+
+            Ok(ThreadlaneMcpServer::new(scoped_client)
+                .with_paired_observation(enrollment.thread_id, self.observation_journal_dir())
+                .with_paired_observation_context(matched))
+        })
     }
 
     fn scoped_workflow_for_enrolled(
@@ -1412,69 +2785,64 @@ impl PairedMcpServer {
         Ok(workflow)
     }
 
-    async fn run_workflow_blocking<T, F>(
+    fn run_workflow_blocking<T, F>(
         &self,
         tool_name: &'static str,
         op: F,
-    ) -> Result<CallToolResult, CallToolResult>
+    ) -> BoxedTaskLocalFuture<'_, Result<CallToolResult, CallToolResult>>
     where
         T: Serialize + Send + 'static,
         F: FnOnce(ScopedWorkflow) -> Result<T, WorkflowError> + Send + 'static,
     {
-        let enrollment = self.verify_enrolled_binding_for_tool(tool_name)?;
-        let trusted_binding_id = enrollment.binding_id;
-        let trusted_thread_uuid = enrollment.thread_id;
+        Box::pin(async move {
+            let enrollment = self.verify_enrolled_binding_for_tool(tool_name)?;
+            let trusted_binding_id = enrollment.binding_id;
+            let trusted_thread_uuid = enrollment.thread_id;
 
-        let Some(stores) = self.workflow_stores.as_ref() else {
-            return Err(Self::format_scoped_error(
-                &trusted_binding_id,
-                tool_name,
-                NativeErrorCode::WorkflowNotConfigured.as_str(),
-                WORKFLOW_NOT_CONFIGURED_MESSAGE,
-            ));
-        };
-
-        let workflow = self.scoped_workflow_for_enrolled(stores, &trusted_binding_id, tool_name)?;
-        let req_id = self
-            .begin_paired_observation(
-                &trusted_binding_id,
-                &trusted_thread_uuid,
-                tool_name,
-                None,
-                None,
-            )
-            .await;
-
-        let outcome = tokio::task::spawn_blocking(move || op(workflow))
-            .await
-            .map_err(|_| {
-                Self::format_scoped_error(
+            let Some(stores) = self.workflow_stores.as_ref() else {
+                return Err(Self::format_scoped_error(
                     &trusted_binding_id,
                     tool_name,
-                    "io_error",
-                    "Workflow background task failed to complete.",
-                )
-            });
+                    NativeErrorCode::WorkflowNotConfigured.as_str(),
+                    WORKFLOW_NOT_CONFIGURED_MESSAGE,
+                ));
+            };
 
-        let result = match outcome {
-            Ok(Ok(data)) => Self::format_workflow_result(&trusted_binding_id, tool_name, data),
-            Ok(Err(err)) => Err(Self::format_workflow_error(
-                &trusted_binding_id,
-                tool_name,
-                err,
-            )),
-            Err(err_res) => Err(err_res),
-        };
-        self.finish_paired_observation(
-            req_id,
-            &trusted_binding_id,
-            &trusted_thread_uuid,
-            tool_name,
-            None,
-            None,
-            &result,
-        );
-        result
+            let workflow =
+                self.scoped_workflow_for_enrolled(stores, &trusted_binding_id, tool_name)?;
+            let req_id = self
+                .begin_paired_observation(
+                    &trusted_binding_id,
+                    &trusted_thread_uuid,
+                    tool_name,
+                    None,
+                    None,
+                )
+                .await;
+
+            let outcome = tokio::task::spawn_blocking(move || op(workflow))
+                .await
+                .map_err(|_| {
+                    Self::format_scoped_error(
+                        &trusted_binding_id,
+                        tool_name,
+                        "io_error",
+                        "Workflow background task failed to complete.",
+                    )
+                });
+
+            let result = match outcome {
+                Ok(Ok(data)) => Self::format_workflow_result(&trusted_binding_id, tool_name, data),
+                Ok(Err(err)) => Err(Self::format_workflow_error(
+                    &trusted_binding_id,
+                    tool_name,
+                    err,
+                )),
+                Err(err_res) => Err(err_res),
+            };
+            self.finish_paired_observation(req_id, &result).await;
+            result
+        })
     }
 
     fn format_workflow_result<T: Serialize>(
@@ -1623,7 +2991,11 @@ impl PairedMcpServer {
             let Some((reconnect_cfg, backend_pid)) = self
                 .matched_observation_context(&trusted_binding_id, &trusted_thread_uuid)
                 .and_then(|_| {
-                    threadlane::native_endpoint::NativeReconnectConfig::discover_for_mcp_parent()
+                    self.managed_parent_environment()
+                        .discover_reconnect(
+                            NativeErrorCode::NotConfigured,
+                            "coworker native notices require a verified managed native MCP session",
+                        )
                         .ok()
                 })
             else {
@@ -1640,62 +3012,55 @@ impl PairedMcpServer {
         Ok((trusted_binding_id, trusted_thread_uuid, gateway))
     }
 
-    async fn run_planning_gateway_blocking<T, F>(
+    fn run_planning_gateway_blocking<T, F>(
         &self,
         tool_name: &'static str,
-        initial_job_id: Option<&str>,
+        initial_job_id: Option<String>,
         op: F,
-    ) -> Result<CallToolResult, CallToolResult>
+    ) -> BoxedTaskLocalFuture<'_, Result<CallToolResult, CallToolResult>>
     where
         T: Serialize + Send + 'static,
         F: FnOnce(CoworkerPlanningGateway) -> Result<T, NativeError> + Send + 'static,
     {
-        let (trusted_binding_id, trusted_thread_uuid, gateway) =
-            self.verified_planning_gateway(tool_name)?;
-        let req_id = self
-            .begin_paired_observation_with_job(
-                &trusted_binding_id,
-                &trusted_thread_uuid,
-                tool_name,
-                initial_job_id,
-                None,
-                None,
-            )
-            .await;
+        Box::pin(async move {
+            let (trusted_binding_id, trusted_thread_uuid, gateway) =
+                self.verified_planning_gateway(tool_name)?;
+            let req_id = self
+                .begin_paired_observation_with_job(
+                    &trusted_binding_id,
+                    &trusted_thread_uuid,
+                    tool_name,
+                    initial_job_id.as_deref(),
+                    None,
+                    None,
+                )
+                .await;
 
-        let outcome = tokio::task::spawn_blocking(move || op(gateway))
-            .await
-            .map_err(|_| {
-                Self::format_scoped_error(
+            let outcome = tokio::task::spawn_blocking(move || op(gateway))
+                .await
+                .map_err(|_| {
+                    Self::format_scoped_error(
+                        &trusted_binding_id,
+                        tool_name,
+                        "io_error",
+                        "Coworker planning background task failed to complete.",
+                    )
+                });
+
+            let result = match outcome {
+                Ok(Ok(data)) => {
+                    Self::format_planning_gateway_result(&trusted_binding_id, tool_name, data)
+                }
+                Ok(Err(err)) => Err(Self::format_planning_gateway_error(
                     &trusted_binding_id,
                     tool_name,
-                    "io_error",
-                    "Coworker planning background task failed to complete.",
-                )
-            });
-
-        let result = match outcome {
-            Ok(Ok(data)) => {
-                Self::format_planning_gateway_result(&trusted_binding_id, tool_name, data)
-            }
-            Ok(Err(err)) => Err(Self::format_planning_gateway_error(
-                &trusted_binding_id,
-                tool_name,
-                err,
-            )),
-            Err(err_res) => Err(err_res),
-        };
-        self.finish_paired_observation_with_job(
-            req_id,
-            &trusted_binding_id,
-            &trusted_thread_uuid,
-            tool_name,
-            initial_job_id,
-            None,
-            None,
-            &result,
-        );
-        result
+                    err,
+                )),
+                Err(err_res) => Err(err_res),
+            };
+            self.finish_paired_observation(req_id, &result).await;
+            result
+        })
     }
 
     fn format_planning_gateway_result<T: Serialize>(
@@ -1748,16 +3113,897 @@ impl PairedMcpServer {
         CallToolResult::structured_error(payload)
     }
 
-    fn format_pairing_error(tool_name: &str, err: NativeError) -> CallToolResult {
+    fn format_unscoped_tool_error(
+        tool_name: &str,
+        code: &'static str,
+        message: &str,
+    ) -> CallToolResult {
         let payload = json!({
             "untrusted_data": true,
             "tool": tool_name,
             "error": {
-                "code": err.code(),
-                "message": err.message(),
+                "code": code,
+                "message": message,
             }
         });
         CallToolResult::structured_error(payload)
+    }
+
+    fn format_pairing_error(tool_name: &str, err: NativeError) -> CallToolResult {
+        Self::format_unscoped_tool_error(tool_name, err.code(), err.message())
+    }
+
+    fn start_approved_task_with_deadline(
+        &self,
+        params: StartApprovedTaskParams,
+        startup_deadline: Option<Instant>,
+        preverified_enrollment: Option<EnrollmentRecord>,
+    ) -> BoxedTaskLocalFuture<'_, Result<CallToolResult, CallToolResult>> {
+        Box::pin(async move {
+            let enrollment = match preverified_enrollment {
+                Some(record) => record,
+                None => {
+                    self.verify_enrolled_binding_for_tool_until(
+                        "start_approved_task",
+                        startup_deadline,
+                    )
+                    .await?
+                }
+            };
+            let trusted_binding_id = enrollment.binding_id;
+            let trusted_thread_uuid = enrollment.thread_id;
+
+            let Some(stores) = self.host_stores.clone() else {
+                return Err(format_approved_scoped_error(
+                    &trusted_binding_id,
+                    "start_approved_task",
+                    NativeErrorCode::HostNotConfigured.as_str(),
+                    HOST_NOT_CONFIGURED_MESSAGE,
+                ));
+            };
+
+            let authority_for_guard = Arc::clone(&stores.authority);
+            let guard_binding_id = trusted_binding_id.clone();
+            let guard_thread_uuid = trusted_thread_uuid.clone();
+            let guard_approval_id = params.approval_id.clone();
+            let guard_task_id = params.task_id.clone();
+            let expected_binding_id = trusted_binding_id.clone();
+            let expected_thread_uuid = trusted_thread_uuid.clone();
+            let pairing_store_for_recheck = self.pairing_store.clone();
+            let nonce_for_recheck = self.connection_nonce.clone();
+            let epoch_for_recheck = self.epoch_id.clone();
+            let server_for_recheck = self.clone();
+            let host_launcher = self.host_launcher.clone();
+
+            let obs = match self
+                .begin_paired_observation_until(
+                    &guard_binding_id,
+                    &guard_thread_uuid,
+                    "start_approved_task",
+                    None,
+                    Some(&guard_approval_id),
+                    Some(&guard_task_id),
+                    startup_deadline,
+                )
+                .await
+            {
+                Ok(handle) => handle,
+                Err(timed_out_handle) => {
+                    let res = Err(format_approved_scoped_error(
+                        &guard_binding_id,
+                        "start_approved_task",
+                        "host_not_ready",
+                        HOST_NOT_READY_STARTUP_TIMEOUT_MESSAGE,
+                    ));
+                    self.finish_paired_observation_until(timed_out_handle, startup_deadline, &res)
+                        .await;
+                    return res;
+                }
+            };
+
+            let res = crate::dispatch_guard::with_guarded_native_dispatch_until(
+                &authority_for_guard,
+                &guard_binding_id,
+                &guard_thread_uuid,
+                &guard_approval_id,
+                &guard_task_id,
+                None,
+                startup_deadline,
+                || async move {
+                    Ok(execute_start_approved_task_with_launcher_until(
+                        stores.authority,
+                        stores.sessions_dir,
+                        trusted_binding_id,
+                        trusted_thread_uuid,
+                        params,
+                        host_launcher,
+                        startup_deadline,
+                        move || {
+                            Ok(pairing_store_for_recheck
+                                .verify_enrolled_binding(&nonce_for_recheck, &epoch_for_recheck))
+                        },
+                        move |store_result| {
+                            let enrollment = server_for_recheck
+                                .revalidate_enrollment_record_on_task(
+                                    "start_approved_task",
+                                    store_result,
+                                )?;
+                            if !constant_time_str_eq(&enrollment.binding_id, &expected_binding_id)
+                                || !constant_time_str_eq(
+                                    &enrollment.thread_id,
+                                    &expected_thread_uuid,
+                                )
+                            {
+                                return Err(Self::format_pairing_error(
+                                    "start_approved_task",
+                                    NativeError::new(
+                                        NativeErrorCode::RebindRejected,
+                                        "enrolled binding or native thread changed during approved host startup",
+                                    ),
+                                ));
+                            }
+                            Ok(())
+                        },
+                    )
+                    .await)
+                },
+            )
+            .await
+            .map_err(|err| match err {
+                crate::dispatch_guard::GuardedDispatchError::PreEffect { code, message } => {
+                    crate::approved_mcp::format_approved_scoped_error(
+                        &guard_binding_id,
+                        "start_approved_task",
+                        code,
+                        message,
+                    )
+                }
+                crate::dispatch_guard::GuardedDispatchError::Host(host_err) => {
+                    let (code, message) = crate::approved_mcp::map_host_error_to_mcp(&host_err);
+                    crate::approved_mcp::format_approved_scoped_error(
+                        &guard_binding_id,
+                        "start_approved_task",
+                        code,
+                        message,
+                    )
+                }
+            })
+            .and_then(|inner| inner);
+
+            self.finish_paired_observation_until(obs, startup_deadline, &res)
+                .await;
+            res
+        })
+    }
+
+    fn connect_current_chat_boxed(
+        &self,
+        _params: ConnectionIdentityParams,
+        meta: rmcp::model::RequestMetaObject,
+    ) -> BoxedTaskLocalFuture<'_, Result<CallToolResult, CallToolResult>> {
+        Box::pin(async move {
+            let result = async {
+                let hint = parse_thread_hint(meta.get("threadId").and_then(Value::as_str))?;
+                let identity = self
+                    .pairing_store
+                    .inspect_epoch(&self.connection_nonce, &self.epoch_id)?;
+                let context_config = crate::context_export::OperatorContextServerConfig {
+                    pairing_dir: self.pairing_store.dir(),
+                    state_dir: &self.state_dir,
+                    workflow_stores: self
+                        .workflow_stores
+                        .as_ref()
+                        .map(|w| (w.registry.config_dir(), w.plans.dir())),
+                    host_stores: self
+                        .host_stores
+                        .as_ref()
+                        .map(|h| (h.authority.dir(), h.sessions_dir.as_path())),
+                    sibling_anchor_exe: self.sibling_anchor_exe.as_deref(),
+                };
+                let runtime = AutomaticPairingRuntime {
+                    context_config,
+                    parent_env: self.managed_parent_environment(),
+                    sampler_owner: &self.sampler_owner,
+                };
+                self.automatic_pairing
+                    .connect_with_context_config(
+                        hint,
+                        &self.state_dir,
+                        &self.pairing_store,
+                        &identity,
+                        runtime,
+                    )
+                    .await
+            }
+            .await
+            .map_err(|error| Self::format_pairing_error("connect_current_chat", error))?;
+            Ok(CallToolResult::structured(
+                json!({"untrusted_data": false, "tool": "connect_current_chat", "data": result}),
+            ))
+        })
+    }
+
+    fn connection_identity_sync(&self) -> Result<CallToolResult, CallToolResult> {
+        let identity = self
+            .pairing_store
+            .inspect_epoch(&self.connection_nonce, &self.epoch_id)
+            .map_err(|err| Self::format_pairing_error(CONNECTION_IDENTITY_TOOL, err))?;
+
+        let payload = json!({
+            "untrusted_data": false,
+            "tool": CONNECTION_IDENTITY_TOOL,
+            "data": identity,
+        });
+        Ok(CallToolResult::structured(payload))
+    }
+
+    fn operating_guide_boxed(
+        &self,
+        params: OperatingGuideParams,
+    ) -> BoxedTaskLocalFuture<'_, Result<CallToolResult, CallToolResult>> {
+        Box::pin(async move {
+            let delegate = self.enrolled_delegate(OPERATING_GUIDE_TOOL).await?;
+            delegate.operating_guide(Parameters(params)).await
+        })
+    }
+
+    fn status_boxed(
+        &self,
+        params: StatusParams,
+    ) -> BoxedTaskLocalFuture<'_, Result<CallToolResult, CallToolResult>> {
+        Box::pin(async move {
+            let delegate = self.enrolled_delegate("status").await?;
+            delegate.status(Parameters(params)).await
+        })
+    }
+
+    fn get_run_boxed(
+        &self,
+        params: GetRunParams,
+    ) -> BoxedTaskLocalFuture<'_, Result<CallToolResult, CallToolResult>> {
+        Box::pin(async move {
+            let delegate = self.enrolled_delegate("get_run").await?;
+            delegate.get_run(Parameters(params)).await
+        })
+    }
+
+    fn list_runs_boxed(
+        &self,
+        params: ListRunsParams,
+    ) -> BoxedTaskLocalFuture<'_, Result<CallToolResult, CallToolResult>> {
+        Box::pin(async move {
+            let delegate = self.enrolled_delegate("list_runs").await?;
+            delegate.list_runs(Parameters(params)).await
+        })
+    }
+
+    fn list_run_revisions_boxed(
+        &self,
+        params: ListRunRevisionsParams,
+    ) -> BoxedTaskLocalFuture<'_, Result<CallToolResult, CallToolResult>> {
+        Box::pin(async move {
+            let delegate = self.enrolled_delegate("list_run_revisions").await?;
+            delegate.list_run_revisions(Parameters(params)).await
+        })
+    }
+
+    fn list_run_questions_boxed(
+        &self,
+        params: ListRunQuestionsParams,
+    ) -> BoxedTaskLocalFuture<'_, Result<CallToolResult, CallToolResult>> {
+        Box::pin(async move {
+            let delegate = self.enrolled_delegate("list_run_questions").await?;
+            delegate.list_run_questions(Parameters(params)).await
+        })
+    }
+
+    fn list_activity_boxed(
+        &self,
+        params: ListActivityParams,
+    ) -> BoxedTaskLocalFuture<'_, Result<CallToolResult, CallToolResult>> {
+        Box::pin(async move {
+            let delegate = self.enrolled_delegate("list_activity").await?;
+            delegate.list_activity(Parameters(params)).await
+        })
+    }
+
+    fn start_demo_boxed(
+        &self,
+        params: StartDemoParams,
+    ) -> BoxedTaskLocalFuture<'_, Result<CallToolResult, CallToolResult>> {
+        Box::pin(async move {
+            let delegate = self.enrolled_delegate("start_demo").await?;
+            delegate.start_demo(Parameters(params)).await
+        })
+    }
+
+    fn pull_events_boxed(
+        &self,
+        params: PullEventsParams,
+    ) -> BoxedTaskLocalFuture<'_, Result<CallToolResult, CallToolResult>> {
+        Box::pin(async move {
+            let delegate = self.enrolled_delegate("pull_events").await?;
+            delegate.pull_events(Parameters(params)).await
+        })
+    }
+
+    fn ack_events_boxed(
+        &self,
+        params: AckEventsParams,
+    ) -> BoxedTaskLocalFuture<'_, Result<CallToolResult, CallToolResult>> {
+        Box::pin(async move {
+            let delegate = self.enrolled_delegate("ack_events").await?;
+            delegate.ack_events(Parameters(params)).await
+        })
+    }
+
+    fn answer_boxed(
+        &self,
+        params: AnswerParams,
+    ) -> BoxedTaskLocalFuture<'_, Result<CallToolResult, CallToolResult>> {
+        Box::pin(async move {
+            let delegate = self.enrolled_delegate("answer").await?;
+            delegate.answer(Parameters(params)).await
+        })
+    }
+
+    fn steer_boxed(
+        &self,
+        params: SteerParams,
+    ) -> BoxedTaskLocalFuture<'_, Result<CallToolResult, CallToolResult>> {
+        Box::pin(async move {
+            let delegate = self.enrolled_delegate("steer").await?;
+            delegate.steer(Parameters(params)).await
+        })
+    }
+
+    fn cancel_boxed(
+        &self,
+        params: CancelParams,
+    ) -> BoxedTaskLocalFuture<'_, Result<CallToolResult, CallToolResult>> {
+        Box::pin(async move {
+            let delegate = self.enrolled_delegate("cancel").await?;
+            delegate.cancel(Parameters(params)).await
+        })
+    }
+
+    fn start_worker_boxed(
+        &self,
+        params: StartWorkerParams,
+    ) -> BoxedTaskLocalFuture<'_, Result<CallToolResult, CallToolResult>> {
+        Box::pin(async move {
+            let delegate = self.enrolled_delegate("start_worker").await?;
+            delegate.start_worker(Parameters(params)).await
+        })
+    }
+
+    fn get_worker_boxed(
+        &self,
+        params: GetWorkerParams,
+    ) -> BoxedTaskLocalFuture<'_, Result<CallToolResult, CallToolResult>> {
+        Box::pin(async move {
+            let delegate = self.enrolled_delegate("get_worker").await?;
+            delegate.get_worker(Parameters(params)).await
+        })
+    }
+
+    fn cancel_worker_boxed(
+        &self,
+        params: CancelWorkerParams,
+    ) -> BoxedTaskLocalFuture<'_, Result<CallToolResult, CallToolResult>> {
+        Box::pin(async move {
+            let delegate = self.enrolled_delegate("cancel_worker").await?;
+            delegate.cancel_worker(Parameters(params)).await
+        })
+    }
+
+    fn catalog_boxed(
+        &self,
+        params: CatalogParams,
+    ) -> BoxedTaskLocalFuture<'_, Result<CallToolResult, CallToolResult>> {
+        self.run_workflow_blocking("catalog", move |workflow| {
+            workflow.catalog(params.cursor, params.limit)
+        })
+    }
+
+    fn list_plans_boxed(
+        &self,
+        params: ListPlansParams,
+    ) -> BoxedTaskLocalFuture<'_, Result<CallToolResult, CallToolResult>> {
+        self.run_workflow_blocking("list_plans", move |workflow| {
+            workflow.list_plans(params.cursor, params.limit)
+        })
+    }
+
+    fn get_plan_boxed(
+        &self,
+        params: GetPlanParams,
+    ) -> BoxedTaskLocalFuture<'_, Result<CallToolResult, CallToolResult>> {
+        self.run_workflow_blocking("get_plan", move |workflow| {
+            workflow.get_plan(
+                &params.plan_id,
+                params.revision,
+                params.task_cursor,
+                params.task_limit,
+            )
+        })
+    }
+
+    fn save_draft_boxed(
+        &self,
+        params: SaveDraftParams,
+    ) -> BoxedTaskLocalFuture<'_, Result<CallToolResult, CallToolResult>> {
+        self.run_workflow_blocking("save_draft", move |workflow| {
+            workflow.save_draft(SavePlanDraft::from(params))
+        })
+    }
+
+    fn publish_boxed(
+        &self,
+        params: PublishParams,
+    ) -> BoxedTaskLocalFuture<'_, Result<CallToolResult, CallToolResult>> {
+        self.run_workflow_blocking("publish", move |workflow| {
+            workflow.publish(&params.plan_id, params.revision)
+        })
+    }
+
+    fn list_approvals_boxed(
+        &self,
+        params: ListApprovalsParams,
+    ) -> BoxedTaskLocalFuture<'_, Result<CallToolResult, CallToolResult>> {
+        Box::pin(async move {
+            let (trusted_binding_id, trusted_thread_uuid, stores) =
+                self.verified_host_context("list_approvals")?;
+            let req_id = self
+                .begin_paired_observation(
+                    &trusted_binding_id,
+                    &trusted_thread_uuid,
+                    "list_approvals",
+                    None,
+                    None,
+                )
+                .await;
+            let res = execute_list_approvals(
+                stores.authority,
+                trusted_binding_id,
+                trusted_thread_uuid,
+                params,
+            )
+            .await;
+            self.finish_paired_observation(req_id, &res).await;
+            res
+        })
+    }
+
+    fn approved_session_boxed(
+        &self,
+        params: ApprovedSessionParams,
+    ) -> BoxedTaskLocalFuture<'_, Result<CallToolResult, CallToolResult>> {
+        Box::pin(async move {
+            let (trusted_binding_id, trusted_thread_uuid, stores) =
+                self.verified_host_context("approved_session")?;
+            let req_id = self
+                .begin_paired_observation(
+                    &trusted_binding_id,
+                    &trusted_thread_uuid,
+                    "approved_session",
+                    Some(&params.approval_id),
+                    None,
+                )
+                .await;
+            let res = execute_approved_session(
+                stores.authority,
+                stores.sessions_dir,
+                trusted_binding_id,
+                trusted_thread_uuid,
+                params,
+            )
+            .await;
+            self.finish_paired_observation(req_id, &res).await;
+            res
+        })
+    }
+
+    fn start_approved_task_boxed(
+        &self,
+        params: StartApprovedTaskParams,
+    ) -> BoxedTaskLocalFuture<'_, Result<CallToolResult, CallToolResult>> {
+        Box::pin(async move {
+            let startup_deadline = self
+                .host_launcher
+                .as_ref()
+                .map(|launcher| Instant::now() + launcher.policy().startup_timeout());
+            self.start_approved_task_with_deadline(params, startup_deadline, None)
+                .await
+        })
+    }
+
+    fn approved_task_boxed(
+        &self,
+        params: ApprovedTaskParams,
+    ) -> BoxedTaskLocalFuture<'_, Result<CallToolResult, CallToolResult>> {
+        Box::pin(async move {
+            let (trusted_binding_id, trusted_thread_uuid, stores) =
+                self.verified_host_context("approved_task")?;
+            let req_id = self
+                .begin_paired_observation(
+                    &trusted_binding_id,
+                    &trusted_thread_uuid,
+                    "approved_task",
+                    Some(&params.approval_id),
+                    Some(&params.task_id),
+                )
+                .await;
+            let res = execute_approved_task(
+                stores.authority,
+                stores.sessions_dir,
+                trusted_binding_id,
+                trusted_thread_uuid,
+                params,
+            )
+            .await;
+            self.finish_paired_observation(req_id, &res).await;
+            res
+        })
+    }
+
+    fn cancel_approved_task_boxed(
+        &self,
+        params: CancelApprovedTaskParams,
+    ) -> BoxedTaskLocalFuture<'_, Result<CallToolResult, CallToolResult>> {
+        Box::pin(async move {
+            let (trusted_binding_id, trusted_thread_uuid, stores) =
+                self.verified_host_context("cancel_approved_task")?;
+            let req_id = self
+                .begin_paired_observation(
+                    &trusted_binding_id,
+                    &trusted_thread_uuid,
+                    "cancel_approved_task",
+                    Some(&params.approval_id),
+                    Some(&params.task_id),
+                )
+                .await;
+            let res = execute_cancel_approved_task(
+                stores.authority,
+                stores.sessions_dir,
+                trusted_binding_id,
+                trusted_thread_uuid,
+                params,
+            )
+            .await;
+            self.finish_paired_observation(req_id, &res).await;
+            res
+        })
+    }
+
+    fn approved_activity_boxed(
+        &self,
+        params: ApprovedActivityParams,
+    ) -> BoxedTaskLocalFuture<'_, Result<CallToolResult, CallToolResult>> {
+        Box::pin(async move {
+            let (trusted_binding_id, trusted_thread_uuid, stores) =
+                self.verified_host_context("approved_activity")?;
+            let req_id = self
+                .begin_paired_observation(
+                    &trusted_binding_id,
+                    &trusted_thread_uuid,
+                    "approved_activity",
+                    Some(&params.approval_id),
+                    params.task_id.as_deref(),
+                )
+                .await;
+            let res = execute_approved_activity(
+                stores.authority,
+                stores.sessions_dir,
+                trusted_binding_id,
+                trusted_thread_uuid,
+                params,
+            )
+            .await;
+            self.finish_paired_observation(req_id, &res).await;
+            res
+        })
+    }
+
+    fn approved_pull_events_boxed(
+        &self,
+        params: ApprovedPullEventsParams,
+    ) -> BoxedTaskLocalFuture<'_, Result<CallToolResult, CallToolResult>> {
+        Box::pin(async move {
+            let (trusted_binding_id, trusted_thread_uuid, stores) =
+                self.verified_host_context("approved_pull_events")?;
+            let req_id = self
+                .begin_paired_observation(
+                    &trusted_binding_id,
+                    &trusted_thread_uuid,
+                    "approved_pull_events",
+                    Some(&params.approval_id),
+                    None,
+                )
+                .await;
+            let res = execute_approved_pull_events(
+                stores.authority,
+                stores.sessions_dir,
+                trusted_binding_id,
+                trusted_thread_uuid,
+                params,
+            )
+            .await;
+            self.finish_paired_observation(req_id, &res).await;
+            res
+        })
+    }
+
+    fn approved_ack_events_boxed(
+        &self,
+        params: ApprovedAckEventsParams,
+    ) -> BoxedTaskLocalFuture<'_, Result<CallToolResult, CallToolResult>> {
+        Box::pin(async move {
+            let (trusted_binding_id, trusted_thread_uuid, stores) =
+                self.verified_host_context("approved_ack_events")?;
+            let req_id = self
+                .begin_paired_observation(
+                    &trusted_binding_id,
+                    &trusted_thread_uuid,
+                    "approved_ack_events",
+                    Some(&params.approval_id),
+                    None,
+                )
+                .await;
+            let res = execute_approved_ack_events(
+                stores.authority,
+                stores.sessions_dir,
+                trusted_binding_id,
+                trusted_thread_uuid,
+                params,
+            )
+            .await;
+            self.finish_paired_observation(req_id, &res).await;
+            res
+        })
+    }
+
+    fn coworker_status_boxed(
+        &self,
+        params: CoworkerStatusParams,
+    ) -> BoxedTaskLocalFuture<'_, Result<CallToolResult, CallToolResult>> {
+        self.run_planning_gateway_blocking("coworker_status", None, move |gateway| {
+            gateway.coworker_status(&params)
+        })
+    }
+
+    fn prepare_work_boxed(
+        &self,
+        params: PrepareWorkParams,
+    ) -> BoxedTaskLocalFuture<'_, Result<CallToolResult, CallToolResult>> {
+        let initial_job_id = params.amendment.as_ref().map(|a| a.target_job_id.clone());
+        self.run_planning_gateway_blocking("prepare_work", initial_job_id, move |gateway| {
+            gateway.prepare_work(&params)
+        })
+    }
+
+    fn consult_architect_boxed(
+        &self,
+        params: ConsultArchitectParams,
+    ) -> BoxedTaskLocalFuture<'_, Result<CallToolResult, CallToolResult>> {
+        Box::pin(async move {
+            let (trusted_binding_id, trusted_thread_uuid, gateway) =
+                self.verified_planning_gateway("consult_architect")?;
+            let req_id = self
+                .begin_paired_observation_with_job(
+                    &trusted_binding_id,
+                    &trusted_thread_uuid,
+                    "consult_architect",
+                    Some(&params.job_id),
+                    None,
+                    None,
+                )
+                .await;
+            let result = match gateway.consult_architect(&params).await {
+                Ok(data) => Self::format_planning_gateway_result(
+                    &trusted_binding_id,
+                    "consult_architect",
+                    data,
+                ),
+                Err(err) => Err(Self::format_planning_gateway_error(
+                    &trusted_binding_id,
+                    "consult_architect",
+                    err,
+                )),
+            };
+            self.finish_paired_observation(req_id, &result).await;
+            result
+        })
+    }
+
+    fn request_technical_plan_boxed(
+        &self,
+        params: RequestTechnicalPlanParams,
+    ) -> BoxedTaskLocalFuture<'_, Result<CallToolResult, CallToolResult>> {
+        Box::pin(async move {
+            let (trusted_binding_id, trusted_thread_uuid, gateway) =
+                self.verified_planning_gateway("request_technical_plan")?;
+            let req_id = self
+                .begin_paired_observation_with_job(
+                    &trusted_binding_id,
+                    &trusted_thread_uuid,
+                    "request_technical_plan",
+                    Some(&params.job_id),
+                    None,
+                    None,
+                )
+                .await;
+            let result = match gateway.request_technical_plan(&params).await {
+                Ok(data) => Self::format_planning_gateway_result(
+                    &trusted_binding_id,
+                    "request_technical_plan",
+                    data,
+                ),
+                Err(err) => Err(Self::format_planning_gateway_error(
+                    &trusted_binding_id,
+                    "request_technical_plan",
+                    err,
+                )),
+            };
+            self.finish_paired_observation(req_id, &result).await;
+            result
+        })
+    }
+
+    fn planning_command_boxed(
+        &self,
+        params: PlanningCommandParams,
+    ) -> BoxedTaskLocalFuture<'_, Result<CallToolResult, CallToolResult>> {
+        self.run_planning_gateway_blocking("planning_command", None, move |gateway| {
+            gateway.planning_command(&params)
+        })
+    }
+
+    fn preview_execution_boxed(
+        &self,
+        params: PreviewExecutionParams,
+    ) -> BoxedTaskLocalFuture<'_, Result<CallToolResult, CallToolResult>> {
+        Box::pin(async move {
+            let (trusted_binding_id, trusted_thread_uuid, gateway) =
+                self.verified_execution_gateway("preview_execution")?;
+            let req_id = self
+                .begin_paired_observation_with_job(
+                    &trusted_binding_id,
+                    &trusted_thread_uuid,
+                    "preview_execution",
+                    Some(&params.job_id),
+                    None,
+                    None,
+                )
+                .await;
+            let outcome = tokio::task::spawn_blocking(move || gateway.preview_execution(&params))
+                .await
+                .map_err(|_| {
+                    Self::format_scoped_error(
+                        &trusted_binding_id,
+                        "preview_execution",
+                        "io_error",
+                        "Coworker execution preview task failed to complete.",
+                    )
+                });
+            let result = match outcome {
+                Ok(Ok(data)) => Self::format_planning_gateway_result(
+                    &trusted_binding_id,
+                    "preview_execution",
+                    data,
+                ),
+                Ok(Err(err)) => Err(Self::format_planning_gateway_error(
+                    &trusted_binding_id,
+                    "preview_execution",
+                    err,
+                )),
+                Err(err_res) => Err(err_res),
+            };
+            self.finish_paired_observation(req_id, &result).await;
+            result
+        })
+    }
+
+    fn start_execution_boxed(
+        &self,
+        params: StartExecutionParams,
+    ) -> BoxedTaskLocalFuture<'_, Result<CallToolResult, CallToolResult>> {
+        Box::pin(async move {
+            let (trusted_binding_id, trusted_thread_uuid, gateway) =
+                self.verified_execution_gateway("start_execution")?;
+            let req_id = self
+                .begin_paired_observation_with_job(
+                    &trusted_binding_id,
+                    &trusted_thread_uuid,
+                    "start_execution",
+                    Some(&params.job_id),
+                    None,
+                    None,
+                )
+                .await;
+            let result = match gateway.start_execution(&params).await {
+                Ok(data) => Self::format_planning_gateway_result(
+                    &trusted_binding_id,
+                    "start_execution",
+                    data,
+                ),
+                Err(err) => Err(Self::format_planning_gateway_error(
+                    &trusted_binding_id,
+                    "start_execution",
+                    err,
+                )),
+            };
+            self.finish_paired_observation(req_id, &result).await;
+            result
+        })
+    }
+
+    fn execution_status_boxed(
+        &self,
+        params: ExecutionStatusParams,
+    ) -> BoxedTaskLocalFuture<'_, Result<CallToolResult, CallToolResult>> {
+        Box::pin(async move {
+            let (trusted_binding_id, trusted_thread_uuid, gateway) =
+                self.verified_execution_gateway("execution_status")?;
+            let req_id = self
+                .begin_paired_observation_with_job(
+                    &trusted_binding_id,
+                    &trusted_thread_uuid,
+                    "execution_status",
+                    Some(&params.job_id),
+                    None,
+                    None,
+                )
+                .await;
+            let result = match gateway.execution_status(&params).await {
+                Ok(data) => Self::format_planning_gateway_result(
+                    &trusted_binding_id,
+                    "execution_status",
+                    data,
+                ),
+                Err(err) => Err(Self::format_planning_gateway_error(
+                    &trusted_binding_id,
+                    "execution_status",
+                    err,
+                )),
+            };
+            self.finish_paired_observation(req_id, &result).await;
+            result
+        })
+    }
+
+    fn stop_execution_boxed(
+        &self,
+        params: StopExecutionParams,
+    ) -> BoxedTaskLocalFuture<'_, Result<CallToolResult, CallToolResult>> {
+        Box::pin(async move {
+            let (trusted_binding_id, trusted_thread_uuid, gateway) =
+                self.verified_execution_gateway("stop_execution")?;
+            let req_id = self
+                .begin_paired_observation_with_job(
+                    &trusted_binding_id,
+                    &trusted_thread_uuid,
+                    "stop_execution",
+                    Some(&params.job_id),
+                    None,
+                    None,
+                )
+                .await;
+            let result = match gateway.stop_execution(&params).await {
+                Ok(data) => Self::format_planning_gateway_result(
+                    &trusted_binding_id,
+                    "stop_execution",
+                    data,
+                ),
+                Err(err) => Err(Self::format_planning_gateway_error(
+                    &trusted_binding_id,
+                    "stop_execution",
+                    err,
+                )),
+            };
+            self.finish_paired_observation(req_id, &result).await;
+            result
+        })
     }
 }
 
@@ -1777,42 +4023,10 @@ impl PairedMcpServer {
     )]
     pub async fn connect_current_chat(
         &self,
-        Parameters(_params): Parameters<ConnectionIdentityParams>,
+        Parameters(params): Parameters<ConnectionIdentityParams>,
         meta: rmcp::model::RequestMetaObject,
     ) -> Result<CallToolResult, CallToolResult> {
-        let result = async {
-            let hint = parse_thread_hint(meta.get("threadId").and_then(Value::as_str))?;
-            let identity = self
-                .pairing_store
-                .inspect_epoch(&self.connection_nonce, &self.epoch_id)?;
-            let context_config = crate::context_export::OperatorContextServerConfig {
-                pairing_dir: self.pairing_store.dir(),
-                state_dir: &self.state_dir,
-                workflow_stores: self
-                    .workflow_stores
-                    .as_ref()
-                    .map(|w| (w.registry.config_dir(), w.plans.dir())),
-                host_stores: self
-                    .host_stores
-                    .as_ref()
-                    .map(|h| (h.authority.dir(), h.sessions_dir.as_path())),
-                sibling_anchor_exe: self.sibling_anchor_exe.as_deref(),
-            };
-            self.automatic_pairing
-                .connect_with_context_config(
-                    hint,
-                    &self.state_dir,
-                    &self.pairing_store,
-                    &identity,
-                    context_config,
-                )
-                .await
-        }
-        .await
-        .map_err(|error| Self::format_pairing_error("connect_current_chat", error))?;
-        Ok(CallToolResult::structured(
-            json!({"untrusted_data": false, "tool": "connect_current_chat", "data": result}),
-        ))
+        self.connect_current_chat_boxed(params, meta).await
     }
 
     /// Returns the connection nonce and epoch status for trusted operator thread-scoped pairing.
@@ -1831,17 +4045,7 @@ impl PairedMcpServer {
         &self,
         Parameters(_params): Parameters<ConnectionIdentityParams>,
     ) -> Result<CallToolResult, CallToolResult> {
-        let identity = self
-            .pairing_store
-            .inspect_epoch(&self.connection_nonce, &self.epoch_id)
-            .map_err(|err| Self::format_pairing_error(CONNECTION_IDENTITY_TOOL, err))?;
-
-        let payload = json!({
-            "untrusted_data": false,
-            "tool": CONNECTION_IDENTITY_TOOL,
-            "data": identity,
-        });
-        Ok(CallToolResult::structured(payload))
+        self.connection_identity_sync()
     }
 
     /// Delegated `operating_guide` tool (requires verified operator enrollment).
@@ -1860,8 +4064,7 @@ impl PairedMcpServer {
         &self,
         Parameters(params): Parameters<OperatingGuideParams>,
     ) -> Result<CallToolResult, CallToolResult> {
-        let delegate = self.enrolled_delegate(OPERATING_GUIDE_TOOL).await?;
-        delegate.operating_guide(Parameters(params)).await
+        self.operating_guide_boxed(params).await
     }
 
     /// Delegated `status` tool (requires verified operator enrollment).
@@ -1880,8 +4083,7 @@ impl PairedMcpServer {
         &self,
         Parameters(params): Parameters<StatusParams>,
     ) -> Result<CallToolResult, CallToolResult> {
-        let delegate = self.enrolled_delegate("status").await?;
-        delegate.status(Parameters(params)).await
+        self.status_boxed(params).await
     }
 
     /// Delegated `get_run` tool (requires verified operator enrollment).
@@ -1900,8 +4102,7 @@ impl PairedMcpServer {
         &self,
         Parameters(params): Parameters<GetRunParams>,
     ) -> Result<CallToolResult, CallToolResult> {
-        let delegate = self.enrolled_delegate("get_run").await?;
-        delegate.get_run(Parameters(params)).await
+        self.get_run_boxed(params).await
     }
 
     /// Delegated `list_runs` tool (requires verified operator enrollment).
@@ -1920,8 +4121,7 @@ impl PairedMcpServer {
         &self,
         Parameters(params): Parameters<ListRunsParams>,
     ) -> Result<CallToolResult, CallToolResult> {
-        let delegate = self.enrolled_delegate("list_runs").await?;
-        delegate.list_runs(Parameters(params)).await
+        self.list_runs_boxed(params).await
     }
 
     /// Delegated `list_run_revisions` tool (requires verified operator enrollment).
@@ -1940,8 +4140,7 @@ impl PairedMcpServer {
         &self,
         Parameters(params): Parameters<ListRunRevisionsParams>,
     ) -> Result<CallToolResult, CallToolResult> {
-        let delegate = self.enrolled_delegate("list_run_revisions").await?;
-        delegate.list_run_revisions(Parameters(params)).await
+        self.list_run_revisions_boxed(params).await
     }
 
     /// Delegated `list_run_questions` tool (requires verified operator enrollment).
@@ -1960,8 +4159,7 @@ impl PairedMcpServer {
         &self,
         Parameters(params): Parameters<ListRunQuestionsParams>,
     ) -> Result<CallToolResult, CallToolResult> {
-        let delegate = self.enrolled_delegate("list_run_questions").await?;
-        delegate.list_run_questions(Parameters(params)).await
+        self.list_run_questions_boxed(params).await
     }
 
     /// Delegated `list_activity` tool (requires verified operator enrollment).
@@ -1980,8 +4178,7 @@ impl PairedMcpServer {
         &self,
         Parameters(params): Parameters<ListActivityParams>,
     ) -> Result<CallToolResult, CallToolResult> {
-        let delegate = self.enrolled_delegate("list_activity").await?;
-        delegate.list_activity(Parameters(params)).await
+        self.list_activity_boxed(params).await
     }
 
     /// Delegated `start_demo` tool (requires verified operator enrollment).
@@ -2000,8 +4197,7 @@ impl PairedMcpServer {
         &self,
         Parameters(params): Parameters<StartDemoParams>,
     ) -> Result<CallToolResult, CallToolResult> {
-        let delegate = self.enrolled_delegate("start_demo").await?;
-        delegate.start_demo(Parameters(params)).await
+        self.start_demo_boxed(params).await
     }
 
     /// Delegated `pull_events` tool (requires verified operator enrollment).
@@ -2020,8 +4216,7 @@ impl PairedMcpServer {
         &self,
         Parameters(params): Parameters<PullEventsParams>,
     ) -> Result<CallToolResult, CallToolResult> {
-        let delegate = self.enrolled_delegate("pull_events").await?;
-        delegate.pull_events(Parameters(params)).await
+        self.pull_events_boxed(params).await
     }
 
     /// Delegated `ack_events` tool (requires verified operator enrollment).
@@ -2040,8 +4235,7 @@ impl PairedMcpServer {
         &self,
         Parameters(params): Parameters<AckEventsParams>,
     ) -> Result<CallToolResult, CallToolResult> {
-        let delegate = self.enrolled_delegate("ack_events").await?;
-        delegate.ack_events(Parameters(params)).await
+        self.ack_events_boxed(params).await
     }
 
     /// Delegated `answer` tool (requires verified operator enrollment).
@@ -2060,8 +4254,7 @@ impl PairedMcpServer {
         &self,
         Parameters(params): Parameters<AnswerParams>,
     ) -> Result<CallToolResult, CallToolResult> {
-        let delegate = self.enrolled_delegate("answer").await?;
-        delegate.answer(Parameters(params)).await
+        self.answer_boxed(params).await
     }
 
     /// Delegated `steer` tool (requires verified operator enrollment).
@@ -2080,8 +4273,7 @@ impl PairedMcpServer {
         &self,
         Parameters(params): Parameters<SteerParams>,
     ) -> Result<CallToolResult, CallToolResult> {
-        let delegate = self.enrolled_delegate("steer").await?;
-        delegate.steer(Parameters(params)).await
+        self.steer_boxed(params).await
     }
 
     /// Delegated `cancel` tool (requires verified operator enrollment).
@@ -2100,8 +4292,7 @@ impl PairedMcpServer {
         &self,
         Parameters(params): Parameters<CancelParams>,
     ) -> Result<CallToolResult, CallToolResult> {
-        let delegate = self.enrolled_delegate("cancel").await?;
-        delegate.cancel(Parameters(params)).await
+        self.cancel_boxed(params).await
     }
 
     /// Delegated `start_worker` tool (requires verified operator enrollment).
@@ -2120,8 +4311,7 @@ impl PairedMcpServer {
         &self,
         Parameters(params): Parameters<StartWorkerParams>,
     ) -> Result<CallToolResult, CallToolResult> {
-        let delegate = self.enrolled_delegate("start_worker").await?;
-        delegate.start_worker(Parameters(params)).await
+        self.start_worker_boxed(params).await
     }
 
     /// Delegated `get_worker` tool (requires verified operator enrollment).
@@ -2140,8 +4330,7 @@ impl PairedMcpServer {
         &self,
         Parameters(params): Parameters<GetWorkerParams>,
     ) -> Result<CallToolResult, CallToolResult> {
-        let delegate = self.enrolled_delegate("get_worker").await?;
-        delegate.get_worker(Parameters(params)).await
+        self.get_worker_boxed(params).await
     }
 
     /// Delegated `cancel_worker` tool (requires verified operator enrollment).
@@ -2160,8 +4349,7 @@ impl PairedMcpServer {
         &self,
         Parameters(params): Parameters<CancelWorkerParams>,
     ) -> Result<CallToolResult, CallToolResult> {
-        let delegate = self.enrolled_delegate("cancel_worker").await?;
-        delegate.cancel_worker(Parameters(params)).await
+        self.cancel_worker_boxed(params).await
     }
 
     /// Lists a bounded page of configured workflow profiles from the operator registry (requires verified operator enrollment).
@@ -2180,10 +4368,7 @@ impl PairedMcpServer {
         &self,
         Parameters(params): Parameters<CatalogParams>,
     ) -> Result<CallToolResult, CallToolResult> {
-        self.run_workflow_blocking("catalog", move |workflow| {
-            workflow.catalog(params.cursor, params.limit)
-        })
-        .await
+        self.catalog_boxed(params).await
     }
 
     /// Lists a bounded page of workflow plan summaries owned by the enrolled chat binding (requires verified operator enrollment).
@@ -2202,10 +4387,7 @@ impl PairedMcpServer {
         &self,
         Parameters(params): Parameters<ListPlansParams>,
     ) -> Result<CallToolResult, CallToolResult> {
-        self.run_workflow_blocking("list_plans", move |workflow| {
-            workflow.list_plans(params.cursor, params.limit)
-        })
-        .await
+        self.list_plans_boxed(params).await
     }
 
     /// Fetches a workflow plan revision header and a cursor-paginated page of full task definitions owned by the enrolled chat binding (requires verified operator enrollment).
@@ -2224,15 +4406,7 @@ impl PairedMcpServer {
         &self,
         Parameters(params): Parameters<GetPlanParams>,
     ) -> Result<CallToolResult, CallToolResult> {
-        self.run_workflow_blocking("get_plan", move |workflow| {
-            workflow.get_plan(
-                &params.plan_id,
-                params.revision,
-                params.task_cursor,
-                params.task_limit,
-            )
-        })
-        .await
+        self.get_plan_boxed(params).await
     }
 
     /// Creates or updates a draft workflow plan revision owned by the enrolled chat binding (requires verified operator enrollment).
@@ -2251,9 +4425,7 @@ impl PairedMcpServer {
         &self,
         Parameters(params): Parameters<SaveDraftParams>,
     ) -> Result<CallToolResult, CallToolResult> {
-        let draft = SavePlanDraft::from(params);
-        self.run_workflow_blocking("save_draft", move |workflow| workflow.save_draft(draft))
-            .await
+        self.save_draft_boxed(params).await
     }
 
     /// Explicitly publishes a draft workflow plan revision owned by the enrolled chat binding (requires verified operator enrollment).
@@ -2272,10 +4444,7 @@ impl PairedMcpServer {
         &self,
         Parameters(params): Parameters<PublishParams>,
     ) -> Result<CallToolResult, CallToolResult> {
-        self.run_workflow_blocking("publish", move |workflow| {
-            workflow.publish(&params.plan_id, params.revision)
-        })
-        .await
+        self.publish_boxed(params).await
     }
 
     /// Lists a bounded page of safe operator approval summaries owned by the enrolled chat binding and native thread (requires verified operator enrollment).
@@ -2294,34 +4463,7 @@ impl PairedMcpServer {
         &self,
         Parameters(params): Parameters<ListApprovalsParams>,
     ) -> Result<CallToolResult, CallToolResult> {
-        let (trusted_binding_id, trusted_thread_uuid, stores) =
-            self.verified_host_context("list_approvals")?;
-        let req_id = self
-            .begin_paired_observation(
-                &trusted_binding_id,
-                &trusted_thread_uuid,
-                "list_approvals",
-                None,
-                None,
-            )
-            .await;
-        let res = execute_list_approvals(
-            stores.authority,
-            trusted_binding_id.clone(),
-            trusted_thread_uuid.clone(),
-            params,
-        )
-        .await;
-        self.finish_paired_observation(
-            req_id,
-            &trusted_binding_id,
-            &trusted_thread_uuid,
-            "list_approvals",
-            None,
-            None,
-            &res,
-        );
-        res
+        self.list_approvals_boxed(params).await
     }
 
     /// Queries live authenticated host session readiness for an operator approval record owned by the enrolled chat binding and native thread (requires verified operator enrollment).
@@ -2340,36 +4482,7 @@ impl PairedMcpServer {
         &self,
         Parameters(params): Parameters<ApprovedSessionParams>,
     ) -> Result<CallToolResult, CallToolResult> {
-        let (trusted_binding_id, trusted_thread_uuid, stores) =
-            self.verified_host_context("approved_session")?;
-        let approval_id = params.approval_id.clone();
-        let req_id = self
-            .begin_paired_observation(
-                &trusted_binding_id,
-                &trusted_thread_uuid,
-                "approved_session",
-                Some(&approval_id),
-                None,
-            )
-            .await;
-        let res = execute_approved_session(
-            stores.authority,
-            stores.sessions_dir,
-            trusted_binding_id.clone(),
-            trusted_thread_uuid.clone(),
-            params,
-        )
-        .await;
-        self.finish_paired_observation(
-            req_id,
-            &trusted_binding_id,
-            &trusted_thread_uuid,
-            "approved_session",
-            Some(&approval_id),
-            None,
-            &res,
-        );
-        res
+        self.approved_session_boxed(params).await
     }
 
     /// Dispatches an approved root worker task using its frozen instruction, profile, write scope, and deterministic command key (requires verified operator enrollment).
@@ -2388,100 +4501,7 @@ impl PairedMcpServer {
         &self,
         Parameters(params): Parameters<StartApprovedTaskParams>,
     ) -> Result<CallToolResult, CallToolResult> {
-        let (trusted_binding_id, trusted_thread_uuid, stores) =
-            self.verified_host_context("start_approved_task")?;
-        let authority_for_guard = Arc::clone(&stores.authority);
-        let guard_binding_id = trusted_binding_id.clone();
-        let guard_thread_uuid = trusted_thread_uuid.clone();
-        let guard_approval_id = params.approval_id.clone();
-        let guard_task_id = params.task_id.clone();
-        let expected_binding_id = trusted_binding_id.clone();
-        let expected_thread_uuid = trusted_thread_uuid.clone();
-        let server_for_recheck = self.clone();
-        let host_launcher = self.host_launcher.clone();
-        let startup_deadline = host_launcher
-            .as_ref()
-            .map(|launcher| Instant::now() + launcher.policy().startup_timeout());
-
-        let req_id = self
-            .begin_paired_observation(
-                &guard_binding_id,
-                &guard_thread_uuid,
-                "start_approved_task",
-                Some(&guard_approval_id),
-                Some(&guard_task_id),
-            )
-            .await;
-
-        let res = crate::dispatch_guard::with_guarded_native_dispatch_until(
-            &authority_for_guard,
-            &guard_binding_id,
-            &guard_thread_uuid,
-            &guard_approval_id,
-            &guard_task_id,
-            None,
-            startup_deadline,
-            || async move {
-                Ok(execute_start_approved_task_with_launcher_until(
-                    stores.authority,
-                    stores.sessions_dir,
-                    trusted_binding_id,
-                    trusted_thread_uuid,
-                    params,
-                    host_launcher,
-                    startup_deadline,
-                    move || {
-                        let enrollment = server_for_recheck
-                            .verify_enrolled_binding_for_tool("start_approved_task")?;
-                        if !constant_time_str_eq(&enrollment.binding_id, &expected_binding_id)
-                            || !constant_time_str_eq(&enrollment.thread_id, &expected_thread_uuid)
-                        {
-                            return Err(Self::format_pairing_error(
-                                "start_approved_task",
-                                NativeError::new(
-                                    NativeErrorCode::RebindRejected,
-                                    "enrolled binding or native thread changed during approved host startup",
-                                ),
-                            ));
-                        }
-                        Ok(())
-                    },
-                )
-                .await)
-            },
-        )
-        .await
-        .map_err(|err| match err {
-            crate::dispatch_guard::GuardedDispatchError::PreEffect { code, message } => {
-                crate::approved_mcp::format_approved_scoped_error(
-                    &guard_binding_id,
-                    "start_approved_task",
-                    code,
-                    message,
-                )
-            }
-            crate::dispatch_guard::GuardedDispatchError::Host(host_err) => {
-                let (code, message) = crate::approved_mcp::map_host_error_to_mcp(&host_err);
-                crate::approved_mcp::format_approved_scoped_error(
-                    &guard_binding_id,
-                    "start_approved_task",
-                    code,
-                    message,
-                )
-            }
-        })
-        .and_then(|inner| inner);
-
-        self.finish_paired_observation(
-            req_id,
-            &guard_binding_id,
-            &guard_thread_uuid,
-            "start_approved_task",
-            Some(&guard_approval_id),
-            Some(&guard_task_id),
-            &res,
-        );
-        res
+        self.start_approved_task_boxed(params).await
     }
 
     /// Reads the current execution status of an approved task within an operator approval record (requires verified operator enrollment).
@@ -2500,37 +4520,7 @@ impl PairedMcpServer {
         &self,
         Parameters(params): Parameters<ApprovedTaskParams>,
     ) -> Result<CallToolResult, CallToolResult> {
-        let (trusted_binding_id, trusted_thread_uuid, stores) =
-            self.verified_host_context("approved_task")?;
-        let approval_id = params.approval_id.clone();
-        let task_id = params.task_id.clone();
-        let req_id = self
-            .begin_paired_observation(
-                &trusted_binding_id,
-                &trusted_thread_uuid,
-                "approved_task",
-                Some(&approval_id),
-                Some(&task_id),
-            )
-            .await;
-        let res = execute_approved_task(
-            stores.authority,
-            stores.sessions_dir,
-            trusted_binding_id.clone(),
-            trusted_thread_uuid.clone(),
-            params,
-        )
-        .await;
-        self.finish_paired_observation(
-            req_id,
-            &trusted_binding_id,
-            &trusted_thread_uuid,
-            "approved_task",
-            Some(&approval_id),
-            Some(&task_id),
-            &res,
-        );
-        res
+        self.approved_task_boxed(params).await
     }
 
     /// Requests revision-checked cancellation of an active approved root worker task (requires verified operator enrollment).
@@ -2549,37 +4539,7 @@ impl PairedMcpServer {
         &self,
         Parameters(params): Parameters<CancelApprovedTaskParams>,
     ) -> Result<CallToolResult, CallToolResult> {
-        let (trusted_binding_id, trusted_thread_uuid, stores) =
-            self.verified_host_context("cancel_approved_task")?;
-        let approval_id = params.approval_id.clone();
-        let task_id = params.task_id.clone();
-        let req_id = self
-            .begin_paired_observation(
-                &trusted_binding_id,
-                &trusted_thread_uuid,
-                "cancel_approved_task",
-                Some(&approval_id),
-                Some(&task_id),
-            )
-            .await;
-        let res = execute_cancel_approved_task(
-            stores.authority,
-            stores.sessions_dir,
-            trusted_binding_id.clone(),
-            trusted_thread_uuid.clone(),
-            params,
-        )
-        .await;
-        self.finish_paired_observation(
-            req_id,
-            &trusted_binding_id,
-            &trusted_thread_uuid,
-            "cancel_approved_task",
-            Some(&approval_id),
-            Some(&task_id),
-            &res,
-        );
-        res
+        self.cancel_approved_task_boxed(params).await
     }
 
     /// Lists a read-only bounded page of durable activity events from an approved host session (requires verified operator enrollment).
@@ -2598,37 +4558,7 @@ impl PairedMcpServer {
         &self,
         Parameters(params): Parameters<ApprovedActivityParams>,
     ) -> Result<CallToolResult, CallToolResult> {
-        let (trusted_binding_id, trusted_thread_uuid, stores) =
-            self.verified_host_context("approved_activity")?;
-        let approval_id = params.approval_id.clone();
-        let task_id = params.task_id.clone();
-        let req_id = self
-            .begin_paired_observation(
-                &trusted_binding_id,
-                &trusted_thread_uuid,
-                "approved_activity",
-                Some(&approval_id),
-                task_id.as_deref(),
-            )
-            .await;
-        let res = execute_approved_activity(
-            stores.authority,
-            stores.sessions_dir,
-            trusted_binding_id.clone(),
-            trusted_thread_uuid.clone(),
-            params,
-        )
-        .await;
-        self.finish_paired_observation(
-            req_id,
-            &trusted_binding_id,
-            &trusted_thread_uuid,
-            "approved_activity",
-            Some(&approval_id),
-            task_id.as_deref(),
-            &res,
-        );
-        res
+        self.approved_activity_boxed(params).await
     }
 
     /// Pulls a bounded ordered batch of durable events from an approved host session (requires verified operator enrollment).
@@ -2647,36 +4577,7 @@ impl PairedMcpServer {
         &self,
         Parameters(params): Parameters<ApprovedPullEventsParams>,
     ) -> Result<CallToolResult, CallToolResult> {
-        let (trusted_binding_id, trusted_thread_uuid, stores) =
-            self.verified_host_context("approved_pull_events")?;
-        let approval_id = params.approval_id.clone();
-        let req_id = self
-            .begin_paired_observation(
-                &trusted_binding_id,
-                &trusted_thread_uuid,
-                "approved_pull_events",
-                Some(&approval_id),
-                None,
-            )
-            .await;
-        let res = execute_approved_pull_events(
-            stores.authority,
-            stores.sessions_dir,
-            trusted_binding_id.clone(),
-            trusted_thread_uuid.clone(),
-            params,
-        )
-        .await;
-        self.finish_paired_observation(
-            req_id,
-            &trusted_binding_id,
-            &trusted_thread_uuid,
-            "approved_pull_events",
-            Some(&approval_id),
-            None,
-            &res,
-        );
-        res
+        self.approved_pull_events_boxed(params).await
     }
 
     /// Explicitly acknowledges processing of a delivered event batch from an approved host session (requires verified operator enrollment).
@@ -2695,36 +4596,7 @@ impl PairedMcpServer {
         &self,
         Parameters(params): Parameters<ApprovedAckEventsParams>,
     ) -> Result<CallToolResult, CallToolResult> {
-        let (trusted_binding_id, trusted_thread_uuid, stores) =
-            self.verified_host_context("approved_ack_events")?;
-        let approval_id = params.approval_id.clone();
-        let req_id = self
-            .begin_paired_observation(
-                &trusted_binding_id,
-                &trusted_thread_uuid,
-                "approved_ack_events",
-                Some(&approval_id),
-                None,
-            )
-            .await;
-        let res = execute_approved_ack_events(
-            stores.authority,
-            stores.sessions_dir,
-            trusted_binding_id.clone(),
-            trusted_thread_uuid.clone(),
-            params,
-        )
-        .await;
-        self.finish_paired_observation(
-            req_id,
-            &trusted_binding_id,
-            &trusted_thread_uuid,
-            "approved_ack_events",
-            Some(&approval_id),
-            None,
-            &res,
-        );
-        res
+        self.approved_ack_events_boxed(params).await
     }
 
     /// Reads bounded Coworker standing-grant, job, advice, and planning-command summaries for the enrolled chat binding (requires verified operator enrollment).
@@ -2743,10 +4615,7 @@ impl PairedMcpServer {
         &self,
         Parameters(params): Parameters<CoworkerStatusParams>,
     ) -> Result<CallToolResult, CallToolResult> {
-        self.run_planning_gateway_blocking("coworker_status", None, move |gateway| {
-            gateway.coworker_status(&params)
-        })
-        .await
+        self.coworker_status_boxed(params).await
     }
 
     /// Creates a new Coworker job or amends an existing job's structured work brief under an active standing planning grant (requires verified operator enrollment).
@@ -2765,13 +4634,7 @@ impl PairedMcpServer {
         &self,
         Parameters(params): Parameters<PrepareWorkParams>,
     ) -> Result<CallToolResult, CallToolResult> {
-        let initial_job_id = params.amendment.as_ref().map(|a| a.target_job_id.clone());
-        self.run_planning_gateway_blocking(
-            "prepare_work",
-            initial_job_id.as_deref(),
-            move |gateway| gateway.prepare_work(&params),
-        )
-        .await
+        self.prepare_work_boxed(params).await
     }
 
     /// Enqueues a dependency-bound Architect consultation command and triggers detached execution via `threadlane-flow` (requires verified operator enrollment).
@@ -2790,40 +4653,7 @@ impl PairedMcpServer {
         &self,
         Parameters(params): Parameters<ConsultArchitectParams>,
     ) -> Result<CallToolResult, CallToolResult> {
-        let (trusted_binding_id, trusted_thread_uuid, gateway) =
-            self.verified_planning_gateway("consult_architect")?;
-        let job_id = params.job_id.clone();
-        let req_id = self
-            .begin_paired_observation_with_job(
-                &trusted_binding_id,
-                &trusted_thread_uuid,
-                "consult_architect",
-                Some(&job_id),
-                None,
-                None,
-            )
-            .await;
-        let result = match gateway.consult_architect(&params).await {
-            Ok(data) => {
-                Self::format_planning_gateway_result(&trusted_binding_id, "consult_architect", data)
-            }
-            Err(err) => Err(Self::format_planning_gateway_error(
-                &trusted_binding_id,
-                "consult_architect",
-                err,
-            )),
-        };
-        self.finish_paired_observation_with_job(
-            req_id,
-            &trusted_binding_id,
-            &trusted_thread_uuid,
-            "consult_architect",
-            Some(&job_id),
-            None,
-            None,
-            &result,
-        );
-        result
+        self.consult_architect_boxed(params).await
     }
 
     /// Enqueues an Orchestrator technical planning command for a prepared Coworker job and triggers detached execution via `threadlane-flow` (requires verified operator enrollment).
@@ -2842,42 +4672,7 @@ impl PairedMcpServer {
         &self,
         Parameters(params): Parameters<RequestTechnicalPlanParams>,
     ) -> Result<CallToolResult, CallToolResult> {
-        let (trusted_binding_id, trusted_thread_uuid, gateway) =
-            self.verified_planning_gateway("request_technical_plan")?;
-        let job_id = params.job_id.clone();
-        let req_id = self
-            .begin_paired_observation_with_job(
-                &trusted_binding_id,
-                &trusted_thread_uuid,
-                "request_technical_plan",
-                Some(&job_id),
-                None,
-                None,
-            )
-            .await;
-        let result = match gateway.request_technical_plan(&params).await {
-            Ok(data) => Self::format_planning_gateway_result(
-                &trusted_binding_id,
-                "request_technical_plan",
-                data,
-            ),
-            Err(err) => Err(Self::format_planning_gateway_error(
-                &trusted_binding_id,
-                "request_technical_plan",
-                err,
-            )),
-        };
-        self.finish_paired_observation_with_job(
-            req_id,
-            &trusted_binding_id,
-            &trusted_thread_uuid,
-            "request_technical_plan",
-            Some(&job_id),
-            None,
-            None,
-            &result,
-        );
-        result
+        self.request_technical_plan_boxed(params).await
     }
 
     /// Reads the current status and verified structured outcome (without raw prompts) of a scoped planning command (requires verified operator enrollment).
@@ -2896,10 +4691,7 @@ impl PairedMcpServer {
         &self,
         Parameters(params): Parameters<PlanningCommandParams>,
     ) -> Result<CallToolResult, CallToolResult> {
-        self.run_planning_gateway_blocking("planning_command", None, move |gateway| {
-            gateway.planning_command(&params)
-        })
-        .await
+        self.planning_command_boxed(params).await
     }
 
     /// Reads a process-free, provider-free preview of the concrete approval and execution scope for a Coworker job (requires verified operator enrollment).
@@ -2918,51 +4710,7 @@ impl PairedMcpServer {
         &self,
         Parameters(params): Parameters<PreviewExecutionParams>,
     ) -> Result<CallToolResult, CallToolResult> {
-        let (trusted_binding_id, trusted_thread_uuid, gateway) =
-            self.verified_execution_gateway("preview_execution")?;
-        let job_id = params.job_id.clone();
-        let req_id = self
-            .begin_paired_observation_with_job(
-                &trusted_binding_id,
-                &trusted_thread_uuid,
-                "preview_execution",
-                Some(&job_id),
-                None,
-                None,
-            )
-            .await;
-        let outcome = tokio::task::spawn_blocking(move || gateway.preview_execution(&params))
-            .await
-            .map_err(|_| {
-                Self::format_scoped_error(
-                    &trusted_binding_id,
-                    "preview_execution",
-                    "io_error",
-                    "Coworker execution preview task failed to complete.",
-                )
-            });
-        let result = match outcome {
-            Ok(Ok(data)) => {
-                Self::format_planning_gateway_result(&trusted_binding_id, "preview_execution", data)
-            }
-            Ok(Err(err)) => Err(Self::format_planning_gateway_error(
-                &trusted_binding_id,
-                "preview_execution",
-                err,
-            )),
-            Err(err_res) => Err(err_res),
-        };
-        self.finish_paired_observation_with_job(
-            req_id,
-            &trusted_binding_id,
-            &trusted_thread_uuid,
-            "preview_execution",
-            Some(&job_id),
-            None,
-            None,
-            &result,
-        );
-        result
+        self.preview_execution_boxed(params).await
     }
 
     /// Starts or reuses the single verified physical `CoworkerCodeDriver` owner for an approved, envelope-frozen Coworker job (requires verified operator enrollment).
@@ -2981,40 +4729,7 @@ impl PairedMcpServer {
         &self,
         Parameters(params): Parameters<StartExecutionParams>,
     ) -> Result<CallToolResult, CallToolResult> {
-        let (trusted_binding_id, trusted_thread_uuid, gateway) =
-            self.verified_execution_gateway("start_execution")?;
-        let job_id = params.job_id.clone();
-        let req_id = self
-            .begin_paired_observation_with_job(
-                &trusted_binding_id,
-                &trusted_thread_uuid,
-                "start_execution",
-                Some(&job_id),
-                None,
-                None,
-            )
-            .await;
-        let result = match gateway.start_execution(&params).await {
-            Ok(data) => {
-                Self::format_planning_gateway_result(&trusted_binding_id, "start_execution", data)
-            }
-            Err(err) => Err(Self::format_planning_gateway_error(
-                &trusted_binding_id,
-                "start_execution",
-                err,
-            )),
-        };
-        self.finish_paired_observation_with_job(
-            req_id,
-            &trusted_binding_id,
-            &trusted_thread_uuid,
-            "start_execution",
-            Some(&job_id),
-            None,
-            None,
-            &result,
-        );
-        result
+        self.start_execution_boxed(params).await
     }
 
     /// Reads the current verified `CoworkerCodeDriver` status for an approved Coworker job (requires verified operator enrollment).
@@ -3033,40 +4748,7 @@ impl PairedMcpServer {
         &self,
         Parameters(params): Parameters<ExecutionStatusParams>,
     ) -> Result<CallToolResult, CallToolResult> {
-        let (trusted_binding_id, trusted_thread_uuid, gateway) =
-            self.verified_execution_gateway("execution_status")?;
-        let job_id = params.job_id.clone();
-        let req_id = self
-            .begin_paired_observation_with_job(
-                &trusted_binding_id,
-                &trusted_thread_uuid,
-                "execution_status",
-                Some(&job_id),
-                None,
-                None,
-            )
-            .await;
-        let result = match gateway.execution_status(&params).await {
-            Ok(data) => {
-                Self::format_planning_gateway_result(&trusted_binding_id, "execution_status", data)
-            }
-            Err(err) => Err(Self::format_planning_gateway_error(
-                &trusted_binding_id,
-                "execution_status",
-                err,
-            )),
-        };
-        self.finish_paired_observation_with_job(
-            req_id,
-            &trusted_binding_id,
-            &trusted_thread_uuid,
-            "execution_status",
-            Some(&job_id),
-            None,
-            None,
-            &result,
-        );
-        result
+        self.execution_status_boxed(params).await
     }
 
     /// Records durable operator stop first and performs narrow `CoworkerCodeDriver` task cancellation for an approved Coworker job (requires verified operator enrollment).
@@ -3085,40 +4767,7 @@ impl PairedMcpServer {
         &self,
         Parameters(params): Parameters<StopExecutionParams>,
     ) -> Result<CallToolResult, CallToolResult> {
-        let (trusted_binding_id, trusted_thread_uuid, gateway) =
-            self.verified_execution_gateway("stop_execution")?;
-        let job_id = params.job_id.clone();
-        let req_id = self
-            .begin_paired_observation_with_job(
-                &trusted_binding_id,
-                &trusted_thread_uuid,
-                "stop_execution",
-                Some(&job_id),
-                None,
-                None,
-            )
-            .await;
-        let result = match gateway.stop_execution(&params).await {
-            Ok(data) => {
-                Self::format_planning_gateway_result(&trusted_binding_id, "stop_execution", data)
-            }
-            Err(err) => Err(Self::format_planning_gateway_error(
-                &trusted_binding_id,
-                "stop_execution",
-                err,
-            )),
-        };
-        self.finish_paired_observation_with_job(
-            req_id,
-            &trusted_binding_id,
-            &trusted_thread_uuid,
-            "stop_execution",
-            Some(&job_id),
-            None,
-            None,
-            &result,
-        );
-        result
+        self.stop_execution_boxed(params).await
     }
 }
 
@@ -3693,7 +5342,7 @@ mod observation_correlation_tests {
                 let obs_a1 = server
                     .begin_paired_observation(binding_id, thread_id, "list_plans", None, None)
                     .await;
-                let req_a1_id = obs_a1.request_id.clone();
+                let req_a1_id = obs_a1.request_id().to_owned();
 
                 // While A1 is in flight, Request B1 refreshes the shared context to model2 ("Sol", "xhigh")
                 // and completes.
@@ -3713,27 +5362,17 @@ mod observation_correlation_tests {
                 let obs_b1 = server
                     .begin_paired_observation(binding_id, thread_id, "catalog", None, None)
                     .await;
-                let req_b1_id = obs_b1.request_id.clone();
-                server.finish_paired_observation(
-                    obs_b1, binding_id, thread_id, "catalog", None, None, &ok_res,
-                );
+                let req_b1_id = obs_b1.request_id().to_owned();
+                server.finish_paired_observation(obs_b1, &ok_res).await;
 
                 // Request A1 now finishes; its Finish record must retain its entry-captured model1 ("GPT-5.4", "high").
-                server.finish_paired_observation(
-                    obs_a1,
-                    binding_id,
-                    thread_id,
-                    "list_plans",
-                    None,
-                    None,
-                    &ok_res,
-                );
+                server.finish_paired_observation(obs_a1, &ok_res).await;
 
                 // 2. Request A2 begins while selection is model2 ("Sol", "xhigh").
                 let obs_a2 = server
                     .begin_paired_observation(binding_id, thread_id, "get_plan", None, None)
                     .await;
-                let req_a2_id = obs_a2.request_id.clone();
+                let req_a2_id = obs_a2.request_id().to_owned();
 
                 // While A2 is in flight, Request B2 hits a failed metadata refresh (clearing shared selection)
                 // and completes.
@@ -3746,21 +5385,11 @@ mod observation_correlation_tests {
                 let obs_b2 = server
                     .begin_paired_observation(binding_id, thread_id, "list_approvals", None, None)
                     .await;
-                let req_b2_id = obs_b2.request_id.clone();
-                server.finish_paired_observation(
-                    obs_b2,
-                    binding_id,
-                    thread_id,
-                    "list_approvals",
-                    None,
-                    None,
-                    &ok_res,
-                );
+                let req_b2_id = obs_b2.request_id().to_owned();
+                server.finish_paired_observation(obs_b2, &ok_res).await;
 
                 // Request A2 now finishes; its Finish record must still retain model2 ("Sol", "xhigh").
-                server.finish_paired_observation(
-                    obs_a2, binding_id, thread_id, "get_plan", None, None, &ok_res,
-                );
+                server.finish_paired_observation(obs_a2, &ok_res).await;
 
                 (req_a1_id, req_b1_id, req_a2_id, req_b2_id)
             })

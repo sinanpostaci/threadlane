@@ -1,3 +1,6 @@
+#[path = "tray_linux.rs"]
+mod tray_linux;
+
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -12,6 +15,8 @@ use sha2::{Digest, Sha256};
 use tauri::image::Image;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
+#[cfg(not(target_os = "linux"))]
+use tauri::LogicalSize;
 use tauri::{
     AppHandle, Emitter, Manager, PhysicalPosition, State, WebviewUrl, WebviewWindow,
     WebviewWindowBuilder, Window, WindowEvent,
@@ -58,8 +63,29 @@ pub const MENU_LABEL_QUIT: &str = "Quit";
 /// Initial logical width of the tray popover window in pixels.
 pub const TRAY_POPOVER_WIDTH: f64 = 360.0;
 
-/// Initial logical height of the tray popover window in pixels.
+/// Initial logical height of the tray popover window in pixels, fitted to the compact 360x320
+/// status popup contract (up to [`TRAY_MAX_CONTRACT_ROWS`] concise two-line rows) without carrying
+/// over [`MAIN_WINDOW_MIN_HEIGHT`].
 pub const TRAY_POPOVER_HEIGHT: f64 = 320.0;
+
+/// Compact minimum logical width floor for constrained display workareas.
+pub const TRAY_POPOVER_MIN_WIDTH: f64 = 280.0;
+
+/// Compact minimum logical height floor for constrained display workareas.
+pub const TRAY_POPOVER_MIN_HEIGHT: f64 = 240.0;
+
+/// Maximum status rows displayed by the shared tray popover frontend contract (`TRAY_MAX_ROWS`).
+pub const TRAY_MAX_CONTRACT_ROWS: usize = 3;
+
+/// Minimum logical height configured on the primary `main` window (`tauri.conf.json`), which must
+/// never be inherited by or enforced upon the compact `tray` popover window.
+pub const MAIN_WINDOW_MIN_HEIGHT: f64 = 500.0;
+
+const _: () = assert!(
+    TRAY_MAX_CONTRACT_ROWS == 3
+        && (TRAY_POPOVER_HEIGHT as u32) < (MAIN_WINDOW_MIN_HEIGHT as u32)
+        && (TRAY_POPOVER_MIN_HEIGHT as u32) < (MAIN_WINDOW_MIN_HEIGHT as u32)
+);
 
 /// Relative path to the parent-rendered monochrome PNG icon used as a macOS template image.
 pub const MACOS_TRAY_ICON_REL_PATH: &str = "icons/tray.png";
@@ -91,8 +117,15 @@ const MAX_SINGLE_INSTANCE_BYTES: u64 = 4096;
 /// Grace window after opening the popover during which transient focus-loss events are ignored.
 pub const POPOVER_BLUR_GRACE_PERIOD: Duration = Duration::from_millis(180);
 
+/// Window after an automatic focus-loss hide during which an immediately arriving tray left-click
+/// is treated as completing that close toggle rather than reopening the popover.
+pub const POPOVER_BLUR_REOPEN_SUPPRESSION: Duration = Duration::from_millis(250);
+
 /// Minimum interval between consecutive left-click toggle events to prevent duplicate backend triggers.
 pub const TRAY_CLICK_DEBOUNCE: Duration = Duration::from_millis(90);
+
+#[cfg(not(target_os = "linux"))]
+const NON_LINUX_MISSING_COORDS_NOTICE: &str = "Tray host did not provide icon coordinates; status popup used fallback monitor placement instead of anchoring to the tray icon.";
 
 const TRAY_ESCAPE_INIT_SCRIPT: &str = r#"
 window.addEventListener('keydown', (event) => {
@@ -191,6 +224,7 @@ pub enum TrayAvailabilityRecoveryDecision {
 }
 
 /// Physical rectangle of a tray icon in screen pixels.
+#[cfg(any(not(target_os = "linux"), test))]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TrayRectPx {
     pub x: f64,
@@ -219,6 +253,237 @@ impl Default for MonitorBoundsPx {
             scale_factor: 1.0,
         }
     }
+}
+
+/// Raw 2D coordinate preserving whether the toolkit supplied physical or logical units.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RawCoordinate2D {
+    Physical { x: f64, y: f64 },
+    Logical { x: f64, y: f64 },
+}
+
+impl RawCoordinate2D {
+    pub fn from_tauri_position(position: tauri::Position) -> Self {
+        match position {
+            tauri::Position::Physical(pos) => Self::Physical {
+                x: pos.x as f64,
+                y: pos.y as f64,
+            },
+            tauri::Position::Logical(pos) => Self::Logical { x: pos.x, y: pos.y },
+        }
+    }
+}
+
+/// Raw 2D size preserving whether the toolkit supplied physical or logical units.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RawSize2D {
+    Physical { width: f64, height: f64 },
+    Logical { width: f64, height: f64 },
+}
+
+impl RawSize2D {
+    pub fn from_tauri_size(size: tauri::Size) -> Self {
+        match size {
+            tauri::Size::Physical(sz) => Self::Physical {
+                width: sz.width as f64,
+                height: sz.height as f64,
+            },
+            tauri::Size::Logical(sz) => Self::Logical {
+                width: sz.width,
+                height: sz.height,
+            },
+        }
+    }
+}
+
+/// Raw tray icon rectangle captured before monitor-specific scale conversion.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RawTrayRect {
+    pub position: RawCoordinate2D,
+    pub size: RawSize2D,
+}
+
+impl RawTrayRect {
+    pub fn from_tauri_rect(rect: &tauri::Rect) -> Self {
+        Self {
+            position: RawCoordinate2D::from_tauri_position(rect.position),
+            size: RawSize2D::from_tauri_size(rect.size),
+        }
+    }
+}
+
+/// Raw activation coordinates captured from a tray icon click event prior to monitor resolution.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RawTrayAnchor {
+    pub click_position: Option<RawCoordinate2D>,
+    pub tray_rect: Option<RawTrayRect>,
+}
+
+impl RawTrayAnchor {
+    pub fn from_click_event(position: PhysicalPosition<f64>, rect: &tauri::Rect) -> Self {
+        Self {
+            click_position: Some(RawCoordinate2D::Physical {
+                x: position.x,
+                y: position.y,
+            }),
+            tray_rect: Some(RawTrayRect::from_tauri_rect(rect)),
+        }
+    }
+}
+
+/// Resolved target monitor and physical anchor coordinates computed using that monitor's own scale.
+#[cfg(any(not(target_os = "linux"), test))]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ResolvedTrayAnchor {
+    pub monitor: MonitorBoundsPx,
+    pub click_position_px: Option<(f64, f64)>,
+    pub tray_rect_px: Option<TrayRectPx>,
+    pub has_valid_anchor: bool,
+}
+
+/// Reason why a popover open operation could not anchor directly to tray icon coordinates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnanchoredPlacementReason {
+    /// Tray host omitted icon coordinates (e.g. `(0, 0)` sentinel or context-menu open).
+    MissingTrayCoordinates,
+    /// Wayland `xdg_toplevel` surfaces do not permit client-driven tray-anchored placement.
+    #[cfg(any(target_os = "linux", test))]
+    WaylandCompositorManaged,
+    /// Both valid tray coordinates and Wayland client positioning support are absent.
+    #[cfg(any(target_os = "linux", test))]
+    WaylandMissingCoordinatesAndCompositorSupport,
+    /// Display backend does not expose client window positioning.
+    #[cfg(any(target_os = "linux", test))]
+    BackendUnsupported,
+}
+
+/// Truthful classification of how the tray status popover was placed on screen.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PopoverPlacementOutcome {
+    /// Positioned relative to real tray icon geometry or activation coordinates on a backend that
+    /// honors client window coordinates.
+    IconAnchored { x: i32, y: i32, scale_factor: f64 },
+    /// Positioned at a safe monitor fallback corner because valid icon coordinates were absent.
+    /// Explicitly not counted as genuine icon-anchored placement.
+    FallbackMonitorCorner {
+        x: i32,
+        y: i32,
+        scale_factor: f64,
+        reason: UnanchoredPlacementReason,
+        notice: String,
+    },
+    /// Compositor or window system controls placement (e.g. Wayland `xdg_toplevel`); `set_position`
+    /// is not treated as icon-anchored placement.
+    #[cfg(any(target_os = "linux", test))]
+    CompositorManaged {
+        scale_factor: f64,
+        has_activation_coordinates: bool,
+        reason: UnanchoredPlacementReason,
+        notice: String,
+    },
+}
+
+impl PopoverPlacementOutcome {
+    /// Returns `true` strictly when the window was positioned using real tray icon/activation
+    /// coordinates on a display backend that honors client positioning.
+    pub fn is_icon_anchored(&self) -> bool {
+        matches!(self, Self::IconAnchored { .. })
+    }
+
+    /// Returns the human-readable diagnostic message when icon-anchored placement was unavailable.
+    pub fn diagnostic_notice(&self) -> Option<&str> {
+        match self {
+            Self::IconAnchored { .. } => None,
+            Self::FallbackMonitorCorner { notice, .. } => Some(notice.as_str()),
+            #[cfg(any(target_os = "linux", test))]
+            Self::CompositorManaged { notice, .. } => Some(notice.as_str()),
+        }
+    }
+
+    /// Returns the scale factor of the monitor selected for this open operation.
+    pub fn scale_factor(&self) -> f64 {
+        match self {
+            Self::IconAnchored { scale_factor, .. }
+            | Self::FallbackMonitorCorner { scale_factor, .. } => *scale_factor,
+            #[cfg(any(target_os = "linux", test))]
+            Self::CompositorManaged { scale_factor, .. } => *scale_factor,
+        }
+    }
+
+    /// Validates structural truthfulness invariants across placement variants.
+    pub fn validate_invariants(&self) -> bool {
+        let valid_scale = self.scale_factor().is_finite() && self.scale_factor() > 0.0;
+        if !valid_scale {
+            return false;
+        }
+        match self {
+            Self::IconAnchored { x, y, .. } => {
+                self.is_icon_anchored()
+                    && self.diagnostic_notice().is_none()
+                    && *x > i32::MIN
+                    && *y > i32::MIN
+            }
+            Self::FallbackMonitorCorner {
+                x,
+                y,
+                reason,
+                notice,
+                ..
+            } => {
+                !self.is_icon_anchored()
+                    && !notice.is_empty()
+                    && matches!(reason, UnanchoredPlacementReason::MissingTrayCoordinates)
+                    && *x > i32::MIN
+                    && *y > i32::MIN
+            }
+            #[cfg(any(target_os = "linux", test))]
+            Self::CompositorManaged {
+                has_activation_coordinates,
+                reason,
+                notice,
+                ..
+            } => {
+                let _ = *has_activation_coordinates;
+                !self.is_icon_anchored()
+                    && !notice.is_empty()
+                    && !matches!(reason, UnanchoredPlacementReason::MissingTrayCoordinates)
+            }
+        }
+    }
+}
+
+/// Origin of a request to open the tray status popover.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PopoverActivationSource {
+    /// Triggered by left-clicking / activating the tray icon.
+    TrayIconClick,
+    /// Triggered from the context menu (`Open status`) where no fresh icon click coordinates exist.
+    MenuOpenStatus,
+}
+
+/// Pure lifecycle decision when a tray icon click event arrives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrayToggleDecision {
+    /// Ignore non-left click, pre-release event on macOS, or duplicate bounce within debounce window.
+    IgnoreClick,
+    /// Popover is currently visible; hide it cleanly.
+    HideVisiblePopover,
+    /// Popover was just auto-hidden by focus loss milliseconds before this click arrived; keep it
+    /// closed rather than immediately reopening.
+    SuppressReopenAfterBlur,
+    /// Popover is hidden; open and present it.
+    OpenPopover,
+}
+
+/// Input bundle for evaluating [`TrayState::evaluate_tray_click_toggle`].
+#[derive(Debug, Clone, Copy)]
+pub struct TrayClickEvaluationInput {
+    pub button: MouseButton,
+    pub button_state: MouseButtonState,
+    pub is_linux: bool,
+    pub popover_currently_visible: bool,
+    pub raw_anchor: RawTrayAnchor,
+    pub now: Instant,
 }
 
 /// Normalized startup argument fingerprint used to detect conflicting second-instance launches.
@@ -403,6 +668,7 @@ pub fn ensure_main_window_only(window: &Window) -> Result<(), AppError> {
 
 /// Selects the monitor containing `anchor_px` (if usable), falling back to the first available
 /// monitor or [`MonitorBoundsPx::default`].
+#[cfg(test)]
 pub fn select_monitor_for_point(
     monitors: &[MonitorBoundsPx],
     anchor_px: Option<(f64, f64)>,
@@ -426,6 +692,7 @@ pub fn select_monitor_for_point(
     monitors[0]
 }
 
+#[cfg(any(not(target_os = "linux"), test))]
 fn is_usable_tray_rect(rect: &TrayRectPx, monitor: &MonitorBoundsPx) -> bool {
     if !rect.x.is_finite()
         || !rect.y.is_finite()
@@ -445,6 +712,7 @@ fn is_usable_tray_rect(rect: &TrayRectPx, monitor: &MonitorBoundsPx) -> bool {
     rect.x >= min_x && rect.x <= max_x && rect.y >= min_y && rect.y <= max_y
 }
 
+#[cfg(any(not(target_os = "linux"), test))]
 fn is_usable_click_point(point: (f64, f64), monitor: &MonitorBoundsPx) -> bool {
     let (x, y) = point;
     if !x.is_finite() || !y.is_finite() {
@@ -466,6 +734,7 @@ fn is_usable_click_point(point: (f64, f64), monitor: &MonitorBoundsPx) -> bool {
 /// Uses `tray_rect` when non-empty, else `click_position` when valid and non-zero, and otherwise
 /// falls back to a safe top-right (Linux/macOS) or bottom-right (Windows) position inside the
 /// target monitor bounds.
+#[cfg(any(not(target_os = "linux"), test))]
 pub fn compute_popover_position_px(
     monitor: MonitorBoundsPx,
     popover_logical_size: (f64, f64),
@@ -552,6 +821,334 @@ pub fn compute_popover_position_px(
         .max(min_y);
 
     (raw_x.clamp(min_x, max_x), raw_y.clamp(min_y, max_y))
+}
+
+#[cfg(any(not(target_os = "linux"), test))]
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct LogicalMonitorSpan {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+}
+
+#[cfg(any(not(target_os = "linux"), test))]
+fn sanitize_scale_factor(scale_factor: f64) -> f64 {
+    if scale_factor.is_finite() && scale_factor > 0.0 {
+        scale_factor
+    } else {
+        1.0
+    }
+}
+
+#[cfg(any(not(target_os = "linux"), test))]
+fn derive_logical_monitor_spans(monitors: &[MonitorBoundsPx]) -> Vec<LogicalMonitorSpan> {
+    let n = monitors.len();
+    let mut origins: Vec<Option<(f64, f64)>> = vec![None; n];
+    let logical_sizes: Vec<(f64, f64)> = monitors
+        .iter()
+        .map(|m| {
+            let s = sanitize_scale_factor(m.scale_factor);
+            ((m.width.max(1) as f64) / s, (m.height.max(1) as f64) / s)
+        })
+        .collect();
+
+    for (idx, mon) in monitors.iter().enumerate() {
+        if mon.x == 0 && mon.y == 0 {
+            origins[idx] = Some((0.0, 0.0));
+        }
+    }
+    if origins.iter().all(Option::is_none) && !monitors.is_empty() {
+        let s = sanitize_scale_factor(monitors[0].scale_factor);
+        origins[0] = Some(((monitors[0].x as f64) / s, (monitors[0].y as f64) / s));
+    }
+
+    for _ in 0..n {
+        let mut progress = false;
+        for i in 0..n {
+            if origins[i].is_some() {
+                continue;
+            }
+            for j in 0..n {
+                let Some((jx, jy)) = origins[j] else {
+                    continue;
+                };
+                let m_i = &monitors[i];
+                let m_j = &monitors[j];
+                let (jw, jh) = logical_sizes[j];
+                let (iw, ih) = logical_sizes[i];
+
+                let candidate_x = if m_i.x == m_j.x.saturating_add(m_j.width as i32) {
+                    Some(jx + jw)
+                } else if m_i.x.saturating_add(m_i.width as i32) == m_j.x {
+                    Some(jx - iw)
+                } else if m_i.x == m_j.x {
+                    Some(jx)
+                } else {
+                    None
+                };
+
+                let candidate_y = if m_i.y == m_j.y.saturating_add(m_j.height as i32) {
+                    Some(jy + jh)
+                } else if m_i.y.saturating_add(m_i.height as i32) == m_j.y {
+                    Some(jy - ih)
+                } else if m_i.y == m_j.y {
+                    Some(jy)
+                } else {
+                    None
+                };
+
+                if let (Some(cx), Some(cy)) = (candidate_x, candidate_y) {
+                    origins[i] = Some((cx, cy));
+                    progress = true;
+                    break;
+                }
+            }
+        }
+        if !progress {
+            break;
+        }
+    }
+
+    monitors
+        .iter()
+        .enumerate()
+        .map(|(idx, mon)| {
+            let s = sanitize_scale_factor(mon.scale_factor);
+            let fallback = ((mon.x as f64) / s, (mon.y as f64) / s);
+            let (lx, ly) = origins[idx].unwrap_or(fallback);
+            let (lw, lh) = logical_sizes[idx];
+            LogicalMonitorSpan {
+                x: lx,
+                y: ly,
+                width: lw,
+                height: lh,
+            }
+        })
+        .collect()
+}
+
+#[cfg(any(not(target_os = "linux"), test))]
+fn point_in_physical_monitor(monitor: &MonitorBoundsPx, px: f64, py: f64, tolerance: f64) -> bool {
+    if !px.is_finite() || !py.is_finite() {
+        return false;
+    }
+    let min_x = (monitor.x as f64) - tolerance;
+    let max_x = (monitor.x as f64) + (monitor.width as f64) + tolerance;
+    let min_y = (monitor.y as f64) - tolerance;
+    let max_y = (monitor.y as f64) + (monitor.height as f64) + tolerance;
+    if tolerance == 0.0 {
+        px >= min_x && px < max_x && py >= min_y && py < max_y
+    } else {
+        px >= min_x && px <= max_x && py >= min_y && py <= max_y
+    }
+}
+
+#[cfg(any(not(target_os = "linux"), test))]
+fn point_in_logical_span(span: &LogicalMonitorSpan, lx: f64, ly: f64, tolerance: f64) -> bool {
+    if !lx.is_finite() || !ly.is_finite() {
+        return false;
+    }
+    let min_x = span.x - tolerance;
+    let max_x = span.x + span.width + tolerance;
+    let min_y = span.y - tolerance;
+    let max_y = span.y + span.height + tolerance;
+    if tolerance == 0.0 {
+        lx >= min_x && lx < max_x && ly >= min_y && ly < max_y
+    } else {
+        lx >= min_x && lx <= max_x && ly >= min_y && ly <= max_y
+    }
+}
+
+/// Resolves raw tray activation geometry against `monitors` using the containing monitor's own
+/// `scale_factor` rather than converting logical coordinates upfront with `monitors.first()`.
+#[cfg(any(not(target_os = "linux"), test))]
+pub fn resolve_tray_anchor_for_monitors(
+    monitors: &[MonitorBoundsPx],
+    raw_anchor: Option<RawTrayAnchor>,
+) -> ResolvedTrayAnchor {
+    let default_monitor = monitors.first().copied().unwrap_or_default();
+    let effective_monitors: &[MonitorBoundsPx] = if monitors.is_empty() {
+        std::slice::from_ref(&default_monitor)
+    } else {
+        monitors
+    };
+    let logical_spans = derive_logical_monitor_spans(effective_monitors);
+
+    let Some(anchor) = raw_anchor else {
+        return ResolvedTrayAnchor {
+            monitor: default_monitor,
+            click_position_px: None,
+            tray_rect_px: None,
+            has_valid_anchor: false,
+        };
+    };
+
+    let mut matched_monitor: Option<(usize, MonitorBoundsPx)> = None;
+    let mut resolved_rect_px: Option<TrayRectPx> = None;
+
+    if let Some(raw_rect) = anchor.tray_rect {
+        'rect_search: for &tolerance in &[0.0, 32.0] {
+            for (idx, (mon, span)) in effective_monitors
+                .iter()
+                .zip(logical_spans.iter())
+                .enumerate()
+            {
+                let scale = sanitize_scale_factor(mon.scale_factor);
+                match raw_rect.position {
+                    RawCoordinate2D::Physical { x, y } => {
+                        let (pw, ph) = match raw_rect.size {
+                            RawSize2D::Physical { width, height } => (width, height),
+                            RawSize2D::Logical { width, height } => (width * scale, height * scale),
+                        };
+                        if !x.is_finite()
+                            || !y.is_finite()
+                            || !pw.is_finite()
+                            || !ph.is_finite()
+                            || (pw <= 1.0 && ph <= 1.0)
+                        {
+                            continue;
+                        }
+                        let cx = x + pw / 2.0;
+                        let cy = y + ph / 2.0;
+                        if point_in_physical_monitor(mon, cx, cy, tolerance) {
+                            let candidate = TrayRectPx {
+                                x,
+                                y,
+                                width: pw,
+                                height: ph,
+                            };
+                            if is_usable_tray_rect(&candidate, mon) {
+                                matched_monitor = Some((idx, *mon));
+                                resolved_rect_px = Some(candidate);
+                                break 'rect_search;
+                            }
+                        }
+                    }
+                    RawCoordinate2D::Logical { x, y } => {
+                        let (lw, lh) = match raw_rect.size {
+                            RawSize2D::Logical { width, height } => (width, height),
+                            RawSize2D::Physical { width, height } => {
+                                (width / scale, height / scale)
+                            }
+                        };
+                        if !x.is_finite()
+                            || !y.is_finite()
+                            || !lw.is_finite()
+                            || !lh.is_finite()
+                            || (lw <= 1.0 && lh <= 1.0)
+                        {
+                            continue;
+                        }
+                        let lcx = x + lw / 2.0;
+                        let lcy = y + lh / 2.0;
+                        if point_in_logical_span(span, lcx, lcy, tolerance) {
+                            let candidate = TrayRectPx {
+                                x: (mon.x as f64) + (x - span.x) * scale,
+                                y: (mon.y as f64) + (y - span.y) * scale,
+                                width: lw * scale,
+                                height: lh * scale,
+                            };
+                            if is_usable_tray_rect(&candidate, mon) {
+                                matched_monitor = Some((idx, *mon));
+                                resolved_rect_px = Some(candidate);
+                                break 'rect_search;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut resolved_click_px: Option<(f64, f64)> = None;
+    if let Some(raw_click) = anchor.click_position {
+        if let Some((idx, mon)) = matched_monitor {
+            let span = &logical_spans[idx];
+            let scale = sanitize_scale_factor(mon.scale_factor);
+            let candidate_pt = match raw_click {
+                RawCoordinate2D::Physical { x, y } => (x, y),
+                RawCoordinate2D::Logical { x, y } => (
+                    (mon.x as f64) + (x - span.x) * scale,
+                    (mon.y as f64) + (y - span.y) * scale,
+                ),
+            };
+            if is_usable_click_point(candidate_pt, &mon) {
+                resolved_click_px = Some(candidate_pt);
+            }
+        } else {
+            'click_search: for &tolerance in &[0.0, 32.0] {
+                for (idx, (mon, span)) in effective_monitors
+                    .iter()
+                    .zip(logical_spans.iter())
+                    .enumerate()
+                {
+                    let scale = sanitize_scale_factor(mon.scale_factor);
+                    match raw_click {
+                        RawCoordinate2D::Physical { x, y } => {
+                            if !(x == 0.0 && y == 0.0)
+                                && point_in_physical_monitor(mon, x, y, tolerance)
+                                && is_usable_click_point((x, y), mon)
+                            {
+                                matched_monitor = Some((idx, *mon));
+                                resolved_click_px = Some((x, y));
+                                break 'click_search;
+                            }
+                        }
+                        RawCoordinate2D::Logical { x, y } => {
+                            if !(x == 0.0 && y == 0.0)
+                                && point_in_logical_span(span, x, y, tolerance)
+                            {
+                                let pt = (
+                                    (mon.x as f64) + (x - span.x) * scale,
+                                    (mon.y as f64) + (y - span.y) * scale,
+                                );
+                                if is_usable_click_point(pt, mon) {
+                                    matched_monitor = Some((idx, *mon));
+                                    resolved_click_px = Some(pt);
+                                    break 'click_search;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let final_monitor = matched_monitor
+        .map(|(_, mon)| mon)
+        .unwrap_or(default_monitor);
+    let has_valid_anchor = resolved_rect_px.is_some() || resolved_click_px.is_some();
+
+    ResolvedTrayAnchor {
+        monitor: final_monitor,
+        click_position_px: resolved_click_px,
+        tray_rect_px: resolved_rect_px,
+        has_valid_anchor,
+    }
+}
+
+/// Computes compact logical `(width, height)` dimensions for the tray popover on `monitor`,
+/// fitting up to [`TRAY_MAX_CONTRACT_ROWS`] status rows without carrying over `main`'s minimum
+/// window height (`500px`).
+#[cfg(any(not(target_os = "linux"), test))]
+pub fn compute_popover_logical_size_for_monitor(monitor: MonitorBoundsPx) -> (f64, f64) {
+    let scale = sanitize_scale_factor(monitor.scale_factor);
+    let logical_mon_w = (monitor.width.max(1) as f64) / scale;
+    let logical_mon_h = (monitor.height.max(1) as f64) / scale;
+    let avail_w = (logical_mon_w - 24.0).max(160.0);
+    let avail_h = (logical_mon_h - 24.0).max(160.0);
+
+    let width = TRAY_POPOVER_WIDTH
+        .max(TRAY_POPOVER_MIN_WIDTH)
+        .min(avail_w)
+        .round();
+    let height = TRAY_POPOVER_HEIGHT
+        .max(TRAY_POPOVER_MIN_HEIGHT)
+        .min(avail_h)
+        .round();
+    (width, height)
 }
 
 /// Bounded persistent store for `tray-preferences.json` under `app_data_dir`.
@@ -1417,13 +2014,14 @@ struct TrayRuntimeInner {
     tray_available: bool,
     persistence_warning: Option<String>,
     tray_status_message: Option<String>,
+    placement_notice: Option<String>,
     status_message: Option<String>,
     explicit_quit_requested: bool,
     last_popover_opened_at: Option<Instant>,
+    last_popover_blur_hidden_at: Option<Instant>,
     last_tray_click_at: Option<Instant>,
-    last_click_position: Option<(f64, f64)>,
-    last_tray_rect: Option<TrayRectPx>,
-    _tray_icon: Option<TrayIcon>,
+    last_raw_anchor: Option<RawTrayAnchor>,
+    tray_icon: Option<TrayIcon>,
     _single_instance: Option<SingleInstanceGuard>,
 }
 
@@ -1458,8 +2056,12 @@ impl TrayState {
     ) -> Self {
         let persistence_warning = initial.warning;
         let tray_status_message = tray_init_message;
-        let status_message =
-            combine_status_messages(persistence_warning.clone(), tray_status_message.clone());
+        let status_message = combine_status_messages(
+            persistence_warning.clone(),
+            tray_status_message.clone(),
+            None,
+            tray_available,
+        );
         Self {
             store,
             inner: Arc::new(Mutex::new(TrayRuntimeInner {
@@ -1467,13 +2069,14 @@ impl TrayState {
                 tray_available,
                 persistence_warning,
                 tray_status_message,
+                placement_notice: None,
                 status_message,
                 explicit_quit_requested: false,
                 last_popover_opened_at: None,
+                last_popover_blur_hidden_at: None,
                 last_tray_click_at: None,
-                last_click_position: None,
-                last_tray_rect: None,
-                _tray_icon: tray_icon,
+                last_raw_anchor: None,
+                tray_icon,
                 _single_instance: single_instance,
             })),
         }
@@ -1500,6 +2103,8 @@ impl TrayState {
                 guard.status_message = combine_status_messages(
                     guard.persistence_warning.clone(),
                     guard.tray_status_message.clone(),
+                    guard.placement_notice.clone(),
+                    guard.tray_available,
                 );
                 Ok(TrayPreferencesResponse {
                     close_behavior: guard.close_behavior,
@@ -1515,6 +2120,8 @@ impl TrayState {
                 guard.status_message = combine_status_messages(
                     guard.persistence_warning.clone(),
                     guard.tray_status_message.clone(),
+                    guard.placement_notice.clone(),
+                    guard.tray_available,
                 );
                 Err(error)
             }
@@ -1556,35 +2163,122 @@ impl TrayState {
         guard.last_popover_opened_at = Some(Instant::now());
     }
 
-    pub fn record_tray_click_and_should_toggle(
-        &self,
-        button: MouseButton,
-        button_state: MouseButtonState,
-        click_position: (f64, f64),
-        tray_rect: TrayRectPx,
-    ) -> bool {
-        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let now = Instant::now();
-        let elapsed = guard
-            .last_tray_click_at
-            .map(|prev| now.saturating_duration_since(prev));
-        let should_toggle = should_toggle_popover_on_tray_click(
-            button,
-            button_state,
-            cfg!(target_os = "linux"),
-            elapsed,
-        );
-        guard.last_click_position = Some(click_position);
-        guard.last_tray_rect = Some(tray_rect);
-        if should_toggle {
-            guard.last_tray_click_at = Some(now);
-        }
-        should_toggle
+    pub fn record_popover_blur_hidden(&self) {
+        self.record_popover_blur_hidden_at(Instant::now());
     }
 
-    pub fn last_anchor_coordinates(&self) -> (Option<(f64, f64)>, Option<TrayRectPx>) {
+    pub fn record_popover_blur_hidden_at(&self, now: Instant) {
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        guard.last_popover_blur_hidden_at = Some(now);
+    }
+
+    /// Evaluates a tray icon mouse click event against button/state filters, duplicate-emission
+    /// debounce, current popover visibility, and post-blur reopen suppression.
+    pub fn evaluate_tray_click_toggle(
+        &self,
+        input: TrayClickEvaluationInput,
+    ) -> TrayToggleDecision {
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let elapsed_since_click = guard
+            .last_tray_click_at
+            .map(|prev| input.now.saturating_duration_since(prev));
+        if !should_toggle_popover_on_tray_click(
+            input.button,
+            input.button_state,
+            input.is_linux,
+            elapsed_since_click,
+        ) {
+            return TrayToggleDecision::IgnoreClick;
+        }
+
+        guard.last_tray_click_at = Some(input.now);
+        guard.last_raw_anchor = Some(input.raw_anchor);
+
+        if input.popover_currently_visible {
+            guard.last_popover_blur_hidden_at = None;
+            return TrayToggleDecision::HideVisiblePopover;
+        }
+
+        if let Some(blur_hidden_at) = guard.last_popover_blur_hidden_at {
+            if input.now.saturating_duration_since(blur_hidden_at) < POPOVER_BLUR_REOPEN_SUPPRESSION
+            {
+                guard.last_popover_blur_hidden_at = None;
+                return TrayToggleDecision::SuppressReopenAfterBlur;
+            }
+        }
+
+        guard.last_popover_blur_hidden_at = None;
+        TrayToggleDecision::OpenPopover
+    }
+
+    /// Resolves the raw activation anchor appropriate for `source` without reusing stale click
+    /// coordinates when opening from the context menu (`Open status`).
+    pub fn anchor_for_activation(&self, source: PopoverActivationSource) -> Option<RawTrayAnchor> {
+        match source {
+            PopoverActivationSource::TrayIconClick => self.last_raw_anchor(),
+            PopoverActivationSource::MenuOpenStatus => {
+                let icon = {
+                    let guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+                    guard.tray_icon.clone()
+                };
+                icon.and_then(|ti| ti.rect().ok().flatten())
+                    .map(|rect| RawTrayAnchor {
+                        click_position: None,
+                        tray_rect: Some(RawTrayRect::from_tauri_rect(&rect)),
+                    })
+            }
+        }
+    }
+
+    pub fn last_raw_anchor(&self) -> Option<RawTrayAnchor> {
         let guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        (guard.last_click_position, guard.last_tray_rect)
+        guard.last_raw_anchor
+    }
+
+    pub fn set_placement_notice(&self, notice: Option<String>) {
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        guard.placement_notice = notice.filter(|msg| !msg.trim().is_empty());
+        guard.status_message = combine_status_messages(
+            guard.persistence_warning.clone(),
+            guard.tray_status_message.clone(),
+            guard.placement_notice.clone(),
+            guard.tray_available,
+        );
+    }
+
+    pub fn record_popover_open_outcome(
+        &self,
+        outcome: &PopoverPlacementOutcome,
+        effective_notice: Option<String>,
+    ) -> TrayPreferencesResponse {
+        debug_assert!(outcome.validate_invariants());
+        let resolved_notice =
+            effective_notice.or_else(|| outcome.diagnostic_notice().map(str::to_string));
+        self.set_placement_notice(resolved_notice);
+        self.preferences_response()
+    }
+
+    #[cfg(any(target_os = "linux", test))]
+    pub fn record_runtime_capability_notice(
+        &self,
+        capability_notice: &str,
+    ) -> TrayPreferencesResponse {
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        guard.placement_notice = tray_linux::combine_popover_notices(
+            guard.placement_notice.as_deref(),
+            Some(capability_notice),
+        );
+        guard.status_message = combine_status_messages(
+            guard.persistence_warning.clone(),
+            guard.tray_status_message.clone(),
+            guard.placement_notice.clone(),
+            guard.tray_available,
+        );
+        TrayPreferencesResponse {
+            close_behavior: guard.close_behavior,
+            tray_available: guard.tray_available,
+            message: guard.status_message.clone(),
+        }
     }
 
     pub fn mark_tray_unavailable(&self, reason: impl Into<String>) -> TrayPreferencesResponse {
@@ -1594,6 +2288,8 @@ impl TrayState {
         guard.status_message = combine_status_messages(
             guard.persistence_warning.clone(),
             guard.tray_status_message.clone(),
+            guard.placement_notice.clone(),
+            guard.tray_available,
         );
         TrayPreferencesResponse {
             close_behavior: guard.close_behavior,
@@ -1601,22 +2297,95 @@ impl TrayState {
             message: guard.status_message.clone(),
         }
     }
+
+    #[cfg(any(target_os = "linux", test))]
+    pub fn apply_linux_open_outcome(
+        &self,
+        open_outcome: Result<tray_linux::LinuxOpenOutcome, String>,
+    ) -> LinuxOpenPublicationAction {
+        match open_outcome {
+            Ok(tray_linux::LinuxOpenOutcome::Presented {
+                outcome,
+                effective_notice,
+            }) => {
+                let payload = self.record_popover_open_outcome(&outcome, effective_notice);
+                LinuxOpenPublicationAction::EmitOpened(payload)
+            }
+            Ok(tray_linux::LinuxOpenOutcome::SupersededSameGeneration) => {
+                LinuxOpenPublicationAction::EmitOpened(self.preferences_response())
+            }
+            Ok(tray_linux::LinuxOpenOutcome::SupersededOrCancelled) => {
+                LinuxOpenPublicationAction::NoPublication
+            }
+            Err(_) => LinuxOpenPublicationAction::RecoverMainOnCurrentFailure,
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LinuxOpenPublicationAction {
+    EmitOpened(TrayPreferencesResponse),
+    NoPublication,
+    RecoverMainOnCurrentFailure,
 }
 
 fn combine_status_messages(
     warning: Option<String>,
     tray_init_message: Option<String>,
+    placement_notice: Option<String>,
+    tray_available: bool,
 ) -> Option<String> {
-    match (warning, tray_init_message) {
-        (Some(w), Some(t)) => Some(format!("{w} {t}")),
-        (Some(w), None) => Some(w),
-        (None, Some(t)) => Some(t),
-        (None, None) => None,
+    let mut parts = Vec::with_capacity(3);
+    if let Some(w) = warning.filter(|s| !s.is_empty()) {
+        parts.push(w);
+    }
+    if let Some(t) = tray_init_message.filter(|s| !s.is_empty()) {
+        parts.push(t);
+    }
+    if tray_available {
+        if let Some(p) = placement_notice.filter(|s| !s.is_empty()) {
+            parts.push(p);
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" "))
     }
 }
 
 /// Restores, unminimizes, shows, and focuses the primary `main` window.
 pub fn show_and_focus_main_window(app: &AppHandle) {
+    #[cfg(target_os = "linux")]
+    {
+        if !tray_linux::is_linux_gtk_main_thread() {
+            let app_clone = app.clone();
+            if app
+                .run_on_main_thread(move || {
+                    tray_linux::release_linux_outside_click_backdrops(&app_clone);
+                    if let Some(tray_window) = app_clone.get_webview_window(TRAY_WINDOW_LABEL) {
+                        tray_linux::hide_linux_popover_gtk_window_on_main_thread(&tray_window);
+                        let _ = tray_window.hide();
+                    }
+                    if let Some(main_window) = app_clone.get_webview_window(MAIN_WINDOW_LABEL) {
+                        let _ = main_window.show();
+                        let _ = main_window.unminimize();
+                        let _ = main_window.set_focus();
+                    }
+                })
+                .is_ok()
+            {
+                return;
+            }
+        } else {
+            tray_linux::release_linux_outside_click_backdrops(app);
+            if let Some(tray_window) = app.get_webview_window(TRAY_WINDOW_LABEL) {
+                tray_linux::hide_linux_popover_gtk_window_on_main_thread(&tray_window);
+                let _ = tray_window.hide();
+            }
+        }
+    }
     if let Some(main_window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
         let _ = main_window.show();
         let _ = main_window.unminimize();
@@ -1624,10 +2393,66 @@ pub fn show_and_focus_main_window(app: &AppHandle) {
     }
 }
 
-/// Hides only the `tray` popover window without affecting `main` or running workers.
+/// Hides only the `tray` popover window (and releases any transient Linux Wayland outside-click
+/// surfaces fail-open) without affecting `main` or running workers.
 pub fn hide_popover_window(app: &AppHandle) {
+    #[cfg(target_os = "linux")]
+    {
+        if !tray_linux::is_linux_gtk_main_thread() {
+            let app_clone = app.clone();
+            if app
+                .run_on_main_thread(move || {
+                    tray_linux::release_linux_outside_click_backdrops(&app_clone);
+                    if let Some(tray_window) = app_clone.get_webview_window(TRAY_WINDOW_LABEL) {
+                        tray_linux::hide_linux_popover_gtk_window_on_main_thread(&tray_window);
+                        let _ = tray_window.hide();
+                    }
+                })
+                .is_ok()
+            {
+                return;
+            }
+        } else {
+            tray_linux::release_linux_outside_click_backdrops(app);
+        }
+    }
     if let Some(tray_window) = app.get_webview_window(TRAY_WINDOW_LABEL) {
+        #[cfg(target_os = "linux")]
+        tray_linux::hide_linux_popover_gtk_window_on_main_thread(&tray_window);
         let _ = tray_window.hide();
+    }
+}
+
+/// Hides the Linux `tray` popover window only when `(generation, attempt_ticket)` still matches
+/// the exact unsuperseded, non-cancelled outside-click dismissal epoch on the GTK main thread.
+#[cfg(target_os = "linux")]
+pub(crate) fn hide_popover_window_if_linux_epoch_current(
+    app: &AppHandle,
+    generation: u64,
+    attempt_ticket: u64,
+) {
+    if !tray_linux::fence_linux_popover_dismiss_epoch_on_main_thread(
+        app,
+        generation,
+        attempt_ticket,
+    ) {
+        return;
+    }
+    if let Some(tray_window) = app.get_webview_window(TRAY_WINDOW_LABEL) {
+        tray_linux::hide_linux_popover_gtk_window_on_main_thread(&tray_window);
+        if tray_linux::is_linux_dismiss_epoch_unsuperseded_on_main_thread(
+            generation,
+            attempt_ticket,
+        ) {
+            let _ = tray_window.hide();
+        }
+    }
+    if tray_linux::is_linux_dismiss_epoch_unsuperseded_on_main_thread(generation, attempt_ticket) {
+        if let Some(tray) = app.try_state::<TrayState>() {
+            if !tray.is_explicit_quit_requested() {
+                ensure_main_reachable_if_tray_unavailable(app, &tray);
+            }
+        }
     }
 }
 
@@ -1635,7 +2460,34 @@ pub fn hide_popover_window(app: &AppHandle) {
 /// cancelling independent `threadlane-host` executions, or restarting Codex.
 pub fn execute_explicit_quit(app: &AppHandle, tray: &TrayState) {
     tray.request_explicit_quit();
+    #[cfg(target_os = "linux")]
+    {
+        if !tray_linux::is_linux_gtk_main_thread() {
+            let app_clone = app.clone();
+            if app
+                .run_on_main_thread(move || {
+                    tray_linux::release_linux_outside_click_backdrops(&app_clone);
+                    if let Some(tray_window) = app_clone.get_webview_window(TRAY_WINDOW_LABEL) {
+                        tray_linux::hide_linux_popover_gtk_window_on_main_thread(&tray_window);
+                        let _ = tray_window.hide();
+                        let _ = tray_window.close();
+                    }
+                    if let Some(main_window) = app_clone.get_webview_window(MAIN_WINDOW_LABEL) {
+                        let _ = main_window.close();
+                    }
+                    app_clone.exit(0);
+                })
+                .is_ok()
+            {
+                return;
+            }
+        } else {
+            tray_linux::release_linux_outside_click_backdrops(app);
+        }
+    }
     if let Some(tray_window) = app.get_webview_window(TRAY_WINDOW_LABEL) {
+        #[cfg(target_os = "linux")]
+        tray_linux::hide_linux_popover_gtk_window_on_main_thread(&tray_window);
         let _ = tray_window.hide();
         let _ = tray_window.close();
     }
@@ -1704,64 +2556,128 @@ pub fn handle_window_event(window: &Window, event: &WindowEvent) {
     };
 
     match window.label() {
-        MAIN_WINDOW_LABEL => {
-            if let WindowEvent::CloseRequested { api, .. } = event {
-                match tray.main_close_decision() {
-                    MainCloseDecision::HideMainToTray => {
-                        api.prevent_close();
-                        if window.hide().is_err() {
-                            let updated = tray.mark_tray_unavailable(
-                                "Unable to hide window to system tray; keeping main window reachable.",
-                            );
-                            let _ = app.emit(TRAY_PREFERENCES_CHANGED_EVENT, &updated);
-                            show_and_focus_main_window(app);
-                        }
+        MAIN_WINDOW_LABEL => match event {
+            WindowEvent::CloseRequested { api, .. } => match tray.main_close_decision() {
+                MainCloseDecision::HideMainToTray => {
+                    api.prevent_close();
+                    if window.hide().is_err() {
+                        let updated = tray.mark_tray_unavailable(
+                            "Unable to hide window to system tray; keeping main window reachable.",
+                        );
+                        let _ = app.emit(TRAY_PREFERENCES_CHANGED_EVENT, &updated);
+                        show_and_focus_main_window(app);
                     }
-                    MainCloseDecision::QuitApp => {
-                        tray.request_explicit_quit();
-                        if let Some(tray_window) = app.get_webview_window(TRAY_WINDOW_LABEL) {
-                            let _ = tray_window.close();
-                        }
-                        app.exit(0);
+                }
+                MainCloseDecision::QuitApp => {
+                    tray.request_explicit_quit();
+                    #[cfg(target_os = "linux")]
+                    tray_linux::release_linux_outside_click_backdrops(app);
+                    if let Some(tray_window) = app.get_webview_window(TRAY_WINDOW_LABEL) {
+                        let _ = tray_window.hide();
+                        let _ = tray_window.close();
+                    }
+                    app.exit(0);
+                }
+            },
+            #[cfg(not(target_os = "linux"))]
+            WindowEvent::Focused(true) => {
+                if let Some(popover) = app.get_webview_window(TRAY_WINDOW_LABEL) {
+                    if popover.is_visible().unwrap_or(false)
+                        && tray.popover_blur_decision() == PopoverDismissDecision::HidePopoverOnly
+                    {
+                        tray.record_popover_blur_hidden();
+                        let _ = popover.hide();
+                        ensure_main_reachable_if_tray_unavailable(app, &tray);
                     }
                 }
             }
-        }
+            _ => {}
+        },
         TRAY_WINDOW_LABEL => match event {
             WindowEvent::CloseRequested { api, .. } => match tray.popover_close_decision() {
                 PopoverDismissDecision::HidePopoverOnly
                 | PopoverDismissDecision::IgnoreTransientBlur => {
                     api.prevent_close();
-                    let _ = window.hide();
+                    hide_popover_window(app);
                     ensure_main_reachable_if_tray_unavailable(app, &tray);
                 }
-                PopoverDismissDecision::AllowCloseForQuit => {}
+                PopoverDismissDecision::AllowCloseForQuit => {
+                    #[cfg(target_os = "linux")]
+                    tray_linux::release_linux_outside_click_backdrops(app);
+                }
             },
             WindowEvent::Focused(false) => match tray.popover_blur_decision() {
                 PopoverDismissDecision::HidePopoverOnly => {
-                    let _ = window.hide();
-                    ensure_main_reachable_if_tray_unavailable(app, &tray);
+                    #[cfg(target_os = "linux")]
+                    {
+                        tray_linux::handle_linux_popover_unfocused(app, &tray);
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        tray.record_popover_blur_hidden();
+                        let _ = window.hide();
+                        ensure_main_reachable_if_tray_unavailable(app, &tray);
+                    }
                 }
                 PopoverDismissDecision::IgnoreTransientBlur
                 | PopoverDismissDecision::AllowCloseForQuit => {}
             },
+            WindowEvent::ScaleFactorChanged { .. } => {
+                if let Some(popover) = app.get_webview_window(TRAY_WINDOW_LABEL) {
+                    let monitors = resolve_available_monitors(app);
+                    let raw_anchor = tray.last_raw_anchor();
+                    #[cfg(target_os = "linux")]
+                    {
+                        tray_linux::refresh_linux_popover_size_on_scale_change(
+                            app, &popover, &monitors, raw_anchor,
+                        );
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        let resolved = resolve_tray_anchor_for_monitors(&monitors, raw_anchor);
+                        let (lw, lh) = compute_popover_logical_size_for_monitor(resolved.monitor);
+                        apply_non_linux_popover_logical_size(&popover, lw, lh);
+                    }
+                }
+            }
             _ => {}
         },
         _ => {}
     }
 }
 
-fn ensure_or_create_tray_popover_window(app: &AppHandle) -> Result<WebviewWindow, String> {
+#[cfg(not(target_os = "linux"))]
+fn apply_non_linux_popover_logical_size(
+    popover: &WebviewWindow,
+    logical_width: f64,
+    logical_height: f64,
+) {
+    let target = LogicalSize::new(logical_width, logical_height);
+    let _ = popover.set_min_size(None::<LogicalSize<f64>>);
+    let _ = popover.set_max_size(None::<LogicalSize<f64>>);
+    let _ = popover.set_min_size(Some(target));
+    let _ = popover.set_max_size(Some(target));
+    let _ = popover.set_size(target);
+}
+
+fn ensure_or_create_tray_popover_window(
+    app: &AppHandle,
+) -> Result<(WebviewWindow, Option<String>), String> {
     if let Some(existing) = app.get_webview_window(TRAY_WINDOW_LABEL) {
-        return Ok(existing);
+        #[cfg(target_os = "linux")]
+        tray_linux::attach_linux_main_window_outside_click_guard(app);
+        return Ok((existing, None));
     }
-    WebviewWindowBuilder::new(
+
+    let popover = WebviewWindowBuilder::new(
         app,
         TRAY_WINDOW_LABEL,
         WebviewUrl::App(TRAY_WINDOW_URL.into()),
     )
     .title("Threadlane Status")
     .inner_size(TRAY_POPOVER_WIDTH, TRAY_POPOVER_HEIGHT)
+    .min_inner_size(TRAY_POPOVER_MIN_WIDTH, TRAY_POPOVER_MIN_HEIGHT)
+    .max_inner_size(TRAY_POPOVER_WIDTH, TRAY_POPOVER_HEIGHT)
     .resizable(false)
     .decorations(false)
     .transparent(true)
@@ -1771,7 +2687,14 @@ fn ensure_or_create_tray_popover_window(app: &AppHandle) -> Result<WebviewWindow
     .focused(false)
     .initialization_script(TRAY_ESCAPE_INIT_SCRIPT)
     .build()
-    .map_err(|err| format!("Failed to create tray popover window: {err}"))
+    .map_err(|err| format!("Failed to create tray popover window: {err}"))?;
+
+    #[cfg(target_os = "linux")]
+    let init_notice = tray_linux::initialize_linux_popover_window(app, &popover);
+    #[cfg(not(target_os = "linux"))]
+    let init_notice: Option<String> = None;
+
+    Ok((popover, init_notice))
 }
 
 fn resolve_available_monitors(app: &AppHandle) -> Vec<MonitorBoundsPx> {
@@ -1805,71 +2728,100 @@ fn resolve_available_monitors(app: &AppHandle) -> Vec<MonitorBoundsPx> {
     out
 }
 
-fn rect_to_physical_px(rect: &tauri::Rect, scale_factor: f64) -> TrayRectPx {
-    let scale = if scale_factor.is_finite() && scale_factor > 0.0 {
-        scale_factor
-    } else {
-        1.0
-    };
-    let (x, y) = match rect.position {
-        tauri::Position::Physical(pos) => (pos.x as f64, pos.y as f64),
-        tauri::Position::Logical(pos) => (pos.x * scale, pos.y * scale),
-    };
-    let (width, height) = match rect.size {
-        tauri::Size::Physical(size) => (size.width as f64, size.height as f64),
-        tauri::Size::Logical(size) => (size.width * scale, size.height * scale),
-    };
-    TrayRectPx {
-        x,
-        y,
-        width,
-        height,
+/// Shows and presents the compact `tray` popover window for `source`, anchoring to real tray
+/// icon/activation geometry when supported by the active platform/compositor and emitting
+/// `threadlane:tray-opened` with truthful capability status.
+pub fn open_popover_window_with_source(
+    app: &AppHandle,
+    tray: &TrayState,
+    source: PopoverActivationSource,
+) {
+    #[cfg(target_os = "linux")]
+    if !tray_linux::is_linux_gtk_main_thread() {
+        let app_clone = app.clone();
+        let tray_clone = tray.clone();
+        if app
+            .run_on_main_thread(move || {
+                open_popover_window_with_source(&app_clone, &tray_clone, source);
+            })
+            .is_err()
+        {
+            show_and_focus_main_window(app);
+        }
+        return;
     }
-}
 
-/// Shows and focuses the `tray` popover window near the tray icon, emitting `threadlane:tray-opened`.
-pub fn open_popover_window(app: &AppHandle, tray: &TrayState) {
-    let Ok(popover) = ensure_or_create_tray_popover_window(app) else {
+    let Ok((popover, init_notice)) = ensure_or_create_tray_popover_window(app) else {
         show_and_focus_main_window(app);
         return;
     };
+    if let Some(notice) = init_notice {
+        tray.set_placement_notice(Some(notice));
+    }
 
-    let (click_pos, tray_rect) = tray.last_anchor_coordinates();
-    let anchor_hint = tray_rect
-        .map(|r| (r.x + r.width / 2.0, r.y + r.height / 2.0))
-        .or(click_pos);
+    let raw_anchor = tray.anchor_for_activation(source);
     let monitors = resolve_available_monitors(app);
-    let monitor = select_monitor_for_point(&monitors, anchor_hint);
-    let (x, y) = compute_popover_position_px(
-        monitor,
-        (TRAY_POPOVER_WIDTH, TRAY_POPOVER_HEIGHT),
-        click_pos,
-        tray_rect,
-        cfg!(target_os = "windows"),
-    );
 
-    let _ = popover.set_position(PhysicalPosition::new(x, y));
-    tray.record_popover_opened();
-    if popover.show().is_err() {
-        show_and_focus_main_window(app);
-        return;
-    }
-    let _ = popover.unminimize();
-    let _ = popover.set_focus();
-
-    let payload = tray.preferences_response();
-    let _ = app.emit(TRAY_OPENED_EVENT, &payload);
-}
-
-/// Toggles the visibility of the `tray` popover window.
-pub fn toggle_popover_window(app: &AppHandle, tray: &TrayState) {
-    if let Some(popover) = app.get_webview_window(TRAY_WINDOW_LABEL) {
-        if popover.is_visible().unwrap_or(false) {
-            let _ = popover.hide();
-            return;
+    #[cfg(target_os = "linux")]
+    {
+        let open_outcome = tray_linux::open_and_present_linux_popover(
+            app,
+            &popover,
+            &monitors,
+            raw_anchor,
+            || tray.record_popover_opened(),
+        );
+        match tray.apply_linux_open_outcome(open_outcome) {
+            LinuxOpenPublicationAction::EmitOpened(payload) => {
+                let _ = app.emit(TRAY_OPENED_EVENT, &payload);
+            }
+            LinuxOpenPublicationAction::NoPublication => {}
+            LinuxOpenPublicationAction::RecoverMainOnCurrentFailure => {
+                show_and_focus_main_window(app);
+            }
         }
     }
-    open_popover_window(app, tray);
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let resolved = resolve_tray_anchor_for_monitors(&monitors, raw_anchor);
+        let (logical_w, logical_h) = compute_popover_logical_size_for_monitor(resolved.monitor);
+        apply_non_linux_popover_logical_size(&popover, logical_w, logical_h);
+        let (x, y) = compute_popover_position_px(
+            resolved.monitor,
+            (logical_w, logical_h),
+            resolved.click_position_px,
+            resolved.tray_rect_px,
+            false,
+        );
+        let outcome = if resolved.has_valid_anchor {
+            PopoverPlacementOutcome::IconAnchored {
+                x,
+                y,
+                scale_factor: resolved.monitor.scale_factor,
+            }
+        } else {
+            PopoverPlacementOutcome::FallbackMonitorCorner {
+                x,
+                y,
+                scale_factor: resolved.monitor.scale_factor,
+                reason: UnanchoredPlacementReason::MissingTrayCoordinates,
+                notice: NON_LINUX_MISSING_COORDS_NOTICE.to_string(),
+            }
+        };
+        let _ = popover.set_position(PhysicalPosition::new(x, y));
+        tray.record_popover_opened();
+        if popover.show().is_err() {
+            show_and_focus_main_window(app);
+            return;
+        }
+        let _ = popover.unminimize();
+        let _ = popover.set_focus();
+
+        let notice = outcome.diagnostic_notice().map(str::to_string);
+        let payload = tray.record_popover_open_outcome(&outcome, notice);
+        let _ = app.emit(TRAY_OPENED_EVENT, &payload);
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -2051,7 +3003,11 @@ fn build_system_tray(app: &AppHandle) -> Result<TrayIcon, String> {
             };
             match event.id().as_ref() {
                 MENU_ID_OPEN_STATUS => {
-                    open_popover_window(app, &tray);
+                    open_popover_window_with_source(
+                        app,
+                        &tray,
+                        PopoverActivationSource::MenuOpenStatus,
+                    );
                 }
                 MENU_ID_OPEN_MAIN => {
                     hide_popover_window(app);
@@ -2076,16 +3032,32 @@ fn build_system_tray(app: &AppHandle) -> Result<TrayIcon, String> {
                 let Some(tray) = app.try_state::<TrayState>() else {
                     return;
                 };
-                let monitors = resolve_available_monitors(app);
-                let scale = monitors.first().map(|m| m.scale_factor).unwrap_or(1.0);
-                let rect_px = rect_to_physical_px(&rect, scale);
-                if tray.record_tray_click_and_should_toggle(
+                let popover_visible = app
+                    .get_webview_window(TRAY_WINDOW_LABEL)
+                    .and_then(|w| w.is_visible().ok())
+                    .unwrap_or(false);
+                let raw_anchor = RawTrayAnchor::from_click_event(position, &rect);
+                match tray.evaluate_tray_click_toggle(TrayClickEvaluationInput {
                     button,
                     button_state,
-                    (position.x, position.y),
-                    rect_px,
-                ) {
-                    toggle_popover_window(app, &tray);
+                    is_linux: cfg!(target_os = "linux"),
+                    popover_currently_visible: popover_visible,
+                    raw_anchor,
+                    now: Instant::now(),
+                }) {
+                    TrayToggleDecision::IgnoreClick
+                    | TrayToggleDecision::SuppressReopenAfterBlur => {}
+                    TrayToggleDecision::HideVisiblePopover => {
+                        hide_popover_window(app);
+                        ensure_main_reachable_if_tray_unavailable(app, &tray);
+                    }
+                    TrayToggleDecision::OpenPopover => {
+                        open_popover_window_with_source(
+                            app,
+                            &tray,
+                            PopoverActivationSource::TrayIconClick,
+                        );
+                    }
                 }
             }
         })
@@ -2103,7 +3075,12 @@ pub fn setup_tray(
     let store = TrayPreferencesStore::new(app_data_dir.to_path_buf());
     let initial = store.load_or_default();
 
-    let _ = ensure_or_create_tray_popover_window(app);
+    #[cfg(target_os = "linux")]
+    tray_linux::attach_linux_main_window_outside_click_guard(app);
+
+    let init_placement_notice = ensure_or_create_tray_popover_window(app)
+        .ok()
+        .and_then(|(_, notice)| notice);
 
     let (tray_available, tray_init_message, tray_icon) = match build_system_tray(app) {
         Ok(icon) => (true, None, Some(icon)),
@@ -2125,6 +3102,7 @@ pub fn setup_tray(
         tray_icon,
         single_instance,
     );
+    state.set_placement_notice(init_placement_notice);
     app.manage(state);
     Ok(())
 }
@@ -2610,7 +3588,7 @@ mod tests {
             true,
         );
         assert_eq!(x_bot, 1920 - 360 - 12);
-        assert_eq!(y_bot, 1040 - 320 - 6);
+        assert_eq!(y_bot, 1040 - (TRAY_POPOVER_HEIGHT as i32) - 6);
 
         // Linux host giving (0, 0) click position and 0x0 rect -> safe top-right fallback inside monitor.
         let zero_rect = TrayRectPx {
@@ -2627,7 +3605,314 @@ mod tests {
             false,
         );
         assert_eq!(x_fb, 1920 - 360 - 12);
-        assert!(y_fb >= 12 && y_fb + 320 <= 1080 - 12);
+        assert!(y_fb >= 12 && y_fb + (TRAY_POPOVER_HEIGHT as i32) <= 1080 - 12);
+    }
+
+    #[test]
+    fn mixed_scale_monitors_resolve_logical_and_physical_anchors_with_target_monitor_scale() {
+        // Primary monitor: 2x Retina/HiDPI (physical 0..3840 x 0..2160, logical 0..1920 x 0..1080).
+        // Secondary monitor on right: 1x external (physical 3840..5760 x 0..1080, logical 1920..3840 x 0..1080).
+        let monitors = [
+            MonitorBoundsPx {
+                x: 0,
+                y: 0,
+                width: 3840,
+                height: 2160,
+                scale_factor: 2.0,
+            },
+            MonitorBoundsPx {
+                x: 3840,
+                y: 0,
+                width: 1920,
+                height: 1080,
+                scale_factor: 1.0,
+            },
+        ];
+
+        assert_eq!(
+            select_monitor_for_point(&monitors, Some((4200.0, 12.0))),
+            monitors[1]
+        );
+        assert_eq!(
+            select_monitor_for_point(&monitors, Some((0.0, 0.0))),
+            monitors[0]
+        );
+
+        // Logical tray rect on secondary 1x monitor at logical (3760, 4) size 28x22:
+        // Must resolve to `monitors[1]` (scale 1.0), NOT multiply by `monitors[0]`'s 2.0 scale!
+        let secondary_logical_anchor = RawTrayAnchor {
+            click_position: None,
+            tray_rect: Some(RawTrayRect {
+                position: RawCoordinate2D::Logical { x: 3760.0, y: 4.0 },
+                size: RawSize2D::Logical {
+                    width: 28.0,
+                    height: 22.0,
+                },
+            }),
+        };
+        let resolved_second =
+            resolve_tray_anchor_for_monitors(&monitors, Some(secondary_logical_anchor));
+        assert!(resolved_second.has_valid_anchor);
+        assert_eq!(resolved_second.monitor, monitors[1]);
+        assert_eq!(
+            resolved_second.tray_rect_px,
+            Some(TrayRectPx {
+                x: 3840.0 + (3760.0 - 1920.0),
+                y: 4.0,
+                width: 28.0,
+                height: 22.0,
+            })
+        );
+
+        let (logical_w, logical_h) =
+            compute_popover_logical_size_for_monitor(resolved_second.monitor);
+        assert_eq!((logical_w, logical_h), (360.0, 320.0));
+        assert!(logical_h < MAIN_WINDOW_MIN_HEIGHT);
+
+        // Reopen on primary 2x monitor with logical click (1880, 12) -> physical (3760, 24).
+        let primary_logical_click = RawTrayAnchor {
+            click_position: Some(RawCoordinate2D::Logical { x: 1880.0, y: 12.0 }),
+            tray_rect: None,
+        };
+        let resolved_first =
+            resolve_tray_anchor_for_monitors(&monitors, Some(primary_logical_click));
+        assert!(resolved_first.has_valid_anchor);
+        assert_eq!(resolved_first.monitor, monitors[0]);
+        assert_eq!(resolved_first.click_position_px, Some((3760.0, 24.0)));
+
+        // Missing coordinates (0, 0) never claim `has_valid_anchor`.
+        let missing_anchor = RawTrayAnchor {
+            click_position: Some(RawCoordinate2D::Physical { x: 0.0, y: 0.0 }),
+            tray_rect: Some(RawTrayRect {
+                position: RawCoordinate2D::Physical { x: 0.0, y: 0.0 },
+                size: RawSize2D::Physical {
+                    width: 0.0,
+                    height: 0.0,
+                },
+            }),
+        };
+        let resolved_missing = resolve_tray_anchor_for_monitors(&monitors, Some(missing_anchor));
+        assert!(!resolved_missing.has_valid_anchor);
+
+        // Constrained display height (e.g. 300px logical) clamps cleanly below TRAY_POPOVER_HEIGHT and MAIN_WINDOW_MIN_HEIGHT.
+        let small_size = compute_popover_logical_size_for_monitor(MonitorBoundsPx {
+            x: 0,
+            y: 0,
+            width: 1600,
+            height: 600,
+            scale_factor: 2.0,
+        });
+        assert_eq!(small_size, (360.0, 300.0 - 24.0));
+        assert!(small_size.1 < TRAY_POPOVER_HEIGHT);
+        assert!(small_size.1 < MAIN_WINDOW_MIN_HEIGHT);
+    }
+
+    #[test]
+    fn tray_click_toggle_handles_repeated_click_blur_bounce_suppression_debounce_and_menu_isolation(
+    ) {
+        let tmp = TempDir::new().expect("tempdir");
+        let store = TrayPreferencesStore::new(tmp.path().join("app-data"));
+        let initial = store.load_or_default();
+        let state = TrayState::new(store, initial, true, None, None, None);
+
+        let t0 = Instant::now();
+        let anchor_a = RawTrayAnchor {
+            click_position: Some(RawCoordinate2D::Physical { x: 1880.0, y: 14.0 }),
+            tray_rect: None,
+        };
+
+        // 1. Initial left click opens popover and stores raw anchor.
+        assert_eq!(
+            state.evaluate_tray_click_toggle(TrayClickEvaluationInput {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                is_linux: true,
+                popover_currently_visible: false,
+                raw_anchor: anchor_a,
+                now: t0,
+            }),
+            TrayToggleDecision::OpenPopover
+        );
+        assert_eq!(
+            state.anchor_for_activation(PopoverActivationSource::TrayIconClick),
+            Some(anchor_a)
+        );
+        // Context-menu `Open status` never reuses stale click coordinates from `anchor_a`.
+        assert_eq!(
+            state.anchor_for_activation(PopoverActivationSource::MenuOpenStatus),
+            None
+        );
+
+        // 2. Duplicate backend click within 90ms debounce is ignored.
+        assert_eq!(
+            state.evaluate_tray_click_toggle(TrayClickEvaluationInput {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                is_linux: true,
+                popover_currently_visible: true,
+                raw_anchor: anchor_a,
+                now: t0 + Duration::from_millis(25),
+            }),
+            TrayToggleDecision::IgnoreClick
+        );
+
+        // 3. Right click is ignored without overwriting `anchor_a`.
+        let bogus_right_anchor = RawTrayAnchor {
+            click_position: Some(RawCoordinate2D::Physical { x: 50.0, y: 50.0 }),
+            tray_rect: None,
+        };
+        assert_eq!(
+            state.evaluate_tray_click_toggle(TrayClickEvaluationInput {
+                button: MouseButton::Right,
+                button_state: MouseButtonState::Up,
+                is_linux: true,
+                popover_currently_visible: true,
+                raw_anchor: bogus_right_anchor,
+                now: t0 + Duration::from_millis(200),
+            }),
+            TrayToggleDecision::IgnoreClick
+        );
+        assert_eq!(state.last_raw_anchor(), Some(anchor_a));
+
+        // 4. Repeated left click while popover is visible hides it cleanly.
+        let t_close = t0 + Duration::from_millis(400);
+        assert_eq!(
+            state.evaluate_tray_click_toggle(TrayClickEvaluationInput {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                is_linux: true,
+                popover_currently_visible: true,
+                raw_anchor: anchor_a,
+                now: t_close,
+            }),
+            TrayToggleDecision::HideVisiblePopover
+        );
+
+        // 5. If clicking the panel icon caused focus-out hide 40ms before the SNI Activate event
+        //    arrived, `SuppressReopenAfterBlur` prevents immediately bouncing back open.
+        let t_blur = t_close + Duration::from_millis(500);
+        state.record_popover_blur_hidden_at(t_blur);
+        let t_bounce = t_blur + Duration::from_millis(40);
+        assert_eq!(
+            state.evaluate_tray_click_toggle(TrayClickEvaluationInput {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                is_linux: true,
+                popover_currently_visible: false,
+                raw_anchor: anchor_a,
+                now: t_bounce,
+            }),
+            TrayToggleDecision::SuppressReopenAfterBlur
+        );
+
+        // 6. A deliberate subsequent click after debounce reopens cleanly.
+        assert_eq!(
+            state.evaluate_tray_click_toggle(TrayClickEvaluationInput {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                is_linux: true,
+                popover_currently_visible: false,
+                raw_anchor: anchor_a,
+                now: t_bounce + Duration::from_millis(150),
+            }),
+            TrayToggleDecision::OpenPopover
+        );
+    }
+
+    #[test]
+    fn placement_notices_surface_truthfully_and_clear_when_icon_anchored_open_succeeds() {
+        let tmp = TempDir::new().expect("tempdir");
+        let store = TrayPreferencesStore::new(tmp.path().join("app-data"));
+        let initial = store.load_or_default();
+        let state = TrayState::new(store, initial, true, None, None, None);
+
+        state.set_placement_notice(Some(
+            tray_linux::WAYLAND_COMPOSITOR_PLACEMENT_NOTICE.to_string(),
+        ));
+        assert_eq!(
+            state.preferences_response().message.as_deref(),
+            Some(tray_linux::WAYLAND_COMPOSITOR_PLACEMENT_NOTICE)
+        );
+
+        let fallback_outcome = PopoverPlacementOutcome::FallbackMonitorCorner {
+            x: 1548,
+            y: 12,
+            scale_factor: 1.0,
+            reason: UnanchoredPlacementReason::MissingTrayCoordinates,
+            notice: tray_linux::MISSING_TRAY_COORDINATES_FALLBACK_NOTICE.to_string(),
+        };
+        assert!(fallback_outcome.validate_invariants());
+        let fallback_resp = state.record_popover_open_outcome(&fallback_outcome, None);
+        assert_eq!(
+            fallback_resp.message.as_deref(),
+            Some(tray_linux::MISSING_TRAY_COORDINATES_FALLBACK_NOTICE)
+        );
+
+        let anchored_outcome = PopoverPlacementOutcome::IconAnchored {
+            x: 1548,
+            y: 30,
+            scale_factor: 2.0,
+        };
+        assert!(anchored_outcome.validate_invariants());
+        let anchored_resp = state.record_popover_open_outcome(&anchored_outcome, None);
+        assert_eq!(
+            anchored_resp.message, None,
+            "icon-anchored open without capability limits must clear stale fallback notice"
+        );
+
+        // Wayland outside-click capability notices (missing RGBA visual or failed surface
+        // creation) surface accurately without marking the system tray unavailable, and clear on
+        // a subsequent full-capability open.
+        let rgba_limited = state.record_popover_open_outcome(
+            &anchored_outcome,
+            Some(tray_linux::WAYLAND_TRANSPARENT_VISUAL_UNAVAILABLE_NOTICE.to_string()),
+        );
+        assert!(rgba_limited.tray_available);
+        assert_eq!(
+            rgba_limited.message.as_deref(),
+            Some(tray_linux::WAYLAND_TRANSPARENT_VISUAL_UNAVAILABLE_NOTICE)
+        );
+        let prefs_rgba = state.preferences_response();
+        assert!(prefs_rgba.tray_available);
+        assert_eq!(
+            prefs_rgba.message.as_deref(),
+            Some(tray_linux::WAYLAND_TRANSPARENT_VISUAL_UNAVAILABLE_NOTICE)
+        );
+
+        let missing_coords = tray_linux::MISSING_TRAY_COORDINATES_FALLBACK_NOTICE;
+        let surface_unavail = tray_linux::WAYLAND_OUTSIDE_CLICK_SURFACE_UNAVAILABLE_NOTICE;
+        let combined_fallback_and_surface = tray_linux::combine_popover_notices(
+            fallback_outcome.diagnostic_notice(),
+            Some(surface_unavail),
+        );
+        let surface_limited =
+            state.record_popover_open_outcome(&fallback_outcome, combined_fallback_and_surface);
+        let surfaced_msg = surface_limited
+            .message
+            .expect("combined fallback + backdrop capability notice");
+        assert!(surfaced_msg.contains(missing_coords));
+        assert!(surfaced_msg.contains(surface_unavail));
+
+        // Async runtime capability notices (e.g. post-open backdrop configure timeout) combine
+        // cleanly with any active placement fallback without duplicating warnings, and clear on the
+        // next full-capability open.
+        let _ = state.record_popover_open_outcome(&fallback_outcome, None);
+        let runtime_limited = state.record_runtime_capability_notice(surface_unavail);
+        assert!(runtime_limited.tray_available);
+        let runtime_msg = runtime_limited
+            .message
+            .expect("runtime capability notice combined with fallback");
+        assert!(runtime_msg.contains(missing_coords));
+        assert!(runtime_msg.contains(surface_unavail));
+        let runtime_deduped = state.record_runtime_capability_notice(surface_unavail);
+        assert_eq!(
+            runtime_deduped.message.as_deref(),
+            Some(runtime_msg.as_str())
+        );
+
+        let recovered = state.record_popover_open_outcome(&anchored_outcome, None);
+        assert_eq!(recovered.message, None);
+        assert_eq!(state.preferences_response().message, None);
     }
 
     #[test]
@@ -2715,6 +4000,79 @@ mod tests {
         assert!(
             opaque_pixels > 40,
             "expected visible opaque node/stem pixels"
+        );
+    }
+
+    #[test]
+    fn linux_open_outcome_publication_preserves_newer_notice_and_fences_superseded_attempts() {
+        let tmp = TempDir::new().expect("tempdir");
+        let store = TrayPreferencesStore::new(tmp.path().join("app-data"));
+        let initial = store.load_or_default();
+        let state = TrayState::new(store, initial, true, None, None, None);
+
+        let anchored_outcome = PopoverPlacementOutcome::IconAnchored {
+            x: 1548,
+            y: 30,
+            scale_factor: 1.0,
+        };
+
+        // 1. Normal presented open updates placement notice and emits `threadlane:tray-opened`.
+        let presented_outcome = tray_linux::LinuxOpenOutcome::Presented {
+            outcome: anchored_outcome,
+            effective_notice: Some(
+                tray_linux::MISSING_TRAY_COORDINATES_FALLBACK_NOTICE.to_string(),
+            ),
+        };
+        let presented = state.apply_linux_open_outcome(Ok(presented_outcome));
+        assert_eq!(
+            presented,
+            LinuxOpenPublicationAction::EmitOpened(TrayPreferencesResponse {
+                close_behavior: CloseBehavior::HideToTray,
+                tray_available: true,
+                message: Some(tray_linux::MISSING_TRAY_COORDINATES_FALLBACK_NOTICE.to_string()),
+            })
+        );
+
+        // 2. Same-generation nested refresh publishes a newer capability notice before outer open
+        //    unwinds: outer `SupersededSameGeneration` must NOT clear the newer notice with `None`.
+        state.set_placement_notice(Some(
+            tray_linux::WAYLAND_OUTSIDE_CLICK_SURFACE_UNAVAILABLE_NOTICE.to_string(),
+        ));
+        let ok_same_gen = Ok(tray_linux::LinuxOpenOutcome::SupersededSameGeneration);
+        let same_gen = state.apply_linux_open_outcome(ok_same_gen);
+        assert_eq!(
+            same_gen,
+            LinuxOpenPublicationAction::EmitOpened(TrayPreferencesResponse {
+                close_behavior: CloseBehavior::HideToTray,
+                tray_available: true,
+                message: Some(
+                    tray_linux::WAYLAND_OUTSIDE_CLICK_SURFACE_UNAVAILABLE_NOTICE.to_string()
+                ),
+            })
+        );
+        assert_eq!(
+            state.preferences_response().message.as_deref(),
+            Some(tray_linux::WAYLAND_OUTSIDE_CLICK_SURFACE_UNAVAILABLE_NOTICE)
+        );
+
+        // 3. Stale open superseded by a newer generation or cancelled by hide/quit emits nothing
+        //    and leaves the newer owner's notice untouched.
+        state.set_placement_notice(Some(
+            tray_linux::WAYLAND_TRANSPARENT_VISUAL_UNAVAILABLE_NOTICE.to_string(),
+        ));
+        let ok_cancelled = Ok(tray_linux::LinuxOpenOutcome::SupersededOrCancelled);
+        let cancelled = state.apply_linux_open_outcome(ok_cancelled);
+        assert_eq!(cancelled, LinuxOpenPublicationAction::NoPublication);
+        assert_eq!(
+            state.preferences_response().message.as_deref(),
+            Some(tray_linux::WAYLAND_TRANSPARENT_VISUAL_UNAVAILABLE_NOTICE)
+        );
+
+        // 4. Current unsuperseded error recovers `main` without indiscriminate global teardown.
+        let current_err = state.apply_linux_open_outcome(Err("present failed".to_string()));
+        assert_eq!(
+            current_err,
+            LinuxOpenPublicationAction::RecoverMainOnCurrentFailure
         );
     }
 }

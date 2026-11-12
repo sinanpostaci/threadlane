@@ -63,9 +63,9 @@ use threadlane_operations::{
     ReviewReceipt, ReviewSubject, TestEvidenceSummary, RECEIPTS_SUBDIR,
 };
 use threadlane_workers::{
-    resolve_exact_commit_sha, resolve_exact_tree_sha, run_sanitized_git, ExecutionBudgets,
-    WorkerFilePermissions, WorkerRunStatus, WorktreeKind, DEFAULT_GIT_COMMAND_TIMEOUT_MS,
-    MANIFESTS_SUBDIR,
+    resolve_exact_commit_sha, resolve_exact_tree_sha, run_sanitized_git, run_sanitized_git_bytes,
+    ExecutionBudgets, WorkerFilePermissions, WorkerRunStatus, WorktreeKind,
+    DEFAULT_GIT_COMMAND_TIMEOUT_MS, DEFAULT_MAX_GIT_OUTPUT_BYTES, MANIFESTS_SUBDIR,
 };
 use threadlane_workflow::{
     compile_plan_revision, ModelChoice, ModelDefinition, PlanChange, PlanStore, PlanTask,
@@ -8115,6 +8115,922 @@ exit 0
 
     drop(fence_session);
     fence_host.shutdown().await.expect("shutdown fence_host");
+}
+
+fn build_large_rust_source(line_count: u32, fn_name: &str, return_value: u32) -> String {
+    let mut source = String::with_capacity((line_count as usize) * 68 + 64);
+    for idx in 0..line_count {
+        source.push_str(&format!(
+            "pub const ITEM_{idx:06}: &str = \"0123456789abcdef0123456789ab\";\n"
+        ));
+    }
+    source.push_str(&format!("pub fn {fn_name}() -> u32 {{ {return_value} }}\n"));
+    source
+}
+
+fn single_coder_task_interfaces(
+    task_id: &str,
+    iface: &str,
+) -> BTreeMap<String, TaskInterfaceOwnershipSpec> {
+    let mut map = BTreeMap::new();
+    map.insert(
+        task_id.to_string(),
+        TaskInterfaceOwnershipSpec {
+            owned_interfaces: vec![iface.to_string()],
+            consumed_interfaces: Vec::new(),
+        },
+    );
+    map
+}
+
+fn install_large_diff_agy_cases(
+    fixture: &ControllerTestFixture,
+    large_a_path: &Path,
+    large_b_path: &Path,
+    fenced_gate_path: &Path,
+) {
+    let orig_script = fs::read_to_string(&fixture.fake_agy_exe).expect("read fake-agy");
+    let extra_cases = [
+        "        *CTRL_LARGE_UNFENCED_A*)".to_string(),
+        format!("            cp \"{}\" \"src/a.rs\"", large_a_path.display()),
+        "            ;;".to_string(),
+        "        *CTRL_LARGE_FENCED_B*)".to_string(),
+        format!("            cp \"{}\" \"src/b.rs\"", large_b_path.display()),
+        format!(
+            "            while [ -f \"{}\" ]; do sleep 0.02; done",
+            fenced_gate_path.display(),
+        ),
+        "            ;;".to_string(),
+        "        *CTRL_TASK_A*)".to_string(),
+    ]
+    .join("\n");
+    let updated_script = orig_script.replacen("        *CTRL_TASK_A*)", &extra_cases, 1);
+    assert_ne!(updated_script, orig_script);
+    write_executable_script(&fixture.fake_agy_exe, &updated_script);
+}
+
+#[tokio::test]
+async fn controller_reconciles_over_64kib_tracked_diffs_unfenced_fenced_and_rejects_overflow() {
+    let fixture = setup_fixture();
+    let root_dir = fixture.agy_count_file.parent().expect("fixture root dir");
+    let large_a_path = root_dir.join("large_src_a.rs");
+    let large_b_path = root_dir.join("large_src_b.rs");
+    let fenced_gate_path = root_dir.join("fenced_task_b.gate");
+
+    fs::write(&large_a_path, build_large_rust_source(3_000, "a", 100))
+        .expect("write >64KiB src/a.rs payload");
+    fs::write(&large_b_path, build_large_rust_source(3_000, "b", 200))
+        .expect("write >64KiB src/b.rs payload");
+    install_large_diff_agy_cases(&fixture, &large_a_path, &large_b_path, &fenced_gate_path);
+
+    let host_client = ApprovedHostClient::new(
+        Arc::clone(&fixture.authority),
+        &fixture.sessions_dir,
+        BINDING_A,
+        THREAD_UUID_A,
+    )
+    .expect("create ApprovedHostClient");
+
+    // 1. Unfenced >64 KiB (~189 KiB) tracked diff reconciles to ReadyForReview with exact raw-byte digest.
+    let (unfenced_job, unfenced_approval_id) = Box::pin(create_planned_approved_and_frozen_job(
+        &fixture,
+        "brf_large_unfenced",
+        "plan-large-unfenced",
+        vec![PlanTask {
+            id: "task-large-a".to_string(),
+            title: "Large Unfenced A".to_string(),
+            instruction: "CTRL_LARGE_UNFENCED_A".to_string(),
+            role: WorkflowRole::Coder,
+            difficulty: Difficulty::Hard,
+            depends_on: Vec::new(),
+            allowed_write_paths: vec!["src/a.rs".to_string()],
+        }],
+        single_coder_task_interfaces("task-large-a", "iface_large_a"),
+        vec!["src/a.rs".to_string()],
+        1,
+        ExecutionBudgets::default(),
+        ControllerRoleExecutionBudget::default_for_role(WorkflowRole::Coder, 4),
+    ))
+    .await;
+
+    let unfenced_host = ApprovedHost::start(ApprovedHostConfig::new(
+        &fixture.registry_dir,
+        &fixture.plans_dir,
+        &fixture.authority_dir,
+        &fixture.sessions_dir,
+        &unfenced_approval_id,
+    ))
+    .await
+    .expect("start unfenced ApprovedHost");
+    let unfenced_session = fixture
+        .controller
+        .open_owned_session(BINDING_A, THREAD_UUID_A, &unfenced_job.job_id, 600_000)
+        .expect("open unfenced session");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut step_ts = 600_100u64;
+    let unfenced_rep = loop {
+        let rep = Box::pin(unfenced_session.step(step_ts))
+            .await
+            .expect("unfenced >64KiB controller step");
+        step_ts += 100;
+        let obs = rep
+            .tasks
+            .iter()
+            .find(|t| t.task_id == "task-large-a")
+            .expect("task-large-a observation");
+        if obs.stage == CoworkerTaskStage::ReadyForReview {
+            break rep;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for ReadyForReview on task-large-a"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+    assert_eq!(
+        unfenced_rep.status,
+        CoworkerControllerPhase1Status::AwaitingChecksOrReview
+    );
+    let obs_a = unfenced_rep
+        .tasks
+        .iter()
+        .find(|t| t.task_id == "task-large-a")
+        .expect("task-large-a observation");
+
+    let snap_a = host_client
+        .get_task(&unfenced_approval_id, "task-large-a")
+        .await
+        .expect("get task-large-a snapshot");
+    let wt_a = PathBuf::from(
+        snap_a
+            .worker
+            .as_ref()
+            .expect("worker snapshot")
+            .worktree
+            .task_worktree_path
+            .as_ref()
+            .expect("task_worktree_path"),
+    );
+    let legacy_diff_a = run_sanitized_git(
+        &wt_a,
+        &["diff", "--binary", &fixture.base_commit],
+        DEFAULT_GIT_COMMAND_TIMEOUT_MS,
+    );
+    assert!(legacy_diff_a.is_err());
+
+    let raw_diff_a = run_sanitized_git_bytes(
+        &wt_a,
+        &["diff", "--binary", &fixture.base_commit],
+        DEFAULT_MAX_GIT_OUTPUT_BYTES,
+        DEFAULT_GIT_COMMAND_TIMEOUT_MS,
+    )
+    .expect("compute 4 MiB raw-byte diff for task-large-a");
+    assert!(raw_diff_a.stdout_bytes.len() > 180_000);
+    let expected_digest_a = sha256_hex(&raw_diff_a.stdout_bytes);
+    let expected_art_id_a = deterministic_prefixed_id(
+        "threadlane-native:coworker-coder-attempt-report:v1",
+        "art",
+        &[
+            &unfenced_approval_id,
+            "task-large-a",
+            obs_a.run_id.as_deref().expect("run_id"),
+            obs_a.worker_id.as_deref().expect("worker_id"),
+            obs_a.task_worktree_id.as_deref().expect("task_worktree_id"),
+            &expected_digest_a,
+        ],
+    );
+    let ledger_a = fixture
+        .workflow_store
+        .read_binding_ledger(BINDING_A)
+        .expect("read binding ledger after unfenced step");
+    let task_rec_a = ledger_a
+        .jobs
+        .iter()
+        .find(|j| j.job_id == unfenced_job.job_id)
+        .expect("unfenced job")
+        .tasks
+        .iter()
+        .find(|t| t.task_id == "task-large-a")
+        .expect("task-large-a record");
+    assert_eq!(
+        task_rec_a.attempts[0].diff_digest.as_deref(),
+        Some(expected_digest_a.as_str())
+    );
+    assert_eq!(
+        task_rec_a.attempts[0].report_artifact_id.as_deref(),
+        Some(expected_art_id_a.as_str())
+    );
+    assert_eq!(read_invocation_count(&fixture.agy_count_file), 1);
+    drop(unfenced_session);
+    unfenced_host
+        .shutdown()
+        .await
+        .expect("shutdown unfenced_host");
+
+    // 2. Fenced >64 KiB + raw non-UTF-8 tracked diff on an already-confirmed Running outbox
+    // reconciles via reconcile_fenced_ready_for_review_snapshot, retaining verified runtime
+    // artifacts against actual host proof while preserving the confirmed Running ledger without
+    // promoting to ReadyForReview or double-charging budgets.
+    fs::write(&fenced_gate_path, b"hold").expect("write fenced gate");
+    let (fenced_job, fenced_approval_id) = Box::pin(create_planned_approved_and_frozen_job(
+        &fixture,
+        "brf_large_fenced",
+        "plan-large-fenced",
+        vec![PlanTask {
+            id: "task-large-b".to_string(),
+            title: "Large Fenced B".to_string(),
+            instruction: "CTRL_LARGE_FENCED_B".to_string(),
+            role: WorkflowRole::Coder,
+            difficulty: Difficulty::Hard,
+            depends_on: Vec::new(),
+            allowed_write_paths: vec!["src/b.rs".to_string()],
+        }],
+        single_coder_task_interfaces("task-large-b", "iface_large_b"),
+        vec!["src/b.rs".to_string()],
+        1,
+        ExecutionBudgets::default(),
+        ControllerRoleExecutionBudget::default_for_role(WorkflowRole::Coder, 4),
+    ))
+    .await;
+
+    let fenced_host = ApprovedHost::start(ApprovedHostConfig::new(
+        &fixture.registry_dir,
+        &fixture.plans_dir,
+        &fixture.authority_dir,
+        &fixture.sessions_dir,
+        &fenced_approval_id,
+    ))
+    .await
+    .expect("start fenced ApprovedHost");
+    let fenced_session = fixture
+        .controller
+        .open_owned_session(BINDING_A, THREAD_UUID_A, &fenced_job.job_id, 610_000)
+        .expect("open fenced session");
+
+    let dispatch_rep = Box::pin(fenced_session.step(610_100))
+        .await
+        .expect("dispatch task-large-b");
+    assert_eq!(
+        dispatch_rep.dispatched_task_ids,
+        vec!["task-large-b".to_string()]
+    );
+    let dispatched_job_rev_b = dispatch_rep.job_revision;
+
+    fixture
+        .policy_store
+        .mutate_job_runtime_for_operator(BINDING_A, &fenced_job.job_id, |rt| {
+            rt.stop_requested = true;
+            Ok(())
+        })
+        .expect("set stop_requested while worker is gated");
+    fs::remove_file(&fenced_gate_path).expect("remove fenced gate");
+
+    let fenced_deadline = Instant::now() + Duration::from_secs(10);
+    let snap_b = loop {
+        let snap = host_client
+            .get_task(&fenced_approval_id, "task-large-b")
+            .await
+            .expect("poll task-large-b host snapshot");
+        if snap.status == TaskExecutionStatus::ReadyForReview {
+            break snap;
+        }
+        assert!(
+            Instant::now() < fenced_deadline,
+            "timed out waiting for host ReadyForReview on task-large-b"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+    assert_eq!(read_invocation_count(&fixture.agy_count_file), 2);
+
+    let wb = snap_b.worker.as_ref().expect("worker snapshot");
+    let run_id_b = snap_b.run_id.clone().expect("host run_id");
+    let worker_id_b = snap_b.worker_id.clone().expect("host worker_id");
+    let task_wt_id_b = wb
+        .worktree
+        .task_worktree_id
+        .clone()
+        .expect("host task_worktree_id");
+    let run_wt_id_b = wb
+        .worktree
+        .run_worktree_id
+        .clone()
+        .expect("host run_worktree_id");
+    let wt_b = PathBuf::from(
+        wb.worktree
+            .task_worktree_path
+            .as_ref()
+            .expect("task_worktree_path"),
+    );
+    assert_eq!(wb.worktree.base_commit, fixture.base_commit);
+    assert_eq!(wb.observed_model.as_deref(), Some("gemini-4-argon-high"));
+    assert_eq!(wb.observed_effort.as_deref(), Some("high"));
+
+    let mut raw_b_bytes = fs::read(wt_b.join("src/b.rs")).expect("read worker src/b.rs");
+    raw_b_bytes.extend_from_slice(b"// raw non-utf8 bytes: \xff\xfe\x80\n");
+    fs::write(wt_b.join("src/b.rs"), &raw_b_bytes).expect("append non-UTF-8 bytes to src/b.rs");
+
+    let legacy_diff_b = run_sanitized_git(
+        &wt_b,
+        &["diff", "--binary", &fixture.base_commit],
+        DEFAULT_GIT_COMMAND_TIMEOUT_MS,
+    );
+    assert!(legacy_diff_b.is_err());
+
+    let raw_diff_b = run_sanitized_git_bytes(
+        &wt_b,
+        &["diff", "--binary", &fixture.base_commit],
+        DEFAULT_MAX_GIT_OUTPUT_BYTES,
+        DEFAULT_GIT_COMMAND_TIMEOUT_MS,
+    )
+    .expect("compute raw diff for task-large-b");
+    assert!(raw_diff_b.stdout_bytes.len() > 180_000);
+    assert!(std::str::from_utf8(&raw_diff_b.stdout_bytes).is_err());
+
+    let head_b = resolve_exact_commit_sha(&wt_b, "HEAD", DEFAULT_GIT_COMMAND_TIMEOUT_MS)
+        .expect("resolve wt_b HEAD commit");
+    let tree_b = resolve_exact_tree_sha(&wt_b, &head_b, DEFAULT_GIT_COMMAND_TIMEOUT_MS)
+        .expect("resolve wt_b HEAD tree");
+
+    let fenced_rep = Box::pin(fenced_session.step(610_500))
+        .await
+        .expect("reconcile fenced >64KiB ReadyForReview snapshot");
+    assert_eq!(fenced_rep.status, CoworkerControllerPhase1Status::Stopped);
+    assert_eq!(fenced_rep.job_revision, dispatched_job_rev_b);
+    assert_eq!(fenced_rep.active_running_count, 0);
+    assert!(fenced_rep.dispatched_task_ids.is_empty());
+    assert!(fenced_rep
+        .fenced_task_ids
+        .iter()
+        .any(|id| id == "task-large-b"));
+    assert!(fenced_rep.reconciled_ready_for_review_task_ids.is_empty());
+
+    let obs_b = fenced_rep
+        .tasks
+        .iter()
+        .find(|t| t.task_id == "task-large-b")
+        .expect("task-large-b observation");
+    assert_eq!(obs_b.stage, CoworkerTaskStage::Running);
+    assert_eq!(obs_b.host_status, TaskExecutionStatus::ReadyForReview);
+    assert!(obs_b.fenced);
+    assert_eq!(obs_b.run_id.as_deref(), Some(run_id_b.as_str()));
+    assert_eq!(obs_b.worker_id.as_deref(), Some(worker_id_b.as_str()));
+    assert_eq!(
+        obs_b.task_worktree_id.as_deref(),
+        Some(task_wt_id_b.as_str())
+    );
+    assert_eq!(obs_b.observed_model, wb.observed_model);
+    assert_eq!(obs_b.observed_effort, wb.observed_effort);
+
+    let repo_head_b =
+        resolve_exact_commit_sha(&fixture.repo_dir, "HEAD", DEFAULT_GIT_COMMAND_TIMEOUT_MS)
+            .expect("resolve primary repo HEAD");
+    assert_eq!(repo_head_b, fixture.base_commit);
+    let repo_b_path = fixture.repo_dir.join("src/b.rs");
+    let repo_b_text = fs::read_to_string(&repo_b_path).expect("read repo b.rs");
+    assert_eq!(repo_b_text, "pub fn b() -> u32 { 2 }\n");
+    assert!(wt_b.exists());
+    let kept_b_bytes = fs::read(wt_b.join("src/b.rs")).expect("read wt_b b.rs");
+    assert_eq!(kept_b_bytes, raw_b_bytes);
+
+    let ledger_b = fixture
+        .workflow_store
+        .read_binding_ledger(BINDING_A)
+        .expect("read binding ledger after fenced step");
+    let job_rec_b = ledger_b
+        .jobs
+        .iter()
+        .find(|j| j.job_id == fenced_job.job_id)
+        .expect("fenced job");
+    assert_eq!(job_rec_b.job_revision, dispatched_job_rev_b);
+    assert_eq!(job_rec_b.outbox.len(), 1);
+    let outbox_b = &job_rec_b.outbox[0];
+    assert_eq!(
+        outbox_b.status,
+        OutboxDispatchStatus::DispatchedEffectConfirmed
+    );
+    assert_eq!(outbox_b.run_id.as_deref(), Some(run_id_b.as_str()));
+    assert_eq!(outbox_b.worker_id.as_deref(), Some(worker_id_b.as_str()));
+
+    let task_rec_b = job_rec_b
+        .tasks
+        .iter()
+        .find(|t| t.task_id == "task-large-b")
+        .expect("task-large-b record");
+    assert_eq!(task_rec_b.stage, CoworkerTaskStage::Running);
+    assert!(task_rec_b.unresolved_outbox_id.is_none());
+    assert!(task_rec_b.candidates.is_empty());
+    assert!(task_rec_b.active_candidate_id.is_none());
+    assert!(task_rec_b.accepted_candidate_id.is_none());
+    assert_eq!(task_rec_b.attempts.len(), 1);
+    let attempt_b = &task_rec_b.attempts[0];
+    assert_eq!(attempt_b.run_id.as_deref(), Some(run_id_b.as_str()));
+    assert_eq!(attempt_b.worker_id.as_deref(), Some(worker_id_b.as_str()));
+    assert_eq!(attempt_b.base_commit, fixture.base_commit);
+    assert!(attempt_b.report_artifact_id.is_none());
+    assert!(attempt_b.diff_digest.is_none());
+    assert!(attempt_b.head_commit.is_none());
+    assert!(attempt_b.tree_sha.is_none());
+
+    let rep2_b = Box::pin(fenced_session.step(610_600))
+        .await
+        .expect("repeat fenced >64KiB step idempotently");
+    assert_eq!(rep2_b.status, CoworkerControllerPhase1Status::Stopped);
+    assert_eq!(rep2_b.job_revision, dispatched_job_rev_b);
+    assert!(rep2_b.dispatched_task_ids.is_empty());
+    assert!(rep2_b.reconciled_ready_for_review_task_ids.is_empty());
+    assert_eq!(read_invocation_count(&fixture.agy_count_file), 2);
+
+    let fenced_rt = fixture
+        .policy_store
+        .get_job_runtime_readonly(BINDING_A, &fenced_job.job_id)
+        .expect("read fenced runtime")
+        .expect("fenced runtime exists");
+    assert_eq!(fenced_rt.total_task_attempts_reserved, 1);
+    let fenced_coder_usage = fenced_rt
+        .role_usage
+        .get(&WorkflowRole::Coder)
+        .expect("fenced Coder usage");
+    assert_eq!(fenced_coder_usage.calls_reserved, 1);
+    assert_eq!(fenced_coder_usage.calls_completed, 1);
+
+    let fenced_art_key = ControllerJobRuntimeState::artifact_key("task-large-b", 1);
+    let art_b = fenced_rt
+        .attempt_artifacts
+        .get(&fenced_art_key)
+        .expect("retained runtime artifacts for task-large-b attempt 1");
+    assert_eq!(art_b.task_id, "task-large-b");
+    assert_eq!(art_b.attempt_no, 1);
+    assert_eq!(art_b.run_id, run_id_b);
+    assert_eq!(art_b.worker_id, worker_id_b);
+    assert_eq!(art_b.task_worktree_id, task_wt_id_b);
+    assert_eq!(art_b.integration_worktree_id, run_wt_id_b);
+    assert_eq!(art_b.execution_base_commit, fixture.base_commit);
+    assert_eq!(art_b.observed_provider, wb.provider);
+    assert_eq!(art_b.observed_model, wb.observed_model);
+    assert_eq!(art_b.observed_effort, wb.observed_effort);
+    assert_eq!(
+        art_b.committed_head_commit.as_deref(),
+        Some(head_b.as_str())
+    );
+    assert_eq!(art_b.committed_tree_sha.as_deref(), Some(tree_b.as_str()));
+    assert!(art_b.candidate_id.is_none());
+    assert!(art_b.check_evidence.is_empty());
+    assert!(art_b.test_evidence_summary.is_none());
+    assert!(art_b.review_subject.is_none());
+    assert!(art_b.reviewer_response_digest.is_none());
+    assert!(art_b.review_receipt.is_none());
+    assert!(art_b.integration_receipt.is_none());
+    assert!(!art_b.is_derived_attempt);
+
+    let approval_b = fixture
+        .authority
+        .get_for_operator(&fenced_approval_id)
+        .expect("read fenced approval");
+    let approved_task_b = approval_b
+        .tasks
+        .iter()
+        .find(|t| t.task_id == "task-large-b")
+        .expect("approved task-large-b");
+    let choice_b = &task_rec_b.selected_choice;
+    let coder_ok_b = art_b.has_matching_coder_evidence(approved_task_b, choice_b);
+    assert!(coder_ok_b);
+
+    let ef_b = fenced_rt
+        .pending_effects
+        .values()
+        .find(|e| e.request_key == obs_b.command_key)
+        .expect("fenced CoderDispatch effect");
+    assert_eq!(ef_b.kind, PendingControllerEffectKind::CoderDispatch);
+    assert_eq!(ef_b.task_id.as_deref(), Some("task-large-b"));
+    assert_eq!(ef_b.attempt_no, Some(1));
+    assert_eq!(ef_b.status, PendingControllerEffectStatus::EffectConfirmed);
+    assert_eq!(
+        ef_b.external_correlation_id.as_deref(),
+        Some(run_id_b.as_str())
+    );
+
+    drop(fenced_session);
+    fenced_host.shutdown().await.expect("shutdown fenced_host");
+
+    // 3. Bounded >4 MiB (DEFAULT_MAX_GIT_OUTPUT_BYTES) tracked diff overflow is rejected closed.
+    fs::write(&fenced_gate_path, b"hold").expect("write overflow gate");
+    let (overflow_job, overflow_approval_id) = Box::pin(create_planned_approved_and_frozen_job(
+        &fixture,
+        "brf_large_overflow",
+        "plan-large-overflow",
+        vec![PlanTask {
+            id: "task-overflow-b".to_string(),
+            title: "Large Overflow B".to_string(),
+            instruction: "CTRL_LARGE_FENCED_B".to_string(),
+            role: WorkflowRole::Coder,
+            difficulty: Difficulty::Hard,
+            depends_on: Vec::new(),
+            allowed_write_paths: vec!["src/b.rs".to_string()],
+        }],
+        single_coder_task_interfaces("task-overflow-b", "iface_overflow_b"),
+        vec!["src/b.rs".to_string()],
+        1,
+        ExecutionBudgets::default(),
+        ControllerRoleExecutionBudget::default_for_role(WorkflowRole::Coder, 4),
+    ))
+    .await;
+
+    let overflow_host = ApprovedHost::start(ApprovedHostConfig::new(
+        &fixture.registry_dir,
+        &fixture.plans_dir,
+        &fixture.authority_dir,
+        &fixture.sessions_dir,
+        &overflow_approval_id,
+    ))
+    .await
+    .expect("start overflow ApprovedHost");
+    let overflow_session = fixture
+        .controller
+        .open_owned_session(BINDING_A, THREAD_UUID_A, &overflow_job.job_id, 620_000)
+        .expect("open overflow session");
+
+    Box::pin(overflow_session.step(620_100))
+        .await
+        .expect("dispatch task-overflow-b");
+    fs::remove_file(&fenced_gate_path).expect("remove overflow gate");
+
+    let ov_deadline = Instant::now() + Duration::from_secs(10);
+    let snap_ov = loop {
+        let snap = host_client
+            .get_task(&overflow_approval_id, "task-overflow-b")
+            .await
+            .expect("poll task-overflow-b host snapshot");
+        if snap.status == TaskExecutionStatus::ReadyForReview {
+            break snap;
+        }
+        assert!(
+            Instant::now() < ov_deadline,
+            "timed out waiting for host ReadyForReview on task-overflow-b"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+    let wt_ov = PathBuf::from(
+        snap_ov
+            .worker
+            .as_ref()
+            .expect("worker snapshot")
+            .worktree
+            .task_worktree_path
+            .as_ref()
+            .expect("task_worktree_path"),
+    );
+    let overflow_source = build_large_rust_source(70_000, "b", 201);
+    assert!(overflow_source.len() > DEFAULT_MAX_GIT_OUTPUT_BYTES);
+    fs::write(wt_ov.join("src/b.rs"), overflow_source.as_bytes())
+        .expect("write >4 MiB tracked diff to src/b.rs");
+
+    let ov_err = Box::pin(overflow_session.step(620_500))
+        .await
+        .expect_err(">4 MiB git diff must be rejected by controller reconciliation");
+    assert_eq!(ov_err.code(), NativeErrorCode::ValidationFailed.as_str());
+    let ov_msg = ov_err.message();
+    assert!(ov_msg.contains("failed to compute git diff in task worktree:"));
+    assert_eq!(read_invocation_count(&fixture.agy_count_file), 3);
+
+    let ledger_ov = fixture
+        .workflow_store
+        .read_binding_ledger(BINDING_A)
+        .expect("read binding ledger after overflow error");
+    let task_rec_ov = ledger_ov
+        .jobs
+        .iter()
+        .find(|j| j.job_id == overflow_job.job_id)
+        .expect("overflow job")
+        .tasks
+        .iter()
+        .find(|t| t.task_id == "task-overflow-b")
+        .expect("task-overflow-b record");
+    assert_ne!(task_rec_ov.stage, CoworkerTaskStage::ReadyForReview);
+
+    let overflow_rt = fixture
+        .policy_store
+        .get_job_runtime_readonly(BINDING_A, &overflow_job.job_id)
+        .expect("read overflow runtime")
+        .expect("overflow runtime exists");
+    let ov_art_key = ControllerJobRuntimeState::artifact_key("task-overflow-b", 1);
+    assert!(!overflow_rt.attempt_artifacts.contains_key(&ov_art_key));
+
+    drop(overflow_session);
+    overflow_host
+        .shutdown()
+        .await
+        .expect("shutdown overflow_host");
+}
+
+#[tokio::test]
+async fn controller_fenced_uncertain_outbox_reconciles_over_64kib_raw_bytes_report_id() {
+    let fixture = setup_fixture();
+    let root_dir = fixture.agy_count_file.parent().expect("fixture root dir");
+    let large_a_path = root_dir.join("large_src_a_u.rs");
+    let large_b_path = root_dir.join("large_src_b_u.rs");
+    let fenced_gate_path = root_dir.join("fenced_task_u.gate");
+
+    fs::write(&large_a_path, build_large_rust_source(3_000, "a", 100))
+        .expect("write >64KiB src/a.rs payload");
+    fs::write(&large_b_path, build_large_rust_source(3_000, "b", 200))
+        .expect("write >64KiB src/b.rs payload");
+    install_large_diff_agy_cases(&fixture, &large_a_path, &large_b_path, &fenced_gate_path);
+
+    let (job_u, approval_id_u) = Box::pin(create_planned_approved_and_frozen_job(
+        &fixture,
+        "brf_large_fenced_uncertain",
+        "plan-large-fenced-uncertain",
+        vec![PlanTask {
+            id: "task-uncertain-b".to_string(),
+            title: "Large Fenced Uncertain B".to_string(),
+            instruction: "CTRL_LARGE_FENCED_B".to_string(),
+            role: WorkflowRole::Coder,
+            difficulty: Difficulty::Hard,
+            depends_on: Vec::new(),
+            allowed_write_paths: vec!["src/b.rs".to_string()],
+        }],
+        single_coder_task_interfaces("task-uncertain-b", "iface_uncertain_b"),
+        vec!["src/b.rs".to_string()],
+        1,
+        ExecutionBudgets::default(),
+        ControllerRoleExecutionBudget::default_for_role(WorkflowRole::Coder, 4),
+    ))
+    .await;
+
+    let host_u = ApprovedHost::start(ApprovedHostConfig::new(
+        &fixture.registry_dir,
+        &fixture.plans_dir,
+        &fixture.authority_dir,
+        &fixture.sessions_dir,
+        &approval_id_u,
+    ))
+    .await
+    .expect("start uncertain ApprovedHost");
+    let host_client = ApprovedHostClient::new(
+        Arc::clone(&fixture.authority),
+        &fixture.sessions_dir,
+        BINDING_A,
+        THREAD_UUID_A,
+    )
+    .expect("create ApprovedHostClient");
+
+    let approval_u = fixture
+        .authority
+        .get_for_operator(&approval_id_u)
+        .expect("read approval_u");
+    let approved_task_u = approval_u
+        .tasks
+        .iter()
+        .find(|t| t.task_id == "task-uncertain-b")
+        .expect("approved task-uncertain-b");
+    let cmd_key_u = approved_task_u
+        .command_key
+        .clone()
+        .expect("frozen command_key");
+
+    // Durable intent reserved before host dispatch, followed by host execution and operator stop
+    // before controller post-dispatch outbox confirmation.
+    let (reserved_job_u, reserved_outbox_u) = fixture
+        .workflow_store
+        .reserve_task_outbox(&ReserveTaskOutboxRequest {
+            binding_id: BINDING_A.to_string(),
+            thread_uuid: THREAD_UUID_A.to_string(),
+            job_id: job_u.job_id.clone(),
+            expected_job_revision: job_u.job_revision,
+            expected_ledger_revision: None,
+            request_key: cmd_key_u.clone(),
+            kind: OutboxDispatchKind::TaskAttemptDispatch,
+            task_id: "task-uncertain-b".to_string(),
+            role: WorkflowRole::Coder,
+            subject_digest: approved_task_u.task_digest.clone(),
+            dependency_input_commit: None,
+            dependency_input_tree_sha: None,
+            accepted_predecessor_receipts: Vec::new(),
+        })
+        .expect("reserve initial coder outbox before host dispatch");
+    assert_eq!(
+        reserved_outbox_u.status,
+        OutboxDispatchStatus::ReservedBeforeEffect
+    );
+    assert_eq!(
+        reserved_job_u.tasks[0].stage,
+        CoworkerTaskStage::DispatchReserved
+    );
+    assert_eq!(
+        reserved_job_u.tasks[0].unresolved_outbox_id.as_deref(),
+        Some(reserved_outbox_u.outbox_id.as_str())
+    );
+    let pre_attempt_u = &reserved_job_u.tasks[0].attempts[0];
+    assert!(pre_attempt_u.report_artifact_id.is_none());
+
+    host_client
+        .dispatch_task(&approval_id_u, "task-uncertain-b")
+        .await
+        .expect("dispatch task-uncertain-b on ApprovedHost");
+
+    fixture
+        .policy_store
+        .mutate_job_runtime_for_operator(BINDING_A, &job_u.job_id, |rt| {
+            rt.stop_requested = true;
+            Ok(())
+        })
+        .expect("set stop_requested before controller reconciles uncertain outbox");
+
+    let deadline_u = Instant::now() + Duration::from_secs(10);
+    let snap_u = loop {
+        let snap = host_client
+            .get_task(&approval_id_u, "task-uncertain-b")
+            .await
+            .expect("poll task-uncertain-b host snapshot");
+        if snap.status == TaskExecutionStatus::ReadyForReview {
+            break snap;
+        }
+        assert!(
+            Instant::now() < deadline_u,
+            "timed out waiting for host ReadyForReview on task-uncertain-b"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+    assert_eq!(read_invocation_count(&fixture.agy_count_file), 1);
+
+    let wu = snap_u.worker.as_ref().expect("worker snapshot");
+    let run_id_u = snap_u.run_id.clone().expect("host run_id");
+    let worker_id_u = snap_u.worker_id.clone().expect("host worker_id");
+    let task_wt_id_u = wu
+        .worktree
+        .task_worktree_id
+        .clone()
+        .expect("host task_worktree_id");
+    let run_wt_id_u = wu
+        .worktree
+        .run_worktree_id
+        .clone()
+        .expect("host run_worktree_id");
+    let wt_u = PathBuf::from(
+        wu.worktree
+            .task_worktree_path
+            .as_ref()
+            .expect("task_worktree_path"),
+    );
+    assert_eq!(wu.worktree.base_commit, fixture.base_commit);
+    assert_eq!(wu.observed_model.as_deref(), Some("gemini-4-argon-high"));
+    assert_eq!(wu.observed_effort.as_deref(), Some("high"));
+
+    let mut raw_u_bytes = fs::read(wt_u.join("src/b.rs")).expect("read worker src/b.rs");
+    raw_u_bytes.extend_from_slice(b"// raw non-utf8 bytes: \xff\xfe\x80\n");
+    fs::write(wt_u.join("src/b.rs"), &raw_u_bytes).expect("append non-UTF-8 bytes to src/b.rs");
+
+    let legacy_diff_u = run_sanitized_git(
+        &wt_u,
+        &["diff", "--binary", &fixture.base_commit],
+        DEFAULT_GIT_COMMAND_TIMEOUT_MS,
+    );
+    assert!(legacy_diff_u.is_err());
+
+    let raw_diff_u = run_sanitized_git_bytes(
+        &wt_u,
+        &["diff", "--binary", &fixture.base_commit],
+        DEFAULT_MAX_GIT_OUTPUT_BYTES,
+        DEFAULT_GIT_COMMAND_TIMEOUT_MS,
+    )
+    .expect("compute raw diff for task-uncertain-b");
+    assert!(raw_diff_u.stdout_bytes.len() > 180_000);
+    assert!(std::str::from_utf8(&raw_diff_u.stdout_bytes).is_err());
+
+    let head_u = resolve_exact_commit_sha(&wt_u, "HEAD", DEFAULT_GIT_COMMAND_TIMEOUT_MS)
+        .expect("resolve wt_u HEAD commit");
+    let tree_u = resolve_exact_tree_sha(&wt_u, &head_u, DEFAULT_GIT_COMMAND_TIMEOUT_MS)
+        .expect("resolve wt_u HEAD tree");
+    let expected_digest_u = sha256_hex(&raw_diff_u.stdout_bytes);
+    let expected_art_id_u = deterministic_prefixed_id(
+        "threadlane-native:coworker-coder-attempt-report:v1",
+        "art",
+        &[
+            &approval_id_u,
+            "task-uncertain-b",
+            &run_id_u,
+            &worker_id_u,
+            &task_wt_id_u,
+            &expected_digest_u,
+        ],
+    );
+
+    let session_u = fixture
+        .controller
+        .open_owned_session(BINDING_A, THREAD_UUID_A, &job_u.job_id, 615_000)
+        .expect("open uncertain fenced session");
+    let rep_u = Box::pin(session_u.step(615_100))
+        .await
+        .expect("reconcile fenced uncertain outbox >64KiB ReadyForReview snapshot");
+    assert_eq!(rep_u.status, CoworkerControllerPhase1Status::Stopped);
+    assert_eq!(rep_u.active_running_count, 0);
+    assert!(rep_u.dispatched_task_ids.is_empty());
+    assert!(rep_u.reconciled_ready_for_review_task_ids.is_empty());
+    assert!(rep_u
+        .fenced_task_ids
+        .iter()
+        .any(|id| id == "task-uncertain-b"));
+
+    let obs_u = rep_u
+        .tasks
+        .iter()
+        .find(|t| t.task_id == "task-uncertain-b")
+        .expect("task-uncertain-b observation");
+    assert_eq!(obs_u.stage, CoworkerTaskStage::Running);
+    assert_eq!(obs_u.host_status, TaskExecutionStatus::ReadyForReview);
+    assert!(obs_u.fenced);
+
+    let ledger_u = fixture
+        .workflow_store
+        .read_binding_ledger(BINDING_A)
+        .expect("read binding ledger after uncertain fenced step");
+    let job_rec_u = ledger_u
+        .jobs
+        .iter()
+        .find(|j| j.job_id == job_u.job_id)
+        .expect("uncertain fenced job");
+    assert_eq!(job_rec_u.outbox.len(), 1);
+    let outbox_u = &job_rec_u.outbox[0];
+    assert_eq!(
+        outbox_u.status,
+        OutboxDispatchStatus::DispatchedEffectConfirmed
+    );
+    assert_eq!(outbox_u.run_id.as_deref(), Some(run_id_u.as_str()));
+    assert_eq!(outbox_u.worker_id.as_deref(), Some(worker_id_u.as_str()));
+
+    let task_rec_u = job_rec_u
+        .tasks
+        .iter()
+        .find(|t| t.task_id == "task-uncertain-b")
+        .expect("task-uncertain-b record");
+    assert_eq!(task_rec_u.stage, CoworkerTaskStage::Running);
+    assert!(task_rec_u.unresolved_outbox_id.is_none());
+    assert!(task_rec_u.candidates.is_empty());
+    let attempt_u = &task_rec_u.attempts[0];
+    assert_eq!(attempt_u.run_id.as_deref(), Some(run_id_u.as_str()));
+    assert_eq!(attempt_u.worker_id.as_deref(), Some(worker_id_u.as_str()));
+    assert_eq!(
+        attempt_u.task_worktree_id.as_deref(),
+        Some(task_wt_id_u.as_str())
+    );
+    assert_eq!(attempt_u.base_commit, fixture.base_commit);
+    assert_eq!(attempt_u.head_commit.as_deref(), Some(head_u.as_str()));
+    assert_eq!(attempt_u.tree_sha.as_deref(), Some(tree_u.as_str()));
+    assert_eq!(
+        attempt_u.diff_digest.as_deref(),
+        Some(expected_digest_u.as_str())
+    );
+    assert_eq!(
+        attempt_u.report_artifact_id.as_deref(),
+        Some(expected_art_id_u.as_str())
+    );
+    assert_eq!(
+        attempt_u.observed_model.as_deref(),
+        Some("gemini-4-argon-high")
+    );
+    assert_eq!(attempt_u.observed_effort.as_deref(), Some("high"));
+
+    let rep2_u = Box::pin(session_u.step(615_200))
+        .await
+        .expect("repeat uncertain fenced >64KiB step idempotently");
+    assert_eq!(rep2_u.status, CoworkerControllerPhase1Status::Stopped);
+    assert_eq!(rep2_u.job_revision, rep_u.job_revision);
+    assert!(rep2_u.dispatched_task_ids.is_empty());
+    assert!(rep2_u.reconciled_ready_for_review_task_ids.is_empty());
+    assert_eq!(read_invocation_count(&fixture.agy_count_file), 1);
+
+    let rt_u = fixture
+        .policy_store
+        .get_job_runtime_readonly(BINDING_A, &job_u.job_id)
+        .expect("read uncertain fenced runtime")
+        .expect("uncertain fenced runtime exists");
+    assert_eq!(rt_u.total_task_attempts_reserved, 1);
+    let coder_usage_u = rt_u
+        .role_usage
+        .get(&WorkflowRole::Coder)
+        .expect("uncertain fenced Coder usage");
+    assert_eq!(coder_usage_u.calls_reserved, 1);
+    assert_eq!(coder_usage_u.calls_completed, 1);
+
+    let art_key_u = ControllerJobRuntimeState::artifact_key("task-uncertain-b", 1);
+    let art_u = rt_u
+        .attempt_artifacts
+        .get(&art_key_u)
+        .expect("retained runtime artifacts for task-uncertain-b attempt 1");
+    assert_eq!(art_u.run_id, run_id_u);
+    assert_eq!(art_u.worker_id, worker_id_u);
+    assert_eq!(art_u.task_worktree_id, task_wt_id_u);
+    assert_eq!(art_u.integration_worktree_id, run_wt_id_u);
+    assert_eq!(art_u.execution_base_commit, fixture.base_commit);
+    assert_eq!(
+        art_u.committed_head_commit.as_deref(),
+        Some(head_u.as_str())
+    );
+    assert_eq!(art_u.committed_tree_sha.as_deref(), Some(tree_u.as_str()));
+
+    drop(session_u);
+    host_u.shutdown().await.expect("shutdown host_u");
 }
 
 #[path = "support/coworker_correction_execution.rs"]

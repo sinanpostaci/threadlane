@@ -102,21 +102,29 @@ impl FinalCandidateClosureStore {
 
 ## 3. Native Controller Integration Contract
 
-When wiring final-candidate closure into the native workflow controller (`threadlane-native` / `threadlane-operator`):
+When wiring final-candidate closure into the native workflow controller (`threadlane-native::coworker_workflow::candidate` / `threadlane-operator`):
 
 1. **Freeze the Live Combined Candidate**:
    - Call `inspect_final_candidate_readonly(&InspectFinalCandidateRequest { ... })` pointing at the owned `WorktreeKind::RunIntegration` worktree and the selected accepted/integrated task receipts.
-2. **Reserve or Reuse Closure Attempt Before External Dispatch**:
+2. **Verify Frozen Brief and Envelope Bindings Before Cache Reuse or Reservation**:
+   - `ExecuteFinalCandidateClosureRequest` (`#[serde(deny_unknown_fields)]`) accepts only scoped identifiers, CAS revisions, the verified `FinalCandidateSubject`, and timestamp—never caller-supplied free-form prompt text or authority overrides.
+   - Before any accepted-cache reuse (`ClosureReservationOutcome::CacheHit`), crash recovery, or new reservation, `CoworkerCandidateService::execute_final_candidate_closure` validates `job.work_brief`, recomputes `job.work_brief.digest()` against both `job.work_brief_digest` and `FrozenControllerExecutionEnvelope.work_brief_digest`, and recomputes `FinalCandidateSubject.policy.closure_task_digest` from `(job.job_id, closure_task_id, runtime.envelope.envelope_digest)`.
+3. **Build and Size-Check the Read-Only Closure Prompt Pre-Effect**:
+   - For non-cached dispatches, `CoworkerCandidateService` constructs a typed read-only evaluation context from the verified frozen `WorkBrief` (`brief_id`, `work_brief_digest`, `kind`, `summary`, `confirmed_requirements`, and any `accepted_architect_decisions`, while excluding unapproved `proposed_additions`, `assumptions`, and `open_questions`), the immutable `FinalCandidateSubject` (base/head/tree/diff/scope/predecessor/policy identities), and the bound `CandidateCheckEvidence`.
+   - Approved human scope from `WorkBrief` (including any broader multi-commit baseline, documentation audit scope, or human response-language requirement stated in the frozen brief) is rendered strictly as read-only evaluation data (`grants_execution_or_mutation_authority: false`, inside a single `<closure_evaluation_data>...</closure_evaluation_data>` block with serialized `<` and `>` JSON-escaped as `\u003c` and `\u003e`) separated from execution authority. Closure is instructed to write human-readable `summary` and `findings` in the response language specified by `confirmed_requirements` (or otherwise evident in the frozen `WorkBrief`) while keeping JSON keys, schema, and `outcome` enum values unchanged, with no language or baseline commit SHA hardcoded in product code.
+   - Complete prompt serialization, NUL rejection, and `threadlane_workers::MAX_PROMPT_BYTES` (`65_536` UTF-8 bytes) verification run **before** `Closure` role-budget reservation, `PendingControllerEffect` creation, `FinalCandidateClosureStore::reserve_closure_attempt`, `mark_closure_attempt_submitted`, or provider launch. Approved requirements and check evidence are never truncated or dropped to fit; overflow fails closed pre-effect with zero provider invocations and zero new reservations, role-usage charges, pending effects, or submissions.
+4. **Reserve or Reuse Closure Attempt Before External Dispatch**:
    - Open `FinalCandidateClosureStore::open(&repository_path, &work_area_root)`.
    - Call `store.reserve_closure_attempt(&ReserveClosureAttemptRequest { expected_ledger_revision, command_key, attempt_id, subject, legacy_base_tree_digest, reserved_at_ms })`.
    - Handle `ClosureReservationOutcome`:
      - `ClosureReservationOutcome::CacheHit { ledger_revision, attempt, verdict }`: reuse `verdict` directly; **do not** invoke an external closure model/provider.
-     - `ClosureReservationOutcome::IdempotentReserved { ledger_revision, attempt }` or `ClosureReservationOutcome::Reserved { ledger_revision, attempt }`: proceed to step 3.
-3. **Persist `Submitted` Before Invoking External Inference**:
+     - `ClosureReservationOutcome::IdempotentReserved { ledger_revision, attempt }` or `ClosureReservationOutcome::Reserved { ledger_revision, attempt }`: proceed to step 5.
+5. **Persist `Submitted` Before Invoking External Inference**:
    - Call `store.mark_closure_attempt_submitted(&MarkClosureSubmittedRequest { expected_ledger_revision, attempt_id, command_key, expected_subject_digest, external_request_id, submitted_at_ms })`.
    - If this write fails, **do not** dispatch the external provider call.
-4. **Finalize or Quarantine Outcome**:
+6. **Finalize, Quarantine, and Preserve Historical Inspection**:
    - If external execution completes with verified telemetry and a durable handoff/turn receipt, call `store.record_closure_verdict(&RecordClosureVerdictRequest { ... })`.
    - If external transport, timeout, or receipt persistence leaves the outcome uncertain, call `store.mark_closure_attempt_unknown(&MarkClosureUnknownRequest { ... })` and require explicit receipt-bound `store.reconcile_closure_attempt(&ReconcileClosureAttemptRequest { ... })` before any retry.
-5. **Respect Authority Boundaries**:
+   - Historical read-only verification of previously accepted closure records remains separate from active Closure execution and performs no ledger rewriting.
+7. **Respect Authority Boundaries**:
    - A `ClosureVerdictKind::Accepted` verdict proves final-candidate closure review on `subject_digest`; it never grants merge/push authority and never substitutes for required formatting, Clippy, or behavioral test checks.

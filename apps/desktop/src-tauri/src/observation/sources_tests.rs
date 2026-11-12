@@ -397,6 +397,10 @@ fn valid_linked_context_is_available_inventory_and_persisted() {
 
     let source = registry.link_context(&context).expect("link valid context");
 
+    let expected_source_id =
+        compute_observation_source_id(&stores.plans, &stores.authority, &stores.sessions)
+            .expect("canonical source id");
+    assert_eq!(source.id, expected_source_id);
     assert!(source.id.starts_with("src_"));
     assert_eq!(source.label, LINKED_SOURCE_LABEL);
     assert_eq!(
@@ -554,6 +558,16 @@ fn missing_linked_context_is_unavailable_while_healthy_source_stays_available() 
 
     let source_a = registry.link_context(&context_a).expect("link source a");
     let source_b = registry.link_context(&context_b).expect("link source b");
+    assert_eq!(
+        source_a.id,
+        compute_observation_source_id(&stores_a.plans, &stores_a.authority, &stores_a.sessions)
+            .expect("canonical source id a")
+    );
+    assert_eq!(
+        source_b.id,
+        compute_observation_source_id(&stores_b.plans, &stores_b.authority, &stores_b.sessions)
+            .expect("canonical source id b")
+    );
     assert_ne!(source_a.id, source_b.id);
 
     let healthy = registry.inventory();
@@ -1414,15 +1428,17 @@ mod coworker_projection_tests {
             ObservationJobState::Completed
         );
 
-        // Full job completion + ClosureAccepted proof projects Completed.
+        // Plausible ledger receipt IDs without store-backed ControllerJobRuntimeState,
+        // FinalCandidateClosureStore verdict, and task receipts must fail closed to Unknown.
         assert_eq!(
             by_id["job_completed_07"].state,
-            ObservationJobState::Completed
+            ObservationJobState::Unknown
         );
-        assert_eq!(by_id["job_completed_07"].execution_status, "completed");
+        assert_eq!(by_id["job_completed_07"].approval_status, "unknown");
+        assert_eq!(by_id["job_completed_07"].execution_status, "unknown");
         assert_eq!(
             by_id["job_completed_07"].review_state.as_deref(),
-            Some("review_passed")
+            Some("unknown")
         );
 
         // Same-title unrelated legacy plan is preserved (`plan-unrelated-same-title`).

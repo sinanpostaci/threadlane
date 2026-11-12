@@ -23,6 +23,8 @@ use crate::ws_rpc::{execute_ws_rpc_for_backend, map_reconnect_error};
 const DEFAULT_THREAD_LIST_LIMIT: u32 = 25;
 const MAX_ID_CHARS: usize = 128;
 const MAX_CURSOR_CHARS: usize = 512;
+const MAX_ACTIVE_FLAGS_COUNT: usize = 32;
+const MAX_ACTIVE_FLAG_CHARS: usize = 128;
 
 /// Public configuration for [`NativeClient`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -53,6 +55,41 @@ pub struct NativeThread {
     /// Whether the host allows direct input to this loaded thread, when reported.
     #[serde(default)]
     pub can_accept_direct_input: Option<bool>,
+}
+
+/// Structured status detail extracted from a native Codex `ThreadStatus` wire field.
+///
+/// Preserves whether the backend reported a structured tagged object (`{"type": ...}`) versus a
+/// plain string (`"active"`), whether an explicit `activeFlags` array was present on the wire,
+/// bounded flag tokens, and whether any malformed or oversized flag entry was encountered.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeThreadStatusDetail {
+    /// Normalized coarse thread status (`idle`, `active`, `not_loaded`, `system_error`).
+    pub status: String,
+    /// `true` when the wire status was a structured tagged object (`{"type": ...}`),
+    /// `false` when it was a plain string without structured `activeFlags`.
+    pub tagged: bool,
+    /// `true` when the wire status object explicitly carried a non-null `activeFlags` array.
+    #[serde(default)]
+    pub active_flags_present: bool,
+    /// Sanitized bounded `activeFlags` tokens reported by the backend.
+    #[serde(default)]
+    pub active_flags: Vec<String>,
+    /// `true` if `activeFlags` exceeded count/length bounds or contained non-identifier tokens.
+    #[serde(default)]
+    pub has_invalid_active_flags: bool,
+}
+
+/// Additive read-only thread metadata envelope returned by [`NativeClient::thread_metadata`].
+///
+/// Preserves existing [`NativeThread`] compatibility while surfacing structured
+/// [`NativeThreadStatusDetail`] (`activeFlags` and tagged-vs-plain wire provenance).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeThreadMetadata {
+    /// Normalized [`NativeThread`] metadata compatible with [`NativeClient::thread`].
+    pub thread: NativeThread,
+    /// Structured status detail including `activeFlags` provenance.
+    pub status_detail: NativeThreadStatusDetail,
 }
 
 /// Paginated response from [`NativeClient::threads`].
@@ -489,6 +526,20 @@ impl NativeClient {
     /// Never requests conversation turns or transcript text, and verifies that the returned
     /// authoritative `thread.id` matches `thread_id`.
     pub async fn thread(&self, thread_id: &str) -> Result<NativeThread, NativeError> {
+        self.thread_metadata(thread_id)
+            .await
+            .map(|metadata| metadata.thread)
+    }
+
+    /// Fetches additive read-only metadata and structured [`NativeThreadStatusDetail`] (`activeFlags`)
+    /// for a single native thread (`thread/read` with `includeTurns: false`).
+    ///
+    /// Never requests conversation turns or transcript text, and verifies that the returned
+    /// authoritative `thread.id` matches `thread_id`.
+    pub async fn thread_metadata(
+        &self,
+        thread_id: &str,
+    ) -> Result<NativeThreadMetadata, NativeError> {
         let clean_thread_id = validate_bounded_identifier(thread_id, "thread_id", MAX_ID_CHARS)?;
         let params = json!({
             "threadId": clean_thread_id,
@@ -498,8 +549,8 @@ impl NativeClient {
         let wire_res: WireThreadReadResult =
             self.execute_readonly_rpc("thread/read", params).await?;
 
-        let mapped = wire_res.thread.into_native_thread()?;
-        if mapped.id != clean_thread_id {
+        let mapped = wire_res.thread.into_native_thread_metadata()?;
+        if mapped.thread.id != clean_thread_id {
             return Err(NativeError::new(
                 NativeErrorCode::ThreadNotFound,
                 "returned native thread.id did not match requested thread_id",
@@ -880,6 +931,11 @@ struct WireThread {
 
 impl WireThread {
     fn into_native_thread(self) -> Result<NativeThread, NativeError> {
+        self.into_native_thread_metadata()
+            .map(|metadata| metadata.thread)
+    }
+
+    fn into_native_thread_metadata(self) -> Result<NativeThreadMetadata, NativeError> {
         let clean_id = validate_bounded_identifier(&self.id, "thread.id", MAX_ID_CHARS)?;
         if self.cwd.trim().is_empty() || self.cwd.chars().any(char::is_control) {
             return Err(NativeError::new(
@@ -904,16 +960,20 @@ impl WireThread {
             .reasoning_effort
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
+        let status_detail = self.status.into_status_detail()?;
 
-        Ok(NativeThread {
-            id: clean_id,
-            project_id,
-            title,
-            cwd: self.cwd,
-            status: self.status.into_status_string()?,
-            model,
-            effort,
-            can_accept_direct_input: self.can_accept_direct_input,
+        Ok(NativeThreadMetadata {
+            thread: NativeThread {
+                id: clean_id,
+                project_id,
+                title,
+                cwd: self.cwd,
+                status: status_detail.status.clone(),
+                model,
+                effort,
+                can_accept_direct_input: self.can_accept_direct_input,
+            },
+            status_detail,
         })
     }
 }
@@ -925,16 +985,16 @@ enum WireThreadStatusField {
         #[serde(rename = "type")]
         kind: String,
         #[serde(default, rename = "activeFlags")]
-        _active_flags: Vec<String>,
+        active_flags: Option<Vec<String>>,
     },
     Plain(String),
 }
 
 impl WireThreadStatusField {
-    fn into_status_string(self) -> Result<String, NativeError> {
-        let raw = match self {
-            Self::Tagged { kind, .. } => kind,
-            Self::Plain(s) => s,
+    fn into_status_detail(self) -> Result<NativeThreadStatusDetail, NativeError> {
+        let (raw, tagged, raw_flags) = match self {
+            Self::Tagged { kind, active_flags } => (kind, true, active_flags),
+            Self::Plain(s) => (s, false, None),
         };
         let normalized = match raw.trim() {
             "notLoaded" | "not_loaded" => "not_loaded",
@@ -951,7 +1011,35 @@ impl WireThreadStatusField {
                 ));
             }
         };
-        Ok(normalized.to_string())
+        let active_flags_present = raw_flags.is_some();
+        let mut active_flags = Vec::new();
+        let mut has_invalid_active_flags = false;
+        if let Some(flags) = raw_flags {
+            if flags.len() > MAX_ACTIVE_FLAGS_COUNT {
+                has_invalid_active_flags = true;
+            }
+            for raw_flag in flags.into_iter().take(MAX_ACTIVE_FLAGS_COUNT) {
+                let trimmed = raw_flag.trim();
+                if trimmed.is_empty()
+                    || trimmed.len() > MAX_ACTIVE_FLAG_CHARS
+                    || trimmed.chars().any(char::is_control)
+                    || !trimmed
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+                {
+                    has_invalid_active_flags = true;
+                } else {
+                    active_flags.push(trimmed.to_string());
+                }
+            }
+        }
+        Ok(NativeThreadStatusDetail {
+            status: normalized.to_string(),
+            tagged,
+            active_flags_present,
+            active_flags,
+            has_invalid_active_flags,
+        })
     }
 }
 
@@ -989,4 +1077,87 @@ struct WireMcpToolCallResult {
 #[serde(rename_all = "camelCase")]
 struct WireTurnSteerResult {
     turn_id: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wire_thread_preserves_tagged_active_flags_and_legacy_native_thread_contract() {
+        let tagged_waiting: WireThread = serde_json::from_value(json!({
+            "id": "0196ed00-0000-7000-8000-00000000000a",
+            "projectId": "proj_alpha",
+            "name": "Architecture Chat",
+            "cwd": "/tmp/workspace/alpha",
+            "status": {
+                "type": "active",
+                "activeFlags": ["waitingOnApproval"]
+            },
+            "model": "gpt-5.4",
+            "reasoningEffort": "high",
+            "canAcceptDirectInput": true
+        }))
+        .expect("deserialize tagged active thread");
+
+        let metadata = tagged_waiting
+            .into_native_thread_metadata()
+            .expect("map metadata");
+        assert_eq!(metadata.thread.status, "active");
+        assert_eq!(metadata.thread.model.as_deref(), Some("gpt-5.4"));
+        assert_eq!(metadata.thread.effort.as_deref(), Some("high"));
+        assert_eq!(metadata.status_detail.status, "active");
+        assert!(metadata.status_detail.tagged);
+        assert!(metadata.status_detail.active_flags_present);
+        assert_eq!(
+            metadata.status_detail.active_flags,
+            vec!["waitingOnApproval"]
+        );
+        assert!(!metadata.status_detail.has_invalid_active_flags);
+
+        let plain_active: WireThread = serde_json::from_value(json!({
+            "id": "0196ed00-0000-7000-8000-00000000000b",
+            "cwd": "/tmp/workspace/alpha",
+            "status": "active"
+        }))
+        .expect("deserialize plain active thread");
+        let plain_meta = plain_active
+            .into_native_thread_metadata()
+            .expect("map plain metadata");
+        assert_eq!(plain_meta.thread.status, "active");
+        assert!(!plain_meta.status_detail.tagged);
+        assert!(!plain_meta.status_detail.active_flags_present);
+        assert!(plain_meta.status_detail.active_flags.is_empty());
+
+        let missing_flags: WireThread = serde_json::from_value(json!({
+            "id": "0196ed00-0000-7000-8000-00000000000c",
+            "cwd": "/tmp/workspace/alpha",
+            "status": { "type": "active" }
+        }))
+        .expect("deserialize tagged active without flags");
+        let missing_meta = missing_flags
+            .into_native_thread_metadata()
+            .expect("map missing flags metadata");
+        assert!(missing_meta.status_detail.tagged);
+        assert!(!missing_meta.status_detail.active_flags_present);
+        assert!(missing_meta.status_detail.active_flags.is_empty());
+
+        let invalid_flag: WireThread = serde_json::from_value(json!({
+            "id": "0196ed00-0000-7000-8000-00000000000d",
+            "cwd": "/tmp/workspace/alpha",
+            "status": {
+                "type": "active",
+                "activeFlags": ["waitingOnApproval", "bad flag\n"]
+            }
+        }))
+        .expect("deserialize invalid flag token");
+        let invalid_meta = invalid_flag
+            .into_native_thread_metadata()
+            .expect("map invalid flag metadata");
+        assert!(invalid_meta.status_detail.has_invalid_active_flags);
+        assert_eq!(
+            invalid_meta.status_detail.active_flags,
+            vec!["waitingOnApproval"]
+        );
+    }
 }

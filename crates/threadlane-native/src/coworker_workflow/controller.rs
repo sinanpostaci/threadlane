@@ -44,8 +44,8 @@ use threadlane_host::{
 };
 use threadlane_operations::inspect_dependency_input_seal_readonly;
 use threadlane_workers::{
-    resolve_exact_commit_sha, resolve_exact_tree_sha, run_sanitized_git,
-    DEFAULT_GIT_COMMAND_TIMEOUT_MS,
+    resolve_exact_commit_sha, resolve_exact_tree_sha, run_sanitized_git_bytes,
+    DEFAULT_GIT_COMMAND_TIMEOUT_MS, DEFAULT_MAX_GIT_OUTPUT_BYTES,
 };
 use threadlane_workflow::WorkflowRole;
 
@@ -2996,18 +2996,8 @@ fn extract_verified_ready_for_review_evidence(
                 )
             })?;
 
-    let diff_out = run_sanitized_git(
-        checkout_path,
-        &["diff", "--binary", &worker.worktree.base_commit],
-        DEFAULT_GIT_COMMAND_TIMEOUT_MS,
-    )
-    .map_err(|err| {
-        NativeError::new(
-            NativeErrorCode::ValidationFailed,
-            format!("failed to compute git diff in task worktree: {err}"),
-        )
-    })?;
-    let diff_digest = sha256_hex(diff_out.as_bytes());
+    let diff_digest =
+        compute_task_worktree_diff_digest(checkout_path, &worker.worktree.base_commit)?;
 
     let report_artifact_id = deterministic_prefixed_id(
         "threadlane-native:coworker-coder-attempt-report:v1",
@@ -3043,6 +3033,25 @@ fn extract_verified_ready_for_review_evidence(
         observed_effort: worker.observed_effort.clone(),
         duration_ms,
     })
+}
+
+fn compute_task_worktree_diff_digest(
+    checkout_path: &Path,
+    base_commit: &str,
+) -> Result<String, NativeError> {
+    let diff_out = run_sanitized_git_bytes(
+        checkout_path,
+        &["diff", "--binary", base_commit],
+        DEFAULT_MAX_GIT_OUTPUT_BYTES,
+        DEFAULT_GIT_COMMAND_TIMEOUT_MS,
+    )
+    .map_err(|err| {
+        NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            format!("failed to compute git diff in task worktree: {err}"),
+        )
+    })?;
+    Ok(sha256_hex(&diff_out.stdout_bytes))
 }
 
 fn verify_approved_task_matches_coder_choice(
@@ -3828,4 +3837,104 @@ fn map_host_error(err: HostError) -> NativeError {
         _ => NativeErrorCode::ValidationFailed,
     };
     NativeError::new(code, sanitize_diagnostic_text(&err.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use tempfile::TempDir;
+    use threadlane_workers::run_sanitized_git;
+
+    use super::*;
+
+    fn init_temp_repo() -> (TempDir, PathBuf, String) {
+        let tmp = TempDir::new().expect("create tempdir");
+        let repo_dir = tmp.path().join("repo");
+        fs::create_dir_all(repo_dir.join("src")).expect("create repo src");
+        fs::write(repo_dir.join("src/a.rs"), b"pub fn a() -> u32 { 1 }\n")
+            .expect("write initial src/a.rs");
+        for args in [
+            &["init", "--quiet"][..],
+            &["config", "user.email", "test@threadlane.local"][..],
+            &["config", "user.name", "Threadlane Test"][..],
+            &["add", "."][..],
+            &["commit", "-m", "initial commit", "--quiet"][..],
+        ] {
+            run_sanitized_git(&repo_dir, args, DEFAULT_GIT_COMMAND_TIMEOUT_MS)
+                .expect("init git repo");
+        }
+        let base_commit =
+            resolve_exact_commit_sha(&repo_dir, "HEAD", DEFAULT_GIT_COMMAND_TIMEOUT_MS)
+                .expect("resolve base commit");
+        (tmp, repo_dir, base_commit)
+    }
+
+    #[test]
+    fn task_worktree_diff_digest_handles_large_raw_byte_diffs_and_rejects_overflow() {
+        let (_tmp, repo_dir, base_commit) = init_temp_repo();
+
+        let clean_digest = compute_task_worktree_diff_digest(&repo_dir, &base_commit)
+            .expect("clean worktree diff digest");
+        assert_eq!(clean_digest, sha256_hex(b""));
+
+        let mut large_source = String::with_capacity(195_000);
+        for idx in 0..3_000u32 {
+            large_source.push_str(&format!(
+                "pub const ITEM_{idx:06}: &str = \"0123456789abcdef0123456789ab\";\n"
+            ));
+        }
+        large_source.push_str("pub fn a() -> u32 { 100 }\n");
+
+        let mut raw_bytes = large_source.into_bytes();
+        raw_bytes.extend_from_slice(b"// raw non-utf8 bytes: \xff\xfe\x80\n");
+        fs::write(repo_dir.join("src/a.rs"), &raw_bytes).expect("write >64KiB raw-byte src/a.rs");
+
+        let legacy_text_diff = run_sanitized_git(
+            &repo_dir,
+            &["diff", "--binary", &base_commit],
+            DEFAULT_GIT_COMMAND_TIMEOUT_MS,
+        );
+        assert!(legacy_text_diff.is_err());
+
+        let expected_raw = run_sanitized_git_bytes(
+            &repo_dir,
+            &["diff", "--binary", &base_commit],
+            DEFAULT_MAX_GIT_OUTPUT_BYTES,
+            DEFAULT_GIT_COMMAND_TIMEOUT_MS,
+        )
+        .expect("4 MiB raw-byte git diff");
+        assert!(expected_raw.stdout_bytes.len() > 180_000);
+        assert!(std::str::from_utf8(&expected_raw.stdout_bytes).is_err());
+
+        let digest_first = compute_task_worktree_diff_digest(&repo_dir, &base_commit)
+            .expect("compute >64 KiB raw-byte diff digest");
+        let digest_second = compute_task_worktree_diff_digest(&repo_dir, &base_commit)
+            .expect("recompute >64 KiB raw-byte diff digest");
+        assert_eq!(digest_first, sha256_hex(&expected_raw.stdout_bytes));
+        assert_eq!(digest_first, digest_second);
+
+        let mutate_idx = raw_bytes.len() - 2;
+        raw_bytes[mutate_idx] = 0x81;
+        fs::write(repo_dir.join("src/a.rs"), &raw_bytes).expect("mutate single non-UTF-8 byte");
+        let digest_mutated = compute_task_worktree_diff_digest(&repo_dir, &base_commit)
+            .expect("compute mutated raw-byte diff digest");
+        assert_ne!(digest_mutated, digest_first);
+
+        let mut overflow_source = String::with_capacity(DEFAULT_MAX_GIT_OUTPUT_BYTES + 262_144);
+        for idx in 0..70_000u32 {
+            overflow_source.push_str(&format!(
+                "pub const OVERFLOW_{idx:06}: &str = \"0123456789abcdef0123456789ab\";\n"
+            ));
+        }
+        assert!(overflow_source.len() > DEFAULT_MAX_GIT_OUTPUT_BYTES);
+        fs::write(repo_dir.join("src/a.rs"), overflow_source.as_bytes())
+            .expect("write >4 MiB tracked src/a.rs");
+
+        let err = compute_task_worktree_diff_digest(&repo_dir, &base_commit)
+            .expect_err(">4 MiB tracked diff must fail closed");
+        assert_eq!(err.code(), NativeErrorCode::ValidationFailed.as_str());
+        let err_msg = err.message();
+        assert!(err_msg.contains("failed to compute git diff in task worktree:"));
+    }
 }

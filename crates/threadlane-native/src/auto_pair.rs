@@ -8,7 +8,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use threadlane::{NativeReconnectConfig, SupervisorClient};
 use threadlane_core::observation::VerifiedMcpObservationContext;
 use tokio::sync::Mutex;
@@ -19,6 +19,9 @@ use crate::context_export::{
     OperatorContextServerConfig,
 };
 use crate::fs_safety::constant_time_str_eq;
+use crate::native_chat_observation::{
+    ManagedParentEnvironment, NativeChatSamplerOwner, SamplerStartRequest,
+};
 use crate::{
     ensure_control_runtime, verify_thread_hint_candidate, ConnectionIdentity, NativeClient,
     NativeError, NativeErrorCode, NativeThread, OperatorEnrollRequest, PairingStore,
@@ -36,6 +39,7 @@ enum ObservationMetadataSource {
     ManagedParent {
         reconnect: NativeReconnectConfig,
         backend_pid: u32,
+        parent_env: ManagedParentEnvironment,
     },
     #[cfg(test)]
     TestRefresh(TestMetadataRefreshFn),
@@ -49,10 +53,12 @@ impl fmt::Debug for ObservationMetadataSource {
             Self::ManagedParent {
                 reconnect,
                 backend_pid,
+                parent_env,
             } => f
                 .debug_struct("ManagedParent")
                 .field("reconnect", reconnect)
                 .field("backend_pid", backend_pid)
+                .field("parent_env", parent_env)
                 .finish(),
             #[cfg(test)]
             Self::TestRefresh(_) => f.write_str("TestRefresh(..)"),
@@ -80,6 +86,12 @@ pub(crate) struct AutomaticPairing {
     pub(crate) require_call_identity: Arc<AtomicBool>,
     coordinator: Arc<Mutex<()>>,
     observation_context: Arc<std::sync::Mutex<Option<CachedObservationContext>>>,
+}
+
+pub(crate) struct AutomaticPairingRuntime<'a> {
+    pub(crate) context_config: OperatorContextServerConfig<'a>,
+    pub(crate) parent_env: ManagedParentEnvironment,
+    pub(crate) sampler_owner: &'a NativeChatSamplerOwner,
 }
 
 #[derive(Debug, Serialize)]
@@ -115,7 +127,7 @@ pub(crate) fn parse_thread_hint(value: Option<&str>) -> Result<String, NativeErr
     Ok(value.to_owned())
 }
 
-fn validate_refreshed_thread_metadata(
+pub(crate) fn validate_refreshed_thread_metadata(
     thread: &NativeThread,
     expected_thread_id: &str,
     expected_cwd: &Path,
@@ -133,17 +145,15 @@ fn validate_refreshed_thread_metadata(
 async fn refresh_managed_parent_thread_metadata(
     reconnect: &NativeReconnectConfig,
     backend_pid: u32,
+    parent_env: &ManagedParentEnvironment,
     expected_thread_id: &str,
     expected_cwd: &Path,
     expected_project_id: Option<&str>,
 ) -> Result<NativeThread, NativeError> {
-    let (current_reconnect, current_pid) = NativeReconnectConfig::discover_for_mcp_parent()
-        .map_err(|_| {
-            NativeError::new(
-                NativeErrorCode::ExpiredEpoch,
-                "Codex parent connection changed",
-            )
-        })?;
+    let (current_reconnect, current_pid) = parent_env.discover_reconnect(
+        NativeErrorCode::ExpiredEpoch,
+        "Codex parent connection changed",
+    )?;
     if &current_reconnect != reconnect || current_pid != backend_pid {
         return Err(NativeError::new(
             NativeErrorCode::ExpiredEpoch,
@@ -169,6 +179,22 @@ async fn refresh_managed_parent_thread_metadata(
 }
 
 impl AutomaticPairing {
+    pub(crate) fn verify_call_hint_present_if_required(&self) -> Result<(), NativeError> {
+        if !self.require_call_identity.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let present = CALL_THREAD_HINT
+            .try_with(|hint| hint.is_some())
+            .unwrap_or(false);
+        if !present {
+            return Err(NativeError::new(
+                NativeErrorCode::SharedConnectionRejected,
+                "This MCP call does not match the connected Codex chat.",
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn verify_call(&self, expected_thread: &str) -> Result<(), NativeError> {
         if !self.require_call_identity.load(Ordering::Acquire) {
             return Ok(());
@@ -189,6 +215,88 @@ impl AutomaticPairing {
         if let Ok(mut guard) = self.observation_context.lock() {
             *guard = None;
         }
+    }
+
+    pub(crate) fn invalidate_sampler_observation_context(
+        &self,
+        connection_nonce: &str,
+        epoch_id: &str,
+        server_pid: u32,
+    ) {
+        let mut guard = self
+            .observation_context
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let matches = guard.as_ref().is_some_and(|cached| {
+            cached.server_pid == server_pid
+                && constant_time_str_eq(&cached.connection_nonce, connection_nonce)
+                && constant_time_str_eq(&cached.epoch_id, epoch_id)
+        });
+        if matches {
+            *guard = None;
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn apply_sampler_thread_metadata(
+        &self,
+        connection_nonce: &str,
+        epoch_id: &str,
+        server_pid: u32,
+        binding_id: &str,
+        thread_id: &str,
+        title: Option<&str>,
+        selected_model: Option<&str>,
+        selected_effort: Option<&str>,
+    ) {
+        let mut guard = self
+            .observation_context
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(cached) = guard.as_mut() else {
+            return;
+        };
+        if cached.server_pid != server_pid
+            || !constant_time_str_eq(&cached.connection_nonce, connection_nonce)
+            || !constant_time_str_eq(&cached.epoch_id, epoch_id)
+            || cached
+                .context
+                .matching_scope(binding_id, thread_id)
+                .is_none()
+        {
+            return;
+        }
+        cached
+            .context
+            .refresh_thread_metadata(title, selected_model, selected_effort);
+    }
+
+    pub(crate) fn clear_sampler_selected_model(
+        &self,
+        connection_nonce: &str,
+        epoch_id: &str,
+        server_pid: u32,
+        binding_id: &str,
+        thread_id: &str,
+    ) {
+        let mut guard = self
+            .observation_context
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(cached) = guard.as_mut() else {
+            return;
+        };
+        if cached.server_pid != server_pid
+            || !constant_time_str_eq(&cached.connection_nonce, connection_nonce)
+            || !constant_time_str_eq(&cached.epoch_id, epoch_id)
+            || cached
+                .context
+                .matching_scope(binding_id, thread_id)
+                .is_none()
+        {
+            return;
+        }
+        cached.context.clear_selected_model();
     }
 
     #[cfg(test)]
@@ -263,6 +371,7 @@ impl AutomaticPairing {
         selected_effort: Option<&str>,
         reconnect: NativeReconnectConfig,
         backend_pid: u32,
+        parent_env: ManagedParentEnvironment,
     ) {
         self.record_observation_context_with_source(
             connection_nonce,
@@ -278,6 +387,7 @@ impl AutomaticPairing {
             ObservationMetadataSource::ManagedParent {
                 reconnect,
                 backend_pid,
+                parent_env,
             },
         );
     }
@@ -366,6 +476,7 @@ impl AutomaticPairing {
             .cloned()
     }
 
+    #[cfg(test)]
     pub(crate) async fn refresh_observation_context_for_call(
         &self,
         connection_nonce: &str,
@@ -374,14 +485,33 @@ impl AutomaticPairing {
         binding_id: &str,
         thread_id: &str,
     ) -> Option<VerifiedMcpObservationContext> {
+        self.refresh_observation_context_for_call_until(
+            connection_nonce,
+            epoch_id,
+            server_pid,
+            binding_id,
+            thread_id,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn refresh_observation_context_for_call_until(
+        &self,
+        connection_nonce: &str,
+        epoch_id: &str,
+        server_pid: u32,
+        binding_id: &str,
+        thread_id: &str,
+        deadline: Option<Instant>,
+    ) -> Option<VerifiedMcpObservationContext> {
         if !self.require_call_identity.load(Ordering::Acquire) {
             return None;
         }
         if self.verify_call(thread_id).is_err() {
             return None;
         }
-        #[cfg_attr(not(test), allow(unused_variables))]
-        let (metadata_source, canonical_cwd, project_id, initial_context) = {
+        let (metadata_source, canonical_cwd, project_id) = {
             let guard = self
                 .observation_context
                 .lock()
@@ -393,59 +523,87 @@ impl AutomaticPairing {
             {
                 return None;
             }
-            let matched = cached
-                .context
-                .matching_scope(binding_id, thread_id)?
-                .clone();
+            #[cfg(test)]
+            {
+                let matched = cached.context.matching_scope(binding_id, thread_id)?;
+                if matches!(cached.metadata_source, ObservationMetadataSource::Static) {
+                    return Some(matched.clone());
+                }
+            }
+            #[cfg(not(test))]
+            cached.context.matching_scope(binding_id, thread_id)?;
             (
                 cached.metadata_source.clone(),
                 cached.canonical_cwd.clone(),
                 cached.project_id.clone(),
-                matched,
             )
         };
 
-        let refreshed = match metadata_source {
-            #[cfg(test)]
-            ObservationMetadataSource::Static => return Some(initial_context),
-            ObservationMetadataSource::ManagedParent {
-                reconnect,
-                backend_pid,
-            } => {
-                tokio::time::timeout(
-                    OBSERVATION_METADATA_REFRESH_TIMEOUT,
-                    refresh_managed_parent_thread_metadata(
-                        &reconnect,
-                        backend_pid,
-                        thread_id,
-                        &canonical_cwd,
-                        project_id.as_deref(),
-                    ),
-                )
-                .await
-            }
-            #[cfg(test)]
-            ObservationMetadataSource::TestRefresh(refresher) => {
-                let thread_id_owned = thread_id.to_string();
-                let canonical_cwd_clone = canonical_cwd.clone();
-                let project_id_clone = project_id.clone();
-                tokio::time::timeout(OBSERVATION_METADATA_REFRESH_TIMEOUT, async move {
-                    let thread = refresher(&thread_id_owned)?;
-                    if !validate_refreshed_thread_metadata(
-                        &thread,
-                        &thread_id_owned,
-                        &canonical_cwd_clone,
-                        project_id_clone.as_deref(),
-                    ) {
-                        return Err(NativeError::new(
-                            NativeErrorCode::NeedsVerification,
-                            "Refreshed Codex thread metadata did not match verified chat scope",
-                        ));
-                    }
-                    Ok(thread)
-                })
-                .await
-            }
+        let refresh_budget = match deadline {
+            Some(dl) => dl
+                .checked_duration_since(Instant::now())
+                .map(|rem| rem.min(OBSERVATION_METADATA_REFRESH_TIMEOUT)),
+            None => Some(OBSERVATION_METADATA_REFRESH_TIMEOUT),
+        };
+
+        let refreshed = match refresh_budget {
+            None => Ok(Err(NativeError::new(
+                NativeErrorCode::TimedOut,
+                "Observation metadata refresh deadline expired",
+            ))),
+            Some(budget) => match metadata_source {
+                #[cfg(test)]
+                ObservationMetadataSource::Static => return None,
+                ObservationMetadataSource::ManagedParent {
+                    reconnect,
+                    backend_pid,
+                    parent_env,
+                } => {
+                    tokio::time::timeout(
+                        budget,
+                        refresh_managed_parent_thread_metadata(
+                            &reconnect,
+                            backend_pid,
+                            &parent_env,
+                            thread_id,
+                            &canonical_cwd,
+                            project_id.as_deref(),
+                        ),
+                    )
+                    .await
+                }
+                #[cfg(test)]
+                ObservationMetadataSource::TestRefresh(refresher) => {
+                    let thread_id_for_call = thread_id.to_string();
+                    let expected_thread_id = thread_id.to_string();
+                    let canonical_cwd_clone = canonical_cwd.clone();
+                    let project_id_clone = project_id.clone();
+                    tokio::time::timeout(budget, async move {
+                        let thread =
+                            tokio::task::spawn_blocking(move || refresher(&thread_id_for_call))
+                                .await
+                                .map_err(|_| {
+                                    NativeError::new(
+                                        NativeErrorCode::IoError,
+                                        "Observation metadata refresher failed to join",
+                                    )
+                                })??;
+                        if !validate_refreshed_thread_metadata(
+                            &thread,
+                            &expected_thread_id,
+                            &canonical_cwd_clone,
+                            project_id_clone.as_deref(),
+                        ) {
+                            return Err(NativeError::new(
+                                NativeErrorCode::NeedsVerification,
+                                "Refreshed Codex thread metadata did not match verified chat scope",
+                            ));
+                        }
+                        Ok(thread)
+                    })
+                    .await
+                }
+            },
         };
 
         if !self.require_call_identity.load(Ordering::Acquire)
@@ -489,8 +647,13 @@ impl AutomaticPairing {
         state_dir: &Path,
         store: &PairingStore,
         identity: &ConnectionIdentity,
-        context_config: OperatorContextServerConfig<'_>,
+        runtime: AutomaticPairingRuntime<'_>,
     ) -> Result<AutomaticPairingResult, NativeError> {
+        let AutomaticPairingRuntime {
+            context_config,
+            parent_env,
+            sampler_owner,
+        } = runtime;
         let operation = async {
             let _guard = self.coordinator.lock().await;
             let current = store.inspect_epoch(&identity.connection_nonce, &identity.epoch_id)?;
@@ -511,23 +674,16 @@ impl AutomaticPairing {
                     ));
                 }
             }
-            let (reconnect, backend_pid) = NativeReconnectConfig::discover_for_mcp_parent()
-                .map_err(|_| {
-                    NativeError::new(
-                        NativeErrorCode::NotConfigured,
-                        "Automatic pairing requires the managed Codex desktop connection on Linux.",
-                    )
-                })?;
+            let (reconnect, backend_pid) = parent_env.discover_reconnect(
+                NativeErrorCode::NotConfigured,
+                "Automatic pairing requires the managed Codex desktop connection on Linux.",
+            )?;
             let native = NativeClient::new_managed_websocket(reconnect.clone())?
                 .with_expected_backend_pid(backend_pid);
-            let cwd = std::env::current_dir().map_err(|_| {
-                NativeError::new(
-                    NativeErrorCode::InvalidConfig,
-                    "Cannot determine the MCP project directory",
-                )
-            })?;
+            let cwd = parent_env.resolve_project_cwd()?;
             let candidate = verify_thread_hint_candidate(&native, &hint, identity, &cwd).await?;
-            let metadata = native.thread(&candidate.thread_id).await?;
+            let metadata_envelope = native.thread_metadata(&candidate.thread_id).await?;
+            let metadata = metadata_envelope.thread.clone();
             let mut label = String::new();
             for ch in metadata.title.as_deref().unwrap_or("Codex chat").chars() {
                 if !ch.is_control() && label.len() + ch.len_utf8() <= threadlane_core::MAX_LABEL_LEN
@@ -581,13 +737,10 @@ impl AutomaticPairing {
                     )
                 })?;
             let checked = verify_thread_hint_candidate(&native, &hint, identity, &cwd).await?;
-            let (last_config, last_pid) = NativeReconnectConfig::discover_for_mcp_parent()
-                .map_err(|_| {
-                    NativeError::new(
-                        NativeErrorCode::ExpiredEpoch,
-                        "Codex parent connection changed",
-                    )
-                })?;
+            let (last_config, last_pid) = parent_env.discover_reconnect(
+                NativeErrorCode::ExpiredEpoch,
+                "Codex parent connection changed",
+            )?;
             if last_config != reconnect
                 || last_pid != backend_pid
                 || checked.thread_id != candidate.thread_id
@@ -638,9 +791,28 @@ impl AutomaticPairing {
                 verified_project_id.as_deref(),
                 selected_model,
                 selected_effort,
-                reconnect,
+                reconnect.clone(),
                 backend_pid,
+                parent_env.clone(),
             );
+            sampler_owner
+                .ensure_started_after_verified_connect(SamplerStartRequest {
+                    connection_nonce: &identity.connection_nonce,
+                    epoch_id: &identity.epoch_id,
+                    server_pid: identity.server_pid,
+                    binding_id: &enrolled.binding_id,
+                    thread_uuid: &enrolled.thread_id,
+                    verified_cwd: &verified_cwd,
+                    verified_project_id: verified_project_id.as_deref(),
+                    initial_metadata: &metadata_envelope,
+                    reconnect,
+                    backend_pid,
+                    parent_env,
+                    pairing_store: store.clone(),
+                    automatic_pairing: self.clone(),
+                    context_config: &context_config,
+                })
+                .await?;
             let operator_context =
                 bootstrap_verified_operator_context(&OperatorContextExportRequest {
                     binding_id: &enrolled.binding_id,

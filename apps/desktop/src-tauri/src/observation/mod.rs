@@ -3,6 +3,7 @@ pub(crate) mod diagnostics;
 pub(crate) mod jobs;
 pub(crate) mod requests;
 pub(crate) mod sources;
+pub(crate) mod workspace;
 
 use std::cmp::Reverse;
 use std::collections::BTreeSet;
@@ -48,7 +49,8 @@ const CURSOR_PREFIX: &str = "obscur1_";
 /// Cloneable read-only observation service backed by [`ObservationSourceRegistry`].
 #[derive(Debug, Clone)]
 pub(crate) struct ObservationService {
-    registry: ObservationSourceRegistry,
+    pub(super) registry: ObservationSourceRegistry,
+    pub(super) sample_cache: workspace::BoundedSampleCache,
 }
 
 impl ObservationService {
@@ -56,6 +58,7 @@ impl ObservationService {
     pub(crate) fn new(config: ObservationSourceConfig) -> Self {
         Self {
             registry: ObservationSourceRegistry::new(config),
+            sample_cache: workspace::BoundedSampleCache::new(),
         }
     }
 
@@ -197,10 +200,10 @@ impl ObservationService {
 }
 
 #[cfg(unix)]
-type StoreTriadInodeKey = ((u64, u64), (u64, u64), (u64, u64));
+pub(super) type StoreTriadInodeKey = ((u64, u64), (u64, u64), (u64, u64));
 
 #[cfg(unix)]
-fn physical_store_inode_key(spec: &SourceSpec) -> Option<StoreTriadInodeKey> {
+pub(super) fn physical_store_inode_key(spec: &SourceSpec) -> Option<StoreTriadInodeKey> {
     let plans_meta = std::fs::symlink_metadata(&spec.plans_dir).ok()?;
     let authority_meta = std::fs::symlink_metadata(&spec.authority_dir).ok()?;
     let sessions_meta = std::fs::symlink_metadata(&spec.sessions_dir).ok()?;
