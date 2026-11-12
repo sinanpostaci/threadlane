@@ -12,9 +12,10 @@ use threadlane_core::observation::{
     sanitize_observation_label, sanitize_observation_summary, validate_correlation_id,
     ObservationJob, ObservationJobState, ObservationRequest, ObservationSnapshotRequest,
     ReadonlyCoreStateSnapshot, WorkspaceAcceptanceProof, WorkspaceAcceptanceStatus,
-    WorkspaceActivityState, WorkspaceAttentionKind, WorkspaceAvailabilityState,
-    WorkspaceChatIdentity, WorkspaceChatSummary, WorkspaceConfiguredSelection,
-    WorkspaceExternalResolutionScope, WorkspaceJobHistory, WorkspaceJobSummary,
+    WorkspaceActivityState, WorkspaceAttentionKind, WorkspaceAttentionState,
+    WorkspaceAvailabilityState, WorkspaceChatIdentity, WorkspaceChatSummary,
+    WorkspaceConfiguredSelection, WorkspaceCoveredAttention, WorkspaceExternalResolutionScope,
+    WorkspaceJobHistory, WorkspaceJobSummary,
     WorkspaceMessageCandidateInput, WorkspaceMessageItem,
     WorkspaceMessageScope, WorkspaceMessageSourceOrder, WorkspaceMessagesWindow,
     WorkspaceNativeSample, WorkspaceRecordLinks, WorkspaceSampleReconcileDecision,
@@ -1084,7 +1085,7 @@ fn build_legacy_fallback_job_history(
     verified_chat: Option<WorkspaceChatIdentity>,
     verified_external_resolutions: Option<&VerifiedLegacyPlanExternalResolutions>,
 ) -> WorkspaceJobHistory {
-    let tasks = job
+    let tasks: Vec<WorkspaceTaskHistory> = job
         .tasks
         .iter()
         .map(|t| WorkspaceTaskHistory {
@@ -1092,13 +1093,18 @@ fn build_legacy_fallback_job_history(
             title: t.title.clone(),
             status: t.status.clone(),
             depends_on: t.depends_on.clone(),
+            current_attention: legacy_task_attention(&t.id, &t.status, job.updated_at_ms),
             acceptance_proof: WorkspaceAcceptanceProof::unknown(),
             ..WorkspaceTaskHistory::default()
         })
         .collect();
+    let has_task_attention = tasks.iter().any(|task| task.current_attention.is_some());
+    let current_attention = if has_task_attention {
+        None
+    } else {
+        legacy_job_attention(job.state, job.updated_at_ms)
+    };
 
-    let full_external_resolution =
-        verified_external_resolutions.is_some_and(|verified| verified.has_applicable_full_job());
     let mut history = WorkspaceJobHistory {
         job: WorkspaceJobSummary {
             source_id: job.source_id.clone(),
@@ -1122,12 +1128,35 @@ fn build_legacy_fallback_job_history(
             source_plan_revision: job.plan_revision,
             ..WorkspaceRecordLinks::default()
         },
+        current_attention,
         acceptance_proof: WorkspaceAcceptanceProof::unknown(),
         external_resolutions: verified_external_resolutions
             .map(|verified| verified.resolutions().to_vec())
             .unwrap_or_default(),
         ..WorkspaceJobHistory::default()
     };
+
+    apply_legacy_external_resolution_coverage(&mut history);
+
+    let full_coverage_proven =
+        verified_external_resolutions.is_some_and(|verified| verified.has_applicable_full_job());
+    if !full_coverage_proven
+        && history.current_attention.is_none()
+        && history
+            .tasks
+            .iter()
+            .all(|task| task.current_attention.is_none())
+    {
+        // Partial or absent coverage must not let the original raw user-attention state disappear
+        // after all task-level needs were covered by multiple task-scoped receipts.
+        history.current_attention = legacy_job_attention(history.job.state, job.updated_at_ms);
+    }
+    let full_external_resolution = full_coverage_proven
+        && history.current_attention.is_none()
+        && history
+            .tasks
+            .iter()
+            .all(|task| task.current_attention.is_none());
     if full_external_resolution {
         // External resolution is a separate logical token: preserve the old fallback identity,
         // stored phase/outcomes, tasks, and acceptance proof without fabricating completion.
@@ -1135,6 +1164,157 @@ fn build_legacy_fallback_job_history(
         history.job.execution_status = "resolved_externally".to_string();
     }
     history.normalized()
+}
+
+fn legacy_task_attention(
+    task_id: &str,
+    status: &str,
+    updated_at_ms: Option<i64>,
+) -> Option<WorkspaceAttentionState> {
+    let (kind, reason) = match status {
+        "native_route_required" => (
+            WorkspaceAttentionKind::NeedsUserInput,
+            format!("Task {task_id} requires the native Codex route."),
+        ),
+        "failed" | "timed_out" => (
+            WorkspaceAttentionKind::BlockedFailure,
+            format!("Task {task_id} is recorded as failed in the legacy observation."),
+        ),
+        "ready_for_review" => (
+            WorkspaceAttentionKind::ReviewRequired,
+            format!("Task {task_id} is recorded as ready for review."),
+        ),
+        "unknown" => (
+            WorkspaceAttentionKind::Unknown,
+            format!("Task {task_id} has an unknown legacy observation outcome."),
+        ),
+        "not_approved" => (
+            WorkspaceAttentionKind::Unknown,
+            format!("Task {task_id} is not covered by the recorded approval."),
+        ),
+        _ => return None,
+    };
+    Some(WorkspaceAttentionState {
+        kind,
+        reason,
+        next_step: None,
+        blocking_hold_ids: Vec::new(),
+        blocking_outbox_ids: Vec::new(),
+        question_id: None,
+        updated_at_ms,
+    })
+}
+
+fn legacy_job_attention(
+    state: ObservationJobState,
+    updated_at_ms: Option<i64>,
+) -> Option<WorkspaceAttentionState> {
+    let (kind, reason) = match state {
+        ObservationJobState::NeedsUser => (
+            WorkspaceAttentionKind::Unknown,
+            "The legacy observation records a user-attention requirement without task-level detail."
+                .to_string(),
+        ),
+        ObservationJobState::Unknown => (
+            WorkspaceAttentionKind::Unknown,
+            "The legacy observation state is unknown and cannot be independently verified."
+                .to_string(),
+        ),
+        ObservationJobState::Failed => (
+            WorkspaceAttentionKind::BlockedFailure,
+            "The legacy observation records a failed job without task-level failure detail."
+                .to_string(),
+        ),
+        _ => return None,
+    };
+    Some(WorkspaceAttentionState {
+        kind,
+        reason,
+        next_step: None,
+        blocking_hold_ids: Vec::new(),
+        blocking_outbox_ids: Vec::new(),
+        question_id: None,
+        updated_at_ms,
+    })
+}
+
+fn legacy_attention_is_coverable(attention: &WorkspaceAttentionState) -> bool {
+    !matches!(
+        attention.kind,
+        WorkspaceAttentionKind::None
+            | WorkspaceAttentionKind::Unknown
+            | WorkspaceAttentionKind::UnresolvedEffect
+    )
+}
+
+fn resolution_covers_all_displayed_tasks(
+    task_ids: &[String],
+    tasks: &[WorkspaceTaskHistory],
+) -> bool {
+    let declared: BTreeSet<&str> = task_ids.iter().map(String::as_str).collect();
+    let displayed: BTreeSet<&str> = tasks.iter().map(|task| task.task_id.as_str()).collect();
+    !displayed.is_empty() && declared.len() == task_ids.len() && declared == displayed
+}
+
+fn apply_legacy_external_resolution_coverage(history: &mut WorkspaceJobHistory) {
+    let displayed_task_ids: BTreeSet<String> =
+        history.tasks.iter().map(|task| task.task_id.clone()).collect();
+    let mut resolutions = std::mem::take(&mut history.external_resolutions);
+
+    for resolution in &mut resolutions {
+        resolution.covered_attention.clear();
+        if !resolution.applicability.is_applicable() {
+            continue;
+        }
+        let covers_all_displayed = resolution.scope == WorkspaceExternalResolutionScope::Job
+            && resolution_covers_all_displayed_tasks(&resolution.task_ids, &history.tasks);
+        let target_task_ids: BTreeSet<String> = if covers_all_displayed {
+            displayed_task_ids.clone()
+        } else {
+            resolution.task_ids.iter().cloned().collect()
+        };
+
+        if covers_all_displayed {
+            if let Some(attention) = history.current_attention.take() {
+                if legacy_attention_is_coverable(&attention) {
+                    resolution.covered_attention.push(WorkspaceCoveredAttention {
+                        task_id: None,
+                        attention,
+                    });
+                } else {
+                    history.current_attention = Some(attention);
+                }
+            }
+        }
+
+        for task in &mut history.tasks {
+            if !target_task_ids.contains(&task.task_id) {
+                continue;
+            }
+            let Some(attention) = task.current_attention.take() else {
+                continue;
+            };
+            if legacy_attention_is_coverable(&attention) {
+                resolution.covered_attention.push(WorkspaceCoveredAttention {
+                    task_id: Some(task.task_id.clone()),
+                    attention,
+                });
+            } else {
+                task.current_attention = Some(attention);
+            }
+        }
+    }
+
+    history.external_resolutions = resolutions;
+    if history.current_attention.is_none() {
+        if let Some(attention) = history
+            .tasks
+            .iter()
+            .find_map(|task| task.current_attention.clone())
+        {
+            history.current_attention = Some(attention);
+        }
+    }
 }
 
 fn attach_correlated_request_ids(

@@ -8735,6 +8735,17 @@ fn ext_remove_lockfiles_recursive(dir: &Path) {
 }
 
 fn ext_create_legacy_plan(fixture: &ExternalHistoryFixture) -> LegacyExternalHistoryFixture {
+    let task_ids = vec![
+        "task-legacy-alpha".to_string(),
+        "task-legacy-beta".to_string(),
+    ];
+    ext_create_legacy_plan_with_approved_ids(fixture, &task_ids)
+}
+
+fn ext_create_legacy_plan_with_approved_ids(
+    fixture: &ExternalHistoryFixture,
+    approved_task_ids: &[String],
+) -> LegacyExternalHistoryFixture {
     let base_commit = fixture.approval.base_commit.clone();
     let plan_id = "plan_history_legacy".to_string();
     let task_ids = vec![
@@ -8807,7 +8818,7 @@ fn ext_create_legacy_plan(fixture: &ExternalHistoryFixture) -> LegacyExternalHis
                     expected_plan_digest: compiled.plan_digest.clone(),
                     repository_path: fixture.repo.clone(),
                     base_commit,
-                    approved_task_ids: task_ids.clone(),
+                    approved_task_ids: approved_task_ids.to_vec(),
                     approved_write_paths: vec!["src/legacy.rs".to_string()],
                     max_parallel: 2,
                     budgets: ExecutionBudgets::default(),
@@ -8871,6 +8882,20 @@ fn ext_read_legacy_history(
     fixture: &ExternalHistoryFixture,
     legacy: &LegacyExternalHistoryFixture,
 ) -> Result<VerifiedLegacyPlanExternalResolutions, WorkspaceHistoryDiagnostic> {
+    ext_read_legacy_history_scope(
+        fixture,
+        &legacy.plan_id,
+        legacy.plan_revision,
+        &legacy.task_ids,
+    )
+}
+
+fn ext_read_legacy_history_scope(
+    fixture: &ExternalHistoryFixture,
+    plan_id: &str,
+    plan_revision: u64,
+    task_ids: &[String],
+) -> Result<VerifiedLegacyPlanExternalResolutions, WorkspaceHistoryDiagnostic> {
     let stores = WorkspaceHistoryStores::new(&fixture.plans)
         .with_authority_dir(&fixture.authority_dir)
         .with_sessions_dir(&fixture.sessions);
@@ -8879,15 +8904,61 @@ fn ext_read_legacy_history(
         binding_id: EXT_HIST_BINDING,
         thread_uuid: EXT_HIST_THREAD,
         canonical_project_scope: &project_scope,
-        plan_id: &legacy.plan_id,
-        plan_revision: legacy.plan_revision,
-        task_ids: &legacy.task_ids,
+        plan_id,
+        plan_revision,
+        task_ids,
     };
     read_legacy_plan_external_resolutions_readonly(
         &ext_chat_identity(fixture),
         &stores,
         &scope,
     )
+}
+
+fn ext_publish_newer_legacy_revision(
+    fixture: &ExternalHistoryFixture,
+    legacy: &LegacyExternalHistoryFixture,
+    task_ids: &[String],
+) -> PlanRevision {
+    let plans = PlanStore::open(&fixture.plans).expect("open newer legacy plans");
+    let tasks: Vec<PlanTask> = task_ids
+        .iter()
+        .map(|task_id| PlanTask {
+            id: task_id.clone(),
+            title: format!("Newer legacy task {task_id}"),
+            instruction: format!("Do newer legacy work for {task_id}"),
+            role: WorkflowRole::Coder,
+            difficulty: Difficulty::Hard,
+            depends_on: Vec::new(),
+            allowed_write_paths: vec!["src/legacy.rs".to_string()],
+        })
+        .collect();
+    let draft = plans
+        .change_at(
+            legacy.plan_revision,
+            PlanChange::SaveDraft {
+                plan_id: legacy.plan_id.clone(),
+                binding_id: EXT_HIST_BINDING.to_string(),
+                profile_id: legacy.approval.profile_id.clone(),
+                profile_revision: legacy.approval.registry_revision,
+                summary: "Newer legacy plan-only external history fixture".to_string(),
+                tasks,
+            },
+            1_700_000_003_000,
+        )
+        .expect("save newer legacy plan draft");
+    let published = plans
+        .change_at(
+            draft.revision,
+            PlanChange::Publish {
+                plan_id: draft.plan_id.clone(),
+                revision: draft.revision,
+            },
+            1_700_000_003_500,
+        )
+        .expect("publish newer legacy plan");
+    drop(plans);
+    published
 }
 
 fn ext_install_stopped_session(fixture: &ExternalHistoryFixture) -> (PathBuf, String) {
@@ -9232,7 +9303,7 @@ fn external_resolution_history_stale_unverified_forged_and_tampered_records_fail
             outbox_id: "obx_history_unknown".to_string(),
             request_key: "req_history_unknown".to_string(),
             kind: OutboxDispatchKind::TaskAttemptDispatch,
-            task_id: Some("task-beta".to_string()),
+            task_id: "task-beta".to_string(),
             attempt_no: 1,
             role: WorkflowRole::Coder,
             subject_digest: EXT_HIST_HEX64_A.to_string(),
@@ -9415,6 +9486,107 @@ fn legacy_plan_external_resolution_history_full_and_partial_positive_readonly() 
         vec!["task-legacy-alpha".to_string()]
     );
     assert!(!partial_verified.has_applicable_full_job());
+}
+
+#[test]
+fn legacy_plan_external_resolution_full_receipt_for_subset_approval_stays_task_scoped() {
+    let fixture = setup_external_history_fixture();
+    let subset_legacy =
+        ext_create_legacy_plan_with_approved_ids(&fixture, &["task-legacy-alpha".to_string()]);
+    let receipt = ext_record_legacy_receipt(
+        &fixture,
+        &subset_legacy,
+        "req_legacy_history_subset_full_01",
+        ExternalResolutionScope::FullJob,
+    );
+    let verified =
+        ext_read_legacy_history(&fixture, &subset_legacy).expect("subset legacy history read");
+    assert_eq!(verified.resolutions().len(), 1);
+    let resolution = &verified.resolutions()[0];
+    assert_eq!(resolution.receipt_id, receipt.receipt_id);
+    assert_eq!(
+        resolution.applicability,
+        WorkspaceExternalResolutionApplicability::Applicable
+    );
+    assert_eq!(
+        resolution.scope,
+        WorkspaceExternalResolutionScope::Tasks,
+        "a stored full receipt over a subset approval must expose task-scoped displayed coverage"
+    );
+    assert_eq!(
+        resolution.task_ids,
+        vec!["task-legacy-alpha".to_string()],
+        "the immutable resolved task IDs must remain exact"
+    );
+    assert!(resolution.covered_attention.is_empty());
+    assert!(
+        !verified.has_applicable_full_job(),
+        "a subset approval cannot claim whole displayed-plan coverage"
+    );
+}
+
+#[test]
+fn legacy_plan_external_resolution_old_revision_receipt_is_stale_after_newer_published_revision() {
+    let fixture = setup_external_history_fixture();
+    let legacy = ext_create_legacy_plan(&fixture);
+    let receipt = ext_record_legacy_receipt(
+        &fixture,
+        &legacy,
+        "req_legacy_history_old_revision_01",
+        ExternalResolutionScope::FullJob,
+    );
+    let newer_task_ids = vec![
+        "task-legacy-alpha".to_string(),
+        "task-legacy-gamma".to_string(),
+    ];
+    let newer = ext_publish_newer_legacy_revision(&fixture, &legacy, &newer_task_ids);
+    ext_remove_lockfiles_recursive(&fixture.plans);
+    ext_remove_lockfiles_recursive(&fixture.authority_dir);
+    let before = (
+        snapshot_private_dir_sha256(&fixture.plans),
+        snapshot_private_dir_sha256(&fixture.authority_dir),
+        snapshot_private_dir_sha256(&fixture.sessions),
+    );
+    let verified = ext_read_legacy_history_scope(
+        &fixture,
+        &legacy.plan_id,
+        newer.revision,
+        &newer_task_ids,
+    )
+    .expect("old revision legacy history read");
+    let after = (
+        snapshot_private_dir_sha256(&fixture.plans),
+        snapshot_private_dir_sha256(&fixture.authority_dir),
+        snapshot_private_dir_sha256(&fixture.sessions),
+    );
+    assert_eq!(
+        before, after,
+        "same-plan historical legacy reads must not create locks, caches, or other files"
+    );
+    assert_eq!(verified.resolutions().len(), 1);
+    let resolution = &verified.resolutions()[0];
+    assert_eq!(resolution.receipt_id, receipt.receipt_id);
+    assert_eq!(
+        resolution.applicability,
+        WorkspaceExternalResolutionApplicability::Stale,
+        "an old same-plan receipt remains visible as stale history"
+    );
+    assert_eq!(
+        resolution.scope,
+        WorkspaceExternalResolutionScope::Job,
+        "stale history preserves the immutable stored receipt scope"
+    );
+    assert_eq!(
+        resolution.task_ids,
+        vec![
+            "task-legacy-alpha".to_string(),
+            "task-legacy-beta".to_string()
+        ],
+        "stale history must not manufacture coverage for the newer revision"
+    );
+    assert!(resolution.covered_attention.is_empty());
+    assert!(!verified.has_applicable_full_job());
+    assert!(verified.diagnostics().is_empty());
 }
 
 #[test]

@@ -1134,7 +1134,9 @@ impl VerifiedLegacyPlanExternalResolutions {
         &self.resolutions
     }
 
-    /// Returns `true` only when an applicable full-plan receipt covers the legacy job.
+    /// Returns `true` only when an applicable stored full-plan receipt covers the exact complete
+    /// displayed legacy plan. A full receipt over a strict subset approval is projected as
+    /// task-scoped coverage and never sets this flag.
     #[must_use]
     pub const fn has_applicable_full_job(&self) -> bool {
         self.full_job_applicable
@@ -1221,17 +1223,17 @@ pub fn read_legacy_plan_external_resolutions_readonly(
         }
     }
 
+    // Same-plan historical receipts stay visible after a newer revision is published. Each
+    // candidate is classified against its own immutable plan/approval provenance below; revision
+    // drift yields `Stale` with no coverage instead of silently hiding preserved ledger history.
     let matching_receipts: Vec<&ExternalResolutionReceipt> = ledger
         .external_resolutions
         .iter()
         .filter(|receipt| {
             matches!(
                 &receipt.target,
-                ExternalResolutionTarget::LegacyPlan {
-                    plan_id,
-                    plan_revision,
-                } if plan_id.as_str() == scope.plan_id
-                    && *plan_revision == scope.plan_revision
+                ExternalResolutionTarget::LegacyPlan { plan_id, .. }
+                    if plan_id.as_str() == scope.plan_id
             )
         })
         .collect();
@@ -1290,6 +1292,16 @@ pub fn read_legacy_plan_external_resolutions_readonly(
         }
         if applicability.is_applicable()
             && projected.scope == WorkspaceExternalResolutionScope::Job
+            && !task_id_sets_match(&projected.task_ids, scope.task_ids)
+        {
+            // A stored `full_job` receipt whose genuine approval only covered a strict subset of
+            // the displayed plan must not claim whole-job workspace coverage. The immutable stored
+            // receipt and its exact resolved IDs are preserved; only the derived workspace
+            // projection becomes task-scoped.
+            projected.scope = WorkspaceExternalResolutionScope::Tasks;
+        }
+        if applicability.is_applicable()
+            && projected.scope == WorkspaceExternalResolutionScope::Job
         {
             verified.full_job_applicable = true;
         }
@@ -1297,6 +1309,12 @@ pub fn read_legacy_plan_external_resolutions_readonly(
     }
     verified.diagnostics = diagnostics;
     Ok(verified)
+}
+
+fn task_id_sets_match(left: &[String], right: &[String]) -> bool {
+    let left_set: BTreeSet<&str> = left.iter().map(String::as_str).collect();
+    let right_set: BTreeSet<&str> = right.iter().map(String::as_str).collect();
+    left_set.len() == left.len() && right_set.len() == right.len() && left_set == right_set
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1330,105 +1348,44 @@ fn classify_legacy_plan_external_resolution_applicability_readonly(
             Some("Plan evidence is missing for legacy external resolution applicability."),
         );
     }
-    let Some(plan) = plan_snapshot
-        .revisions_by_key
-        .get(&(scope.plan_id.to_string(), scope.plan_revision))
-    else {
-        return (
-            WorkspaceExternalResolutionApplicability::Unverified,
-            Some("Legacy plan revision is missing from the current PlanStore."),
-        );
-    };
-    if plan.binding_id != chat_identity.binding_id {
-        return (
-            WorkspaceExternalResolutionApplicability::Unverified,
-            Some("Legacy plan revision belongs to a different binding."),
-        );
-    }
-
-    let plan_task_ids: BTreeSet<&str> = plan.tasks.iter().map(|task| task.id.as_str()).collect();
-    let scope_task_ids: BTreeSet<&str> = scope.task_ids.iter().map(String::as_str).collect();
-    if scope_task_ids.len() != scope.task_ids.len() || scope_task_ids != plan_task_ids {
-        return (
-            WorkspaceExternalResolutionApplicability::Unverified,
-            Some("Legacy observation task set does not exactly match the published plan revision."),
-        );
-    }
-
     if !authority_store_configured || approval_records.is_empty() {
         return (
             WorkspaceExternalResolutionApplicability::Unverified,
             Some("Authority evidence is missing for legacy external resolution applicability."),
         );
     }
-    let matching_approvals: Vec<&ApprovalRecord> = approval_records
-        .iter()
-        .filter(|approval| {
-            approval.plan_id.as_str() == scope.plan_id
-                && approval.plan_revision == scope.plan_revision
-        })
-        .collect();
-    if matching_approvals.len() != 1 {
-        return (
-            WorkspaceExternalResolutionApplicability::Unverified,
-            Some(
-                "Legacy plan revision is not uniquely linked to a single verified ApprovalRecord.",
-            ),
-        );
-    }
-    let approval = matching_approvals[0];
-    if approval.binding_id != chat_identity.binding_id
-        || approval.thread_uuid != chat_identity.thread_uuid
-        || approval.repository_path != receipt.project.canonical_repo_root
-        || approval.base_commit != receipt.project.base_commit
-        || Some(approval.approval_id.as_str()) != receipt.approval_id.as_deref()
-        || Some(approval.subject_digest.as_str()) != receipt.approval_subject_digest.as_deref()
-        || Some(approval.plan_digest.as_str()) != receipt.plan_digest.as_deref()
-    {
-        return (
-            WorkspaceExternalResolutionApplicability::Unverified,
-            Some("Legacy approval evidence does not match immutable receipt scope."),
-        );
+
+    let (original_plan, approval) = match verify_legacy_plan_receipt_original_provenance(
+        receipt,
+        chat_identity,
+        plan_snapshot,
+        approval_records,
+    ) {
+        Ok(verified) => verified,
+        Err(message) => {
+            return (
+                WorkspaceExternalResolutionApplicability::Unverified,
+                Some(message),
+            );
+        }
+    };
+    if original_plan.revision != scope.plan_revision {
+        // The immutable receipt is genuine for its original plan revision, but revision drift means
+        // it cannot cover any task in the currently displayed revision.
+        return (WorkspaceExternalResolutionApplicability::Stale, None);
     }
 
-    let approved_task_ids: BTreeSet<&str> = approval
-        .approved_task_ids
+    let plan_task_ids: BTreeSet<&str> = original_plan
+        .tasks
         .iter()
-        .map(String::as_str)
+        .map(|task| task.id.as_str())
         .collect();
-    if approved_task_ids.is_empty()
-        || approved_task_ids.len() != approval.approved_task_ids.len()
-        || !approved_task_ids.is_subset(&plan_task_ids)
-    {
+    let scope_task_ids: BTreeSet<&str> = scope.task_ids.iter().map(String::as_str).collect();
+    if scope_task_ids.len() != scope.task_ids.len() || scope_task_ids != plan_task_ids {
         return (
             WorkspaceExternalResolutionApplicability::Unverified,
-            Some("Legacy approval task membership is empty, duplicate, or outside the plan revision."),
+            Some("Legacy observation task set does not exactly match the published plan revision."),
         );
-    }
-    match &receipt.scope {
-        ExternalResolutionScope::FullJob => {
-            let mut expected = approval.approved_task_ids.clone();
-            expected.sort();
-            if expected != receipt.resolved_task_ids {
-                return (
-                    WorkspaceExternalResolutionApplicability::Unverified,
-                    Some("Full legacy receipt does not cover the exact approved task set."),
-                );
-            }
-        }
-        ExternalResolutionScope::Tasks { task_ids } => {
-            if task_ids != &receipt.resolved_task_ids
-                || task_ids.is_empty()
-                || task_ids
-                    .iter()
-                    .any(|task_id| !approved_task_ids.contains(task_id.as_str()))
-            {
-                return (
-                    WorkspaceExternalResolutionApplicability::Unverified,
-                    Some("Task-scoped legacy receipt references a task outside the approved set."),
-                );
-            }
-        }
     }
 
     if ledger.jobs.iter().any(|job| {
@@ -1528,6 +1485,91 @@ fn classify_legacy_plan_external_resolution_applicability_readonly(
     (WorkspaceExternalResolutionApplicability::Applicable, None)
 }
 
+fn verify_legacy_plan_receipt_original_provenance<'a>(
+    receipt: &ExternalResolutionReceipt,
+    chat_identity: &WorkspaceChatIdentity,
+    plan_snapshot: &'a ReadOnlyPlanSnapshot,
+    approval_records: &'a [ApprovalRecord],
+) -> Result<(&'a PlanRevision, &'a ApprovalRecord), &'static str> {
+    let ExternalResolutionTarget::LegacyPlan {
+        plan_id,
+        plan_revision,
+    } = &receipt.target
+    else {
+        return Err("External resolution receipt does not target a legacy plan.");
+    };
+    let Some(plan) = plan_snapshot
+        .revisions_by_key
+        .get(&(plan_id.as_str().to_string(), *plan_revision))
+    else {
+        return Err("Legacy plan revision is missing from the current PlanStore.");
+    };
+    if plan.binding_id != chat_identity.binding_id {
+        return Err("Legacy plan revision belongs to a different binding.");
+    }
+
+    let matching_approvals: Vec<&ApprovalRecord> = approval_records
+        .iter()
+        .filter(|approval| {
+            approval.plan_id.as_str() == plan_id.as_str()
+                && approval.plan_revision == *plan_revision
+        })
+        .collect();
+    if matching_approvals.len() != 1 {
+        return Err(
+            "Legacy plan revision is not uniquely linked to a single verified ApprovalRecord.",
+        );
+    }
+    let approval = matching_approvals[0];
+    if approval.binding_id != chat_identity.binding_id
+        || approval.thread_uuid != chat_identity.thread_uuid
+        || approval.repository_path != receipt.project.canonical_repo_root
+        || approval.base_commit != receipt.project.base_commit
+        || Some(approval.approval_id.as_str()) != receipt.approval_id.as_deref()
+        || Some(approval.subject_digest.as_str()) != receipt.approval_subject_digest.as_deref()
+        || Some(approval.plan_digest.as_str()) != receipt.plan_digest.as_deref()
+    {
+        return Err("Legacy approval evidence does not match immutable receipt scope.");
+    }
+
+    let plan_task_ids: BTreeSet<&str> = plan.tasks.iter().map(|task| task.id.as_str()).collect();
+    let approved_task_ids: BTreeSet<&str> = approval
+        .approved_task_ids
+        .iter()
+        .map(String::as_str)
+        .collect();
+    if approved_task_ids.is_empty()
+        || approved_task_ids.len() != approval.approved_task_ids.len()
+        || !approved_task_ids.is_subset(&plan_task_ids)
+    {
+        return Err(
+            "Legacy approval task membership is empty, duplicate, or outside the plan revision.",
+        );
+    }
+    match &receipt.scope {
+        ExternalResolutionScope::FullJob => {
+            let mut expected = approval.approved_task_ids.clone();
+            expected.sort();
+            if expected != receipt.resolved_task_ids {
+                return Err("Full legacy receipt does not cover the exact approved task set.");
+            }
+        }
+        ExternalResolutionScope::Tasks { task_ids } => {
+            if task_ids != &receipt.resolved_task_ids
+                || task_ids.is_empty()
+                || task_ids
+                    .iter()
+                    .any(|task_id| !approved_task_ids.contains(task_id.as_str()))
+            {
+                return Err(
+                    "Task-scoped legacy receipt references a task outside the approved set.",
+                );
+            }
+        }
+    }
+    Ok((plan, approval))
+}
+
 fn verify_legacy_plan_receipt_identity_and_project(
     receipt: &ExternalResolutionReceipt,
     chat_identity: &WorkspaceChatIdentity,
@@ -1543,15 +1585,11 @@ fn verify_legacy_plan_receipt_identity_and_project(
     {
         return Err("Legacy external resolution receipt binding or thread scope does not match.");
     }
-    let ExternalResolutionTarget::LegacyPlan {
-        plan_id,
-        plan_revision,
-    } = &receipt.target
-    else {
+    let ExternalResolutionTarget::LegacyPlan { plan_id, .. } = &receipt.target else {
         return Err("External resolution receipt does not target a legacy plan.");
     };
-    if plan_id.as_str() != scope.plan_id || *plan_revision != scope.plan_revision {
-        return Err("External resolution receipt targets a different legacy plan revision.");
+    if plan_id.as_str() != scope.plan_id {
+        return Err("External resolution receipt targets a different legacy plan.");
     }
     if receipt.source_job_revision.is_some()
         || receipt.source_runtime_revision.is_some()

@@ -5390,13 +5390,16 @@ pub enum WorkspaceExternalResolutionOutcome {
     Unknown,
 }
 
-/// Explicit coverage scope of a store-verified external resolution receipt.
+/// Workspace coverage scope derived from a store-verified external resolution receipt relative to
+/// the displayed target. The immutable stored receipt scope is never rewritten.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkspaceExternalResolutionScope {
-    /// The receipt covers the entire current job.
+    /// The receipt independently covers the exact complete displayed job/plan.
     Job,
-    /// The receipt covers only the explicitly listed task identifiers.
+    /// The receipt covers only the explicitly listed displayed task identifiers. A stored
+    /// `full_job` receipt whose genuine approval covered only a displayed-plan subset projects as
+    /// task-scoped workspace coverage rather than claiming the whole job.
     Tasks,
     /// Unrecognized future scope token; normalized receipts are rejected.
     #[default]
@@ -5459,10 +5462,12 @@ pub struct WorkspaceExternalResolution {
     /// Logical outcome; only `resolved_externally` is accepted.
     #[serde(default, deserialize_with = "deserialize_null_default")]
     pub outcome: WorkspaceExternalResolutionOutcome,
-    /// Explicit full-job or task-subset coverage.
+    /// Derived full-displayed-job or task-subset workspace coverage. The stored receipt scope
+    /// remains immutable in the ledger.
     #[serde(default, deserialize_with = "deserialize_null_default")]
     pub scope: WorkspaceExternalResolutionScope,
-    /// Sorted concrete task identifiers declared by the receipt.
+    /// Sorted concrete task identifiers declared by the immutable receipt (never broadened to
+    /// cover unapproved displayed work).
     #[serde(default, deserialize_with = "deserialize_null_default")]
     pub task_ids: Vec<String>,
     /// Read-time applicability classified by the store-backed reader.
@@ -5477,7 +5482,8 @@ pub struct WorkspaceExternalResolution {
     /// Receipt creation timestamp in milliseconds since Unix epoch.
     #[serde(default)]
     pub recorded_at_ms: Option<i64>,
-    /// Exact current attention rows closed by this applicable receipt.
+    /// Exact displayed attention rows closed by this applicable receipt projection, including
+    /// preserved legacy-fallback task/job details.
     #[serde(default, deserialize_with = "deserialize_null_default")]
     pub covered_attention: Vec<WorkspaceCoveredAttention>,
 }

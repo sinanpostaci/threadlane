@@ -1,6 +1,6 @@
 #[cfg(unix)]
 mod unix_workspace_tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::env;
     use std::fs;
     use std::io::Write;
@@ -12,8 +12,9 @@ mod unix_workspace_tests {
     use threadlane_core::observation::{
         current_observation_time_ms, serialize_workspace_native_sample_sidecar,
         ObservationJobState, ObservationSnapshotRequest, ObservationSourceAvailability,
-        WorkspaceAcceptanceStatus, WorkspaceActivityState, WorkspaceAvailabilityState,
-        WorkspaceCapabilityState, WorkspaceChatIdentity, WorkspaceConfiguredSelection,
+        WorkspaceAcceptanceStatus, WorkspaceActivityState, WorkspaceAttentionKind,
+        WorkspaceAvailabilityState, WorkspaceCapabilityState, WorkspaceChatIdentity,
+        WorkspaceConfiguredSelection,
         WorkspaceConnectionState, WorkspaceExternalResolutionApplicability,
         WorkspaceExternalResolutionScope, WorkspaceFreshnessState, WorkspaceMessageSourceKind,
         WorkspaceNativeCapabilities, WorkspaceNativeSample, WorkspaceSampleConnection,
@@ -424,51 +425,35 @@ mod unix_workspace_tests {
         path
     }
 
-    fn write_legacy_plan_and_approval(
-        stores: &TestStores,
+    fn write_legacy_approvals_ledger(stores: &TestStores, approvals: &[ApprovalRecord]) {
+        let approvals_path = stores.authority.join(APPROVALS_FILE_NAME);
+        for approval in approvals {
+            verify_approval_record_integrity(approval, &approvals_path)
+                .expect("legacy approval integrity");
+        }
+        let ledger = serde_json::json!({
+            "schema_version": AUTHORITY_SCHEMA_VERSION,
+            "approvals": approvals,
+        });
+        let bytes = serde_json::to_vec_pretty(&ledger).expect("serialize legacy approvals");
+        fs::write(&approvals_path, bytes).expect("write legacy approvals");
+        set_mode(&approvals_path, 0o600);
+    }
+
+    fn make_legacy_approval(
+        published: &PlanRevision,
         binding_id: &str,
         thread_uuid: &str,
         project: &Path,
-    ) -> (PlanRevision, ApprovalRecord) {
-        let plan_id = "plan_ws_legacy_01";
-        let plan_store = PlanStore::open(&stores.plans).expect("open legacy PlanStore");
-        let draft = plan_store
-            .change_at(
-                0,
-                PlanChange::SaveDraft {
-                    plan_id: plan_id.to_string(),
-                    binding_id: binding_id.to_string(),
-                    profile_id: "profile-main".to_string(),
-                    profile_revision: 1,
-                    summary: "Legacy plan-only workspace summary".to_string(),
-                    tasks: vec![PlanTask {
-                        id: "task-legacy".to_string(),
-                        title: "Legacy task".to_string(),
-                        instruction: "Do not leak this legacy instruction".to_string(),
-                        role: WorkflowRole::Coder,
-                        difficulty: Difficulty::Medium,
-                        depends_on: Vec::new(),
-                        allowed_write_paths: vec!["src/lib.rs".to_string()],
-                    }],
-                },
-                1_700_000_300_000,
-            )
-            .expect("save legacy plan draft");
-        let published = plan_store
-            .change_at(
-                draft.revision,
-                PlanChange::Publish {
-                    plan_id: draft.plan_id.clone(),
-                    revision: draft.revision,
-                },
-                1_700_000_300_500,
-            )
-            .expect("publish legacy plan");
-        drop(plan_store);
-
+        approved_task_ids: &[String],
+        created_at_ms: i64,
+    ) -> ApprovalRecord {
+        let approved_set: BTreeSet<&str> =
+            approved_task_ids.iter().map(String::as_str).collect();
         let approved_tasks: Vec<ApprovedTaskRecord> = published
             .tasks
             .iter()
+            .filter(|task| approved_set.contains(task.id.as_str()))
             .map(|task| ApprovedTaskRecord {
                 task_id: task.id.clone(),
                 title: task.title.clone(),
@@ -494,6 +479,11 @@ mod unix_workspace_tests {
                 command_key: None,
             })
             .collect();
+        assert_eq!(
+            approved_tasks.len(),
+            approved_task_ids.len(),
+            "legacy fixture approval must reference only tasks in the published revision"
+        );
         let mut approval = ApprovalRecord {
             approval_id: String::new(),
             subject_digest: String::new(),
@@ -515,22 +505,136 @@ mod unix_workspace_tests {
             max_parallel: 1,
             budgets: Default::default(),
             tasks: approved_tasks,
-            created_at_ms: 1_700_000_301_000,
+            created_at_ms,
         };
         approval.subject_digest =
             compute_record_subject_digest(&approval).expect("legacy approval subject digest");
         approval.approval_id = derive_approval_id(&approval.subject_digest);
-        let approvals_path = stores.authority.join(APPROVALS_FILE_NAME);
-        verify_approval_record_integrity(&approval, &approvals_path)
-            .expect("legacy approval integrity");
-        let ledger = serde_json::json!({
-            "schema_version": AUTHORITY_SCHEMA_VERSION,
-            "approvals": [approval.clone()],
-        });
-        let bytes = serde_json::to_vec_pretty(&ledger).expect("serialize legacy approvals");
-        fs::write(&approvals_path, bytes).expect("write legacy approvals");
-        set_mode(&approvals_path, 0o600);
+        approval
+    }
+
+    fn write_legacy_plan_and_approval_with_tasks(
+        stores: &TestStores,
+        binding_id: &str,
+        thread_uuid: &str,
+        project: &Path,
+        plan_id: &str,
+        plan_tasks: Vec<PlanTask>,
+        approved_task_ids: &[String],
+        approval_created_at_ms: i64,
+    ) -> (PlanRevision, ApprovalRecord) {
+        let plan_store = PlanStore::open(&stores.plans).expect("open legacy PlanStore");
+        let draft = plan_store
+            .change_at(
+                0,
+                PlanChange::SaveDraft {
+                    plan_id: plan_id.to_string(),
+                    binding_id: binding_id.to_string(),
+                    profile_id: "profile-main".to_string(),
+                    profile_revision: 1,
+                    summary: "Legacy plan-only workspace summary".to_string(),
+                    tasks: plan_tasks,
+                },
+                1_700_000_300_000,
+            )
+            .expect("save legacy plan draft");
+        let published = plan_store
+            .change_at(
+                draft.revision,
+                PlanChange::Publish {
+                    plan_id: draft.plan_id.clone(),
+                    revision: draft.revision,
+                },
+                1_700_000_300_500,
+            )
+            .expect("publish legacy plan");
+        drop(plan_store);
+
+        let approval = make_legacy_approval(
+            &published,
+            binding_id,
+            thread_uuid,
+            project,
+            approved_task_ids,
+            approval_created_at_ms,
+        );
+        write_legacy_approvals_ledger(stores, std::slice::from_ref(&approval));
         (published, approval)
+    }
+
+    fn write_legacy_plan_and_approval(
+        stores: &TestStores,
+        binding_id: &str,
+        thread_uuid: &str,
+        project: &Path,
+    ) -> (PlanRevision, ApprovalRecord) {
+        write_legacy_plan_and_approval_with_tasks(
+            stores,
+            binding_id,
+            thread_uuid,
+            project,
+            "plan_ws_legacy_01",
+            vec![PlanTask {
+                id: "task-legacy".to_string(),
+                title: "Legacy task".to_string(),
+                instruction: "Do not leak this legacy instruction".to_string(),
+                role: WorkflowRole::Coder,
+                difficulty: Difficulty::Medium,
+                depends_on: Vec::new(),
+                allowed_write_paths: vec!["src/lib.rs".to_string()],
+            }],
+            &["task-legacy".to_string()],
+            1_700_000_301_000,
+        )
+    }
+
+    fn publish_legacy_plan_revision(
+        stores: &TestStores,
+        binding_id: &str,
+        plan_id: &str,
+        expected_revision: u64,
+        summary: &str,
+        plan_tasks: Vec<PlanTask>,
+    ) -> PlanRevision {
+        let plan_store = PlanStore::open(&stores.plans).expect("open legacy PlanStore");
+        let draft = plan_store
+            .change_at(
+                expected_revision,
+                PlanChange::SaveDraft {
+                    plan_id: plan_id.to_string(),
+                    binding_id: binding_id.to_string(),
+                    profile_id: "profile-main".to_string(),
+                    profile_revision: 1,
+                    summary: summary.to_string(),
+                    tasks: plan_tasks,
+                },
+                1_700_000_302_000,
+            )
+            .expect("save newer legacy plan draft");
+        let published = plan_store
+            .change_at(
+                draft.revision,
+                PlanChange::Publish {
+                    plan_id: draft.plan_id.clone(),
+                    revision: draft.revision,
+                },
+                1_700_000_302_500,
+            )
+            .expect("publish newer legacy plan");
+        drop(plan_store);
+        published
+    }
+
+    fn legacy_plan_task(id: &str, title: &str) -> PlanTask {
+        PlanTask {
+            id: id.to_string(),
+            title: title.to_string(),
+            instruction: "Do not leak this legacy instruction".to_string(),
+            role: WorkflowRole::Coder,
+            difficulty: Difficulty::Medium,
+            depends_on: Vec::new(),
+            allowed_write_paths: vec!["src/lib.rs".to_string()],
+        }
     }
 
     #[test]
@@ -1964,6 +2068,596 @@ mod unix_workspace_tests {
         assert!(snap.messages.items.iter().any(|message| {
             message.source_kind == WorkspaceMessageSourceKind::PlanSummary
                 && message.summary == "Legacy plan-only workspace summary"
+        }));
+    }
+
+    #[test]
+    fn workspace_snapshot_legacy_subset_full_receipt_preserves_unapproved_displayed_work() {
+        let tree = TestTree::new("legacy-subset-resolution");
+        let stores = TestStores::new(&tree, "stores");
+        let app_data = tree.dir("app-data");
+        let project = tree.dir("legacy-subset-project");
+        fs::write(project.join(".git"), b"gitdir: disposable fixture\n")
+            .expect("write disposable legacy .git marker");
+        set_mode(&project.join(".git"), 0o600);
+        let binding_id = "bnd_ws_legacy_subset_01";
+        let thread_uuid = "0196ed00-0000-7000-8000-000000000711";
+        let alpha = "task-legacy-alpha";
+        let beta = "task-legacy-beta";
+        let (plan, _approval) = write_legacy_plan_and_approval_with_tasks(
+            &stores,
+            binding_id,
+            thread_uuid,
+            &project,
+            "plan_ws_legacy_subset_01",
+            vec![
+                legacy_plan_task(alpha, "Legacy alpha task"),
+                legacy_plan_task(beta, "Legacy beta task"),
+            ],
+            &[alpha.to_string()],
+            1_700_000_311_000,
+        );
+
+        let external_service = ExternalResolutionService::new(
+            &stores.plans,
+            &stores.authority,
+            &stores.registry,
+            Some(&stores.sessions),
+        )
+        .expect("open legacy subset external resolution service");
+        let request = RecordExternalResolutionRequest {
+            binding_id: binding_id.to_string(),
+            thread_uuid: thread_uuid.to_string(),
+            canonical_repo_root: project.clone(),
+            target: ExternalResolutionTarget::LegacyPlan {
+                plan_id: plan.plan_id.clone(),
+                plan_revision: plan.revision,
+            },
+            scope: ExternalResolutionScope::FullJob,
+            expected_ledger_revision: None,
+            expected_job_revision: None,
+            expected_runtime_revision: None,
+            request_key: "req_ws_legacy_subset_01".to_string(),
+            created_at_ms: 1_700_000_411_000,
+            explanation: "The approved subset was resolved outside Threadlane.".to_string(),
+            evidence_refs: vec![ExternalResolutionEvidenceRef::ArtifactRef {
+                reference: "issue-legacy-ws-subset".to_string(),
+            }],
+        };
+        let preview = external_service
+            .preview(&request)
+            .expect("preview legacy subset external resolution");
+        let receipt = external_service
+            .record(
+                &request,
+                &ExternalResolutionConfirmation {
+                    trusted_local_attested: true,
+                    thread_uuid: preview.thread_uuid.clone(),
+                    preview_digest: preview.preview_digest.clone(),
+                },
+            )
+            .expect("record legacy subset external resolution");
+        let before_read = snapshot_tree_fingerprints(tree.path());
+
+        let service = ObservationService::new(stores.config(&app_data));
+        let snap = service
+            .workspace_snapshot(None)
+            .expect("workspace_snapshot with legacy subset external resolution");
+        let after_read = snapshot_tree_fingerprints(tree.path());
+        assert_eq!(
+            before_read, after_read,
+            "subset legacy fallback reads must not create locks, caches, or other files"
+        );
+
+        let history = snap
+            .job_histories
+            .iter()
+            .find(|history| history.job.job_id == plan.plan_id)
+            .expect("legacy subset fallback job history");
+        assert_eq!(history.external_resolutions.len(), 1);
+        let resolution = &history.external_resolutions[0];
+        assert_eq!(resolution.receipt_id, receipt.receipt_id);
+        assert_eq!(
+            resolution.applicability,
+            WorkspaceExternalResolutionApplicability::Applicable
+        );
+        assert_eq!(
+            resolution.scope,
+            WorkspaceExternalResolutionScope::Tasks,
+            "a full receipt over a subset approval must project task-scoped workspace coverage"
+        );
+        assert_eq!(resolution.task_ids, vec![alpha.to_string()]);
+        assert_eq!(resolution.covered_attention.len(), 1);
+        assert_eq!(
+            resolution.covered_attention[0].task_id.as_deref(),
+            Some(alpha)
+        );
+        assert_eq!(
+            resolution.covered_attention[0].attention.kind,
+            WorkspaceAttentionKind::NeedsUserInput
+        );
+
+        let alpha_task = history
+            .tasks
+            .iter()
+            .find(|task| task.task_id == alpha)
+            .expect("legacy subset alpha task");
+        let beta_task = history
+            .tasks
+            .iter()
+            .find(|task| task.task_id == beta)
+            .expect("legacy subset beta task");
+        assert_eq!(alpha_task.status, "native_route_required");
+        assert!(alpha_task.current_attention.is_none());
+        assert_eq!(beta_task.status, "not_approved");
+        assert_eq!(
+            beta_task
+                .current_attention
+                .as_ref()
+                .map(|attention| attention.kind),
+            Some(WorkspaceAttentionKind::Unknown),
+            "the unapproved displayed task must remain uncovered"
+        );
+        assert_eq!(history.job.state, ObservationJobState::NeedsUser);
+        assert_ne!(history.job.execution_status, "resolved_externally");
+        assert_eq!(
+            history.acceptance_proof.status,
+            WorkspaceAcceptanceStatus::Unknown
+        );
+        assert_eq!(
+            snap.chats
+                .iter()
+                .find(|chat| chat.identity.binding_id == binding_id)
+                .map(|chat| (chat.active_job_count, chat.attention_count)),
+            Some((1, 1)),
+            "the remaining displayed work must keep the job active with attention"
+        );
+        assert!(snap.observation.jobs.iter().any(|job| {
+            job.id == plan.plan_id
+                && job.state == ObservationJobState::NeedsUser
+                && job.execution_status != "resolved_externally"
+        }));
+        assert!(snap.messages.items.iter().any(|message| {
+            message.source_record_id == receipt.receipt_id
+                && message.scope.job_id.as_deref() == Some(plan.plan_id.as_str())
+        }));
+    }
+
+    #[test]
+    fn workspace_snapshot_legacy_exact_full_receipt_covers_details_and_retires_attention() {
+        let tree = TestTree::new("legacy-exact-full-resolution");
+        let stores = TestStores::new(&tree, "stores");
+        let app_data = tree.dir("app-data");
+        let project = tree.dir("legacy-full-project");
+        fs::write(project.join(".git"), b"gitdir: disposable fixture\n")
+            .expect("write disposable legacy .git marker");
+        set_mode(&project.join(".git"), 0o600);
+        let binding_id = "bnd_ws_legacy_full_01";
+        let thread_uuid = "0196ed00-0000-7000-8000-000000000712";
+        let alpha = "task-legacy-alpha";
+        let beta = "task-legacy-beta";
+        let approved = vec![alpha.to_string(), beta.to_string()];
+        let (plan, _approval) = write_legacy_plan_and_approval_with_tasks(
+            &stores,
+            binding_id,
+            thread_uuid,
+            &project,
+            "plan_ws_legacy_full_01",
+            vec![
+                legacy_plan_task(alpha, "Legacy alpha task"),
+                legacy_plan_task(beta, "Legacy beta task"),
+            ],
+            &approved,
+            1_700_000_312_000,
+        );
+
+        let external_service = ExternalResolutionService::new(
+            &stores.plans,
+            &stores.authority,
+            &stores.registry,
+            Some(&stores.sessions),
+        )
+        .expect("open legacy full external resolution service");
+        let request = RecordExternalResolutionRequest {
+            binding_id: binding_id.to_string(),
+            thread_uuid: thread_uuid.to_string(),
+            canonical_repo_root: project.clone(),
+            target: ExternalResolutionTarget::LegacyPlan {
+                plan_id: plan.plan_id.clone(),
+                plan_revision: plan.revision,
+            },
+            scope: ExternalResolutionScope::FullJob,
+            expected_ledger_revision: None,
+            expected_job_revision: None,
+            expected_runtime_revision: None,
+            request_key: "req_ws_legacy_full_01".to_string(),
+            created_at_ms: 1_700_000_412_000,
+            explanation: "The complete displayed legacy plan was resolved outside Threadlane."
+                .to_string(),
+            evidence_refs: vec![ExternalResolutionEvidenceRef::ArtifactRef {
+                reference: "issue-legacy-ws-full".to_string(),
+            }],
+        };
+        let preview = external_service
+            .preview(&request)
+            .expect("preview legacy full external resolution");
+        let receipt = external_service
+            .record(
+                &request,
+                &ExternalResolutionConfirmation {
+                    trusted_local_attested: true,
+                    thread_uuid: preview.thread_uuid.clone(),
+                    preview_digest: preview.preview_digest.clone(),
+                },
+            )
+            .expect("record legacy full external resolution");
+        let before_read = snapshot_tree_fingerprints(tree.path());
+
+        let service = ObservationService::new(stores.config(&app_data));
+        let snap = service
+            .workspace_snapshot(None)
+            .expect("workspace_snapshot with legacy full external resolution");
+        let after_read = snapshot_tree_fingerprints(tree.path());
+        assert_eq!(
+            before_read, after_read,
+            "exact full legacy fallback reads must not create locks, caches, or other files"
+        );
+
+        let history = snap
+            .job_histories
+            .iter()
+            .find(|history| history.job.job_id == plan.plan_id)
+            .expect("legacy full fallback job history");
+        let resolution = &history.external_resolutions[0];
+        assert_eq!(resolution.receipt_id, receipt.receipt_id);
+        assert_eq!(
+            resolution.applicability,
+            WorkspaceExternalResolutionApplicability::Applicable
+        );
+        assert_eq!(resolution.scope, WorkspaceExternalResolutionScope::Job);
+        assert_eq!(resolution.task_ids, approved);
+        let covered_task_ids: BTreeSet<&str> = resolution
+            .covered_attention
+            .iter()
+            .filter_map(|covered| covered.task_id.as_deref())
+            .collect();
+        assert_eq!(
+            covered_task_ids,
+            BTreeSet::from([alpha, beta]),
+            "both prior task attention details must be preserved under the receipt"
+        );
+        assert!(resolution.covered_attention.iter().all(|covered| {
+            covered.attention.kind == WorkspaceAttentionKind::NeedsUserInput
+        }));
+        assert!(history.current_attention.is_none());
+        assert!(history
+            .tasks
+            .iter()
+            .all(|task| task.current_attention.is_none()));
+        assert_eq!(history.job.state, ObservationJobState::Unknown);
+        assert_eq!(history.job.execution_status, "resolved_externally");
+        assert_eq!(
+            history.acceptance_proof.status,
+            WorkspaceAcceptanceStatus::Unknown
+        );
+        assert!(history
+            .tasks
+            .iter()
+            .all(|task| task.status == "native_route_required"));
+        assert_eq!(
+            snap.chats
+                .iter()
+                .find(|chat| chat.identity.binding_id == binding_id)
+                .map(|chat| (chat.active_job_count, chat.attention_count)),
+            Some((0, 0))
+        );
+        assert!(snap.observation.jobs.iter().any(|job| {
+            job.id == plan.plan_id
+                && job.state == ObservationJobState::Unknown
+                && job.execution_status == "resolved_externally"
+        }));
+        assert!(snap.messages.items.iter().any(|message| {
+            message.source_record_id == receipt.receipt_id
+                && message.scope.job_id.as_deref() == Some(plan.plan_id.as_str())
+        }));
+    }
+
+    #[test]
+    fn workspace_snapshot_legacy_partial_multi_receipts_keep_residual_job_attention() {
+        let tree = TestTree::new("legacy-partial-multi-resolution");
+        let stores = TestStores::new(&tree, "stores");
+        let app_data = tree.dir("app-data");
+        let project = tree.dir("legacy-partial-project");
+        fs::write(project.join(".git"), b"gitdir: disposable fixture\n")
+            .expect("write disposable legacy .git marker");
+        set_mode(&project.join(".git"), 0o600);
+        let binding_id = "bnd_ws_legacy_partial_01";
+        let thread_uuid = "0196ed00-0000-7000-8000-000000000713";
+        let alpha = "task-legacy-alpha";
+        let beta = "task-legacy-beta";
+        let approved = vec![alpha.to_string(), beta.to_string()];
+        let (plan, _approval) = write_legacy_plan_and_approval_with_tasks(
+            &stores,
+            binding_id,
+            thread_uuid,
+            &project,
+            "plan_ws_legacy_partial_01",
+            vec![
+                legacy_plan_task(alpha, "Legacy alpha task"),
+                legacy_plan_task(beta, "Legacy beta task"),
+            ],
+            &approved,
+            1_700_000_313_000,
+        );
+
+        let external_service = ExternalResolutionService::new(
+            &stores.plans,
+            &stores.authority,
+            &stores.registry,
+            Some(&stores.sessions),
+        )
+        .expect("open legacy partial external resolution service");
+        let record_task = |request_key: &str, task_id: &str, created_at_ms: u64| {
+            let request = RecordExternalResolutionRequest {
+                binding_id: binding_id.to_string(),
+                thread_uuid: thread_uuid.to_string(),
+                canonical_repo_root: project.clone(),
+                target: ExternalResolutionTarget::LegacyPlan {
+                    plan_id: plan.plan_id.clone(),
+                    plan_revision: plan.revision,
+                },
+                scope: ExternalResolutionScope::Tasks {
+                    task_ids: vec![task_id.to_string()],
+                },
+                expected_ledger_revision: None,
+                expected_job_revision: None,
+                expected_runtime_revision: None,
+                request_key: request_key.to_string(),
+                created_at_ms,
+                explanation: "An approved legacy task was resolved outside Threadlane.".to_string(),
+                evidence_refs: vec![ExternalResolutionEvidenceRef::ArtifactRef {
+                    reference: format!("issue-legacy-ws-{task_id}"),
+                }],
+            };
+            let preview = external_service
+                .preview(&request)
+                .expect("preview partial legacy external resolution");
+            external_service
+                .record(
+                    &request,
+                    &ExternalResolutionConfirmation {
+                        trusted_local_attested: true,
+                        thread_uuid: preview.thread_uuid.clone(),
+                        preview_digest: preview.preview_digest.clone(),
+                    },
+                )
+                .expect("record partial legacy external resolution")
+        };
+        let alpha_receipt = record_task("req_ws_legacy_partial_alpha", alpha, 1_700_000_413_000);
+        let beta_receipt = record_task("req_ws_legacy_partial_beta", beta, 1_700_000_414_000);
+        let before_read = snapshot_tree_fingerprints(tree.path());
+
+        let service = ObservationService::new(stores.config(&app_data));
+        let snap = service
+            .workspace_snapshot(None)
+            .expect("workspace_snapshot with partial legacy external resolutions");
+        let after_read = snapshot_tree_fingerprints(tree.path());
+        assert_eq!(
+            before_read, after_read,
+            "partial multi-receipt legacy reads must not create locks, caches, or other files"
+        );
+
+        let history = snap
+            .job_histories
+            .iter()
+            .find(|history| history.job.job_id == plan.plan_id)
+            .expect("legacy partial fallback job history");
+        assert_eq!(history.external_resolutions.len(), 2);
+        assert!(history.external_resolutions.iter().all(|resolution| {
+            resolution.applicability == WorkspaceExternalResolutionApplicability::Applicable
+                && resolution.scope == WorkspaceExternalResolutionScope::Tasks
+        }));
+        assert_eq!(
+            history
+                .external_resolutions
+                .iter()
+                .map(|resolution| resolution.receipt_id.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([alpha_receipt.receipt_id.as_str(), beta_receipt.receipt_id.as_str()])
+        );
+        for resolution in &history.external_resolutions {
+            assert_eq!(resolution.covered_attention.len(), 1);
+            assert!(resolution.covered_attention.iter().all(|covered| {
+                covered.task_id.as_deref() == resolution.task_ids.first().map(String::as_str)
+                    && covered.attention.kind == WorkspaceAttentionKind::NeedsUserInput
+            }));
+        }
+        assert!(history
+            .tasks
+            .iter()
+            .all(|task| task.current_attention.is_none()));
+        assert_eq!(
+            history
+                .current_attention
+                .as_ref()
+                .map(|attention| attention.kind),
+            Some(WorkspaceAttentionKind::Unknown),
+            "unproven full displayed coverage must retain conservative residual job attention"
+        );
+        assert_eq!(history.job.state, ObservationJobState::NeedsUser);
+        assert_ne!(history.job.execution_status, "resolved_externally");
+        assert_eq!(
+            snap.chats
+                .iter()
+                .find(|chat| chat.identity.binding_id == binding_id)
+                .map(|chat| (chat.active_job_count, chat.attention_count)),
+            Some((1, 1))
+        );
+        assert!(snap.observation.jobs.iter().any(|job| {
+            job.id == plan.plan_id
+                && job.state == ObservationJobState::NeedsUser
+                && job.execution_status != "resolved_externally"
+        }));
+    }
+
+    #[test]
+    fn workspace_snapshot_legacy_old_revision_receipt_stays_stale_after_newer_published_revision() {
+        let tree = TestTree::new("legacy-stale-revision-resolution");
+        let stores = TestStores::new(&tree, "stores");
+        let app_data = tree.dir("app-data");
+        let project = tree.dir("legacy-stale-project");
+        fs::write(project.join(".git"), b"gitdir: disposable fixture\n")
+            .expect("write disposable legacy .git marker");
+        set_mode(&project.join(".git"), 0o600);
+        let binding_id = "bnd_ws_legacy_stale_01";
+        let thread_uuid = "0196ed00-0000-7000-8000-000000000714";
+        let alpha = "task-legacy-alpha";
+        let beta = "task-legacy-beta";
+        let gamma = "task-legacy-gamma";
+        let (old_plan, old_approval) = write_legacy_plan_and_approval_with_tasks(
+            &stores,
+            binding_id,
+            thread_uuid,
+            &project,
+            "plan_ws_legacy_stale_01",
+            vec![
+                legacy_plan_task(alpha, "Legacy alpha task"),
+                legacy_plan_task(beta, "Legacy beta task"),
+            ],
+            &[alpha.to_string(), beta.to_string()],
+            1_700_000_314_000,
+        );
+
+        let external_service = ExternalResolutionService::new(
+            &stores.plans,
+            &stores.authority,
+            &stores.registry,
+            Some(&stores.sessions),
+        )
+        .expect("open legacy stale external resolution service");
+        let request = RecordExternalResolutionRequest {
+            binding_id: binding_id.to_string(),
+            thread_uuid: thread_uuid.to_string(),
+            canonical_repo_root: project.clone(),
+            target: ExternalResolutionTarget::LegacyPlan {
+                plan_id: old_plan.plan_id.clone(),
+                plan_revision: old_plan.revision,
+            },
+            scope: ExternalResolutionScope::FullJob,
+            expected_ledger_revision: None,
+            expected_job_revision: None,
+            expected_runtime_revision: None,
+            request_key: "req_ws_legacy_stale_01".to_string(),
+            created_at_ms: 1_700_000_415_000,
+            explanation: "The original legacy revision was resolved outside Threadlane.".to_string(),
+            evidence_refs: vec![ExternalResolutionEvidenceRef::ArtifactRef {
+                reference: "issue-legacy-ws-stale".to_string(),
+            }],
+        };
+        let preview = external_service
+            .preview(&request)
+            .expect("preview legacy stale external resolution");
+        let receipt = external_service
+            .record(
+                &request,
+                &ExternalResolutionConfirmation {
+                    trusted_local_attested: true,
+                    thread_uuid: preview.thread_uuid.clone(),
+                    preview_digest: preview.preview_digest.clone(),
+                },
+            )
+            .expect("record legacy stale external resolution");
+
+        let newer = publish_legacy_plan_revision(
+            &stores,
+            binding_id,
+            &old_plan.plan_id,
+            old_plan.revision,
+            "Legacy plan-only workspace summary revision two",
+            vec![
+                legacy_plan_task(alpha, "Legacy alpha task"),
+                legacy_plan_task(gamma, "Legacy gamma task"),
+            ],
+        );
+        let newer_approval = make_legacy_approval(
+            &newer,
+            binding_id,
+            thread_uuid,
+            &project,
+            &[alpha.to_string(), gamma.to_string()],
+            1_700_000_316_000,
+        );
+        write_legacy_approvals_ledger(&stores, &[old_approval, newer_approval]);
+        let before_read = snapshot_tree_fingerprints(tree.path());
+
+        let service = ObservationService::new(stores.config(&app_data));
+        let snap = service
+            .workspace_snapshot(None)
+            .expect("workspace_snapshot with stale legacy external resolution");
+        let after_read = snapshot_tree_fingerprints(tree.path());
+        assert_eq!(
+            before_read, after_read,
+            "stale legacy history reads must not create locks, caches, or other files"
+        );
+
+        let history = snap
+            .job_histories
+            .iter()
+            .find(|history| history.job.job_id == old_plan.plan_id)
+            .expect("legacy stale fallback job history");
+        assert_eq!(history.links.source_plan_revision, Some(newer.revision));
+        assert_eq!(history.external_resolutions.len(), 1);
+        let resolution = &history.external_resolutions[0];
+        assert_eq!(resolution.receipt_id, receipt.receipt_id);
+        assert_eq!(
+            resolution.applicability,
+            WorkspaceExternalResolutionApplicability::Stale
+        );
+        assert_eq!(resolution.scope, WorkspaceExternalResolutionScope::Job);
+        assert_eq!(
+            resolution.task_ids,
+            vec![alpha.to_string(), beta.to_string()],
+            "the immutable original receipt task IDs must remain untouched"
+        );
+        assert!(
+            resolution.covered_attention.is_empty(),
+            "a stale historical receipt must not cover the newer displayed revision"
+        );
+        let displayed_task_ids: BTreeSet<&str> = history
+            .tasks
+            .iter()
+            .map(|task| task.task_id.as_str())
+            .collect();
+        assert_eq!(displayed_task_ids, BTreeSet::from([alpha, gamma]));
+        assert!(history
+            .tasks
+            .iter()
+            .all(|task| task.status == "native_route_required"));
+        assert_eq!(
+            history
+                .current_attention
+                .as_ref()
+                .map(|attention| attention.kind),
+            Some(WorkspaceAttentionKind::NeedsUserInput)
+        );
+        assert_eq!(history.job.state, ObservationJobState::NeedsUser);
+        assert_ne!(history.job.execution_status, "resolved_externally");
+        assert_eq!(
+            snap.chats
+                .iter()
+                .find(|chat| chat.identity.binding_id == binding_id)
+                .map(|chat| (chat.active_job_count, chat.attention_count)),
+            Some((1, 1)),
+            "the newer displayed revision keeps its active job and current attention"
+        );
+        assert!(snap.observation.jobs.iter().any(|job| {
+            job.id == old_plan.plan_id
+                && job.state == ObservationJobState::NeedsUser
+                && job.execution_status != "resolved_externally"
+        }));
+        assert!(snap.messages.items.iter().any(|message| {
+            message.source_record_id == receipt.receipt_id
+                && message.scope.job_id.as_deref() == Some(old_plan.plan_id.as_str())
         }));
     }
 }
