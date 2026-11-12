@@ -28,28 +28,28 @@ use threadlane_native::coworker_workflow::{
     CombinedCandidateStatus, ControllerConfigurationPreview, ControllerJobRuntimeState,
     ControllerPolicyStore, ControllerRoleExecutionBudget, CoworkerControllerPhase1Status,
     CoworkerControllerService, CoworkerControllerStepRequest, CoworkerJobCompletionRequest,
-    CoworkerJobCompletionService, CoworkerJobCompletionStatus, CoworkerJobOwnershipGuard,
-    CoworkerJobOwnershipKey, CoworkerJobOwnershipStore, CoworkerJobPhase, CoworkerJobRecord,
-    CoworkerPlanningService, CoworkerTaskCorrectionDisposition,
-    CoworkerTaskCorrectionExecuteRequest, CoworkerTaskCorrectionExecuteStatus,
-    CoworkerTaskCorrectionExecutionService, CoworkerTaskCorrectionPrepareRequest,
-    CoworkerTaskCorrectionPrepareStatus, CoworkerTaskCorrectionService,
-    CoworkerTaskIntegrationOutcome, CoworkerTaskIntegrationRequest, CoworkerTaskIntegrationService,
-    CoworkerTaskIntegrationStatus, CoworkerTaskReviewStageRequest, CoworkerTaskReviewStageService,
-    CoworkerTaskReviewStageStatus, CoworkerTaskStage, CoworkerTaskVerificationOutcome,
-    CoworkerTaskVerificationRequest, CoworkerTaskVerificationService,
-    CoworkerTaskVerificationStatus, CoworkerWorkflowStore, CreateCoworkerJobRequest,
-    CreatePlanningGrantRequest, ExpectedTaskReviewIdentity, FinalizeTaskOutboxRequest,
-    FreezeControllerExecutionEnvelopeRequest, FrozenCheckCommandSpec, FrozenCheckExecutionStatus,
-    FrozenCheckKind, FrozenControllerCapabilityEnvelope, OrchestrateWorkBriefPlanRequest,
-    OutboxDispatchKind, OutboxDispatchStatus, PendingControllerEffect, PendingControllerEffectKind,
-    PendingControllerEffectStatus, PlannedCheckSuggestion, PlanningCallBudget,
-    PlanningReadOnlyCapabilities, PlanningReservationStatus, RecordTaskReviewVerdictRequest,
-    ReserveTaskOutboxRequest, ResolveWorkflowHoldRequest, ReviewVerdictOutcome,
-    StructuredOrchestratorOutput, StructuredPlannedTask, StructuredReviewVerdict,
-    StructuredTaskReviewModelResponse, TaskCandidateRef, TaskInterfaceOwnershipSpec,
-    TaskReviewExecutionStatus, WorkBrief, WorkBriefKind, WorkflowHoldReason,
-    TASK_REVIEW_RESPONSE_SCHEMA_VERSION,
+    CoworkerJobCompletionService, CoworkerJobCompletionStatus, CoworkerJobLockState,
+    CoworkerJobOwnershipGuard, CoworkerJobOwnershipKey, CoworkerJobOwnershipStore,
+    CoworkerJobPhase, CoworkerJobRecord, CoworkerPlanningService,
+    CoworkerTaskCorrectionDisposition, CoworkerTaskCorrectionExecuteRequest,
+    CoworkerTaskCorrectionExecuteStatus, CoworkerTaskCorrectionExecutionService,
+    CoworkerTaskCorrectionPrepareRequest, CoworkerTaskCorrectionPrepareStatus,
+    CoworkerTaskCorrectionService, CoworkerTaskIntegrationOutcome, CoworkerTaskIntegrationRequest,
+    CoworkerTaskIntegrationService, CoworkerTaskIntegrationStatus, CoworkerTaskReviewStageRequest,
+    CoworkerTaskReviewStageService, CoworkerTaskReviewStageStatus, CoworkerTaskStage,
+    CoworkerTaskVerificationOutcome, CoworkerTaskVerificationRequest,
+    CoworkerTaskVerificationService, CoworkerTaskVerificationStatus, CoworkerWorkflowStore,
+    CreateCoworkerJobRequest, CreatePlanningGrantRequest, ExpectedTaskReviewIdentity,
+    FinalizeTaskOutboxRequest, FreezeControllerExecutionEnvelopeRequest, FrozenCheckCommandSpec,
+    FrozenCheckExecutionStatus, FrozenCheckKind, FrozenControllerCapabilityEnvelope,
+    OrchestrateWorkBriefPlanRequest, OutboxDispatchKind, OutboxDispatchStatus,
+    PendingControllerEffect, PendingControllerEffectKind, PendingControllerEffectStatus,
+    PlannedCheckSuggestion, PlanningCallBudget, PlanningReadOnlyCapabilities,
+    PlanningReservationStatus, RecordTaskReviewVerdictRequest, ReserveTaskOutboxRequest,
+    ResolveWorkflowHoldRequest, ReviewVerdictOutcome, StructuredOrchestratorOutput,
+    StructuredPlannedTask, StructuredReviewVerdict, StructuredTaskReviewModelResponse,
+    TaskCandidateRef, TaskInterfaceOwnershipSpec, TaskReviewExecutionStatus, WorkBrief,
+    WorkBriefKind, WorkflowHoldReason, TASK_REVIEW_RESPONSE_SCHEMA_VERSION,
 };
 use threadlane_native::{
     Difficulty, ExecutionPolicy, NativeErrorCode, PolicyAllowRule, RegistryStore,
@@ -10788,6 +10788,185 @@ async fn external_resolution_record_waits_for_an_already_admitted_direct_dispatc
     );
 }
 
+struct ReadonlyDriverRefusalBaseline {
+    status: threadlane_native::coworker_driver::CoworkerDriverStatusReport,
+    lock_state: CoworkerJobLockState,
+    lock_path: PathBuf,
+    lock_bytes: Vec<u8>,
+    workflow_ledger_path: PathBuf,
+    workflow_ledger_bytes: Vec<u8>,
+    controller_ledger_path: PathBuf,
+    controller_ledger_bytes: Vec<u8>,
+}
+
+async fn assert_readonly_driver_refusal_preserved(
+    driver: &threadlane_native::coworker_driver::CoworkerCodeDriver,
+    key: &CoworkerJobOwnershipKey,
+    baseline: &ReadonlyDriverRefusalBaseline,
+    label: &str,
+) {
+    let status = tokio::time::timeout(
+        Duration::from_secs(5),
+        driver.status(&key.binding_id, &key.thread_uuid, &key.job_id),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("{label}: read-only driver status timed out"))
+    .unwrap_or_else(|err| panic!("{label}: read-only driver status failed: {err:?}"));
+
+    assert_eq!(
+        status.owner_state,
+        threadlane_native::coworker_driver::CoworkerDriverOwnerState::StaleCrashArtifactDetected,
+        "{label}: historical stale ownership artifact must remain visible"
+    );
+    assert_eq!(
+        status.binding_id, baseline.status.binding_id,
+        "{label}: binding_id drifted"
+    );
+    assert_eq!(
+        status.thread_uuid, baseline.status.thread_uuid,
+        "{label}: thread_uuid drifted"
+    );
+    assert_eq!(
+        status.job_id, baseline.status.job_id,
+        "{label}: job_id drifted"
+    );
+    assert_eq!(
+        status.approval_id, baseline.status.approval_id,
+        "{label}: approval_id drifted"
+    );
+    assert_eq!(
+        status.owner_state, baseline.status.owner_state,
+        "{label}: owner_state drifted"
+    );
+    assert_eq!(
+        status.lease_active, baseline.status.lease_active,
+        "{label}: lease_active drifted"
+    );
+    assert_eq!(
+        status.lease_owner_instance_id, baseline.status.lease_owner_instance_id,
+        "{label}: lease owner instance drifted"
+    );
+    assert_eq!(
+        status.lease.as_ref().map(|lease| (
+            lease.job_id.as_str(),
+            lease.binding_id.as_str(),
+            lease.instance_id.as_str(),
+            lease.lease_epoch,
+            lease.active,
+        )),
+        baseline.status.lease.as_ref().map(|lease| (
+            lease.job_id.as_str(),
+            lease.binding_id.as_str(),
+            lease.instance_id.as_str(),
+            lease.lease_epoch,
+            lease.active,
+        )),
+        "{label}: lease identity or flags drifted"
+    );
+    assert_eq!(
+        status.host_phase, baseline.status.host_phase,
+        "{label}: host_phase drifted"
+    );
+    assert_eq!(
+        status.host_lock_held, baseline.status.host_lock_held,
+        "{label}: host lock state drifted"
+    );
+    assert_eq!(
+        status.host_mode, baseline.status.host_mode,
+        "{label}: host_mode drifted"
+    );
+    assert_eq!(
+        status.job_phase, baseline.status.job_phase,
+        "{label}: job_phase drifted"
+    );
+    assert_eq!(
+        status.overall_status, baseline.status.overall_status,
+        "{label}: overall_status drifted"
+    );
+    assert_eq!(
+        status.execution_mode, baseline.status.execution_mode,
+        "{label}: execution_mode drifted"
+    );
+    assert_eq!(
+        status.pipeline_status, baseline.status.pipeline_status,
+        "{label}: pipeline_status drifted"
+    );
+    assert_eq!(
+        status.stop_requested, baseline.status.stop_requested,
+        "{label}: stop_requested drifted"
+    );
+    assert_eq!(
+        status.blocked_on_unknown_effect, baseline.status.blocked_on_unknown_effect,
+        "{label}: unknown-effect blocking drifted"
+    );
+    assert_eq!(
+        status.total_task_attempts_reserved, baseline.status.total_task_attempts_reserved,
+        "{label}: task attempt count drifted"
+    );
+    assert_eq!(
+        status.max_total_task_attempts_per_job, baseline.status.max_total_task_attempts_per_job,
+        "{label}: task attempt budget drifted"
+    );
+    assert_eq!(
+        status.fatal_error, baseline.status.fatal_error,
+        "{label}: fatal owner diagnosis drifted"
+    );
+    assert_eq!(
+        status.tasks, baseline.status.tasks,
+        "{label}: task observations drifted"
+    );
+    assert_eq!(
+        status.step_report, baseline.status.step_report,
+        "{label}: step report drifted"
+    );
+    assert_eq!(
+        status.pipeline_boundary, baseline.status.pipeline_boundary,
+        "{label}: pipeline boundary drifted"
+    );
+
+    let lock_state = driver
+        .controller()
+        .ownership_store()
+        .inspect_job_lock(key)
+        .unwrap_or_else(|err| panic!("{label}: inspect ownership lock failed: {err:?}"));
+    assert_eq!(
+        lock_state, baseline.lock_state,
+        "{label}: ownership lock summary drifted"
+    );
+    assert_eq!(
+        fs::read(&baseline.lock_path)
+            .unwrap_or_else(|err| panic!("{label}: read ownership lock failed: {err:?}")),
+        baseline.lock_bytes,
+        "{label}: ownership lock artifact bytes changed"
+    );
+    assert!(
+        driver
+            .read_driver_state_optional(key)
+            .unwrap_or_else(|err| panic!("{label}: read driver state failed: {err:?}"))
+            .is_none(),
+        "{label}: refusal must not synthesize a driver state or graceful exit"
+    );
+    assert!(
+        driver
+            .read_owner_failure_optional(key)
+            .unwrap_or_else(|err| panic!("{label}: read owner failure failed: {err:?}"))
+            .is_none(),
+        "{label}: refusal must not persist an owner failure diagnostic"
+    );
+    assert_eq!(
+        fs::read(&baseline.workflow_ledger_path)
+            .unwrap_or_else(|err| panic!("{label}: read workflow ledger failed: {err:?}")),
+        baseline.workflow_ledger_bytes,
+        "{label}: workflow ledger bytes changed"
+    );
+    assert_eq!(
+        fs::read(&baseline.controller_ledger_path)
+            .unwrap_or_else(|err| panic!("{label}: read controller ledger failed: {err:?}")),
+        baseline.controller_ledger_bytes,
+        "{label}: controller ledger bytes changed"
+    );
+}
+
 #[tokio::test]
 async fn external_resolution_full_job_blocks_execution_and_driver_but_preserves_readonly_status() {
     let fixture = setup_fixture();
@@ -10843,6 +11022,111 @@ async fn external_resolution_full_job_blocks_execution_and_driver_but_preserves_
     )
     .expect("create execution gateway");
 
+    let driver = threadlane_native::coworker_driver::CoworkerCodeDriver::open_from_dirs(
+        &state_dir,
+        &fixture.registry_dir,
+        &fixture.plans_dir,
+        &fixture.authority_dir,
+        &fixture.sessions_dir,
+    )
+    .expect("create code driver");
+
+    let key = CoworkerJobOwnershipKey::new(BINDING_A, THREAD_UUID_A, &job.job_id)
+        .expect("driver ownership key");
+    let baseline_status = tokio::time::timeout(
+        Duration::from_secs(5),
+        driver.status(BINDING_A, THREAD_UUID_A, &job.job_id),
+    )
+    .await
+    .expect("baseline read-only driver status should not time out")
+    .expect("baseline read-only driver status");
+    assert_eq!(
+        baseline_status.owner_state,
+        threadlane_native::coworker_driver::CoworkerDriverOwnerState::StaleCrashArtifactDetected,
+        "record leaves a real unlocked historical ownership summary, not a graceful no-owner state"
+    );
+    assert_eq!(
+        baseline_status.job_id, job.job_id,
+        "baseline readonly status must remain bound to the refused job"
+    );
+    assert_eq!(
+        baseline_status.approval_id, approval_id,
+        "baseline readonly status must remain bound to the frozen approval"
+    );
+    assert_ne!(
+        baseline_status.job_phase,
+        CoworkerJobPhase::Completed,
+        "the full-job receipt must not fabricate job completion"
+    );
+
+    let ownership_store = driver.controller().ownership_store();
+    let lock_path = ownership_store
+        .lock_path_for_job(&key)
+        .expect("driver ownership lock path");
+    let lock_state = ownership_store
+        .inspect_job_lock(&key)
+        .expect("inspect driver ownership lock before refusals");
+    match &lock_state {
+        CoworkerJobLockState::UnlockedStaleFile {
+            recorded_summary: Some(summary),
+            lock_file_identity,
+        } => {
+            assert_eq!(
+                summary.lock_file_identity, *lock_file_identity,
+                "historical lock summary must describe the physical lockfile"
+            );
+            summary
+                .validate_for_key(&key)
+                .expect("historical lock summary must remain scoped to the job");
+            assert!(
+                !summary.grants_execution_authority,
+                "historical ownership summary must never grant execution authority"
+            );
+        }
+        other => panic!(
+            "expected an unlocked historical ownership summary before refusals, got {other:?}"
+        ),
+    }
+    let lock_bytes = fs::read(&lock_path).expect("read driver ownership lock before refusals");
+    assert!(
+        driver
+            .read_driver_state_optional(&key)
+            .expect("read driver state before refusals")
+            .is_none(),
+        "record must not create a graceful driver state"
+    );
+    assert!(
+        driver
+            .read_owner_failure_optional(&key)
+            .expect("read owner failure before refusals")
+            .is_none(),
+        "record must not create an owner failure diagnostic"
+    );
+
+    let workflow_ledger_path = fixture
+        .workflow_store
+        .ledger_path_for_binding(BINDING_A)
+        .expect("workflow ledger path before refusals");
+    let workflow_ledger_bytes =
+        fs::read(&workflow_ledger_path).expect("read workflow ledger before refusals");
+    let controller_ledger_path = fixture
+        .policy_store
+        .ledger_path_for_binding(BINDING_A)
+        .expect("controller ledger path before refusals");
+    let controller_ledger_bytes =
+        fs::read(&controller_ledger_path).expect("read controller ledger before refusals");
+
+    let baseline = ReadonlyDriverRefusalBaseline {
+        status: baseline_status,
+        lock_state,
+        lock_path,
+        lock_bytes,
+        workflow_ledger_path,
+        workflow_ledger_bytes,
+        controller_ledger_path,
+        controller_ledger_bytes,
+    };
+
     let agy_count_before = read_invocation_count(&fixture.agy_count_file);
     let mut sessions_before: Vec<_> = fs::read_dir(&fixture.sessions_dir)
         .expect("read sessions before driver refusals")
@@ -10869,6 +11153,8 @@ async fn external_resolution_full_job_blocks_execution_and_driver_but_preserves_
     assert!(preview_error
         .message()
         .contains(receipt.receipt_id.as_str()));
+    assert_readonly_driver_refusal_preserved(&driver, &key, &baseline, "execution preview refusal")
+        .await;
 
     let start_error = gateway
         .start_execution(&threadlane_native::StartExecutionParams {
@@ -10882,15 +11168,8 @@ async fn external_resolution_full_job_blocks_execution_and_driver_but_preserves_
         NativeErrorCode::UnsupportedCapability.as_str()
     );
     assert!(start_error.message().contains(receipt.receipt_id.as_str()));
-
-    let driver = threadlane_native::coworker_driver::CoworkerCodeDriver::open_from_dirs(
-        &state_dir,
-        &fixture.registry_dir,
-        &fixture.plans_dir,
-        &fixture.authority_dir,
-        &fixture.sessions_dir,
-    )
-    .expect("create code driver");
+    assert_readonly_driver_refusal_preserved(&driver, &key, &baseline, "execution start refusal")
+        .await;
 
     let run_error = tokio::time::timeout(
         Duration::from_secs(5),
@@ -10909,6 +11188,8 @@ async fn external_resolution_full_job_blocks_execution_and_driver_but_preserves_
         NativeErrorCode::UnsupportedCapability.as_str()
     );
     assert!(run_error.message().contains(receipt.receipt_id.as_str()));
+    assert_readonly_driver_refusal_preserved(&driver, &key, &baseline, "driver run-owner refusal")
+        .await;
 
     let ensure_error = tokio::time::timeout(
         Duration::from_secs(5),
@@ -10927,21 +11208,8 @@ async fn external_resolution_full_job_blocks_execution_and_driver_but_preserves_
         NativeErrorCode::UnsupportedCapability.as_str()
     );
     assert!(ensure_error.message().contains(receipt.receipt_id.as_str()));
-
-    let status = tokio::time::timeout(
-        Duration::from_secs(5),
-        driver.status(BINDING_A, THREAD_UUID_A, &job.job_id),
-    )
-    .await
-    .expect("read-only driver status should remain accessible")
-    .expect("read-only driver status");
-    assert_eq!(status.job_id, job.job_id);
-    assert_eq!(status.approval_id, approval_id);
-    assert_eq!(
-        status.owner_state,
-        threadlane_native::coworker_driver::CoworkerDriverOwnerState::NoActiveOwner
-    );
-    assert!(!status.blocked_on_unknown_effect);
+    assert_readonly_driver_refusal_preserved(&driver, &key, &baseline, "driver ensure refusal")
+        .await;
 
     assert_eq!(
         read_invocation_count(&fixture.agy_count_file),
