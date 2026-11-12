@@ -57,9 +57,9 @@ pub mod workspace_history;
 pub use workspace_history::{
     project_coworker_job_history, project_coworker_job_record,
     read_legacy_plan_external_resolutions_readonly, read_scoped_workspace_job_histories,
-    LegacyPlanObservationScope, VerifiedLegacyPlanExternalResolutions,
-    WorkspaceHistoryDiagnostic, WorkspaceHistoryDiagnosticKind, WorkspaceHistoryStores,
-    WorkspaceJobLineageContext, WorkspaceScopedHistoryRead,
+    LegacyPlanObservationScope, VerifiedLegacyPlanExternalResolutions, WorkspaceHistoryDiagnostic,
+    WorkspaceHistoryDiagnosticKind, WorkspaceHistoryStores, WorkspaceJobLineageContext,
+    WorkspaceScopedHistoryRead,
 };
 
 /// Canonical observation operation name for headless `Orchestrator` technical planning calls.

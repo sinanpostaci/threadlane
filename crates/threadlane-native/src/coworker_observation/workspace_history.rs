@@ -69,11 +69,12 @@ use threadlane_core::observation::{
     validate_correlation_id, ObservationDeliveryStage, ObservationExecutor, ObservationJobState,
     WorkspaceAcceptanceProof, WorkspaceAcceptanceStatus, WorkspaceAttentionKind,
     WorkspaceAttentionState, WorkspaceChatIdentity, WorkspaceCombinedCandidate,
-    WorkspaceCoveredAttention, WorkspaceExternalResolution, WorkspaceExternalResolutionApplicability,
-    WorkspaceExternalResolutionOutcome, WorkspaceExternalResolutionScope,
-    WorkspaceHistoricalFailure, WorkspaceJobHistory, WorkspaceJobHistoryTruncation,
-    WorkspaceJobResult, WorkspaceJobSummary, WorkspaceOutboxRecord, WorkspaceRecordLinks,
-    WorkspaceRunRecord, WorkspaceTaskAttempt, WorkspaceTaskCandidate, WorkspaceTaskHistory,
+    WorkspaceCoveredAttention, WorkspaceExternalResolution,
+    WorkspaceExternalResolutionApplicability, WorkspaceExternalResolutionOutcome,
+    WorkspaceExternalResolutionScope, WorkspaceHistoricalFailure, WorkspaceJobHistory,
+    WorkspaceJobHistoryTruncation, WorkspaceJobResult, WorkspaceJobSummary, WorkspaceOutboxRecord,
+    WorkspaceRecordLinks, WorkspaceRunRecord, WorkspaceTaskAttempt, WorkspaceTaskCandidate,
+    WorkspaceTaskHistory,
 };
 use threadlane_host::{
     read_host_manifest_optional, verify_existing_private_dir, verify_existing_session_dir,
@@ -355,8 +356,7 @@ pub fn read_scoped_workspace_job_histories(
         load_authority_records_readonly(stores, &mut degraded, &mut diagnostics);
     let authority_store_configured =
         stores.authority_store.is_some() || stores.authority_dir.is_some();
-    let authority_store_degraded =
-        authority_store_configured && authority_records_by_id.is_none();
+    let authority_store_degraded = authority_store_configured && authority_records_by_id.is_none();
     let verified_sessions_root =
         verify_sessions_root_readonly(stores.sessions_dir, &mut degraded, &mut diagnostics);
     let all_approval_records: Vec<ApprovalRecord> = authority_records_by_id
@@ -636,7 +636,14 @@ pub fn project_coworker_job_history(
     context: Option<&WorkspaceJobLineageContext>,
 ) -> Result<WorkspaceJobHistory, WorkspaceHistoryDiagnostic> {
     project_coworker_job_history_internal(
-        chat_identity, job, runtime, context, None, None, None, None,
+        chat_identity,
+        job,
+        runtime,
+        context,
+        None,
+        None,
+        None,
+        None,
     )
 }
 
@@ -751,25 +758,24 @@ fn project_coworker_job_history_internal(
             verified_current_published_plan,
         )
     };
-    let (external_resolutions, full_job_externally_resolved) =
-        if verified_acceptance.is_some() {
-            (
-                verified_external_resolutions
-                    .map(|verified| verified.resolutions.clone())
-                    .unwrap_or_default(),
-                false,
-            )
-        } else {
-            apply_external_resolution_coverage(
-                job,
-                runtime,
-                verified_obsolete_planning,
-                verified_current_published_plan,
-                &mut projected_tasks,
-                &mut current_attention,
-                verified_external_resolutions,
-            )
-        };
+    let (external_resolutions, full_job_externally_resolved) = if verified_acceptance.is_some() {
+        (
+            verified_external_resolutions
+                .map(|verified| verified.resolutions.clone())
+                .unwrap_or_default(),
+            false,
+        )
+    } else {
+        apply_external_resolution_coverage(
+            job,
+            runtime,
+            verified_obsolete_planning,
+            verified_current_published_plan,
+            &mut projected_tasks,
+            &mut current_attention,
+            verified_external_resolutions,
+        )
+    };
     let links = project_record_links(job, context);
     let result = project_job_result(job, runtime, runtime_missing, verified_acceptance);
     let mut job_summary = project_job_summary(
@@ -909,9 +915,7 @@ fn apply_external_resolution_coverage(
             }
             WorkspaceExternalResolutionScope::Tasks => {
                 for task_id in &resolution.task_ids {
-                    let Some(task) = projected_tasks
-                        .iter()
-                        .find(|task| &task.task_id == task_id)
+                    let Some(task) = projected_tasks.iter().find(|task| &task.task_id == task_id)
                     else {
                         continue;
                     };
@@ -1028,10 +1032,12 @@ fn filter_job_for_covered_task_attention(
         .retain(|outbox| !covered_outbox_ids.contains(&outbox.outbox_id));
     let filtered_runtime = runtime.map(|runtime| {
         let mut filtered_runtime = runtime.clone();
-        filtered_runtime.pending_effects.retain(|effect_id, effect| {
-            !covered_outbox_ids.contains(effect_id)
-                && !covered_outbox_ids.contains(&effect.effect_id)
-        });
+        filtered_runtime
+            .pending_effects
+            .retain(|effect_id, effect| {
+                !covered_outbox_ids.contains(effect_id)
+                    && !covered_outbox_ids.contains(&effect.effect_id)
+            });
         filtered_runtime
     });
     (filtered, filtered_runtime)
@@ -1065,21 +1071,22 @@ fn verify_scoped_external_resolutions_readonly(
         }
 
         let mut projected = project_external_resolution_receipt(receipt);
-        let (applicability, verification_error) = classify_external_resolution_applicability_readonly(
-            chat_identity,
-            job,
-            runtime,
-            receipt,
-            verified_ledger,
-            plan_snapshot,
-            approval_records,
-            plan_revisions,
-            authority_records_by_id,
-            authority_store_configured,
-            policy_store,
-            stores,
-            verified_sessions_root,
-        );
+        let (applicability, verification_error) =
+            classify_external_resolution_applicability_readonly(
+                chat_identity,
+                job,
+                runtime,
+                receipt,
+                verified_ledger,
+                plan_snapshot,
+                approval_records,
+                plan_revisions,
+                authority_records_by_id,
+                authority_store_configured,
+                policy_store,
+                stores,
+                verified_sessions_root,
+            );
         projected.applicability = applicability;
         if let Some(message) = verification_error {
             diagnostics.push(WorkspaceHistoryDiagnostic::new(
@@ -1300,8 +1307,7 @@ pub fn read_legacy_plan_external_resolutions_readonly(
             // projection becomes task-scoped.
             projected.scope = WorkspaceExternalResolutionScope::Tasks;
         }
-        if applicability.is_applicable()
-            && projected.scope == WorkspaceExternalResolutionScope::Job
+        if applicability.is_applicable() && projected.scope == WorkspaceExternalResolutionScope::Job
         {
             verified.full_job_applicable = true;
         }
@@ -1459,11 +1465,7 @@ fn classify_legacy_plan_external_resolution_applicability_readonly(
             Some("Current planning reservations are ambiguous or pending reconciliation."),
         );
     }
-    if !verify_no_active_owner_readonly(
-        stores.plans_dir,
-        chat_identity,
-        &approval.approval_id,
-    ) {
+    if !verify_no_active_owner_readonly(stores.plans_dir, chat_identity, &approval.approval_id) {
         return (
             WorkspaceExternalResolutionApplicability::Unverified,
             Some("Current legacy approval ownership evidence does not permit applicability."),
@@ -1601,8 +1603,7 @@ fn verify_legacy_plan_receipt_identity_and_project(
     if receipt.project.base_tree_sha.is_some()
         || receipt.project.canonical_repo_root.as_path()
             != Path::new(&chat_identity.canonical_project_scope)
-        || receipt.project.canonical_repo_root.as_path()
-            != Path::new(scope.canonical_project_scope)
+        || receipt.project.canonical_repo_root.as_path() != Path::new(scope.canonical_project_scope)
     {
         return Err(
             "Legacy external resolution receipt canonical project/base/tree does not match scope.",
@@ -1731,9 +1732,7 @@ fn classify_external_resolution_applicability_readonly(
     } else if receipt.source_controller_ledger_revision > 0 {
         return (
             WorkspaceExternalResolutionApplicability::Unverified,
-            Some(
-                "Controller ledger evidence is missing for external resolution applicability.",
-            ),
+            Some("Controller ledger evidence is missing for external resolution applicability."),
         );
     }
 
@@ -1746,10 +1745,7 @@ fn classify_external_resolution_applicability_readonly(
         stores.plans_dir,
     ) {
         Ok(ExternalResolutionApplicability::Stale { .. }) => {
-            return (
-                WorkspaceExternalResolutionApplicability::Stale,
-                None,
-            );
+            return (WorkspaceExternalResolutionApplicability::Stale, None);
         }
         Ok(ExternalResolutionApplicability::Applicable) => {
             WorkspaceExternalResolutionApplicability::Applicable
@@ -1794,7 +1790,9 @@ fn classify_external_resolution_applicability_readonly(
     if !verify_no_active_job_owner_readonly(stores.plans_dir, chat_identity, job) {
         return (
             WorkspaceExternalResolutionApplicability::Unverified,
-            Some("Current job ownership evidence does not permit external resolution applicability."),
+            Some(
+                "Current job ownership evidence does not permit external resolution applicability.",
+            ),
         );
     }
     if receipt.approval_id.is_some() {
@@ -1908,7 +1906,9 @@ fn verify_exact_current_job_receipt_links(
             let plan = plan_snapshot
                 .revisions_by_key
                 .get(&(plan_id.clone(), plan_revision))
-                .ok_or("External resolution plan revision is missing from the current PlanStore.")?;
+                .ok_or(
+                    "External resolution plan revision is missing from the current PlanStore.",
+                )?;
             if plan.binding_id != receipt.binding_id {
                 return Err("External resolution plan revision belongs to a different binding.");
             }
@@ -1917,8 +1917,7 @@ fn verify_exact_current_job_receipt_links(
                 linked = true;
                 if &planning_result.plan_id != plan_id
                     || planning_result.plan_revision != plan_revision
-                    || receipt.plan_digest.as_deref()
-                        != Some(planning_result.plan_digest.as_str())
+                    || receipt.plan_digest.as_deref() != Some(planning_result.plan_digest.as_str())
                 {
                     return Err(
                         "External resolution plan link drifted from the job planning result.",
@@ -1929,8 +1928,7 @@ fn verify_exact_current_job_receipt_links(
                 linked = true;
                 if &approval_linkage.plan_id != plan_id
                     || approval_linkage.plan_revision != plan_revision
-                    || receipt.plan_digest.as_deref()
-                        != Some(approval_linkage.plan_digest.as_str())
+                    || receipt.plan_digest.as_deref() != Some(approval_linkage.plan_digest.as_str())
                 {
                     return Err(
                         "External resolution plan link drifted from the job approval linkage.",
@@ -1956,13 +1954,13 @@ fn verify_exact_current_job_receipt_links(
     match (&receipt.approval_id, &receipt.approval_subject_digest) {
         (Some(approval_id), Some(subject_digest)) => {
             if !authority_store_configured {
-                return Err(
-                    "Authority evidence is missing for external resolution applicability.",
-                );
+                return Err("Authority evidence is missing for external resolution applicability.");
             }
             let approval = authority_records_by_id
                 .and_then(|records| records.get(approval_id))
-                .ok_or("External resolution approval is missing from the current authority store.")?;
+                .ok_or(
+                    "External resolution approval is missing from the current authority store.",
+                )?;
             if approval.binding_id != receipt.binding_id
                 || approval.thread_uuid != receipt.thread_uuid
                 || approval.repository_path != receipt.project.canonical_repo_root
@@ -1988,7 +1986,8 @@ fn verify_exact_current_job_receipt_links(
                 );
             }
             if let Some(ref plan_id) = receipt.plan_id {
-                if &approval.plan_id != plan_id || receipt.plan_revision != Some(approval.plan_revision)
+                if &approval.plan_id != plan_id
+                    || receipt.plan_revision != Some(approval.plan_revision)
                 {
                     return Err("External resolution approval plan/revision link drifted.");
                 }
