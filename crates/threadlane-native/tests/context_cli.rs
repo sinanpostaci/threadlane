@@ -464,8 +464,7 @@ fn parse_flow_data(output: &Output) -> Value {
         "flow command failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let envelope: Value =
-        serde_json::from_slice(&output.stdout).expect("parse flow JSON envelope");
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("parse flow JSON envelope");
     assert_eq!(envelope["untrusted_data"], true);
     envelope["data"].clone()
 }
@@ -490,10 +489,7 @@ fn assert_no_host_repo_or_journal_effects(
         "external-resolution CLI must not mutate repository files"
     );
     assert!(
-        !fixture
-            .plans_dir
-            .join("observation-journal.jsonl")
-            .exists(),
+        !fixture.plans_dir.join("observation-journal.jsonl").exists(),
         "external-resolution CLI must not create an observation journal"
     );
 }
@@ -3540,10 +3536,8 @@ async fn external_resolution_real_flow_cli_preview_record_inspect_reconcile_and_
         "threadlane-flow",
     );
 
-    let context = f.write_private_context(
-        "external-resolution-context.json",
-        &f.valid_context_json(),
-    );
+    let context =
+        f.write_private_context("external-resolution-context.json", &f.valid_context_json());
     let context = context.to_str().expect("utf8 context path").to_string();
     let approval = AuthorityStore::get_for_operator_readonly_at(&f.authority_dir, &f.approval_id)
         .expect("read the fixture's real approval");
@@ -3568,7 +3562,10 @@ async fn external_resolution_real_flow_cli_preview_record_inspect_reconcile_and_
         "external-resolution-request.json",
         &serde_json::to_value(&request).expect("serialize external resolution request"),
     );
-    let request_path = request_path.to_str().expect("utf8 request path").to_string();
+    let request_path = request_path
+        .to_str()
+        .expect("utf8 request path")
+        .to_string();
 
     let head_before = fs::read_to_string(f.project_root.join(".git/HEAD")).expect("read HEAD");
     let lib_before = fs::read(f.project_root.join("src/lib.rs")).expect("read fixture source");
@@ -3690,10 +3687,8 @@ async fn external_resolution_real_flow_cli_preview_record_inspect_reconcile_and_
         .expect("request object for self-attestation");
     object.insert("trusted_local_attested".to_string(), json!(true));
     object.insert("operator_approved".to_string(), json!(true));
-    let self_attested_path = f.write_private_context(
-        "external-resolution-self-attested.json",
-        &self_attested,
-    );
+    let self_attested_path =
+        f.write_private_context("external-resolution-self-attested.json", &self_attested);
     let self_attested_path = self_attested_path
         .to_str()
         .expect("utf8 self-attested request path")
@@ -3925,7 +3920,10 @@ async fn external_resolution_real_flow_cli_preview_record_inspect_reconcile_and_
     // Direct flow invocations with the pinned R2 root are refused for both inspect entry routes
     // and for reconcile, proving the context router cannot be bypassed.
     let flow_bin = f.pkg_bin_dir.join("threadlane-flow");
-    let other_project_str = other_project.to_str().expect("utf8 other project").to_string();
+    let other_project_str = other_project
+        .to_str()
+        .expect("utf8 other project")
+        .to_string();
 
     let mut direct_inspect_args = five_store_scope_args(&f);
     direct_inspect_args.extend([
@@ -3936,10 +3934,7 @@ async fn external_resolution_real_flow_cli_preview_record_inspect_reconcile_and_
         "--request-key".to_string(),
         request.request_key.clone(),
     ]);
-    let direct_inspect_refs: Vec<&str> = direct_inspect_args
-        .iter()
-        .map(String::as_str)
-        .collect();
+    let direct_inspect_refs: Vec<&str> = direct_inspect_args.iter().map(String::as_str).collect();
     let direct_inspect = run_bin(&flow_bin, &direct_inspect_refs).await;
     assert_error_code(&direct_inspect, "scope_mismatch");
 
@@ -3950,10 +3945,8 @@ async fn external_resolution_real_flow_cli_preview_record_inspect_reconcile_and_
         "external-resolution".to_string(),
         "inspect".to_string(),
     ]);
-    let direct_inspect_all_refs: Vec<&str> = direct_inspect_all_args
-        .iter()
-        .map(String::as_str)
-        .collect();
+    let direct_inspect_all_refs: Vec<&str> =
+        direct_inspect_all_args.iter().map(String::as_str).collect();
     let direct_inspect_all = run_bin(&flow_bin, &direct_inspect_all_refs).await;
     assert_error_code(&direct_inspect_all, "scope_mismatch");
 
@@ -3972,10 +3965,8 @@ async fn external_resolution_real_flow_cli_preview_record_inspect_reconcile_and_
         "--reconcile-existing".to_string(),
         "--operator-approved".to_string(),
     ]);
-    let direct_reconcile_refs: Vec<&str> = direct_reconcile_args
-        .iter()
-        .map(String::as_str)
-        .collect();
+    let direct_reconcile_refs: Vec<&str> =
+        direct_reconcile_args.iter().map(String::as_str).collect();
     let direct_reconcile = run_bin(&flow_bin, &direct_reconcile_refs).await;
     assert_error_code(&direct_reconcile, "scope_mismatch");
 
