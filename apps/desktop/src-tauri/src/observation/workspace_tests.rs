@@ -3600,7 +3600,9 @@ mod unix_workspace_tests {
         assert!(history.external_resolutions.is_empty());
         assert_eq!(history.job.state, ObservationJobState::Failed);
         assert_eq!(history.job.execution_status, "failed");
-        assert_eq!(history.job.review_state.as_deref(), Some("pending_review"));
+        // The real review lifecycle remains invalidated without an accepted
+        // review; this is independent of the worker's ready_for_review status.
+        assert_eq!(history.job.review_state.as_deref(), Some("invalidated"));
         let job_attention = history
             .current_attention
             .as_ref()
