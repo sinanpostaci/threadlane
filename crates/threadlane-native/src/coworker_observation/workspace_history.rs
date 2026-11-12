@@ -36,8 +36,14 @@
 //!   digests, commits, trees, normalized frozen command-path data, and original frozen revisions
 //!   rather than requiring current live Git `HEAD`, active plan status, latest registry revision
 //!   equality, or continued on-disk availability of past worker/check executables.
+//! - **Scope-first causal lineage validation**: Verified in-scope amendment `follow_up_job_ids`
+//!   are preserved in deterministic `(target_job_revision, job_id)` order, while conflicting
+//!   admitted successors, cycles, or missing/unverified targets in a connected local lineage
+//!   component conservatively clear canonical `superseded_by_job_id` and refuse obsolete-planning
+//!   attention retirement regardless of ledger vector order. Scope-rejected foreign records never
+//!   mint proof or poison verified local components.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -448,45 +454,20 @@ pub fn read_scoped_workspace_job_histories(
         admitted_by_id.insert(entry.job.job_id.as_str(), entry);
     }
 
-    let mut follow_ups_by_target: BTreeMap<&str, Vec<String>> = BTreeMap::new();
-    let mut superseded_by_target: BTreeMap<&str, String> = BTreeMap::new();
-    for entry in &admitted_jobs {
-        if let (
-            Some(ref sup_target_id),
-            WorkBriefKind::Amendment {
-                ref target_job_id,
-                target_job_revision,
-                ..
-            },
-        ) = (&entry.job.supersedes_job_id, &entry.job.work_brief.kind)
-        {
-            if sup_target_id != target_job_id || *target_job_revision == 0 {
-                continue;
-            }
-            if admitted_by_id
-                .get(sup_target_id.as_str())
-                .is_some_and(|target_entry| {
-                    target_entry.job.job_id != entry.job.job_id
-                        && *target_job_revision <= target_entry.job.job_revision
-                })
-            {
-                follow_ups_by_target
-                    .entry(sup_target_id.as_str())
-                    .or_default()
-                    .push(entry.job.job_id.clone());
-                superseded_by_target.insert(sup_target_id.as_str(), entry.job.job_id.clone());
-            }
-        }
-    }
+    let lineage = build_validated_scoped_lineage(&admitted_jobs, &admitted_by_id);
 
     let mut projected_jobs = Vec::with_capacity(admitted_jobs.len());
 
     for entry in &admitted_jobs {
         let job = entry.job;
         let context = WorkspaceJobLineageContext {
-            superseded_by_job_id: superseded_by_target.get(job.job_id.as_str()).cloned(),
+            superseded_by_job_id: lineage
+                .superseded_by_target
+                .get(job.job_id.as_str())
+                .cloned(),
             parent_job_id: None,
-            follow_up_job_ids: follow_ups_by_target
+            follow_up_job_ids: lineage
+                .follow_ups_by_target
                 .get(job.job_id.as_str())
                 .cloned()
                 .unwrap_or_default(),
@@ -495,8 +476,12 @@ pub fn read_scoped_workspace_job_histories(
             runtime_missing_or_degraded: entry.runtime_missing_or_degraded,
         };
 
-        let verified_obsolete_planning =
-            verify_obsolete_planning_supersession_readonly(&ledger, entry, &admitted_jobs);
+        let verified_obsolete_planning = verify_obsolete_planning_supersession_readonly(
+            &ledger,
+            entry,
+            &admitted_by_id,
+            &lineage,
+        );
 
         let verified_acceptance = if job.phase == CoworkerJobPhase::Completed {
             let store_ctx = HistoricalStoreVerificationContext {
@@ -771,6 +756,184 @@ fn validate_chat_identity_and_canonical_repo_on_disk(
     Ok(())
 }
 
+struct ValidatedScopedLineage<'l> {
+    follow_ups_by_target: BTreeMap<&'l str, Vec<String>>,
+    superseded_by_target: BTreeMap<&'l str, String>,
+    tainted_job_ids: BTreeSet<&'l str>,
+}
+
+fn build_validated_scoped_lineage<'a, 'l>(
+    admitted_jobs: &'a [PrevalidatedScopedJob<'l>],
+    admitted_by_id: &BTreeMap<&'l str, &'a PrevalidatedScopedJob<'l>>,
+) -> ValidatedScopedLineage<'l> {
+    let mut raw_follow_ups_by_target: BTreeMap<&'l str, Vec<(u64, &'l str)>> = BTreeMap::new();
+    let mut undirected_neighbors: BTreeMap<&'l str, BTreeSet<&'l str>> = BTreeMap::new();
+    let mut direct_tainted: BTreeSet<&'l str> = BTreeSet::new();
+
+    if admitted_jobs.len() != admitted_by_id.len() {
+        for entry in admitted_jobs {
+            direct_tainted.insert(entry.job.job_id.as_str());
+        }
+    }
+
+    {
+        let mut link_undirected = |left: &'l str, right: &'l str| {
+            if left != right {
+                undirected_neighbors.entry(left).or_default().insert(right);
+                undirected_neighbors.entry(right).or_default().insert(left);
+            }
+        };
+
+        for entry in admitted_jobs {
+            let job = entry.job;
+            let succ_id = job.job_id.as_str();
+            match (&job.supersedes_job_id, &job.work_brief.kind) {
+                (None, WorkBriefKind::NewJob) => {}
+                (
+                    Some(sup_target_id),
+                    WorkBriefKind::Amendment {
+                        target_job_id,
+                        target_job_revision,
+                        ..
+                    },
+                ) => {
+                    let target_id = sup_target_id.as_str();
+                    let target_rev_ok = match admitted_by_id.get(target_id) {
+                        Some(t) => *target_job_revision <= t.job.job_revision,
+                        None => false,
+                    };
+                    let valid_in_scope_edge = sup_target_id == target_job_id
+                        && *target_job_revision >= 1
+                        && target_id != succ_id
+                        && target_rev_ok;
+                    if valid_in_scope_edge {
+                        raw_follow_ups_by_target
+                            .entry(target_id)
+                            .or_default()
+                            .push((*target_job_revision, succ_id));
+                        link_undirected(target_id, succ_id);
+                    } else {
+                        direct_tainted.insert(succ_id);
+                        if admitted_by_id.contains_key(target_id) {
+                            link_undirected(target_id, succ_id);
+                        }
+                        let brief_target = target_job_id.as_str();
+                        if brief_target != target_id && admitted_by_id.contains_key(brief_target) {
+                            link_undirected(brief_target, succ_id);
+                        }
+                    }
+                }
+                (sup_opt, kind) => {
+                    direct_tainted.insert(succ_id);
+                    if let Some(sup_target_id) = sup_opt {
+                        let target_id = sup_target_id.as_str();
+                        if admitted_by_id.contains_key(target_id) {
+                            link_undirected(target_id, succ_id);
+                        }
+                    }
+                    if let WorkBriefKind::Amendment { target_job_id, .. } = kind {
+                        let brief_target = target_job_id.as_str();
+                        if admitted_by_id.contains_key(brief_target) {
+                            link_undirected(brief_target, succ_id);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut directed_children: BTreeMap<&'l str, Vec<&'l str>> = BTreeMap::new();
+    let mut in_degree: BTreeMap<&'l str, usize> =
+        admitted_by_id.keys().map(|&id| (id, 0usize)).collect();
+    let mut follow_ups_by_target: BTreeMap<&'l str, Vec<String>> = BTreeMap::new();
+
+    for (target_id, mut edges) in raw_follow_ups_by_target {
+        edges.sort_unstable();
+        if edges.len() > 1 {
+            direct_tainted.insert(target_id);
+        }
+        let mut children = Vec::with_capacity(edges.len());
+        let mut owned_ids = Vec::with_capacity(edges.len());
+        for (_, succ_id) in edges {
+            if children.last().copied() != Some(succ_id) {
+                children.push(succ_id);
+                owned_ids.push(succ_id.to_string());
+                if let Some(deg) = in_degree.get_mut(succ_id) {
+                    *deg += 1;
+                }
+            } else {
+                direct_tainted.insert(target_id);
+            }
+        }
+        directed_children.insert(target_id, children);
+        follow_ups_by_target.insert(target_id, owned_ids);
+    }
+
+    for entry in admitted_jobs {
+        let job = entry.job;
+        let job_id = job.job_id.as_str();
+        let follow_ups = follow_ups_by_target.get(job_id).map(Vec::as_slice);
+        for hold in &job.holds {
+            if !amendment_hold_matches_followup(job, hold, follow_ups, admitted_by_id) {
+                direct_tainted.insert(job_id);
+                break;
+            }
+        }
+    }
+
+    let mut zero_in_queue: VecDeque<&'l str> = in_degree
+        .iter()
+        .filter_map(|(&id, &deg)| (deg == 0).then_some(id))
+        .collect();
+    while let Some(node) = zero_in_queue.pop_front() {
+        if let Some(children) = directed_children.get(node) {
+            for &child in children {
+                if let Some(deg) = in_degree.get_mut(child) {
+                    *deg = deg.saturating_sub(1);
+                    if *deg == 0 {
+                        zero_in_queue.push_back(child);
+                    }
+                }
+            }
+        }
+    }
+    for (&id, &remaining_deg) in &in_degree {
+        if remaining_deg > 0 {
+            direct_tainted.insert(id);
+        }
+    }
+
+    let mut tainted_job_ids: BTreeSet<&'l str> = BTreeSet::new();
+    let mut bfs_queue: VecDeque<&'l str> = VecDeque::new();
+    for &seed in &direct_tainted {
+        if tainted_job_ids.insert(seed) {
+            bfs_queue.push_back(seed);
+        }
+    }
+    while let Some(curr) = bfs_queue.pop_front() {
+        if let Some(neighbors) = undirected_neighbors.get(curr) {
+            for &next in neighbors {
+                if tainted_job_ids.insert(next) {
+                    bfs_queue.push_back(next);
+                }
+            }
+        }
+    }
+
+    let mut superseded_by_target: BTreeMap<&'l str, String> = BTreeMap::new();
+    for (&target_id, follow_ups) in &follow_ups_by_target {
+        if !tainted_job_ids.contains(target_id) && follow_ups.len() == 1 {
+            superseded_by_target.insert(target_id, follow_ups[0].clone());
+        }
+    }
+
+    ValidatedScopedLineage {
+        follow_ups_by_target,
+        superseded_by_target,
+        tainted_job_ids,
+    }
+}
+
 fn successor_amendment_hold_revision(
     old_job: &CoworkerJobRecord,
     succ_job: &CoworkerJobRecord,
@@ -794,39 +957,83 @@ fn successor_amendment_hold_revision(
     }
 }
 
-fn verify_obsolete_planning_supersession_readonly(
+fn amendment_hold_matches_followup<'l>(
+    job: &CoworkerJobRecord,
+    hold: &WorkflowHoldRecord,
+    follow_ups: Option<&[String]>,
+    admitted_by_id: &BTreeMap<&'l str, &PrevalidatedScopedJob<'l>>,
+) -> bool {
+    if hold.reason != WorkflowHoldReason::BriefAmendmentPending {
+        return true;
+    }
+    let Some(expected_req_key) = hold.request_key.strip_prefix("amend_") else {
+        return true;
+    };
+    let Some(succ_ids) = follow_ups else {
+        return false;
+    };
+    for succ_id in succ_ids {
+        if let Some(succ_entry) = admitted_by_id.get(succ_id.as_str()) {
+            let expected_rev = successor_amendment_hold_revision(job, succ_entry.job);
+            if succ_entry.job.create_request_key == expected_req_key
+                && expected_rev == Some(hold.created_at_job_revision)
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn job_hold_matches_successor(
+    hold: &WorkflowHoldRecord,
+    succ_job: &CoworkerJobRecord,
+    expected_hold_rev: u64,
+) -> bool {
+    hold.reason == WorkflowHoldReason::BriefAmendmentPending
+        && hold.created_at_job_revision == expected_hold_rev
+        && hold
+            .request_key
+            .strip_prefix("amend_")
+            .is_some_and(|rk| rk == succ_job.create_request_key)
+}
+
+fn verify_obsolete_planning_supersession_readonly<'l>(
     ledger: &CoworkerBindingLedger,
-    old_entry: &PrevalidatedScopedJob<'_>,
-    admitted_jobs: &[PrevalidatedScopedJob<'_>],
+    old_entry: &PrevalidatedScopedJob<'l>,
+    admitted_by_id: &BTreeMap<&'l str, &PrevalidatedScopedJob<'l>>,
+    lineage: &ValidatedScopedLineage<'l>,
 ) -> Option<VerifiedObsoletePlanningSupersession> {
+    let old_job = old_entry.job;
+    if lineage.tainted_job_ids.contains(old_job.job_id.as_str()) {
+        return None;
+    }
+    let canonical_succ_id = lineage
+        .superseded_by_target
+        .get(old_job.job_id.as_str())?
+        .as_str();
+    let succ_entry = admitted_by_id.get(canonical_succ_id)?;
+
     if !job_is_effect_free_obsolete_planning(ledger, old_entry) {
         return None;
     }
 
-    let old_job = old_entry.job;
-    let has_verified_successor = admitted_jobs
+    let succ_job = succ_entry.job;
+    let hold_rev = successor_amendment_hold_revision(old_job, succ_job)?;
+
+    let has_causal_amendment_hold = old_job
+        .holds
         .iter()
-        .any(|succ_entry| successor_amendment_hold_revision(old_job, succ_entry.job).is_some());
-    if !has_verified_successor {
+        .any(|h| job_hold_matches_successor(h, succ_job, hold_rev));
+    if !has_causal_amendment_hold {
         return None;
     }
 
-    let all_active_holds_causally_verified =
-        old_job.holds.iter().filter(|h| h.active).all(|hold| {
-            hold.reason == WorkflowHoldReason::BriefAmendmentPending
-                && admitted_jobs.iter().any(|succ_entry| {
-                    let succ_job = succ_entry.job;
-                    successor_amendment_hold_revision(old_job, succ_job).is_some_and(
-                        |expected_hold_rev| {
-                            hold.created_at_job_revision == expected_hold_rev
-                                && hold
-                                    .request_key
-                                    .strip_prefix("amend_")
-                                    .is_some_and(|rk| rk == succ_job.create_request_key)
-                        },
-                    )
-                })
-        });
+    let all_active_holds_causally_verified = old_job
+        .holds
+        .iter()
+        .filter(|h| h.active)
+        .all(|h| job_hold_matches_successor(h, succ_job, hold_rev));
 
     all_active_holds_causally_verified.then_some(VerifiedObsoletePlanningSupersession)
 }

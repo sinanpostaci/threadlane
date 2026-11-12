@@ -46,6 +46,7 @@ use threadlane_native::coworker_workflow::{
     StructuredReviewVerdict, TaskAttemptExecutionArtifacts, TaskAttemptRef, TaskCandidateRef,
     TaskInterfaceOwnershipSpec, WorkBrief, WorkBriefKind, WorkflowHoldReason, WorkflowHoldRecord,
 };
+use threadlane_native::error::NativeErrorCode;
 use threadlane_native::profile_flow::{
     ExecutionPolicy, PolicyAllowRule, RoleExecutionRoute, SelectedRoleChoice,
 };
@@ -5674,4 +5675,1020 @@ fn preserves_unresolved_effect_attention_across_stop_supersession_and_completed_
         assert_eq!(hist.job.state, ObservationJobState::Unknown);
         assert_eq!(hist.acceptance_proof, WorkspaceAcceptanceProof::unknown());
     }
+}
+
+fn collect_dir_sha256(base: &Path, dir: &Path, hashes: &mut BTreeMap<String, String>) {
+    for entry in fs::read_dir(dir).expect("read directory for sha256 snapshot") {
+        let entry = entry.expect("directory entry");
+        let path = entry.path();
+        let meta = fs::symlink_metadata(&path).expect("entry metadata");
+        if meta.is_dir() {
+            collect_dir_sha256(base, &path, hashes);
+        } else {
+            let rel = path
+                .strip_prefix(base)
+                .expect("relative store path")
+                .to_string_lossy()
+                .into_owned();
+            let bytes = fs::read(&path).expect("read store file bytes");
+            let digest = threadlane_native::coworker_workflow::sha256_hex(&bytes);
+            hashes.insert(rel, digest);
+        }
+    }
+}
+
+fn snapshot_private_dir_sha256(dir: &Path) -> BTreeMap<String, String> {
+    let mut hashes = BTreeMap::new();
+    collect_dir_sha256(dir, dir, &mut hashes);
+    hashes
+}
+
+#[allow(clippy::too_many_arguments)]
+fn create_public_store_job(
+    workflow_store: &CoworkerWorkflowStore,
+    project_base: &CanonicalProjectBaseRef,
+    binding_id: &str,
+    thread_uuid: &str,
+    expected_ledger_revision: u64,
+    request_key: &str,
+    brief_id: &str,
+    kind: WorkBriefKind,
+    summary: &str,
+) -> CoworkerJobRecord {
+    let (brief, _) = sample_work_brief(
+        brief_id,
+        binding_id,
+        thread_uuid,
+        project_base.clone(),
+        kind,
+        summary,
+    );
+    workflow_store
+        .create_or_amend_job(&CreateCoworkerJobRequest {
+            binding_id: binding_id.to_string(),
+            thread_uuid: thread_uuid.to_string(),
+            request_key: request_key.to_string(),
+            expected_ledger_revision: Some(expected_ledger_revision),
+            work_brief: brief,
+            amended_target_task_ids: Vec::new(),
+            amended_write_paths: Vec::new(),
+            amended_interfaces: Vec::new(),
+        })
+        .expect("public create_or_amend_job")
+}
+
+fn find_projected_job(
+    jobs: &[threadlane_core::observation::WorkspaceJobHistory],
+    id: &str,
+) -> threadlane_core::observation::WorkspaceJobHistory {
+    jobs.iter()
+        .find(|j| j.job.job_id == id)
+        .unwrap_or_else(|| panic!("missing projected job {id}"))
+        .clone()
+}
+
+#[test]
+fn conflicting_public_store_amendments_do_not_select_arbitrary_successor_or_retire_attention() {
+    let tmp = TempDir::new().expect("tempdir");
+    let root = fs::canonicalize(tmp.path()).expect("canonicalize temp root");
+    let plans_dir = make_private_dir(&root.join("plans-branch-regression"));
+
+    let raw_repo = root.join("repo-branch-regression");
+    let (base_commit, _) = init_phase2_git_repo(&raw_repo);
+    let repo_dir = fs::canonicalize(&raw_repo).expect("canonicalize git repo");
+    let project_base = CanonicalProjectBaseRef::resolve_and_validate(&repo_dir, &base_commit)
+        .expect("resolve live git project base");
+
+    let chat_a =
+        WorkspaceChatIdentity::new(SOURCE_A, BINDING_A, THREAD_A, &repo_dir.to_string_lossy())
+            .expect("chat_a identity");
+    let chat_b =
+        WorkspaceChatIdentity::new(SOURCE_A, BINDING_B, THREAD_B, &repo_dir.to_string_lossy())
+            .expect("chat_b identity");
+
+    let workflow_store = CoworkerWorkflowStore::new(&plans_dir).expect("open workflow store");
+
+    // Component 1: Real public-store consecutive amendments of the same target (`branch_root`).
+    // First amendment advances `branch_root` from rev 1 -> rev 2 (`Held`); second amendment
+    // advances `branch_root` from rev 2 -> rev 3 (`Held` with two active causal amendment holds).
+    let branch_root = create_public_store_job(
+        &workflow_store,
+        &project_base,
+        BINDING_A,
+        THREAD_A,
+        0,
+        "req_branch_root_01",
+        "brf_branch_root_01",
+        WorkBriefKind::NewJob,
+        "Root planning job with competing amendments",
+    );
+    assert_eq!(branch_root.job_revision, 1);
+
+    let branch_alpha = create_public_store_job(
+        &workflow_store,
+        &project_base,
+        BINDING_A,
+        THREAD_A,
+        1,
+        "req_branch_alpha_02",
+        "brf_branch_alpha_02",
+        WorkBriefKind::Amendment {
+            target_job_id: branch_root.job_id.clone(),
+            target_job_revision: 1,
+            amendment_reason: "First competing amendment branch".to_string(),
+        },
+        "Competing amendment branch Alpha",
+    );
+    let branch_bravo = create_public_store_job(
+        &workflow_store,
+        &project_base,
+        BINDING_A,
+        THREAD_A,
+        2,
+        "req_branch_bravo_03",
+        "brf_branch_bravo_03",
+        WorkBriefKind::Amendment {
+            target_job_id: branch_root.job_id.clone(),
+            target_job_revision: 2,
+            amendment_reason: "Second competing amendment branch".to_string(),
+        },
+        "Competing amendment branch Bravo",
+    );
+
+    // Component 2: Two-step chain (`chain_conflict_1 -> chain_conflict_2`) whose downstream head
+    // branches into `chain_conflict_3a` and `chain_conflict_3b`, tainting that connected component.
+    let chain_conflict_1 = create_public_store_job(
+        &workflow_store,
+        &project_base,
+        BINDING_A,
+        THREAD_A,
+        3,
+        "req_cc_01",
+        "brf_cc_01",
+        WorkBriefKind::NewJob,
+        "Upstream step in conflicted lineage component",
+    );
+    let chain_conflict_2 = create_public_store_job(
+        &workflow_store,
+        &project_base,
+        BINDING_A,
+        THREAD_A,
+        4,
+        "req_cc_02",
+        "brf_cc_02",
+        WorkBriefKind::Amendment {
+            target_job_id: chain_conflict_1.job_id.clone(),
+            target_job_revision: 1,
+            amendment_reason: "Linear step before downstream fork".to_string(),
+        },
+        "Midpoint step that forks into two competing amendments",
+    );
+    let chain_conflict_3a = create_public_store_job(
+        &workflow_store,
+        &project_base,
+        BINDING_A,
+        THREAD_A,
+        5,
+        "req_cc_03a",
+        "brf_cc_03a",
+        WorkBriefKind::Amendment {
+            target_job_id: chain_conflict_2.job_id.clone(),
+            target_job_revision: 1,
+            amendment_reason: "Downstream fork option A".to_string(),
+        },
+        "Downstream fork option A",
+    );
+    let chain_conflict_3b = create_public_store_job(
+        &workflow_store,
+        &project_base,
+        BINDING_A,
+        THREAD_A,
+        6,
+        "req_cc_03b",
+        "brf_cc_03b",
+        WorkBriefKind::Amendment {
+            target_job_id: chain_conflict_2.job_id.clone(),
+            target_job_revision: 2,
+            amendment_reason: "Downstream fork option B".to_string(),
+        },
+        "Downstream fork option B",
+    );
+
+    // Component 3: Unrelated valid two-step chain (`valid_1 -> valid_2 -> valid_3`) in the same
+    // binding ledger, which must still retire obsolete planning attention cleanly.
+    let valid_1 = create_public_store_job(
+        &workflow_store,
+        &project_base,
+        BINDING_A,
+        THREAD_A,
+        7,
+        "req_valid_chain_01",
+        "brf_valid_chain_01",
+        WorkBriefKind::NewJob,
+        "Unrelated valid chain root",
+    );
+    let valid_2 = create_public_store_job(
+        &workflow_store,
+        &project_base,
+        BINDING_A,
+        THREAD_A,
+        8,
+        "req_valid_chain_02",
+        "brf_valid_chain_02",
+        WorkBriefKind::Amendment {
+            target_job_id: valid_1.job_id.clone(),
+            target_job_revision: 1,
+            amendment_reason: "Valid chain step 2".to_string(),
+        },
+        "Unrelated valid chain midpoint",
+    );
+    let valid_3 = create_public_store_job(
+        &workflow_store,
+        &project_base,
+        BINDING_A,
+        THREAD_A,
+        9,
+        "req_valid_chain_03",
+        "brf_valid_chain_03",
+        WorkBriefKind::Amendment {
+            target_job_id: valid_2.job_id.clone(),
+            target_job_revision: 1,
+            amendment_reason: "Valid chain step 3".to_string(),
+        },
+        "Unrelated valid chain current head",
+    );
+
+    // Separate binding (`BINDING_B` / `THREAD_B`) to prove cross-binding isolation.
+    let bravo_old = create_public_store_job(
+        &workflow_store,
+        &project_base,
+        BINDING_B,
+        THREAD_B,
+        0,
+        "req_bravo_chain_01",
+        "brf_bravo_chain_01",
+        WorkBriefKind::NewJob,
+        "Separate binding superseded planning job",
+    );
+    let bravo_new = create_public_store_job(
+        &workflow_store,
+        &project_base,
+        BINDING_B,
+        THREAD_B,
+        1,
+        "req_bravo_chain_02",
+        "brf_bravo_chain_02",
+        WorkBriefKind::Amendment {
+            target_job_id: bravo_old.job_id.clone(),
+            target_job_revision: 1,
+            amendment_reason: "Separate binding clean amendment".to_string(),
+        },
+        "Separate binding active planning head",
+    );
+
+    let stored_ledger_a = workflow_store
+        .read_binding_ledger(BINDING_A)
+        .expect("read binding A ledger");
+    let stored_branch_root = stored_ledger_a
+        .jobs
+        .iter()
+        .find(|j| j.job_id == branch_root.job_id)
+        .expect("branch_root stored");
+    assert_eq!(stored_branch_root.job_revision, 3);
+    assert_eq!(stored_branch_root.phase, CoworkerJobPhase::Held);
+    assert_eq!(stored_branch_root.holds.len(), 2);
+
+    // Caller-supplied `WorkspaceJobLineageContext` never mints the private retirement witness.
+    let forged_ctx = WorkspaceJobLineageContext {
+        superseded_by_job_id: Some(branch_alpha.job_id.clone()),
+        follow_up_job_ids: vec![branch_alpha.job_id.clone()],
+        ..WorkspaceJobLineageContext::default()
+    };
+    let caller_projected =
+        project_coworker_job_history(&chat_a, stored_branch_root, None, Some(&forged_ctx))
+            .expect("caller projection");
+    assert_eq!(
+        caller_projected.current_attention.as_ref().map(|a| a.kind),
+        Some(WorkspaceAttentionKind::OnHold)
+    );
+    assert_eq!(caller_projected.job.state, ObservationJobState::NeedsUser);
+
+    remove_lockfiles_in_dir(&plans_dir);
+    let hashes_before = snapshot_private_dir_sha256(&plans_dir);
+
+    let stores = WorkspaceHistoryStores::new(&plans_dir);
+    let forward_read =
+        read_scoped_workspace_job_histories(&chat_a, &stores).expect("forward scoped read");
+    let bravo_read =
+        read_scoped_workspace_job_histories(&chat_b, &stores).expect("bravo scoped read");
+
+    assert_no_lock_or_wal_files(&plans_dir);
+    assert_eq!(
+        snapshot_private_dir_sha256(&plans_dir),
+        hashes_before,
+        "read_scoped_workspace_job_histories must not mutate any ledger file bytes"
+    );
+
+    assert!(!forward_read.degraded);
+    assert_eq!(forward_read.rejected_scope_count, 0);
+    assert_eq!(forward_read.jobs.len(), 10);
+
+    // Conflicting branch root: must NOT pick last-write-wins `superseded_by_job_id` or retire attention.
+    let h_root = find_projected_job(&forward_read.jobs, &branch_root.job_id);
+    assert_eq!(
+        h_root.links.superseded_by_job_id, None,
+        "conflicting admitted successors must not select an arbitrary current successor"
+    );
+    assert_eq!(
+        h_root.links.follow_up_job_ids,
+        vec![branch_alpha.job_id.clone(), branch_bravo.job_id.clone()],
+        "all verified historical follow-up links must remain visible in deterministic order"
+    );
+    assert_eq!(
+        h_root.current_attention.as_ref().map(|a| a.kind),
+        Some(WorkspaceAttentionKind::OnHold),
+        "conflicting amendment branches must preserve live OnHold attention"
+    );
+    assert_eq!(
+        h_root
+            .current_attention
+            .as_ref()
+            .expect("branch_root attention")
+            .blocking_hold_ids
+            .len(),
+        2
+    );
+    assert_eq!(h_root.job.state, ObservationJobState::NeedsUser);
+    assert_ne!(h_root.job.state, ObservationJobState::Completed);
+    assert_ne!(h_root.job.state, ObservationJobState::Failed);
+    assert_eq!(h_root.job.approval_status, "draft");
+    assert_eq!(h_root.acceptance_proof, WorkspaceAcceptanceProof::unknown());
+
+    for branch_id in [&branch_alpha.job_id, &branch_bravo.job_id] {
+        let h_branch = find_projected_job(&forward_read.jobs, branch_id);
+        assert_eq!(
+            h_branch.links.supersedes_job_id.as_deref(),
+            Some(branch_root.job_id.as_str())
+        );
+        assert_eq!(h_branch.links.superseded_by_job_id, None);
+        assert_eq!(h_branch.job.state, ObservationJobState::Planning);
+        assert_eq!(
+            h_branch.acceptance_proof,
+            WorkspaceAcceptanceProof::unknown()
+        );
+    }
+
+    // Connected component with downstream fork: both `chain_conflict_1` and `chain_conflict_2`
+    // conservatively clear `superseded_by_job_id` and preserve live `OnHold` attention.
+    let h_cc_1 = find_projected_job(&forward_read.jobs, &chain_conflict_1.job_id);
+    assert_eq!(h_cc_1.links.superseded_by_job_id, None);
+    assert_eq!(
+        h_cc_1.links.follow_up_job_ids,
+        vec![chain_conflict_2.job_id.clone()]
+    );
+    assert_eq!(
+        h_cc_1.current_attention.as_ref().map(|a| a.kind),
+        Some(WorkspaceAttentionKind::OnHold)
+    );
+    assert_eq!(h_cc_1.job.state, ObservationJobState::NeedsUser);
+    assert_eq!(h_cc_1.job.approval_status, "draft");
+
+    let h_cc_2 = find_projected_job(&forward_read.jobs, &chain_conflict_2.job_id);
+    assert_eq!(h_cc_2.links.superseded_by_job_id, None);
+    assert_eq!(
+        h_cc_2.links.follow_up_job_ids,
+        vec![
+            chain_conflict_3a.job_id.clone(),
+            chain_conflict_3b.job_id.clone(),
+        ]
+    );
+    assert_eq!(
+        h_cc_2.current_attention.as_ref().map(|a| a.kind),
+        Some(WorkspaceAttentionKind::OnHold)
+    );
+    assert_eq!(h_cc_2.job.state, ObservationJobState::NeedsUser);
+    assert_eq!(h_cc_2.job.approval_status, "draft");
+
+    // Unrelated valid two-step chain in the same ledger still retires obsolete planning attention.
+    let h_valid_1 = find_projected_job(&forward_read.jobs, &valid_1.job_id);
+    assert_eq!(h_valid_1.current_attention, None);
+    assert_eq!(h_valid_1.job.state, ObservationJobState::Unknown);
+    assert_eq!(h_valid_1.job.approval_status, "superseded");
+    assert_eq!(
+        h_valid_1.links.superseded_by_job_id.as_deref(),
+        Some(valid_2.job_id.as_str())
+    );
+    let h_valid_2 = find_projected_job(&forward_read.jobs, &valid_2.job_id);
+    assert_eq!(h_valid_2.current_attention, None);
+    assert_eq!(h_valid_2.job.state, ObservationJobState::Unknown);
+    assert_eq!(h_valid_2.job.approval_status, "superseded");
+    assert_eq!(
+        h_valid_2.links.superseded_by_job_id.as_deref(),
+        Some(valid_3.job_id.as_str())
+    );
+    let h_valid_3 = find_projected_job(&forward_read.jobs, &valid_3.job_id);
+    assert_eq!(h_valid_3.job.state, ObservationJobState::Planning);
+    assert_eq!(h_valid_3.links.superseded_by_job_id, None);
+
+    // Separate binding remains isolated and retires its own valid 1-step chain.
+    assert!(!bravo_read.degraded);
+    assert_eq!(bravo_read.rejected_scope_count, 0);
+    assert_eq!(bravo_read.jobs.len(), 2);
+    let h_bravo_old = find_projected_job(&bravo_read.jobs, &bravo_old.job_id);
+    assert_eq!(h_bravo_old.current_attention, None);
+    assert_eq!(
+        h_bravo_old.links.superseded_by_job_id.as_deref(),
+        Some(bravo_new.job_id.as_str())
+    );
+
+    // Reverse `ledger.jobs` order, validate via `CoworkerBindingLedger::validate` and
+    // `workflow_store.read_binding_ledger`, and prove identical neutral results.
+    let mut reversed_ledger = stored_ledger_a;
+    reversed_ledger.jobs.reverse();
+    reversed_ledger
+        .validate(BINDING_A)
+        .expect("reversed binding ledger must remain typed-valid");
+    let ledger_path_a = workflow_store
+        .ledger_path_for_binding(BINDING_A)
+        .expect("binding A ledger path");
+    write_private_json(&ledger_path_a, &reversed_ledger);
+    let reread_reversed = workflow_store
+        .read_binding_ledger(BINDING_A)
+        .expect("read reversed binding ledger");
+    assert_eq!(reread_reversed.jobs.len(), 10);
+
+    remove_lockfiles_in_dir(&plans_dir);
+    let rev_hashes_before = snapshot_private_dir_sha256(&plans_dir);
+    let reversed_read =
+        read_scoped_workspace_job_histories(&chat_a, &stores).expect("reversed scoped read");
+    assert_no_lock_or_wal_files(&plans_dir);
+    assert_eq!(
+        snapshot_private_dir_sha256(&plans_dir),
+        rev_hashes_before,
+        "reversed ledger read must not mutate stored files"
+    );
+    assert_eq!(
+        reversed_read, forward_read,
+        "reversing ledger.jobs order must produce identical neutral projection and follow-up order"
+    );
+}
+
+#[test]
+fn cyclic_and_dangling_amendment_lineages_preserve_attention_and_isolate_foreign_records() {
+    let tmp = TempDir::new().expect("tempdir");
+    let root = fs::canonicalize(tmp.path()).expect("canonicalize temp root");
+    let plans_dir = make_private_dir(&root.join("plans-cycle-dangling"));
+    let auth_dir = make_private_dir(&root.join("authority-empty"));
+    let reg_dir = make_private_dir(&root.join("reg"));
+    let pln_dir = make_private_dir(&root.join("pln"));
+    let reg = Arc::new(RegistryStore::open(&reg_dir).expect("open registry"));
+    let pln = Arc::new(PlanStore::open(&pln_dir).expect("open plans"));
+    let _ = AuthorityStore::open(&auth_dir, reg, pln).expect("initialize empty authority store");
+    remove_lockfiles_in_dir(&auth_dir);
+
+    let raw_repo_a = root.join("repo-cycle-a");
+    let (base_commit_a, _) = init_phase2_git_repo(&raw_repo_a);
+    let repo_a = fs::canonicalize(&raw_repo_a).expect("canonicalize repo_a");
+    let base_a = CanonicalProjectBaseRef::resolve_and_validate(&repo_a, &base_commit_a)
+        .expect("resolve base_a");
+
+    let repo_b = make_private_dir(&root.join("repo-foreign-b"));
+    let base_b = sample_project_base(&repo_b);
+
+    let chat_a =
+        WorkspaceChatIdentity::new(SOURCE_A, BINDING_A, THREAD_A, &repo_a.to_string_lossy())
+            .expect("chat_a");
+
+    let workflow_store = CoworkerWorkflowStore::new(&plans_dir).expect("open workflow store");
+
+    // Verify public `create_or_amend_job` rejects missing targets (`ValidationFailed`), so cyclic
+    // and dangling-target histories are exercised via typed-validated `CoworkerBindingLedger`.
+    let (missing_target_brief, _) = sample_work_brief(
+        "brf_public_missing_target",
+        BINDING_A,
+        THREAD_A,
+        base_a.clone(),
+        WorkBriefKind::Amendment {
+            target_job_id: "job_missing_000000000000000000000000".to_string(),
+            target_job_revision: 1,
+            amendment_reason: "Attempt amendment against missing target".to_string(),
+        },
+        "Rejected public missing-target amendment",
+    );
+    let missing_err = workflow_store
+        .create_or_amend_job(&CreateCoworkerJobRequest {
+            binding_id: BINDING_A.to_string(),
+            thread_uuid: THREAD_A.to_string(),
+            request_key: "req_public_missing_target".to_string(),
+            expected_ledger_revision: Some(0),
+            work_brief: missing_target_brief,
+            amended_target_task_ids: Vec::new(),
+            amended_write_paths: Vec::new(),
+            amended_interfaces: Vec::new(),
+        })
+        .expect_err("public create_or_amend_job must reject missing target_job_id");
+    assert_eq!(missing_err.error_code(), NativeErrorCode::ValidationFailed);
+
+    // 1. Typed-validated 2-job cycle (`cycle_a <-> cycle_b`), with matching causal amendment holds.
+    let cycle_a_id = "job_cycle_alpha_01".to_string();
+    let cycle_b_id = "job_cycle_bravo_02".to_string();
+    let (b_cyc_a, d_cyc_a) = sample_work_brief(
+        "brf_cycle_alpha",
+        BINDING_A,
+        THREAD_A,
+        base_a.clone(),
+        WorkBriefKind::Amendment {
+            target_job_id: cycle_b_id.clone(),
+            target_job_revision: 1,
+            amendment_reason: "Cycle edge A -> B".to_string(),
+        },
+        "Cyclic awaiting-approval job A",
+    );
+    let job_cycle_a = CoworkerJobRecord {
+        job_id: cycle_a_id.clone(),
+        job_revision: 2,
+        create_request_key: "req_cyc_a".to_string(),
+        binding_id: BINDING_A.to_string(),
+        thread_uuid: THREAD_A.to_string(),
+        phase: CoworkerJobPhase::AwaitingApproval,
+        work_brief: b_cyc_a,
+        work_brief_digest: d_cyc_a,
+        supersedes_job_id: Some(cycle_b_id.clone()),
+        planning_result: None,
+        approval_linkage: None,
+        tasks: Vec::new(),
+        holds: vec![sample_amendment_hold(
+            "hld_cyc_a",
+            "amend_req_cyc_b",
+            2,
+            "Cycle hold from B",
+        )],
+        outbox: Vec::new(),
+        combined_candidates: Vec::new(),
+    };
+    let (b_cyc_b, d_cyc_b) = sample_work_brief(
+        "brf_cycle_bravo",
+        BINDING_A,
+        THREAD_A,
+        base_a.clone(),
+        WorkBriefKind::Amendment {
+            target_job_id: cycle_a_id.clone(),
+            target_job_revision: 1,
+            amendment_reason: "Cycle edge B -> A".to_string(),
+        },
+        "Cyclic held job B",
+    );
+    let job_cycle_b = CoworkerJobRecord {
+        job_id: cycle_b_id.clone(),
+        job_revision: 2,
+        create_request_key: "req_cyc_b".to_string(),
+        binding_id: BINDING_A.to_string(),
+        thread_uuid: THREAD_A.to_string(),
+        phase: CoworkerJobPhase::Held,
+        work_brief: b_cyc_b,
+        work_brief_digest: d_cyc_b,
+        supersedes_job_id: Some(cycle_a_id.clone()),
+        planning_result: None,
+        approval_linkage: None,
+        tasks: Vec::new(),
+        holds: vec![sample_amendment_hold(
+            "hld_cyc_b",
+            "amend_req_cyc_a",
+            2,
+            "Cycle hold from A",
+        )],
+        outbox: Vec::new(),
+        combined_candidates: Vec::new(),
+    };
+
+    // 2. Dangling missing upstream target (`missing <- dangling_mid <- dangling_head`).
+    let (b_dang_mid, d_dang_mid) = sample_work_brief(
+        "brf_dangling_mid",
+        BINDING_A,
+        THREAD_A,
+        base_a.clone(),
+        WorkBriefKind::Amendment {
+            target_job_id: "job_missing_upstream_00".to_string(),
+            target_job_revision: 1,
+            amendment_reason: "References missing upstream target".to_string(),
+        },
+        "Midpoint with missing upstream target",
+    );
+    let job_dangling_mid = CoworkerJobRecord {
+        job_id: "job_dangling_mid_01".to_string(),
+        job_revision: 2,
+        create_request_key: "req_dangling_mid".to_string(),
+        binding_id: BINDING_A.to_string(),
+        thread_uuid: THREAD_A.to_string(),
+        phase: CoworkerJobPhase::Held,
+        work_brief: b_dang_mid,
+        work_brief_digest: d_dang_mid,
+        supersedes_job_id: Some("job_missing_upstream_00".to_string()),
+        planning_result: None,
+        approval_linkage: None,
+        tasks: Vec::new(),
+        holds: vec![sample_amendment_hold(
+            "hld_dangling_mid",
+            "amend_req_dangling_head",
+            2,
+            "Amended by dangling_head despite missing upstream target",
+        )],
+        outbox: Vec::new(),
+        combined_candidates: Vec::new(),
+    };
+    let (b_dang_head, d_dang_head) = sample_work_brief(
+        "brf_dangling_head",
+        BINDING_A,
+        THREAD_A,
+        base_a.clone(),
+        WorkBriefKind::Amendment {
+            target_job_id: job_dangling_mid.job_id.clone(),
+            target_job_revision: 1,
+            amendment_reason: "Follow-up on dangling component".to_string(),
+        },
+        "Head of dangling component",
+    );
+    let job_dangling_head = CoworkerJobRecord {
+        job_id: "job_dangling_head_02".to_string(),
+        job_revision: 1,
+        create_request_key: "req_dangling_head".to_string(),
+        binding_id: BINDING_A.to_string(),
+        thread_uuid: THREAD_A.to_string(),
+        phase: CoworkerJobPhase::Planning,
+        work_brief: b_dang_head,
+        work_brief_digest: d_dang_head,
+        supersedes_job_id: Some(job_dangling_mid.job_id.clone()),
+        planning_result: None,
+        approval_linkage: None,
+        tasks: Vec::new(),
+        holds: Vec::new(),
+        outbox: Vec::new(),
+        combined_candidates: Vec::new(),
+    };
+
+    // 3. Scope-rejected upstream target (`job_foreign_upstream` in `repo_b`) referenced by an
+    // admitted local chain (`job_unverified_mid <- job_unverified_head`).
+    let (b_for_up, d_for_up) = sample_work_brief(
+        "brf_foreign_upstream",
+        BINDING_A,
+        THREAD_A,
+        base_b.clone(),
+        WorkBriefKind::NewJob,
+        "Foreign repository job",
+    );
+    let job_foreign_upstream = CoworkerJobRecord {
+        job_id: "job_foreign_upstream_00".to_string(),
+        job_revision: 2,
+        create_request_key: "req_foreign_upstream".to_string(),
+        binding_id: BINDING_A.to_string(),
+        thread_uuid: THREAD_A.to_string(),
+        phase: CoworkerJobPhase::Planning,
+        work_brief: b_for_up,
+        work_brief_digest: d_for_up,
+        supersedes_job_id: None,
+        planning_result: None,
+        approval_linkage: None,
+        tasks: Vec::new(),
+        holds: Vec::new(),
+        outbox: Vec::new(),
+        combined_candidates: Vec::new(),
+    };
+    let (b_unv_mid, d_unv_mid) = sample_work_brief(
+        "brf_unverified_mid",
+        BINDING_A,
+        THREAD_A,
+        base_a.clone(),
+        WorkBriefKind::Amendment {
+            target_job_id: job_foreign_upstream.job_id.clone(),
+            target_job_revision: 1,
+            amendment_reason: "References rejected foreign-repo target".to_string(),
+        },
+        "Local job referencing unverified foreign target",
+    );
+    let job_unverified_mid = CoworkerJobRecord {
+        job_id: "job_unverified_mid_01".to_string(),
+        job_revision: 2,
+        create_request_key: "req_unverified_mid".to_string(),
+        binding_id: BINDING_A.to_string(),
+        thread_uuid: THREAD_A.to_string(),
+        phase: CoworkerJobPhase::Held,
+        work_brief: b_unv_mid,
+        work_brief_digest: d_unv_mid,
+        supersedes_job_id: Some(job_foreign_upstream.job_id.clone()),
+        planning_result: None,
+        approval_linkage: None,
+        tasks: Vec::new(),
+        holds: vec![sample_amendment_hold(
+            "hld_unverified_mid",
+            "amend_req_unverified_head",
+            2,
+            "Amended by unverified_head",
+        )],
+        outbox: Vec::new(),
+        combined_candidates: Vec::new(),
+    };
+    let (b_unv_head, d_unv_head) = sample_work_brief(
+        "brf_unverified_head",
+        BINDING_A,
+        THREAD_A,
+        base_a.clone(),
+        WorkBriefKind::Amendment {
+            target_job_id: job_unverified_mid.job_id.clone(),
+            target_job_revision: 1,
+            amendment_reason: "Follow-up on unverified-target component".to_string(),
+        },
+        "Head of unverified-target component",
+    );
+    let job_unverified_head = CoworkerJobRecord {
+        job_id: "job_unverified_head_02".to_string(),
+        job_revision: 1,
+        create_request_key: "req_unverified_head".to_string(),
+        binding_id: BINDING_A.to_string(),
+        thread_uuid: THREAD_A.to_string(),
+        phase: CoworkerJobPhase::Planning,
+        work_brief: b_unv_head,
+        work_brief_digest: d_unv_head,
+        supersedes_job_id: Some(job_unverified_mid.job_id.clone()),
+        planning_result: None,
+        approval_linkage: None,
+        tasks: Vec::new(),
+        holds: Vec::new(),
+        outbox: Vec::new(),
+        combined_candidates: Vec::new(),
+    };
+
+    // 4. Valid local chain (`job_clean_local_old -> job_clean_local_new`) plus rejected foreign
+    // and unverified-approval records claiming `supersedes_job_id = Some(job_clean_local_old)`.
+    // Rejected records must neither mint proof nor poison the verified local component.
+    let (b_clean_old, d_clean_old) = sample_work_brief(
+        "brf_clean_local_old",
+        BINDING_A,
+        THREAD_A,
+        base_a.clone(),
+        WorkBriefKind::NewJob,
+        "Valid local chain root",
+    );
+    let job_clean_local_old = CoworkerJobRecord {
+        job_id: "job_clean_local_old_01".to_string(),
+        job_revision: 2,
+        create_request_key: "req_clean_local_old".to_string(),
+        binding_id: BINDING_A.to_string(),
+        thread_uuid: THREAD_A.to_string(),
+        phase: CoworkerJobPhase::Held,
+        work_brief: b_clean_old,
+        work_brief_digest: d_clean_old,
+        supersedes_job_id: None,
+        planning_result: None,
+        approval_linkage: None,
+        tasks: Vec::new(),
+        holds: vec![sample_amendment_hold(
+            "hld_clean_local_old",
+            "amend_req_clean_local_new",
+            2,
+            "Verified local amendment",
+        )],
+        outbox: Vec::new(),
+        combined_candidates: Vec::new(),
+    };
+    let (b_clean_new, d_clean_new) = sample_work_brief(
+        "brf_clean_local_new",
+        BINDING_A,
+        THREAD_A,
+        base_a.clone(),
+        WorkBriefKind::Amendment {
+            target_job_id: job_clean_local_old.job_id.clone(),
+            target_job_revision: 1,
+            amendment_reason: "Verified local amendment".to_string(),
+        },
+        "Valid local chain head",
+    );
+    let job_clean_local_new = CoworkerJobRecord {
+        job_id: "job_clean_local_new_02".to_string(),
+        job_revision: 1,
+        create_request_key: "req_clean_local_new".to_string(),
+        binding_id: BINDING_A.to_string(),
+        thread_uuid: THREAD_A.to_string(),
+        phase: CoworkerJobPhase::Planning,
+        work_brief: b_clean_new,
+        work_brief_digest: d_clean_new,
+        supersedes_job_id: Some(job_clean_local_old.job_id.clone()),
+        planning_result: None,
+        approval_linkage: None,
+        tasks: Vec::new(),
+        holds: Vec::new(),
+        outbox: Vec::new(),
+        combined_candidates: Vec::new(),
+    };
+
+    let (b_for_poison, d_for_poison) = sample_work_brief(
+        "brf_foreign_poison",
+        BINDING_A,
+        THREAD_A,
+        base_b,
+        WorkBriefKind::Amendment {
+            target_job_id: job_clean_local_old.job_id.clone(),
+            target_job_revision: 1,
+            amendment_reason: "Foreign repo record targeting local chain".to_string(),
+        },
+        "Rejected foreign-repo poison candidate",
+    );
+    let job_foreign_poison = CoworkerJobRecord {
+        job_id: "job_foreign_poison_03".to_string(),
+        job_revision: 1,
+        create_request_key: "req_foreign_poison".to_string(),
+        binding_id: BINDING_A.to_string(),
+        thread_uuid: THREAD_A.to_string(),
+        phase: CoworkerJobPhase::Planning,
+        work_brief: b_for_poison,
+        work_brief_digest: d_for_poison,
+        supersedes_job_id: Some(job_clean_local_old.job_id.clone()),
+        planning_result: None,
+        approval_linkage: None,
+        tasks: Vec::new(),
+        holds: Vec::new(),
+        outbox: Vec::new(),
+        combined_candidates: Vec::new(),
+    };
+
+    let policy = ExecutionPolicy::deny_all("policy-test").expect("policy");
+    let policy_digest = policy.digest().expect("policy digest");
+    let mut unverified_linkage = sample_approval_linkage(
+        base_a.clone(),
+        &policy_digest,
+        vec!["task-p-01".to_string()],
+    );
+    unverified_linkage.plan_id = "plan_unverified_poison_01".to_string();
+    let (b_auth_poison, d_auth_poison) = sample_work_brief(
+        "brf_auth_poison",
+        BINDING_A,
+        THREAD_A,
+        base_a,
+        WorkBriefKind::Amendment {
+            target_job_id: job_clean_local_old.job_id.clone(),
+            target_job_revision: 1,
+            amendment_reason: "Unverified approval record targeting local chain".to_string(),
+        },
+        "Rejected unverified-approval poison candidate",
+    );
+    let job_auth_poison = CoworkerJobRecord {
+        job_id: "job_auth_poison_04".to_string(),
+        job_revision: 1,
+        create_request_key: "req_auth_poison".to_string(),
+        binding_id: BINDING_A.to_string(),
+        thread_uuid: THREAD_A.to_string(),
+        phase: CoworkerJobPhase::Executing,
+        work_brief: b_auth_poison,
+        work_brief_digest: d_auth_poison,
+        supersedes_job_id: Some(job_clean_local_old.job_id.clone()),
+        planning_result: None,
+        approval_linkage: Some(unverified_linkage),
+        tasks: Vec::new(),
+        holds: Vec::new(),
+        outbox: Vec::new(),
+        combined_candidates: Vec::new(),
+    };
+
+    let ledger = CoworkerBindingLedger {
+        schema_version: 1,
+        binding_id: BINDING_A.to_string(),
+        thread_uuid: Some(THREAD_A.to_string()),
+        ledger_revision: 1,
+        planning_grants: Vec::new(),
+        architect_advice: Vec::new(),
+        jobs: vec![
+            job_cycle_a.clone(),
+            job_cycle_b.clone(),
+            job_dangling_mid.clone(),
+            job_dangling_head.clone(),
+            job_foreign_upstream,
+            job_unverified_mid.clone(),
+            job_unverified_head.clone(),
+            job_clean_local_old.clone(),
+            job_clean_local_new.clone(),
+            job_foreign_poison,
+            job_auth_poison,
+        ],
+        admission_markers: BTreeMap::new(),
+    };
+    ledger
+        .validate(BINDING_A)
+        .expect("malformed-lineage fixture must pass CoworkerBindingLedger::validate");
+
+    let ledger_path = workflow_store
+        .ledger_path_for_binding(BINDING_A)
+        .expect("ledger path");
+    write_private_json(&ledger_path, &ledger);
+    let _ = workflow_store
+        .read_binding_ledger(BINDING_A)
+        .expect("workflow_store.read_binding_ledger accepts typed-valid fixture");
+
+    remove_lockfiles_in_dir(&plans_dir);
+    let hashes_before = snapshot_private_dir_sha256(&plans_dir);
+    let auth_hashes_before = snapshot_private_dir_sha256(&auth_dir);
+
+    let stores = WorkspaceHistoryStores::new(&plans_dir).with_authority_dir(&auth_dir);
+    let forward_read =
+        read_scoped_workspace_job_histories(&chat_a, &stores).expect("forward malformed read");
+
+    assert_no_lock_or_wal_files(&plans_dir);
+    assert_no_lock_or_wal_files(&auth_dir);
+    assert_eq!(snapshot_private_dir_sha256(&plans_dir), hashes_before);
+    assert_eq!(snapshot_private_dir_sha256(&auth_dir), auth_hashes_before);
+    assert_eq!(forward_read.rejected_scope_count, 3);
+    assert_eq!(forward_read.jobs.len(), 8);
+
+    // Cycle: neither job selects `superseded_by_job_id` or retires attention; follow-ups remain.
+    let h_cyc_a = find_projected_job(&forward_read.jobs, &job_cycle_a.job_id);
+    assert_eq!(h_cyc_a.links.superseded_by_job_id, None);
+    assert_eq!(
+        h_cyc_a.links.follow_up_job_ids,
+        vec![job_cycle_b.job_id.clone()]
+    );
+    assert_eq!(
+        h_cyc_a.current_attention.as_ref().map(|a| a.kind),
+        Some(WorkspaceAttentionKind::OnHold)
+    );
+    assert_eq!(h_cyc_a.job.state, ObservationJobState::NeedsUser);
+    assert_eq!(h_cyc_a.job.approval_status, "pending_approval");
+    assert_eq!(
+        h_cyc_a.acceptance_proof,
+        WorkspaceAcceptanceProof::unknown()
+    );
+
+    let h_cyc_b = find_projected_job(&forward_read.jobs, &job_cycle_b.job_id);
+    assert_eq!(h_cyc_b.links.superseded_by_job_id, None);
+    assert_eq!(
+        h_cyc_b.links.follow_up_job_ids,
+        vec![job_cycle_a.job_id.clone()]
+    );
+    assert_eq!(
+        h_cyc_b.current_attention.as_ref().map(|a| a.kind),
+        Some(WorkspaceAttentionKind::OnHold)
+    );
+    assert_eq!(h_cyc_b.job.state, ObservationJobState::NeedsUser);
+    assert_eq!(h_cyc_b.job.approval_status, "draft");
+
+    // Missing upstream target taints its connected component (`dangling_mid` keeps OnHold).
+    let h_dang_mid = find_projected_job(&forward_read.jobs, &job_dangling_mid.job_id);
+    assert_eq!(h_dang_mid.links.superseded_by_job_id, None);
+    assert_eq!(
+        h_dang_mid.links.follow_up_job_ids,
+        vec![job_dangling_head.job_id.clone()]
+    );
+    assert_eq!(
+        h_dang_mid.current_attention.as_ref().map(|a| a.kind),
+        Some(WorkspaceAttentionKind::OnHold)
+    );
+    assert_eq!(h_dang_mid.job.state, ObservationJobState::NeedsUser);
+    assert_eq!(h_dang_mid.job.approval_status, "draft");
+
+    // Scope-rejected upstream target also taints the referencing local component.
+    let h_unv_mid = find_projected_job(&forward_read.jobs, &job_unverified_mid.job_id);
+    assert_eq!(h_unv_mid.links.superseded_by_job_id, None);
+    assert_eq!(
+        h_unv_mid.links.follow_up_job_ids,
+        vec![job_unverified_head.job_id.clone()]
+    );
+    assert_eq!(
+        h_unv_mid.current_attention.as_ref().map(|a| a.kind),
+        Some(WorkspaceAttentionKind::OnHold)
+    );
+    assert_eq!(h_unv_mid.job.state, ObservationJobState::NeedsUser);
+
+    // Rejected foreign and unverified-approval records do NOT poison the valid local chain.
+    let h_clean_old = find_projected_job(&forward_read.jobs, &job_clean_local_old.job_id);
+    assert_eq!(h_clean_old.current_attention, None);
+    assert_eq!(h_clean_old.job.state, ObservationJobState::Unknown);
+    assert_eq!(h_clean_old.job.approval_status, "superseded");
+    assert_eq!(
+        h_clean_old.links.superseded_by_job_id.as_deref(),
+        Some(job_clean_local_new.job_id.as_str())
+    );
+    assert_eq!(
+        h_clean_old.links.follow_up_job_ids,
+        vec![job_clean_local_new.job_id.clone()]
+    );
+
+    // Reverse `ledger.jobs` order and prove identical projected job histories.
+    let mut reversed_ledger = ledger;
+    reversed_ledger.jobs.reverse();
+    reversed_ledger
+        .validate(BINDING_A)
+        .expect("reversed malformed-lineage ledger remains typed-valid");
+    write_private_json(&ledger_path, &reversed_ledger);
+    let _ = workflow_store
+        .read_binding_ledger(BINDING_A)
+        .expect("read reversed malformed-lineage ledger");
+
+    remove_lockfiles_in_dir(&plans_dir);
+    let rev_hashes_before = snapshot_private_dir_sha256(&plans_dir);
+    let reversed_read =
+        read_scoped_workspace_job_histories(&chat_a, &stores).expect("reversed malformed read");
+    assert_no_lock_or_wal_files(&plans_dir);
+    assert_eq!(snapshot_private_dir_sha256(&plans_dir), rev_hashes_before);
+    assert_eq!(reversed_read.rejected_scope_count, 3);
+    assert_eq!(
+        reversed_read.jobs, forward_read.jobs,
+        "reversed ledger order must yield identical projections for cycles and dangling links"
+    );
 }
