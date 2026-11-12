@@ -1664,6 +1664,34 @@ fn ensure_external_resolution_preview_scope(
     Ok(())
 }
 
+fn ensure_stored_external_resolution_project_scope(
+    receipt: &ExternalResolutionReceipt,
+    original_request_root: Option<&Path>,
+    pinned_project_root: Option<&Path>,
+) -> Result<(), OperatorCliError> {
+    // The immutable stored receipt is the authority for its own project scope. Both the original
+    // request's canonical root (when reconciling) and the optional router pin must match it exactly
+    // before any durability operation can run.
+    let stored_root = receipt.project.canonical_repo_root.as_path();
+    if let Some(expected_root) = original_request_root {
+        if stored_root != expected_root {
+            return Err(OperatorCliError::new(
+                "scope_mismatch",
+                "Stored external resolution receipt project root does not match the original request canonical_repo_root.",
+            ));
+        }
+    }
+    if let Some(expected_root) = pinned_project_root {
+        if stored_root != expected_root {
+            return Err(OperatorCliError::new(
+                "scope_mismatch",
+                "Stored external resolution receipt project root does not match the router-validated project root.",
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_external_resolution(
     subcommand: ExternalResolutionCommand,
@@ -1705,6 +1733,31 @@ fn run_external_resolution(
             )?;
 
             if reconcile_existing {
+                // Reconcile must never fsync or otherwise touch a receipt owned by another project.
+                // The pure lookup runs before `reconcile` so both the original request root and the
+                // router-pinned root are proven against the immutable stored receipt first.
+                let existing = service
+                    .inspect_by_request_key(binding, thread, &request.request_key)
+                    .map_err(|error| map_native_error(&error, false))?
+                    .ok_or_else(|| {
+                        OperatorCliError::new(
+                            "validation_failed",
+                            "No existing external resolution receipt exists for the original request_key in the fixed scope.",
+                        )
+                    })?;
+                ensure_scope(
+                    &existing.receipt,
+                    binding,
+                    thread,
+                    "scope_mismatch",
+                    STORED_SCOPE_MISMATCH,
+                )?;
+                ensure_stored_external_resolution_project_scope(
+                    &existing.receipt,
+                    Some(request.canonical_repo_root.as_path()),
+                    project_root,
+                )?;
+
                 let receipt = service
                     .reconcile(&ReconcileExternalResolutionRequest {
                         trusted_local_attested: true,
@@ -1763,6 +1816,11 @@ fn run_external_resolution(
                     "scope_mismatch",
                     STORED_SCOPE_MISMATCH,
                 )?;
+                ensure_stored_external_resolution_project_scope(
+                    &entry.receipt,
+                    None,
+                    project_root,
+                )?;
                 write_result(binding, &entry, false)
             } else {
                 let inspection = service
@@ -1782,6 +1840,11 @@ fn run_external_resolution(
                         thread,
                         "scope_mismatch",
                         STORED_SCOPE_MISMATCH,
+                    )?;
+                    ensure_stored_external_resolution_project_scope(
+                        &entry.receipt,
+                        None,
+                        project_root,
                     )?;
                 }
                 write_result(binding, &inspection, false)
@@ -3345,7 +3408,8 @@ mod tests {
             Some(THREAD.to_string()),
             Some(DIGEST.to_string()),
         )
-        .expect_err("missing operator approval must fail");
+        .err()
+        .expect("missing operator approval must fail");
         assert_eq!(missing_approval.code, "unauthorized_operator");
 
         let missing_thread = apply_external_resolution_record_confirmations(
@@ -3355,7 +3419,8 @@ mod tests {
             None,
             Some(DIGEST.to_string()),
         )
-        .expect_err("missing thread confirmation must fail");
+        .err()
+        .expect("missing thread confirmation must fail");
         assert_eq!(missing_thread.code, "invalid_input");
 
         let wrong_thread = apply_external_resolution_record_confirmations(
@@ -3365,7 +3430,8 @@ mod tests {
             Some("0196ed00-0000-7000-8000-000000000099".to_string()),
             Some(DIGEST.to_string()),
         )
-        .expect_err("wrong thread confirmation must fail");
+        .err()
+        .expect("wrong thread confirmation must fail");
         assert_eq!(wrong_thread.code, "scope_mismatch");
 
         let missing_preview = apply_external_resolution_record_confirmations(
@@ -3375,7 +3441,8 @@ mod tests {
             Some(THREAD.to_string()),
             None,
         )
-        .expect_err("missing preview confirmation must fail");
+        .err()
+        .expect("missing preview confirmation must fail");
         assert_eq!(missing_preview.code, "invalid_input");
 
         let invalid_preview = apply_external_resolution_record_confirmations(
@@ -3385,7 +3452,8 @@ mod tests {
             Some(THREAD.to_string()),
             Some("not-a-digest".to_string()),
         )
-        .expect_err("invalid preview digest must fail");
+        .err()
+        .expect("invalid preview digest must fail");
         assert_eq!(invalid_preview.code, "invalid_input");
 
         let confirmed = apply_external_resolution_record_confirmations(

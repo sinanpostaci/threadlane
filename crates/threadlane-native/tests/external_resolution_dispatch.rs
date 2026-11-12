@@ -139,6 +139,52 @@ fn task_scope_blocks_only_the_covered_task_and_full_job_closes_advancement() {
 }
 
 #[test]
+fn unrelated_ledger_advance_does_not_unblock_a_stale_covered_task_snapshot() {
+    let mut ledger = ledger();
+    let mut stale_receipt = receipt(
+        "req_stale_partial",
+        ExternalResolutionTarget::Job {
+            job_id: "job_a".to_string(),
+        },
+        ExternalResolutionScope::Tasks {
+            task_ids: vec!["task-1".to_string()],
+        },
+    );
+    stale_receipt.source_ledger_revision = 2;
+    stale_receipt.recorded_ledger_revision = 3;
+    ledger.external_resolutions = vec![stale_receipt];
+    // An unrelated append advanced the binding ledger after the receipt was recorded. The
+    // historical receipt is stale relative to that snapshot but its covered task remains fenced.
+    ledger.ledger_revision = 9;
+
+    let block = external_resolution_blocks_task(
+        &ledger,
+        Some("job_a"),
+        Some("plan_a"),
+        Some("apr_a"),
+        "task-1",
+    )
+    .expect("stale-but-recorded coverage must still block the covered task");
+    assert_eq!(block.request_key, "req_stale_partial");
+    assert!(!block.full_job);
+    assert!(external_resolution_blocks_task(
+        &ledger,
+        Some("job_a"),
+        Some("plan_a"),
+        Some("apr_a"),
+        "task-2"
+    )
+    .is_none());
+    assert!(external_resolution_blocks_full_job(
+        &ledger,
+        Some("job_a"),
+        Some("plan_a"),
+        Some("apr_a")
+    )
+    .is_none());
+}
+
+#[test]
 fn legacy_plan_receipts_block_the_bound_plan_even_after_restart_without_a_witness() {
     let mut ledger = ledger();
     ledger.external_resolutions = vec![receipt(

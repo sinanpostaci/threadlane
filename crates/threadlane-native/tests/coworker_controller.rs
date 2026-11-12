@@ -3,7 +3,8 @@ use std::fs;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
@@ -10163,20 +10164,24 @@ fn external_resolution_record_request(
     }
 }
 
-fn record_external_resolution(
+fn external_resolution_service(
     fixture: &ControllerTestFixture,
-    request: &threadlane_native::external_resolution::RecordExternalResolutionRequest,
-) -> threadlane_native::external_resolution::ExternalResolutionReceipt {
-    let service = threadlane_native::external_resolution::ExternalResolutionService::new(
+) -> threadlane_native::external_resolution::ExternalResolutionService {
+    threadlane_native::external_resolution::ExternalResolutionService::new(
         &fixture.plans_dir,
         &fixture.authority_dir,
         &fixture.registry_dir,
         Some(&fixture.sessions_dir),
     )
-    .expect("open external resolution service");
-    let preview = service
-        .preview(request)
-        .expect("external resolution preview");
+    .expect("open external resolution service")
+}
+
+fn record_external_resolution(
+    fixture: &ControllerTestFixture,
+    request: &threadlane_native::external_resolution::RecordExternalResolutionRequest,
+) -> threadlane_native::external_resolution::ExternalResolutionReceipt {
+    let service = external_resolution_service(fixture);
+    let preview = service.preview(request).expect("external resolution preview");
     service
         .record(
             request,
@@ -10309,7 +10314,7 @@ async fn external_resolution_partial_scope_fences_only_the_covered_task() {
             allowed_write_paths: vec!["src/b.rs".to_string()],
         },
     ];
-    let (job, _) = create_planned_approved_and_frozen_job(
+    let (job, approval_id) = create_planned_approved_and_frozen_job(
         &fixture,
         "brf_external_partial",
         "plan-external-partial",
@@ -10332,12 +10337,6 @@ async fn external_resolution_partial_scope_fences_only_the_covered_task() {
     );
     let receipt = record_external_resolution(&fixture, &request);
 
-    let session = fixture
-        .controller
-        .open_owned_session(BINDING_A, THREAD_UUID_A, &job.job_id, 20_000)
-        .expect("partial receipt must not block unrelated controller admission");
-    drop(session);
-
     let covered_err = fixture
         .workflow_store
         .reserve_task_outbox(&external_resolution_outbox_request(
@@ -10348,32 +10347,87 @@ async fn external_resolution_partial_scope_fences_only_the_covered_task() {
         .expect_err("covered task must be refused");
     assert_eq!(covered_err.code, NativeErrorCode::UnsupportedCapability);
 
-    let (_, unrelated_outbox) = fixture
-        .workflow_store
-        .reserve_task_outbox(&external_resolution_outbox_request(
-            &job,
-            "task-ext-partial-b",
-            "req_external_partial_unrelated",
-        ))
-        .expect("unrelated task must remain dispatchable");
-    assert_eq!(unrelated_outbox.task_id, "task-ext-partial-b");
+    // Advance unrelated root B through the genuine bounded controller/host path. The controller
+    // must skip covered A, dispatch only B, and leave the immutable receipt untouched.
+    let host = ApprovedHost::start(ApprovedHostConfig::new(
+        &fixture.registry_dir,
+        &fixture.plans_dir,
+        &fixture.authority_dir,
+        &fixture.sessions_dir,
+        &approval_id,
+    ))
+    .await
+    .expect("start ApprovedHost for unrelated task advancement");
+    let session = fixture
+        .controller
+        .open_owned_session(BINDING_A, THREAD_UUID_A, &job.job_id, 20_000)
+        .expect("partial receipt must not block unrelated controller admission");
 
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut step_ts = 20_100u64;
+    loop {
+        let report = session.step(step_ts).await.expect("controller step");
+        step_ts += 100;
+        let observed_b = report
+            .tasks
+            .iter()
+            .find(|task| task.task_id == "task-ext-partial-b")
+            .expect("task B observation");
+        let observed_a = report
+            .tasks
+            .iter()
+            .find(|task| task.task_id == "task-ext-partial-a")
+            .expect("task A observation");
+        assert_ne!(
+            observed_a.stage,
+            CoworkerTaskStage::ReadyForReview,
+            "covered task A must never be dispatched or advanced"
+        );
+        if observed_b.stage == CoworkerTaskStage::ReadyForReview {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for unrelated task B to advance: {report:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    session.release().expect("release controller session");
+    host.shutdown().await.expect("shutdown ApprovedHost");
+
+    // B's advancement changes the job revision and therefore stales the original receipt snapshot,
+    // but historical coverage of A remains blocking without rebuilding a preview or re-recording.
     let ledger = fixture
         .workflow_store
         .read_binding_ledger(BINDING_A)
-        .expect("read ledger after partial scope");
-    assert_eq!(ledger.external_resolutions, vec![receipt]);
+        .expect("read ledger after unrelated advancement");
+    assert_eq!(ledger.external_resolutions, vec![receipt.clone()]);
     let job_after = ledger
         .jobs
         .iter()
         .find(|candidate| candidate.job_id == job.job_id)
-        .expect("job after partial reservation");
+        .expect("job after unrelated advancement")
+        .clone();
+    assert_ne!(job_after.job_revision, job.job_revision);
+    let task_b_after = job_after
+        .tasks
+        .iter()
+        .find(|task| task.task_id == "task-ext-partial-b")
+        .expect("task B after advancement");
+    assert_eq!(task_b_after.stage, CoworkerTaskStage::ReadyForReview);
+    let task_a_after = job_after
+        .tasks
+        .iter()
+        .find(|task| task.task_id == "task-ext-partial-a")
+        .expect("task A after advancement");
+    assert_ne!(task_a_after.stage, CoworkerTaskStage::ReadyForReview);
     assert!(
         job_after
             .outbox
             .iter()
             .all(|outbox| outbox.task_id != "task-ext-partial-a"),
-        "covered task must not receive an outbox reservation"
+        "covered task must not receive an outbox reservation after unrelated advancement"
     );
     assert!(
         job_after
@@ -10382,6 +10436,529 @@ async fn external_resolution_partial_scope_fences_only_the_covered_task() {
             .any(|outbox| outbox.task_id == "task-ext-partial-b"),
         "unrelated task progress must be preserved"
     );
+
+    let covered_after_advance = fixture
+        .workflow_store
+        .reserve_task_outbox(&external_resolution_outbox_request(
+            &job_after,
+            "task-ext-partial-a",
+            "req_external_partial_dispatch_after_advance",
+        ))
+        .expect_err("covered task must stay refused after an unrelated job revision advance");
+    assert_eq!(
+        covered_after_advance.code,
+        NativeErrorCode::UnsupportedCapability
+    );
+
+    let reopened = fixture
+        .controller
+        .open_owned_session(BINDING_A, THREAD_UUID_A, &job.job_id, step_ts + 100)
+        .expect("unrelated job and read-only status must remain accessible");
+    reopened
+        .release()
+        .expect("release reopened controller session");
+
+    let final_ledger = fixture
+        .workflow_store
+        .read_binding_ledger(BINDING_A)
+        .expect("read final ledger");
+    assert_eq!(final_ledger.external_resolutions, vec![receipt]);
+    let final_job = final_ledger
+        .jobs
+        .iter()
+        .find(|candidate| candidate.job_id == job_after.job_id)
+        .expect("final job");
+    assert!(
+        final_job
+            .outbox
+            .iter()
+            .all(|outbox| outbox.task_id != "task-ext-partial-a"),
+        "stale-after-advance refusal must not create a covered outbox entry"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn external_resolution_record_blocks_direct_dispatch_that_starts_after_the_receipt() {
+    let fixture = setup_fixture();
+    let tasks = vec![PlanTask {
+        id: "task-ext-race-a".to_string(),
+        title: "External race A".to_string(),
+        instruction: "CTRL_TASK_A implement src/a.rs".to_string(),
+        role: WorkflowRole::Coder,
+        difficulty: Difficulty::Hard,
+        depends_on: Vec::new(),
+        allowed_write_paths: vec!["src/a.rs".to_string()],
+    }];
+    let (job, approval_id) = create_planned_approved_and_frozen_job(
+        &fixture,
+        "brf_external_race_record_first",
+        "plan-external-race-record-first",
+        tasks,
+        BTreeMap::new(),
+        vec!["src/a.rs".to_string()],
+        1,
+        ExecutionBudgets::default(),
+        ControllerRoleExecutionBudget::default_for_role(WorkflowRole::Coder, 4),
+    )
+    .await;
+    let request = external_resolution_record_request(
+        &fixture,
+        &job,
+        threadlane_native::external_resolution::ExternalResolutionScope::FullJob,
+        "req_external_race_record_first",
+    );
+    let service = external_resolution_service(&fixture);
+    let preview = service.preview(&request).expect("preview race receipt");
+    let approval = fixture
+        .authority
+        .get_for_operator(&approval_id)
+        .expect("read race approval");
+    let subject_digest = approval.subject_digest.clone();
+    let ledger_path = fixture
+        .workflow_store
+        .ledger_path_for_binding(BINDING_A)
+        .expect("race ledger path");
+
+    let (entered_tx, entered_rx) = mpsc::channel::<()>();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let release_rx = Arc::new(Mutex::new(release_rx));
+    let probe_service = external_resolution_service(&fixture).with_post_persist_probe(
+        move |_ledger_path: &Path| -> Result<(), threadlane_native::NativeError> {
+            entered_tx.send(()).map_err(|_| {
+                threadlane_native::NativeError::persistence_uncertain(
+                    "race probe entry channel closed",
+                )
+            })?;
+            let release = release_rx.lock().map_err(|_| {
+                threadlane_native::NativeError::persistence_uncertain("race probe lock poisoned")
+            })?;
+            release.recv_timeout(Duration::from_secs(5)).map_err(|_| {
+                threadlane_native::NativeError::persistence_uncertain(
+                    "race probe release timed out",
+                )
+            })?;
+            Ok(())
+        },
+    );
+    let request_for_record = request.clone();
+    let preview_digest = preview.preview_digest.clone();
+    let record_handle = tokio::task::spawn_blocking(move || {
+        probe_service.record(
+            &request_for_record,
+            &threadlane_native::external_resolution::ExternalResolutionConfirmation {
+                trusted_local_attested: true,
+                thread_uuid: THREAD_UUID_A.to_string(),
+                preview_digest,
+            },
+        )
+    });
+
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::task::spawn_blocking(move || entered_rx.recv_timeout(Duration::from_secs(5))),
+    )
+    .await
+    .expect("post-persist probe entry timed out")
+    .expect("join post-persist probe waiter")
+    .expect("post-persist probe entered");
+
+    let effect_counter = Arc::new(AtomicUsize::new(0));
+    let dispatch_counter = Arc::clone(&effect_counter);
+    let dispatch_authority = Arc::clone(&fixture.authority);
+    let dispatch_approval_id = approval_id.clone();
+    let mut dispatch_handle = tokio::spawn(async move {
+        threadlane_native::with_guarded_native_dispatch(
+            &dispatch_authority,
+            BINDING_A,
+            THREAD_UUID_A,
+            &dispatch_approval_id,
+            "task-ext-race-a",
+            Some(&subject_digest),
+            move || async move {
+                dispatch_counter.fetch_add(1, Ordering::SeqCst);
+                Ok::<(), threadlane_native::GuardedDispatchError>(())
+            },
+        )
+        .await
+    });
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(75), &mut dispatch_handle)
+            .await
+            .is_err(),
+        "guarded dispatch must wait while the winning record still holds its advancement guard"
+    );
+
+    release_tx
+        .send(())
+        .expect("release the post-persist probe");
+    let receipt = tokio::time::timeout(Duration::from_secs(5), record_handle)
+        .await
+        .expect("record should finish after probe release")
+        .expect("join record task")
+        .expect("record external resolution");
+    let dispatch_result = tokio::time::timeout(Duration::from_secs(5), dispatch_handle)
+        .await
+        .expect("dispatch should finish after receipt commit")
+        .expect("join dispatch task");
+    let dispatch_error = dispatch_result.expect_err("winning receipt must refuse later dispatch");
+    assert!(matches!(
+        dispatch_error,
+        threadlane_native::GuardedDispatchError::PreEffect { code, .. }
+            if code == threadlane_native::dispatch_guard::EXTERNAL_RESOLUTION_DISPATCH_BLOCKED
+    ));
+    assert_eq!(
+        effect_counter.load(Ordering::SeqCst),
+        0,
+        "no fake effect may start after the winning receipt"
+    );
+
+    let ledger_bytes = fs::read(&ledger_path).expect("read ledger after winning record");
+    let ledger = fixture
+        .workflow_store
+        .read_binding_ledger(BINDING_A)
+        .expect("read ledger after winning record");
+    assert_eq!(ledger.external_resolutions, vec![receipt]);
+    assert_eq!(
+        fs::read(&ledger_path).expect("reread ledger after refused dispatch"),
+        ledger_bytes,
+        "refused later dispatch must leave the immutable receipt bytes unchanged"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn external_resolution_record_waits_for_an_already_admitted_direct_dispatch_guard() {
+    let fixture = setup_fixture();
+    let tasks = vec![PlanTask {
+        id: "task-ext-race-b".to_string(),
+        title: "External race B".to_string(),
+        instruction: "CTRL_TASK_A implement src/a.rs".to_string(),
+        role: WorkflowRole::Coder,
+        difficulty: Difficulty::Hard,
+        depends_on: Vec::new(),
+        allowed_write_paths: vec!["src/a.rs".to_string()],
+    }];
+    let (job, approval_id) = create_planned_approved_and_frozen_job(
+        &fixture,
+        "brf_external_race_dispatch_first",
+        "plan-external-race-dispatch-first",
+        tasks,
+        BTreeMap::new(),
+        vec!["src/a.rs".to_string()],
+        1,
+        ExecutionBudgets::default(),
+        ControllerRoleExecutionBudget::default_for_role(WorkflowRole::Coder, 4),
+    )
+    .await;
+    let request = external_resolution_record_request(
+        &fixture,
+        &job,
+        threadlane_native::external_resolution::ExternalResolutionScope::FullJob,
+        "req_external_race_dispatch_first",
+    );
+    let service = external_resolution_service(&fixture);
+    let preview = service.preview(&request).expect("preview race receipt");
+    let approval = fixture
+        .authority
+        .get_for_operator(&approval_id)
+        .expect("read race approval");
+    let subject_digest = approval.subject_digest.clone();
+    let ledger_path = fixture
+        .workflow_store
+        .ledger_path_for_binding(BINDING_A)
+        .expect("race ledger path");
+
+    let (op_entered_tx, op_entered_rx) = tokio::sync::oneshot::channel::<()>();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    let effect_counter = Arc::new(AtomicUsize::new(0));
+    let dispatch_counter = Arc::clone(&effect_counter);
+    let dispatch_authority = Arc::clone(&fixture.authority);
+    let dispatch_approval_id = approval_id.clone();
+    let dispatch_handle = tokio::spawn(async move {
+        threadlane_native::with_guarded_native_dispatch(
+            &dispatch_authority,
+            BINDING_A,
+            THREAD_UUID_A,
+            &dispatch_approval_id,
+            "task-ext-race-b",
+            Some(&subject_digest),
+            move || async move {
+                op_entered_tx.send(()).map_err(|_| {
+                    threadlane_native::GuardedDispatchError::pre_effect(
+                        "io_error",
+                        "race dispatch entry signal failed",
+                    )
+                })?;
+                release_rx.await.map_err(|_| {
+                    threadlane_native::GuardedDispatchError::pre_effect(
+                        "io_error",
+                        "race dispatch release signal failed",
+                    )
+                })?;
+                dispatch_counter.fetch_add(1, Ordering::SeqCst);
+                Ok::<(), threadlane_native::GuardedDispatchError>(())
+            },
+        )
+        .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(5), op_entered_rx)
+        .await
+        .expect("guarded dispatch op did not start")
+        .expect("guarded dispatch op entry signal");
+
+    let request_for_record = request.clone();
+    let preview_digest = preview.preview_digest.clone();
+    let service_for_record = external_resolution_service(&fixture);
+    let mut record_handle = tokio::task::spawn_blocking(move || {
+        service_for_record.record(
+            &request_for_record,
+            &threadlane_native::external_resolution::ExternalResolutionConfirmation {
+                trusted_local_attested: true,
+                thread_uuid: THREAD_UUID_A.to_string(),
+                preview_digest,
+            },
+        )
+    });
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(75), &mut record_handle)
+            .await
+            .is_err(),
+        "record must not commit while the already-admitted dispatch holds the advancement guard"
+    );
+
+    release_tx
+        .send(())
+        .expect("release the admitted guarded dispatch");
+    tokio::time::timeout(Duration::from_secs(5), dispatch_handle)
+        .await
+        .expect("admitted dispatch should finish")
+        .expect("join admitted dispatch")
+        .expect("admitted fake effect may win before the receipt");
+    assert_eq!(
+        effect_counter.load(Ordering::SeqCst),
+        1,
+        "the already-admitted fake effect must have run exactly once"
+    );
+
+    let receipt = tokio::time::timeout(Duration::from_secs(5), record_handle)
+        .await
+        .expect("record should finish after the dispatch guard is released")
+        .expect("join record task")
+        .expect("record external resolution after admitted dispatch");
+    let ledger_bytes = fs::read(&ledger_path).expect("read ledger after record");
+    let ledger = fixture
+        .workflow_store
+        .read_binding_ledger(BINDING_A)
+        .expect("read ledger after record");
+    assert_eq!(ledger.external_resolutions, vec![receipt]);
+
+    let later_counter = Arc::new(AtomicUsize::new(0));
+    let later_effect_counter = Arc::clone(&later_counter);
+    let later_dispatch = threadlane_native::with_guarded_native_dispatch(
+        &fixture.authority,
+        BINDING_A,
+        THREAD_UUID_A,
+        &approval_id,
+        "task-ext-race-b",
+        Some(&approval.subject_digest),
+        move || async move {
+            later_effect_counter.fetch_add(1, Ordering::SeqCst);
+            Ok::<(), threadlane_native::GuardedDispatchError>(())
+        },
+    )
+    .await;
+    let later_error = later_dispatch.expect_err("winning receipt must block the next dispatch");
+    assert!(matches!(
+        later_error,
+        threadlane_native::GuardedDispatchError::PreEffect { code, .. }
+            if code == threadlane_native::dispatch_guard::EXTERNAL_RESOLUTION_DISPATCH_BLOCKED
+    ));
+    assert_eq!(
+        later_counter.load(Ordering::SeqCst),
+        0,
+        "a winning receipt must prevent every later fake effect"
+    );
+    assert_eq!(effect_counter.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        fs::read(&ledger_path).expect("reread ledger after later refusal"),
+        ledger_bytes,
+        "later refused dispatch must not rewrite the winning receipt"
+    );
+}
+
+#[tokio::test]
+async fn external_resolution_full_job_blocks_execution_and_driver_but_preserves_readonly_status() {
+    let fixture = setup_fixture();
+    let tasks = vec![PlanTask {
+        id: "task-ext-effect-a".to_string(),
+        title: "External effect A".to_string(),
+        instruction: "CTRL_TASK_A implement src/a.rs".to_string(),
+        role: WorkflowRole::Coder,
+        difficulty: Difficulty::Hard,
+        depends_on: Vec::new(),
+        allowed_write_paths: vec!["src/a.rs".to_string()],
+    }];
+    let (job, approval_id) = create_planned_approved_and_frozen_job(
+        &fixture,
+        "brf_external_effect_gate",
+        "plan-external-effect-gate",
+        tasks,
+        BTreeMap::new(),
+        vec!["src/a.rs".to_string()],
+        1,
+        ExecutionBudgets::default(),
+        ControllerRoleExecutionBudget::default_for_role(WorkflowRole::Coder, 4),
+    )
+    .await;
+    let request = external_resolution_record_request(
+        &fixture,
+        &job,
+        threadlane_native::external_resolution::ExternalResolutionScope::FullJob,
+        "req_external_effect_gate",
+    );
+    let receipt = record_external_resolution(&fixture, &request);
+
+    let runtime = fixture
+        .policy_store
+        .get_job_runtime_readonly(BINDING_A, &job.job_id)
+        .expect("read frozen runtime")
+        .expect("frozen runtime exists");
+    let envelope_digest = runtime.envelope.envelope_digest.clone();
+
+    let state_dir = fixture.root.join("execution-gateway-state");
+    fs::create_dir_all(&state_dir).expect("create execution gateway state dir");
+    fs::set_permissions(&state_dir, fs::Permissions::from_mode(0o700))
+        .expect("chmod execution gateway state dir 0700");
+
+    let gateway = threadlane_native::CoworkerExecutionGateway::new(
+        &state_dir,
+        &fixture.registry_dir,
+        &fixture.plans_dir,
+        &fixture.authority_dir,
+        &fixture.sessions_dir,
+        BINDING_A,
+        THREAD_UUID_A,
+    )
+    .expect("create execution gateway");
+
+    let preview_error = gateway
+        .preview_execution(&threadlane_native::PreviewExecutionParams {
+            job_id: job.job_id.clone(),
+        })
+        .expect_err("full-job receipt must refuse execution preview");
+    assert_eq!(preview_error.code(), NativeErrorCode::UnsupportedCapability);
+    assert!(preview_error.message().contains(receipt.receipt_id.as_str()));
+
+    let start_error = gateway
+        .start_execution(&threadlane_native::StartExecutionParams {
+            job_id: job.job_id.clone(),
+            expected_envelope_digest: envelope_digest,
+        })
+        .await
+        .expect_err("full-job receipt must refuse execution start before owner spawn");
+    assert_eq!(start_error.code(), NativeErrorCode::UnsupportedCapability);
+    assert!(start_error.message().contains(receipt.receipt_id.as_str()));
+
+    let agy_count_before = read_invocation_count(&fixture.agy_count_file);
+    let mut sessions_before: Vec<_> = fs::read_dir(&fixture.sessions_dir)
+        .expect("read sessions before driver refusals")
+        .map(|entry| {
+            entry
+                .expect("session entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    sessions_before.sort();
+    let head_before = fs::read_to_string(fixture.repo_dir.join(".git/HEAD")).expect("read HEAD");
+    let driver = threadlane_native::coworker_driver::CoworkerCodeDriver::open_from_dirs(
+        &state_dir,
+        &fixture.registry_dir,
+        &fixture.plans_dir,
+        &fixture.authority_dir,
+        &fixture.sessions_dir,
+    )
+    .expect("create code driver");
+
+    let run_error = tokio::time::timeout(
+        Duration::from_secs(5),
+        driver.run_owner(
+            BINDING_A,
+            THREAD_UUID_A,
+            &job.job_id,
+            threadlane_native::coworker_driver::CoworkerDriverRunOptions::default(),
+        ),
+    )
+    .await
+    .expect("driver run-owner should refuse promptly")
+    .expect_err("full-job receipt must refuse driver run-owner");
+    assert_eq!(run_error.code(), NativeErrorCode::UnsupportedCapability);
+    assert!(run_error.message().contains(receipt.receipt_id.as_str()));
+
+    let ensure_error = tokio::time::timeout(
+        Duration::from_secs(5),
+        driver.ensure_owner(
+            BINDING_A,
+            THREAD_UUID_A,
+            &job.job_id,
+            Some(threadlane_native::coworker_driver::CoworkerDriverRunOptions::default()),
+        ),
+    )
+    .await
+    .expect("driver ensure should refuse promptly")
+    .expect_err("full-job receipt must refuse driver ensure");
+    assert_eq!(ensure_error.code(), NativeErrorCode::UnsupportedCapability);
+    assert!(ensure_error.message().contains(receipt.receipt_id.as_str()));
+
+    let status = tokio::time::timeout(
+        Duration::from_secs(5),
+        driver.status(BINDING_A, THREAD_UUID_A, &job.job_id),
+    )
+    .await
+    .expect("read-only driver status should remain accessible")
+    .expect("read-only driver status");
+    assert_eq!(status.job_id, job.job_id);
+    assert_eq!(status.approval_id, approval_id);
+    assert_eq!(
+        status.owner_state,
+        threadlane_native::coworker_driver::CoworkerDriverOwnerState::NoActiveOwner
+    );
+    assert!(!status.blocked_on_unknown_effect);
+
+    assert_eq!(
+        read_invocation_count(&fixture.agy_count_file),
+        agy_count_before,
+        "execution/driver refusals must not invoke a provider"
+    );
+    let mut sessions_after: Vec<_> = fs::read_dir(&fixture.sessions_dir)
+        .expect("read sessions after driver refusals")
+        .map(|entry| {
+            entry
+                .expect("session entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    sessions_after.sort();
+    assert_eq!(
+        sessions_after, sessions_before,
+        "execution/driver refusals must not create host session state"
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.repo_dir.join(".git/HEAD")).expect("read HEAD after refusals"),
+        head_before,
+        "execution/driver refusals must not mutate Git"
+    );
+
+    let ledger = fixture
+        .workflow_store
+        .read_binding_ledger(BINDING_A)
+        .expect("read ledger after execution/driver refusals");
+    assert_eq!(ledger.external_resolutions, vec![receipt]);
 }
 
 #[path = "support/coworker_correction_execution.rs"]

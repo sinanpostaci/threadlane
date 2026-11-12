@@ -25,6 +25,10 @@ use serde_json::{json, Value};
 use tempfile::TempDir;
 use threadlane::{Supervisor, SupervisorClient, SupervisorConfig, SupervisorHandle};
 use threadlane_authority::{AuthorityStore, OperatorApprovalRequest};
+use threadlane_native::coworker_workflow::CoworkerWorkflowStore;
+use threadlane_native::external_resolution::{
+    ExternalResolutionScope, ExternalResolutionTarget, RecordExternalResolutionRequest,
+};
 use threadlane_native::{PlanStore, RegistryStore};
 use threadlane_workers::{
     resolve_exact_commit_sha, run_sanitized_git, ExecutionBudgets, DEFAULT_GIT_COMMAND_TIMEOUT_MS,
@@ -387,6 +391,111 @@ async fn run_bin_with_path(bin: &Path, args: &[&str], path_value: &str) -> Outpu
         .output()
         .await
         .expect("execute CLI binary with an explicit hostile PATH")
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct TreeEntry {
+    relative: PathBuf,
+    mode: u32,
+    bytes: Vec<u8>,
+}
+
+fn snapshot_tree(root: &Path) -> Vec<TreeEntry> {
+    fn walk(root: &Path, dir: &Path, entries: &mut Vec<TreeEntry>) {
+        let mut children: Vec<_> = fs::read_dir(dir)
+            .expect("read snapshot directory")
+            .map(|entry| entry.expect("snapshot directory entry"))
+            .collect();
+        children.sort_by_key(|entry| entry.file_name());
+        for child in children {
+            let path = child.path();
+            let metadata = fs::symlink_metadata(&path).expect("stat snapshot path");
+            let relative = path
+                .strip_prefix(root)
+                .expect("snapshot path under root")
+                .to_path_buf();
+            let mode = metadata.permissions().mode() & 0o777;
+            if metadata.file_type().is_dir() {
+                entries.push(TreeEntry {
+                    relative,
+                    mode,
+                    bytes: Vec::new(),
+                });
+                walk(root, &path, entries);
+            } else if metadata.file_type().is_file() {
+                entries.push(TreeEntry {
+                    relative,
+                    mode,
+                    bytes: fs::read(&path).expect("read snapshot file"),
+                });
+            } else {
+                entries.push(TreeEntry {
+                    relative,
+                    mode,
+                    bytes: Vec::new(),
+                });
+            }
+        }
+    }
+
+    let mut entries = Vec::new();
+    walk(root, root, &mut entries);
+    entries
+}
+
+async fn run_context_flow(fixture: &ContextFixture, context: &str, inner: &[&str]) -> Output {
+    let mut args = vec!["--context", context, "flow"];
+    args.extend_from_slice(inner);
+    Command::new(&fixture.context_bin)
+        .args(args)
+        .env("THREADLANE_OBSERVATION_PARENT_REQUEST_ID", "parent-request")
+        .env("THREADLANE_OBSERVATION_PLAN_ID", "parent-plan")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .expect("run real context->flow command")
+}
+
+fn parse_flow_data(output: &Output) -> Value {
+    assert!(
+        output.status.success(),
+        "flow command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let envelope: Value =
+        serde_json::from_slice(&output.stdout).expect("parse flow JSON envelope");
+    assert_eq!(envelope["untrusted_data"], true);
+    envelope["data"].clone()
+}
+
+fn assert_no_host_repo_or_journal_effects(
+    fixture: &ContextFixture,
+    expected_head: &str,
+    expected_lib: &[u8],
+) {
+    assert!(
+        !fixture.sessions_dir.join(&fixture.approval_id).exists(),
+        "external-resolution CLI must not create an approved host session"
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.project_root.join(".git/HEAD")).expect("read fixture HEAD"),
+        expected_head,
+        "external-resolution CLI must not mutate Git HEAD"
+    );
+    assert_eq!(
+        fs::read(fixture.project_root.join("src/lib.rs")).expect("read fixture source"),
+        expected_lib,
+        "external-resolution CLI must not mutate repository files"
+    );
+    assert!(
+        !fixture
+            .plans_dir
+            .join("observation-journal.jsonl")
+            .exists(),
+        "external-resolution CLI must not create an observation journal"
+    );
 }
 
 fn write_argv_recording_sibling(dir: &Path, name: &str, marker: &Path) -> PathBuf {
@@ -3423,54 +3532,468 @@ async fn exported_operator_context_admits_planning_grant_and_scope_approval_with
 }
 
 #[tokio::test]
-async fn external_resolution_flow_forwarding_skips_context_journal_in_inherited_observation_env() {
+async fn external_resolution_real_flow_cli_preview_record_inspect_reconcile_and_project_pins() {
     let mut f = ContextFixture::start().await;
-    let context =
-        f.write_private_context("external-resolution-context.json", &f.valid_context_json());
-    let marker = f.root.join("external-resolution-argv.marker");
-    write_argv_recording_sibling(&f.pkg_bin_dir, "threadlane-flow", &marker);
-    let inner = [
-        "external-resolution",
-        "preview",
-        "--request",
-        "/private/external-resolution-request.json",
-    ];
-    let mut args = vec!["--context", context.to_str().unwrap(), "flow"];
-    args.extend(inner);
-    let out = Command::new(&f.context_bin)
-        .args(&args)
-        .env("THREADLANE_OBSERVATION_PARENT_REQUEST_ID", "parent-request")
-        .env("THREADLANE_OBSERVATION_PLAN_ID", "parent-plan")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .await
-        .expect("run external-resolution context forwarding");
-    assert!(
-        out.status.success(),
-        "external-resolution forwarding failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert_eq!(
-        read_argv_marker(&marker),
-        expected_recorded_argv(&flow_scope_args(&f), &inner),
-        "external-resolution flow forwarding must carry the router project root and inner args"
-    );
-    assert!(
-        !f.plans_dir.join("observation-journal.jsonl").exists(),
-        "external-resolution forwarding must not create context entry/finish journal records even with inherited observation environment"
+    copy_executable_atomic(
+        Path::new(env!("CARGO_BIN_EXE_threadlane-flow")),
+        &f.pkg_bin_dir,
+        "threadlane-flow",
     );
 
-    // Caller-supplied project-root overrides remain refused before child execution.
-    if marker.exists() {
-        fs::remove_file(&marker).unwrap();
-    }
-    let mut hostile = args.clone();
-    hostile.push("--project-root=/tmp/forged");
-    let hostile_out = run_bin(&f.context_bin, &hostile).await;
-    assert_error_code(&hostile_out, "invalid_input");
-    assert!(!marker.exists());
+    let context = f.write_private_context(
+        "external-resolution-context.json",
+        &f.valid_context_json(),
+    );
+    let context = context.to_str().expect("utf8 context path").to_string();
+    let approval = AuthorityStore::get_for_operator_readonly_at(&f.authority_dir, &f.approval_id)
+        .expect("read the fixture's real approval");
+    let request = RecordExternalResolutionRequest {
+        binding_id: f.binding_id.clone(),
+        thread_uuid: THREAD_UUID.to_string(),
+        canonical_repo_root: f.project_root.clone(),
+        target: ExternalResolutionTarget::LegacyPlan {
+            plan_id: approval.plan_id.clone(),
+            plan_revision: approval.plan_revision,
+        },
+        scope: ExternalResolutionScope::FullJob,
+        expected_ledger_revision: None,
+        expected_job_revision: None,
+        expected_runtime_revision: None,
+        request_key: "req_external_resolution_cli_real_01".to_string(),
+        created_at_ms: 1_700_000_200_000,
+        explanation: "Real context-to-flow external resolution CLI fixture.".to_string(),
+        evidence_refs: Vec::new(),
+    };
+    let request_path = f.write_private_context(
+        "external-resolution-request.json",
+        &serde_json::to_value(&request).expect("serialize external resolution request"),
+    );
+    let request_path = request_path.to_str().expect("utf8 request path").to_string();
+
+    let head_before = fs::read_to_string(f.project_root.join(".git/HEAD")).expect("read HEAD");
+    let lib_before = fs::read(f.project_root.join("src/lib.rs")).expect("read fixture source");
+    let plans_before = snapshot_tree(&f.plans_dir);
+    let sessions_before = snapshot_tree(&f.sessions_dir);
+    let authority_before = snapshot_tree(&f.authority_dir);
+    let workflow = CoworkerWorkflowStore::new(&f.plans_dir).expect("open workflow store");
+    let ledger_path = workflow
+        .ledger_path_for_binding(&f.binding_id)
+        .expect("workflow ledger path");
+    assert!(!ledger_path.exists());
+
+    // Real preview through the context router, a real flow process, the private stores and the
+    // inherited observation environment. Preview must remain pure and produce the operator digest.
+    let preview_out = run_context_flow(
+        &f,
+        &context,
+        &[
+            "external-resolution",
+            "preview",
+            "--request",
+            request_path.as_str(),
+        ],
+    )
+    .await;
+    let preview = parse_flow_data(&preview_out);
+    assert_eq!(preview["binding_id"], f.binding_id);
+    assert_eq!(preview["thread_uuid"], THREAD_UUID);
+    assert_eq!(preview["target"]["kind"], "legacy_plan");
+    assert_eq!(preview["scope"]["kind"], "full_job");
+    assert_eq!(
+        preview["project"]["canonical_repo_root"],
+        json!(f.project_root)
+    );
+    let preview_digest = preview["preview_digest"]
+        .as_str()
+        .expect("preview digest")
+        .to_string();
+    assert_eq!(preview_digest.len(), 64);
+    assert_eq!(snapshot_tree(&f.plans_dir), plans_before);
+    assert_eq!(snapshot_tree(&f.sessions_dir), sessions_before);
+    assert_eq!(snapshot_tree(&f.authority_dir), authority_before);
+    assert!(!ledger_path.exists());
+    assert_no_host_repo_or_journal_effects(&f, &head_before, &lib_before);
+
+    // Refusals that must be decided before the flow child acquires any shared or exclusive lock.
+    let missing_operator = run_context_flow(
+        &f,
+        &context,
+        &[
+            "external-resolution",
+            "record",
+            "--request",
+            request_path.as_str(),
+            "--confirm-thread",
+            THREAD_UUID,
+            "--confirm-preview",
+            preview_digest.as_str(),
+        ],
+    )
+    .await;
+    assert_error_code(&missing_operator, "unauthorized_operator");
+
+    let missing_thread = run_context_flow(
+        &f,
+        &context,
+        &[
+            "external-resolution",
+            "record",
+            "--request",
+            request_path.as_str(),
+            "--confirm-preview",
+            preview_digest.as_str(),
+            "--operator-approved",
+        ],
+    )
+    .await;
+    assert_error_code(&missing_thread, "invalid_input");
+
+    let wrong_thread = run_context_flow(
+        &f,
+        &context,
+        &[
+            "external-resolution",
+            "record",
+            "--request",
+            request_path.as_str(),
+            "--confirm-thread",
+            OTHER_THREAD_UUID,
+            "--confirm-preview",
+            preview_digest.as_str(),
+            "--operator-approved",
+        ],
+    )
+    .await;
+    assert_error_code(&wrong_thread, "scope_mismatch");
+
+    let missing_preview = run_context_flow(
+        &f,
+        &context,
+        &[
+            "external-resolution",
+            "record",
+            "--request",
+            request_path.as_str(),
+            "--confirm-thread",
+            THREAD_UUID,
+            "--operator-approved",
+        ],
+    )
+    .await;
+    assert_error_code(&missing_preview, "invalid_input");
+
+    // JSON self-attestation cannot replace the independent CLI flags.
+    let mut self_attested =
+        serde_json::to_value(&request).expect("serialize self-attested request");
+    let object = self_attested
+        .as_object_mut()
+        .expect("request object for self-attestation");
+    object.insert("trusted_local_attested".to_string(), json!(true));
+    object.insert("operator_approved".to_string(), json!(true));
+    let self_attested_path = f.write_private_context(
+        "external-resolution-self-attested.json",
+        &self_attested,
+    );
+    let self_attested_path = self_attested_path
+        .to_str()
+        .expect("utf8 self-attested request path")
+        .to_string();
+    let self_attested_out = run_context_flow(
+        &f,
+        &context,
+        &[
+            "external-resolution",
+            "record",
+            "--request",
+            self_attested_path.as_str(),
+            "--confirm-thread",
+            THREAD_UUID,
+            "--confirm-preview",
+            preview_digest.as_str(),
+            "--operator-approved",
+        ],
+    )
+    .await;
+    assert_error_code(&self_attested_out, "invalid_input");
+
+    let protected_override = run_context_flow(
+        &f,
+        &context,
+        &[
+            "external-resolution",
+            "preview",
+            "--request",
+            request_path.as_str(),
+            "--project-root=/tmp/forged",
+        ],
+    )
+    .await;
+    assert_error_code(&protected_override, "invalid_input");
+
+    assert_eq!(snapshot_tree(&f.plans_dir), plans_before);
+    assert_eq!(snapshot_tree(&f.sessions_dir), sessions_before);
+    assert_eq!(snapshot_tree(&f.authority_dir), authority_before);
+    assert!(!ledger_path.exists());
+    assert_no_host_repo_or_journal_effects(&f, &head_before, &lib_before);
+
+    // Record exactly once with the real preview digest and explicit local consent.
+    let record_inner = [
+        "external-resolution",
+        "record",
+        "--request",
+        request_path.as_str(),
+        "--confirm-thread",
+        THREAD_UUID,
+        "--confirm-preview",
+        preview_digest.as_str(),
+        "--operator-approved",
+    ];
+    let record_out = run_context_flow(&f, &context, &record_inner).await;
+    let receipt = parse_flow_data(&record_out);
+    assert_eq!(receipt["binding_id"], f.binding_id);
+    assert_eq!(receipt["thread_uuid"], THREAD_UUID);
+    assert_eq!(receipt["request_key"], request.request_key);
+    assert_eq!(receipt["preview_digest"], preview_digest);
+    let receipt_digest = receipt["receipt_digest"]
+        .as_str()
+        .expect("receipt digest")
+        .to_string();
+    assert_eq!(receipt_digest.len(), 64);
+    let plans_after_record = snapshot_tree(&f.plans_dir);
+    let sessions_after_record = snapshot_tree(&f.sessions_dir);
+    let ledger_bytes_after_record = fs::read(&ledger_path).expect("read ledger after record");
+    let ledger_after_record = workflow
+        .read_binding_ledger(&f.binding_id)
+        .expect("read binding ledger after record");
+    assert_eq!(ledger_after_record.external_resolutions.len(), 1);
+    assert_eq!(
+        ledger_after_record.external_resolutions[0].receipt_digest,
+        receipt_digest
+    );
+    let ledger_revision_after_record = ledger_after_record.ledger_revision;
+    assert_no_host_repo_or_journal_effects(&f, &head_before, &lib_before);
+
+    // A fresh CLI process can see the immutable receipt bytes but cannot claim a local fsync
+    // witness, so inspect must report PersistenceUncertain and must not rewrite anything.
+    let inspect_inner = [
+        "external-resolution",
+        "inspect",
+        "--request-key",
+        request.request_key.as_str(),
+    ];
+    let inspected = parse_flow_data(&run_context_flow(&f, &context, &inspect_inner).await);
+    assert_eq!(inspected["receipt"]["receipt_digest"], receipt_digest);
+    assert_eq!(inspected["durability"], "persistence_uncertain");
+    assert_eq!(inspected["applicability"]["status"], "applicable");
+    assert_eq!(
+        fs::read(&ledger_path).expect("read ledger after inspect"),
+        ledger_bytes_after_record
+    );
+    assert_eq!(snapshot_tree(&f.plans_dir), plans_after_record);
+    assert_eq!(snapshot_tree(&f.sessions_dir), sessions_after_record);
+    assert_no_host_repo_or_journal_effects(&f, &head_before, &lib_before);
+
+    // A conflicting duplicate preview digest is refused without touching the immutable ledger.
+    let wrong_digest = "b".repeat(64);
+    let duplicate_wrong_digest = run_context_flow(
+        &f,
+        &context,
+        &[
+            "external-resolution",
+            "record",
+            "--request",
+            request_path.as_str(),
+            "--confirm-thread",
+            THREAD_UUID,
+            "--confirm-preview",
+            wrong_digest.as_str(),
+            "--operator-approved",
+        ],
+    )
+    .await;
+    assert_error_code(&duplicate_wrong_digest, "unauthorized_operator");
+    assert_eq!(
+        fs::read(&ledger_path).expect("read ledger after wrong digest"),
+        ledger_bytes_after_record
+    );
+    assert_eq!(snapshot_tree(&f.plans_dir), plans_after_record);
+
+    // The exact duplicate must refuse uncertainty rather than pretending the append was durable.
+    let duplicate_exact = run_context_flow(&f, &context, &record_inner).await;
+    assert_error_code(&duplicate_exact, "persistence_uncertain");
+    assert_eq!(
+        fs::read(&ledger_path).expect("read ledger after exact duplicate"),
+        ledger_bytes_after_record
+    );
+    assert_eq!(snapshot_tree(&f.plans_dir), plans_after_record);
+    assert_eq!(snapshot_tree(&f.sessions_dir), sessions_after_record);
+    assert_no_host_repo_or_journal_effects(&f, &head_before, &lib_before);
+
+    // Explicit reconcile of the original key/digest is allowed to fsync the unchanged bytes only.
+    // It must not append a receipt, increment the ledger revision, or alter any stored byte.
+    let reconcile_out = run_context_flow(
+        &f,
+        &context,
+        &[
+            "external-resolution",
+            "record",
+            "--request",
+            request_path.as_str(),
+            "--confirm-thread",
+            THREAD_UUID,
+            "--confirm-preview",
+            preview_digest.as_str(),
+            "--reconcile-existing",
+            "--operator-approved",
+        ],
+    )
+    .await;
+    let reconciled = parse_flow_data(&reconcile_out);
+    assert_eq!(reconciled["receipt_digest"], receipt_digest);
+    assert_eq!(
+        fs::read(&ledger_path).expect("read ledger after reconcile"),
+        ledger_bytes_after_record
+    );
+    assert_eq!(
+        workflow
+            .read_binding_ledger(&f.binding_id)
+            .expect("read ledger revision after reconcile")
+            .ledger_revision,
+        ledger_revision_after_record
+    );
+    assert_eq!(snapshot_tree(&f.plans_dir), plans_after_record);
+    assert_eq!(snapshot_tree(&f.sessions_dir), sessions_after_record);
+    assert_no_host_repo_or_journal_effects(&f, &head_before, &lib_before);
+
+    // The fsync witness remains process-local, so the next fresh process is honestly uncertain.
+    let reinspected = parse_flow_data(&run_context_flow(&f, &context, &inspect_inner).await);
+    assert_eq!(reinspected["receipt"]["receipt_digest"], receipt_digest);
+    assert_eq!(reinspected["durability"], "persistence_uncertain");
+
+    // A genuinely canonical second project under the same binding/thread must not surface or
+    // reconcile R1's receipt. The wrong root is rejected before any durability operation.
+    let other_project = f.root.join("external-resolution-other-project");
+    let _other_commit = init_disposable_repo(&other_project);
+    fs::set_permissions(&other_project, fs::Permissions::from_mode(0o755))
+        .expect("chmod second canonical project 0755");
+    let mut other_context_value = f.valid_context_json();
+    other_context_value["project_root"] = json!(other_project);
+    let other_context_path = f.write_private_context(
+        "external-resolution-other-context.json",
+        &other_context_value,
+    );
+    let other_context = other_context_path
+        .to_str()
+        .expect("utf8 other context path")
+        .to_string();
+
+    let other_inspect = run_context_flow(&f, &other_context, &inspect_inner).await;
+    assert_error_code(&other_inspect, "scope_mismatch");
+    let other_inspect_all =
+        run_context_flow(&f, &other_context, &["external-resolution", "inspect"]).await;
+    assert_error_code(&other_inspect_all, "scope_mismatch");
+
+    let mut other_request = request.clone();
+    other_request.canonical_repo_root = other_project.clone();
+    let other_request_path = f.write_private_context(
+        "external-resolution-other-request.json",
+        &serde_json::to_value(&other_request).expect("serialize other request"),
+    );
+    let other_request_path = other_request_path
+        .to_str()
+        .expect("utf8 other request path")
+        .to_string();
+    let other_reconcile = run_context_flow(
+        &f,
+        &other_context,
+        &[
+            "external-resolution",
+            "record",
+            "--request",
+            other_request_path.as_str(),
+            "--confirm-thread",
+            THREAD_UUID,
+            "--confirm-preview",
+            preview_digest.as_str(),
+            "--reconcile-existing",
+            "--operator-approved",
+        ],
+    )
+    .await;
+    assert_error_code(&other_reconcile, "scope_mismatch");
+
+    // Direct flow invocations with the pinned R2 root are refused for both inspect entry routes
+    // and for reconcile, proving the context router cannot be bypassed.
+    let flow_bin = f.pkg_bin_dir.join("threadlane-flow");
+    let other_project_str = other_project.to_str().expect("utf8 other project").to_string();
+
+    let mut direct_inspect_args = five_store_scope_args(&f);
+    direct_inspect_args.extend([
+        "--project-root".to_string(),
+        other_project_str.clone(),
+        "external-resolution".to_string(),
+        "inspect".to_string(),
+        "--request-key".to_string(),
+        request.request_key.clone(),
+    ]);
+    let direct_inspect_refs: Vec<&str> = direct_inspect_args
+        .iter()
+        .map(String::as_str)
+        .collect();
+    let direct_inspect = run_bin(&flow_bin, &direct_inspect_refs).await;
+    assert_error_code(&direct_inspect, "scope_mismatch");
+
+    let mut direct_inspect_all_args = five_store_scope_args(&f);
+    direct_inspect_all_args.extend([
+        "--project-root".to_string(),
+        other_project_str.clone(),
+        "external-resolution".to_string(),
+        "inspect".to_string(),
+    ]);
+    let direct_inspect_all_refs: Vec<&str> = direct_inspect_all_args
+        .iter()
+        .map(String::as_str)
+        .collect();
+    let direct_inspect_all = run_bin(&flow_bin, &direct_inspect_all_refs).await;
+    assert_error_code(&direct_inspect_all, "scope_mismatch");
+
+    let mut direct_reconcile_args = five_store_scope_args(&f);
+    direct_reconcile_args.extend([
+        "--project-root".to_string(),
+        other_project_str,
+        "external-resolution".to_string(),
+        "record".to_string(),
+        "--request".to_string(),
+        other_request_path,
+        "--confirm-thread".to_string(),
+        THREAD_UUID.to_string(),
+        "--confirm-preview".to_string(),
+        preview_digest.clone(),
+        "--reconcile-existing".to_string(),
+        "--operator-approved".to_string(),
+    ]);
+    let direct_reconcile_refs: Vec<&str> = direct_reconcile_args
+        .iter()
+        .map(String::as_str)
+        .collect();
+    let direct_reconcile = run_bin(&flow_bin, &direct_reconcile_refs).await;
+    assert_error_code(&direct_reconcile, "scope_mismatch");
+
+    assert_eq!(
+        fs::read(&ledger_path).expect("read ledger after wrong-project refusals"),
+        ledger_bytes_after_record
+    );
+    assert_eq!(
+        workflow
+            .read_binding_ledger(&f.binding_id)
+            .expect("read ledger after wrong-project refusals")
+            .ledger_revision,
+        ledger_revision_after_record
+    );
+    assert_eq!(snapshot_tree(&f.plans_dir), plans_after_record);
+    assert_eq!(snapshot_tree(&f.sessions_dir), sessions_after_record);
+    assert_no_host_repo_or_journal_effects(&f, &head_before, &lib_before);
+
     f.shutdown().await;
 }
 
