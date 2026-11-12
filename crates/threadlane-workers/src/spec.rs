@@ -317,7 +317,8 @@ pub struct WorkerSpec {
 ///
 /// Static validation is side-effect-free and does not create or require the per-task checkout
 /// directory to exist yet. When `file_permissions` is [`WorkerFilePermissions::TaskFiles`],
-/// `constructed_argv` is the static base preview without `--settings`,
+/// `constructed_argv` is the static base preview without the Antigravity `--settings`, Codex
+/// `permissions.threadlane-task-files` profile, or OpenCode task-files prologue,
 /// `workdir_argv_resolution_required` is `true`, and `argv_resolution_note` documents that the
 /// actual launch argv is resolved against the canonical task working directory via
 /// [`WorkerSpec::build_argv_for_workdir`].
@@ -333,7 +334,8 @@ pub struct SpecValidationReport {
     #[serde(default)]
     pub workdir_argv_resolution_required: bool,
     /// Explicit note when final launch argv depends on resolving the canonical task working
-    /// directory (`Some(...)` when `file_permissions == TaskFiles`, `None` when `Inherit`).
+    /// directory and provider-specific workdir configuration (`Some(...)` for every `TaskFiles`
+    /// mode, `None` when `Inherit`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub argv_resolution_note: Option<String>,
     /// Canonical executable path.
@@ -347,9 +349,11 @@ pub struct SpecValidationReport {
     /// Static base argv array (excluding `argv[0]`).
     ///
     /// When `file_permissions` is [`WorkerFilePermissions::Inherit`], this is the full launch argv.
-    /// When `file_permissions` is [`WorkerFilePermissions::TaskFiles`], session-only
-    /// `--settings <inline-json>` is omitted here and resolved against the canonical working
-    /// directory by [`WorkerSpec::build_argv_for_workdir`].
+    /// When `file_permissions` is [`WorkerFilePermissions::TaskFiles`], this is only the static
+    /// base preview: Antigravity `--settings <inline-json>`, the Codex
+    /// `permissions.threadlane-task-files` profile, and the OpenCode task-files prologue are
+    /// omitted here and resolved against the canonical working directory by
+    /// [`WorkerSpec::build_argv_for_workdir`].
     pub constructed_argv: Vec<String>,
     /// Validated repository-relative write allowlist.
     pub allowed_write_paths: BTreeSet<String>,
@@ -464,16 +468,17 @@ impl WorkerSpec {
 
         validate_prompt(&self.prompt)?;
         let constructed_argv = self.build_argv_from_resolved(&resolved_model, None);
-        let workdir_argv_resolution_required = matches!(
-            self.provider,
-            WorkerProvider::Antigravity | WorkerProvider::CodexCli
-        ) && self.file_permissions.requires_workdir_argv();
+        let workdir_argv_resolution_required = self.file_permissions.requires_workdir_argv();
         let argv_resolution_note = workdir_argv_resolution_required.then(|| {
             match self.provider {
                 WorkerProvider::CodexCli => format!(
                     "file_permissions is `{}`; `constructed_argv` is the static base preview without `-c permissions.{}=...`, which is resolved from the canonical task working directory and base commit via `WorkerSpec::build_argv_for_workdir`.",
                     self.file_permissions.as_str(),
                     CODEX_TASK_FILES_PERMISSION_PROFILE_NAME
+                ),
+                WorkerProvider::OpenCodeV2 => format!(
+                    "file_permissions is `{}`; `constructed_argv` is the static base preview with the caller prompt only and no OpenCode task_files prologue; the actual launch prompt (including the exact canonical task working directory and declared write scopes) and argv are resolved via `WorkerSpec::build_argv_for_workdir`.",
+                    self.file_permissions.as_str()
                 ),
                 _ => format!(
                     "file_permissions is `{}`; `constructed_argv` is the static base preview without `--settings`, which is resolved from the canonical task working directory via `WorkerSpec::build_argv_for_workdir`.",
@@ -538,17 +543,22 @@ impl WorkerSpec {
     /// when `file_permissions` is [`WorkerFilePermissions::Inherit`].
     ///
     /// Returns [`WorkerError::InvalidSpec`] when `file_permissions` is
-    /// [`WorkerFilePermissions::TaskFiles`] or [`WorkerFilePermissions::ReadOnly`] on Antigravity
-    /// because session-only `--settings <inline-json>` requires validating and interpolating the
-    /// actual canonical working directory via [`WorkerSpec::build_argv_for_workdir`].
+    /// [`WorkerFilePermissions::TaskFiles`] because the Antigravity `--settings <inline-json>`,
+    /// Codex permission profile, or OpenCode task-files prologue requires validating and
+    /// interpolating the actual canonical working directory via
+    /// [`WorkerSpec::build_argv_for_workdir`].
     ///
     /// Never uses shell interpolation, never invents unsupported flags (such as `--variant`),
     /// and never adds `--dangerously-skip-permissions` or `--auto`.
     pub fn build_argv(&self) -> Result<Vec<String>, WorkerError> {
         let report = self.validate()?;
         if report.workdir_argv_resolution_required {
+            let workdir_dependent_argv = match self.provider {
+                WorkerProvider::OpenCodeV2 => "the session-local OpenCode task_files prologue",
+                _ => "session-only `--settings`",
+            };
             return Err(WorkerError::InvalidSpec(format!(
-                "`file_permissions: {}` requires a canonical task working directory to construct session-only `--settings`; call `WorkerSpec::build_argv_for_workdir`",
+                "`file_permissions: {}` requires a canonical task working directory to construct {workdir_dependent_argv}; call `WorkerSpec::build_argv_for_workdir`",
                 self.file_permissions.as_str()
             )));
         }
@@ -570,9 +580,11 @@ impl WorkerSpec {
     /// [`WriteScopeKind::ExactFile`] scopes), and prepends a session-local `task_files` execution
     /// contract ahead of the verbatim task instruction in the `--print` argument. For
     /// [`WorkerProvider::OpenCodeV2`] with [`WorkerFilePermissions::TaskFiles`], validates the
-    /// per-child configuration and, for an owned checkout inside `work_area_root`, prepends a
-    /// session-local OpenCode `task_files` contract with the actual `working_directory` and
-    /// declared write scopes ahead of the verbatim prompt.
+    /// per-child configuration and prepends a session-local OpenCode `task_files` contract with
+    /// the actual canonical `working_directory` and declared write scopes ahead of the verbatim
+    /// prompt. The complete effective OpenCode task-files prompt, including the canonical
+    /// working directory, write scopes, prologue, and original prompt, must fit within
+    /// [`MAX_PROMPT_BYTES`].
     /// [`WorkerFilePermissions::ReadOnly`] is rejected on [`WorkerSpec`] and must use
     /// [`AdvisoryWorkerSpec::build_argv_for_workdir`].
     pub fn build_argv_for_workdir(
@@ -612,18 +624,13 @@ impl WorkerSpec {
                 let _ = self.build_opencode_config_for_workdir(&canonical_workdir)?;
                 let effective_prompt = match opencode_file_permissions {
                     WorkerFilePermissions::TaskFiles => {
-                        // Only an owned checkout inside the validated task work area is an actual
-                        // task worktree; other directories keep the legacy bare-prompt behavior.
-                        let is_owned_task_worktree = canonical_workdir
-                            .strip_prefix(&report.work_area_root)
-                            .is_ok_and(|relative| !relative.as_os_str().is_empty());
-                        is_owned_task_worktree.then(|| {
-                            build_opencode_task_files_prompt(
-                                &canonical_workdir,
-                                &self.allowed_write_paths,
-                                &self.prompt,
-                            )
-                        })
+                        let effective_prompt = build_opencode_task_files_prompt(
+                            &canonical_workdir,
+                            &self.allowed_write_paths,
+                            &self.prompt,
+                        )?;
+                        validate_opencode_task_files_effective_prompt(&effective_prompt)?;
+                        Some(effective_prompt)
                     }
                     WorkerFilePermissions::Inherit | WorkerFilePermissions::ReadOnly => None,
                 };
@@ -1674,6 +1681,18 @@ fn validate_prompt(prompt: &str) -> Result<(), WorkerError> {
         return Err(WorkerError::InvalidSpec(
             "prompt must not contain NUL bytes".to_string(),
         ));
+    }
+    Ok(())
+}
+
+fn validate_opencode_task_files_effective_prompt(
+    effective_prompt: &str,
+) -> Result<(), WorkerError> {
+    if effective_prompt.len() > MAX_PROMPT_BYTES {
+        return Err(WorkerError::InvalidSpec(format!(
+            "effective OpenCode task_files prompt length ({} bytes), including the canonical task working directory, declared write scopes, session-local prologue, and original task prompt, exceeds maximum of {MAX_PROMPT_BYTES} bytes; refusing to launch rather than truncating the original prompt",
+            effective_prompt.len()
+        )));
     }
     Ok(())
 }

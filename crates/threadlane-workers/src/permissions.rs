@@ -370,8 +370,8 @@ impl WorkerFilePermissions {
         matches!(self, Self::ReadOnly)
     }
 
-    /// Returns `true` when constructing the final launch argv for Antigravity requires the
-    /// canonical working directory (`TaskFiles` or `ReadOnly`).
+    /// Returns `true` when constructing the final launch argv requires the canonical working
+    /// directory (`TaskFiles` or `ReadOnly`).
     pub fn requires_workdir_argv(self) -> bool {
         matches!(self, Self::TaskFiles | Self::ReadOnly)
     }
@@ -1689,14 +1689,21 @@ pub(crate) const OPENCODE_TASK_FILES_PROMPT_BOUNDARY: &str = "[THREADLANE_TASK_I
 /// configuration edits, and requires reporting any out-of-scope path instead of probing outside
 /// the declared scopes. Preserves `task_prompt` byte-for-byte after
 /// [`OPENCODE_TASK_FILES_PROMPT_BOUNDARY`].
-#[must_use]
+///
+/// Returns [`WorkerError::InvalidSpec`] if the already validated canonical `canonical_workdir`
+/// is not valid UTF-8, rather than substituting a lossy path.
 pub(crate) fn build_opencode_task_files_prompt(
     canonical_workdir: &Path,
     allowed_write_paths: &BTreeSet<String>,
     task_prompt: &str,
-) -> String {
-    let workdir_lossy = canonical_workdir.to_string_lossy();
-    let clean_workdir = workdir_lossy.trim_end_matches('/');
+) -> Result<String, WorkerError> {
+    let canonical_workdir_str = canonical_workdir.to_str().ok_or_else(|| {
+        WorkerError::InvalidSpec(format!(
+            "canonical task working directory `{}` is not valid UTF-8 and cannot be used for the OpenCode task_files prologue",
+            canonical_workdir.display()
+        ))
+    })?;
+    let clean_workdir = canonical_workdir_str.trim_end_matches('/');
     let mut scope_descriptions = Vec::with_capacity(allowed_write_paths.len());
     for entry in allowed_write_paths {
         let clean_entry = entry.strip_suffix('/').unwrap_or(entry.as_str());
@@ -1712,7 +1719,7 @@ pub(crate) fn build_opencode_task_files_prompt(
     }
     let scopes_summary = scope_descriptions.join(", ");
 
-    format!(
+    Ok(format!(
         "[THREADLANE_OPENCODE_TASK_FILES_CONTRACT] Session-local OpenCode task_files execution contract: \
 canonical task working directory (authoritative checkout root for every file operation): `{clean_workdir}`. \
 Prefer repository-relative paths under `{clean_workdir}` for every tool; if a tool requires an absolute path, \
@@ -1726,7 +1733,7 @@ create temporary files or edit provider/control configuration, `AGENTS.md`, or `
 outside the declared write scopes, report it instead of probing outside the scopes or treating the rest of the \
 repository as read-only. Persist changes only within declared task write scopes: [{scopes_summary}]. \
 {OPENCODE_TASK_FILES_PROMPT_BOUNDARY}{task_prompt}"
-    )
+    ))
 }
 
 /// Builds the structured OpenCode 2.2.0 V2 [`OpenCodeConfigContent`] for a validated model target,
