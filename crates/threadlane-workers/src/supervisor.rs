@@ -3582,6 +3582,16 @@ printf '%s\n' '{{"event":"result","result":{{"status":"SUCCESS","response":"{{\"
         fs::create_dir_all(&bin_dir).expect("create bin_dir");
         let launch_log = root.join("launch.log");
         let script_path = bin_dir.join("fake-codex-etxtbsy");
+        let payload = serde_json::json!({"ok": true}).to_string();
+        let terminal_event = serde_json::json!({
+            "type": "item.completed",
+            "item": {
+                "id": "msg_1",
+                "type": "agent_message",
+                "text": payload
+            }
+        })
+        .to_string();
         let script = format!(
             r#"#!/usr/bin/env sh
 set -eu
@@ -3600,11 +3610,13 @@ while [ "$#" -gt 0 ]; do
 done
 printf '%s\n' '{{"type":"thread.started","thread_id":"thread-etxtbsy-codex"}}'
 printf '%s\n' '{{"type":"turn.started"}}'
-printf '%s\n' '{{"type":"item.completed","item":{{"id":"msg_1","type":"agent_message","text":"{{\"ok\":true}}"}}}}'
+printf '%s\n' '{}'
 printf '%s\n' '{{"type":"turn.completed","usage":{{"input_tokens":10,"output_tokens":5}}}}'
-printf '%s\n' '{{"ok":true}}' > "$OUT"
+printf '%s' '{}' > "$OUT"
 "#,
-            launch_log.display()
+            launch_log.display(),
+            terminal_event,
+            payload
         );
         fs::write(&script_path, script).expect("write script");
         fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700))
