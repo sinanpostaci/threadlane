@@ -73,6 +73,9 @@ pub struct CoworkerBindingLedger {
     /// Immutable automatic admission subjects, written atomically with approval linkage.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub admission_markers: BTreeMap<String, crate::coworker_admission::AdmissionMarker>,
+    /// Immutable operator-attested external resolution receipts appended to this binding.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub external_resolutions: Vec<crate::external_resolution::ExternalResolutionReceipt>,
 }
 
 impl CoworkerBindingLedger {
@@ -89,6 +92,7 @@ impl CoworkerBindingLedger {
             architect_advice: Vec::new(),
             jobs: Vec::new(),
             admission_markers: BTreeMap::new(),
+            external_resolutions: Vec::new(),
         })
     }
 
@@ -145,10 +149,11 @@ impl CoworkerBindingLedger {
                 || !self.architect_advice.is_empty()
                 || !self.jobs.is_empty()
                 || !self.admission_markers.is_empty()
+                || !self.external_resolutions.is_empty()
             {
                 return Err(NativeError::new(
                     NativeErrorCode::ProtocolError,
-                    "revision-0 coworker workflow ledger must not contain grants, advice, or jobs",
+                    "revision-0 coworker workflow ledger must not contain grants, advice, jobs, or external resolutions",
                 ));
             }
             return Ok(());
@@ -164,6 +169,8 @@ impl CoworkerBindingLedger {
         if self.planning_grants.len() > MAX_PLANNING_GRANTS_PER_BINDING
             || self.architect_advice.len() > MAX_ARCHITECT_ADVICE_RECORDS_PER_BINDING
             || self.jobs.len() > MAX_JOBS_PER_BINDING
+            || self.external_resolutions.len()
+                > crate::external_resolution::MAX_EXTERNAL_RESOLUTIONS_PER_BINDING
         {
             return Err(NativeError::new(
                 NativeErrorCode::ProtocolError,
@@ -371,6 +378,13 @@ impl CoworkerBindingLedger {
                 }
             }
         }
+        crate::external_resolution::validate_ledger_external_resolutions(
+            &self.external_resolutions,
+            expected_binding_id,
+            pinned_thread,
+            self.ledger_revision,
+            &self.jobs,
+        )?;
         Ok(())
     }
 
@@ -920,6 +934,27 @@ impl CoworkerWorkflowStore {
             &mut CoworkerBindingLedger,
         ) -> Result<CoworkerLedgerMutationOutcome<T>, NativeError>,
     {
+        self.transact_binding_ledger_with_post_persist_probe(
+            binding_id,
+            expected_ledger_revision,
+            f,
+            |_| Ok(()),
+        )
+    }
+
+    pub(crate) fn transact_binding_ledger_with_post_persist_probe<T, F, P>(
+        &self,
+        binding_id: &str,
+        expected_ledger_revision: Option<u64>,
+        f: F,
+        post_persist_probe: P,
+    ) -> Result<(CoworkerBindingLedger, T), NativeError>
+    where
+        F: FnOnce(
+            &mut CoworkerBindingLedger,
+        ) -> Result<CoworkerLedgerMutationOutcome<T>, NativeError>,
+        P: FnOnce(&Path) -> Result<(), NativeError>,
+    {
         validate_bounded_identifier(binding_id, "binding_id", MAX_COWORKER_ID_LEN)?;
         let _ = validate_existing_private_store_dir(&self.plans_dir, "plans_dir")?;
         let lock_filename = lock_filename_for_binding(binding_id);
@@ -954,6 +989,15 @@ impl CoworkerWorkflowStore {
                         ));
                     }
                 }
+                if working.external_resolutions.len() < original.external_resolutions.len()
+                    || working.external_resolutions[..original.external_resolutions.len()]
+                        != original.external_resolutions[..]
+                {
+                    return Err(NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        "External resolution receipts are append-only and immutable; existing receipts cannot be removed, reordered, or modified",
+                    ));
+                }
                 if let Some(expected_rev) = expected_ledger_revision {
                     if expected_rev != original.ledger_revision {
                         return Err(NativeError::new(
@@ -973,9 +1017,77 @@ impl CoworkerWorkflowStore {
                 })?;
                 working.ledger_revision = next_rev;
                 self.write_ledger_unlocked(binding_id, &working)?;
+                post_persist_probe(&ledger_path)?;
                 Ok((working, value))
             }
         }
+    }
+
+    /// Establishes file-and-directory `fsync` durability on an existing unchanged binding ledger
+    /// under the per-binding workflow lock without rewriting bytes or advancing `ledger_revision`.
+    pub(crate) fn sync_existing_binding_ledger_durability<F>(
+        &self,
+        binding_id: &str,
+        verify_fn: F,
+    ) -> Result<(PathBuf, CoworkerBindingLedger), NativeError>
+    where
+        F: FnOnce(&CoworkerBindingLedger) -> Result<(), NativeError>,
+    {
+        validate_bounded_identifier(binding_id, "binding_id", MAX_COWORKER_ID_LEN)?;
+        let _ = validate_existing_private_store_dir(&self.plans_dir, "plans_dir")?;
+        let lock_filename = lock_filename_for_binding(binding_id);
+        let _guard = acquire_cross_process_lock(
+            &self.plans_dir,
+            &lock_filename,
+            "coworker_workflow_ledger_lock",
+        )?;
+        let ledger_path = self.ledger_path_for_binding(binding_id)?;
+        let Some(raw_before) = read_private_file_bounded(
+            &ledger_path,
+            MAX_COWORKER_LEDGER_BYTES,
+            "coworker_workflow_ledger",
+        )?
+        else {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "cannot reconcile external resolution durability: binding ledger file does not exist on disk",
+            ));
+        };
+        let ledger: CoworkerBindingLedger = serde_json::from_slice(&raw_before).map_err(|_| {
+            NativeError::new(
+                NativeErrorCode::ProtocolError,
+                "failed to parse coworker workflow ledger JSON; existing file preserved untouched",
+            )
+        })?;
+        ledger.validate(binding_id)?;
+        verify_fn(&ledger)?;
+
+        fs::File::open(&ledger_path)
+            .and_then(|file| file.sync_all())
+            .map_err(|_| {
+                NativeError::persistence_uncertain(
+                    "failed to fsync existing coworker workflow ledger file during durability reconciliation",
+                )
+            })?;
+        fs::File::open(&self.plans_dir)
+            .and_then(|dir_file| dir_file.sync_all())
+            .map_err(|_| {
+                NativeError::persistence_uncertain(
+                    "failed to fsync coworker workflow plans_dir during durability reconciliation",
+                )
+            })?;
+
+        let raw_after = read_private_file_bounded(
+            &ledger_path,
+            MAX_COWORKER_LEDGER_BYTES,
+            "coworker_workflow_ledger",
+        )?;
+        if raw_after.as_deref() != Some(raw_before.as_slice()) {
+            return Err(NativeError::persistence_uncertain(
+                "coworker workflow ledger bytes changed unexpectedly during durability reconciliation",
+            ));
+        }
+        Ok((ledger_path, ledger))
     }
 
     /// Creates and persists a scoped read-only [`PlanningAdviceGrant`] after verifying live

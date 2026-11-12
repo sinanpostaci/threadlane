@@ -653,6 +653,7 @@ fn populated_valid_history_projects_tasks_attempts_candidates_outbox_runs_and_li
         architect_advice: vec![architect_advice],
         jobs: vec![job_1.clone(), job_2.clone()],
         admission_markers: BTreeMap::new(),
+        external_resolutions: Vec::new(),
     };
     ledger
         .validate(BINDING_A)
@@ -922,6 +923,7 @@ fn rejects_wrong_binding_thread_repository_source_and_mismatched_approval() {
         architect_advice: Vec::new(),
         jobs: vec![job_a],
         admission_markers: BTreeMap::new(),
+        external_resolutions: Vec::new(),
     };
     ledger
         .validate(BINDING_A)
@@ -1083,6 +1085,7 @@ fn missing_store_and_missing_runtime_degrade_honestly_without_creating_files_or_
         architect_advice: Vec::new(),
         jobs: vec![job],
         admission_markers: BTreeMap::new(),
+        external_resolutions: Vec::new(),
     };
     write_private_json(
         &workflow_store
@@ -4146,6 +4149,7 @@ fn retires_attention_for_store_verified_obsolete_planning_jobs_across_two_step_l
         architect_advice: Vec::new(),
         jobs: vec![job_1.clone(), job_2.clone(), job_3.clone(), job_4.clone()],
         admission_markers: BTreeMap::new(),
+        external_resolutions: Vec::new(),
     };
     ledger.validate(BINDING_A).expect("valid workflow ledger");
     let ledger_path = workflow_store
@@ -4645,6 +4649,7 @@ fn forged_lineage_context_unrelated_jobs_and_scope_or_revision_mismatches_do_not
             job_auth_succ,
         ],
         admission_markers: BTreeMap::new(),
+        external_resolutions: Vec::new(),
     };
     ledger.validate(BINDING_A).expect("valid ledger");
     write_private_json(
@@ -5149,6 +5154,7 @@ fn non_amendment_holds_execution_linkage_runtime_degradation_and_ambiguous_reser
             job_clean_succ,
         ],
         admission_markers: BTreeMap::new(),
+        external_resolutions: Vec::new(),
     };
     ledger.validate(BINDING_A).expect("valid ledger");
     write_private_json(
@@ -5334,6 +5340,7 @@ fn non_amendment_holds_execution_linkage_runtime_degradation_and_ambiguous_reser
             architect_advice: Vec::new(),
             jobs: vec![job_ambig_old.clone(), job_ambig_succ],
             admission_markers: BTreeMap::new(),
+            external_resolutions: Vec::new(),
         };
         ambig_ledger
             .validate(binding_id)
@@ -5653,6 +5660,7 @@ fn preserves_unresolved_effect_attention_across_stop_supersession_and_completed_
             job_completed_unknown.clone(),
         ],
         admission_markers: BTreeMap::new(),
+        external_resolutions: Vec::new(),
     };
     ledger.validate(BINDING_A).expect("valid ledger");
     write_private_json(
@@ -6623,6 +6631,7 @@ fn cyclic_and_dangling_amendment_lineages_preserve_attention_and_isolate_foreign
             job_auth_poison,
         ],
         admission_markers: BTreeMap::new(),
+        external_resolutions: Vec::new(),
     };
     ledger
         .validate(BINDING_A)
@@ -7176,6 +7185,7 @@ fn awaiting_approval_verified_current_published_plan_metadata_projects_bounded_n
             job_inflight.clone(),
         ],
         admission_markers: BTreeMap::new(),
+        external_resolutions: Vec::new(),
     };
     ledger.validate(BINDING_A).expect("valid positive ledger");
     let ledger_path = workflow_store
@@ -7378,6 +7388,7 @@ fn awaiting_approval_legacy_noref_missing_or_corrupt_store_projects_unknown_with
         architect_advice: Vec::new(),
         jobs: vec![job_legacy.clone(), job_with_ref.clone()],
         admission_markers: BTreeMap::new(),
+        external_resolutions: Vec::new(),
     };
     ledger.validate(BINDING_A).expect("valid workflow ledger");
     let ledger_path = workflow_store
@@ -7763,6 +7774,7 @@ fn awaiting_approval_stale_head_profile_mismatch_and_forged_caller_context_remai
         architect_advice: Vec::new(),
         jobs: jobs.clone(),
         admission_markers: BTreeMap::new(),
+        external_resolutions: Vec::new(),
     };
     ledger.validate(BINDING_A).expect("valid ledger");
     let ledger_path = workflow_store

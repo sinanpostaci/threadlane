@@ -598,6 +598,7 @@ mod unix_workspace_tests {
             architect_advice: Vec::new(),
             jobs: vec![job],
             admission_markers: BTreeMap::new(),
+            external_resolutions: Vec::new(),
         };
         ledger.validate(binding_id).expect("valid ledger");
         write_coworker_ledger(&stores.plans, &ledger);
@@ -896,6 +897,7 @@ mod unix_workspace_tests {
             architect_advice: Vec::new(),
             jobs: vec![healthy_job],
             admission_markers: BTreeMap::new(),
+            external_resolutions: Vec::new(),
         };
         write_coworker_ledger(&stores_healthy.plans, &healthy_ledger);
 
@@ -1039,6 +1041,7 @@ mod unix_workspace_tests {
             architect_advice: Vec::new(),
             jobs: vec![job_wrong_thread, job_symlink_repo],
             admission_markers: BTreeMap::new(),
+            external_resolutions: Vec::new(),
         };
         let ledger_path = write_coworker_ledger(&stores.plans, &base_ledger);
         let mut raw_ledger = serde_json::to_value(&base_ledger).expect("ledger json");
@@ -1456,6 +1459,7 @@ mod unix_workspace_tests {
             architect_advice: Vec::new(),
             jobs: vec![job_unproved, job_planning],
             admission_markers: BTreeMap::new(),
+            external_resolutions: Vec::new(),
         };
         ledger.validate(binding_id).expect("valid ledger");
         write_coworker_ledger(&stores.plans, &ledger);

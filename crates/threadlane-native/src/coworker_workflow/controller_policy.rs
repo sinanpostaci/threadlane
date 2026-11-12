@@ -4660,6 +4660,83 @@ impl ControllerPolicyStore {
         Ok(ledger.jobs.remove(job_id))
     }
 
+    /// Pure read-only lookup of `binding_id`'s controller ledger revision and optional
+    /// [`ControllerJobRuntimeState`] for `job_id`, creating no directories, files, or locks.
+    pub(crate) fn get_binding_runtime_and_job_readonly(
+        &self,
+        binding_id: &str,
+        job_id: &str,
+    ) -> Result<(u64, Option<ControllerJobRuntimeState>), NativeError> {
+        validate_bounded_identifier(binding_id, "binding_id", MAX_COWORKER_ID_LEN)?;
+        validate_bounded_identifier(job_id, "job_id", MAX_COWORKER_ID_LEN)?;
+        let _ = validate_existing_private_dir(&self.plans_dir, "plans_dir")?;
+        let path = self.ledger_path_for_binding(binding_id)?;
+        let Some(mut ledger) = self.read_ledger_unlocked(binding_id, &path)? else {
+            return Ok((0, None));
+        };
+        Ok((ledger.ledger_revision, ledger.jobs.remove(job_id)))
+    }
+
+    /// Pure read-only lookup of `binding_id`'s controller ledger revision, creating no directories,
+    /// files, or locks.
+    pub(crate) fn get_binding_ledger_revision_readonly(
+        &self,
+        binding_id: &str,
+    ) -> Result<u64, NativeError> {
+        validate_bounded_identifier(binding_id, "binding_id", MAX_COWORKER_ID_LEN)?;
+        let _ = validate_existing_private_dir(&self.plans_dir, "plans_dir")?;
+        let path = self.ledger_path_for_binding(binding_id)?;
+        Ok(self
+            .read_ledger_unlocked(binding_id, &path)?
+            .map(|ledger| ledger.ledger_revision)
+            .unwrap_or(0))
+    }
+
+    /// Acquires the per-binding controller policy lock (`coworker-controller-<tag>.lock`) and
+    /// reads the current controller ledger revision without mutating disk state.
+    pub(crate) fn acquire_binding_lock_and_read_ledger_revision(
+        &self,
+        binding_id: &str,
+    ) -> Result<(crate::fs_safety::CrossProcessLockGuard, u64), NativeError> {
+        validate_bounded_identifier(binding_id, "binding_id", MAX_COWORKER_ID_LEN)?;
+        let clean_dir = validate_existing_private_dir(&self.plans_dir, "plans_dir")?;
+        let lock_name = controller_lock_filename(binding_id);
+        let guard = acquire_cross_process_lock(&clean_dir, &lock_name, "controller_policy_lock")?;
+        let path = self.ledger_path_for_binding(binding_id)?;
+        let revision = self
+            .read_ledger_unlocked(binding_id, &path)?
+            .map(|ledger| ledger.ledger_revision)
+            .unwrap_or(0);
+        Ok((guard, revision))
+    }
+
+    /// Acquires the per-binding controller policy lock (`coworker-controller-<tag>.lock`) and
+    /// reads the current controller ledger revision and optional [`ControllerJobRuntimeState`] for
+    /// `job_id` without mutating disk state.
+    pub(crate) fn acquire_binding_lock_and_read_job_runtime(
+        &self,
+        binding_id: &str,
+        job_id: &str,
+    ) -> Result<
+        (
+            crate::fs_safety::CrossProcessLockGuard,
+            u64,
+            Option<ControllerJobRuntimeState>,
+        ),
+        NativeError,
+    > {
+        validate_bounded_identifier(binding_id, "binding_id", MAX_COWORKER_ID_LEN)?;
+        validate_bounded_identifier(job_id, "job_id", MAX_COWORKER_ID_LEN)?;
+        let clean_dir = validate_existing_private_dir(&self.plans_dir, "plans_dir")?;
+        let lock_name = controller_lock_filename(binding_id);
+        let guard = acquire_cross_process_lock(&clean_dir, &lock_name, "controller_policy_lock")?;
+        let path = self.ledger_path_for_binding(binding_id)?;
+        let Some(mut ledger) = self.read_ledger_unlocked(binding_id, &path)? else {
+            return Ok((guard, 0, None));
+        };
+        Ok((guard, ledger.ledger_revision, ledger.jobs.remove(job_id)))
+    }
+
     /// Alias for [`Self::get_job_runtime_readonly`] returning `Option<ControllerJobRuntimeState>`.
     pub fn read_job_runtime(
         &self,

@@ -1007,6 +1007,46 @@ impl PlanningCommandStore {
         self.read_binding_ledger_with_probe_hook(binding_id, |_, _| Ok(()))
     }
 
+    /// Acquires the per-binding planning command lock (`planning-commands-<tag>.lock`) and reads a
+    /// validated snapshot of `binding_id`'s [`PlanningCommandBindingLedger`] (projecting any
+    /// abandoned `Running` command to `Unknown` in memory) without mutating disk state.
+    pub(crate) fn acquire_binding_lock_and_read_ledger(
+        &self,
+        binding_id: &str,
+    ) -> Result<
+        (
+            crate::fs_safety::CrossProcessLockGuard,
+            PlanningCommandBindingLedger,
+        ),
+        NativeError,
+    > {
+        validate_bounded_identifier(binding_id, "binding_id", MAX_COWORKER_ID_LEN)?;
+        let _ = validate_existing_private_store_dir(&self.commands_dir, "planning_commands_dir")?;
+        let lock_filename = lock_filename_for_binding(binding_id);
+        let guard = acquire_cross_process_lock(
+            &self.commands_dir,
+            &lock_filename,
+            "planning_command_ledger_lock",
+        )?;
+        let path = self.ledger_path_for_binding(binding_id)?;
+        let Some(mut ledger) = self.read_ledger_unlocked(binding_id, &path)? else {
+            return Ok((guard, PlanningCommandBindingLedger::empty(binding_id)?));
+        };
+        for cmd in &mut ledger.commands {
+            if cmd.status == PlanningCommandStatus::Running
+                && !self.is_running_owner_still_active(cmd)?
+            {
+                cmd.status = PlanningCommandStatus::Unknown;
+                cmd.pending_reconciliation = true;
+                if cmd.diagnostic.is_none() {
+                    cmd.diagnostic = Some(ABANDONED_RUNNING_DIAGNOSTIC.to_string());
+                }
+            }
+        }
+        ledger.validate(binding_id)?;
+        Ok((guard, ledger))
+    }
+
     fn read_binding_ledger_with_probe_hook<H>(
         &self,
         binding_id: &str,

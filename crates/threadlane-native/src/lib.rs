@@ -62,6 +62,9 @@ pub mod dispatch_guard;
 pub mod error;
 /// Scoped Coworker execution handoff gateway bridging MCP tool parameters to `CoworkerCodeDriver`.
 pub mod execution_gateway;
+/// Operator-attested external resolution receipts (`external_resolution_receipts_v1`) over the
+/// existing Coworker workflow ledger.
+pub mod external_resolution;
 /// Path validation, private `0700`/`0600` persistence, cross-process locking, and sanitization.
 pub mod fs_safety;
 /// Validated operator launcher policy, CLI flags, and initial fresh-only host auto-start coordinator.
@@ -201,6 +204,19 @@ pub use execution_gateway::{
     ExecutionPreviewTaskSummary, ExecutionReadinessStatus, ExecutionStatusParams,
     ExecutionStatusResponse, PreviewExecutionParams, StartExecutionParams, StartExecutionResponse,
     StopExecutionParams, StopExecutionResponse, TRUSTED_LOCAL_HUMAN_APPROVAL_ROUTE,
+};
+pub use external_resolution::{
+    evaluate_receipt_applicability, ReconcileExternalResolutionRequest,
+    RecordExternalResolutionRequest, ExternalResolutionApplicability,
+    ExternalResolutionConfirmation, ExternalResolutionDurability, ExternalResolutionEvidenceRef,
+    ExternalResolutionInspection, ExternalResolutionPreview, ExternalResolutionProjectRef,
+    ExternalResolutionReceipt, ExternalResolutionReceiptInspection, ExternalResolutionScope,
+    ExternalResolutionService, ExternalResolutionStaleReason, ExternalResolutionTarget,
+    EXTERNAL_RESOLUTION_ID_DOMAIN, EXTERNAL_RESOLUTION_INTERFACE_VERSION,
+    EXTERNAL_RESOLUTION_PREVIEW_DOMAIN, EXTERNAL_RESOLUTION_RECEIPT_DOMAIN,
+    EXTERNAL_RESOLUTION_REQUEST_DOMAIN, EXTERNAL_RESOLUTION_SCHEMA_VERSION,
+    MAX_EXTERNAL_RESOLUTION_EVIDENCE_REFS, MAX_EXTERNAL_RESOLUTION_EXPLANATION_BYTES,
+    MAX_EXTERNAL_RESOLUTION_REFERENCE_BYTES, MAX_EXTERNAL_RESOLUTIONS_PER_BINDING,
 };
 pub use host_launcher::{
     validate_host_executable_path, ApprovedHostLauncherPolicy, HostLauncherPolicy, NativeMcpCli,
