@@ -9033,6 +9033,1112 @@ async fn controller_fenced_uncertain_outbox_reconciles_over_64kib_raw_bytes_repo
     host_u.shutdown().await.expect("shutdown host_u");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn controller_preflight_enforces_4096_utf8_bytes_across_task_set_before_first_root_and_preserves_recovery(
+) {
+    async fn orchestrate_and_freeze_job(
+        fixture: &ControllerTestFixture,
+        brief_id: &str,
+        plan_id: &str,
+        tasks: Vec<PlanTask>,
+        approved_write_paths: Vec<String>,
+        max_parallel: usize,
+        seed_legacy_approval: bool,
+    ) -> (CoworkerJobRecord, String) {
+        let pb = project_base(fixture);
+        let reg_snap = fixture.registry.snapshot().expect("registry snapshot");
+        let brief = sample_brief_for_scope(fixture, BINDING_A, THREAD_UUID_A, brief_id);
+        let scoped_workflow = ScopedWorkflow::new(
+            Arc::clone(&fixture.registry),
+            Arc::clone(&fixture.plans),
+            BINDING_A.to_string(),
+        )
+        .expect("create scoped_workflow");
+
+        let job = fixture
+            .workflow_store
+            .create_or_amend_job(&CreateCoworkerJobRequest {
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                request_key: format!("req_job_{brief_id}"),
+                expected_ledger_revision: None,
+                work_brief: brief,
+                amended_target_task_ids: Vec::new(),
+                amended_write_paths: Vec::new(),
+                amended_interfaces: Vec::new(),
+            })
+            .expect("create job");
+
+        let grant = fixture
+            .workflow_store
+            .create_planning_grant(&CreatePlanningGrantRequest {
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                request_key: format!("req_grant_{brief_id}"),
+                expected_ledger_revision: None,
+                project_base: pb,
+                profile_id: "profile-coworker".to_string(),
+                registry_revision: reg_snap.revision,
+                policy: planning_only_policy(),
+                capabilities: PlanningReadOnlyCapabilities::strict_read_only(),
+                budget: PlanningCallBudget {
+                    max_total_calls: 4,
+                    max_orchestrator_calls: 2,
+                    max_architect_calls: 2,
+                    max_timeout_ms_per_call: 30_000,
+                    max_output_bytes_per_call: 65_536,
+                },
+                created_at_ms: 1_000,
+                expires_at_ms: 60_000,
+                operator_attested: true,
+            })
+            .expect("create planning grant");
+
+        let planned_tasks: Vec<StructuredPlannedTask> = tasks
+            .iter()
+            .map(|t| StructuredPlannedTask {
+                task_id: t.id.clone(),
+                title: t.title.clone(),
+                description: t.instruction.clone(),
+                role: t.role,
+                difficulty: t.difficulty,
+                depends_on: t.depends_on.clone(),
+                allowed_write_paths: t.allowed_write_paths.clone(),
+                owned_interfaces: Vec::new(),
+                consumed_interfaces: Vec::new(),
+                model_override: None,
+                tool_override: None,
+            })
+            .collect();
+        let structured_plan = StructuredOrchestratorOutput::Plan {
+            schema_version: 1,
+            summary: format!(
+                "Orchestrator plan `{plan_id}` for `{brief_id}` exercising executable instruction preflight."
+            ),
+            tasks: planned_tasks,
+            check_suggestions: vec![PlannedCheckSuggestion {
+                check_id: "cargo_test".to_string(),
+                command_summary: "cargo test --workspace".to_string(),
+                required: true,
+            }],
+            unconfirmed_proposal_notes: Vec::new(),
+            resolved_open_questions: Vec::new(),
+            deferred_proposals: Vec::new(),
+        };
+        fs::write(
+            &fixture.agy_plan_response_file,
+            serde_json::to_string(&structured_plan).expect("serialize structured plan"),
+        )
+        .expect("write agy_plan_response_file");
+
+        let orch_req = OrchestrateWorkBriefPlanRequest {
+            binding_id: BINDING_A.to_string(),
+            thread_uuid: THREAD_UUID_A.to_string(),
+            grant_id: grant.grant_id.clone(),
+            job_id: job.job_id.clone(),
+            request_key: format!("req_orch_{brief_id}"),
+            expected_ledger_revision: None,
+            difficulty: Some(Difficulty::Hard),
+            architect_difficulty: Some(Difficulty::Hard),
+            plan_id: Some(plan_id.to_string()),
+            expected_plan_revision: 0,
+            architect_advice_ids: Vec::new(),
+            max_architect_rounds: 0,
+            current_time_ms: 2_000,
+        };
+
+        let (planned_plan_id, planned_plan_revision, planned_plan_digest) = if !seed_legacy_approval
+        {
+            let plan_outcome = fixture
+                .planning_service
+                .orchestrate_brief_to_plan(&scoped_workflow, &orch_req)
+                .await
+                .expect("orchestrate_brief_to_plan");
+            let published_outcome = plan_outcome
+                .require_published_plan()
+                .expect("published plan outcome");
+            (
+                published_outcome.planning_result.plan_id.clone(),
+                published_outcome.planning_result.plan_revision,
+                published_outcome.planning_result.plan_digest.clone(),
+            )
+        } else {
+            // Fresh Orchestrator planning now refuses oversized Coder task descriptions before
+            // PlanStore draft/publication/linkage while preserving the completed call artifact.
+            let fresh_plan_err = fixture
+                .planning_service
+                .orchestrate_brief_to_plan(&scoped_workflow, &orch_req)
+                .await
+                .expect_err("fresh Orchestrator planning must reject oversized description");
+            assert_eq!(fresh_plan_err.code, NativeErrorCode::ValidationFailed);
+            assert!(fresh_plan_err.message.contains("4096 bytes"));
+            assert!(!fixture
+                .plans
+                .snapshot()
+                .expect("snapshot plans after fresh refusal")
+                .iter()
+                .any(|rev| rev.binding_id == BINDING_A));
+
+            let ledger_after = fixture
+                .workflow_store
+                .read_binding_ledger(BINDING_A)
+                .expect("read binding ledger after fresh refusal");
+            let grant_after = ledger_after
+                .planning_grants
+                .iter()
+                .find(|g| g.grant_id == grant.grant_id)
+                .expect("grant after fresh refusal");
+            let completed_res = &grant_after.reservations[0];
+            assert_eq!(completed_res.status, PlanningReservationStatus::Completed);
+
+            let draft = fixture
+                .plans
+                .change_at(
+                    0,
+                    PlanChange::SaveDraft {
+                        plan_id: plan_id.to_string(),
+                        binding_id: BINDING_A.to_string(),
+                        profile_id: "profile-coworker".to_string(),
+                        profile_revision: reg_snap.revision,
+                        summary: format!("Historical Orchestrator plan `{plan_id}`"),
+                        tasks: tasks.clone(),
+                    },
+                    1_700_000_000_000,
+                )
+                .expect("save historical oversized draft via generic 65K PlanStore");
+            let published = fixture
+                .plans
+                .change(
+                    draft.revision,
+                    PlanChange::Publish {
+                        plan_id: plan_id.to_string(),
+                        revision: draft.revision,
+                    },
+                )
+                .expect("publish historical oversized plan");
+            let compiled = compile_plan_revision(&published, &reg_snap)
+                .expect("compile historical oversized plan");
+
+            let seeded_pr = threadlane_native::coworker_workflow::contracts::PlanningResultRef {
+                grant_id: grant_after.grant_id.clone(),
+                reservation_id: completed_res.reservation_id.clone(),
+                request_key: completed_res.request_key.clone(),
+                run_id: completed_res.run_id.clone().expect("run_id"),
+                report_artifact_id: completed_res
+                    .report_artifact_id
+                    .clone()
+                    .expect("report_artifact_id"),
+                output_digest: completed_res.output_digest.clone().expect("output_digest"),
+                work_brief_digest: job.work_brief_digest.clone(),
+                project_base: project_base(fixture),
+                profile_id: grant_after.profile_id.clone(),
+                registry_revision: grant_after.registry_revision,
+                policy_digest: grant_after.policy_digest.clone(),
+                selected_choice: completed_res.selected_choice.clone(),
+                plan_id: published.plan_id.clone(),
+                plan_revision: published.revision,
+                plan_digest: compiled.plan_digest.clone(),
+                plan_status: threadlane_workflow::PlanStatus::Published,
+                task_interfaces: BTreeMap::new(),
+                architect_advice_ids: Vec::new(),
+                resolved_open_questions: Vec::new(),
+                deferred_proposals: Vec::new(),
+                recorded_at_ms: 2_500,
+            };
+            fixture
+                .workflow_store
+                .record_job_planning_result(
+                    &threadlane_native::coworker_workflow::store::RecordJobPlanningResultRequest {
+                        binding_id: BINDING_A.to_string(),
+                        thread_uuid: THREAD_UUID_A.to_string(),
+                        job_id: job.job_id.clone(),
+                        expected_job_revision: Some(job.job_revision),
+                        expected_ledger_revision: None,
+                        planning_result: seeded_pr,
+                    },
+                )
+                .expect("record historical PlanningResultRef");
+
+            (published.plan_id, published.revision, compiled.plan_digest)
+        };
+
+        let job = fixture
+            .workflow_store
+            .read_binding_ledger(BINDING_A)
+            .expect("read binding ledger")
+            .jobs
+            .into_iter()
+            .find(|j| j.job_id == job.job_id)
+            .expect("find orchestrated job");
+        assert_eq!(job.phase, CoworkerJobPhase::AwaitingApproval);
+
+        let approved_task_ids: Vec<String> = tasks.iter().map(|t| t.id.clone()).collect();
+        let approval_req = OperatorApprovalRequest {
+            binding_id: BINDING_A.to_string(),
+            thread_uuid: THREAD_UUID_A.to_string(),
+            plan_id: planned_plan_id.clone(),
+            plan_revision: planned_plan_revision,
+            expected_registry_revision: reg_snap.revision,
+            expected_plan_digest: planned_plan_digest,
+            repository_path: fixture.repo_dir.clone(),
+            base_commit: fixture.base_commit.clone(),
+            approved_task_ids: approved_task_ids.clone(),
+            approved_write_paths: approved_write_paths.clone(),
+            max_parallel,
+            budgets: ExecutionBudgets::default(),
+        };
+
+        let approval_id = if !seed_legacy_approval {
+            fixture
+                .authority
+                .approve_at(approval_req, 1_700_000_001_000)
+                .expect("approve valid 4096-byte plan")
+                .approval_id
+        } else {
+            let new_approval_err = fixture
+                .authority
+                .approve_at(approval_req, 1_700_000_001_000)
+                .expect_err("new approval must reject oversized later worker task");
+            let err_text = new_approval_err.to_string();
+            assert!(
+                err_text.contains("task-b") && err_text.contains("4096 bytes"),
+                "unexpected authority error: {err_text}"
+            );
+
+            let published_plan = fixture
+                .plans
+                .get_revision(&planned_plan_id, planned_plan_revision)
+                .expect("read published plan")
+                .expect("published plan exists");
+            let compiled =
+                compile_plan_revision(&published_plan, &reg_snap).expect("compile published plan");
+            let canonical_repo = fs::canonicalize(&fixture.repo_dir).expect("canonical repo");
+            let canonical_agy = fs::canonicalize(&fixture.fake_agy_exe).expect("canonical agy");
+
+            let mut record = threadlane_authority::ApprovalRecord {
+                approval_id: String::new(),
+                subject_digest: String::new(),
+                policy_version: threadlane_authority::AUTHORITY_POLICY_VERSION,
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                plan_id: published_plan.plan_id.clone(),
+                plan_revision: published_plan.revision,
+                profile_id: "profile-coworker".to_string(),
+                registry_revision: reg_snap.revision,
+                plan_digest: compiled.plan_digest,
+                repository_path: canonical_repo,
+                base_commit: fixture.base_commit.clone(),
+                approved_task_ids,
+                approved_write_paths,
+                max_parallel,
+                budgets: ExecutionBudgets::default(),
+                tasks: compiled
+                    .tasks
+                    .iter()
+                    .map(|ct| threadlane_authority::ApprovedTaskRecord {
+                        task_id: ct.id.clone(),
+                        title: ct.title.clone(),
+                        instruction: ct.instruction.clone(),
+                        instruction_digest: ct.instruction_digest.clone(),
+                        role: ct.role,
+                        difficulty: ct.difficulty,
+                        tool_id: ct.tool_id.clone(),
+                        adapter: ct.adapter,
+                        provider: Some(threadlane_workers::WorkerProvider::Antigravity),
+                        canonical_executable: Some(canonical_agy.clone()),
+                        model_id: ct.choice.model_id.clone(),
+                        model_arg: ct.model_arg.clone(),
+                        base_model: ct.model_arg.clone(),
+                        effort: ct.choice.effort.clone(),
+                        cli_model_arg: Some(ct.model_arg.clone()),
+                        standalone: Some(false),
+                        file_permissions: Some(WorkerFilePermissions::TaskFiles),
+                        depends_on: ct.depends_on.clone(),
+                        allowed_write_paths: ct.allowed_write_paths.clone(),
+                        task_digest: ct.task_digest.clone(),
+                        profile_id: None,
+                        command_key: None,
+                    })
+                    .collect(),
+                created_at_ms: 1_700_000_001_000,
+            };
+            let core_digest =
+                threadlane_authority::compute_authority_core_digest(&record).expect("core digest");
+            for task in &mut record.tasks {
+                task.profile_id = Some(threadlane_authority::derive_profile_id(
+                    &core_digest,
+                    &task.task_id,
+                    &task.task_digest,
+                ));
+                task.command_key = Some(threadlane_authority::derive_command_key(
+                    &core_digest,
+                    &task.task_id,
+                    &task.task_digest,
+                ));
+            }
+            record.subject_digest = threadlane_authority::compute_record_subject_digest(&record)
+                .expect("subject digest");
+            record.approval_id = threadlane_authority::derive_approval_id(&record.subject_digest);
+            threadlane_authority::verify_approval_record_integrity(
+                &record,
+                fixture.authority.approvals_path(),
+            )
+            .expect("historical sealed approval record integrity");
+
+            let ledger_json = serde_json::json!({
+                "schema_version": threadlane_authority::AUTHORITY_SCHEMA_VERSION,
+                "approvals": [&record],
+            });
+            fs::write(
+                fixture.authority.approvals_path(),
+                serde_json::to_vec(&ledger_json).expect("serialize approvals ledger"),
+            )
+            .expect("write legacy approvals.json");
+            fs::set_permissions(
+                fixture.authority.approvals_path(),
+                fs::Permissions::from_mode(0o600),
+            )
+            .expect("chmod 0600 approvals.json");
+            record.approval_id
+        };
+
+        let cap_env = FrozenControllerCapabilityEnvelope {
+            allowed_reviewer_choices: vec![headless_argon_choice(Difficulty::Hard)],
+            allowed_closure_choices: vec![headless_argon_choice(Difficulty::Extreme)],
+            max_in_scope_correction_attempts: 1,
+            allowed_check_ids: vec!["cargo_test".to_string()],
+            local_git_integration_allowed: true,
+            allow_check_failure_corrections: false,
+        };
+        let bound_job = fixture
+            .workflow_store
+            .bind_job_approval(
+                &BindJobApprovalRequest {
+                    binding_id: BINDING_A.to_string(),
+                    thread_uuid: THREAD_UUID_A.to_string(),
+                    job_id: job.job_id,
+                    expected_job_revision: job.job_revision,
+                    expected_ledger_revision: None,
+                    approval_id: approval_id.clone(),
+                    policy: execution_policy_for_fixture(fixture),
+                    controller_envelope: Some(cap_env),
+                    task_interfaces: BTreeMap::new(),
+                },
+                &fixture.authority,
+            )
+            .expect("bind job approval");
+
+        let mut role_budgets = BTreeMap::new();
+        role_budgets.insert(
+            WorkflowRole::Coder,
+            ControllerRoleExecutionBudget::default_for_role(WorkflowRole::Coder, 4),
+        );
+        role_budgets.insert(
+            WorkflowRole::Reviewer,
+            ControllerRoleExecutionBudget::default_for_role(WorkflowRole::Reviewer, 4),
+        );
+        role_budgets.insert(
+            WorkflowRole::Closure,
+            ControllerRoleExecutionBudget::default_for_role(WorkflowRole::Closure, 2),
+        );
+        let preview_req = FreezeControllerExecutionEnvelopeRequest {
+            binding_id: BINDING_A.to_string(),
+            thread_uuid: THREAD_UUID_A.to_string(),
+            job_id: bound_job.job_id.clone(),
+            expected_job_revision: bound_job.job_revision,
+            policy: execution_policy_for_fixture(fixture),
+            reviewer_choice: headless_argon_choice(Difficulty::Hard),
+            closure_choice: headless_argon_choice(Difficulty::Extreme),
+            role_budgets,
+            max_in_scope_corrections_per_task: 1,
+            max_total_corrections_per_job: 2,
+            max_total_task_attempts_per_job: 6,
+            check_commands: default_check_commands(fixture),
+            allow_task_worktree_commits: true,
+            allow_run_integration_execution: true,
+            default_integration_strategy: IntegrationStrategy::FastForwardOnly,
+            independence_completeness_receipt: None,
+            shadow_jev_policy: None,
+            created_at_ms: 1_700_000_100_000,
+            operator_attested: false,
+            confirm_approval_subject_digest: None,
+            confirm_envelope_digest: None,
+        };
+        let preview = fixture
+            .policy_store
+            .preview_execution_envelope(&preview_req, &bound_job, &fixture.authority)
+            .expect("preview execution envelope");
+        let mut freeze_req = preview_req;
+        freeze_req.operator_attested = true;
+        freeze_req.confirm_approval_subject_digest = Some(preview.approval_subject_digest);
+        freeze_req.confirm_envelope_digest = Some(preview.envelope_digest);
+        fixture
+            .policy_store
+            .record_execution_envelope(&freeze_req, &bound_job, &fixture.authority)
+            .expect("record execution envelope");
+
+        (bound_job, approval_id)
+    }
+
+    // 1. Exact 4,096 UTF-8 byte boundary (`12 + 2042 * 2 = 4,096` bytes, `2,054` chars)
+    // dispatches through controller + host verbatim without truncation or normalization.
+    let fixture_ok = setup_fixture();
+    let instruction_4096_utf8 = format!("CTRL_TASK_A {}", "é".repeat(2042));
+    assert_eq!(instruction_4096_utf8.len(), 4_096);
+    assert_eq!(instruction_4096_utf8.chars().count(), 2_054);
+    let (job_ok, approval_id_ok) = Box::pin(orchestrate_and_freeze_job(
+        &fixture_ok,
+        "brf_ctrl_utf8_4096",
+        "plan-ctrl-utf8-4096",
+        vec![PlanTask {
+            id: "task-utf8-4096".to_string(),
+            title: "UTF-8 4096B Boundary".to_string(),
+            instruction: instruction_4096_utf8.clone(),
+            role: WorkflowRole::Coder,
+            difficulty: Difficulty::Hard,
+            depends_on: Vec::new(),
+            allowed_write_paths: vec!["src/a.rs".to_string()],
+        }],
+        vec!["src/a.rs".to_string()],
+        1,
+        false,
+    ))
+    .await;
+    let host_ok = Box::pin(ApprovedHost::start(ApprovedHostConfig::new(
+        &fixture_ok.registry_dir,
+        &fixture_ok.plans_dir,
+        &fixture_ok.authority_dir,
+        &fixture_ok.sessions_dir,
+        &approval_id_ok,
+    )))
+    .await
+    .expect("start host_ok");
+    let session_ok = fixture_ok
+        .controller
+        .open_owned_session(BINDING_A, THREAD_UUID_A, &job_ok.job_id, 5_000)
+        .expect("open session_ok");
+    let deadline_ok = Instant::now() + Duration::from_secs(15);
+    loop {
+        let rep = Box::pin(session_ok.step(5_100))
+            .await
+            .expect("step 4096B UTF-8 job");
+        if rep.status == CoworkerControllerPhase1Status::AwaitingChecksOrReview {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline_ok,
+            "timed out waiting for 4096B UTF-8 task ReadyForReview"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(read_invocation_count(&fixture_ok.agy_count_file), 1);
+    const AGY_CONTRACT_PREFIX: &str =
+        "[THREADLANE_AGY_TASK_FILES_CONTRACT] Session-local Antigravity task_files execution contract: ";
+    const AGY_INSTRUCTION_MARKER: &str = "[THREADLANE_TASK_INSTRUCTION] ";
+    assert!(!instruction_4096_utf8.contains(AGY_INSTRUCTION_MARKER));
+    let captured_prompt =
+        fs::read_to_string(&fixture_ok.agy_prompt_file).expect("read agy_prompt_file");
+    assert!(
+        captured_prompt.starts_with(AGY_CONTRACT_PREFIX),
+        "expected software-owned task_files contract header prefix"
+    );
+    assert_eq!(
+        captured_prompt.matches(AGY_INSTRUCTION_MARKER).count(),
+        1,
+        "expected exactly one task instruction boundary marker"
+    );
+    let (header_part, payload_part) = captured_prompt
+        .split_once(AGY_INSTRUCTION_MARKER)
+        .expect("split at AGY_TASK_FILES_PROMPT_BOUNDARY");
+    assert!(header_part.starts_with(AGY_CONTRACT_PREFIX));
+    assert!(header_part.contains("Persist changes only within declared task write scopes: ["));
+    assert_eq!(payload_part.as_bytes(), instruction_4096_utf8.as_bytes());
+    assert_eq!(payload_part.len(), threadlane_core::MAX_INSTRUCTION_LEN);
+    assert_eq!(payload_part, instruction_4096_utf8);
+    session_ok.release().expect("release session_ok");
+    host_ok.shutdown().await.expect("shutdown host_ok");
+
+    // 2. Legacy-approved frozen job with valid first root A (`3,965` bytes) + oversized second
+    // parallel root B (`4,365` bytes) refuses BEFORE lease, outbox, host intent, or first root!
+    let fixture_par = setup_fixture();
+    let valid_root_a_instr = format!("CTRL_TASK_A {}", "a".repeat(3_953));
+    let oversized_task_b_instr = format!("CTRL_TASK_B {}", "b".repeat(4_353));
+    assert_eq!(valid_root_a_instr.len(), 3_965);
+    assert_eq!(oversized_task_b_instr.len(), 4_365);
+
+    let (job_par, approval_id_par) = Box::pin(orchestrate_and_freeze_job(
+        &fixture_par,
+        "brf_ctrl_legacy_parallel",
+        "plan-ctrl-legacy-parallel",
+        vec![
+            PlanTask {
+                id: "task-root-a".to_string(),
+                title: "Valid First Root A".to_string(),
+                instruction: valid_root_a_instr.clone(),
+                role: WorkflowRole::Coder,
+                difficulty: Difficulty::Hard,
+                depends_on: Vec::new(),
+                allowed_write_paths: vec!["src/a.rs".to_string()],
+            },
+            PlanTask {
+                id: "task-b".to_string(),
+                title: "Oversized Second Parallel Root B".to_string(),
+                instruction: oversized_task_b_instr.clone(),
+                role: WorkflowRole::Coder,
+                difficulty: Difficulty::Hard,
+                depends_on: Vec::new(),
+                allowed_write_paths: vec!["src/b.rs".to_string()],
+            },
+        ],
+        vec!["src/a.rs".to_string(), "src/b.rs".to_string()],
+        2,
+        true,
+    ))
+    .await;
+
+    let host_par = Box::pin(ApprovedHost::start(ApprovedHostConfig::new(
+        &fixture_par.registry_dir,
+        &fixture_par.plans_dir,
+        &fixture_par.authority_dir,
+        &fixture_par.sessions_dir,
+        &approval_id_par,
+    )))
+    .await
+    .expect("start host_par for legacy sealed approval");
+    let session_par = fixture_par
+        .controller
+        .open_owned_session(BINDING_A, THREAD_UUID_A, &job_par.job_id, 10_000)
+        .expect("open session_par");
+    let adm_par = session_par
+        .verify_admission()
+        .expect("verify_admission remains readable on legacy oversized job");
+    let par_rev_before = adm_par.job.job_revision;
+    let rt_par_before = fixture_par
+        .policy_store
+        .get_job_runtime_readonly(BINDING_A, &job_par.job_id)
+        .expect("read rt_par_before")
+        .expect("rt_par_before exists");
+
+    let par_err = Box::pin(session_par.step(10_100))
+        .await
+        .expect_err("controller step must refuse oversized later root before first root starts");
+    assert_eq!(par_err.code, NativeErrorCode::ValidationFailed);
+    assert!(par_err.message.contains("task-b"));
+    assert!(par_err.message.contains("4096 bytes"));
+    assert_eq!(
+        read_invocation_count(&fixture_par.agy_count_file),
+        0,
+        "valid first root A must NEVER start when later task B is oversized"
+    );
+
+    let rt_par = fixture_par
+        .policy_store
+        .get_job_runtime_readonly(BINDING_A, &job_par.job_id)
+        .expect("read rt_par")
+        .expect("rt_par exists");
+    assert_eq!(
+        rt_par, rt_par_before,
+        "controller runtime state must remain unchanged on pre-effect refusal"
+    );
+    assert!(
+        rt_par.lease.is_none(),
+        "preflight refusal must occur before logical lease acquisition"
+    );
+    assert_eq!(rt_par.total_task_attempts_reserved, 0);
+    assert_eq!(rt_par.total_corrections_reserved, 0);
+    assert!(rt_par.pending_effects.is_empty());
+    assert!(rt_par.role_usage.values().all(|usage| {
+        usage.calls_reserved == 0 && usage.calls_completed == 0 && usage.total_runtime_ms == 0
+    }));
+
+    let job_par_after = fixture_par
+        .workflow_store
+        .read_binding_ledger(BINDING_A)
+        .expect("read ledger after refusal")
+        .jobs
+        .into_iter()
+        .find(|j| j.job_id == job_par.job_id)
+        .expect("job_par exists");
+    assert_eq!(job_par_after.job_revision, par_rev_before);
+    assert!(job_par_after.outbox.is_empty());
+    assert!(job_par_after
+        .tasks
+        .iter()
+        .all(|t| t.stage == CoworkerTaskStage::ReadyToDispatch && t.attempts.is_empty()));
+
+    let session_dir_par = fixture_par.sessions_dir.join(&approval_id_par);
+    let manifest_par =
+        threadlane_host::read_host_manifest_optional(&session_dir_par, &adm_par.approval)
+            .expect("read manifest_par")
+            .expect("manifest_par must exist");
+    let binding_par = manifest_par
+        .session_binding_id
+        .clone()
+        .expect("session_binding_id");
+    let (intents_par, receipts_par) = threadlane_host::read_session_task_ledger_readonly(
+        &session_dir_par,
+        &adm_par.approval,
+        &binding_par,
+    )
+    .expect("read host ledger")
+    .unwrap_or_default();
+    assert!(intents_par.is_empty(), "zero host TaskDispatchIntents");
+    assert!(receipts_par.is_empty(), "zero host TaskRunReceipts");
+
+    // 3. Receipt-only recovery on `fixture_par`: when BOTH tasks already have historical
+    // completed `TaskRunReceipt`s on the host, `session_par.step` reconciles them to
+    // `ReadyForReview` without redispatching (`agy_count` stays at `2`).
+    let host_client_par = ApprovedHostClient::new(
+        Arc::clone(&fixture_par.authority),
+        &fixture_par.sessions_dir,
+        BINDING_A,
+        THREAD_UUID_A,
+    )
+    .expect("create host_client_par");
+    host_client_par
+        .dispatch_task(&approval_id_par, "task-root-a")
+        .await
+        .expect("dispatch valid task-root-a for historical receipt seed");
+    let hist_a_deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if host_client_par
+            .get_task(&approval_id_par, "task-root-a")
+            .await
+            .expect("poll task-root-a")
+            .status
+            == TaskExecutionStatus::ReadyForReview
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < hist_a_deadline,
+            "timed out waiting for task-root-a ReadyForReview"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    let approved_task_b = adm_par
+        .approval
+        .tasks
+        .iter()
+        .find(|t| t.task_id == "task-b")
+        .expect("approved task-b");
+    let profile_b = approved_task_b.profile_id.clone().expect("profile_b");
+    let cmd_key_b = approved_task_b.command_key.clone().expect("cmd_key_b");
+    let scoped_par = threadlane::ScopedClient::from_state_dir(
+        session_dir_par.join(threadlane_host::RUNTIME_STATE_SUBDIR),
+        &binding_par,
+    )
+    .expect("open scoped runtime client");
+    let hist_worker_b = scoped_par
+        .start_worker(
+            cmd_key_b.clone(),
+            profile_b.clone(),
+            "CTRL_TASK_B historical pre-limit worker run".to_string(),
+        )
+        .await
+        .expect("start historical worker for task-b");
+    let hist_b_deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if scoped_par
+            .get_worker(hist_worker_b.run_id.clone())
+            .await
+            .expect("poll hist_worker_b")
+            .status
+            == threadlane_core::WorkerStatus::Completed
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < hist_b_deadline,
+            "timed out waiting for hist_worker_b Completed"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let _ = threadlane_host::record_task_dispatch_intent(
+        &session_dir_par,
+        &adm_par.approval,
+        &binding_par,
+        threadlane_host::TaskDispatchIntent {
+            task_id: "task-b".to_string(),
+            task_digest: approved_task_b.task_digest.clone(),
+            profile_id: profile_b.clone(),
+            command_key: cmd_key_b.clone(),
+            execution_binding: None,
+            recorded_at_ms: 1_700_000_200_000,
+        },
+    )
+    .expect("record historical intent for task-b");
+    let _ = threadlane_host::record_task_receipt(
+        &session_dir_par,
+        &adm_par.approval,
+        &binding_par,
+        threadlane_host::TaskRunReceipt {
+            task_id: "task-b".to_string(),
+            task_digest: approved_task_b.task_digest.clone(),
+            profile_id: profile_b,
+            command_key: cmd_key_b,
+            run_id: hist_worker_b.run_id,
+            worker_id: hist_worker_b.worker_id,
+            execution_binding: None,
+            recorded_at_ms: 1_700_000_200_100,
+        },
+    )
+    .expect("record historical receipt for task-b");
+    assert_eq!(read_invocation_count(&fixture_par.agy_count_file), 2);
+
+    let recovered_rep = Box::pin(session_par.step(10_500))
+        .await
+        .expect("receipt-only recovery must succeed without redispatching oversized task");
+    assert_eq!(
+        recovered_rep.status,
+        CoworkerControllerPhase1Status::AwaitingChecksOrReview
+    );
+    assert!(recovered_rep.dispatched_task_ids.is_empty());
+    assert_eq!(
+        recovered_rep.reconciled_ready_for_review_task_ids,
+        vec!["task-root-a".to_string(), "task-b".to_string()]
+    );
+    assert_eq!(
+        read_invocation_count(&fixture_par.agy_count_file),
+        2,
+        "receipt-only recovery must observe existing receipts without redispatch"
+    );
+    session_par.release().expect("release session_par");
+    host_par.shutdown().await.expect("shutdown host_par");
+
+    // 4. Legacy-approved frozen job where oversized `task-b` is a DOWNSTREAM child
+    // (`PendingDependencies` on `task-root-a`) ALSO fails preflight before `task-root-a` starts,
+    // while `stop_requested` recovery remains usable for any pre-stop root receipt!
+    let fixture_dep = setup_fixture();
+    let (job_dep, approval_id_dep) = Box::pin(orchestrate_and_freeze_job(
+        &fixture_dep,
+        "brf_ctrl_legacy_dep",
+        "plan-ctrl-legacy-dep",
+        vec![
+            PlanTask {
+                id: "task-root-a".to_string(),
+                title: "Valid First Root A".to_string(),
+                instruction: valid_root_a_instr,
+                role: WorkflowRole::Coder,
+                difficulty: Difficulty::Hard,
+                depends_on: Vec::new(),
+                allowed_write_paths: vec!["src/a.rs".to_string()],
+            },
+            PlanTask {
+                id: "task-b".to_string(),
+                title: "Oversized Downstream Child B".to_string(),
+                instruction: oversized_task_b_instr,
+                role: WorkflowRole::Coder,
+                difficulty: Difficulty::Hard,
+                depends_on: vec!["task-root-a".to_string()],
+                allowed_write_paths: vec!["src/b.rs".to_string()],
+            },
+        ],
+        vec!["src/a.rs".to_string(), "src/b.rs".to_string()],
+        1,
+        true,
+    ))
+    .await;
+
+    let host_dep = Box::pin(ApprovedHost::start(ApprovedHostConfig::new(
+        &fixture_dep.registry_dir,
+        &fixture_dep.plans_dir,
+        &fixture_dep.authority_dir,
+        &fixture_dep.sessions_dir,
+        &approval_id_dep,
+    )))
+    .await
+    .expect("start host_dep");
+    let session_dep = fixture_dep
+        .controller
+        .open_owned_session(BINDING_A, THREAD_UUID_A, &job_dep.job_id, 20_000)
+        .expect("open session_dep");
+
+    let rt_dep_before = fixture_dep
+        .policy_store
+        .get_job_runtime_readonly(BINDING_A, &job_dep.job_id)
+        .expect("read rt_dep_before")
+        .expect("rt_dep_before exists");
+
+    let dep_err = Box::pin(session_dep.step(20_100))
+        .await
+        .expect_err("oversized downstream child must block before valid root A starts");
+    assert_eq!(dep_err.code, NativeErrorCode::ValidationFailed);
+    assert!(dep_err.message.contains("task-b"));
+    assert!(dep_err.message.contains("4096 bytes"));
+    assert_eq!(read_invocation_count(&fixture_dep.agy_count_file), 0);
+    let rt_dep = fixture_dep
+        .policy_store
+        .get_job_runtime_readonly(BINDING_A, &job_dep.job_id)
+        .expect("read rt_dep")
+        .expect("rt_dep exists");
+    assert_eq!(
+        rt_dep, rt_dep_before,
+        "controller runtime state must remain unchanged on downstream preflight refusal"
+    );
+    assert!(rt_dep.lease.is_none());
+    assert_eq!(rt_dep.total_task_attempts_reserved, 0);
+    assert_eq!(rt_dep.total_corrections_reserved, 0);
+    assert!(rt_dep.pending_effects.is_empty());
+    assert!(rt_dep.role_usage.values().all(|usage| {
+        usage.calls_reserved == 0 && usage.calls_completed == 0 && usage.total_runtime_ms == 0
+    }));
+
+    // Seed pre-stop root A receipt + durable stop_requested, proving Stopped reconciliation works
+    // even when unstarted downstream `task-b` has an oversized legacy instruction.
+    let host_client_dep = ApprovedHostClient::new(
+        Arc::clone(&fixture_dep.authority),
+        &fixture_dep.sessions_dir,
+        BINDING_A,
+        THREAD_UUID_A,
+    )
+    .expect("create host_client_dep");
+    host_client_dep
+        .dispatch_task(&approval_id_dep, "task-root-a")
+        .await
+        .expect("dispatch pre-stop task-root-a");
+    let stop_a_deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if host_client_dep
+            .get_task(&approval_id_dep, "task-root-a")
+            .await
+            .expect("poll pre-stop task-root-a")
+            .status
+            == TaskExecutionStatus::ReadyForReview
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < stop_a_deadline,
+            "timed out waiting for pre-stop task-root-a ReadyForReview"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    fixture_dep
+        .policy_store
+        .mutate_job_runtime_for_operator(BINDING_A, &job_dep.job_id, |rt| {
+            rt.stop_requested = true;
+            Ok(())
+        })
+        .expect("set stop_requested on job_dep");
+
+    let stopped_rep = Box::pin(session_dep.step(20_500))
+        .await
+        .expect("stopped legacy oversized job must reconcile without error");
+    assert_eq!(stopped_rep.status, CoworkerControllerPhase1Status::Stopped);
+    assert!(stopped_rep.dispatched_task_ids.is_empty());
+    assert_eq!(read_invocation_count(&fixture_dep.agy_count_file), 1);
+
+    session_dep.release().expect("release session_dep");
+    host_dep.shutdown().await.expect("shutdown host_dep");
+
+    // 5. Prior pending host `TaskDispatchIntent` WITHOUT `TaskRunReceipt` on an oversized legacy
+    //    task (`4,097`B): `dispatch_task` returns `HostError::MutationOutcomeUncertain` (never
+    //    `Validation`), host `task-receipts.json` bytes stay unchanged, zero provider runs occur,
+    //    and controller `step` retains `EffectUnknown` (`BlockedOnUnknownEffect`) rather than
+    //    promoting the prior uncertain attempt to `ReconciledNotExecuted` or `RefusedBeforeEffect`.
+    let fixture_unk = setup_fixture();
+    let oversized_4097_instr = format!(
+        "CTRL_TASK_B {}",
+        "u".repeat(threadlane_core::MAX_INSTRUCTION_LEN + 1 - 12)
+    );
+    assert_eq!(
+        oversized_4097_instr.len(),
+        threadlane_core::MAX_INSTRUCTION_LEN + 1
+    );
+    let (job_unk, approval_id_unk) = Box::pin(orchestrate_and_freeze_job(
+        &fixture_unk,
+        "brf_ctrl_pending_unknown",
+        "plan-ctrl-pending-unknown",
+        vec![PlanTask {
+            id: "task-b".to_string(),
+            title: "Oversized Pending Unknown Root".to_string(),
+            instruction: oversized_4097_instr,
+            role: WorkflowRole::Coder,
+            difficulty: Difficulty::Hard,
+            depends_on: Vec::new(),
+            allowed_write_paths: vec!["src/b.rs".to_string()],
+        }],
+        vec!["src/b.rs".to_string()],
+        1,
+        true,
+    ))
+    .await;
+
+    let host_unk = Box::pin(ApprovedHost::start(ApprovedHostConfig::new(
+        &fixture_unk.registry_dir,
+        &fixture_unk.plans_dir,
+        &fixture_unk.authority_dir,
+        &fixture_unk.sessions_dir,
+        &approval_id_unk,
+    )))
+    .await
+    .expect("start host_unk");
+    let session_unk = fixture_unk
+        .controller
+        .open_owned_session(BINDING_A, THREAD_UUID_A, &job_unk.job_id, 30_000)
+        .expect("open session_unk");
+    let adm_unk = session_unk
+        .verify_admission()
+        .expect("verify_admission on job_unk");
+
+    let approved_unk_b = adm_unk
+        .approval
+        .tasks
+        .iter()
+        .find(|t| t.task_id == "task-b")
+        .expect("approved task-b");
+    let profile_unk_b = approved_unk_b.profile_id.clone().expect("profile_id");
+    let cmd_key_unk_b = approved_unk_b.command_key.clone().expect("command_key");
+
+    let session_dir_unk = fixture_unk.sessions_dir.join(&approval_id_unk);
+    let manifest_unk =
+        threadlane_host::read_host_manifest_optional(&session_dir_unk, &adm_unk.approval)
+            .expect("read manifest_unk")
+            .expect("manifest_unk must exist");
+    let binding_unk = manifest_unk.session_binding_id.expect("session_binding_id");
+
+    // Seed prior controller reservation (`ReservedBeforeEffect`) + host `TaskDispatchIntent` without receipt.
+    let _ = fixture_unk
+        .workflow_store
+        .reserve_task_outbox(&ReserveTaskOutboxRequest {
+            binding_id: BINDING_A.to_string(),
+            thread_uuid: THREAD_UUID_A.to_string(),
+            job_id: job_unk.job_id.clone(),
+            expected_job_revision: adm_unk.job.job_revision,
+            expected_ledger_revision: None,
+            request_key: cmd_key_unk_b.clone(),
+            kind: OutboxDispatchKind::TaskAttemptDispatch,
+            task_id: "task-b".to_string(),
+            role: WorkflowRole::Coder,
+            subject_digest: approved_unk_b.task_digest.clone(),
+            dependency_input_commit: None,
+            dependency_input_tree_sha: None,
+            accepted_predecessor_receipts: Vec::new(),
+        })
+        .expect("seed prior outbox reservation");
+    let eff_id_unk = deterministic_prefixed_id(
+        "threadlane-native:coworker-controller-effect:v1",
+        "eff",
+        &[&job_unk.job_id, "task-b", &cmd_key_unk_b],
+    );
+    fixture_unk
+        .policy_store
+        .mutate_job_runtime_for_operator(BINDING_A, &job_unk.job_id, |rt| {
+            rt.reserve_role_call(WorkflowRole::Coder)?;
+            rt.total_task_attempts_reserved = 1;
+            rt.pending_effects.insert(
+                eff_id_unk.clone(),
+                PendingControllerEffect {
+                    effect_id: eff_id_unk.clone(),
+                    request_key: cmd_key_unk_b.clone(),
+                    job_id: job_unk.job_id.clone(),
+                    task_id: Some("task-b".to_string()),
+                    attempt_no: Some(1),
+                    kind: PendingControllerEffectKind::CoderDispatch,
+                    status: PendingControllerEffectStatus::ReservedBeforeEffect,
+                    subject_digest: approved_unk_b.task_digest.clone(),
+                    external_correlation_id: None,
+                    created_at_ms: 29_900,
+                    updated_at_ms: 29_900,
+                    diagnostic: None,
+                },
+            );
+            Ok(())
+        })
+        .expect("seed prior PendingControllerEffect");
+
+    let _ = threadlane_host::record_task_dispatch_intent(
+        &session_dir_unk,
+        &adm_unk.approval,
+        &binding_unk,
+        threadlane_host::TaskDispatchIntent {
+            task_id: "task-b".to_string(),
+            task_digest: approved_unk_b.task_digest.clone(),
+            profile_id: profile_unk_b,
+            command_key: cmd_key_unk_b.clone(),
+            execution_binding: None,
+            recorded_at_ms: 1_700_000_300_000,
+        },
+    )
+    .expect("record prior host TaskDispatchIntent without receipt");
+
+    let host_ledger_path = session_dir_unk.join(threadlane_host::TASK_RECEIPTS_FILENAME);
+    let host_ledger_before = fs::read(&host_ledger_path).expect("read host task-receipts.json");
+
+    let host_client_unk = ApprovedHostClient::new(
+        Arc::clone(&fixture_unk.authority),
+        &fixture_unk.sessions_dir,
+        BINDING_A,
+        THREAD_UUID_A,
+    )
+    .expect("open host_client_unk");
+    let direct_err = host_client_unk
+        .dispatch_task(&approval_id_unk, "task-b")
+        .await
+        .expect_err("dispatch_task with existing intent must remain outcome-uncertain");
+    assert!(matches!(
+        direct_err,
+        threadlane_host::HostError::MutationOutcomeUncertain { .. }
+    ));
+    assert_eq!(
+        fs::read(&host_ledger_path).expect("read host task-receipts.json after direct_err"),
+        host_ledger_before
+    );
+    assert_eq!(read_invocation_count(&fixture_unk.agy_count_file), 0);
+
+    for step_ts in [30_100u64, 30_200u64] {
+        let unk_rep = Box::pin(session_unk.step(step_ts)).await.expect(
+            "controller step must reconcile prior pending intent to BlockedOnUnknownEffect",
+        );
+        assert_eq!(
+            unk_rep.status,
+            CoworkerControllerPhase1Status::BlockedOnUnknownEffect
+        );
+        assert!(unk_rep.dispatched_task_ids.is_empty());
+        assert_eq!(read_invocation_count(&fixture_unk.agy_count_file), 0);
+        assert_eq!(
+            fs::read(&host_ledger_path)
+                .expect("read host task-receipts.json after controller step"),
+            host_ledger_before,
+            "host task-receipts.json must remain byte-for-byte unchanged"
+        );
+
+        let job_unk_after = fixture_unk
+            .workflow_store
+            .read_binding_ledger(BINDING_A)
+            .expect("read ledger after unk_rep")
+            .jobs
+            .into_iter()
+            .find(|j| j.job_id == job_unk.job_id)
+            .expect("job_unk exists");
+        assert_eq!(
+            job_unk_after.tasks[0].stage,
+            CoworkerTaskStage::EffectUnknown
+        );
+        assert_eq!(
+            job_unk_after.outbox[0].status,
+            OutboxDispatchStatus::EffectUnknown,
+            "prior uncertain attempt must never promote to ReconciledNotExecuted"
+        );
+
+        let rt_unk_after = fixture_unk
+            .policy_store
+            .get_job_runtime_readonly(BINDING_A, &job_unk.job_id)
+            .expect("read rt_unk_after")
+            .expect("rt_unk_after exists");
+        assert_eq!(
+            rt_unk_after.pending_effects[&eff_id_unk].status,
+            PendingControllerEffectStatus::EffectUnknown,
+            "prior uncertain effect must never promote to RefusedBeforeEffect"
+        );
+    }
+
+    session_unk.release().expect("release session_unk");
+    host_unk.shutdown().await.expect("shutdown host_unk");
+}
+
 #[path = "support/coworker_correction_execution.rs"]
 mod coworker_correction_execution;
 

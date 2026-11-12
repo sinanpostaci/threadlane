@@ -44,7 +44,9 @@ use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 use threadlane_authority::validation::validate_canonical_thread_uuid;
+use threadlane_authority::{validate_executable_worker_instruction, AuthorityError};
 use threadlane_core::observation::ObservationCallState;
+use threadlane_core::MAX_INSTRUCTION_LEN;
 use threadlane_workers::{
     inspect_base_commit_path_kind, is_commit_ancestor, is_source_worktree_clean, is_worktree_clean,
     resolve_exact_commit_sha, resolve_exact_tree_sha, resolve_model_target,
@@ -4293,6 +4295,23 @@ impl CoworkerPlanningService {
             Some(output_digest),
         )?;
 
+        if existing_linked.is_none() {
+            for task in &tasks {
+                validate_executable_worker_instruction(&task.description).map_err(|err| {
+                    let detail = match err {
+                        AuthorityError::Validation { reason, .. } => {
+                            format!("task `{}` {reason}", task.task_id)
+                        }
+                        other => other.to_string(),
+                    };
+                    NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        sanitize_diagnostic_text(&detail),
+                    )
+                })?;
+            }
+        }
+
         let live_reg_snapshot = read_registry_snapshot_readonly(&self.registry_dir)?;
         let _ = verify_grant_registry_dependencies(&live_reg_snapshot, grant)?;
 
@@ -5106,6 +5125,9 @@ fn build_orchestrator_prompt(
             "Only confirmed_requirements define requested planning scope; producing a plan is read-only and never grants code execution permission without separate human approval.",
             "Keep proposed_additions and open_questions separate: never silently promote proposed_additions into confirmed tasks; list explicitly deferred items from work_brief.proposed_additions in deferred_proposals and resolved items from work_brief.open_questions in resolved_open_questions.",
             "Every implementation task node in `tasks` must have `role: \"coder\"` and a difficulty tier (`\"easy\"`, `\"medium\"`, `\"hard\"`, or `\"extreme\"`).",
+            format!(
+                "Every task `description` is executed by a headless `coder` Worker and must be non-empty (after trimming), contain no NUL bytes, and be at most {MAX_INSTRUCTION_LEN} UTF-8 bytes; decompose larger implementation work across multiple bounded `coder` tasks rather than exceeding {MAX_INSTRUCTION_LEN} UTF-8 bytes or dropping any `confirmed_requirements`."
+            ),
             "Never emit `reviewer`, `closure`, `orchestrator`, `architect`, or `follower` as task nodes, and never set `model_override` or `tool_override` (must be omitted).",
             "Parallel tasks without a `depends_on` ordering edge must have disjoint `allowed_write_paths`, and any task consuming an interface in `consumed_interfaces` must depend on the task owning that interface in `owned_interfaces`.",
             "Each task's `allowed_write_paths` must request clean, normalized, individual repository-relative file paths (for example `\"src/parser.rs\"`; never leading `/`, backslashes `\\`, `.` or `..` traversal components, wildcards/globs `* ? [ ] { } !`, bare existing directory names without trailing `/`, symlinks, or submodule gitlinks at `base_commit`).",
@@ -5123,7 +5145,9 @@ fn build_orchestrator_prompt(
                         {
                             "task_id": "required unique identifier (1..=128 ASCII id chars; 1..=64 tasks total)",
                             "title": "required non-empty string (1..=4096 bytes)",
-                            "description": "required non-empty implementation instructions (1..=65536 bytes)",
+                            "description": format!(
+                                "required non-empty executable coder instructions (1..={MAX_INSTRUCTION_LEN} UTF-8 bytes, non-empty after trimming, no NUL bytes; decompose larger work across multiple tasks without dropping confirmed_requirements)"
+                            ),
                             "role": "coder",
                             "difficulty": "easy | medium | hard | extreme",
                             "depends_on": ["optional upstream task_id"],

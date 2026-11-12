@@ -53,7 +53,8 @@ pub use types::{
 pub use validation::{
     compute_authority_core_digest, compute_record_subject_digest, derive_approval_id,
     derive_command_key, derive_profile_id, is_task_scope_contained_in_operator_allowlist,
-    resolve_and_validate_worker_executable, validate_canonical_thread_uuid,
+    resolve_and_validate_worker_executable, validate_approved_executable_task_instructions,
+    validate_canonical_thread_uuid, validate_executable_worker_instruction,
     validate_repository_and_base_commit, validate_write_scope_entry,
     validate_write_scope_entry_at_base_commit, verify_approval_record_integrity,
 };
@@ -2635,5 +2636,381 @@ mod tests {
         assert!(native.workers.is_none());
         assert!(native.task_dispatch.is_empty());
         assert_eq!(native.native_routes.len(), 1);
+    }
+
+    #[test]
+    fn worker_instruction_preflight_enforces_4096_utf8_bytes_preserves_native_and_legacy_records() {
+        // 1. Direct guard enforces runtime UTF-8 byte length, NUL, and trimmed non-empty rules
+        //    without echoing raw instruction prose.
+        validate_executable_worker_instruction(&"x".repeat(threadlane_core::MAX_INSTRUCTION_LEN))
+            .expect("4096 ASCII bytes accepted");
+        let utf8_exact = "é".repeat(threadlane_core::MAX_INSTRUCTION_LEN / 2);
+        assert_eq!(utf8_exact.chars().count(), 2_048);
+        assert_eq!(utf8_exact.len(), threadlane_core::MAX_INSTRUCTION_LEN);
+        validate_executable_worker_instruction(&utf8_exact)
+            .expect("4096 UTF-8 bytes across 2048 chars accepted");
+
+        for (bad_instruction, expected_fragment) in [
+            (
+                "x".repeat(threadlane_core::MAX_INSTRUCTION_LEN + 1),
+                "exceeds maximum length of 4096 bytes",
+            ),
+            (
+                format!("{utf8_exact}z"),
+                "exceeds maximum length of 4096 bytes",
+            ),
+            ("€".repeat(1_366), "exceeds maximum length of 4096 bytes"),
+            (
+                "valid prefix\0SECRET_TAIL".to_string(),
+                "must not contain NUL bytes",
+            ),
+            ("  \t\n  ".to_string(), "must not be empty"),
+        ] {
+            let err = validate_executable_worker_instruction(&bad_instruction)
+                .expect_err("invalid worker instruction must fail");
+            match err {
+                AuthorityError::Validation { field, reason } => {
+                    assert_eq!(field, "instruction");
+                    assert!(
+                        reason.contains(expected_fragment),
+                        "unexpected reason: {reason}"
+                    );
+                    assert!(!reason.contains("SECRET_TAIL"));
+                }
+                other => panic!("expected AuthorityError::Validation, got {other:?}"),
+            }
+        }
+
+        // 2. New authority preview/approve accepts 4096-byte ASCII & multibyte UTF-8 worker tasks
+        //    alongside an 8192-byte manual native `codex_cli` route (`provider == None`), without
+        //    truncating or normalizing frozen instructions.
+        let fixture = setup_fixture();
+        let reg_rev = fixture
+            .registry
+            .snapshot()
+            .expect("registry snapshot")
+            .revision;
+        let ascii_4096 = format!(
+            "  {}  ",
+            "a".repeat(threadlane_core::MAX_INSTRUCTION_LEN - 4)
+        );
+        assert_eq!(ascii_4096.len(), threadlane_core::MAX_INSTRUCTION_LEN);
+        let native_8192 = "n".repeat(8_192);
+        let (plan_ok_rev, plan_ok_digest) = save_and_publish_plan(
+            &fixture,
+            "plan-inst-boundary-ok",
+            "binding-1",
+            reg_rev,
+            vec![
+                PlanTask {
+                    id: "task-ascii-4096".to_string(),
+                    title: "Exact 4096 ASCII bytes".to_string(),
+                    instruction: ascii_4096.clone(),
+                    role: WorkflowRole::Coder,
+                    difficulty: Difficulty::Hard,
+                    depends_on: Vec::new(),
+                    allowed_write_paths: vec!["src/lib.rs".to_string()],
+                },
+                PlanTask {
+                    id: "task-utf8-4096".to_string(),
+                    title: "Exact 4096 UTF-8 bytes".to_string(),
+                    instruction: utf8_exact.clone(),
+                    role: WorkflowRole::Coder,
+                    difficulty: Difficulty::Easy,
+                    depends_on: Vec::new(),
+                    allowed_write_paths: vec!["src/extra.rs".to_string()],
+                },
+                PlanTask {
+                    id: "task-native-8192".to_string(),
+                    title: "Manual native route >4096 bytes".to_string(),
+                    instruction: native_8192.clone(),
+                    role: WorkflowRole::Follower,
+                    difficulty: Difficulty::Hard,
+                    depends_on: Vec::new(),
+                    allowed_write_paths: vec!["src/sub/".to_string()],
+                },
+            ],
+        );
+
+        let ok_req = OperatorApprovalRequest {
+            binding_id: "binding-1".to_string(),
+            thread_uuid: THREAD_UUID_A.to_string(),
+            plan_id: "plan-inst-boundary-ok".to_string(),
+            plan_revision: plan_ok_rev,
+            expected_registry_revision: reg_rev,
+            expected_plan_digest: plan_ok_digest,
+            repository_path: fixture.repo_dir.clone(),
+            base_commit: fixture.base_commit.clone(),
+            approved_task_ids: vec![
+                "task-ascii-4096".to_string(),
+                "task-utf8-4096".to_string(),
+                "task-native-8192".to_string(),
+            ],
+            approved_write_paths: vec![
+                "src/lib.rs".to_string(),
+                "src/extra.rs".to_string(),
+                "src/sub/".to_string(),
+            ],
+            max_parallel: 2,
+            budgets: ExecutionBudgets::default(),
+        };
+        let preview_ok = fixture
+            .authority
+            .preview_for_operator(ok_req.clone())
+            .expect("preview 4096-byte workers + 8192-byte native route");
+        assert_eq!(preview_ok.tasks[0].instruction, ascii_4096);
+        assert_eq!(preview_ok.tasks[1].instruction, utf8_exact);
+        assert_eq!(preview_ok.tasks[2].instruction, native_8192);
+        assert_eq!(preview_ok.tasks[2].provider, None);
+
+        let ok_summary = fixture
+            .authority
+            .approve(ok_req)
+            .expect("approve 4096-byte workers + 8192-byte native route");
+        assert_eq!(ok_summary.worker_profile_count, 2);
+        assert_eq!(ok_summary.native_route_count, 1);
+        let ok_materialized = fixture
+            .authority
+            .materialize(
+                &ok_summary.approval_id,
+                &sample_binding("bnd_boundary_ok", THREAD_UUID_A),
+                &fixture.root.join("boundary-ok-work-area"),
+            )
+            .expect("materialize boundary approval");
+        assert_eq!(ok_materialized.task_dispatch.len(), 2);
+        assert_eq!(ok_materialized.task_dispatch[0].instruction, ascii_4096);
+        assert_eq!(ok_materialized.task_dispatch[1].instruction, utf8_exact);
+        assert_eq!(ok_materialized.native_routes.len(), 1);
+        assert_eq!(ok_materialized.native_routes[0].instruction, native_8192);
+
+        // 3. Oversized LATER task (4097 ASCII bytes and 4098 UTF-8 bytes across 1366 chars) is
+        //    rejected on preview and approve with zero new authority records written.
+        let reject_fixture = setup_fixture();
+        let reject_reg_rev = reject_fixture.registry.snapshot().unwrap().revision;
+        let valid_first = "v".repeat(3_965);
+        let oversized_ascii_4097 = "b".repeat(threadlane_core::MAX_INSTRUCTION_LEN + 1);
+        let oversized_utf8_4098 = "€".repeat(1_366);
+        assert_eq!(oversized_utf8_4098.chars().count(), 1_366);
+        assert_eq!(oversized_utf8_4098.len(), 4_098);
+
+        for (plan_id, later_instruction) in [
+            ("plan-later-ascii-4097", oversized_ascii_4097),
+            ("plan-later-utf8-4098", oversized_utf8_4098),
+        ] {
+            let (bad_rev, bad_digest) = save_and_publish_plan(
+                &reject_fixture,
+                plan_id,
+                "binding-1",
+                reject_reg_rev,
+                vec![
+                    PlanTask {
+                        id: "task-root-first".to_string(),
+                        title: "Valid first root".to_string(),
+                        instruction: valid_first.clone(),
+                        role: WorkflowRole::Coder,
+                        difficulty: Difficulty::Hard,
+                        depends_on: Vec::new(),
+                        allowed_write_paths: vec!["src/lib.rs".to_string()],
+                    },
+                    PlanTask {
+                        id: "task-later-oversized".to_string(),
+                        title: "Oversized later worker".to_string(),
+                        instruction: later_instruction,
+                        role: WorkflowRole::Coder,
+                        difficulty: Difficulty::Easy,
+                        depends_on: vec!["task-root-first".to_string()],
+                        allowed_write_paths: vec!["src/extra.rs".to_string()],
+                    },
+                ],
+            );
+            let bad_req = OperatorApprovalRequest {
+                binding_id: "binding-1".to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                plan_id: plan_id.to_string(),
+                plan_revision: bad_rev,
+                expected_registry_revision: reject_reg_rev,
+                expected_plan_digest: bad_digest,
+                repository_path: reject_fixture.repo_dir.clone(),
+                base_commit: reject_fixture.base_commit.clone(),
+                approved_task_ids: vec![
+                    "task-root-first".to_string(),
+                    "task-later-oversized".to_string(),
+                ],
+                approved_write_paths: vec!["src/lib.rs".to_string(), "src/extra.rs".to_string()],
+                max_parallel: 2,
+                budgets: ExecutionBudgets::default(),
+            };
+            for err in [
+                reject_fixture
+                    .authority
+                    .preview_for_operator(bad_req.clone())
+                    .expect_err("preview must reject oversized later task"),
+                reject_fixture
+                    .authority
+                    .approve(bad_req)
+                    .expect_err("approve must reject oversized later task"),
+            ] {
+                match err {
+                    AuthorityError::Validation { field, reason } => {
+                        assert_eq!(field, "instruction");
+                        assert!(reason.contains("task-later-oversized"));
+                        assert!(reason.contains("4096 bytes"));
+                    }
+                    other => panic!("expected AuthorityError::Validation, got {other:?}"),
+                }
+            }
+            assert!(
+                !reject_fixture.authority.approvals_path().exists(),
+                "rejected preview/approve must not create approvals.json"
+            );
+            assert!(reject_fixture
+                .authority
+                .list_for_binding("binding-1")
+                .unwrap()
+                .is_empty());
+        }
+
+        // 4. Historical validly sealed oversized ApprovalRecord remains readable and materializable
+        //    without mutating or truncating stored instructions.
+        let legacy_oversized = "L".repeat(4_365);
+        let (legacy_rev, legacy_plan_digest) = save_and_publish_plan(
+            &reject_fixture,
+            "plan-legacy-sealed-4365",
+            "binding-1",
+            reject_reg_rev,
+            vec![
+                PlanTask {
+                    id: "task-valid-a".to_string(),
+                    title: "Valid root A".to_string(),
+                    instruction: valid_first.clone(),
+                    role: WorkflowRole::Coder,
+                    difficulty: Difficulty::Hard,
+                    depends_on: Vec::new(),
+                    allowed_write_paths: vec!["src/lib.rs".to_string()],
+                },
+                PlanTask {
+                    id: "task-legacy-b".to_string(),
+                    title: "Historical 4365-byte root B".to_string(),
+                    instruction: legacy_oversized.clone(),
+                    role: WorkflowRole::Coder,
+                    difficulty: Difficulty::Hard,
+                    depends_on: Vec::new(),
+                    allowed_write_paths: vec!["src/extra.rs".to_string()],
+                },
+            ],
+        );
+        let legacy_plan = reject_fixture
+            .plans
+            .get_revision("plan-legacy-sealed-4365", legacy_rev)
+            .unwrap()
+            .unwrap();
+        let legacy_snap = reject_fixture.registry.snapshot().unwrap();
+        let compiled_legacy = compile_plan_revision(&legacy_plan, &legacy_snap).unwrap();
+        let canonical_repo = fs::canonicalize(&reject_fixture.repo_dir).unwrap();
+        let canonical_agy = fs::canonicalize(&reject_fixture.fake_agy_exe).unwrap();
+        let mut legacy_record = ApprovalRecord {
+            approval_id: String::new(),
+            subject_digest: String::new(),
+            policy_version: AUTHORITY_POLICY_VERSION,
+            binding_id: "binding-1".to_string(),
+            thread_uuid: THREAD_UUID_A.to_string(),
+            plan_id: "plan-legacy-sealed-4365".to_string(),
+            plan_revision: legacy_rev,
+            profile_id: legacy_plan.profile_id.clone(),
+            registry_revision: reject_reg_rev,
+            plan_digest: legacy_plan_digest,
+            repository_path: canonical_repo,
+            base_commit: reject_fixture.base_commit.clone(),
+            approved_task_ids: vec!["task-valid-a".to_string(), "task-legacy-b".to_string()],
+            approved_write_paths: vec!["src/lib.rs".to_string(), "src/extra.rs".to_string()],
+            max_parallel: 2,
+            budgets: ExecutionBudgets::default(),
+            tasks: compiled_legacy
+                .tasks
+                .iter()
+                .map(|ct| ApprovedTaskRecord {
+                    task_id: ct.id.clone(),
+                    title: ct.title.clone(),
+                    instruction: ct.instruction.clone(),
+                    instruction_digest: ct.instruction_digest.clone(),
+                    role: ct.role,
+                    difficulty: ct.difficulty,
+                    tool_id: ct.tool_id.clone(),
+                    adapter: ct.adapter,
+                    provider: Some(WorkerProvider::Antigravity),
+                    canonical_executable: Some(canonical_agy.clone()),
+                    model_id: ct.choice.model_id.clone(),
+                    model_arg: ct.model_arg.clone(),
+                    base_model: ct.model_arg.clone(),
+                    effort: ct.choice.effort.clone(),
+                    cli_model_arg: Some(ct.model_arg.clone()),
+                    standalone: Some(false),
+                    file_permissions: Some(WorkerFilePermissions::TaskFiles),
+                    depends_on: ct.depends_on.clone(),
+                    allowed_write_paths: ct.allowed_write_paths.clone(),
+                    task_digest: ct.task_digest.clone(),
+                    profile_id: None,
+                    command_key: None,
+                })
+                .collect(),
+            created_at_ms: 1_700_000_050_000,
+        };
+        let core_digest = compute_authority_core_digest(&legacy_record).unwrap();
+        for task in &mut legacy_record.tasks {
+            task.profile_id = Some(derive_profile_id(
+                &core_digest,
+                &task.task_id,
+                &task.task_digest,
+            ));
+            task.command_key = Some(derive_command_key(
+                &core_digest,
+                &task.task_id,
+                &task.task_digest,
+            ));
+        }
+        legacy_record.subject_digest = compute_record_subject_digest(&legacy_record).unwrap();
+        legacy_record.approval_id = derive_approval_id(&legacy_record.subject_digest);
+        verify_approval_record_integrity(&legacy_record, reject_fixture.authority.approvals_path())
+            .expect("legacy oversized record integrity remains valid");
+
+        let ledger_json = serde_json::json!({
+            "schema_version": AUTHORITY_SCHEMA_VERSION,
+            "approvals": [&legacy_record],
+        });
+        fs::write(
+            reject_fixture.authority.approvals_path(),
+            serde_json::to_vec(&ledger_json).unwrap(),
+        )
+        .unwrap();
+        fs::set_permissions(
+            reject_fixture.authority.approvals_path(),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+
+        let reopened = AuthorityStore::open(
+            reject_fixture.authority.dir(),
+            Arc::clone(&reject_fixture.registry),
+            Arc::clone(&reject_fixture.plans),
+        )
+        .expect("reopen AuthorityStore with historical oversized record");
+        let loaded = reopened
+            .get_for_operator(&legacy_record.approval_id)
+            .expect("get_for_operator reads historical oversized record");
+        assert_eq!(loaded, legacy_record);
+        assert_eq!(loaded.tasks[1].instruction.len(), 4_365);
+        assert_eq!(reopened.list_for_binding("binding-1").unwrap().len(), 1);
+        let materialized_legacy = reopened
+            .materialize(
+                &legacy_record.approval_id,
+                &sample_binding("bnd_legacy_mat", THREAD_UUID_A),
+                &reject_fixture.root.join("legacy-oversized-work-area"),
+            )
+            .expect("materialize historical oversized record for session inspection/recovery");
+        assert_eq!(materialized_legacy.task_dispatch.len(), 2);
+        assert_eq!(
+            materialized_legacy.task_dispatch[1].instruction.len(),
+            4_365
+        );
     }
 }

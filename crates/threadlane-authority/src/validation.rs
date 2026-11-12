@@ -79,6 +79,61 @@ pub fn validate_sha256_hex(field: &'static str, raw: &str) -> Result<String, Aut
     Ok(raw.to_string())
 }
 
+/// Validates an executable headless worker task `instruction` against the runtime
+/// [`threadlane_core::MAX_INSTRUCTION_LEN`] UTF-8 byte bound, NUL-byte prohibition, and
+/// non-empty trimmed rule enforced by `StartWorker` and `WorkerExecutionBinding`.
+///
+/// This guard is intentionally static and side-effect-free, never echoes raw instruction text in
+/// error diagnostics, and is applied only during new approval preparation and effect-capable
+/// execution preflight (never when reading or verifying stored historical [`ApprovalRecord`]s).
+pub fn validate_executable_worker_instruction(instruction: &str) -> Result<(), AuthorityError> {
+    if instruction.len() > threadlane_core::MAX_INSTRUCTION_LEN {
+        return Err(AuthorityError::validation(
+            "instruction",
+            format!(
+                "instruction exceeds maximum length of {} bytes",
+                threadlane_core::MAX_INSTRUCTION_LEN
+            ),
+        ));
+    }
+    if instruction.contains('\0') {
+        return Err(AuthorityError::validation(
+            "instruction",
+            "instruction must not contain NUL bytes",
+        ));
+    }
+    if instruction.trim().is_empty() {
+        return Err(AuthorityError::validation(
+            "instruction",
+            "instruction must not be empty",
+        ));
+    }
+    Ok(())
+}
+
+/// Validates [`validate_executable_worker_instruction`] across every approved headless/executable
+/// worker task in `tasks`, preserving native/manual `codex_cli` route tasks (`provider.is_none()`).
+pub fn validate_approved_executable_task_instructions<'a, I>(tasks: I) -> Result<(), AuthorityError>
+where
+    I: IntoIterator<Item = &'a ApprovedTaskRecord>,
+{
+    for task in tasks {
+        if task.provider.is_none() && !task.is_frozen_headless_worker() {
+            continue;
+        }
+        if let Err(err) = validate_executable_worker_instruction(&task.instruction) {
+            return match err {
+                AuthorityError::Validation { field, reason } => Err(AuthorityError::Validation {
+                    field,
+                    reason: format!("task `{}` {reason}", task.task_id),
+                }),
+                other => Err(other),
+            };
+        }
+    }
+    Ok(())
+}
+
 /// Validates that `repository_path` is an existing canonical non-symlink Git repository directory
 /// and that `base_commit` is an exact 40-character hexadecimal commit SHA existing in that
 /// repository via bounded sanitized read-only Git.

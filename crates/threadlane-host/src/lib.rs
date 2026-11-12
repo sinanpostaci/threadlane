@@ -233,6 +233,9 @@ if [ -d "src" ]; then
         *CONFLICT_TASK_RIGHT*)
             printf "pub fn conflict() -> u32 {{ 222 }}\n" > "src/lib.rs"
             ;;
+        *HISTORICAL_EXTRA_TASK*)
+            printf "// updated by fake-agy\npub fn extra() {{}}\n" > "src/extra.rs"
+            ;;
         *)
             printf "// updated by fake-agy\npub fn alpha() -> u32 {{ 42 }}\n" > "src/lib.rs"
             ;;
@@ -9244,5 +9247,812 @@ exit 0
             .await
             .expect_err("mismatched DB binding must fail");
         assert_eq!(mismatch_err.code(), "scope_mismatch");
+    }
+
+    fn seed_legacy_approval_record_in_host_fixture(
+        fixture: &mut HostTestFixture,
+        plan_id: &str,
+        binding_id: &str,
+        thread_uuid: &str,
+        tasks: Vec<PlanTask>,
+        approved_write_paths: Vec<String>,
+        legacy_instruction_overrides: &[(&str, &str)],
+    ) -> threadlane_authority::ApprovalRecord {
+        let reg_snap = fixture.registry.snapshot().expect("registry snapshot");
+        let draft = fixture
+            .plans
+            .change_at(
+                0,
+                PlanChange::SaveDraft {
+                    plan_id: plan_id.to_string(),
+                    binding_id: binding_id.to_string(),
+                    profile_id: "profile-main".to_string(),
+                    profile_revision: reg_snap.revision,
+                    summary: format!("Legacy plan {plan_id}"),
+                    tasks,
+                },
+                1_700_000_000_000,
+            )
+            .expect("save legacy draft");
+        let published = fixture
+            .plans
+            .change(
+                draft.revision,
+                PlanChange::Publish {
+                    plan_id: plan_id.to_string(),
+                    revision: draft.revision,
+                },
+            )
+            .expect("publish legacy plan");
+        let compiled =
+            compile_plan_revision(&published, &reg_snap).expect("compile legacy published plan");
+        let canonical_repo = fs::canonicalize(&fixture.repo_dir).expect("canonicalize repo");
+        let canonical_agy = fs::canonicalize(&fixture.fake_agy_exe).expect("canonicalize agy");
+        let canonical_oc = fs::canonicalize(&fixture.fake_oc_exe).expect("canonicalize oc");
+
+        let mut record = threadlane_authority::ApprovalRecord {
+            approval_id: String::new(),
+            subject_digest: String::new(),
+            policy_version: threadlane_authority::AUTHORITY_POLICY_VERSION,
+            binding_id: binding_id.to_string(),
+            thread_uuid: thread_uuid.to_string(),
+            plan_id: plan_id.to_string(),
+            plan_revision: published.revision,
+            profile_id: published.profile_id.clone(),
+            registry_revision: reg_snap.revision,
+            plan_digest: compiled.plan_digest.clone(),
+            repository_path: canonical_repo,
+            base_commit: fixture.base_commit.clone(),
+            approved_task_ids: compiled.tasks.iter().map(|t| t.id.clone()).collect(),
+            approved_write_paths,
+            max_parallel: 2,
+            budgets: ExecutionBudgets::default(),
+            tasks: compiled
+                .tasks
+                .iter()
+                .map(|ct| {
+                    let is_headless =
+                        ct.adapter != ToolAdapter::CodexCli || ct.role == WorkflowRole::Coder;
+                    let (provider, exe, standalone) = if !is_headless {
+                        (None, None, None)
+                    } else if ct.adapter == ToolAdapter::OpencodeV2 {
+                        (
+                            Some(threadlane_workers::WorkerProvider::OpenCodeV2),
+                            Some(canonical_oc.clone()),
+                            Some(true),
+                        )
+                    } else {
+                        (
+                            Some(threadlane_workers::WorkerProvider::Antigravity),
+                            Some(canonical_agy.clone()),
+                            Some(false),
+                        )
+                    };
+                    let cli_model_arg = if !is_headless {
+                        None
+                    } else if ct.adapter == ToolAdapter::OpencodeV2 {
+                        Some(format!(
+                            "{}#{}",
+                            ct.model_arg,
+                            ct.choice.effort.as_deref().unwrap_or("max")
+                        ))
+                    } else {
+                        Some(ct.model_arg.clone())
+                    };
+                    let mut instruction = ct.instruction.clone();
+                    let mut instruction_digest = ct.instruction_digest.clone();
+                    let mut task_digest = ct.task_digest.clone();
+                    if let Some((_, raw_override)) = legacy_instruction_overrides
+                        .iter()
+                        .find(|(id, _)| *id == ct.id)
+                    {
+                        instruction = (*raw_override).to_string();
+                        instruction_digest =
+                            threadlane_authority::validation::sha256_hex(instruction.as_bytes());
+                        task_digest = threadlane_authority::validation::sha256_hex(
+                            format!("legacy-override:{}:{instruction_digest}", ct.id).as_bytes(),
+                        );
+                    }
+                    threadlane_authority::ApprovedTaskRecord {
+                        task_id: ct.id.clone(),
+                        title: ct.title.clone(),
+                        instruction,
+                        instruction_digest,
+                        role: ct.role,
+                        difficulty: ct.difficulty,
+                        tool_id: ct.tool_id.clone(),
+                        adapter: ct.adapter,
+                        provider,
+                        canonical_executable: exe,
+                        model_id: ct.choice.model_id.clone(),
+                        model_arg: ct.model_arg.clone(),
+                        base_model: ct.model_arg.clone(),
+                        effort: ct.choice.effort.clone(),
+                        cli_model_arg,
+                        standalone,
+                        file_permissions: is_headless
+                            .then_some(threadlane_workers::WorkerFilePermissions::TaskFiles),
+                        depends_on: ct.depends_on.clone(),
+                        allowed_write_paths: ct.allowed_write_paths.clone(),
+                        task_digest,
+                        profile_id: None,
+                        command_key: None,
+                    }
+                })
+                .collect(),
+            created_at_ms: 1_700_000_050_000,
+        };
+        let core_digest = threadlane_authority::compute_authority_core_digest(&record)
+            .expect("compute legacy core digest");
+        for task in &mut record.tasks {
+            if task.provider.is_some() {
+                task.profile_id = Some(threadlane_authority::derive_profile_id(
+                    &core_digest,
+                    &task.task_id,
+                    &task.task_digest,
+                ));
+                task.command_key = Some(threadlane_authority::derive_command_key(
+                    &core_digest,
+                    &task.task_id,
+                    &task.task_digest,
+                ));
+            }
+        }
+        record.subject_digest = threadlane_authority::compute_record_subject_digest(&record)
+            .expect("compute legacy subject digest");
+        record.approval_id = threadlane_authority::derive_approval_id(&record.subject_digest);
+        threadlane_authority::verify_approval_record_integrity(
+            &record,
+            fixture.authority.approvals_path(),
+        )
+        .expect("legacy oversized record passes integrity verification");
+
+        let ledger_json = serde_json::json!({
+            "schema_version": threadlane_authority::AUTHORITY_SCHEMA_VERSION,
+            "approvals": [&record],
+        });
+        fs::write(
+            fixture.authority.approvals_path(),
+            serde_json::to_vec(&ledger_json).expect("serialize legacy approvals.json"),
+        )
+        .expect("write legacy approvals.json");
+        fs::set_permissions(
+            fixture.authority.approvals_path(),
+            fs::Permissions::from_mode(0o600),
+        )
+        .expect("chmod 0600 legacy approvals.json");
+
+        fixture.authority = Arc::new(
+            AuthorityStore::open(
+                &fixture.authority_dir,
+                Arc::clone(&fixture.registry),
+                Arc::clone(&fixture.plans),
+            )
+            .expect("reopen AuthorityStore with legacy oversized record"),
+        );
+        record
+    }
+
+    #[tokio::test]
+    async fn dispatch_task_enforces_4096_utf8_bytes_after_existing_receipt_fastpath_without_broad_remote_reclassification(
+    ) {
+        // 1. Generic runtime Remote(ValidationFailed) still maps to HostError::Runtime, preserving
+        //    strict unknown-effect classification for post-RPC remote errors.
+        let remote_err = HostError::from(threadlane::Error::Remote(threadlane::ApiError::new(
+            threadlane::ErrorCode::ValidationFailed,
+            "validation failed on instruction: instruction exceeds maximum length of 4096 bytes",
+        )));
+        assert!(matches!(remote_err, HostError::Runtime { .. }));
+        assert_eq!(remote_err.code(), "runtime_error");
+
+        // 2. Exact 4096 UTF-8 byte instruction (2048 2-byte chars) dispatches and completes cleanly.
+        let fixture_ok = setup_fixture();
+        let utf8_4096 = "é".repeat(threadlane_core::MAX_INSTRUCTION_LEN / 2);
+        assert_eq!(utf8_4096.chars().count(), 2_048);
+        assert_eq!(utf8_4096.len(), threadlane_core::MAX_INSTRUCTION_LEN);
+        let approval_ok = create_approved_plan(
+            &fixture_ok,
+            "plan-host-utf8-4096",
+            BINDING_A,
+            THREAD_UUID_A,
+            default_tasks(&utf8_4096),
+        );
+        let host_ok = ApprovedHost::start(ApprovedHostConfig::new(
+            &fixture_ok.registry_dir,
+            &fixture_ok.plans_dir,
+            &fixture_ok.authority_dir,
+            &fixture_ok.sessions_dir,
+            &approval_ok,
+        ))
+        .await
+        .expect("start host for 4096-byte UTF-8 task");
+        let client_ok = ApprovedHostClient::new(
+            Arc::clone(&fixture_ok.authority),
+            &fixture_ok.sessions_dir,
+            BINDING_A,
+            THREAD_UUID_A,
+        )
+        .expect("open host client");
+        let dispatched_ok = client_ok
+            .dispatch_task(&approval_ok, "task-root-agy")
+            .await
+            .expect("dispatch 4096-byte UTF-8 worker task");
+        assert!(dispatched_ok.run_id.is_some());
+        assert!(dispatched_ok.worker_id.is_some());
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let snap = client_ok
+                .get_task(&approval_ok, "task-root-agy")
+                .await
+                .expect("poll 4096-byte task");
+            if snap.status == TaskExecutionStatus::ReadyForReview {
+                assert_eq!(snap.run_id, dispatched_ok.run_id);
+                assert_eq!(snap.worker_id, dispatched_ok.worker_id);
+                assert!(!snap.accepted);
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for ReadyForReview"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(
+            fs::read_to_string(&fixture_ok.agy_count_file)
+                .expect("read agy count")
+                .trim(),
+            "1"
+        );
+        const AGY_CONTRACT_PREFIX: &str =
+            "[THREADLANE_AGY_TASK_FILES_CONTRACT] Session-local Antigravity task_files execution contract: ";
+        const AGY_INSTRUCTION_MARKER: &str = "[THREADLANE_TASK_INSTRUCTION] ";
+        assert!(!utf8_4096.contains(AGY_INSTRUCTION_MARKER));
+        let captured_prompt =
+            fs::read_to_string(&fixture_ok.agy_prompt_file).expect("read agy prompt");
+        assert!(
+            captured_prompt.starts_with(AGY_CONTRACT_PREFIX),
+            "expected software-owned task_files contract header prefix"
+        );
+        assert_eq!(
+            captured_prompt.matches(AGY_INSTRUCTION_MARKER).count(),
+            1,
+            "expected exactly one task instruction boundary marker"
+        );
+        let (header_part, payload_part) = captured_prompt
+            .split_once(AGY_INSTRUCTION_MARKER)
+            .expect("split at AGY_TASK_FILES_PROMPT_BOUNDARY");
+        assert!(header_part.starts_with(AGY_CONTRACT_PREFIX));
+        assert!(header_part.contains("Persist changes only within declared task write scopes: ["));
+        assert_eq!(payload_part.as_bytes(), utf8_4096.as_bytes());
+        assert_eq!(payload_part.len(), threadlane_core::MAX_INSTRUCTION_LEN);
+        assert_eq!(payload_part, utf8_4096);
+        host_ok.shutdown().await.expect("shutdown host_ok");
+
+        // 3. Legacy sealed approval with valid root A (3965B), oversized root B (4097B),
+        //    oversized dependent C (4365B), and manual native route D (8192B):
+        //    - Native route still returns NativeRouteRequired.
+        //    - Unstarted oversized root B and dependent C return HostError::Validation before
+        //      recording any TaskDispatchIntent or invoking any fake provider.
+        //    - Pre-existing sealed TaskRunReceipt on oversized root B returns ReadyForReview via
+        //      existing_receipt fastpath without redispatching.
+        let mut fixture = setup_fixture();
+        let legacy_record = seed_legacy_approval_record_in_host_fixture(
+            &mut fixture,
+            "plan-host-legacy-oversized",
+            BINDING_A,
+            THREAD_UUID_A,
+            vec![
+                PlanTask {
+                    id: "task-valid-root".to_string(),
+                    title: "Valid 3965B root".to_string(),
+                    instruction: "v".repeat(3_965),
+                    role: WorkflowRole::Coder,
+                    difficulty: Difficulty::Hard,
+                    depends_on: Vec::new(),
+                    allowed_write_paths: vec!["src/lib.rs".to_string()],
+                },
+                PlanTask {
+                    id: "task-oversized-root".to_string(),
+                    title: "Oversized 4097B root".to_string(),
+                    instruction: "R".repeat(threadlane_core::MAX_INSTRUCTION_LEN + 1),
+                    role: WorkflowRole::Coder,
+                    difficulty: Difficulty::Hard,
+                    depends_on: Vec::new(),
+                    allowed_write_paths: vec!["src/extra.rs".to_string()],
+                },
+                PlanTask {
+                    id: "task-oversized-dep".to_string(),
+                    title: "Oversized 4365B dependent".to_string(),
+                    instruction: "D".repeat(4_365),
+                    role: WorkflowRole::Coder,
+                    difficulty: Difficulty::Hard,
+                    depends_on: vec!["task-valid-root".to_string()],
+                    allowed_write_paths: vec!["src/lib.rs".to_string()],
+                },
+                PlanTask {
+                    id: "task-native-manual".to_string(),
+                    title: "Native manual 8192B route".to_string(),
+                    instruction: "N".repeat(8_192),
+                    role: WorkflowRole::Follower,
+                    difficulty: Difficulty::Medium,
+                    depends_on: Vec::new(),
+                    allowed_write_paths: vec!["src/lib.rs".to_string()],
+                },
+            ],
+            vec!["src/lib.rs".to_string(), "src/extra.rs".to_string()],
+            &[],
+        );
+        let approval_id = legacy_record.approval_id.clone();
+
+        let host = ApprovedHost::start(ApprovedHostConfig::new(
+            &fixture.registry_dir,
+            &fixture.plans_dir,
+            &fixture.authority_dir,
+            &fixture.sessions_dir,
+            &approval_id,
+        ))
+        .await
+        .expect("start host on legacy oversized approval");
+        let client = ApprovedHostClient::new(
+            Arc::clone(&fixture.authority),
+            &fixture.sessions_dir,
+            BINDING_A,
+            THREAD_UUID_A,
+        )
+        .expect("open host client");
+
+        let native_err = client
+            .dispatch_task(&approval_id, "task-native-manual")
+            .await
+            .expect_err("native route must still return NativeRouteRequired");
+        assert!(matches!(native_err, HostError::NativeRouteRequired { .. }));
+
+        for oversized_id in ["task-oversized-root", "task-oversized-dep"] {
+            let err = client
+                .dispatch_task(&approval_id, oversized_id)
+                .await
+                .expect_err("oversized worker instruction must fail pre-effect validation");
+            match err {
+                HostError::Validation { field, reason } => {
+                    assert_eq!(field, "instruction");
+                    assert!(reason.contains("4096 bytes"));
+                }
+                other => panic!("expected HostError::Validation for {oversized_id}, got {other:?}"),
+            }
+        }
+        assert!(
+            !fixture.agy_count_file.exists(),
+            "oversized dispatch refusal must never invoke fake provider"
+        );
+        let session_dir = fixture.sessions_dir.join(&approval_id);
+        let summary = client
+            .session_summary(&approval_id)
+            .expect("session_summary remains readable");
+        let session_binding_id = summary
+            .session_binding_id
+            .clone()
+            .expect("active session_binding_id");
+        let (intents, receipts) =
+            read_session_task_ledger_readonly(&session_dir, &legacy_record, &session_binding_id)
+                .expect("read task ledger readonly")
+                .unwrap_or_default();
+        assert!(
+            intents.is_empty(),
+            "zero TaskDispatchIntents may be recorded"
+        );
+        assert!(receipts.is_empty(), "zero TaskRunReceipts may be recorded");
+        assert_eq!(
+            client
+                .get_task(&approval_id, "task-oversized-root")
+                .await
+                .expect("get_task after pre-effect refusal")
+                .status,
+            TaskExecutionStatus::NotStarted
+        );
+
+        // Seed a genuine historical completed worker run + sealed TaskRunReceipt for
+        // `task-oversized-root` and prove `dispatch_task` returns it via `existing_receipt`
+        // fastpath without redispatching.
+        let oversized_task = legacy_record
+            .tasks
+            .iter()
+            .find(|t| t.task_id == "task-oversized-root")
+            .expect("oversized task record");
+        let profile_id = oversized_task.profile_id.clone().expect("profile_id");
+        let command_key = oversized_task.command_key.clone().expect("command_key");
+        let scoped = threadlane::ScopedClient::from_state_dir(
+            session_dir.join(RUNTIME_STATE_SUBDIR),
+            &session_binding_id,
+        )
+        .expect("open scoped runtime client");
+        let historical_worker = scoped
+            .start_worker(
+                command_key.clone(),
+                profile_id.clone(),
+                "HISTORICAL_EXTRA_TASK Historical pre-limit worker run".to_string(),
+            )
+            .await
+            .expect("start historical worker in runtime");
+        let hist_deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let w = scoped
+                .get_worker(historical_worker.run_id.clone())
+                .await
+                .expect("poll historical worker");
+            if w.status == threadlane_core::WorkerStatus::Completed {
+                break;
+            }
+            assert!(
+                !matches!(
+                    w.status,
+                    threadlane_core::WorkerStatus::Failed
+                        | threadlane_core::WorkerStatus::Cancelled
+                        | threadlane_core::WorkerStatus::TimedOut
+                        | threadlane_core::WorkerStatus::Unknown
+                ),
+                "historical worker entered unexpected terminal status {:?}: {:?}",
+                w.status,
+                w.outcome
+            );
+            assert!(
+                Instant::now() < hist_deadline,
+                "timed out waiting for historical worker Completed"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(
+            fs::read_to_string(&fixture.agy_count_file)
+                .expect("agy count after historical run")
+                .trim(),
+            "1"
+        );
+
+        let _ = record_task_dispatch_intent(
+            &session_dir,
+            &legacy_record,
+            &session_binding_id,
+            TaskDispatchIntent {
+                task_id: oversized_task.task_id.clone(),
+                task_digest: oversized_task.task_digest.clone(),
+                profile_id: profile_id.clone(),
+                command_key: command_key.clone(),
+                execution_binding: None,
+                recorded_at_ms: 1_700_000_060_000,
+            },
+        )
+        .expect("record historical intent");
+        let _ = record_task_receipt(
+            &session_dir,
+            &legacy_record,
+            &session_binding_id,
+            TaskRunReceipt {
+                task_id: oversized_task.task_id.clone(),
+                task_digest: oversized_task.task_digest.clone(),
+                profile_id,
+                command_key,
+                run_id: historical_worker.run_id.clone(),
+                worker_id: historical_worker.worker_id.clone(),
+                execution_binding: None,
+                recorded_at_ms: 1_700_000_060_100,
+            },
+        )
+        .expect("record historical sealed receipt");
+
+        let fastpath_snap = client
+            .dispatch_task(&approval_id, "task-oversized-root")
+            .await
+            .expect("existing_receipt fastpath must observe run before instruction guard");
+        assert_eq!(fastpath_snap.status, TaskExecutionStatus::ReadyForReview);
+        assert_eq!(
+            fastpath_snap.run_id.as_deref(),
+            Some(historical_worker.run_id.as_str())
+        );
+        assert_eq!(
+            fastpath_snap.worker_id.as_deref(),
+            Some(historical_worker.worker_id.as_str())
+        );
+        assert_eq!(
+            fs::read_to_string(&fixture.agy_count_file)
+                .expect("agy count unchanged on fastpath")
+                .trim(),
+            "1"
+        );
+
+        let inst_id = summary.instance_id.as_deref().unwrap();
+        // ApprovedHost::start requires its owner to serve the latched stop request.
+        // Drive that real lifecycle concurrently; the client alone cannot release host.lock.
+        let stop_owner = async move {
+            tokio::time::timeout(Duration::from_secs(5), host.wait_for_stop_request())
+                .await
+                .expect("legacy host must receive its authenticated idle stop request");
+            host.shutdown()
+                .await
+                .expect("shutdown legacy host after stop request");
+        };
+        let (stopped, ()) =
+            tokio::join!(client.stop_idle_session(&approval_id, inst_id), stop_owner,);
+        let stopped =
+            stopped.expect("stop_idle_session remains usable on legacy oversized session");
+        assert_eq!(stopped.phase, HostPhase::Stopped);
+        assert!(!is_host_lock_held(&session_dir).expect("legacy host lock released"));
+
+        // 4. Pre-existing `TaskDispatchIntent` WITHOUT `TaskRunReceipt`:
+        //    - On oversized ASCII/UTF-8 legacy tasks, `dispatch_task` MUST return
+        //      `HostError::MutationOutcomeUncertain` (never `HostError::Validation`), keeping
+        //      `task-receipts.json` byte-for-byte unchanged, invoking zero runtime/provider runs,
+        //      and retaining `TaskExecutionStatus::Unknown`.
+        //    - On a valid (3965B) task with a pending `TaskDispatchIntent`, `dispatch_task` still
+        //      reconciles/replays cleanly to `ReadyForReview`.
+        let mut fixture_pending = setup_fixture();
+        let pending_record = seed_legacy_approval_record_in_host_fixture(
+            &mut fixture_pending,
+            "plan-host-pending-intent",
+            BINDING_A,
+            THREAD_UUID_A,
+            vec![
+                PlanTask {
+                    id: "task-valid-pending".to_string(),
+                    title: "Valid 3965B pending root".to_string(),
+                    instruction: "v".repeat(3_965),
+                    role: WorkflowRole::Coder,
+                    difficulty: Difficulty::Hard,
+                    depends_on: Vec::new(),
+                    allowed_write_paths: vec!["src/lib.rs".to_string()],
+                },
+                PlanTask {
+                    id: "task-oversized-pending".to_string(),
+                    title: "Oversized 4097B pending root".to_string(),
+                    instruction: "P".repeat(threadlane_core::MAX_INSTRUCTION_LEN + 1),
+                    role: WorkflowRole::Coder,
+                    difficulty: Difficulty::Hard,
+                    depends_on: Vec::new(),
+                    allowed_write_paths: vec!["src/extra.rs".to_string()],
+                },
+                PlanTask {
+                    id: "task-utf8-oversized-pending".to_string(),
+                    title: "Oversized UTF-8 legacy pending root".to_string(),
+                    instruction: "é".repeat(threadlane_core::MAX_INSTRUCTION_LEN / 2 + 1),
+                    role: WorkflowRole::Coder,
+                    difficulty: Difficulty::Hard,
+                    depends_on: Vec::new(),
+                    allowed_write_paths: vec!["src/lib.rs".to_string()],
+                },
+            ],
+            vec!["src/lib.rs".to_string(), "src/extra.rs".to_string()],
+            &[],
+        );
+        let pending_approval_id = pending_record.approval_id.clone();
+        let host_pending = ApprovedHost::start(ApprovedHostConfig::new(
+            &fixture_pending.registry_dir,
+            &fixture_pending.plans_dir,
+            &fixture_pending.authority_dir,
+            &fixture_pending.sessions_dir,
+            &pending_approval_id,
+        ))
+        .await
+        .expect("start host_pending");
+        let client_pending = ApprovedHostClient::new(
+            Arc::clone(&fixture_pending.authority),
+            &fixture_pending.sessions_dir,
+            BINDING_A,
+            THREAD_UUID_A,
+        )
+        .expect("open client_pending");
+
+        // Before an intent exists, an oversized UTF-8 instruction is a typed pre-effect refusal.
+        let utf8_pre_intent_err = client_pending
+            .dispatch_task(&pending_approval_id, "task-utf8-oversized-pending")
+            .await
+            .expect_err(
+                "absent-intent oversized UTF-8 instruction must fail pre-effect validation",
+            );
+        match utf8_pre_intent_err {
+            HostError::Validation { field, reason } => {
+                assert_eq!(field, "instruction");
+                assert!(reason.contains("4096"));
+                assert!(!reason.contains("secret-nul-tail"));
+            }
+            other => panic!(
+                "expected HostError::Validation for absent-intent UTF-8 overflow, got {other:?}"
+            ),
+        }
+        assert!(!fixture_pending.agy_count_file.exists());
+
+        let pending_session_dir = fixture_pending.sessions_dir.join(&pending_approval_id);
+        let pending_binding_id = client_pending
+            .session_summary(&pending_approval_id)
+            .expect("pending session_summary")
+            .session_binding_id
+            .expect("pending session_binding_id");
+
+        for (idx, pending_task_id) in ["task-oversized-pending", "task-utf8-oversized-pending"]
+            .into_iter()
+            .enumerate()
+        {
+            let task_rec = pending_record
+                .tasks
+                .iter()
+                .find(|t| t.task_id == pending_task_id)
+                .expect("pending task record");
+            let _ = record_task_dispatch_intent(
+                &pending_session_dir,
+                &pending_record,
+                &pending_binding_id,
+                TaskDispatchIntent {
+                    task_id: task_rec.task_id.clone(),
+                    task_digest: task_rec.task_digest.clone(),
+                    profile_id: task_rec.profile_id.clone().expect("profile_id"),
+                    command_key: task_rec.command_key.clone().expect("command_key"),
+                    execution_binding: None,
+                    recorded_at_ms: 1_700_000_070_000 + idx as i64,
+                },
+            )
+            .expect("record pending intent without receipt");
+            assert_eq!(
+                client_pending
+                    .get_task(&pending_approval_id, pending_task_id)
+                    .await
+                    .expect("get_task for pending intent")
+                    .status,
+                TaskExecutionStatus::Unknown
+            );
+        }
+
+        let ledger_path = pending_session_dir.join(TASK_RECEIPTS_FILENAME);
+        let ledger_bytes_before = fs::read(&ledger_path).expect("read task-receipts.json before");
+        for pending_task_id in ["task-oversized-pending", "task-utf8-oversized-pending"] {
+            let err = client_pending
+                .dispatch_task(&pending_approval_id, pending_task_id)
+                .await
+                .expect_err("pending intent with invalid instruction must stay outcome-uncertain");
+            match err {
+                HostError::MutationOutcomeUncertain { operation, detail } => {
+                    assert_eq!(operation, "dispatch_task");
+                    assert!(detail.contains(pending_task_id));
+                    assert!(!detail.contains('\0'));
+                    assert!(!detail.contains("secret-nul-tail"));
+                }
+                other => panic!(
+                    "expected HostError::MutationOutcomeUncertain for {pending_task_id}, got {other:?}"
+                ),
+            }
+            assert_eq!(
+                fs::read(&ledger_path).expect("read task-receipts.json after"),
+                ledger_bytes_before,
+                "task-receipts.json bytes must remain unchanged for {pending_task_id}"
+            );
+            assert!(
+                !fixture_pending.agy_count_file.exists(),
+                "zero runtime starts or fake provider invocations allowed for {pending_task_id}"
+            );
+            assert_eq!(
+                client_pending
+                    .get_task(&pending_approval_id, pending_task_id)
+                    .await
+                    .expect("get_task retains Unknown")
+                    .status,
+                TaskExecutionStatus::Unknown
+            );
+        }
+
+        // Valid `existing_intent` still replays/reconciles cleanly to `ReadyForReview`.
+        let valid_pending_rec = pending_record
+            .tasks
+            .iter()
+            .find(|t| t.task_id == "task-valid-pending")
+            .expect("task-valid-pending");
+        let _ = record_task_dispatch_intent(
+            &pending_session_dir,
+            &pending_record,
+            &pending_binding_id,
+            TaskDispatchIntent {
+                task_id: valid_pending_rec.task_id.clone(),
+                task_digest: valid_pending_rec.task_digest.clone(),
+                profile_id: valid_pending_rec.profile_id.clone().expect("profile_id"),
+                command_key: valid_pending_rec.command_key.clone().expect("command_key"),
+                execution_binding: None,
+                recorded_at_ms: 1_700_000_071_000,
+            },
+        )
+        .expect("record valid pending intent");
+        let valid_replayed = client_pending
+            .dispatch_task(&pending_approval_id, "task-valid-pending")
+            .await
+            .expect("valid existing_intent must still dispatch/reconcile");
+        assert!(valid_replayed.run_id.is_some());
+        let valid_deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if client_pending
+                .get_task(&pending_approval_id, "task-valid-pending")
+                .await
+                .expect("poll task-valid-pending")
+                .status
+                == TaskExecutionStatus::ReadyForReview
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < valid_deadline,
+                "timed out waiting for task-valid-pending ReadyForReview"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(
+            fs::read_to_string(&fixture_pending.agy_count_file)
+                .expect("agy count after valid replay")
+                .trim(),
+            "1"
+        );
+        host_pending
+            .shutdown()
+            .await
+            .expect("shutdown host_pending");
+
+        // 5. A historical NUL instruction remains readable, but current WorkerSpec
+        // validation already prevents its host from becoming Ready. Do not fabricate
+        // a live NUL-profile host to test a dispatch path its startup contract forbids.
+        // The two real oversized pending-intent cases above retain Unknown receipts.
+        let mut fixture_nul = setup_fixture();
+        let nul_record = seed_legacy_approval_record_in_host_fixture(
+            &mut fixture_nul,
+            "plan-host-legacy-nul-startup",
+            BINDING_A,
+            THREAD_UUID_A,
+            vec![PlanTask {
+                id: "task-nul-legacy".to_string(),
+                title: "Legacy NUL startup refusal".to_string(),
+                instruction: "placeholder before legacy override".to_string(),
+                role: WorkflowRole::Coder,
+                difficulty: Difficulty::Hard,
+                depends_on: Vec::new(),
+                allowed_write_paths: vec!["src/lib.rs".to_string()],
+            }],
+            vec!["src/lib.rs".to_string()],
+            &[("task-nul-legacy", "valid prefix\0secret-nul-tail")],
+        );
+        let authority_before = fs::read(fixture_nul.authority.approvals_path())
+            .expect("snapshot legacy NUL authority bytes");
+        let startup_error = match ApprovedHost::start(ApprovedHostConfig::new(
+            &fixture_nul.registry_dir,
+            &fixture_nul.plans_dir,
+            &fixture_nul.authority_dir,
+            &fixture_nul.sessions_dir,
+            &nul_record.approval_id,
+        ))
+        .await
+        {
+            Err(err) => err,
+            Ok(unexpected) => {
+                unexpected
+                    .shutdown()
+                    .await
+                    .expect("clean unexpected NUL host");
+                panic!("NUL WorkerSpec must be refused before a Ready host is returned");
+            }
+        };
+        assert_eq!(startup_error.code(), "authority_error");
+        match &startup_error {
+            HostError::Authority { code, .. } => assert_eq!(code, "workers_config_invalid"),
+            other => panic!("expected worker-configuration authority refusal, got {other:?}"),
+        }
+        let diagnostic = startup_error.to_string();
+        assert!(diagnostic.contains("NUL"));
+        assert!(!diagnostic.contains("secret-nul-tail"));
+        assert!(!fixture_nul.agy_count_file.exists());
+        assert_eq!(
+            fs::read(fixture_nul.authority.approvals_path()).expect("re-read NUL authority"),
+            authority_before,
+            "startup refusal must not rewrite the immutable historical approval"
+        );
+        let still_readable = fixture_nul
+            .authority
+            .get_for_operator(&nul_record.approval_id)
+            .expect("historical NUL authority remains readable");
+        assert_eq!(still_readable.subject_digest, nul_record.subject_digest);
+        let nul_session_dir = fixture_nul.sessions_dir.join(&nul_record.approval_id);
+        if nul_session_dir.exists() {
+            assert!(!is_host_lock_held(&nul_session_dir).expect("NUL startup owner released"));
+        }
     }
 }

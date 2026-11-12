@@ -37,10 +37,12 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use threadlane_authority::{
-    build_approved_worker_profile_config, ApprovalRecord, ApprovedTaskRecord, AuthorityStore,
+    build_approved_worker_profile_config, validate_approved_executable_task_instructions,
+    ApprovalRecord, ApprovedTaskRecord, AuthorityStore,
 };
 use threadlane_host::{
-    ApprovedHostClient, HostError, TaskExecutionStatus, TaskStateSnapshot, WORK_AREA_SUBDIR,
+    read_host_manifest_optional, read_session_task_ledger_readonly, ApprovedHostClient, HostError,
+    TaskExecutionStatus, TaskStateSnapshot, WORK_AREA_SUBDIR,
 };
 use threadlane_operations::inspect_dependency_input_seal_readonly;
 use threadlane_workers::{
@@ -691,6 +693,92 @@ impl CoworkerControllerService {
         })
     }
 
+    /// Returns `true` when `admission` still has at least one unstarted, unfenced executable
+    /// headless worker task for which new host dispatch effects may follow.
+    ///
+    /// Read-only inspection, `stop_requested` fencing, non-executing job phases, and receipt-only
+    /// recovery (where every executable task already has a host receipt or intent, post-initial
+    /// state, terminal stage, or hold/sibling fence) return `Ok(false)`.
+    pub(crate) fn job_may_dispatch_new_executable_tasks(
+        &self,
+        admission: &VerifiedControllerAdmission,
+    ) -> Result<bool, NativeError> {
+        if admission.runtime_state.stop_requested
+            || admission.job.phase != CoworkerJobPhase::Executing
+        {
+            return Ok(false);
+        }
+
+        let session_dir = self.sessions_dir.join(&admission.approval.approval_id);
+        let (intents, receipts) = match std::fs::symlink_metadata(&session_dir) {
+            Ok(_) => {
+                if let Some(manifest) =
+                    read_host_manifest_optional(&session_dir, &admission.approval)
+                        .map_err(map_host_error)?
+                {
+                    if let Some(ref session_binding_id) = manifest.session_binding_id {
+                        read_session_task_ledger_readonly(
+                            &session_dir,
+                            &admission.approval,
+                            session_binding_id,
+                        )
+                        .map_err(map_host_error)?
+                        .unwrap_or_default()
+                    } else {
+                        (Vec::new(), Vec::new())
+                    }
+                } else {
+                    (Vec::new(), Vec::new())
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => (Vec::new(), Vec::new()),
+            Err(err) => {
+                return Err(NativeError::new(
+                    NativeErrorCode::IoError,
+                    sanitize_diagnostic_text(&format!(
+                        "failed to inspect host session directory: {err}"
+                    )),
+                ));
+            }
+        };
+
+        for task in &admission.job.tasks {
+            let Some(approved_task) = admission
+                .approval
+                .tasks
+                .iter()
+                .find(|t| t.task_id == task.task_id)
+            else {
+                continue;
+            };
+            if approved_task.provider.is_none() && !approved_task.is_frozen_headless_worker() {
+                continue;
+            }
+            if receipts.iter().any(|r| r.task_id == task.task_id)
+                || intents.iter().any(|i| i.task_id == task.task_id)
+                || task_has_derived_attempt_or_post_initial_state(task, &admission.runtime_state)
+                || matches!(
+                    task.stage,
+                    CoworkerTaskStage::ReadyForReview
+                        | CoworkerTaskStage::Failed
+                        | CoworkerTaskStage::Cancelled
+                )
+                || is_task_fenced_by_hold_or_sibling(
+                    task,
+                    &admission.job,
+                    &admission.runtime_state,
+                    &admission.approval.approval_id,
+                    self.workflow_store.plans_dir(),
+                )?
+            {
+                continue;
+            }
+            return Ok(true);
+        }
+
+        Ok(false)
+    }
+
     #[inline(never)]
     fn load_and_verify_admitted_job_from_ledger(
         &self,
@@ -1084,6 +1172,13 @@ impl CoworkerControllerService {
                 continue;
             }
 
+            validate_approved_executable_task_instructions(&approval.tasks).map_err(|err| {
+                NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    sanitize_diagnostic_text(&err.to_string()),
+                )
+            })?;
+
             self.dispatch_and_reconcile_initial_coder_task(
                 guard,
                 request,
@@ -1148,6 +1243,16 @@ impl CoworkerControllerService {
             &request.thread_uuid,
             &request.job_id,
         )?;
+
+        if let Err(err) = validate_approved_executable_task_instructions(&admission.approval.tasks)
+        {
+            if self.job_may_dispatch_new_executable_tasks(&admission)? {
+                return Err(NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    sanitize_diagnostic_text(&err.to_string()),
+                ));
+            }
+        }
 
         let lease_ttl_ms = request
             .lease_ttl_ms

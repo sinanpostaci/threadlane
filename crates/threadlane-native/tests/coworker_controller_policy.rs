@@ -2953,3 +2953,593 @@ fn namespaced_coder_job_freezes_controller_envelope_and_reopens_preserving_exact
         Some("max")
     );
 }
+
+#[test]
+fn coworker_admission_preview_and_record_enforce_worker_instruction_limit_across_all_tasks_without_writes_or_locks(
+) {
+    use std::os::unix::fs::PermissionsExt;
+    use threadlane_native::coworker_workflow::{
+        CreatePlanningGrantRequest, FinalizePlanningCallRequest, PlanningCallBudget,
+        PlanningReadOnlyCapabilities, PlanningReservationStatus, PlanningResultRef,
+        RecordJobPlanningResultRequest, ReservePlanningCallRequest,
+    };
+    use threadlane_native::{
+        AdmissionConfirmation, AdmissionInspectionState, AdmissionRequest, AdmissionStage,
+        CoworkerAdmissionService,
+    };
+    use threadlane_workflow::PlanStatus;
+
+    fn dir_snapshot(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+        let mut out = BTreeMap::new();
+        for entry in fs::read_dir(root).expect("read_dir") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                out.extend(dir_snapshot(&path));
+            } else {
+                out.insert(path.clone(), fs::read(&path).expect("read file"));
+            }
+        }
+        out
+    }
+
+    fn prepare_admission_case(
+        brief_id: &str,
+        plan_id: &str,
+        tasks: Vec<PlanTask>,
+        use_legacy_seed: bool,
+    ) -> (
+        ControllerPolicyFixture,
+        CoworkerAdmissionService,
+        AdmissionRequest,
+    ) {
+        let mut fixture = setup_fixture();
+        fs::write(
+            fixture.repo_dir.join("src/b.rs"),
+            "pub fn beta() -> u32 { 2 }\n",
+        )
+        .expect("write src/b.rs");
+        for args in [
+            &["add", "."][..],
+            &["commit", "-m", "add src/b.rs", "--quiet"][..],
+        ] {
+            run_sanitized_git(&fixture.repo_dir, args, DEFAULT_GIT_COMMAND_TIMEOUT_MS)
+                .expect("commit src/b.rs");
+        }
+        fixture.base_commit =
+            resolve_exact_commit_sha(&fixture.repo_dir, "HEAD", DEFAULT_GIT_COMMAND_TIMEOUT_MS)
+                .expect("resolve updated HEAD");
+
+        let pb = project_base(&fixture);
+        let reg_snap = fixture.registry.snapshot().expect("registry snapshot");
+        let planning_policy = ExecutionPolicy {
+            schema_version: 1,
+            policy_id: "policy-planning-only".to_string(),
+            allow_rules: vec![PolicyAllowRule {
+                tool_id: "tool-agy".to_string(),
+                model_id: "model-argon".to_string(),
+                efforts: vec!["high".to_string()],
+                allow_no_effort: false,
+                roles: vec![WorkflowRole::Orchestrator, WorkflowRole::Architect],
+            }],
+        };
+        let brief = WorkBrief {
+            brief_id: brief_id.to_string(),
+            binding_id: BINDING_A.to_string(),
+            thread_uuid: THREAD_UUID_A.to_string(),
+            project_base: pb.clone(),
+            kind: WorkBriefKind::NewJob,
+            summary: format!("Admission preflight test {brief_id}"),
+            confirmed_requirements: vec!["Enforce 4096-byte worker instruction limit".to_string()],
+            proposed_additions: Vec::new(),
+            assumptions: vec!["Trusted-local Linux workspace".to_string()],
+            open_questions: Vec::new(),
+            accepted_architect_decisions: Vec::new(),
+        };
+        let job = fixture
+            .workflow_store
+            .create_or_amend_job(&CreateCoworkerJobRequest {
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                request_key: format!("req_job_{brief_id}"),
+                expected_ledger_revision: None,
+                work_brief: brief,
+                amended_target_task_ids: Vec::new(),
+                amended_write_paths: Vec::new(),
+                amended_interfaces: Vec::new(),
+            })
+            .expect("create job");
+        let grant = fixture
+            .workflow_store
+            .create_planning_grant(&CreatePlanningGrantRequest {
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                request_key: format!("req_grant_{brief_id}"),
+                expected_ledger_revision: None,
+                project_base: pb.clone(),
+                profile_id: "profile-coworker".to_string(),
+                registry_revision: reg_snap.revision,
+                policy: planning_policy,
+                capabilities: PlanningReadOnlyCapabilities::strict_read_only(),
+                budget: PlanningCallBudget {
+                    max_total_calls: 4,
+                    max_orchestrator_calls: 2,
+                    max_architect_calls: 2,
+                    max_timeout_ms_per_call: 30_000,
+                    max_output_bytes_per_call: 65_536,
+                },
+                created_at_ms: 1_000,
+                expires_at_ms: 60_000,
+                operator_attested: true,
+            })
+            .expect("create planning grant");
+        let orch_choice = SelectedRoleChoice {
+            tool_id: "tool-agy".to_string(),
+            adapter: ToolAdapter::Antigravity,
+            route: RoleExecutionRoute::HeadlessWorker,
+            model_id: "model-argon".to_string(),
+            model_arg: "gemini-4-argon-high".to_string(),
+            effort: Some("high".to_string()),
+            matched_difficulty: Some(Difficulty::Hard),
+        };
+        let reserved_call = fixture
+            .workflow_store
+            .reserve_planning_call(&ReservePlanningCallRequest {
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                grant_id: grant.grant_id.clone(),
+                request_key: format!("req_orch_{brief_id}"),
+                expected_ledger_revision: None,
+                role: WorkflowRole::Orchestrator,
+                difficulty: Some(Difficulty::Hard),
+                selected_choice: orch_choice.clone(),
+                context_digest: sha256_hex(brief_id.as_bytes()),
+                call_project_base: Some(pb.clone()),
+                current_time_ms: 2_000,
+            })
+            .expect("reserve orchestrator call");
+        assert_eq!(
+            reserved_call.status,
+            PlanningReservationStatus::ReservedBeforeEffect
+        );
+        let reservation_id = reserved_call.reservation_id;
+        let output_digest = sha256_hex(format!("orch_out_{brief_id}").as_bytes());
+        let completed_call = fixture
+            .workflow_store
+            .finalize_planning_call(&FinalizePlanningCallRequest {
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                grant_id: grant.grant_id.clone(),
+                reservation_id: reservation_id.clone(),
+                expected_ledger_revision: None,
+                status: PlanningReservationStatus::Completed,
+                updated_at_ms: 2_500,
+                run_id: Some(format!("run_orch_{brief_id}")),
+                report_artifact_id: Some(format!("art_orch_{brief_id}")),
+                output_digest: Some(output_digest.clone()),
+                diagnostic: None,
+            })
+            .expect("finalize orchestrator call");
+        assert_eq!(completed_call.status, PlanningReservationStatus::Completed);
+        assert_eq!(
+            completed_call.output_digest.as_deref(),
+            Some(output_digest.as_str())
+        );
+
+        let draft = fixture
+            .plans
+            .change_at(
+                0,
+                PlanChange::SaveDraft {
+                    plan_id: plan_id.to_string(),
+                    binding_id: BINDING_A.to_string(),
+                    profile_id: "profile-coworker".to_string(),
+                    profile_revision: reg_snap.revision,
+                    summary: format!("Admission plan {plan_id}"),
+                    tasks: tasks.clone(),
+                },
+                1_700_000_000_000,
+            )
+            .expect("save draft");
+        let published = fixture
+            .plans
+            .change(
+                draft.revision,
+                PlanChange::Publish {
+                    plan_id: plan_id.to_string(),
+                    revision: draft.revision,
+                },
+            )
+            .expect("publish plan");
+        let compiled = compile_plan_revision(&published, &reg_snap).expect("compile plan");
+
+        let planning_result = PlanningResultRef {
+            grant_id: grant.grant_id.clone(),
+            reservation_id,
+            request_key: format!("req_orch_{brief_id}"),
+            run_id: format!("run_orch_{brief_id}"),
+            report_artifact_id: format!("art_orch_{brief_id}"),
+            output_digest,
+            work_brief_digest: job.work_brief_digest.clone(),
+            project_base: pb,
+            profile_id: "profile-coworker".to_string(),
+            registry_revision: reg_snap.revision,
+            policy_digest: grant.policy_digest,
+            selected_choice: orch_choice,
+            plan_id: plan_id.to_string(),
+            plan_revision: published.revision,
+            plan_digest: compiled.plan_digest.clone(),
+            plan_status: PlanStatus::Published,
+            task_interfaces: BTreeMap::new(),
+            architect_advice_ids: Vec::new(),
+            resolved_open_questions: Vec::new(),
+            deferred_proposals: Vec::new(),
+            recorded_at_ms: 3_000,
+        };
+        let planned_job = fixture
+            .workflow_store
+            .record_job_planning_result(&RecordJobPlanningResultRequest {
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                job_id: job.job_id,
+                expected_job_revision: Some(job.job_revision),
+                expected_ledger_revision: None,
+                planning_result: planning_result.clone(),
+            })
+            .expect("record planning result");
+
+        let approved_task_ids: Vec<String> = tasks.iter().map(|t| t.id.clone()).collect();
+        let approved_write_paths = vec!["src/lib.rs".to_string(), "src/b.rs".to_string()];
+        let approval_id = if !use_legacy_seed {
+            fixture
+                .authority
+                .approve_at(
+                    OperatorApprovalRequest {
+                        binding_id: BINDING_A.to_string(),
+                        thread_uuid: THREAD_UUID_A.to_string(),
+                        plan_id: plan_id.to_string(),
+                        plan_revision: published.revision,
+                        expected_registry_revision: reg_snap.revision,
+                        expected_plan_digest: compiled.plan_digest,
+                        repository_path: fixture.repo_dir.clone(),
+                        base_commit: fixture.base_commit.clone(),
+                        approved_task_ids,
+                        approved_write_paths,
+                        max_parallel: 2,
+                        budgets: ExecutionBudgets::default(),
+                    },
+                    1_700_000_001_000,
+                )
+                .expect("approve valid 4096B plan")
+                .approval_id
+        } else {
+            let canonical_repo = fs::canonicalize(&fixture.repo_dir).expect("canonical repo");
+            let canonical_agy = fs::canonicalize(
+                reg_snap
+                    .tools
+                    .iter()
+                    .find(|t| t.id == "tool-agy")
+                    .unwrap()
+                    .executable_path
+                    .as_ref()
+                    .unwrap(),
+            )
+            .expect("canonical agy");
+            let canonical_oc = fs::canonicalize(
+                reg_snap
+                    .tools
+                    .iter()
+                    .find(|t| t.id == "tool-oc")
+                    .unwrap()
+                    .executable_path
+                    .as_ref()
+                    .unwrap(),
+            )
+            .expect("canonical oc");
+            let mut record = threadlane_authority::ApprovalRecord {
+                approval_id: String::new(),
+                subject_digest: String::new(),
+                policy_version: threadlane_authority::AUTHORITY_POLICY_VERSION,
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                plan_id: plan_id.to_string(),
+                plan_revision: published.revision,
+                profile_id: "profile-coworker".to_string(),
+                registry_revision: reg_snap.revision,
+                plan_digest: compiled.plan_digest,
+                repository_path: canonical_repo,
+                base_commit: fixture.base_commit.clone(),
+                approved_task_ids,
+                approved_write_paths,
+                max_parallel: 2,
+                budgets: ExecutionBudgets::default(),
+                tasks: compiled
+                    .tasks
+                    .iter()
+                    .map(|ct| {
+                        let is_oc = ct.adapter == ToolAdapter::OpencodeV2;
+                        threadlane_authority::ApprovedTaskRecord {
+                            task_id: ct.id.clone(),
+                            title: ct.title.clone(),
+                            instruction: ct.instruction.clone(),
+                            instruction_digest: ct.instruction_digest.clone(),
+                            role: ct.role,
+                            difficulty: ct.difficulty,
+                            tool_id: ct.tool_id.clone(),
+                            adapter: ct.adapter,
+                            provider: Some(if is_oc {
+                                threadlane_workers::WorkerProvider::OpenCodeV2
+                            } else {
+                                threadlane_workers::WorkerProvider::Antigravity
+                            }),
+                            canonical_executable: Some(if is_oc {
+                                canonical_oc.clone()
+                            } else {
+                                canonical_agy.clone()
+                            }),
+                            model_id: ct.choice.model_id.clone(),
+                            model_arg: ct.model_arg.clone(),
+                            base_model: ct.model_arg.clone(),
+                            effort: ct.choice.effort.clone(),
+                            cli_model_arg: Some(if is_oc {
+                                format!(
+                                    "{}#{}",
+                                    ct.model_arg,
+                                    ct.choice.effort.as_deref().unwrap_or("max")
+                                )
+                            } else {
+                                ct.model_arg.clone()
+                            }),
+                            standalone: Some(is_oc),
+                            file_permissions: Some(
+                                threadlane_workers::WorkerFilePermissions::TaskFiles,
+                            ),
+                            depends_on: ct.depends_on.clone(),
+                            allowed_write_paths: ct.allowed_write_paths.clone(),
+                            task_digest: ct.task_digest.clone(),
+                            profile_id: None,
+                            command_key: None,
+                        }
+                    })
+                    .collect(),
+                created_at_ms: 1_700_000_001_000,
+            };
+            let core_digest = threadlane_authority::compute_authority_core_digest(&record).unwrap();
+            for task in &mut record.tasks {
+                task.profile_id = Some(threadlane_authority::derive_profile_id(
+                    &core_digest,
+                    &task.task_id,
+                    &task.task_digest,
+                ));
+                task.command_key = Some(threadlane_authority::derive_command_key(
+                    &core_digest,
+                    &task.task_id,
+                    &task.task_digest,
+                ));
+            }
+            record.subject_digest =
+                threadlane_authority::compute_record_subject_digest(&record).unwrap();
+            record.approval_id = threadlane_authority::derive_approval_id(&record.subject_digest);
+            threadlane_authority::verify_approval_record_integrity(
+                &record,
+                fixture.authority.approvals_path(),
+            )
+            .expect("legacy approval integrity");
+            let json = serde_json::json!({
+                "schema_version": threadlane_authority::AUTHORITY_SCHEMA_VERSION,
+                "approvals": [&record],
+            });
+            fs::write(
+                fixture.authority.approvals_path(),
+                serde_json::to_vec(&json).unwrap(),
+            )
+            .unwrap();
+            fs::set_permissions(
+                fixture.authority.approvals_path(),
+                fs::Permissions::from_mode(0o600),
+            )
+            .unwrap();
+            record.approval_id
+        };
+
+        let ledger_rev = fixture
+            .workflow_store
+            .read_binding_ledger(BINDING_A)
+            .expect("read ledger")
+            .ledger_revision;
+        let closure_argon_choice = SelectedRoleChoice {
+            matched_difficulty: Some(Difficulty::Extreme),
+            ..headless_argon_choice()
+        };
+        let cap_env = FrozenControllerCapabilityEnvelope {
+            allowed_reviewer_choices: vec![headless_argon_choice(), headless_deepseek_choice()],
+            allowed_closure_choices: vec![closure_argon_choice.clone(), headless_deepseek_choice()],
+            max_in_scope_correction_attempts: 2,
+            allowed_check_ids: vec!["cargo_fmt".to_string(), "cargo_test".to_string()],
+            local_git_integration_allowed: true,
+            allow_check_failure_corrections: false,
+        };
+        let policy = execution_policy();
+        let req = AdmissionRequest {
+            request_key: format!("adm_req_{brief_id}"),
+            binding: BindJobApprovalRequest {
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                job_id: planned_job.job_id.clone(),
+                expected_job_revision: planned_job.job_revision,
+                expected_ledger_revision: Some(ledger_rev),
+                approval_id,
+                policy: policy.clone(),
+                controller_envelope: Some(cap_env),
+                task_interfaces: BTreeMap::new(),
+            },
+            planning_result,
+            work_brief_digest: planned_job.work_brief_digest,
+            execution: FreezeControllerExecutionEnvelopeRequest {
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                job_id: planned_job.job_id,
+                expected_job_revision: planned_job.job_revision,
+                policy,
+                reviewer_choice: headless_argon_choice(),
+                closure_choice: closure_argon_choice,
+                role_budgets: default_role_budgets(),
+                max_in_scope_corrections_per_task: 1,
+                max_total_corrections_per_job: 2,
+                max_total_task_attempts_per_job: 4,
+                check_commands: default_check_commands(&fixture),
+                allow_task_worktree_commits: true,
+                allow_run_integration_execution: true,
+                default_integration_strategy: IntegrationStrategy::MergeNoFf,
+                independence_completeness_receipt: None,
+                shadow_jev_policy: None,
+                created_at_ms: 1_700_000_005_000,
+                operator_attested: false,
+                confirm_approval_subject_digest: None,
+                confirm_envelope_digest: None,
+            },
+            reviewer_difficulty: Some(Difficulty::Hard),
+            closure_difficulty: Some(Difficulty::Extreme),
+        };
+        let service = CoworkerAdmissionService::new(
+            fixture.workflow_store.plans_dir(),
+            fixture.authority.dir(),
+            fixture.registry.config_dir(),
+        )
+        .expect("open CoworkerAdmissionService");
+        (fixture, service, req)
+    }
+
+    // 1. Exact 4096-byte ASCII & multibyte UTF-8 tasks succeed in preview and record.
+    let utf8_4096 = "é".repeat(threadlane_core::MAX_INSTRUCTION_LEN / 2);
+    assert_eq!(utf8_4096.chars().count(), 2_048);
+    assert_eq!(utf8_4096.len(), threadlane_core::MAX_INSTRUCTION_LEN);
+    let (_ok_fixture, ok_service, ok_req) = prepare_admission_case(
+        "brf_adm_4096_ok",
+        "plan-adm-4096-ok",
+        vec![
+            PlanTask {
+                id: "task-root-4096-ascii".to_string(),
+                title: "Root 4096 ASCII".to_string(),
+                instruction: "a".repeat(threadlane_core::MAX_INSTRUCTION_LEN),
+                role: WorkflowRole::Coder,
+                difficulty: Difficulty::Hard,
+                depends_on: Vec::new(),
+                allowed_write_paths: vec!["src/lib.rs".to_string()],
+            },
+            PlanTask {
+                id: "task-later-4096-utf8".to_string(),
+                title: "Later 4096 UTF-8".to_string(),
+                instruction: utf8_4096,
+                role: WorkflowRole::Coder,
+                difficulty: Difficulty::Easy,
+                depends_on: vec!["task-root-4096-ascii".to_string()],
+                allowed_write_paths: vec!["src/b.rs".to_string()],
+            },
+        ],
+        false,
+    );
+    let ok_preview = ok_service
+        .preview(&ok_req)
+        .expect("preview 4096B multi-task admission");
+    let ok_receipt = ok_service
+        .record(
+            &ok_req,
+            &AdmissionConfirmation {
+                trusted_local_attested: true,
+                preview_digest: ok_preview.preview_digest.clone(),
+                approval_subject_digest: ok_preview.approval_subject_digest.clone(),
+                envelope_digest: ok_preview.envelope.envelope_digest.clone(),
+            },
+        )
+        .expect("record 4096B multi-task admission");
+    assert_eq!(ok_receipt.stage, AdmissionStage::Complete);
+    assert_eq!(
+        ok_service
+            .inspect(BINDING_A, &ok_req.binding.job_id)
+            .expect("inspect complete admission")
+            .state,
+        AdmissionInspectionState::Complete
+    );
+
+    // 2. Oversized LATER task (4097 ASCII bytes and 4098 UTF-8 bytes across 1366 chars) fails
+    //    pure preview and record with zero writes, locks, intents, or runtime records.
+    for (case_tag, later_instruction) in [
+        (
+            "ascii4097",
+            "B".repeat(threadlane_core::MAX_INSTRUCTION_LEN + 1),
+        ),
+        ("utf8_4098", "€".repeat(1_366)),
+    ] {
+        let (bad_fixture, bad_service, bad_req) = prepare_admission_case(
+            &format!("brf_adm_{case_tag}"),
+            &format!("plan-adm-{case_tag}"),
+            vec![
+                PlanTask {
+                    id: "task-valid-first".to_string(),
+                    title: "Valid 3965B first root".to_string(),
+                    instruction: "v".repeat(3_965),
+                    role: WorkflowRole::Coder,
+                    difficulty: Difficulty::Hard,
+                    depends_on: Vec::new(),
+                    allowed_write_paths: vec!["src/lib.rs".to_string()],
+                },
+                PlanTask {
+                    id: "task-later-oversized".to_string(),
+                    title: "Oversized later task".to_string(),
+                    instruction: later_instruction,
+                    role: WorkflowRole::Coder,
+                    difficulty: Difficulty::Easy,
+                    depends_on: vec!["task-valid-first".to_string()],
+                    allowed_write_paths: vec!["src/b.rs".to_string()],
+                },
+            ],
+            true,
+        );
+
+        let before_plans = dir_snapshot(bad_fixture.workflow_store.plans_dir());
+        let before_auth = dir_snapshot(bad_fixture.authority.dir());
+        let before_reg = dir_snapshot(bad_fixture.registry.config_dir());
+
+        let preview_err = bad_service
+            .preview(&bad_req)
+            .expect_err("preview must reject oversized later task");
+        assert_eq!(
+            preview_err.code(),
+            NativeErrorCode::ValidationFailed.as_str()
+        );
+        assert!(preview_err.message().contains("task-later-oversized"));
+        assert!(preview_err.message().contains("4096 bytes"));
+
+        let record_err = bad_service
+            .record(
+                &bad_req,
+                &AdmissionConfirmation {
+                    trusted_local_attested: true,
+                    preview_digest: "0".repeat(64),
+                    approval_subject_digest: "0".repeat(64),
+                    envelope_digest: "0".repeat(64),
+                },
+            )
+            .expect_err("record must reject oversized later task before lock/intent");
+        assert_eq!(
+            record_err.code(),
+            NativeErrorCode::ValidationFailed.as_str()
+        );
+        assert!(record_err.message().contains("task-later-oversized"));
+
+        assert_eq!(
+            dir_snapshot(bad_fixture.workflow_store.plans_dir()),
+            before_plans,
+            "pure preview/record refusal must not create lockfiles, admission intents, or ledger mutations"
+        );
+        assert_eq!(dir_snapshot(bad_fixture.authority.dir()), before_auth);
+        assert_eq!(dir_snapshot(bad_fixture.registry.config_dir()), before_reg);
+        let inspection = bad_service
+            .inspect(BINDING_A, &bad_req.binding.job_id)
+            .expect("inspect unadmitted job");
+        assert_eq!(inspection.state, AdmissionInspectionState::Absent);
+        assert!(!inspection.intent_present);
+        assert!(!inspection.linkage_present);
+        assert!(!inspection.runtime_present);
+    }
+}

@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
-use threadlane_authority::AuthorityStore;
+use threadlane_authority::{validate_approved_executable_task_instructions, AuthorityStore};
 use threadlane_workers::ExecutionBudgets;
 use threadlane_workflow::{
     compile_plan_revision, Difficulty, PlanStore, RegistryStore, WorkflowRole,
@@ -618,6 +618,8 @@ impl CoworkerAdmissionService {
                 ));
             }
         }
+        validate_approved_executable_task_instructions(&approval.tasks)
+            .map_err(|err| invalid(&err.to_string()))?;
         let mut pins = BTreeMap::new();
         for task in &proposed_job.tasks {
             let approved = approval

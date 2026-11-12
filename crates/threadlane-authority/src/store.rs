@@ -32,8 +32,9 @@ use crate::validation::{
     compute_authority_core_digest, compute_record_subject_digest, derive_approval_id,
     derive_command_key, derive_profile_id, is_task_scope_contained_in_operator_allowlist,
     resolve_and_validate_worker_executable, sha256_hex, validate_canonical_thread_uuid,
-    validate_identifier, validate_repository_and_base_commit, validate_revision,
-    validate_sha256_hex, validate_work_area_for_materialization, validate_worker_task_static,
+    validate_executable_worker_instruction, validate_identifier,
+    validate_repository_and_base_commit, validate_revision, validate_sha256_hex,
+    validate_work_area_for_materialization, validate_worker_task_static,
     validate_write_scope_entry_at_base_commit, verify_approval_record_integrity,
 };
 
@@ -986,6 +987,18 @@ impl AuthorityStore {
                             ),
                         ));
                     }
+
+                    validate_executable_worker_instruction(&compiled_task.instruction).map_err(
+                        |err| match err {
+                            AuthorityError::Validation { field, reason } => {
+                                AuthorityError::Validation {
+                                    field,
+                                    reason: format!("task `{}` {reason}", compiled_task.id),
+                                }
+                            }
+                            other => other,
+                        },
+                    )?;
 
                     let (resolved_provider, canonical_exe) =
                         resolve_and_validate_worker_executable(

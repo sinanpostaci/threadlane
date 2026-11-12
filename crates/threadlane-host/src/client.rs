@@ -10,7 +10,9 @@ use threadlane::{
     HostControlStatusResponse, RearmHostWakeupRequest, ScopedClient, StopIdleHostRequest,
     SupervisorClient, ValidatedWorkersConfig, WorkerAcceptanceState, WorkerSnapshot, WorkerStatus,
 };
-use threadlane_authority::{ApprovalRecord, ApprovedTaskRecord, AuthorityStore};
+use threadlane_authority::{
+    validate_executable_worker_instruction, ApprovalRecord, ApprovedTaskRecord, AuthorityStore,
+};
 use threadlane_core::{
     observation::ReadonlySqliteError, AckResult, Binding, Core, CoreError, EventBatch,
     WorkerExecutionBinding, DEFAULT_PAGE_LIMIT,
@@ -1120,6 +1122,22 @@ impl ApprovedHostClient {
         // instead of asking the runtime to admit it again against mutable predecessor state.
         if existing_receipt.is_some() {
             return self.get_task(approval_id, task_id).await;
+        }
+
+        // Reject oversized, NUL-containing, or empty executable worker instructions as a typed
+        // pre-effect validation refusal ONLY when no prior dispatch intent exists. If a prior
+        // dispatch intent already exists without a sealed receipt, its outcome remains uncertain
+        // (`Unknown`) and must never be reclassified as a fresh pre-effect refusal.
+        if let Err(err) = validate_executable_worker_instruction(&dispatch.instruction) {
+            if existing_intent.is_some() {
+                return Err(HostError::MutationOutcomeUncertain {
+                    operation: "dispatch_task".to_string(),
+                    detail: format!(
+                        "pre-existing dispatch intent without sealed receipt for task `{task_id}` remains outcome-uncertain; refusing redispatch on invalid executable instruction"
+                    ),
+                });
+            }
+            return Err(err.into());
         }
 
         // 2. Determine the dispatch intent to commit/replay:

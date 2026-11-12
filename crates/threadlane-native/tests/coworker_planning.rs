@@ -22,7 +22,8 @@ use threadlane_native::coworker_workflow::{
     CoworkerWorkflowStore, CreateCoworkerJobRequest, CreatePlanningGrantRequest,
     OrchestrateWorkBriefPlanRequest, OrchestratorPlanningDecision, PlanningAdviceGrant,
     PlanningArtifactOutcomeKind, PlanningCallBudget, PlanningReadOnlyCapabilities,
-    PlanningReservationStatus, WorkBrief, WorkBriefKind, WorkflowHoldReason,
+    PlanningReservationStatus, StructuredOrchestratorOutput, WorkBrief, WorkBriefKind,
+    WorkflowHoldReason,
 };
 use threadlane_native::profile_flow::EXECUTION_POLICY_SCHEMA_VERSION;
 use threadlane_native::{
@@ -4709,5 +4710,417 @@ async fn orchestrator_initial_prompt_carries_worker_file_permission_guidance_and
         resolve_exact_commit_sha(&fx.repo_dir, "HEAD", DEFAULT_GIT_COMMAND_TIMEOUT_MS)
             .expect("resolve final HEAD"),
         fx.project_base.base_commit
+    );
+}
+
+#[tokio::test]
+async fn orchestrator_prompt_and_publication_enforce_4096_utf8_byte_coder_instructions_while_preserving_historical_artifacts_and_linked_idempotence(
+) {
+    use threadlane_native::coworker_workflow::contracts::{
+        deterministic_prefixed_id, PlanningResultRef,
+    };
+    use threadlane_native::coworker_workflow::store::RecordJobPlanningResultRequest;
+    use threadlane_workflow::{PlanStatus, PlanTask, SavePlanDraft};
+
+    // 1. Fresh prompt/schema advertises 4,096 UTF-8 bytes + decomposition, and exact 4,096 ASCII &
+    //    4,096 multibyte UTF-8 (`2,048 * 2`) Coder descriptions publish and link verbatim.
+    let fx_ok = OrchestratorTestFixture::new();
+    let grant_ok = fx_ok.create_grant_with_budget(
+        "grant_orch_instr_4096_ok",
+        PlanningCallBudget {
+            max_total_calls: 4,
+            max_orchestrator_calls: 4,
+            max_architect_calls: 0,
+            max_timeout_ms_per_call: 30_000,
+            max_output_bytes_per_call: 65_536,
+        },
+        1_800_000_000_000,
+    );
+    let job_ok = fx_ok.create_initial_job(
+        "job_orch_instr_4096_ok",
+        vec!["Implement parser and metrics within bounded Coder task instructions.".to_string()],
+        Vec::new(),
+        Vec::new(),
+    );
+
+    let ascii_4096 = "a".repeat(threadlane_core::MAX_INSTRUCTION_LEN);
+    let utf8_4096 = "é".repeat(threadlane_core::MAX_INSTRUCTION_LEN / 2);
+    assert_eq!(ascii_4096.len(), 4_096);
+    assert_eq!(utf8_4096.len(), 4_096);
+    assert_eq!(utf8_4096.chars().count(), 2_048);
+
+    let ok_json = serde_json::to_string(&serde_json::json!({
+        "outcome": "plan",
+        "schema_version": 1,
+        "summary": "Two bounded 4096-byte Coder tasks.",
+        "tasks": [
+            {
+                "task_id": "task_ascii_4096",
+                "title": "ASCII 4096 boundary",
+                "description": ascii_4096,
+                "role": "coder",
+                "difficulty": "easy",
+                "depends_on": [],
+                "allowed_write_paths": ["src/parser.rs"]
+            },
+            {
+                "task_id": "task_utf8_4096",
+                "title": "UTF-8 4096 boundary",
+                "description": utf8_4096,
+                "role": "coder",
+                "difficulty": "medium",
+                "depends_on": ["task_ascii_4096"],
+                "allowed_write_paths": ["src/metrics.rs"]
+            }
+        ]
+    }))
+    .expect("serialize ok_json");
+    fx_ok.write_custom_call_response(1, &ok_json, false);
+    let mut req_ok =
+        OrchestratorTestFixture::plan_req(&grant_ok.grant_id, &job_ok.job_id, "orch_ok_4096", 0);
+    req_ok.plan_id = Some("plan-orch-4096-ok".to_string());
+    let outcome_ok = fx_ok
+        .service
+        .orchestrate_brief_to_plan(&fx_ok.workflow, &req_ok)
+        .await
+        .expect("exact 4096 ASCII and UTF-8 descriptions must publish");
+    let pub_ok = outcome_ok
+        .require_published_plan()
+        .expect("published 4096 plan");
+
+    let captured_prompt = fx_ok.read_captured_prompt(1);
+    let (_, json_context) = captured_prompt
+        .split_once("Context:\n")
+        .expect("captured Orchestrator prompt must embed Context JSON");
+    let parsed_context: serde_json::Value =
+        serde_json::from_str(json_context.trim()).expect("valid Context JSON");
+    let rules_text = serde_json::to_string(&parsed_context["rules"]).expect("serialize rules");
+    assert!(rules_text.contains("4096 UTF-8 bytes"));
+    assert!(rules_text.contains("no NUL bytes"));
+    assert!(rules_text.contains("decompose"));
+    assert!(rules_text.contains("confirmed_requirements"));
+    let schema_desc = parsed_context["required_response_schema"]["one_of_outcomes"][0]["tasks"][0]
+        ["description"]
+        .as_str()
+        .expect("schema description string");
+    assert!(schema_desc.contains("1..=4096 UTF-8 bytes"));
+    assert!(!schema_desc.contains("65536"));
+
+    let stored_rev = fx_ok
+        .plans
+        .get_revision(
+            &pub_ok.planning_result.plan_id,
+            pub_ok.planning_result.plan_revision,
+        )
+        .expect("read published 4096 revision")
+        .expect("published 4096 revision exists");
+    assert_eq!(stored_rev.tasks[0].instruction, ascii_4096);
+    assert_eq!(stored_rev.tasks[1].instruction, utf8_4096);
+
+    // 2. Fresh LATER task overflow (`4,097` ASCII bytes and `4,098` multibyte UTF-8 bytes from
+    //    `1,366` 3-byte `'€'` chars) fails BEFORE any PlanStore draft/publish or job linkage, while
+    //    retaining the raw PlanningCallArtifact and completed grant reservation receipt.
+    let fx_rej = OrchestratorTestFixture::new();
+    let grant_rej = fx_rej.create_grant_with_budget(
+        "grant_orch_instr_rej",
+        PlanningCallBudget {
+            max_total_calls: 4,
+            max_orchestrator_calls: 4,
+            max_architect_calls: 0,
+            max_timeout_ms_per_call: 30_000,
+            max_output_bytes_per_call: 65_536,
+        },
+        1_800_000_000_000,
+    );
+    let job_rej = fx_rej.create_initial_job(
+        "job_orch_instr_rej",
+        vec!["Decompose parser and exporter tasks within 4096 UTF-8 bytes.".to_string()],
+        Vec::new(),
+        Vec::new(),
+    );
+
+    let ascii_4097 = "x".repeat(threadlane_core::MAX_INSTRUCTION_LEN + 1);
+    let utf8_4098 = "€".repeat(1_366);
+    assert_eq!(ascii_4097.len(), 4_097);
+    assert_eq!(utf8_4098.chars().count(), 1_366);
+    assert_eq!(utf8_4098.len(), 4_098);
+
+    for (idx, req_key, later_task_id, bad_desc) in [
+        (
+            1u32,
+            "orch_rej_ascii_4097",
+            "task_later_ascii_4097",
+            ascii_4097.as_str(),
+        ),
+        (
+            2u32,
+            "orch_rej_utf8_4098",
+            "task_later_utf8_4098",
+            utf8_4098.as_str(),
+        ),
+    ] {
+        let rej_json = serde_json::to_string(&serde_json::json!({
+            "outcome": "plan",
+            "schema_version": 1,
+            "summary": "Valid first task followed by oversized later task.",
+            "tasks": [
+                {
+                    "task_id": "task_valid_first",
+                    "title": "Valid first task",
+                    "description": "Implement src/parser.rs cleanly.",
+                    "role": "coder",
+                    "difficulty": "easy",
+                    "depends_on": [],
+                    "allowed_write_paths": ["src/parser.rs"]
+                },
+                {
+                    "task_id": later_task_id,
+                    "title": "Oversized later task",
+                    "description": bad_desc,
+                    "role": "coder",
+                    "difficulty": "hard",
+                    "depends_on": ["task_valid_first"],
+                    "allowed_write_paths": ["src/exporter.rs"]
+                }
+            ]
+        }))
+        .expect("serialize rej_json");
+        fx_rej.write_custom_call_response(idx, &rej_json, false);
+        let req_rej =
+            OrchestratorTestFixture::plan_req(&grant_rej.grant_id, &job_rej.job_id, req_key, 0);
+        let err = fx_rej
+            .service
+            .orchestrate_brief_to_plan(&fx_rej.workflow, &req_rej)
+            .await
+            .expect_err("fresh oversized later task must fail before plan publication");
+        assert_eq!(err.code, NativeErrorCode::ValidationFailed);
+        assert!(
+            err.message.contains(later_task_id) && err.message.contains("4096 bytes"),
+            "unexpected diagnostic for {later_task_id}: {}",
+            err.message
+        );
+        assert_eq!(fx_rej.invocation_count(), idx);
+        assert!(
+            fx_rej
+                .workflow
+                .list_plans(None, None)
+                .expect("list plans")
+                .plans
+                .is_empty(),
+            "zero drafts or published plans may be created on oversized rejection"
+        );
+        assert!(!fx_rej
+            .plans
+            .snapshot()
+            .expect("snapshot PlanStore revisions")
+            .iter()
+            .any(|rev| rev.binding_id == BINDING_ID));
+
+        let ledger = fx_rej.store.read_binding_ledger(BINDING_ID).unwrap();
+        let stored_job = ledger
+            .jobs
+            .iter()
+            .find(|j| j.job_id == job_rej.job_id)
+            .unwrap();
+        assert_eq!(stored_job.phase, CoworkerJobPhase::Planning);
+        assert_eq!(stored_job.job_revision, 1);
+        assert!(stored_job.planning_result.is_none());
+
+        let stored_grant = ledger
+            .planning_grants
+            .iter()
+            .find(|g| g.grant_id == grant_rej.grant_id)
+            .unwrap();
+        let res = &stored_grant.reservations[(idx - 1) as usize];
+        assert_eq!(res.status, PlanningReservationStatus::Completed);
+        let art = fx_rej
+            .service
+            .read_planning_artifact(res.report_artifact_id.as_deref().expect("artifact_id"))
+            .expect("raw PlanningCallArtifact must remain readable");
+        match art.outcome {
+            PlanningArtifactOutcomeKind::OrchestratorOutput {
+                structured_output: StructuredOrchestratorOutput::Plan { tasks, .. },
+                ..
+            } => {
+                assert_eq!(tasks[1].task_id, later_task_id);
+                assert_eq!(tasks[1].description.len(), bad_desc.len());
+            }
+            other => panic!("expected preserved OrchestratorOutput::Plan, got {other:?}"),
+        }
+    }
+
+    // 3. Historical >4,096-byte (`8,192`B <= `65,536`B) artifact remains readable AND an already
+    //    linked historical oversized plan preserves exact idempotent replay without re-failing.
+    let fx_hist = OrchestratorTestFixture::new();
+    let grant_hist = fx_hist.create_grant_with_budget(
+        "grant_orch_hist_8192",
+        PlanningCallBudget {
+            max_total_calls: 4,
+            max_orchestrator_calls: 4,
+            max_architect_calls: 0,
+            max_timeout_ms_per_call: 30_000,
+            max_output_bytes_per_call: 65_536,
+        },
+        1_800_000_000_000,
+    );
+    let job_hist = fx_hist.create_initial_job(
+        "job_orch_hist_8192",
+        vec!["Historical 8192-byte Orchestrator plan compatibility.".to_string()],
+        Vec::new(),
+        Vec::new(),
+    );
+    let hist_8192 = "H".repeat(8_192);
+    let hist_summary = "Historical 8192B Orchestrator plan.";
+    let hist_json = serde_json::to_string(&serde_json::json!({
+        "outcome": "plan",
+        "schema_version": 1,
+        "summary": hist_summary,
+        "tasks": [
+            {
+                "task_id": "task_hist_8192",
+                "title": "Historical 8192B task",
+                "description": hist_8192,
+                "role": "coder",
+                "difficulty": "medium",
+                "depends_on": [],
+                "allowed_write_paths": ["src/parser.rs"]
+            }
+        ]
+    }))
+    .expect("serialize hist_json");
+    fx_hist.write_custom_call_response(1, &hist_json, false);
+    let mut req_hist = OrchestratorTestFixture::plan_req(
+        &grant_hist.grant_id,
+        &job_hist.job_id,
+        "orch_hist_8192_linked",
+        0,
+    );
+    req_hist.plan_id = Some("plan-orch-hist-8192".to_string());
+
+    // Fresh attempt refuses publication while recording the genuine 8192B artifact + reservation.
+    let fresh_err = fx_hist
+        .service
+        .orchestrate_brief_to_plan(&fx_hist.workflow, &req_hist)
+        .await
+        .expect_err("fresh 8192B plan must refuse new publication");
+    assert_eq!(fresh_err.code, NativeErrorCode::ValidationFailed);
+    assert_eq!(fx_hist.invocation_count(), 1);
+
+    let ledger_hist = fx_hist.store.read_binding_ledger(BINDING_ID).unwrap();
+    let grant_after = ledger_hist
+        .planning_grants
+        .iter()
+        .find(|g| g.grant_id == grant_hist.grant_id)
+        .unwrap();
+    let res_hist = &grant_after.reservations[0];
+    let hist_artifact_id = res_hist.report_artifact_id.as_ref().unwrap().clone();
+    let hist_output_digest = res_hist.output_digest.as_ref().unwrap().clone();
+    let hist_run_id = res_hist.run_id.as_ref().unwrap().clone();
+
+    let read_hist_art = fx_hist
+        .service
+        .read_planning_artifact(&hist_artifact_id)
+        .expect("historical 8192B artifact must remain readable under 65K reader");
+    match &read_hist_art.outcome {
+        PlanningArtifactOutcomeKind::OrchestratorOutput {
+            structured_output: StructuredOrchestratorOutput::Plan { tasks, .. },
+            ..
+        } => assert_eq!(tasks[0].description.len(), 8_192),
+        other => panic!("expected historical OrchestratorOutput::Plan, got {other:?}"),
+    }
+
+    // Seed the historical pre-guard published plan + job PlanningResultRef using generic 65K
+    // ScopedWorkflow/PlanStore + record_job_planning_result, then verify exact idempotent replay!
+    let draft_cmd_key = deterministic_prefixed_id(
+        "threadlane-native:coworker-plan-draft:v1",
+        "cmd",
+        &[
+            BINDING_ID,
+            &job_hist.job_id,
+            &res_hist.reservation_id,
+            &hist_output_digest,
+        ],
+    );
+    let hist_draft = fx_hist
+        .workflow
+        .save_draft_with_scoped_proof(
+            SavePlanDraft {
+                command_key: draft_cmd_key,
+                plan_id: Some("plan-orch-hist-8192".to_string()),
+                expected_revision: 0,
+                profile_id: grant_after.profile_id.clone(),
+                profile_revision: grant_after.registry_revision,
+                summary: hist_summary.to_string(),
+                tasks: vec![PlanTask {
+                    id: "task_hist_8192".to_string(),
+                    title: "Historical 8192B task".to_string(),
+                    instruction: hist_8192.clone(),
+                    role: WorkflowRole::Coder,
+                    difficulty: Difficulty::Medium,
+                    depends_on: Vec::new(),
+                    allowed_write_paths: vec!["src/parser.rs".to_string()],
+                }],
+            },
+            grant_after.scoped_profile_dependency_proof.clone(),
+        )
+        .expect("save historical 8192B draft via generic 65K PlanStore");
+    let hist_published = fx_hist
+        .workflow
+        .publish(&hist_draft.plan_id, hist_draft.revision)
+        .expect("publish historical 8192B plan");
+    let hist_plan_digest = hist_published
+        .header
+        .plan_digest
+        .clone()
+        .expect("compiled historical plan_digest");
+    let seeded_pr = PlanningResultRef {
+        grant_id: grant_after.grant_id.clone(),
+        reservation_id: res_hist.reservation_id.clone(),
+        request_key: res_hist.request_key.clone(),
+        run_id: hist_run_id,
+        report_artifact_id: hist_artifact_id,
+        output_digest: hist_output_digest,
+        work_brief_digest: job_hist.work_brief_digest.clone(),
+        project_base: fx_hist.project_base.clone(),
+        profile_id: grant_after.profile_id.clone(),
+        registry_revision: grant_after.registry_revision,
+        policy_digest: grant_after.policy_digest.clone(),
+        selected_choice: res_hist.selected_choice.clone(),
+        plan_id: hist_published.header.plan_id.clone(),
+        plan_revision: hist_published.header.revision,
+        plan_digest: hist_plan_digest,
+        plan_status: PlanStatus::Published,
+        task_interfaces: std::collections::BTreeMap::new(),
+        architect_advice_ids: Vec::new(),
+        resolved_open_questions: Vec::new(),
+        deferred_proposals: Vec::new(),
+        recorded_at_ms: 1_700_000_005_000,
+    };
+    let linked_job = fx_hist
+        .store
+        .record_job_planning_result(&RecordJobPlanningResultRequest {
+            binding_id: BINDING_ID.to_string(),
+            thread_uuid: THREAD_UUID.to_string(),
+            job_id: job_hist.job_id.clone(),
+            expected_job_revision: Some(job_hist.job_revision),
+            expected_ledger_revision: None,
+            planning_result: seeded_pr.clone(),
+        })
+        .expect("link historical 8192B PlanningResultRef");
+    assert_eq!(linked_job.phase, CoworkerJobPhase::AwaitingApproval);
+
+    let replayed = fx_hist
+        .service
+        .orchestrate_brief_to_plan(&fx_hist.workflow, &req_hist)
+        .await
+        .expect("already-linked historical 8192B plan must replay idempotently");
+    let replayed_pub = replayed
+        .require_published_plan()
+        .expect("replayed published historical plan");
+    assert_eq!(replayed_pub.planning_result, seeded_pr);
+    assert_eq!(
+        fx_hist.invocation_count(),
+        1,
+        "idempotent replay must not invoke provider again"
     );
 }

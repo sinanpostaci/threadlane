@@ -39,7 +39,9 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use threadlane_authority::{ApprovalRecord, AuthorityError, AuthorityStore};
+use threadlane_authority::{
+    validate_approved_executable_task_instructions, ApprovalRecord, AuthorityError, AuthorityStore,
+};
 use threadlane_core::WorkerStatus;
 use threadlane_host::{
     is_host_lock_held, read_host_launch_intent_optional, read_host_manifest_optional,
@@ -3893,7 +3895,6 @@ impl CoworkerCodeDriver {
                         ),
                     ));
                 }
-                Ok(())
             }
             Err(err) if err.kind() == ErrorKind::NotFound => {
                 if read_host_launch_intent_optional(&self.sessions_dir, &admission.approval)
@@ -3909,13 +3910,27 @@ impl CoworkerCodeDriver {
                         ),
                     ));
                 }
-                Ok(())
             }
-            Err(err) => Err(map_io_error(
-                "failed to inspect host session directory",
-                err,
-            )),
+            Err(err) => {
+                return Err(map_io_error(
+                    "failed to inspect host session directory",
+                    err,
+                ))
+            }
         }
+        if let Err(err) = validate_approved_executable_task_instructions(&admission.approval.tasks)
+        {
+            if self
+                .controller
+                .job_may_dispatch_new_executable_tasks(admission)?
+            {
+                return Err(NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    crate::fs_safety::sanitize_diagnostic_text(&err.to_string()),
+                ));
+            }
+        }
+        Ok(())
     }
 
     async fn ensure_host_for_admission(
