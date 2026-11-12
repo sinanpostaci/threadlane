@@ -444,6 +444,19 @@ fn five_store_scope_args(fixture: &ContextFixture) -> Vec<String> {
     ]
 }
 
+fn flow_scope_args(fixture: &ContextFixture) -> Vec<String> {
+    let mut args = five_store_scope_args(fixture);
+    args.push("--project-root".to_string());
+    args.push(
+        fixture
+            .project_root
+            .to_str()
+            .expect("utf8 project_root")
+            .to_string(),
+    );
+    args
+}
+
 fn workflow_scope_args(fixture: &ContextFixture) -> Vec<String> {
     vec![
         "--state-dir".to_string(),
@@ -907,8 +920,8 @@ async fn flow_forwards_the_same_five_bound_stores_as_session_and_ignores_path_an
     let flow_argv = read_argv_marker(&flow_marker);
     assert_eq!(
         flow_argv,
-        expected_recorded_argv(&five_store_scope_args(&fixture), &inner),
-        "flow must inject the five context-bound stores plus binding/thread before inner args"
+        expected_recorded_argv(&flow_scope_args(&fixture), &inner),
+        "flow must inject the five context-bound stores plus binding/thread/project root before inner args"
     );
 
     // Session must receive the identical five-store scope and binding/thread prefix.
@@ -926,8 +939,8 @@ async fn flow_forwards_the_same_five_bound_stores_as_session_and_ignores_path_an
     );
     assert_eq!(
         read_argv_marker(&session_marker),
-        flow_argv,
-        "flow must forward exactly the same five stores and binding/thread as session"
+        expected_recorded_argv(&five_store_scope_args(&fixture), &inner),
+        "flow and session must forward the same five stores and binding/thread; flow additionally receives the canonical project root"
     );
 
     // Workflow keeps its existing three-store scope after flow support is added.
@@ -1455,7 +1468,7 @@ async fn advice_forwards_canonical_scope_argv_in_exact_order_without_creating_ca
     assert!(flow_out.status.success());
     assert_eq!(
         read_argv_marker(&flow_marker),
-        expected_recorded_argv(&five_store_scope_args(&fixture), &legacy_inner)
+        expected_recorded_argv(&flow_scope_args(&fixture), &legacy_inner)
     );
 
     let mut session_args = vec!["--context", ctx_str, "session"];
@@ -3410,6 +3423,57 @@ async fn exported_operator_context_admits_planning_grant_and_scope_approval_with
 }
 
 #[tokio::test]
+async fn external_resolution_flow_forwarding_skips_context_journal_in_inherited_observation_env() {
+    let mut f = ContextFixture::start().await;
+    let context = f.write_private_context("external-resolution-context.json", &f.valid_context_json());
+    let marker = f.root.join("external-resolution-argv.marker");
+    write_argv_recording_sibling(&f.pkg_bin_dir, "threadlane-flow", &marker);
+    let inner = [
+        "external-resolution",
+        "preview",
+        "--request",
+        "/private/external-resolution-request.json",
+    ];
+    let mut args = vec!["--context", context.to_str().unwrap(), "flow"];
+    args.extend(inner);
+    let out = Command::new(&f.context_bin)
+        .args(&args)
+        .env("THREADLANE_OBSERVATION_PARENT_REQUEST_ID", "parent-request")
+        .env("THREADLANE_OBSERVATION_PLAN_ID", "parent-plan")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .expect("run external-resolution context forwarding");
+    assert!(
+        out.status.success(),
+        "external-resolution forwarding failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        read_argv_marker(&marker),
+        expected_recorded_argv(&flow_scope_args(&f), &inner),
+        "external-resolution flow forwarding must carry the router project root and inner args"
+    );
+    assert!(
+        !f.plans_dir.join("observation-journal.jsonl").exists(),
+        "external-resolution forwarding must not create context entry/finish journal records even with inherited observation environment"
+    );
+
+    // Caller-supplied project-root overrides remain refused before child execution.
+    if marker.exists() {
+        fs::remove_file(&marker).unwrap();
+    }
+    let mut hostile = args.clone();
+    hostile.push("--project-root=/tmp/forged");
+    let hostile_out = run_bin(&f.context_bin, &hostile).await;
+    assert_error_code(&hostile_out, "invalid_input");
+    assert!(!marker.exists());
+    f.shutdown().await;
+}
+
+#[tokio::test]
 async fn admission_flow_forwarding_preserves_scope_and_refuses_protected_overrides() {
     let mut f = ContextFixture::start().await;
     let context = f.write_private_context("admission-context.json", &f.valid_context_json());
@@ -3422,7 +3486,7 @@ async fn admission_flow_forwarding_preserves_scope_and_refuses_protected_overrid
         assert!(run_bin(&f.context_bin, &args).await.status.success());
         assert_eq!(
             read_argv_marker(&marker),
-            expected_recorded_argv(&five_store_scope_args(&f), &inner)
+            expected_recorded_argv(&flow_scope_args(&f), &inner)
         );
         for protected in [
             "--binding=forged",

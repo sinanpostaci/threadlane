@@ -756,6 +756,7 @@ impl CoworkerExecutionGateway {
             &params.job_id,
         )?;
         ensure_job_not_superseded(&wf_ledger, job)?;
+        verify_no_full_job_external_resolution(&self.plans_dir, &self.binding_id, job)?;
 
         let policy_store = ControllerPolicyStore::new(&self.plans_dir)?;
         let runtime_state = policy_store.get_job_runtime_readonly(&self.binding_id, &job.job_id)?;
@@ -1207,6 +1208,7 @@ impl CoworkerExecutionGateway {
         })?;
 
         let ctx = self.require_verified_approved_job(&params.job_id)?;
+        verify_no_full_job_external_resolution(&self.plans_dir, &self.binding_id, &ctx.job)?;
         let actual_digest = &ctx.runtime_state.envelope.envelope_digest;
         if !constant_time_str_eq(actual_digest, &params.expected_envelope_digest) {
             return Err(NativeError::new(
@@ -1542,6 +1544,43 @@ fn verify_ledger_thread_scope(
                 ),
             ));
         }
+    }
+    Ok(())
+}
+
+fn verify_no_full_job_external_resolution(
+    plans_dir: &Path,
+    binding_id: &str,
+    job: &CoworkerJobRecord,
+) -> Result<(), NativeError> {
+    let store = CoworkerWorkflowStore::new(plans_dir)?;
+    let ledger = store.read_binding_ledger(binding_id)?;
+    let target_plan_id = job
+        .planning_result
+        .as_ref()
+        .map(|planning| planning.plan_id.as_str())
+        .or_else(|| {
+            job.approval_linkage
+                .as_ref()
+                .map(|linkage| linkage.plan_id.as_str())
+        });
+    let target_approval_id = job
+        .approval_linkage
+        .as_ref()
+        .map(|linkage| linkage.approval_id.as_str());
+    if let Some(block) = crate::dispatch_guard::external_resolution_blocks_full_job(
+        &ledger,
+        Some(&job.job_id),
+        target_plan_id,
+        target_approval_id,
+    ) {
+        return Err(NativeError::new(
+            NativeErrorCode::UnsupportedCapability,
+            format!(
+                "job `{}` is covered by full-job external resolution receipt `{}`; the receipt is not review, integration, closure, or dependency acceptance, and execution requires an explicit replan and reapproval",
+                job.job_id, block.receipt_id
+            ),
+        ));
     }
     Ok(())
 }

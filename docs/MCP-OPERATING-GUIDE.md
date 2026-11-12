@@ -217,6 +217,32 @@ Version: `2026-11-09.v1`
   and observation performance remain follow-up work. Admission does not fix generic
   dispatch/conversation-change races or missing-check-executable status/stop issues.
 
+## External resolution receipts
+
+- `flow external-resolution preview|inspect` is pure and bypasses observation
+  journaling, including inherited observation environments. `record` requires
+  independent `--operator-approved`, `--confirm-thread`, and `--confirm-preview`
+  CLI flags; JSON self-attestation grants nothing. A receipt is preserved
+  evidence only, never Review/Integration/Closure acceptance, task acceptance, or
+  a dependency seal; see [external resolution](EXTERNAL-RESOLUTION.md).
+- A full-job receipt closes job advancement for direct dispatch, execution start,
+  driver ensure/run, controller admission/step, and outbox reservation. A
+  task-scoped receipt blocks only its covered task IDs while unrelated same-job
+  progress may continue. If a partial result cannot be safely consumed by the
+  approved DAG, require an explicit replan and fresh operator reapproval; do not
+  invent a continuation path or silently reopen a covered task because the
+  receipt is stale or locally durability-uncertain.
+- Inspect first, then use
+  `flow external-resolution record --request <original_request_json> --confirm-thread <THREAD_UUID> --confirm-preview <ORIGINAL_PREVIEW_SHA256> --operator-approved --reconcile-existing`
+  only for unchanged existing bytes. Reconcile never advances revisions, creates
+  a missing receipt, rewrites ledger bytes, or replays a provider/Git/host effect.
+  `persistence_uncertain`/unknown is not success; never auto-reconcile or replay
+  with a new key. Older MCP readers reject a non-empty `external_resolutions`
+  array, so real record/reopen checks use the exact new package with a disposable
+  isolated store and leave the original binding empty/omitted; no live or
+  bidirectional compatibility, Codex restart, or global configuration change is
+  claimed.
+
 ## Execute, monitor, and stop
 
 - With current frozen authorization, `start_execution` drives the full automatic

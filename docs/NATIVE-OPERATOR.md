@@ -182,6 +182,30 @@ The separate `flow coworker-execution preview|record|inspect` route remains
 available for manual envelope recording with its original two-digest confirmations.
 Older limited scopes may expose only diagnostic Phase 1 behavior.
 
+### External resolution receipts
+
+`flow external-resolution preview|record|inspect` preserves operator-attested
+evidence that existing work was resolved outside the controller. Preview and
+inspect are pure; neither creates observation journal entries, locks, caches, or
+provider/Git/host effects. Record requires the independent
+`--operator-approved`, `--confirm-thread`, and `--confirm-preview` flags; JSON
+self-attestation grants nothing. See
+[external resolution](EXTERNAL-RESOLUTION.md) for the exact request, scope,
+durability, and guard rules.
+
+A full-job receipt closes job advancement. A task-scoped receipt blocks its
+covered task IDs while unrelated same-job progress may continue. Receipts are not
+Review/Integration/Closure acceptance or a dependency seal, and a stale or
+`persistence_uncertain` receipt never silently reopens covered dispatch. Inspect
+first, then use `flow external-resolution record --reconcile-existing` only with
+the original `request_key` and preview digest to sync unchanged existing bytes;
+there is no automatic reconcile or new-key replay. The same read-only receipt
+guard covers direct `session dispatch`/MCP `start_approved_task`,
+`preview_execution`/`start_execution`, driver `ensure`/`run-owner`, controller
+admission/step, and task outbox reservation. Use a disposable isolated store for
+record/reopen compatibility checks; an older MCP reader rejects a non-empty
+`external_resolutions` ledger.
+
 Larger runtime policies, decomposition rules, user-language role outputs with
 English code/comments, startup ergonomics, native UI status and observation
 performance remain follow-up work. Admission does not fix generic dispatch/change

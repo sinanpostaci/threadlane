@@ -10139,6 +10139,249 @@ async fn controller_preflight_enforces_4096_utf8_bytes_across_task_set_before_fi
     host_unk.shutdown().await.expect("shutdown host_unk");
 }
 
+fn external_resolution_record_request(
+    fixture: &ControllerTestFixture,
+    job: &CoworkerJobRecord,
+    scope: threadlane_native::external_resolution::ExternalResolutionScope,
+    request_key: &str,
+) -> threadlane_native::external_resolution::RecordExternalResolutionRequest {
+    threadlane_native::external_resolution::RecordExternalResolutionRequest {
+        binding_id: BINDING_A.to_string(),
+        thread_uuid: THREAD_UUID_A.to_string(),
+        canonical_repo_root: fixture.repo_dir.clone(),
+        target: threadlane_native::external_resolution::ExternalResolutionTarget::Job {
+            job_id: job.job_id.clone(),
+        },
+        scope,
+        expected_ledger_revision: None,
+        expected_job_revision: None,
+        expected_runtime_revision: None,
+        request_key: request_key.to_string(),
+        created_at_ms: 1,
+        explanation: "controller boundary external resolution test".to_string(),
+        evidence_refs: Vec::new(),
+    }
+}
+
+fn record_external_resolution(
+    fixture: &ControllerTestFixture,
+    request: &threadlane_native::external_resolution::RecordExternalResolutionRequest,
+) -> threadlane_native::external_resolution::ExternalResolutionReceipt {
+    let service = threadlane_native::external_resolution::ExternalResolutionService::new(
+        &fixture.plans_dir,
+        &fixture.authority_dir,
+        &fixture.registry_dir,
+        Some(&fixture.sessions_dir),
+    )
+    .expect("open external resolution service");
+    let preview = service.preview(request).expect("external resolution preview");
+    service
+        .record(
+            request,
+            &threadlane_native::external_resolution::ExternalResolutionConfirmation {
+                trusted_local_attested: true,
+                thread_uuid: THREAD_UUID_A.to_string(),
+                preview_digest: preview.preview_digest,
+            },
+        )
+        .expect("record external resolution receipt")
+}
+
+fn external_resolution_outbox_request(
+    job: &CoworkerJobRecord,
+    task_id: &str,
+    request_key: &str,
+) -> ReserveTaskOutboxRequest {
+    ReserveTaskOutboxRequest {
+        binding_id: BINDING_A.to_string(),
+        thread_uuid: THREAD_UUID_A.to_string(),
+        job_id: job.job_id.clone(),
+        expected_job_revision: job.job_revision,
+        expected_ledger_revision: None,
+        request_key: request_key.to_string(),
+        kind: OutboxDispatchKind::TaskAttemptDispatch,
+        task_id: task_id.to_string(),
+        role: WorkflowRole::Coder,
+        subject_digest: "a".repeat(64),
+        dependency_input_commit: None,
+        dependency_input_tree_sha: None,
+        accepted_predecessor_receipts: Vec::new(),
+    }
+}
+
+#[tokio::test]
+async fn external_resolution_full_job_blocks_admission_and_every_outbox_reservation() {
+    let fixture = setup_fixture();
+    let tasks = vec![
+        PlanTask {
+            id: "task-ext-root-a".to_string(),
+            title: "External Root A".to_string(),
+            instruction: "CTRL_TASK_A implement src/a.rs".to_string(),
+            role: WorkflowRole::Coder,
+            difficulty: Difficulty::Hard,
+            depends_on: Vec::new(),
+            allowed_write_paths: vec!["src/a.rs".to_string()],
+        },
+        PlanTask {
+            id: "task-ext-root-b".to_string(),
+            title: "External Root B".to_string(),
+            instruction: "CTRL_TASK_B implement src/b.rs".to_string(),
+            role: WorkflowRole::Coder,
+            difficulty: Difficulty::Hard,
+            depends_on: Vec::new(),
+            allowed_write_paths: vec!["src/b.rs".to_string()],
+        },
+    ];
+    let (job, _) = create_planned_approved_and_frozen_job(
+        &fixture,
+        "brf_external_full",
+        "plan-external-full",
+        tasks,
+        BTreeMap::new(),
+        vec!["src/a.rs".to_string(), "src/b.rs".to_string()],
+        2,
+        ExecutionBudgets::default(),
+        ControllerRoleExecutionBudget::default_for_role(WorkflowRole::Coder, 4),
+    )
+    .await;
+
+    let request = external_resolution_record_request(
+        &fixture,
+        &job,
+        threadlane_native::external_resolution::ExternalResolutionScope::FullJob,
+        "req_external_full",
+    );
+    let receipt = record_external_resolution(&fixture, &request);
+    assert_eq!(receipt.binding_id, BINDING_A);
+    assert_eq!(receipt.thread_uuid, THREAD_UUID_A);
+
+    let err = fixture
+        .controller
+        .open_owned_session(BINDING_A, THREAD_UUID_A, &job.job_id, 20_000)
+        .expect_err("full-job receipt must close controller admission");
+    assert_eq!(err.code, NativeErrorCode::UnsupportedCapability);
+    assert!(err.message().contains(receipt.receipt_id.as_str()));
+
+    let reserve_err = fixture
+        .workflow_store
+        .reserve_task_outbox(&external_resolution_outbox_request(
+            &job,
+            "task-ext-root-a",
+            "req_external_full_dispatch",
+        ))
+        .expect_err("full-job receipt must refuse every covered outbox reservation");
+    assert_eq!(reserve_err.code, NativeErrorCode::UnsupportedCapability);
+
+    let ledger = fixture
+        .workflow_store
+        .read_binding_ledger(BINDING_A)
+        .expect("read ledger after refusals");
+    assert_eq!(ledger.external_resolutions, vec![receipt]);
+    assert_eq!(
+        ledger.jobs[0].job_revision, job.job_revision,
+        "refused dispatch must not advance the job revision"
+    );
+    assert!(ledger.jobs[0].outbox.is_empty());
+}
+
+#[tokio::test]
+async fn external_resolution_partial_scope_fences_only_the_covered_task() {
+    let fixture = setup_fixture();
+    let tasks = vec![
+        PlanTask {
+            id: "task-ext-partial-a".to_string(),
+            title: "External Partial A".to_string(),
+            instruction: "CTRL_TASK_A implement src/a.rs".to_string(),
+            role: WorkflowRole::Coder,
+            difficulty: Difficulty::Hard,
+            depends_on: Vec::new(),
+            allowed_write_paths: vec!["src/a.rs".to_string()],
+        },
+        PlanTask {
+            id: "task-ext-partial-b".to_string(),
+            title: "External Partial B".to_string(),
+            instruction: "CTRL_TASK_B implement src/b.rs".to_string(),
+            role: WorkflowRole::Coder,
+            difficulty: Difficulty::Hard,
+            depends_on: Vec::new(),
+            allowed_write_paths: vec!["src/b.rs".to_string()],
+        },
+    ];
+    let (job, _) = create_planned_approved_and_frozen_job(
+        &fixture,
+        "brf_external_partial",
+        "plan-external-partial",
+        tasks,
+        BTreeMap::new(),
+        vec!["src/a.rs".to_string(), "src/b.rs".to_string()],
+        2,
+        ExecutionBudgets::default(),
+        ControllerRoleExecutionBudget::default_for_role(WorkflowRole::Coder, 4),
+    )
+    .await;
+
+    let request = external_resolution_record_request(
+        &fixture,
+        &job,
+        threadlane_native::external_resolution::ExternalResolutionScope::Tasks {
+            task_ids: vec!["task-ext-partial-a".to_string()],
+        },
+        "req_external_partial",
+    );
+    let receipt = record_external_resolution(&fixture, &request);
+
+    let session = fixture
+        .controller
+        .open_owned_session(BINDING_A, THREAD_UUID_A, &job.job_id, 20_000)
+        .expect("partial receipt must not block unrelated controller admission");
+    drop(session);
+
+    let covered_err = fixture
+        .workflow_store
+        .reserve_task_outbox(&external_resolution_outbox_request(
+            &job,
+            "task-ext-partial-a",
+            "req_external_partial_dispatch",
+        ))
+        .expect_err("covered task must be refused");
+    assert_eq!(covered_err.code, NativeErrorCode::UnsupportedCapability);
+
+    let (_, unrelated_outbox) = fixture
+        .workflow_store
+        .reserve_task_outbox(&external_resolution_outbox_request(
+            &job,
+            "task-ext-partial-b",
+            "req_external_partial_unrelated",
+        ))
+        .expect("unrelated task must remain dispatchable");
+    assert_eq!(unrelated_outbox.task_id, "task-ext-partial-b");
+
+    let ledger = fixture
+        .workflow_store
+        .read_binding_ledger(BINDING_A)
+        .expect("read ledger after partial scope");
+    assert_eq!(ledger.external_resolutions, vec![receipt]);
+    let job_after = ledger
+        .jobs
+        .iter()
+        .find(|candidate| candidate.job_id == job.job_id)
+        .expect("job after partial reservation");
+    assert!(
+        job_after
+            .outbox
+            .iter()
+            .all(|outbox| outbox.task_id != "task-ext-partial-a"),
+        "covered task must not receive an outbox reservation"
+    );
+    assert!(
+        job_after
+            .outbox
+            .iter()
+            .any(|outbox| outbox.task_id == "task-ext-partial-b"),
+        "unrelated task progress must be preserved"
+    );
+}
+
 #[path = "support/coworker_correction_execution.rs"]
 mod coworker_correction_execution;
 

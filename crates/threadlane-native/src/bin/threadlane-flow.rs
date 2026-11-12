@@ -15,13 +15,19 @@
 //! - `coworker-execution inspect`: read-only lookup of the stored [`ControllerJobRuntimeState`]
 //!   without creating files, ACKs, or dispatches. Automatic controller scheduling/driving and
 //!   paired MCP wiring are separate downstream owners.
+//! - `external-resolution preview|record|inspect`: operator-attested receipt evidence over
+//!   `external_resolution_receipts_v1`. Preview/inspect are pure; record requires independent
+//!   CLI `--operator-approved`, `--confirm-thread`, and `--confirm-preview` flags, and
+//!   `--reconcile-existing` establishes durability only for the original existing bytes.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
-use threadlane_authority::validation::{validate_identifier, validate_sha256_hex};
+use threadlane_authority::validation::{
+    validate_canonical_thread_uuid, validate_identifier, validate_sha256_hex,
+};
 use threadlane_authority::{AuthorityError, AuthorityStore};
 use threadlane_core::observation::{
     append_journal_record, current_observation_time_ms, current_process_instance,
@@ -50,6 +56,11 @@ use threadlane_native::coworker_workflow::{
     ControllerConfigurationPreview, ControllerJobRuntimeState, ControllerPolicyStore,
     CoworkerJobRecord, CoworkerWorkflowStore, FreezeControllerExecutionEnvelopeRequest,
     FrozenControllerExecutionEnvelope, RevokePlanningGrantRequest,
+};
+use threadlane_native::external_resolution::{
+    ExternalResolutionConfirmation, ExternalResolutionInspection, ExternalResolutionPreview,
+    ExternalResolutionReceipt, ExternalResolutionService, RecordExternalResolutionRequest,
+    ReconcileExternalResolutionRequest,
 };
 use threadlane_native::operator_cli::{
     emit_error, read_request, validate_dirs, verify_binding, write_result, OperatorCliError,
@@ -116,6 +127,10 @@ struct Cli {
     /// Absolute path to the private (`0700`) approved host session store directory.
     #[arg(long = "sessions-dir", global = true, value_name = "ABS")]
     sessions_dir: Option<PathBuf>,
+
+    /// Canonical project root injected by `threadlane-context` for scoped operator commands.
+    #[arg(long = "project-root", global = true, value_name = "ABS")]
+    project_root: Option<PathBuf>,
 
     /// Authoritative Threadlane control binding identifier (`binding_id`).
     #[arg(long = "binding", global = true, value_name = "ID")]
@@ -240,6 +255,51 @@ enum FlowCommand {
     /// Run, ensure, inspect status, reconcile, or cancel an independent Coworker code controller owner (run-owner | ensure | status | reconcile | cancel).
     #[command(subcommand, name = "code-driver", visible_alias = "coworker-driver")]
     CodeDriver(CoworkerDriverCommand),
+    /// Preview, record, inspect, or reconcile an operator-attested external resolution receipt.
+    #[command(
+        subcommand,
+        name = "external-resolution",
+        visible_alias = "external_resolution"
+    )]
+    ExternalResolution(ExternalResolutionCommand),
+}
+
+#[derive(Debug, Subcommand)]
+enum ExternalResolutionCommand {
+    /// Pure read-only preview of an external resolution request without creating journal, lock, or cache state.
+    Preview {
+        /// Absolute path to the private (`0600`) JSON [`RecordExternalResolutionRequest`] file.
+        #[arg(long = "request", value_name = "ABS")]
+        request: PathBuf,
+    },
+    /// Record operator-confirmed receipt evidence; `--reconcile-existing` only syncs original existing bytes.
+    Record {
+        /// Absolute path to the private (`0600`) JSON [`RecordExternalResolutionRequest`] file.
+        #[arg(long = "request", value_name = "ABS")]
+        request: PathBuf,
+
+        /// Exact canonical native thread UUID confirmed independently by the operator.
+        #[arg(long = "confirm-thread", visible_alias = "confirm-thread-uuid", value_name = "UUID")]
+        confirm_thread: Option<String>,
+
+        /// Exact 64-character lowercase SHA-256 preview digest confirmed by the operator.
+        #[arg(long = "confirm-preview", value_name = "SHA256")]
+        confirm_preview: Option<String>,
+
+        /// Explicit trusted-local operator approval flag required to record or reconcile.
+        #[arg(long = "operator-approved")]
+        operator_approved: bool,
+
+        /// Reconcile durability for the original existing receipt bytes instead of appending.
+        #[arg(long = "reconcile-existing")]
+        reconcile_existing: bool,
+    },
+    /// Pure read-only inspection of stored receipts; optionally focus one original request key.
+    Inspect {
+        /// Optional original external resolution request key (`<= 128` identifier bytes).
+        #[arg(long = "request-key", value_name = "ID")]
+        request_key: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -485,6 +545,7 @@ struct GlobalArgs {
     plans_dir: PathBuf,
     authority_dir: PathBuf,
     sessions_dir: PathBuf,
+    project_root: Option<PathBuf>,
     binding: String,
     thread: String,
 }
@@ -519,6 +580,7 @@ impl GlobalArgs {
             plans_dir,
             authority_dir,
             sessions_dir,
+            project_root: cli.project_root.clone(),
             binding,
             thread,
         })
@@ -684,6 +746,46 @@ impl FlowScoped for CoworkerJobRecord {
     }
 }
 
+impl FlowScoped for RecordExternalResolutionRequest {
+    fn binding_id(&self) -> &str {
+        &self.binding_id
+    }
+
+    fn thread_uuid(&self) -> &str {
+        &self.thread_uuid
+    }
+}
+
+impl FlowScoped for ExternalResolutionPreview {
+    fn binding_id(&self) -> &str {
+        &self.binding_id
+    }
+
+    fn thread_uuid(&self) -> &str {
+        &self.thread_uuid
+    }
+}
+
+impl FlowScoped for ExternalResolutionReceipt {
+    fn binding_id(&self) -> &str {
+        &self.binding_id
+    }
+
+    fn thread_uuid(&self) -> &str {
+        &self.thread_uuid
+    }
+}
+
+impl FlowScoped for ExternalResolutionInspection {
+    fn binding_id(&self) -> &str {
+        &self.binding_id
+    }
+
+    fn thread_uuid(&self) -> &str {
+        &self.thread_uuid
+    }
+}
+
 impl FlowScoped for EnqueuePlanningCommandRequest {
     fn binding_id(&self) -> &str {
         &self.binding_id
@@ -827,6 +929,10 @@ async fn run(cli: Cli) -> Result<(), OperatorCliError> {
     let plans_dir = canonical_dirs[2].clone();
     let authority_dir = canonical_dirs[3].clone();
     let sessions_dir = canonical_dirs[4].clone();
+    let project_root = match globals.project_root.as_deref() {
+        Some(path) => Some(validate_project_root_override(path)?),
+        None => None,
+    };
     let binding = globals.binding.clone();
     let thread = globals.thread.clone();
 
@@ -882,6 +988,9 @@ async fn run(cli: Cli) -> Result<(), OperatorCliError> {
             CoworkerDriverCommand::Reconcile { .. } => ("flow.code-driver.reconcile", true, true),
             CoworkerDriverCommand::Cancel { .. } => ("flow.code-driver.cancel", true, true),
         },
+        // External resolution owns its durable receipt ledger. The shared command wrapper must not
+        // add an observation journal entry or finish record, even under inherited observation env.
+        FlowCommand::ExternalResolution(_) => ("flow.external-resolution", false, false),
     };
     let parent_req = read_env_parent_request_id();
     let should_journal = is_mutating || (allow_parent_journal && parent_req.is_some());
@@ -1311,6 +1420,16 @@ async fn run(cli: Cli) -> Result<(), OperatorCliError> {
                 )
                 .await
             }
+            FlowCommand::ExternalResolution(subcommand) => run_external_resolution(
+                subcommand,
+                &registry_dir,
+                &plans_dir,
+                &authority_dir,
+                &sessions_dir,
+                &binding,
+                &thread,
+                project_root.as_deref(),
+            ),
         }
     }
     .await;
@@ -1394,6 +1513,285 @@ fn ensure_scope<T: FlowScoped>(
         return Err(OperatorCliError::new(code, message));
     }
     Ok(())
+}
+
+fn validate_project_root_override(path: &Path) -> Result<PathBuf, OperatorCliError> {
+    if !path.is_absolute() || path.components().any(|part| {
+        matches!(
+            part,
+            std::path::Component::CurDir | std::path::Component::ParentDir
+        )
+    }) {
+        return Err(OperatorCliError::invalid_input(
+            "`--project-root` must be a normalized absolute directory path.",
+        ));
+    }
+    let meta = std::fs::symlink_metadata(path).map_err(|_| {
+        OperatorCliError::invalid_input("`--project-root` does not name an existing directory.")
+    })?;
+    if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
+        return Err(OperatorCliError::new(
+            "security_violation",
+            "`--project-root` must be a non-symlink directory.",
+        ));
+    }
+    let canonical = std::fs::canonicalize(path).map_err(|_| {
+        OperatorCliError::new(
+            "security_violation",
+            "failed to canonicalize the injected project root.",
+        )
+    })?;
+    if canonical.as_path() != path {
+        return Err(OperatorCliError::invalid_input(
+            "`--project-root` must already be canonical.",
+        ));
+    }
+    Ok(canonical)
+}
+
+struct ExternalResolutionRecordConfirmations {
+    thread_uuid: String,
+    preview_digest: String,
+}
+
+fn apply_external_resolution_record_confirmations(
+    request: &RecordExternalResolutionRequest,
+    binding_thread_uuid: &str,
+    operator_approved: bool,
+    confirm_thread: Option<String>,
+    confirm_preview: Option<String>,
+) -> Result<ExternalResolutionRecordConfirmations, OperatorCliError> {
+    // The private request JSON cannot supply or override any of these fields. A record requires
+    // independent CLI thread/preview confirmation and explicit local operator attestation.
+    if !operator_approved {
+        return Err(OperatorCliError::new(
+            NativeErrorCode::UnauthorizedOperator.as_str(),
+            "External resolution record requires explicit `--operator-approved`.",
+        ));
+    }
+    let raw_thread = confirm_thread.ok_or_else(|| {
+        OperatorCliError::invalid_input("Missing required `--confirm-thread` argument.")
+    })?;
+    let thread_uuid = validate_canonical_thread_uuid("confirm_thread", &raw_thread)
+        .map_err(|_| {
+            OperatorCliError::invalid_input(
+                "`--confirm-thread` must be a canonical lowercase non-nil thread UUID.",
+            )
+        })?;
+    if thread_uuid != binding_thread_uuid || thread_uuid != request.thread_uuid {
+        return Err(OperatorCliError::new(
+            "scope_mismatch",
+            "`--confirm-thread` does not match the fixed CLI binding thread and request thread.",
+        ));
+    }
+    let raw_digest = confirm_preview.ok_or_else(|| {
+        OperatorCliError::invalid_input("Missing required `--confirm-preview` argument.")
+    })?;
+    let preview_digest = validate_sha256_hex("confirm_preview", &raw_digest).map_err(|_| {
+        OperatorCliError::invalid_input(
+            "`--confirm-preview` must be a 64-character lowercase hexadecimal SHA-256 digest.",
+        )
+    })?;
+    Ok(ExternalResolutionRecordConfirmations {
+        thread_uuid,
+        preview_digest,
+    })
+}
+
+fn open_external_resolution_service(
+    registry_dir: &Path,
+    plans_dir: &Path,
+    authority_dir: &Path,
+    sessions_dir: &Path,
+) -> Result<ExternalResolutionService, OperatorCliError> {
+    ExternalResolutionService::new(
+        plans_dir,
+        authority_dir,
+        registry_dir,
+        Some(sessions_dir),
+    )
+    .map_err(|error| map_native_error(&error, false))
+}
+
+fn ensure_external_resolution_request_scope(
+    request: &RecordExternalResolutionRequest,
+    binding: &str,
+    thread: &str,
+    project_root: Option<&Path>,
+) -> Result<(), OperatorCliError> {
+    ensure_scope(
+        request,
+        binding,
+        thread,
+        "scope_mismatch",
+        REQUEST_SCOPE_MISMATCH,
+    )?;
+    if let Some(expected_root) = project_root {
+        if request.canonical_repo_root.as_path() != expected_root {
+            return Err(OperatorCliError::new(
+                "scope_mismatch",
+                "External resolution request canonical_repo_root does not match the router-validated project root.",
+            ));
+        }
+    }
+    request
+        .validate()
+        .map_err(|error| map_native_error(&error, false))
+}
+
+fn ensure_external_resolution_preview_scope(
+    preview: &ExternalResolutionPreview,
+    binding: &str,
+    thread: &str,
+    project_root: Option<&Path>,
+) -> Result<(), OperatorCliError> {
+    ensure_scope(preview, binding, thread, "scope_mismatch", STORED_SCOPE_MISMATCH)?;
+    if let Some(expected_root) = project_root {
+        if preview.project.canonical_repo_root.as_path() != expected_root {
+            return Err(OperatorCliError::new(
+                "scope_mismatch",
+                "External resolution preview project root does not match the router-validated project root.",
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_external_resolution(
+    subcommand: ExternalResolutionCommand,
+    registry_dir: &Path,
+    plans_dir: &Path,
+    authority_dir: &Path,
+    sessions_dir: &Path,
+    binding: &str,
+    thread: &str,
+    project_root: Option<&Path>,
+) -> Result<(), OperatorCliError> {
+    let service =
+        open_external_resolution_service(registry_dir, plans_dir, authority_dir, sessions_dir)?;
+    match subcommand {
+        ExternalResolutionCommand::Preview { request } => {
+            let request: RecordExternalResolutionRequest = read_request(&request)?;
+            ensure_external_resolution_request_scope(&request, binding, thread, project_root)?;
+            let preview = service
+                .preview(&request)
+                .map_err(|error| map_native_error(&error, false))?;
+            ensure_external_resolution_preview_scope(&preview, binding, thread, project_root)?;
+            write_result(binding, &preview, false)
+        }
+        ExternalResolutionCommand::Record {
+            request,
+            confirm_thread,
+            confirm_preview,
+            operator_approved,
+            reconcile_existing,
+        } => {
+            let request: RecordExternalResolutionRequest = read_request(&request)?;
+            ensure_external_resolution_request_scope(&request, binding, thread, project_root)?;
+            let confirmations = apply_external_resolution_record_confirmations(
+                &request,
+                thread,
+                operator_approved,
+                confirm_thread,
+                confirm_preview,
+            )?;
+
+            if reconcile_existing {
+                let receipt = service
+                    .reconcile(&ReconcileExternalResolutionRequest {
+                        trusted_local_attested: true,
+                        binding_id: binding.to_string(),
+                        thread_uuid: confirmations.thread_uuid,
+                        request_key: request.request_key.clone(),
+                        expected_preview_digest: confirmations.preview_digest,
+                        expected_receipt_digest: None,
+                    })
+                    .map_err(|error| map_native_error(&error, true))?;
+                ensure_scope(
+                    &receipt,
+                    binding,
+                    thread,
+                    "outcome_unknown",
+                    MUTATION_SCOPE_MISMATCH,
+                )?;
+                return write_result(binding, &receipt, true);
+            }
+
+            let receipt = service
+                .record(
+                    &request,
+                    &ExternalResolutionConfirmation {
+                        trusted_local_attested: true,
+                        thread_uuid: confirmations.thread_uuid,
+                        preview_digest: confirmations.preview_digest,
+                    },
+                )
+                .map_err(|error| map_native_error(&error, true))?;
+            ensure_scope(
+                &receipt,
+                binding,
+                thread,
+                "outcome_unknown",
+                MUTATION_SCOPE_MISMATCH,
+            )?;
+            write_result(binding, &receipt, true)
+        }
+        ExternalResolutionCommand::Inspect { request_key } => {
+            if let Some(request_key) = request_key {
+                validate_bounded_request_key(&request_key)?;
+                let entry = service
+                    .inspect_by_request_key(binding, thread, &request_key)
+                    .map_err(|error| map_native_error(&error, false))?;
+                let Some(entry) = entry else {
+                    return Err(OperatorCliError::new(
+                        "not_configured",
+                        "No external resolution receipt exists for this request_key in the fixed scope.",
+                    ));
+                };
+                ensure_scope(
+                    &entry.receipt,
+                    binding,
+                    thread,
+                    "scope_mismatch",
+                    STORED_SCOPE_MISMATCH,
+                )?;
+                write_result(binding, &entry, false)
+            } else {
+                let inspection = service
+                    .inspect(binding, thread)
+                    .map_err(|error| map_native_error(&error, false))?;
+                ensure_scope(
+                    &inspection,
+                    binding,
+                    thread,
+                    "scope_mismatch",
+                    STORED_SCOPE_MISMATCH,
+                )?;
+                for entry in &inspection.receipts {
+                    ensure_scope(
+                        &entry.receipt,
+                        binding,
+                        thread,
+                        "scope_mismatch",
+                        STORED_SCOPE_MISMATCH,
+                    )?;
+                }
+                write_result(binding, &inspection, false)
+            }
+        }
+    }
+}
+
+fn validate_bounded_request_key(value: &str) -> Result<(), OperatorCliError> {
+    if value.trim() != value || value.is_empty() || value.len() > 128 {
+        return Err(OperatorCliError::invalid_input(
+            "Invalid `--request-key` value.",
+        ));
+    }
+    validate_identifier("request_key", value)
+        .map(|_| ())
+        .map_err(|_| OperatorCliError::invalid_input("Invalid `--request-key` value."))
 }
 
 fn validate_cycle_id(value: &str) -> Result<(), OperatorCliError> {
@@ -2678,6 +3076,9 @@ fn map_native_error(error: &NativeError, mutation: bool) -> OperatorCliError {
         NativeErrorCode::AmbiguousWakeupPendingReconciliation => {
             "Planning command or wakeup outcome is in flight or uncertain pending reconciliation; inspect state before retrying."
         }
+        NativeErrorCode::PersistenceUncertain => {
+            "External resolution receipt bytes may be visible but durability is unconfirmed; inspect, then use `record --reconcile-existing` with the original request_key and preview_digest."
+        }
         NativeErrorCode::TransportUnavailable => "Role-flow host transport is unavailable.",
         NativeErrorCode::ProtocolError
         | NativeErrorCode::RpcError
@@ -2907,6 +3308,112 @@ mod tests {
         assert!(json.contains("approved_cycle_base"));
     }
 
+    fn external_resolution_request() -> RecordExternalResolutionRequest {
+        RecordExternalResolutionRequest {
+            binding_id: BINDING.to_string(),
+            thread_uuid: THREAD.to_string(),
+            canonical_repo_root: PathBuf::from("/tmp/project"),
+            target: threadlane_native::external_resolution::ExternalResolutionTarget::LegacyPlan {
+                plan_id: "plan_external_unit".to_string(),
+                plan_revision: 1,
+            },
+            scope: threadlane_native::external_resolution::ExternalResolutionScope::FullJob,
+            expected_ledger_revision: None,
+            expected_job_revision: None,
+            expected_runtime_revision: None,
+            request_key: "req_external_unit".to_string(),
+            created_at_ms: 1,
+            explanation: "unit test external resolution".to_string(),
+            evidence_refs: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn external_resolution_record_requires_independent_flags_and_exact_thread() {
+        let request = external_resolution_request();
+        let missing_approval = apply_external_resolution_record_confirmations(
+            &request,
+            THREAD,
+            false,
+            Some(THREAD.to_string()),
+            Some(DIGEST.to_string()),
+        )
+        .expect_err("missing operator approval must fail");
+        assert_eq!(missing_approval.code, "unauthorized_operator");
+
+        let missing_thread = apply_external_resolution_record_confirmations(
+            &request,
+            THREAD,
+            true,
+            None,
+            Some(DIGEST.to_string()),
+        )
+        .expect_err("missing thread confirmation must fail");
+        assert_eq!(missing_thread.code, "invalid_input");
+
+        let wrong_thread = apply_external_resolution_record_confirmations(
+            &request,
+            THREAD,
+            true,
+            Some("0196ed00-0000-7000-8000-000000000099".to_string()),
+            Some(DIGEST.to_string()),
+        )
+        .expect_err("wrong thread confirmation must fail");
+        assert_eq!(wrong_thread.code, "scope_mismatch");
+
+        let missing_preview = apply_external_resolution_record_confirmations(
+            &request,
+            THREAD,
+            true,
+            Some(THREAD.to_string()),
+            None,
+        )
+        .expect_err("missing preview confirmation must fail");
+        assert_eq!(missing_preview.code, "invalid_input");
+
+        let invalid_preview = apply_external_resolution_record_confirmations(
+            &request,
+            THREAD,
+            true,
+            Some(THREAD.to_string()),
+            Some("not-a-digest".to_string()),
+        )
+        .expect_err("invalid preview digest must fail");
+        assert_eq!(invalid_preview.code, "invalid_input");
+
+        let confirmed = apply_external_resolution_record_confirmations(
+            &request,
+            THREAD,
+            true,
+            Some(THREAD.to_string()),
+            Some(DIGEST.to_string()),
+        )
+        .expect("exact independent confirmations must be accepted");
+        assert_eq!(confirmed.thread_uuid, THREAD);
+        assert_eq!(confirmed.preview_digest, DIGEST);
+    }
+
+    #[test]
+    fn external_resolution_request_scope_rejects_project_root_drift() {
+        let request = external_resolution_request();
+        let err = ensure_external_resolution_request_scope(
+            &request,
+            BINDING,
+            THREAD,
+            Some(Path::new("/tmp/other-project")),
+        )
+        .expect_err("router project-root drift must fail");
+        assert_eq!(err.code, "scope_mismatch");
+
+        ensure_external_resolution_request_scope(
+            &request,
+            BINDING,
+            THREAD,
+            Some(Path::new("/tmp/project")),
+        )
+        .expect("matching canonical project root must pass structural validation");
+    }
+
     #[test]
     fn cli_parses_grant_subcommands_with_global_flags() {
         for sub in [
@@ -3002,6 +3509,77 @@ mod tests {
             assert_eq!(globals.binding, BINDING);
             assert_eq!(globals.thread, THREAD);
             assert!(matches!(parsed.command, FlowCommand::CoworkerExecution(_)));
+        }
+    }
+
+    #[test]
+    fn cli_parses_external_resolution_subcommands_and_independent_flags() {
+        for sub in [
+            vec![
+                "external-resolution",
+                "preview",
+                "--request",
+                "/tmp/external-resolution.json",
+            ],
+            vec![
+                "external-resolution",
+                "record",
+                "--request",
+                "/tmp/external-resolution.json",
+                "--confirm-thread",
+                THREAD,
+                "--confirm-preview",
+                DIGEST,
+                "--operator-approved",
+            ],
+            vec![
+                "external-resolution",
+                "record",
+                "--request",
+                "/tmp/external-resolution.json",
+                "--confirm-thread",
+                THREAD,
+                "--confirm-preview",
+                DIGEST,
+                "--operator-approved",
+                "--reconcile-existing",
+            ],
+            vec![
+                "external_resolution",
+                "inspect",
+                "--request-key",
+                "req_external_unit",
+            ],
+        ] {
+            let mut argv = vec![
+                "threadlane-flow",
+                "--state-dir",
+                "/tmp/state",
+                "--registry-dir",
+                "/tmp/registry",
+                "--plans-dir",
+                "/tmp/plans",
+                "--authority-dir",
+                "/tmp/authority",
+                "--sessions-dir",
+                "/tmp/sessions",
+                "--project-root",
+                "/tmp/project",
+                "--binding",
+                BINDING,
+                "--thread",
+                THREAD,
+            ];
+            argv.extend(sub);
+            let parsed = Cli::try_parse_from(argv).expect("parse external-resolution subcommand");
+            let globals = GlobalArgs::from_cli(&parsed).expect("extract globals");
+            assert_eq!(globals.binding, BINDING);
+            assert_eq!(globals.thread, THREAD);
+            assert_eq!(globals.project_root.as_deref(), Some(Path::new("/tmp/project")));
+            assert!(matches!(
+                parsed.command,
+                FlowCommand::ExternalResolution(_)
+            ));
         }
     }
 

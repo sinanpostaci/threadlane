@@ -2125,6 +2125,49 @@ impl CoworkerWorkflowStore {
             request.expected_ledger_revision,
             |ledger| {
                 ledger.ensure_thread_scope(&request.thread_uuid)?;
+                // Check immutable receipt coverage before any idempotent return or new
+                // reservation. This runs under the innermost per-binding workflow ledger lock,
+                // the same lock held by `ExternalResolutionService::record` when appending a
+                // receipt, so a record cannot race a new outbox effect past this boundary.
+                let target_job = ledger
+                    .jobs
+                    .iter()
+                    .find(|j| j.job_id == request.job_id)
+                    .ok_or_else(|| {
+                        NativeError::new(
+                            NativeErrorCode::ValidationFailed,
+                            "requested job_id was not found in this binding ledger",
+                        )
+                    })?;
+                let target_plan_id = target_job
+                    .planning_result
+                    .as_ref()
+                    .map(|planning| planning.plan_id.clone())
+                    .or_else(|| {
+                        target_job
+                            .approval_linkage
+                            .as_ref()
+                            .map(|linkage| linkage.plan_id.clone())
+                    });
+                let target_approval_id = target_job
+                    .approval_linkage
+                    .as_ref()
+                    .map(|linkage| linkage.approval_id.clone());
+                if let Some(block) = crate::dispatch_guard::external_resolution_blocks_task(
+                    ledger,
+                    Some(&request.job_id),
+                    target_plan_id.as_deref(),
+                    target_approval_id.as_deref(),
+                    &request.task_id,
+                ) {
+                    return Err(NativeError::new(
+                        NativeErrorCode::UnsupportedCapability,
+                        format!(
+                            "external resolution receipt `{}` covers task `{}`; a receipt is not review, integration, closure, or dependency acceptance, and the exact scope requires replan and explicit reapproval before new outbox effects",
+                            block.receipt_id, request.task_id
+                        ),
+                    ));
+                }
                 let job = ledger
                     .jobs
                     .iter_mut()

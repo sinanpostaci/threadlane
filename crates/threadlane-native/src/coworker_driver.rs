@@ -1319,6 +1319,11 @@ impl CoworkerCodeDriver {
         options: CoworkerDriverRunOptions,
     ) -> Result<CoworkerDriverStatusReport, NativeError> {
         let key = CoworkerJobOwnershipKey::new(binding_id, thread_uuid, job_id)?;
+        verify_no_full_job_external_resolution(
+            self.controller.workflow_store(),
+            binding_id,
+            job_id,
+        )?;
         let max_steps = options.max_steps.filter(|&n| n > 0).map(|n| n.min(4_096));
         let poll_interval_ms = options.poll_interval_ms.clamp(1, 60_000);
         let idle_linger_ms = options.idle_linger_ms.map(|ms| ms.min(60_000));
@@ -2005,6 +2010,11 @@ impl CoworkerCodeDriver {
         options: Option<CoworkerDriverRunOptions>,
     ) -> Result<CoworkerDriverEnsureReport, NativeError> {
         let key = CoworkerJobOwnershipKey::new(binding_id, thread_uuid, job_id)?;
+        verify_no_full_job_external_resolution(
+            self.controller.workflow_store(),
+            binding_id,
+            job_id,
+        )?;
 
         // 1. Check if a live owner is already holding the physical lock.
         if let Some(status) = self
@@ -6146,6 +6156,45 @@ fn phase1_boundary_note() -> String {
      AwaitingChecksOrReview; automated checks, reviewer/architect cycles, task/job closure, and \
      running derived-attempt cancellation are wired in subsequent milestones."
         .to_owned()
+}
+
+fn verify_no_full_job_external_resolution(
+    workflow_store: &CoworkerWorkflowStore,
+    binding_id: &str,
+    job_id: &str,
+) -> Result<(), NativeError> {
+    let ledger = workflow_store.read_binding_ledger(binding_id)?;
+    let Some(job) = ledger.jobs.iter().find(|job| job.job_id == job_id) else {
+        return Ok(());
+    };
+    let target_plan_id = job
+        .planning_result
+        .as_ref()
+        .map(|planning| planning.plan_id.as_str())
+        .or_else(|| {
+            job.approval_linkage
+                .as_ref()
+                .map(|linkage| linkage.plan_id.as_str())
+        });
+    let target_approval_id = job
+        .approval_linkage
+        .as_ref()
+        .map(|linkage| linkage.approval_id.as_str());
+    if let Some(block) = crate::dispatch_guard::external_resolution_blocks_full_job(
+        &ledger,
+        Some(job_id),
+        target_plan_id,
+        target_approval_id,
+    ) {
+        return Err(NativeError::new(
+            NativeErrorCode::UnsupportedCapability,
+            format!(
+                "job `{job_id}` is covered by full-job external resolution receipt `{}`; a receipt is not review, integration, closure, or dependency acceptance, and controller advancement requires an explicit replan and reapproval",
+                block.receipt_id
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn current_time_ms() -> u64 {

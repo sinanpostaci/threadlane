@@ -30,6 +30,9 @@
 //!   `--context-id`, `--binding`, `--thread`, and `--context` come exclusively from the private
 //!   context file; forwarded overrides (including `=` forms and repeated flags) are rejected before
 //!   child execution.
+//! - **Ledger-owned external resolution**: `flow external-resolution` forwarding is excluded from
+//!   context entry/finish journaling even under inherited observation environment; the flow
+//!   receipt ledger remains the durable activity source and preview/inspect create no local state.
 
 use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
@@ -643,6 +646,13 @@ fn is_protected_override_token(token: &str) -> bool {
     })
 }
 
+fn is_external_resolution_family(family: ChildFamily, inner_args: &[String]) -> bool {
+    family == ChildFamily::Flow
+        && inner_args.first().is_some_and(|arg| {
+            matches!(arg.as_str(), "external-resolution" | "external_resolution")
+        })
+}
+
 fn reject_protected_overrides(inner_args: &[&str]) -> Result<(), OperatorCliError> {
     for arg in inner_args {
         if is_protected_override_token(arg) {
@@ -827,42 +837,45 @@ async fn run(context_path: &Path, command: ContextCommand) -> Result<ExitCode, O
             Ok(ExitCode::SUCCESS)
         }
         ContextCommand::Forward { family, inner_args } => {
+            let journal_observation = !is_external_resolution_family(family, &inner_args);
             let safe_meta =
                 sanitize_cli_argv_metadata("context", family.family_label(), &inner_args);
             let request_id = generate_observation_id("obsreq");
             let started_at_ms = current_observation_time_ms();
             let actor = ObservationActor::unknown(Some(TRUSTED_LOCAL_OPERATOR_ROUTE.to_string()));
 
-            let _ = append_journal_record(
-                &plans_dir,
-                &ObservationJournalRecord {
-                    record_id: generate_observation_id("obsrec"),
-                    request_id: request_id.clone(),
-                    parent_request_id: safe_meta.parent_request_id.clone(),
-                    call_id: None,
-                    phase: ObservationRecordPhase::Entry,
-                    at_ms: started_at_ms,
-                    pid: Some(std::process::id()),
-                    process_instance: current_process_instance(),
-                    project_label: Some(project_label.clone()),
-                    project_path: project_path.clone(),
-                    binding_id: Some(validated.binding_id.clone()),
-                    thread_uuid: Some(validated.thread_uuid.clone()),
-                    thread_label: None,
-                    job_id: None,
-                    plan_id: safe_meta.plan_id.clone(),
-                    task_id: safe_meta.task_id.clone(),
-                    approval_id: safe_meta.approval_id.clone(),
-                    operation: safe_meta.operation.clone(),
-                    title: safe_meta.title.clone(),
-                    state: ObservationCallState::Running,
-                    actor: Some(actor.clone()),
-                    executor: None,
-                    usage: None,
-                    delivery: Vec::new(),
-                    summary: Some(safe_meta.safe_summary.clone()),
-                },
-            );
+            if journal_observation {
+                let _ = append_journal_record(
+                    &plans_dir,
+                    &ObservationJournalRecord {
+                        record_id: generate_observation_id("obsrec"),
+                        request_id: request_id.clone(),
+                        parent_request_id: safe_meta.parent_request_id.clone(),
+                        call_id: None,
+                        phase: ObservationRecordPhase::Entry,
+                        at_ms: started_at_ms,
+                        pid: Some(std::process::id()),
+                        process_instance: current_process_instance(),
+                        project_label: Some(project_label.clone()),
+                        project_path: project_path.clone(),
+                        binding_id: Some(validated.binding_id.clone()),
+                        thread_uuid: Some(validated.thread_uuid.clone()),
+                        thread_label: None,
+                        job_id: None,
+                        plan_id: safe_meta.plan_id.clone(),
+                        task_id: safe_meta.task_id.clone(),
+                        approval_id: safe_meta.approval_id.clone(),
+                        operation: safe_meta.operation.clone(),
+                        title: safe_meta.title.clone(),
+                        state: ObservationCallState::Running,
+                        actor: Some(actor.clone()),
+                        executor: None,
+                        usage: None,
+                        delivery: Vec::new(),
+                        summary: Some(safe_meta.safe_summary.clone()),
+                    },
+                );
+            }
 
             let sibling_exe = match resolve_sibling_executable(&validated.current_bin_dir, family) {
                 Ok(exe) => exe,
@@ -879,6 +892,7 @@ async fn run(context_path: &Path, command: ContextCommand) -> Result<ExitCode, O
                         ObservationCallState::Failed,
                         ObservationDeliveryStage::Failed,
                         format!("Pre-dispatch executable validation failed ({})", err.code),
+                        journal_observation,
                     );
                     return Err(err);
                 }
@@ -903,6 +917,7 @@ async fn run(context_path: &Path, command: ContextCommand) -> Result<ExitCode, O
                     ObservationCallState::Failed,
                     ObservationDeliveryStage::Failed,
                     format!("Binding verification failed ({})", err.code),
+                    journal_observation,
                 );
                 return Err(err);
             }
@@ -924,6 +939,7 @@ async fn run(context_path: &Path, command: ContextCommand) -> Result<ExitCode, O
                             ObservationCallState::Completed,
                             ObservationDeliveryStage::ResponseReturned,
                             format!("Completed {}", safe_meta.operation),
+                            journal_observation,
                         );
                     } else {
                         record_forward_finish(
@@ -941,6 +957,7 @@ async fn run(context_path: &Path, command: ContextCommand) -> Result<ExitCode, O
                                 "Command {} exited with non-zero status",
                                 safe_meta.operation
                             ),
+                            journal_observation,
                         );
                     }
                     Ok(code)
@@ -969,6 +986,7 @@ async fn run(context_path: &Path, command: ContextCommand) -> Result<ExitCode, O
                         state,
                         stage,
                         format!("Command {} ended with {}", safe_meta.operation, err.code),
+                        journal_observation,
                     );
                     Err(err)
                 }
@@ -998,7 +1016,11 @@ fn record_forward_finish(
     state: ObservationCallState,
     delivery_stage: ObservationDeliveryStage,
     summary_text: String,
+    journal_observation: bool,
 ) {
+    if !journal_observation {
+        return;
+    }
     let finished_at_ms = current_observation_time_ms();
     let _ = append_journal_record(
         plans_dir,
@@ -1394,6 +1416,10 @@ fn build_child_args(
     args.push(OsString::from(&validated.binding_id));
     args.push(OsString::from("--thread"));
     args.push(OsString::from(&validated.thread_uuid));
+    if family == ChildFamily::Flow {
+        args.push(OsString::from("--project-root"));
+        args.push(validated.project_root.as_os_str().to_os_string());
+    }
 
     for arg in inner_args {
         args.push(OsString::from(arg));
@@ -1857,5 +1883,57 @@ mod tests {
                 OsString::from("--refresh"),
             ]
         );
+
+        let flow_args = build_child_args(
+            &validated,
+            ChildFamily::Flow,
+            &[
+                "external-resolution".to_string(),
+                "inspect".to_string(),
+            ],
+        );
+        assert_eq!(
+            flow_args,
+            vec![
+                OsString::from("--state-dir"),
+                OsString::from("/abs/stores/state"),
+                OsString::from("--registry-dir"),
+                OsString::from("/abs/stores/registry"),
+                OsString::from("--plans-dir"),
+                OsString::from("/abs/stores/plans"),
+                OsString::from("--authority-dir"),
+                OsString::from("/abs/stores/authority"),
+                OsString::from("--sessions-dir"),
+                OsString::from("/abs/stores/sessions"),
+                OsString::from("--binding"),
+                OsString::from("bnd_123"),
+                OsString::from("--thread"),
+                OsString::from("0196ed00-0000-7000-8000-0000000000a1"),
+                OsString::from("--project-root"),
+                OsString::from("/abs/project"),
+                OsString::from("external-resolution"),
+                OsString::from("inspect"),
+            ]
+        );
+    }
+
+    #[test]
+    fn external_resolution_forwarding_is_exempt_from_context_journaling() {
+        assert!(is_external_resolution_family(
+            ChildFamily::Flow,
+            &["external-resolution".to_string(), "inspect".to_string()]
+        ));
+        assert!(is_external_resolution_family(
+            ChildFamily::Flow,
+            &["external_resolution".to_string(), "preview".to_string()]
+        ));
+        assert!(!is_external_resolution_family(
+            ChildFamily::Flow,
+            &["grant-list".to_string()]
+        ));
+        assert!(!is_external_resolution_family(
+            ChildFamily::Session,
+            &["external-resolution".to_string()]
+        ));
     }
 }

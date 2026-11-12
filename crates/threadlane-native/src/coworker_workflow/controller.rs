@@ -742,6 +742,9 @@ impl CoworkerControllerService {
             }
         };
 
+        let ledger = self
+            .workflow_store
+            .read_binding_ledger(&admission.job.binding_id)?;
         for task in &admission.job.tasks {
             let Some(approved_task) = admission
                 .approval
@@ -752,6 +755,12 @@ impl CoworkerControllerService {
                 continue;
             };
             if approved_task.provider.is_none() && !approved_task.is_frozen_headless_worker() {
+                continue;
+            }
+            if self
+                .external_resolution_blocks_task_dispatch(&ledger, &admission.job, &task.task_id)
+                .is_some()
+            {
                 continue;
             }
             if receipts.iter().any(|r| r.task_id == task.task_id)
@@ -777,6 +786,34 @@ impl CoworkerControllerService {
         }
 
         Ok(false)
+    }
+
+    fn external_resolution_blocks_task_dispatch(
+        &self,
+        ledger: &CoworkerBindingLedger,
+        job: &CoworkerJobRecord,
+        task_id: &str,
+    ) -> Option<crate::dispatch_guard::ExternalResolutionDispatchBlock> {
+        let target_plan_id = job
+            .planning_result
+            .as_ref()
+            .map(|planning| planning.plan_id.as_str())
+            .or_else(|| {
+                job.approval_linkage
+                    .as_ref()
+                    .map(|linkage| linkage.plan_id.as_str())
+            });
+        let target_approval_id = job
+            .approval_linkage
+            .as_ref()
+            .map(|linkage| linkage.approval_id.as_str());
+        crate::dispatch_guard::external_resolution_blocks_task(
+            ledger,
+            Some(&job.job_id),
+            target_plan_id,
+            target_approval_id,
+            task_id,
+        )
     }
 
     #[inline(never)]
@@ -869,6 +906,35 @@ impl CoworkerControllerService {
         }
 
         self.verify_planning_provenance_in_ledger(&ledger, &job, &planning_result)?;
+
+        let target_plan_id = job
+            .planning_result
+            .as_ref()
+            .map(|planning| planning.plan_id.as_str())
+            .or_else(|| {
+                job.approval_linkage
+                    .as_ref()
+                    .map(|linkage| linkage.plan_id.as_str())
+            });
+        let target_approval_id = job
+            .approval_linkage
+            .as_ref()
+            .map(|linkage| linkage.approval_id.as_str());
+        if let Some(block) = crate::dispatch_guard::external_resolution_blocks_full_job(
+            &ledger,
+            Some(&job.job_id),
+            target_plan_id,
+            target_approval_id,
+        ) {
+            return Err(NativeError::new(
+                NativeErrorCode::UnsupportedCapability,
+                format!(
+                    "job `{}` is covered by full-job external resolution receipt `{}`; the receipt is not review, integration, closure, or dependency acceptance, and job advancement requires an explicit replan and reapproval",
+                    job.job_id, block.receipt_id
+                ),
+            ));
+        }
+
         Ok((job, planning_result))
     }
 
@@ -1394,6 +1460,9 @@ impl CoworkerControllerService {
             return Ok(None);
         }
 
+        let ledger = self
+            .workflow_store
+            .read_binding_ledger(&request.binding_id)?;
         for task in &current_adm.job.tasks {
             if task.stage != CoworkerTaskStage::ReadyToDispatch {
                 continue;
@@ -1405,6 +1474,19 @@ impl CoworkerControllerService {
                 &approval.approval_id,
                 self.workflow_store.plans_dir(),
             )? {
+                if !fenced_task_ids.contains(&task.task_id) {
+                    fenced_task_ids.push(task.task_id.clone());
+                }
+                continue;
+            }
+            if self
+                .external_resolution_blocks_task_dispatch(
+                    &ledger,
+                    &current_adm.job,
+                    &task.task_id,
+                )
+                .is_some()
+            {
                 if !fenced_task_ids.contains(&task.task_id) {
                     fenced_task_ids.push(task.task_id.clone());
                 }
@@ -1451,6 +1533,23 @@ impl CoworkerControllerService {
                 NativeErrorCode::ValidationFailed,
                 "controller lease_epoch changed concurrently during reconciliation",
             ));
+        }
+
+        let resolution_ledger = self
+            .workflow_store
+            .read_binding_ledger(&request.binding_id)?;
+        if self
+            .external_resolution_blocks_task_dispatch(
+                &resolution_ledger,
+                &current_adm.job,
+                &approved_task.task_id,
+            )
+            .is_some()
+        {
+            if !fenced_task_ids.contains(&approved_task.task_id) {
+                fenced_task_ids.push(approved_task.task_id.clone());
+            }
+            return Ok(());
         }
 
         // Optional host diagnostics never replace authoritative admission or provider results.
