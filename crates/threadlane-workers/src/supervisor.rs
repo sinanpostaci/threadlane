@@ -1387,7 +1387,8 @@ where
         attempts = attempts.saturating_add(1);
         #[cfg(target_os = "linux")]
         if attempts > 1 {
-            if let Err(err) = revalidate_launch_executable(canonical_executable, expected_identity) {
+            if let Err(err) = revalidate_launch_executable(canonical_executable, expected_identity)
+            {
                 return LaunchAttemptOutcome::Failed(err);
             }
         }
@@ -1403,7 +1404,8 @@ where
                 let Some(backoff) = etxtbsy_retry_delay(attempts, &err) else {
                     return LaunchAttemptOutcome::Failed(WorkerError::Io(err));
                 };
-                if let Some(status) = wait_for_launch_retry(cancel_rx, overall_deadline, backoff).await
+                if let Some(status) =
+                    wait_for_launch_retry(cancel_rx, overall_deadline, backoff).await
                 {
                     return LaunchAttemptOutcome::Aborted(status);
                 }
@@ -3491,8 +3493,7 @@ printf '%s\n' '{{"event":"result","result":{{"status":"SUCCESS","response":"{{\"
             launch_log.display()
         );
         fs::write(&script_path, script).expect("write script");
-        fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700))
-            .expect("chmod script");
+        fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700)).expect("chmod script");
         let mut held_writer = Some(
             fs::OpenOptions::new()
                 .write(true)
@@ -3517,7 +3518,10 @@ printf '%s\n' '{{"event":"result","result":{{"status":"SUCCESS","response":"{{\"
             initial_argv: vec!["alpha".to_string(), "beta".to_string()],
             child_env: vec![
                 ("TL_TEST_ENV".to_string(), "stable".to_string()),
-                ("TL_LAUNCH_LOG".to_string(), launch_log.display().to_string()),
+                (
+                    "TL_LAUNCH_LOG".to_string(),
+                    launch_log.display().to_string(),
+                ),
             ],
             budgets: ExecutionBudgets::default(),
         };
@@ -3619,8 +3623,7 @@ printf '%s' '{}' > "$OUT"
             payload
         );
         fs::write(&script_path, script).expect("write script");
-        fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700))
-            .expect("chmod script");
+        fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700)).expect("chmod script");
         let mut held_writer = Some(
             fs::OpenOptions::new()
                 .write(true)
@@ -3672,9 +3675,7 @@ printf '%s' '{}' > "$OUT"
         .await
         .expect("Codex retry after synchronized writer release");
         assert_eq!(refused_attempts, vec![1]);
-        let structured = collector
-            .expect("Codex capture collector")
-            .finalize(report);
+        let structured = collector.expect("Codex capture collector").finalize(report);
         assert_eq!(structured.execution.status, WorkerRunStatus::Succeeded);
         assert!(
             structured.has_verified_response(),
@@ -3818,7 +3819,10 @@ printf '%s' '{}' > "$OUT"
             None,
         )
         .await;
-        assert_eq!(attempts, 1, "backoff cancellation must prevent another spawn");
+        assert_eq!(
+            attempts, 1,
+            "backoff cancellation must prevent another spawn"
+        );
         assert!(matches!(
             outcome,
             LaunchAttemptOutcome::Aborted(WorkerRunStatus::Cancelled)

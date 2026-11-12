@@ -1571,12 +1571,9 @@ printf '%s\n' '{"event":"result","result":{"status":"SUCCESS","response":"{\"ok\
     };
 
     let started = std::time::Instant::now();
-    let err = run_advisory_worker_with_structured_result(
-        &spec,
-        AdvisoryResponseBudget::default(),
-    )
-    .await
-    .expect_err("a held writable executable must exhaust bounded ETXTBSY retries");
+    let err = run_advisory_worker_with_structured_result(&spec, AdvisoryResponseBudget::default())
+        .await
+        .expect_err("a held writable executable must exhaust bounded ETXTBSY retries");
     assert!(
         started.elapsed() < std::time::Duration::from_secs(2),
         "ETXTBSY retry exhaustion must remain finite"

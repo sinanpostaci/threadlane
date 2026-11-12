@@ -2738,15 +2738,13 @@ exit 0
         .write(true)
         .open(&executable)
         .expect("hold executable open for writing");
-    let spec = sample_codex_advisory_spec(executable, workdir.clone(), "held executable regression");
+    let spec =
+        sample_codex_advisory_spec(executable, workdir.clone(), "held executable regression");
 
     let started = std::time::Instant::now();
-    let err = run_advisory_worker_with_structured_result(
-        &spec,
-        AdvisoryResponseBudget::default(),
-    )
-    .await
-    .expect_err("a held writable executable must exhaust bounded ETXTBSY retries");
+    let err = run_advisory_worker_with_structured_result(&spec, AdvisoryResponseBudget::default())
+        .await
+        .expect_err("a held writable executable must exhaust bounded ETXTBSY retries");
     assert!(
         started.elapsed() < std::time::Duration::from_secs(2),
         "ETXTBSY retry exhaustion must remain finite"
