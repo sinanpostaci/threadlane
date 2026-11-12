@@ -10181,9 +10181,7 @@ fn record_external_resolution(
     request: &threadlane_native::external_resolution::RecordExternalResolutionRequest,
 ) -> threadlane_native::external_resolution::ExternalResolutionReceipt {
     let service = external_resolution_service(fixture);
-    let preview = service
-        .preview(request)
-        .expect("external resolution preview");
+    let preview = service.preview(request).expect("external resolution preview");
     service
         .record(
             request,
@@ -10591,7 +10589,9 @@ async fn external_resolution_record_blocks_direct_dispatch_that_starts_after_the
         "guarded dispatch must wait while the winning record still holds its advancement guard"
     );
 
-    release_tx.send(()).expect("release the post-persist probe");
+    release_tx
+        .send(())
+        .expect("release the post-persist probe");
     let receipt = tokio::time::timeout(Duration::from_secs(5), record_handle)
         .await
         .expect("record should finish after probe release")
@@ -10827,7 +10827,7 @@ async fn external_resolution_full_job_blocks_execution_and_driver_but_preserves_
         .expect("frozen runtime exists");
     let envelope_digest = runtime.envelope.envelope_digest.clone();
 
-    let state_dir = fixture.root.join("execution-gateway-state");
+    let state_dir = fixture._tmp.path().join("execution-gateway-state");
     fs::create_dir_all(&state_dir).expect("create execution gateway state dir");
     fs::set_permissions(&state_dir, fs::Permissions::from_mode(0o700))
         .expect("chmod execution gateway state dir 0700");
@@ -10862,10 +10862,11 @@ async fn external_resolution_full_job_blocks_execution_and_driver_but_preserves_
             job_id: job.job_id.clone(),
         })
         .expect_err("full-job receipt must refuse execution preview");
-    assert_eq!(preview_error.code(), NativeErrorCode::UnsupportedCapability);
-    assert!(preview_error
-        .message()
-        .contains(receipt.receipt_id.as_str()));
+    assert_eq!(
+        preview_error.code(),
+        NativeErrorCode::UnsupportedCapability.as_str()
+    );
+    assert!(preview_error.message().contains(receipt.receipt_id.as_str()));
 
     let start_error = gateway
         .start_execution(&threadlane_native::StartExecutionParams {
@@ -10874,7 +10875,10 @@ async fn external_resolution_full_job_blocks_execution_and_driver_but_preserves_
         })
         .await
         .expect_err("full-job receipt must refuse execution start before owner spawn");
-    assert_eq!(start_error.code(), NativeErrorCode::UnsupportedCapability);
+    assert_eq!(
+        start_error.code(),
+        NativeErrorCode::UnsupportedCapability.as_str()
+    );
     assert!(start_error.message().contains(receipt.receipt_id.as_str()));
 
     let driver = threadlane_native::coworker_driver::CoworkerCodeDriver::open_from_dirs(
@@ -10898,7 +10902,10 @@ async fn external_resolution_full_job_blocks_execution_and_driver_but_preserves_
     .await
     .expect("driver run-owner should refuse promptly")
     .expect_err("full-job receipt must refuse driver run-owner");
-    assert_eq!(run_error.code(), NativeErrorCode::UnsupportedCapability);
+    assert_eq!(
+        run_error.code(),
+        NativeErrorCode::UnsupportedCapability.as_str()
+    );
     assert!(run_error.message().contains(receipt.receipt_id.as_str()));
 
     let ensure_error = tokio::time::timeout(
@@ -10913,7 +10920,10 @@ async fn external_resolution_full_job_blocks_execution_and_driver_but_preserves_
     .await
     .expect("driver ensure should refuse promptly")
     .expect_err("full-job receipt must refuse driver ensure");
-    assert_eq!(ensure_error.code(), NativeErrorCode::UnsupportedCapability);
+    assert_eq!(
+        ensure_error.code(),
+        NativeErrorCode::UnsupportedCapability.as_str()
+    );
     assert!(ensure_error.message().contains(receipt.receipt_id.as_str()));
 
     let status = tokio::time::timeout(
