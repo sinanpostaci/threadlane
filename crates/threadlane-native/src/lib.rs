@@ -206,17 +206,17 @@ pub use execution_gateway::{
     StopExecutionParams, StopExecutionResponse, TRUSTED_LOCAL_HUMAN_APPROVAL_ROUTE,
 };
 pub use external_resolution::{
-    evaluate_receipt_applicability, ReconcileExternalResolutionRequest,
-    RecordExternalResolutionRequest, ExternalResolutionApplicability,
+    evaluate_receipt_applicability, ExternalResolutionApplicability,
     ExternalResolutionConfirmation, ExternalResolutionDurability, ExternalResolutionEvidenceRef,
     ExternalResolutionInspection, ExternalResolutionPreview, ExternalResolutionProjectRef,
     ExternalResolutionReceipt, ExternalResolutionReceiptInspection, ExternalResolutionScope,
     ExternalResolutionService, ExternalResolutionStaleReason, ExternalResolutionTarget,
+    ReconcileExternalResolutionRequest, RecordExternalResolutionRequest,
     EXTERNAL_RESOLUTION_ID_DOMAIN, EXTERNAL_RESOLUTION_INTERFACE_VERSION,
     EXTERNAL_RESOLUTION_PREVIEW_DOMAIN, EXTERNAL_RESOLUTION_RECEIPT_DOMAIN,
     EXTERNAL_RESOLUTION_REQUEST_DOMAIN, EXTERNAL_RESOLUTION_SCHEMA_VERSION,
-    MAX_EXTERNAL_RESOLUTION_EVIDENCE_REFS, MAX_EXTERNAL_RESOLUTION_EXPLANATION_BYTES,
-    MAX_EXTERNAL_RESOLUTION_REFERENCE_BYTES, MAX_EXTERNAL_RESOLUTIONS_PER_BINDING,
+    MAX_EXTERNAL_RESOLUTIONS_PER_BINDING, MAX_EXTERNAL_RESOLUTION_EVIDENCE_REFS,
+    MAX_EXTERNAL_RESOLUTION_EXPLANATION_BYTES, MAX_EXTERNAL_RESOLUTION_REFERENCE_BYTES,
 };
 pub use host_launcher::{
     validate_host_executable_path, ApprovedHostLauncherPolicy, HostLauncherPolicy, NativeMcpCli,

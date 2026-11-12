@@ -12,13 +12,13 @@ use serde_json::json;
 use tempfile::TempDir;
 use threadlane_authority::{ApprovalRecord, AuthorityStore, OperatorApprovalRequest};
 use threadlane_native::coworker_workflow::{
-    deterministic_prefixed_id, sha256_hex, CanonicalProjectBaseRef, CoworkerBindingLedger,
-    CoworkerJobOwnershipKey, CoworkerJobOwnershipStore, CoworkerJobPhase, CoworkerJobRecord,
-    CoworkerLedgerMutationOutcome, CoworkerTaskRecord, CoworkerTaskStage, CoworkerWorkflowStore,
-    ControllerPolicyStore, CreatePlanningGrantRequest, FinalizePlanningCallRequest,
-    FrozenApprovalLinkage, OutboxDispatchKind, OutboxDispatchRecord, OutboxDispatchStatus,
-    PlanningCallBudget, PlanningReadOnlyCapabilities, PlanningReservationStatus,
-    ReservePlanningCallRequest, WorkBrief, WorkBriefKind, CoworkerOwnershipAcquireOutcome,
+    deterministic_prefixed_id, sha256_hex, CanonicalProjectBaseRef, ControllerPolicyStore,
+    CoworkerBindingLedger, CoworkerJobOwnershipKey, CoworkerJobOwnershipStore, CoworkerJobPhase,
+    CoworkerJobRecord, CoworkerLedgerMutationOutcome, CoworkerOwnershipAcquireOutcome,
+    CoworkerTaskRecord, CoworkerTaskStage, CoworkerWorkflowStore, CreatePlanningGrantRequest,
+    FinalizePlanningCallRequest, FrozenApprovalLinkage, OutboxDispatchKind, OutboxDispatchRecord,
+    OutboxDispatchStatus, PlanningCallBudget, PlanningReadOnlyCapabilities,
+    PlanningReservationStatus, ReservePlanningCallRequest, WorkBrief, WorkBriefKind,
 };
 use threadlane_native::error::NativeErrorCode;
 use threadlane_native::external_resolution::{
@@ -86,14 +86,12 @@ fn write_executable_script(path: &Path, body: &str) {
         fs::create_dir_all(parent).expect("create executable parent");
     }
     fs::write(path, body).expect("write executable script");
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-        .expect("chmod executable script");
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).expect("chmod executable script");
 }
 
 fn init_repo(repo: &Path) -> (String, String) {
     fs::create_dir_all(repo.join("src")).expect("create repo src");
-    fs::write(repo.join("src/lib.rs"), "pub fn alpha() -> u32 { 1 }\n")
-        .expect("write src/lib.rs");
+    fs::write(repo.join("src/lib.rs"), "pub fn alpha() -> u32 { 1 }\n").expect("write src/lib.rs");
     for args in [
         &["init", "--quiet"][..],
         &["config", "user.email", "test@threadlane.local"][..],
@@ -622,7 +620,10 @@ fn preview_is_read_only_and_proves_job_scope_without_starting_git_provider_or_ho
         preview.work_brief_digest.as_deref(),
         Some(fixture.job.work_brief_digest.as_str())
     );
-    assert_eq!(preview.plan_id.as_deref(), Some(fixture.plan.plan_id.as_str()));
+    assert_eq!(
+        preview.plan_id.as_deref(),
+        Some(fixture.plan.plan_id.as_str())
+    );
     assert_eq!(preview.plan_revision, Some(fixture.plan.revision));
     assert_eq!(
         preview.approval_id.as_deref(),
@@ -643,7 +644,10 @@ fn preview_is_read_only_and_proves_job_scope_without_starting_git_provider_or_ho
     assert!(!fixture.plans.join("coworker-code-driver").exists());
     assert!(!fixture.plans.join("coworker-planning-commands").exists());
     assert!(!fixture.plans.join("conversation-changes").exists());
-    assert!(!fixture.sessions.join(&fixture.approval.approval_id).exists());
+    assert!(!fixture
+        .sessions
+        .join(&fixture.approval.approval_id)
+        .exists());
     assert!(!fixture.sessions.join(".launch-intents").exists());
     assert!(!fixture.provider_marker.exists());
     assert_eq!(
@@ -652,14 +656,20 @@ fn preview_is_read_only_and_proves_job_scope_without_starting_git_provider_or_ho
     );
 
     let second = service.preview(&request).expect("repeated pure preview");
-    assert_eq!(preview, second, "preview must be deterministic and read-only");
+    assert_eq!(
+        preview, second,
+        "preview must be deterministic and read-only"
+    );
 
     let receipt = service
         .record(&request, &confirmation(&preview))
         .expect("record must not require a live Git repository");
     assert_eq!(receipt.request_key, request.request_key);
     assert!(!fixture.provider_marker.exists());
-    assert!(!fixture.sessions.join(&fixture.approval.approval_id).exists());
+    assert!(!fixture
+        .sessions
+        .join(&fixture.approval.approval_id)
+        .exists());
     assert_eq!(
         fs::read(fixture.repo.join(".git")).expect("read fake .git marker after record"),
         fake_git_marker
@@ -751,7 +761,10 @@ fn record_requires_separate_confirmation_and_appends_one_immutable_receipt() {
     assert_eq!(after.external_resolutions[0], receipt);
 
     assert!(
-        !fixture.sessions.join(&fixture.approval.approval_id).exists(),
+        !fixture
+            .sessions
+            .join(&fixture.approval.approval_id)
+            .exists(),
         "recording must not create a live host session directory"
     );
     assert!(
@@ -797,16 +810,25 @@ fn record_requires_separate_confirmation_and_appends_one_immutable_receipt() {
 
     let plans_after = dir_entries(&fixture.plans);
     let sessions_after_record = dir_entries(&fixture.sessions);
-    let ledger_bytes_after_record =
-        fs::read(fixture.store.ledger_path_for_binding(BINDING).expect("ledger path"))
-            .expect("read ledger bytes");
+    let ledger_bytes_after_record = fs::read(
+        fixture
+            .store
+            .ledger_path_for_binding(BINDING)
+            .expect("ledger path"),
+    )
+    .expect("read ledger bytes");
     let duplicate = service
         .record(&request, &confirmation(&preview))
         .expect("exact idempotent replay");
     assert_eq!(duplicate, receipt);
     assert_eq!(
-        fs::read(fixture.store.ledger_path_for_binding(BINDING).expect("ledger path"))
-            .expect("reread ledger bytes"),
+        fs::read(
+            fixture
+                .store
+                .ledger_path_for_binding(BINDING)
+                .expect("ledger path")
+        )
+        .expect("reread ledger bytes"),
         ledger_bytes_after_record,
         "exact duplicate replay must not rewrite the ledger"
     );
@@ -824,8 +846,13 @@ fn record_requires_separate_confirmation_and_appends_one_immutable_receipt() {
         .expect_err("request_key conflict must be rejected");
     assert_eq!(err.code(), NativeErrorCode::ValidationFailed.as_str());
     assert_eq!(
-        fs::read(fixture.store.ledger_path_for_binding(BINDING).expect("ledger path"))
-            .expect("reread ledger bytes after conflict"),
+        fs::read(
+            fixture
+                .store
+                .ledger_path_for_binding(BINDING)
+                .expect("ledger path")
+        )
+        .expect("reread ledger bytes after conflict"),
         ledger_bytes_after_record
     );
 
@@ -851,8 +878,13 @@ fn record_requires_separate_confirmation_and_appends_one_immutable_receipt() {
     assert_eq!(err.code(), NativeErrorCode::ValidationFailed.as_str());
     assert!(err.message().contains("append-only"));
     assert_eq!(
-        fs::read(fixture.store.ledger_path_for_binding(BINDING).expect("ledger path"))
-            .expect("reread ledger bytes after append-only failures"),
+        fs::read(
+            fixture
+                .store
+                .ledger_path_for_binding(BINDING)
+                .expect("ledger path")
+        )
+        .expect("reread ledger bytes after append-only failures"),
         ledger_bytes_after_record
     );
 }
@@ -975,7 +1007,9 @@ fn legacy_plan_requires_unique_verified_approval_and_supports_full_task_scope() 
         .record(&request, &confirmation(&preview))
         .expect("record legacy receipt");
     assert_eq!(receipt.target, request.target);
-    let inspection = service.inspect(BINDING, THREAD).expect("inspect legacy receipt");
+    let inspection = service
+        .inspect(BINDING, THREAD)
+        .expect("inspect legacy receipt");
     assert_eq!(inspection.receipts.len(), 1);
     assert_eq!(
         inspection.receipts[0].applicability,
@@ -1074,7 +1108,9 @@ fn receipt_capacity_is_enforced_without_creating_lock_or_journal_state() {
         .preview(&request)
         .expect_err("capacity must reject preview");
     assert_eq!(err.code(), NativeErrorCode::ValidationFailed.as_str());
-    assert!(err.message().contains("MAX_EXTERNAL_RESOLUTIONS_PER_BINDING"));
+    assert!(err
+        .message()
+        .contains("MAX_EXTERNAL_RESOLUTIONS_PER_BINDING"));
     assert_eq!(dir_entries(&fixture.plans), plans_before);
     assert_eq!(
         fixture
@@ -1502,7 +1538,9 @@ fn unrelated_appends_keep_receipts_applicable_while_target_changes_preserve_stal
         .expect("record receipt two");
     assert_ne!(receipt_one.receipt_id, receipt_two.receipt_id);
 
-    let inspection = service.inspect(BINDING, THREAD).expect("inspect two receipts");
+    let inspection = service
+        .inspect(BINDING, THREAD)
+        .expect("inspect two receipts");
     assert_eq!(inspection.receipts.len(), 2);
     assert_eq!(
         inspection.receipts[0].applicability,
@@ -1599,7 +1637,10 @@ fn stale_preview_after_competing_append_is_rejected_without_a_second_receipt() {
         .expect("ledger after competing append");
     assert_eq!(ledger.ledger_revision, 2);
     assert_eq!(ledger.external_resolutions.len(), 1);
-    assert_eq!(ledger.external_resolutions[0].request_key, request_a.request_key);
+    assert_eq!(
+        ledger.external_resolutions[0].request_key,
+        request_a.request_key
+    );
 }
 
 #[test]
@@ -1643,7 +1684,10 @@ fn restart_and_injected_persist_failure_are_reconciled_without_blind_retry_or_re
         replay.code(),
         NativeErrorCode::PersistenceUncertain.as_str()
     );
-    assert_eq!(fs::read(&ledger_path).expect("ledger bytes after replay"), ledger_bytes);
+    assert_eq!(
+        fs::read(&ledger_path).expect("ledger bytes after replay"),
+        ledger_bytes
+    );
     assert_eq!(dir_entries(&fixture.plans), plans_before);
 
     let wrong = second_service
@@ -1684,7 +1728,10 @@ fn restart_and_injected_persist_failure_are_reconciled_without_blind_retry_or_re
             .ledger_revision,
         2
     );
-    assert_eq!(fs::read(&ledger_path).expect("ledger bytes after reconcile"), ledger_bytes);
+    assert_eq!(
+        fs::read(&ledger_path).expect("ledger bytes after reconcile"),
+        ledger_bytes
+    );
 
     let request_two = job_request(
         &fixture,
@@ -1694,13 +1741,12 @@ fn restart_and_injected_persist_failure_are_reconciled_without_blind_retry_or_re
         Some(1),
     );
     let preview_two = second_service.preview(&request_two).expect("preview two");
-    let failing_service = service(&fixture).with_post_persist_probe(
-        |_: &Path| -> Result<(), NativeError> {
+    let failing_service =
+        service(&fixture).with_post_persist_probe(|_: &Path| -> Result<(), NativeError> {
             Err(NativeError::persistence_uncertain(
                 "injected post-persist durability failure",
             ))
-        },
-    );
+        });
     let failed = failing_service
         .record(&request_two, &confirmation(&preview_two))
         .expect_err("post-persist probe failure must surface uncertainty");
@@ -1812,4 +1858,3 @@ fn tampered_persisted_receipt_fails_closed_and_preserves_tampered_bytes() {
         .expect_err("preview on tampered ledger must fail closed");
     assert_eq!(err.code(), NativeErrorCode::ProtocolError.as_str());
 }
-

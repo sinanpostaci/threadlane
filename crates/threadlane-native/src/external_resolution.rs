@@ -220,7 +220,9 @@ impl ExternalResolutionScope {
                 for tid in task_ids {
                     validate_bounded_identifier(tid, "scope.task_id", MAX_COWORKER_ID_LEN)?;
                     if !seen.insert(tid.as_str()) {
-                        return Err(invalid("scope.task_ids must not contain duplicate task IDs"));
+                        return Err(invalid(
+                            "scope.task_ids must not contain duplicate task IDs",
+                        ));
                     }
                 }
                 Ok(())
@@ -817,7 +819,10 @@ impl ExternalResolutionReceipt {
             }
         }
         for (opt_digest, field) in [
-            (self.work_brief_digest.as_deref(), "receipt.work_brief_digest"),
+            (
+                self.work_brief_digest.as_deref(),
+                "receipt.work_brief_digest",
+            ),
             (self.plan_digest.as_deref(), "receipt.plan_digest"),
             (
                 self.approval_subject_digest.as_deref(),
@@ -1120,10 +1125,7 @@ impl ExternalResolutionService {
     /// Installs a deterministic post-persist durability probe for fault-injection tests.
     #[doc(hidden)]
     #[must_use]
-    pub fn with_post_persist_probe(
-        mut self,
-        probe: fn(&Path) -> Result<(), NativeError>,
-    ) -> Self {
+    pub fn with_post_persist_probe(mut self, probe: fn(&Path) -> Result<(), NativeError>) -> Self {
         self.post_persist_probe = Some(probe);
         self
     }
@@ -1142,7 +1144,8 @@ impl ExternalResolutionService {
     ) -> Result<ExternalResolutionPreview, NativeError> {
         request.validate()?;
         let normalized = request.normalized();
-        let canonical_repo = verify_canonical_git_repo_dir_readonly(&normalized.canonical_repo_root)?;
+        let canonical_repo =
+            verify_canonical_git_repo_dir_readonly(&normalized.canonical_repo_root)?;
 
         let ledger = self.workflow.read_binding_ledger(&normalized.binding_id)?;
         if let Some(ref pinned_thread) = ledger.thread_uuid {
@@ -1202,7 +1205,10 @@ impl ExternalResolutionService {
         )?;
         self.verify_conversation_changes_unblocked_readonly(
             &normalized.binding_id,
-            resolved.bound_approval.as_ref().map(|a| a.approval_id.as_str()),
+            resolved
+                .bound_approval
+                .as_ref()
+                .map(|a| a.approval_id.as_str()),
             &resolved.resolved_task_ids,
         )?;
         if let Some(ref approval) = resolved.bound_approval {
@@ -1227,7 +1233,9 @@ impl ExternalResolutionService {
         request.validate()?;
         let normalized = request.normalized();
         let request_digest = compute_request_digest(&normalized)?;
-        let ledger_path = self.workflow.ledger_path_for_binding(&normalized.binding_id)?;
+        let ledger_path = self
+            .workflow
+            .ledger_path_for_binding(&normalized.binding_id)?;
 
         // Fast pure read-only duplicate / key-conflict / uncertain-durability check before any lock or dir creation.
         let initial_ledger = self.workflow.read_binding_ledger(&normalized.binding_id)?;
@@ -1459,9 +1467,9 @@ impl ExternalResolutionService {
                 ExternalResolutionDurability::PersistenceUncertain
             };
             let runtime_for_job = match &receipt.target {
-                ExternalResolutionTarget::Job { job_id } => {
-                    self.controller.get_job_runtime_readonly(binding_id, job_id)?
-                }
+                ExternalResolutionTarget::Job { job_id } => self
+                    .controller
+                    .get_job_runtime_readonly(binding_id, job_id)?,
                 ExternalResolutionTarget::LegacyPlan { .. }
                 | ExternalResolutionTarget::CommitOnly { .. } => None,
             };
@@ -1624,7 +1632,9 @@ impl ExternalResolutionService {
                     .jobs
                     .iter()
                     .find(|j| &j.job_id == job_id)
-                    .ok_or_else(|| invalid("target job_id does not exist in CoworkerBindingLedger"))?;
+                    .ok_or_else(|| {
+                        invalid("target job_id does not exist in CoworkerBindingLedger")
+                    })?;
                 if job.binding_id != request.binding_id || job.thread_uuid != request.thread_uuid {
                     return Err(NativeError::new(
                         NativeErrorCode::SecurityViolation,
@@ -1632,10 +1642,9 @@ impl ExternalResolutionService {
                     ));
                 }
                 if job.phase == CoworkerJobPhase::Cancelled
-                    || ledger
-                        .jobs
-                        .iter()
-                        .any(|other| other.supersedes_job_id.as_deref() == Some(job.job_id.as_str()))
+                    || ledger.jobs.iter().any(|other| {
+                        other.supersedes_job_id.as_deref() == Some(job.job_id.as_str())
+                    })
                 {
                     return Err(invalid(
                         "superseded CoworkerJobRecord cannot record a new external resolution",
@@ -1656,8 +1665,7 @@ impl ExternalResolutionService {
 
                 verify_job_quiescent(job)?;
 
-                let job_repo =
-                    PathBuf::from(job.work_brief.project_base.repository_path.as_str());
+                let job_repo = PathBuf::from(job.work_brief.project_base.repository_path.as_str());
                 if job_repo != canonical_repo {
                     return Err(invalid(
                         "request.canonical_repo_root does not match job.work_brief.project_base.repository_path",
@@ -1743,8 +1751,12 @@ impl ExternalResolutionService {
                     let plan_rev = plans
                         .iter()
                         .find(|p| p.plan_id == pr.plan_id && p.revision == pr.plan_revision)
-                        .ok_or_else(|| invalid("job.planning_result plan revision is missing from PlanStore"))?;
-                    if plan_rev.binding_id != request.binding_id || !plan_rev.status.is_active_published() {
+                        .ok_or_else(|| {
+                            invalid("job.planning_result plan revision is missing from PlanStore")
+                        })?;
+                    if plan_rev.binding_id != request.binding_id
+                        || !plan_rev.status.is_active_published()
+                    {
                         return Err(invalid(
                             "job.planning_result plan revision is no longer active-published in PlanStore",
                         ));
@@ -2016,11 +2028,8 @@ impl ExternalResolutionService {
         NativeError,
     > {
         let clean = prepare_private_dir(&self.commands_dir, "planning_commands_dir")?;
-        let store = PlanningCommandStore::open_existing(
-            &clean,
-            self.workflow.clone(),
-            &self.registry_dir,
-        )?;
+        let store =
+            PlanningCommandStore::open_existing(&clean, self.workflow.clone(), &self.registry_dir)?;
         store.acquire_binding_lock_and_read_ledger(binding_id)
     }
 
@@ -2174,15 +2183,14 @@ impl ExternalResolutionService {
             Ok(_) => {
                 let session_dir = verify_existing_session_dir(&sessions_dir, &approval.approval_id)
                     .map_err(map_host_error)?;
-                let lock =
-                    HostSessionLock::acquire(&session_dir, &approval.approval_id).map_err(|e| {
-                        match e {
-                            HostError::LockBusy { .. } => invalid(
-                                "live ApprovedHost session lock is currently held for this approval",
-                            ),
-                            other => map_host_error(other),
-                        }
-                    })?;
+                let lock = HostSessionLock::acquire(&session_dir, &approval.approval_id).map_err(
+                    |e| match e {
+                        HostError::LockBusy { .. } => invalid(
+                            "live ApprovedHost session lock is currently held for this approval",
+                        ),
+                        other => map_host_error(other),
+                    },
+                )?;
                 verify_stopped_host_session_contents(&session_dir, approval)?;
                 Some(lock)
             }
@@ -2660,13 +2668,12 @@ fn verify_planning_command_ledger_quiescent(
 fn verify_job_quiescent(job: &CoworkerJobRecord) -> Result<(), NativeError> {
     for outbox in &job.outbox {
         if outbox.status.blocks_replay_and_new_dispatch() {
-            let code = if outbox.status
-                == crate::coworker_workflow::OutboxDispatchStatus::EffectUnknown
-            {
-                NativeErrorCode::AmbiguousWakeupPendingReconciliation
-            } else {
-                NativeErrorCode::ValidationFailed
-            };
+            let code =
+                if outbox.status == crate::coworker_workflow::OutboxDispatchStatus::EffectUnknown {
+                    NativeErrorCode::AmbiguousWakeupPendingReconciliation
+                } else {
+                    NativeErrorCode::ValidationFailed
+                };
             return Err(NativeError::new(
                 code,
                 "cannot record external resolution while an unresolved outbox record exists on the job",
@@ -2674,9 +2681,7 @@ fn verify_job_quiescent(job: &CoworkerJobRecord) -> Result<(), NativeError> {
         }
     }
     for task in &job.tasks {
-        if task.unresolved_outbox_id.is_some()
-            || task.stage == CoworkerTaskStage::EffectUnknown
-        {
+        if task.unresolved_outbox_id.is_some() || task.stage == CoworkerTaskStage::EffectUnknown {
             return Err(NativeError::new(
                 NativeErrorCode::AmbiguousWakeupPendingReconciliation,
                 "cannot record external resolution while a task is in EffectUnknown or has an unresolved outbox record",
@@ -2765,9 +2770,9 @@ fn verify_stopped_host_session_contents(
                 .map_err(map_host_error)?
         {
             for intent in &pending_intents {
-                let sealed = receipts.iter().any(|r| {
-                    r.task_id == intent.task_id && r.command_key == intent.command_key
-                });
+                let sealed = receipts
+                    .iter()
+                    .any(|r| r.task_id == intent.task_id && r.command_key == intent.command_key);
                 if !sealed {
                     return Err(NativeError::new(
                         NativeErrorCode::AmbiguousWakeupPendingReconciliation,
@@ -2953,7 +2958,9 @@ fn validate_clean_bounded_text(
     Ok(())
 }
 
-fn compute_request_digest(normalized: &RecordExternalResolutionRequest) -> Result<String, NativeError> {
+fn compute_request_digest(
+    normalized: &RecordExternalResolutionRequest,
+) -> Result<String, NativeError> {
     let bytes = serialize_bounded(
         &(EXTERNAL_RESOLUTION_REQUEST_DOMAIN, normalized),
         "external resolution request digest",
