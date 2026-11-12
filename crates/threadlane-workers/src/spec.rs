@@ -31,7 +31,8 @@ pub use crate::permissions::{
 };
 use crate::permissions::{
     build_antigravity_task_files_prompt_for_scopes,
-    build_antigravity_task_files_settings_json_for_scopes, validate_permission_pattern_path,
+    build_antigravity_task_files_settings_json_for_scopes, build_opencode_task_files_prompt,
+    validate_permission_pattern_path,
 };
 
 /// Default execution timeout (5 minutes in milliseconds).
@@ -567,7 +568,11 @@ impl WorkerSpec {
     /// injects `--settings <inline-json>` scoped to `working_directory` (granting descendant `/**`
     /// rules only for [`WriteScopeKind::DirectorySubtree`] scopes and exact-only rules for
     /// [`WriteScopeKind::ExactFile`] scopes), and prepends a session-local `task_files` execution
-    /// contract ahead of the verbatim task instruction in the `--print` argument.
+    /// contract ahead of the verbatim task instruction in the `--print` argument. For
+    /// [`WorkerProvider::OpenCodeV2`] with [`WorkerFilePermissions::TaskFiles`], validates the
+    /// per-child configuration and, for an owned checkout inside `work_area_root`, prepends a
+    /// session-local OpenCode `task_files` contract with the actual `working_directory` and
+    /// declared write scopes ahead of the verbatim prompt.
     /// [`WorkerFilePermissions::ReadOnly`] is rejected on [`WorkerSpec`] and must use
     /// [`AdvisoryWorkerSpec::build_argv_for_workdir`].
     pub fn build_argv_for_workdir(
@@ -603,9 +608,26 @@ impl WorkerSpec {
                         .to_string(),
                 ));
             }
-            (WorkerProvider::OpenCodeV2, _) => {
+            (WorkerProvider::OpenCodeV2, opencode_file_permissions) => {
                 let _ = self.build_opencode_config_for_workdir(&canonical_workdir)?;
-                (None, None)
+                let effective_prompt = match opencode_file_permissions {
+                    WorkerFilePermissions::TaskFiles => {
+                        // Only an owned checkout inside the validated task work area is an actual
+                        // task worktree; other directories keep the legacy bare-prompt behavior.
+                        let is_owned_task_worktree = canonical_workdir
+                            .strip_prefix(&report.work_area_root)
+                            .is_ok_and(|relative| !relative.as_os_str().is_empty());
+                        is_owned_task_worktree.then(|| {
+                            build_opencode_task_files_prompt(
+                                &canonical_workdir,
+                                &self.allowed_write_paths,
+                                &self.prompt,
+                            )
+                        })
+                    }
+                    WorkerFilePermissions::Inherit | WorkerFilePermissions::ReadOnly => None,
+                };
+                (None, effective_prompt)
             }
             (WorkerProvider::CodexCli, WorkerFilePermissions::TaskFiles) => {
                 let resolved_write_scopes = crate::git::resolve_allowed_write_scopes_at_base(

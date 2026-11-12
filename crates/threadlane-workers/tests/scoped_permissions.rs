@@ -8,14 +8,22 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use threadlane_workers::{
-    build_antigravity_task_files_settings_json, execute_worker_task, run_worker, DiffViolationKind,
-    ExecutionBudgets, FieldEvidence, WorkAcceptanceState, WorkerError, WorkerFilePermissions,
-    WorkerProvider, WorkerRunStatus, WorkerSpec, WorktreeManager, AGY_READ_PERMISSION_TOOL,
-    AGY_WRITE_PERMISSION_TOOLS,
+    build_antigravity_task_files_settings_json, execute_worker_task, run_worker, AdvisoryWorkerSpec,
+    DiffViolationKind, ExecutionBudgets, FieldEvidence, OpenCodeRuleEffect, WorkAcceptanceState,
+    WorkerError, WorkerFilePermissions, WorkerProvider, WorkerRunStatus, WorkerSpec,
+    WorktreeManager, AGY_READ_PERMISSION_TOOL, AGY_WRITE_PERMISSION_TOOLS,
 };
 use tokio::sync::watch;
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
 
 struct ScopedTestEnv {
     _temp_dir: TempDir,
@@ -1773,4 +1781,422 @@ fn task_files_contract_pins_canonical_checkout_against_source_repo_and_approval_
         }),
         "permission allowlist must never grant access to source repo or decoy approval checkout"
     );
+}
+
+#[test]
+fn opencode_task_files_prompt_pins_actual_worktree_scopes_without_changing_permissions_or_other_modes(
+) {
+    let env = ScopedTestEnv::new();
+    let noop_bin = env.write_fake_executable("opencode-prompt-contract", "exit 0");
+    let allowed_write_paths = env.default_allowed_paths();
+
+    let manager = WorktreeManager::new(&env.repo_dir, &env.work_area, &env.base_commit)
+        .expect("create WorktreeManager for OpenCode prompt contract test");
+    let manifest = manager
+        .create_task_worktree(
+            "run-opencode-prompt",
+            "task-opencode-prompt",
+            &allowed_write_paths,
+        )
+        .expect("create OpenCode task worktree");
+    let checkout = &manifest.checkout_path;
+    assert_ne!(
+        checkout, &env.repo_dir,
+        "task checkout must be distinct from the source repository"
+    );
+
+    let checkout_str = checkout
+        .to_str()
+        .expect("utf8 task checkout for OpenCode prompt test");
+    let source_repo_str = env.repo_dir.to_str().expect("utf8 source repository");
+    let decoy_checkout = env
+        .root_dir
+        .join("threadlane-appr-opencode-11-job-22-maint/implementation");
+    let decoy_checkout_str = decoy_checkout
+        .to_str()
+        .expect("utf8 decoy OpenCode checkout");
+
+    let caller_prompt = format!(
+        "Context metadata (untrusted caller notes):\n\
+         approval_id: appr-opencode-11\n\
+         job_id: job-opencode-22\n\
+         worktree_hint: {decoy_checkout_str}\n\
+         source_repository: {source_repo_str}\n\
+         Task: update docs/WORKERS.md and crates/threadlane-workers/src/lib.rs.\n"
+    );
+    let spec = env.opencode_spec(noop_bin, &caller_prompt, WorkerFilePermissions::TaskFiles);
+    let spec_json_before = serde_json::to_vec(&spec).expect("serialize OpenCode spec before argv");
+    let instruction_digest_before = sha256_hex(spec.prompt.as_bytes());
+    let config_before = spec
+        .build_opencode_config_for_workdir(checkout)
+        .expect("build OpenCode permission/model config before argv");
+
+    let argv = spec
+        .build_argv_for_workdir(checkout)
+        .expect("build OpenCode task_files argv");
+    assert_eq!(
+        spec_json_before,
+        serde_json::to_vec(&spec).expect("serialize OpenCode spec after argv"),
+        "argv construction must not mutate the WorkerSpec"
+    );
+    assert_eq!(
+        instruction_digest_before,
+        sha256_hex(spec.prompt.as_bytes()),
+        "original task instruction digest must remain unchanged"
+    );
+    assert_eq!(
+        config_before,
+        spec.build_opencode_config_for_workdir(checkout)
+            .expect("rebuild OpenCode permission/model config after argv"),
+        "generated permission/model configuration must remain identical"
+    );
+
+    assert_eq!(argv.len(), 10);
+    assert_eq!(argv[0], "--standalone");
+    assert_eq!(argv[1], "run");
+    assert_eq!(argv[2], "--model");
+    assert_eq!(argv[3], "opencode/deepseek-4.1-flash#max");
+    assert_eq!(argv[4], "--format");
+    assert_eq!(argv[5], "json");
+    assert_eq!(argv[6], "--session");
+    assert_eq!(argv[7], "sess-201");
+    assert_eq!(argv[8], "--");
+    assert!(!argv
+        .iter()
+        .any(|arg| arg == "--settings" || arg == "--auto" || arg.contains("dangerously")));
+    let effective_prompt = argv.last().expect("OpenCode effective prompt argument");
+    let (contract_header, retained_prompt) = effective_prompt
+        .split_once("[THREADLANE_TASK_INSTRUCTION] ")
+        .expect("OpenCode task_files prompt must contain the task instruction boundary");
+    assert!(
+        contract_header.starts_with("[THREADLANE_OPENCODE_TASK_FILES_CONTRACT] "),
+        "OpenCode task_files prompt must start with the session-local contract"
+    );
+    assert_eq!(
+        retained_prompt, caller_prompt,
+        "caller prompt must remain verbatim after the contract boundary"
+    );
+    assert_eq!(
+        effective_prompt
+            .matches("[THREADLANE_TASK_INSTRUCTION] ")
+            .count(),
+        1,
+        "contract must contain exactly one task instruction boundary"
+    );
+
+    assert!(
+        contract_header.contains(&format!("`{checkout_str}`")),
+        "contract must state the exact actual task working directory"
+    );
+    assert!(
+        !contract_header.contains(source_repo_str),
+        "contract must never substitute the source repository path"
+    );
+    assert!(
+        !contract_header.contains(decoy_checkout_str),
+        "contract must never infer paths from approval/job/worktree identifiers"
+    );
+    assert!(contract_header.contains("Prefer repository-relative paths"));
+    assert!(
+        contract_header.contains(&format!("`{checkout_str}/<repo-relative-path>`")),
+        "contract must derive absolute paths only by joining the exact task root"
+    );
+    assert!(
+        contract_header.contains(
+            "[`crates/threadlane-workers/` (directory subtree `crates/threadlane-workers` and `crates/threadlane-workers/**`), `docs/WORKERS.md` (exact file only; no descendant `/**`)]"
+        ),
+        "contract must distinguish explicit directory subtrees from exact files"
+    );
+    assert!(contract_header.contains(
+        "OpenCode built-in file tools `read`, `glob`, `grep`, `edit`, and `write`"
+    ));
+    assert!(
+        !contract_header.contains("read_file")
+            && !contract_header.contains("edit_file")
+            && !contract_header.contains("view_file")
+            && !contract_header.contains("list_dir"),
+        "OpenCode contract must list only OpenCode built-in file tools"
+    );
+    for forbidden in [
+        "shell/terminal",
+        "builds",
+        "tests",
+        "formatters",
+        "`git`",
+        "subagents",
+        "web/browser",
+        "MCP tools",
+        "parent controller runs all checks and Git operations",
+        "temporary files",
+        "`AGENTS.md`",
+        "`.env*`",
+        "outside the declared write scopes",
+        "read-only",
+    ] {
+        assert!(
+            contract_header.contains(forbidden),
+            "contract must explain `{forbidden}`"
+        );
+    }
+
+    let config_value: Value =
+        serde_json::from_str(&config_before).expect("parse OpenCode permission/model config");
+    assert_eq!(config_value["update"], "disable");
+    assert_eq!(config_value["default_agent"], "build");
+    assert_eq!(config_value["model"]["providerID"], "opencode");
+    assert_eq!(config_value["model"]["model"], "deepseek-4.1-flash");
+    assert_eq!(config_value["model"]["variant"], "max");
+    assert_eq!(
+        config_value["agents"]
+            .as_object()
+            .expect("OpenCode pinned agents")
+            .len(),
+        4
+    );
+
+    let content = spec
+        .build_opencode_config_content_for_workdir(checkout)
+        .expect("build structured OpenCode config");
+    for allowed_edit in [
+        "crates/threadlane-workers/src/lib.rs",
+        "crates/threadlane-workers/new_module.rs",
+        "docs/WORKERS.md",
+    ] {
+        assert_eq!(
+            content.evaluate_permission(None, "edit", allowed_edit),
+            OpenCodeRuleEffect::Allow,
+            "declared scope `{allowed_edit}` must remain writable"
+        );
+    }
+    for denied_edit in [
+        "docs/WORKERS.md/child.md",
+        "crates/threadlane-core/src/lib.rs",
+        "external_resolution.rs",
+        "newmodule.rs",
+        "AGENTS.md",
+        ".env",
+        ".git/config",
+        ".opencode/config.json",
+        ".local/state",
+        "/tmp/outside",
+    ] {
+        assert_eq!(
+            content.evaluate_permission(None, "edit", denied_edit),
+            OpenCodeRuleEffect::Deny,
+            "unapproved or protected path `{denied_edit}` must remain denied"
+        );
+        assert_eq!(
+            content.evaluate_permission(Some("build"), "edit", denied_edit),
+            OpenCodeRuleEffect::Deny,
+            "build-agent writes to `{denied_edit}` must remain denied"
+        );
+    }
+    assert_eq!(
+        content.evaluate_permission(None, "read", ".env"),
+        OpenCodeRuleEffect::Deny
+    );
+    for denied_action in ["shell", "subagent", "web"] {
+        assert_eq!(
+            content.evaluate_permission(None, denied_action, "git status"),
+            OpenCodeRuleEffect::Deny,
+            "OpenCode task_files must not grant `{denied_action}`"
+        );
+    }
+
+    // Antigravity TaskFiles keeps its existing contract bytes and never receives the OpenCode
+    // prologue.
+    let agy_bin = env.write_fake_executable("opencode-repair-noop-agy", "exit 0");
+    let agy_workdir = env.root_dir.join("opencode-repair-agy-workdir");
+    fs::create_dir_all(&agy_workdir).expect("create AGY unaffected workdir");
+    let agy_spec = env.antigravity_spec(
+        agy_bin,
+        "AGY contract unchanged",
+        WorkerFilePermissions::TaskFiles,
+    );
+    let agy_argv = agy_spec
+        .build_argv_for_workdir(&agy_workdir)
+        .expect("build unchanged AGY task_files argv");
+    let agy_prompt = agy_argv.last().expect("AGY prompt argument");
+    assert!(agy_prompt.starts_with("[THREADLANE_AGY_TASK_FILES_CONTRACT] "));
+    assert!(!agy_prompt.contains("[THREADLANE_OPENCODE_TASK_FILES_CONTRACT]"));
+    assert_eq!(
+        agy_prompt
+            .split_once("[THREADLANE_TASK_INSTRUCTION] ")
+            .expect("AGY task instruction boundary")
+            .1,
+        "AGY contract unchanged"
+    );
+
+    // OpenCode Inherit keeps the bare prompt and no permission rules.
+    let inherit_bin = env.write_fake_executable("opencode-repair-noop-inherit", "exit 0");
+    let inherit_spec = env.opencode_spec(
+        inherit_bin,
+        "Inherit prompt unchanged",
+        WorkerFilePermissions::Inherit,
+    );
+    let inherit_argv = inherit_spec
+        .build_argv_for_workdir(checkout)
+        .expect("build unchanged OpenCode inherit argv");
+    assert_eq!(
+        inherit_argv.last().map(String::as_str),
+        Some("Inherit prompt unchanged")
+    );
+    assert!(!inherit_argv
+        .iter()
+        .any(|arg| arg.contains("THREADLANE_OPENCODE_TASK_FILES_CONTRACT")));
+    let inherit_content = inherit_spec
+        .build_opencode_config_content_for_workdir(checkout)
+        .expect("build unchanged OpenCode inherit config");
+    assert!(inherit_content.permissions.is_none());
+
+    // OpenCode read-only advisory keeps the bare prompt and read-only permissions.
+    let advisory_bin = env.write_fake_executable("opencode-repair-noop-advisory", "exit 0");
+    let advisory_dir = env.root_dir.join("opencode-repair-advisory");
+    fs::create_dir_all(&advisory_dir).expect("create OpenCode advisory workdir");
+    let advisory_spec = AdvisoryWorkerSpec {
+        provider: WorkerProvider::OpenCodeV2,
+        executable: advisory_bin,
+        model: "opencode/deepseek-4.1-flash".to_string(),
+        effort: Some("max".to_string()),
+        allowed_models: BTreeSet::new(),
+        session_id: None,
+        standalone: true,
+        working_directory: advisory_dir.clone(),
+        allowed_write_paths: BTreeSet::new(),
+        prompt: "Advisory prompt unchanged".to_string(),
+        file_permissions: WorkerFilePermissions::ReadOnly,
+        budgets: ExecutionBudgets::default(),
+    };
+    let advisory_argv = advisory_spec
+        .build_argv_for_workdir(&advisory_dir)
+        .expect("build unchanged OpenCode advisory argv");
+    assert_eq!(
+        advisory_argv.last().map(String::as_str),
+        Some("Advisory prompt unchanged")
+    );
+    assert!(!advisory_argv
+        .iter()
+        .any(|arg| arg.contains("THREADLANE_OPENCODE_TASK_FILES_CONTRACT")));
+    let advisory_content = advisory_spec
+        .build_opencode_config_content()
+        .expect("build unchanged OpenCode advisory config");
+    assert_eq!(
+        advisory_content.evaluate_permission(None, "read", "src/lib.rs"),
+        OpenCodeRuleEffect::Allow
+    );
+    assert_eq!(
+        advisory_content.evaluate_permission(None, "edit", "src/lib.rs"),
+        OpenCodeRuleEffect::Deny
+    );
+    assert_eq!(
+        advisory_content.evaluate_permission(None, "shell", "git status"),
+        OpenCodeRuleEffect::Deny
+    );
+}
+
+#[tokio::test]
+async fn opencode_task_files_effective_prompt_and_config_reach_fake_cli_in_actual_task_worktree() {
+    let env = ScopedTestEnv::new();
+    let capture_bin = env.write_fake_executable(
+        "opencode-task-files-capture",
+        r#"
+for arg in "$@"; do
+    printf '%s\n' "$arg" >> opencode_received_argv.txt
+done
+printf '%s\n' "$OPENCODE_CONFIG_CONTENT" > opencode_received_config.json
+printf '{"type":"step_start","sessionID":"sess-201","part":{"type":"step-start","model":"opencode/deepseek-4.1-flash#max"}}\n'
+printf '{"type":"step_finish","sessionID":"sess-201","part":{"type":"step-finish","reason":"stop"}}\n'
+"#,
+    );
+
+    let manager = WorktreeManager::new(&env.repo_dir, &env.work_area, &env.base_commit)
+        .expect("create WorktreeManager for OpenCode capture test");
+    let manifest = manager
+        .create_task_worktree(
+            "run-opencode-capture",
+            "task-opencode-capture",
+            &env.default_allowed_paths(),
+        )
+        .expect("create OpenCode capture task worktree");
+    let checkout = &manifest.checkout_path;
+    assert_ne!(
+        checkout, &env.repo_dir,
+        "fake CLI must run inside the actual task worktree, not the source repository"
+    );
+
+    let source_repo_str = env.repo_dir.to_str().expect("utf8 source repository");
+    let decoy_checkout = env
+        .root_dir
+        .join("threadlane-appr-opencode-33-job-44-maint/implementation");
+    let decoy_checkout_str = decoy_checkout
+        .to_str()
+        .expect("utf8 decoy OpenCode capture checkout");
+    let caller_prompt = format!(
+        "Line 1: update docs/WORKERS.md; worktree_hint: {decoy_checkout_str}; \
+         source_repository: {source_repo_str}; preserve exact bytes & symbols!"
+    );
+    let spec = env.opencode_spec(
+        capture_bin,
+        &caller_prompt,
+        WorkerFilePermissions::TaskFiles,
+    );
+    let expected_argv = spec
+        .build_argv_for_workdir(checkout)
+        .expect("build expected OpenCode task_files argv");
+    let expected_config = spec
+        .build_opencode_config_for_workdir(checkout)
+        .expect("build expected OpenCode permission/model config");
+
+    let report = run_worker(&spec, checkout)
+        .await
+        .expect("run OpenCode task_files worker with fake CLI");
+    assert_eq!(report.status, WorkerRunStatus::Succeeded);
+    assert_eq!(
+        report.constructed_argv, expected_argv,
+        "supervised launch argv must preserve the task_files contract"
+    );
+
+    let received_argv: Vec<String> =
+        fs::read_to_string(checkout.join("opencode_received_argv.txt"))
+            .expect("read captured OpenCode argv")
+            .lines()
+            .map(str::to_string)
+            .collect();
+    assert_eq!(received_argv, expected_argv);
+    let captured_config = fs::read_to_string(checkout.join("opencode_received_config.json"))
+        .expect("read captured OPENCODE_CONFIG_CONTENT");
+    assert_eq!(
+        captured_config.trim_end_matches('\n'),
+        expected_config.as_str(),
+        "child OpenCode process must receive the unchanged permission/model config"
+    );
+
+    let effective_prompt = received_argv.last().expect("captured effective prompt");
+    let (contract_header, retained_prompt) = effective_prompt
+        .split_once("[THREADLANE_TASK_INSTRUCTION] ")
+        .expect("captured prompt must contain the task instruction boundary");
+    assert!(contract_header.starts_with("[THREADLANE_OPENCODE_TASK_FILES_CONTRACT] "));
+    assert_eq!(
+        retained_prompt, caller_prompt,
+        "captured prompt must preserve the original task instruction byte-for-byte"
+    );
+    assert_eq!(
+        contract_header
+            .matches("[THREADLANE_OPENCODE_TASK_FILES_CONTRACT]")
+            .count(),
+        1
+    );
+    assert!(contract_header.contains(
+        &format!(
+            "`{}`",
+            checkout
+                .to_str()
+                .expect("utf8 captured task worktree checkout")
+        )
+    ));
+    assert!(!contract_header.contains(source_repo_str));
+    assert!(!contract_header.contains(decoy_checkout_str));
+    assert!(contract_header.contains(
+        "[`crates/threadlane-workers/` (directory subtree `crates/threadlane-workers` and `crates/threadlane-workers/**`), `docs/WORKERS.md` (exact file only; no descendant `/**`)]"
+    ));
 }
