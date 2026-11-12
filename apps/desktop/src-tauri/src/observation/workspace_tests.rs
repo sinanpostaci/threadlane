@@ -708,12 +708,9 @@ mod unix_workspace_tests {
         created_at_ms: i64,
     ) -> ApprovalRecord {
         let fixture_model = "fake-legacy-model";
-        let fixture_target = resolve_model_target(
-            WorkerProvider::Antigravity,
-            fixture_model,
-            Some("high"),
-        )
-        .expect("resolve fake legacy Antigravity model target");
+        let fixture_target =
+            resolve_model_target(WorkerProvider::Antigravity, fixture_model, Some("high"))
+                .expect("resolve fake legacy Antigravity model target");
         let approved_set: BTreeSet<&str> = approved_task_ids.iter().map(String::as_str).collect();
         let approved_tasks: Vec<ApprovedTaskRecord> = published
             .tasks
