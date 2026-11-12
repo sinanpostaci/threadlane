@@ -1054,7 +1054,7 @@ mod unix_workspace_tests {
         let runtime_dir = session_dir.join(RUNTIME_STATE_SUBDIR);
         make_private_dir(&runtime_dir);
         let mut core =
-            Core::open(&runtime_dir.join("state.db")).expect("open legacy worker runtime DB");
+            Core::open(runtime_dir.join("state.db")).expect("open legacy worker runtime DB");
         let binding = core
             .create_binding(thread_uuid, "Legacy worker host fixture")
             .expect("create legacy worker runtime binding");
