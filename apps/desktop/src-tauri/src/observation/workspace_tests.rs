@@ -521,8 +521,7 @@ mod unix_workspace_tests {
 
     fn write_legacy_plan_and_approval_with_tasks(
         stores: &TestStores,
-        binding_id: &str,
-        thread_uuid: &str,
+        (binding_id, thread_uuid): (&str, &str),
         project: &Path,
         plan_id: &str,
         plan_tasks: Vec<PlanTask>,
@@ -576,8 +575,7 @@ mod unix_workspace_tests {
     ) -> (PlanRevision, ApprovalRecord) {
         write_legacy_plan_and_approval_with_tasks(
             stores,
-            binding_id,
-            thread_uuid,
+            (binding_id, thread_uuid),
             project,
             "plan_ws_legacy_01",
             vec![PlanTask {
@@ -788,8 +786,7 @@ mod unix_workspace_tests {
 
     fn write_legacy_worker_plan_and_approval_with_tasks(
         stores: &TestStores,
-        binding_id: &str,
-        thread_uuid: &str,
+        (binding_id, thread_uuid): (&str, &str),
         project: &Path,
         plan_id: &str,
         plan_tasks: Vec<PlanTask>,
@@ -1043,8 +1040,7 @@ mod unix_workspace_tests {
             plan_tasks.iter().map(|task| task.id.clone()).collect();
         let (plan, approval) = write_legacy_worker_plan_and_approval_with_tasks(
             stores,
-            binding_id,
-            thread_uuid,
+            (binding_id, thread_uuid),
             project,
             plan_id,
             plan_tasks,
@@ -2673,9 +2669,42 @@ mod unix_workspace_tests {
         );
 
         let history = super::super::build_legacy_fallback_job_history(&job, None, None);
+        let first_task_attention = history.tasks[0]
+            .current_attention
+            .as_ref()
+            .expect("the first failed legacy task must carry concrete attention");
+        assert_eq!(
+            first_task_attention.kind,
+            WorkspaceAttentionKind::BlockedFailure
+        );
+        assert_eq!(
+            first_task_attention.reason,
+            "A task is recorded as failed or timed out in the legacy observation."
+        );
+        let aggregate_attention = history.current_attention.as_ref().expect(
+            "a NeedsUser fallback without receipts must retain the first residual task attention",
+        );
+        assert_eq!(
+            aggregate_attention, first_task_attention,
+            "the job aggregate must copy the exact existing first task attention"
+        );
+        assert_eq!(
+            aggregate_attention.updated_at_ms,
+            Some(1_700_000_300_000),
+            "the aggregate must retain the fixture's existing transition timestamp"
+        );
+        assert_eq!(aggregate_attention.next_step, None);
         assert!(
-            history.current_attention.is_none(),
-            "task-specific evidence must remain on the task rows"
+            aggregate_attention.blocking_hold_ids.is_empty(),
+            "the aggregate must not invent blocking holds"
+        );
+        assert!(
+            aggregate_attention.blocking_outbox_ids.is_empty(),
+            "the aggregate must not invent unresolved outbox ids"
+        );
+        assert_eq!(
+            aggregate_attention.question_id, None,
+            "the aggregate must not invent a question id"
         );
         for (task_id, expected_status, expected_kind) in [
             (
@@ -2925,8 +2954,7 @@ mod unix_workspace_tests {
         let beta = "task-legacy-beta";
         let (plan, _approval) = write_legacy_plan_and_approval_with_tasks(
             &stores,
-            binding_id,
-            thread_uuid,
+            (binding_id, thread_uuid),
             &project,
             "plan_ws_legacy_subset_01",
             vec![
@@ -3093,8 +3121,7 @@ mod unix_workspace_tests {
         let approved = vec![alpha.to_string(), beta.to_string()];
         let (plan, _approval) = write_legacy_plan_and_approval_with_tasks(
             &stores,
-            binding_id,
-            thread_uuid,
+            (binding_id, thread_uuid),
             &project,
             "plan_ws_legacy_full_01",
             vec![
@@ -3233,8 +3260,7 @@ mod unix_workspace_tests {
         let approved = vec![alpha.to_string(), beta.to_string()];
         let (plan, _approval) = write_legacy_plan_and_approval_with_tasks(
             &stores,
-            binding_id,
-            thread_uuid,
+            (binding_id, thread_uuid),
             &project,
             "plan_ws_legacy_partial_01",
             vec![
@@ -3374,8 +3400,7 @@ mod unix_workspace_tests {
         let gamma = "task-legacy-gamma";
         let (old_plan, old_approval) = write_legacy_plan_and_approval_with_tasks(
             &stores,
-            binding_id,
-            thread_uuid,
+            (binding_id, thread_uuid),
             &project,
             "plan_ws_legacy_stale_01",
             vec![
