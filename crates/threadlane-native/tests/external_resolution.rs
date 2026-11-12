@@ -17,16 +17,15 @@ use threadlane_core::Core;
 use threadlane_host::{HostPhase, HostSessionManifest};
 use threadlane_native::coworker_workflow::{
     deterministic_prefixed_id, sha256_hex, CanonicalProjectBaseRef, ControllerPolicyStore,
-    ControllerRoleExecutionBudget, CoworkerBindingLedger,
-    CoworkerJobOwnershipKey, CoworkerJobOwnershipStore, CoworkerJobPhase, CoworkerJobRecord,
-    CoworkerLedgerMutationOutcome, CoworkerOwnershipAcquireOutcome, CoworkerTaskRecord,
-    CoworkerTaskStage, CoworkerWorkflowStore, CreatePlanningGrantRequest,
-    FinalizePlanningCallRequest, FreezeControllerExecutionEnvelopeRequest, FrozenApprovalLinkage,
-    FrozenCheckCommandSpec, FrozenCheckKind, FrozenControllerCapabilityEnvelope,
-    OutboxDispatchKind, OutboxDispatchRecord, OutboxDispatchStatus, PendingControllerEffect,
-    PendingControllerEffectKind, PendingControllerEffectStatus, PlanningCallBudget,
-    PlanningReadOnlyCapabilities, PlanningReservationStatus, ReservePlanningCallRequest, WorkBrief,
-    WorkBriefKind,
+    ControllerRoleExecutionBudget, CoworkerBindingLedger, CoworkerJobOwnershipKey,
+    CoworkerJobOwnershipStore, CoworkerJobPhase, CoworkerJobRecord, CoworkerLedgerMutationOutcome,
+    CoworkerOwnershipAcquireOutcome, CoworkerTaskRecord, CoworkerTaskStage, CoworkerWorkflowStore,
+    CreatePlanningGrantRequest, FinalizePlanningCallRequest,
+    FreezeControllerExecutionEnvelopeRequest, FrozenApprovalLinkage, FrozenCheckCommandSpec,
+    FrozenCheckKind, FrozenControllerCapabilityEnvelope, OutboxDispatchKind, OutboxDispatchRecord,
+    OutboxDispatchStatus, PendingControllerEffect, PendingControllerEffectKind,
+    PendingControllerEffectStatus, PlanningCallBudget, PlanningReadOnlyCapabilities,
+    PlanningReservationStatus, ReservePlanningCallRequest, WorkBrief, WorkBriefKind,
 };
 use threadlane_native::error::NativeErrorCode;
 use threadlane_native::external_resolution::{
@@ -527,11 +526,7 @@ fn insert_runtime_run_and_worker(
         .expect("insert fixture worker");
 }
 
-fn update_runtime_run_and_worker_status(
-    session_dir: &Path,
-    run_status: &str,
-    worker_status: &str,
-) {
+fn update_runtime_run_and_worker_status(session_dir: &Path, run_status: &str, worker_status: &str) {
     let connection = rusqlite::Connection::open(runtime_database_path(session_dir))
         .expect("open runtime database for fixture status update");
     connection
@@ -644,49 +639,38 @@ fn install_controller_runtime(fixture: &ExternalFixture) -> ControllerPolicyStor
     policy_store
 }
 
-fn set_controller_effect(
-    store: &ControllerPolicyStore,
-    status: PendingControllerEffectStatus,
-) {
+fn set_controller_effect(store: &ControllerPolicyStore, status: PendingControllerEffectStatus) {
     store
-        .mutate_job_runtime_for_operator(
-            BINDING,
-            "job_0123456789abcdef0123456789abcdef",
-            |state| {
-                let job_id = state.job_id.clone();
-                state.pending_effects.insert(
-                    "eff_0123456789abcdef0123456789abcdef".to_string(),
-                    PendingControllerEffect {
-                        effect_id: "eff_0123456789abcdef0123456789abcdef".to_string(),
-                        request_key: "req_external_runtime_effect".to_string(),
-                        job_id,
-                        task_id: Some("task-alpha".to_string()),
-                        attempt_no: Some(1),
-                        kind: PendingControllerEffectKind::CoderDispatch,
-                        status,
-                        subject_digest: HEX64_B.to_string(),
-                        external_correlation_id: None,
-                        created_at_ms: 1_700_000_100_000,
-                        updated_at_ms: 1_700_000_100_000,
-                        diagnostic: Some("fixture controller effect".to_string()),
-                    },
-                );
-                Ok(())
-            },
-        )
+        .mutate_job_runtime_for_operator(BINDING, "job_0123456789abcdef0123456789abcdef", |state| {
+            let job_id = state.job_id.clone();
+            state.pending_effects.insert(
+                "eff_0123456789abcdef0123456789abcdef".to_string(),
+                PendingControllerEffect {
+                    effect_id: "eff_0123456789abcdef0123456789abcdef".to_string(),
+                    request_key: "req_external_runtime_effect".to_string(),
+                    job_id,
+                    task_id: Some("task-alpha".to_string()),
+                    attempt_no: Some(1),
+                    kind: PendingControllerEffectKind::CoderDispatch,
+                    status,
+                    subject_digest: HEX64_B.to_string(),
+                    external_correlation_id: None,
+                    created_at_ms: 1_700_000_100_000,
+                    updated_at_ms: 1_700_000_100_000,
+                    diagnostic: Some("fixture controller effect".to_string()),
+                },
+            );
+            Ok(())
+        })
         .expect("insert controller effect");
 }
 
 fn clear_controller_effects(store: &ControllerPolicyStore) {
     store
-        .mutate_job_runtime_for_operator(
-            BINDING,
-            "job_0123456789abcdef0123456789abcdef",
-            |state| {
-                state.pending_effects.clear();
-                Ok(())
-            },
-        )
+        .mutate_job_runtime_for_operator(BINDING, "job_0123456789abcdef0123456789abcdef", |state| {
+            state.pending_effects.clear();
+            Ok(())
+        })
         .expect("clear controller effects");
 }
 
@@ -2474,7 +2458,9 @@ fn record_reacquires_physical_owner_and_planning_command_guards() {
         None,
         None,
     );
-    let preview = service.preview(&request).expect("preview before held guards");
+    let preview = service
+        .preview(&request)
+        .expect("preview before held guards");
     let ledger_bytes_before = fs::read(
         fixture
             .store
@@ -2564,7 +2550,9 @@ fn record_waits_for_held_conversation_advancement_guard() {
         None,
         None,
     );
-    let preview = service.preview(&request).expect("preview before held guard");
+    let preview = service
+        .preview(&request)
+        .expect("preview before held guard");
     let namespace_dir = make_private_dir(&fixture.plans.join("conversation-changes"));
     let conversation_guard = acquire_cross_process_lock(
         &namespace_dir,
@@ -2633,7 +2621,9 @@ fn concurrent_plan_publication_and_record_linearize_under_plan_store_lock() {
             .lock()
             .map_err(|_| invalid_probe_error())?
             .recv()
-            .map_err(|_| NativeError::persistence_uncertain("plan race probe release disappeared"))?;
+            .map_err(|_| {
+                NativeError::persistence_uncertain("plan race probe release disappeared")
+            })?;
         Ok(())
     });
     let request = job_request(
@@ -2647,7 +2637,8 @@ fn concurrent_plan_publication_and_record_linearize_under_plan_store_lock() {
     let record_confirmation = confirmation(&preview);
     let record_service = service.clone();
     let record_request = request.clone();
-    let record_thread = thread::spawn(move || record_service.record(&record_request, &record_confirmation));
+    let record_thread =
+        thread::spawn(move || record_service.record(&record_request, &record_confirmation));
     probe_rx
         .recv_timeout(Duration::from_secs(10))
         .expect("record reaches post-persist probe with all guards held");
@@ -2710,10 +2701,11 @@ fn concurrent_plan_publication_and_record_linearize_under_plan_store_lock() {
     publisher_thread.join().expect("join publisher thread");
     assert_eq!(receipt.request_key, request.request_key);
 
-    let inspection = service.inspect(BINDING, THREAD).expect("inspect after race");
+    let inspection = service
+        .inspect(BINDING, THREAD)
+        .expect("inspect after race");
     assert_eq!(inspection.receipts.len(), 1);
-    let ExternalResolutionApplicability::Stale { reasons } =
-        &inspection.receipts[0].applicability
+    let ExternalResolutionApplicability::Stale { reasons } = &inspection.receipts[0].applicability
     else {
         panic!("published successor must make the preserved receipt stale");
     };

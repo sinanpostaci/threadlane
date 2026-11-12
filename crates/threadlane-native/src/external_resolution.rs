@@ -53,13 +53,13 @@ use sha2::{Digest, Sha256};
 use threadlane_authority::validation::validate_canonical_thread_uuid;
 use threadlane_authority::{ApprovalRecord, AuthorityStore};
 use threadlane_core::observation::{
-    read_core_state_readonly, ReadonlyCoreStateSnapshot, ObservationJournalError,
+    read_core_state_readonly, ObservationJournalError, ReadonlyCoreStateSnapshot,
 };
 use threadlane_host::{
     read_host_launch_intent_optional, read_host_manifest_optional,
     read_session_task_ledger_recorded_history_readonly, verify_existing_private_dir,
-    verify_existing_session_dir, HostError, HostLaunchIntentLock, HostLaunchIntentStatus, HostPhase,
-    HostSessionLock, HOST_LOCK_FILENAME, LAUNCH_INTENTS_SUBDIR, RUNTIME_STATE_SUBDIR,
+    verify_existing_session_dir, HostError, HostLaunchIntentLock, HostLaunchIntentStatus,
+    HostPhase, HostSessionLock, HOST_LOCK_FILENAME, LAUNCH_INTENTS_SUBDIR, RUNTIME_STATE_SUBDIR,
 };
 use threadlane_workers::{validate_exact_40_hex_sha, validate_sha256_hex_digest};
 use threadlane_workflow::{compile_plan_revision, PlanRevision, PlanStore, RegistryStore};
@@ -2205,14 +2205,15 @@ impl ExternalResolutionService {
             Ok(_) => {
                 let session_dir = verify_existing_session_dir(&sessions_dir, &approval.approval_id)
                     .map_err(map_host_error)?;
-                let lock = HostSessionLock::acquire(&session_dir, &approval.approval_id).map_err(
-                    |e| match e {
+                let lock =
+                    HostSessionLock::acquire(&session_dir, &approval.approval_id).map_err(|e| {
+                        match e {
                         HostError::LockBusy { .. } => invalid(
                             "live ApprovedHost session lock is currently held for this approval",
                         ),
                         other => map_host_error(other),
-                    },
-                )?;
+                    }
+                    })?;
                 verify_stopped_host_session_contents(&session_dir, approval)?;
                 Some(lock)
             }
@@ -2856,12 +2857,7 @@ fn verify_stopped_host_session_contents(
                 "host manifest records a runtime session binding but runtime-state is missing",
             )
         })?;
-        verify_stopped_runtime_quiescence(
-            &runtime_state_dir,
-            approval,
-            sb,
-            &manifest.phase,
-        )?;
+        verify_stopped_runtime_quiescence(&runtime_state_dir, approval, sb, &manifest.phase)?;
         if let Some((pending_intents, receipts)) =
             read_session_task_ledger_recorded_history_readonly(session_dir, approval, sb)
                 .map_err(map_host_error)?
@@ -3023,10 +3019,7 @@ fn verify_runtime_snapshot_scope(
         .iter()
         .filter(|wakeup| wakeup.binding_id == session_binding_id)
         .collect();
-    if snapshot.wakeups.len() != 1
-        || wakeups.len() != 1
-        || wakeups[0].thread_uuid != thread_uuid
-    {
+    if snapshot.wakeups.len() != 1 || wakeups.len() != 1 || wakeups[0].thread_uuid != thread_uuid {
         return Err(NativeError::new(
             NativeErrorCode::SecurityViolation,
             "read-only host runtime wake-up evidence does not uniquely match the recorded session binding and approval thread",
@@ -3040,15 +3033,12 @@ fn verify_runtime_snapshot_terminal(
     phase: &HostPhase,
     approval_id: &str,
 ) -> Result<(), NativeError> {
-    let wakeup = snapshot
-        .wakeups
-        .first()
-        .ok_or_else(|| {
-            NativeError::new(
-                NativeErrorCode::AmbiguousWakeupPendingReconciliation,
-                "read-only host runtime has no wake-up record",
-            )
-        })?;
+    let wakeup = snapshot.wakeups.first().ok_or_else(|| {
+        NativeError::new(
+            NativeErrorCode::AmbiguousWakeupPendingReconciliation,
+            "read-only host runtime has no wake-up record",
+        )
+    })?;
     match wakeup.status.as_str() {
         "idle" | "failed" | "succeeded" | "satisfied_by_ack" => {}
         "pending" | "in_flight" | "submitted" => {
