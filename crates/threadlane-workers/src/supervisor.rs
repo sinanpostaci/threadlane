@@ -14,7 +14,8 @@ use crate::advisory_response::{
 use crate::antigravity_diagnostics::start_owned_capture;
 use crate::error::WorkerError;
 use crate::fs_safety::{
-    ensure_platform_supported, sanitize_and_redact, validate_existing_canonical_dir,
+    ensure_platform_supported, sanitize_and_redact, validate_executable_file,
+    validate_existing_canonical_dir,
 };
 use crate::opencode_collector::{
     self, OpenCodeCollectorContext, OpenCodeCollectorDiagnostic, OpenCodeCollectorError,
@@ -1221,6 +1222,274 @@ struct SupervisedLaunchInputs {
     budgets: ExecutionBudgets,
 }
 
+/// Total Linux spawn attempts, including the first, for the exact transient exec refusal.
+#[cfg(target_os = "linux")]
+const ETXTBSY_MAX_SPAWN_ATTEMPTS: u32 = 3;
+
+/// Short async backoffs between the bounded Linux `ETXTBSY` spawn attempts.
+#[cfg(target_os = "linux")]
+const ETXTBSY_RETRY_BACKOFF_MS: [u64; 2] = [10, 20];
+
+enum LaunchAttemptOutcome {
+    Spawned(Child),
+    Aborted(WorkerRunStatus),
+    Failed(WorkerError),
+}
+
+fn launch_abort_status(
+    cancel_rx: &watch::Receiver<bool>,
+    overall_deadline: tokio::time::Instant,
+) -> Option<WorkerRunStatus> {
+    if *cancel_rx.borrow() {
+        Some(WorkerRunStatus::Cancelled)
+    } else if tokio::time::Instant::now() >= overall_deadline {
+        Some(WorkerRunStatus::TimedOut)
+    } else {
+        None
+    }
+}
+
+async fn wait_for_launch_retry(
+    cancel_rx: &mut watch::Receiver<bool>,
+    overall_deadline: tokio::time::Instant,
+    backoff: Duration,
+) -> Option<WorkerRunStatus> {
+    let retry_sleep = tokio::time::sleep(backoff);
+    tokio::pin!(retry_sleep);
+    let deadline_sleep = tokio::time::sleep_until(overall_deadline);
+    tokio::pin!(deadline_sleep);
+    tokio::select! {
+        biased;
+        () = wait_for_cancellation(cancel_rx) => Some(WorkerRunStatus::Cancelled),
+        () = &mut deadline_sleep => Some(WorkerRunStatus::TimedOut),
+        () = &mut retry_sleep => None,
+    }
+}
+
+/// Returns a bounded retry delay only for Linux's exact numeric exec refusal.
+///
+/// Message text, broad `Io`, and `ErrorKind` alone are never sufficient. Every other error is
+/// returned to the caller immediately, and no retry is attempted after a child is obtained.
+#[cfg(target_os = "linux")]
+fn etxtbsy_retry_delay(attempts: u32, err: &std::io::Error) -> Option<Duration> {
+    if err.raw_os_error() != Some(libc::ETXTBSY) || attempts >= ETXTBSY_MAX_SPAWN_ATTEMPTS {
+        return None;
+    }
+    let index = usize::try_from(attempts.saturating_sub(1)).ok()?;
+    ETXTBSY_RETRY_BACKOFF_MS
+        .get(index)
+        .copied()
+        .map(Duration::from_millis)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn etxtbsy_retry_delay(_attempts: u32, _err: &std::io::Error) -> Option<Duration> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ExecutableIdentity {
+    dev: u64,
+    ino: u64,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    size: u64,
+    mtime: i64,
+    mtime_nsec: i64,
+    ctime: i64,
+    ctime_nsec: i64,
+}
+
+#[cfg(target_os = "linux")]
+fn executable_identity(path: &Path) -> Result<ExecutableIdentity, WorkerError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = std::fs::symlink_metadata(path).map_err(WorkerError::Io)?;
+    if metadata.file_type().is_symlink() {
+        return Err(WorkerError::SecurityViolation(format!(
+            "worker executable `{}` must not be a symlink",
+            path.display()
+        )));
+    }
+    if !metadata.file_type().is_file() {
+        return Err(WorkerError::InvalidSpec(format!(
+            "worker executable `{}` must be a regular file",
+            path.display()
+        )));
+    }
+    Ok(ExecutableIdentity {
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+        mode: metadata.mode(),
+        uid: metadata.uid(),
+        gid: metadata.gid(),
+        size: metadata.size(),
+        mtime: metadata.mtime(),
+        mtime_nsec: metadata.mtime_nsec(),
+        ctime: metadata.ctime(),
+        ctime_nsec: metadata.ctime_nsec(),
+    })
+}
+
+/// Conservative retry-time guard against executable replacement or permission drift.
+///
+/// This metadata comparison is a race check, not a descriptor-atomic exec identity proof.
+#[cfg(target_os = "linux")]
+fn revalidate_launch_executable(
+    path: &Path,
+    expected: ExecutableIdentity,
+) -> Result<(), WorkerError> {
+    let canonical = validate_executable_file(path)?;
+    if canonical != path {
+        return Err(WorkerError::SecurityViolation(format!(
+            "worker executable `{}` changed canonical path before retry",
+            path.display()
+        )));
+    }
+    if executable_identity(path)? != expected {
+        return Err(WorkerError::SecurityViolation(format!(
+            "worker executable `{}` changed identity before retry",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+async fn launch_with_bounded_etxtbsy_retry<S>(
+    mut spawn: S,
+    canonical_executable: &Path,
+    cancel_rx: &mut watch::Receiver<bool>,
+    overall_deadline: tokio::time::Instant,
+    mut on_spawn_error: Option<&mut (dyn FnMut(u32, &std::io::Error) + Send)>,
+) -> LaunchAttemptOutcome
+where
+    S: FnMut() -> std::io::Result<Child>,
+{
+    if let Some(status) = launch_abort_status(cancel_rx, overall_deadline) {
+        return LaunchAttemptOutcome::Aborted(status);
+    }
+    #[cfg(target_os = "linux")]
+    let expected_identity = match executable_identity(canonical_executable) {
+        Ok(identity) => identity,
+        Err(err) => return LaunchAttemptOutcome::Failed(err),
+    };
+    #[cfg(not(target_os = "linux"))]
+    let _ = canonical_executable;
+
+    let mut attempts = 0u32;
+    loop {
+        if let Some(status) = launch_abort_status(cancel_rx, overall_deadline) {
+            return LaunchAttemptOutcome::Aborted(status);
+        }
+        attempts = attempts.saturating_add(1);
+        #[cfg(target_os = "linux")]
+        if attempts > 1 {
+            if let Err(err) = revalidate_launch_executable(canonical_executable, expected_identity) {
+                return LaunchAttemptOutcome::Failed(err);
+            }
+        }
+        if let Some(status) = launch_abort_status(cancel_rx, overall_deadline) {
+            return LaunchAttemptOutcome::Aborted(status);
+        }
+        match spawn() {
+            Ok(child) => return LaunchAttemptOutcome::Spawned(child),
+            Err(err) => {
+                if let Some(observer) = on_spawn_error.as_deref_mut() {
+                    observer(attempts, &err);
+                }
+                let Some(backoff) = etxtbsy_retry_delay(attempts, &err) else {
+                    return LaunchAttemptOutcome::Failed(WorkerError::Io(err));
+                };
+                if let Some(status) = wait_for_launch_retry(cancel_rx, overall_deadline, backoff).await
+                {
+                    return LaunchAttemptOutcome::Aborted(status);
+                }
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn no_child_launch_report(
+    provider: WorkerProvider,
+    canonical_executable: &Path,
+    canonical_workdir: &Path,
+    resolved_model: &ResolvedModelTarget,
+    requested_session_id: Option<String>,
+    allocated_session_id: Option<String>,
+    status: WorkerRunStatus,
+    budgets: &ExecutionBudgets,
+    watchdog: &Arc<Mutex<ProgressWatchdog>>,
+    health: &HealthPublisher,
+    health_requested: bool,
+    start_instant: Instant,
+) -> WorkerExecutionReport {
+    if status == WorkerRunStatus::TimedOut {
+        watchdog
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .poll(budgets.timeout_ms);
+    }
+    let effective_session_id = allocated_session_id
+        .clone()
+        .or_else(|| requested_session_id.clone());
+    let empty_parser = NdjsonStreamParser::new_for_provider(
+        provider,
+        resolved_model.clone(),
+        effective_session_id,
+        budgets.max_events,
+    );
+    let duration_ms = u64::try_from(start_instant.elapsed().as_millis()).unwrap_or(u64::MAX);
+    WorkerExecutionReport {
+        provider,
+        executed_executable: Some(canonical_executable.to_path_buf()),
+        requested_model: resolved_model.clone(),
+        requested_session_id,
+        allocated_session_id,
+        constructed_argv: Vec::new(),
+        working_directory: canonical_workdir.to_path_buf(),
+        status,
+        exit_code: None,
+        signal: None,
+        process_group_id: None,
+        duration_ms,
+        stdout_bytes_captured: 0,
+        stderr_bytes_captured: 0,
+        overflow: None,
+        descendants_terminated_after_exit: false,
+        cleanup_incomplete: false,
+        redacted_stderr_summary: None,
+        dropped_live_events: 0,
+        evidence: empty_parser.finalize(),
+        opencode_metadata: None,
+        opencode_metadata_error: (provider == WorkerProvider::OpenCodeV2)
+            .then(|| status.as_str().to_string()),
+        provider_health: health_requested.then(|| health.finish(duration_ms, false)),
+        progress_watchdog: Some(
+            watchdog
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .snapshot(duration_ms),
+        ),
+    }
+}
+
+async fn finish_no_child_launch_setup(
+    diagnostic_task: &mut Option<crate::antigravity_diagnostics::DiagnosticTask>,
+    codex_last_message_capture: &mut Option<
+        codex_last_message_capture::OwnedCodexLastMessageCapture,
+    >,
+    start_instant: Instant,
+) {
+    if let Some(task) = diagnostic_task.as_mut() {
+        let elapsed_ms = u64::try_from(start_instant.elapsed().as_millis()).unwrap_or(u64::MAX);
+        task.finish(elapsed_ms).await;
+    }
+    drop(codex_last_message_capture.take());
+}
+
 async fn run_supervised_process_group<F>(
     inputs: SupervisedLaunchInputs,
     rebuild_argv_with_session: F,
@@ -1228,6 +1497,55 @@ async fn run_supervised_process_group<F>(
     cancel_rx: &mut watch::Receiver<bool>,
     progress_tx: Option<mpsc::Sender<NormalizedWorkerEvent>>,
     health_observer: Option<ProviderHealthObserver>,
+) -> Result<(WorkerExecutionReport, Option<AdvisoryResponseCollector>), WorkerError>
+where
+    F: FnOnce(&str) -> Result<Vec<String>, WorkerError>,
+{
+    run_supervised_process_group_with_launch_observer(
+        inputs,
+        rebuild_argv_with_session,
+        response_budget,
+        cancel_rx,
+        progress_tx,
+        health_observer,
+        None,
+    )
+    .await
+}
+
+#[cfg(test)]
+async fn run_supervised_process_group_for_test<F>(
+    inputs: SupervisedLaunchInputs,
+    rebuild_argv_with_session: F,
+    response_budget: Option<AdvisoryResponseBudget>,
+    cancel_rx: &mut watch::Receiver<bool>,
+    progress_tx: Option<mpsc::Sender<NormalizedWorkerEvent>>,
+    health_observer: Option<ProviderHealthObserver>,
+    on_spawn_error: &mut (dyn FnMut(u32, &std::io::Error) + Send),
+) -> Result<(WorkerExecutionReport, Option<AdvisoryResponseCollector>), WorkerError>
+where
+    F: FnOnce(&str) -> Result<Vec<String>, WorkerError>,
+{
+    run_supervised_process_group_with_launch_observer(
+        inputs,
+        rebuild_argv_with_session,
+        response_budget,
+        cancel_rx,
+        progress_tx,
+        health_observer,
+        Some(on_spawn_error),
+    )
+    .await
+}
+
+async fn run_supervised_process_group_with_launch_observer<F>(
+    inputs: SupervisedLaunchInputs,
+    rebuild_argv_with_session: F,
+    response_budget: Option<AdvisoryResponseBudget>,
+    cancel_rx: &mut watch::Receiver<bool>,
+    progress_tx: Option<mpsc::Sender<NormalizedWorkerEvent>>,
+    health_observer: Option<ProviderHealthObserver>,
+    on_spawn_error: Option<&mut (dyn FnMut(u32, &std::io::Error) + Send)>,
 ) -> Result<(WorkerExecutionReport, Option<AdvisoryResponseCollector>), WorkerError>
 where
     F: FnOnce(&str) -> Result<Vec<String>, WorkerError>,
@@ -1282,61 +1600,22 @@ where
                 owned_session = Some(owned);
                 collector_context = Some(ctx);
 
-                let pre_spawn_abort = if *cancel_rx.borrow_and_update() {
-                    Some((WorkerRunStatus::Cancelled, "cancelled"))
-                } else if tokio::time::Instant::now() >= overall_deadline {
-                    Some((WorkerRunStatus::TimedOut, "timed_out"))
-                } else {
-                    None
-                };
-                if let Some((abort_status, abort_code)) = pre_spawn_abort {
-                    if abort_status == WorkerRunStatus::TimedOut {
-                        watchdog
-                            .lock()
-                            .unwrap_or_else(|p| p.into_inner())
-                            .poll(budgets.timeout_ms);
-                    }
-                    let empty_parser = NdjsonStreamParser::new_for_provider(
-                        provider,
-                        resolved_model.clone(),
-                        effective_session_id,
-                        budgets.max_events,
-                    );
-                    let duration_ms =
-                        u64::try_from(start_instant.elapsed().as_millis()).unwrap_or(u64::MAX);
+                if let Some(abort_status) = launch_abort_status(cancel_rx, overall_deadline) {
                     return Ok((
-                        WorkerExecutionReport {
+                        no_child_launch_report(
                             provider,
-                            executed_executable: Some(canonical_executable.clone()),
-                            requested_model: resolved_model,
-                            requested_session_id,
-                            allocated_session_id,
-                            constructed_argv: Vec::new(),
-                            working_directory: canonical_workdir,
-                            status: abort_status,
-                            exit_code: None,
-                            signal: None,
-                            process_group_id: None,
-                            duration_ms,
-                            stdout_bytes_captured: 0,
-                            stderr_bytes_captured: 0,
-                            overflow: None,
-                            descendants_terminated_after_exit: false,
-                            cleanup_incomplete: false,
-                            redacted_stderr_summary: None,
-                            dropped_live_events: 0,
-                            evidence: empty_parser.finalize(),
-                            opencode_metadata: None,
-                            opencode_metadata_error: Some(abort_code.to_string()),
-                            provider_health: health_requested
-                                .then(|| health.finish(duration_ms, false)),
-                            progress_watchdog: Some(
-                                watchdog
-                                    .lock()
-                                    .unwrap_or_else(|p| p.into_inner())
-                                    .snapshot(duration_ms),
-                            ),
-                        },
+                            &canonical_executable,
+                            &canonical_workdir,
+                            &resolved_model,
+                            requested_session_id.clone(),
+                            allocated_session_id.clone(),
+                            abort_status,
+                            &budgets,
+                            &watchdog,
+                            &health,
+                            health_requested,
+                            start_instant,
+                        ),
                         None,
                     ));
                 }
@@ -1399,7 +1678,7 @@ where
         }
     }
 
-    let codex_last_message_capture = if provider == WorkerProvider::CodexCli
+    let mut codex_last_message_capture = if provider == WorkerProvider::CodexCli
         && response_budget.is_some()
     {
         let capture =
@@ -1420,6 +1699,33 @@ where
         health.clone(),
         start_instant,
     );
+
+    if let Some(abort_status) = launch_abort_status(cancel_rx, overall_deadline) {
+        finish_no_child_launch_setup(
+            &mut diagnostic_task,
+            &mut codex_last_message_capture,
+            start_instant,
+        )
+        .await;
+        return Ok((
+            no_child_launch_report(
+                provider,
+                &canonical_executable,
+                &canonical_workdir,
+                &resolved_model,
+                requested_session_id,
+                allocated_session_id,
+                abort_status,
+                &budgets,
+                &watchdog,
+                &health,
+                health_requested,
+                start_instant,
+            ),
+            None,
+        ));
+    }
+
     let mut cmd = Command::new(&canonical_executable);
     cmd.args(&constructed_argv)
         .envs(child_env)
@@ -1434,7 +1740,54 @@ where
         cmd.process_group(0);
     }
 
-    let mut child = cmd.spawn()?;
+    // Only the immediate Linux exec refusal is retried here. Once a Child exists, every failure
+    // remains terminal; no provider, session, model, argv, or capture setup is recreated.
+    let launch_outcome = launch_with_bounded_etxtbsy_retry(
+        || cmd.spawn(),
+        &canonical_executable,
+        cancel_rx,
+        overall_deadline,
+        on_spawn_error,
+    )
+    .await;
+
+    let mut child = match launch_outcome {
+        LaunchAttemptOutcome::Spawned(child) => child,
+        LaunchAttemptOutcome::Aborted(abort_status) => {
+            finish_no_child_launch_setup(
+                &mut diagnostic_task,
+                &mut codex_last_message_capture,
+                start_instant,
+            )
+            .await;
+            return Ok((
+                no_child_launch_report(
+                    provider,
+                    &canonical_executable,
+                    &canonical_workdir,
+                    &resolved_model,
+                    requested_session_id,
+                    allocated_session_id,
+                    abort_status,
+                    &budgets,
+                    &watchdog,
+                    &health,
+                    health_requested,
+                    start_instant,
+                ),
+                None,
+            ));
+        }
+        LaunchAttemptOutcome::Failed(err) => {
+            finish_no_child_launch_setup(
+                &mut diagnostic_task,
+                &mut codex_last_message_capture,
+                start_instant,
+            )
+            .await;
+            return Err(err);
+        }
+    };
     let child_pid = child.id().ok_or_else(|| {
         WorkerError::Io(std::io::Error::other(
             "spawned worker child had no OS process ID",
@@ -2700,6 +3053,9 @@ mod tests {
     use crate::permissions::WorkerFilePermissions;
     use crate::spec::ExecutionBudgets;
 
+    #[cfg(target_os = "linux")]
+    static CAPTURE_TEMP_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     fn sample_report_with_metadata_error(
         opencode_metadata_error: Option<&str>,
     ) -> WorkerExecutionReport {
@@ -3090,5 +3446,621 @@ exit 99
                 "mode={mode}"
             );
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn linux_etxtbsy_retry_releases_on_first_exact_refusal_and_executes_once() {
+        let _capture_temp_guard = CAPTURE_TEMP_TEST_LOCK.lock().await;
+        let temp = tempfile::Builder::new()
+            .prefix("tl-sup-etxtbsy-kernel-")
+            .tempdir()
+            .expect("create tempdir");
+        let root = fs::canonicalize(temp.path()).expect("canonicalize tempdir");
+        let workdir = root.join("work");
+        let bin_dir = root.join("bin");
+        fs::create_dir_all(&workdir).expect("create workdir");
+        fs::create_dir_all(&bin_dir).expect("create bin_dir");
+        let launch_log = root.join("launch.log");
+        let script_path = bin_dir.join("fake-agy-etxtbsy");
+        let script = format!(
+            r#"#!/bin/sh
+set -eu
+{{
+  printf 'BEGIN\n'
+  printf 'cwd=%s\n' "$PWD"
+  for arg in "$@"; do printf 'arg=%s\n' "$arg"; done
+  printf 'env=%s\n' "${{TL_TEST_ENV:-}}"
+}} >> "{}"
+printf '%s\n' '{{"event":"init","init":{{"session_id":"agy-etxtbsy-1","model":"gemini-4-argon-high","effort":"high"}}}}'
+printf '%s\n' '{{"event":"result","result":{{"status":"SUCCESS","response":"{{\"ok\":true}}"}}}}'
+"#,
+            launch_log.display()
+        );
+        fs::write(&script_path, script).expect("write script");
+        fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700))
+            .expect("chmod script");
+        let mut held_writer = Some(
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&script_path)
+                .expect("hold writable executable descriptor"),
+        );
+        let mut first_refusal_observed = false;
+        let mut refusal_attempts = Vec::new();
+
+        let (health_tx, _health_rx) = watch::channel(None);
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        let inputs = SupervisedLaunchInputs {
+            provider: WorkerProvider::Antigravity,
+            canonical_executable: script_path.clone(),
+            canonical_workdir: workdir.clone(),
+            resolved_model: ResolvedModelTarget {
+                base_model: "gemini-4-argon-high".to_string(),
+                effort: Some("high".to_string()),
+                cli_model_arg: "gemini-4-argon-high".to_string(),
+            },
+            requested_session_id: None,
+            initial_argv: vec!["alpha".to_string(), "beta".to_string()],
+            child_env: vec![
+                ("TL_TEST_ENV".to_string(), "stable".to_string()),
+                ("TL_LAUNCH_LOG".to_string(), launch_log.display().to_string()),
+            ],
+            budgets: ExecutionBudgets::default(),
+        };
+        let mut on_spawn_error = |attempt: u32, err: &std::io::Error| {
+            assert_eq!(attempt, 1, "only the first attempt may hit the held writer");
+            assert_eq!(err.raw_os_error(), Some(libc::ETXTBSY));
+            refusal_attempts.push(attempt);
+            first_refusal_observed = true;
+            drop(held_writer.take());
+        };
+        let (report, collector) = run_supervised_process_group_for_test(
+            inputs,
+            |_| Ok(Vec::new()),
+            None,
+            &mut cancel_rx,
+            None,
+            Some(health_tx),
+            &mut on_spawn_error,
+        )
+        .await
+        .expect("retry after synchronized writer release");
+
+        assert!(first_refusal_observed);
+        assert_eq!(refusal_attempts, vec![1]);
+        assert!(collector.is_none());
+        assert_eq!(report.status, WorkerRunStatus::Succeeded);
+        assert_eq!(report.constructed_argv.len(), 4);
+        assert_eq!(report.constructed_argv[0], "--log-file");
+        assert_eq!(report.constructed_argv[2], "alpha");
+        assert_eq!(report.constructed_argv[3], "beta");
+        assert_eq!(
+            report
+                .constructed_argv
+                .iter()
+                .filter(|arg| arg.as_str() == "--log-file")
+                .count(),
+            1,
+            "AGY diagnostic capture setup must not be repeated by retries"
+        );
+        let observed = fs::read_to_string(&launch_log).expect("read launch log");
+        assert_eq!(observed.matches("BEGIN").count(), 1);
+        assert!(observed.contains(&format!("cwd={}", workdir.display())));
+        assert!(observed.contains("arg=alpha"));
+        assert!(observed.contains("arg=beta"));
+        assert!(observed.contains("env=stable"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn linux_codex_capture_setup_survives_etxtbsy_retry_without_duplication() {
+        let _capture_temp_guard = CAPTURE_TEMP_TEST_LOCK.lock().await;
+        let temp = tempfile::Builder::new()
+            .prefix("tl-sup-codex-retry-")
+            .tempdir()
+            .expect("create tempdir");
+        let root = fs::canonicalize(temp.path()).expect("canonicalize tempdir");
+        let workdir = root.join("work");
+        let bin_dir = root.join("bin");
+        fs::create_dir_all(&workdir).expect("create workdir");
+        fs::create_dir_all(workdir.join(".git")).expect("create .git");
+        fs::create_dir_all(&bin_dir).expect("create bin_dir");
+        let launch_log = root.join("launch.log");
+        let script_path = bin_dir.join("fake-codex-etxtbsy");
+        let script = format!(
+            r#"#!/usr/bin/env sh
+set -eu
+LOG="{}"
+printf 'BEGIN\n' >> "$LOG"
+OUT=""
+for arg in "$@"; do
+  printf 'arg=%s\n' "$arg" >> "$LOG"
+done
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --output-last-message|-o) OUT="$2"; shift 2 ;;
+    --) shift; break ;;
+    *) shift 1 ;;
+  esac
+done
+printf '%s\n' '{{"type":"thread.started","thread_id":"thread-etxtbsy-codex"}}'
+printf '%s\n' '{{"type":"turn.started"}}'
+printf '%s\n' '{{"type":"item.completed","item":{{"id":"msg_1","type":"agent_message","text":"{{\"ok\":true}}"}}}}'
+printf '%s\n' '{{"type":"turn.completed","usage":{{"input_tokens":10,"output_tokens":5}}}}'
+printf '%s\n' '{{"ok":true}}' > "$OUT"
+"#,
+            launch_log.display()
+        );
+        fs::write(&script_path, script).expect("write script");
+        fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700))
+            .expect("chmod script");
+        let mut held_writer = Some(
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&script_path)
+                .expect("hold writable executable descriptor"),
+        );
+        let spec = crate::spec::AdvisoryWorkerSpec {
+            provider: WorkerProvider::CodexCli,
+            executable: script_path,
+            model: "gpt-6.1-sol".to_string(),
+            effort: Some("xhigh".to_string()),
+            allowed_models: BTreeSet::from(["gpt-6.1-sol".to_string()]),
+            session_id: None,
+            standalone: false,
+            working_directory: workdir,
+            allowed_write_paths: BTreeSet::new(),
+            prompt: "retry Codex capture".to_string(),
+            file_permissions: WorkerFilePermissions::ReadOnly,
+            budgets: ExecutionBudgets::default(),
+        };
+        let validation = spec.validate().expect("validate Codex spec");
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        let mut refused_attempts = Vec::new();
+        let mut on_spawn_error = |attempt: u32, err: &std::io::Error| {
+            assert_eq!(err.raw_os_error(), Some(libc::ETXTBSY));
+            refused_attempts.push(attempt);
+            drop(held_writer.take());
+        };
+        let inputs = SupervisedLaunchInputs {
+            provider: validation.provider,
+            canonical_executable: validation.canonical_executable,
+            canonical_workdir: validation.canonical_working_directory,
+            resolved_model: validation.resolved_model,
+            requested_session_id: None,
+            initial_argv: validation.constructed_argv,
+            child_env: validation.child_env,
+            budgets: validation.budgets,
+        };
+        let (report, collector) = run_supervised_process_group_for_test(
+            inputs,
+            |_| Ok(Vec::new()),
+            Some(AdvisoryResponseBudget::default()),
+            &mut cancel_rx,
+            None,
+            None,
+            &mut on_spawn_error,
+        )
+        .await
+        .expect("Codex retry after synchronized writer release");
+        assert_eq!(refused_attempts, vec![1]);
+        let structured = collector
+            .expect("Codex capture collector")
+            .finalize(report);
+        assert_eq!(structured.execution.status, WorkerRunStatus::Succeeded);
+        assert!(
+            structured.has_verified_response(),
+            "retried Codex capture must retain verified structured output"
+        );
+        assert_eq!(
+            structured
+                .execution
+                .constructed_argv
+                .iter()
+                .filter(|arg| arg.as_str() == "--output-last-message")
+                .count(),
+            1,
+            "Codex capture arguments must not be duplicated by retries"
+        );
+        let observed = fs::read_to_string(&launch_log).expect("read launch log");
+        assert_eq!(observed.matches("BEGIN").count(), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn test_executable_file(root: &Path, name: &str, body: &str) -> PathBuf {
+        let path = root.join(name);
+        fs::write(&path, body).expect("write test executable");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+            .expect("chmod test executable");
+        path
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn linux_spawn_retry_policy_is_exact_bounded_and_abortable() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let root = fs::canonicalize(temp.path()).expect("canonicalize tempdir");
+        let executable = test_executable_file(&root, "executable", "#!/bin/sh\nexit 0\n");
+        let far_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+
+        let mut attempts = 0u32;
+        let outcome = launch_with_bounded_etxtbsy_retry(
+            || {
+                attempts += 1;
+                Err(std::io::Error::from_raw_os_error(libc::EACCES))
+            },
+            &executable,
+            &mut cancel_rx,
+            far_deadline,
+            None,
+        )
+        .await;
+        assert_eq!(attempts, 1, "non-ETXTBSY errors must not retry");
+        match outcome {
+            LaunchAttemptOutcome::Failed(WorkerError::Io(err)) => {
+                assert_eq!(err.raw_os_error(), Some(libc::EACCES));
+            }
+            _ => panic!("non-ETXTBSY error must surface immediately"),
+        }
+
+        let mut attempts = 0u32;
+        let mut retry_errors = Vec::new();
+        let started = Instant::now();
+        let mut retry_observer = |attempt: u32, err: &std::io::Error| {
+            retry_errors.push((attempt, err.raw_os_error()));
+        };
+        let outcome = launch_with_bounded_etxtbsy_retry(
+            || {
+                attempts += 1;
+                Err(std::io::Error::from_raw_os_error(libc::ETXTBSY))
+            },
+            &executable,
+            &mut cancel_rx,
+            far_deadline,
+            Some(&mut retry_observer),
+        )
+        .await;
+        assert_eq!(attempts, ETXTBSY_MAX_SPAWN_ATTEMPTS);
+        assert_eq!(
+            retry_errors,
+            vec![
+                (1, Some(libc::ETXTBSY)),
+                (2, Some(libc::ETXTBSY)),
+                (3, Some(libc::ETXTBSY))
+            ]
+        );
+        assert!(started.elapsed() >= Duration::from_millis(30));
+        match outcome {
+            LaunchAttemptOutcome::Failed(WorkerError::Io(err)) => {
+                assert_eq!(err.raw_os_error(), Some(libc::ETXTBSY));
+            }
+            _ => panic!("exhaustion must surface the final exact IO refusal"),
+        }
+
+        let (_cancel_tx, mut cancelled_rx) = watch::channel(true);
+        let mut attempts = 0u32;
+        let outcome = launch_with_bounded_etxtbsy_retry(
+            || {
+                attempts += 1;
+                Err(std::io::Error::from_raw_os_error(libc::ETXTBSY))
+            },
+            &executable,
+            &mut cancelled_rx,
+            far_deadline,
+            None,
+        )
+        .await;
+        assert_eq!(attempts, 0, "already-cancelled launches must not spawn");
+        assert!(matches!(
+            outcome,
+            LaunchAttemptOutcome::Aborted(WorkerRunStatus::Cancelled)
+        ));
+
+        let (_cancel_tx, mut expired_rx) = watch::channel(false);
+        let mut attempts = 0u32;
+        let outcome = launch_with_bounded_etxtbsy_retry(
+            || {
+                attempts += 1;
+                Err(std::io::Error::from_raw_os_error(libc::ETXTBSY))
+            },
+            &executable,
+            &mut expired_rx,
+            tokio::time::Instant::now(),
+            None,
+        )
+        .await;
+        assert_eq!(attempts, 0, "expired launches must not spawn");
+        assert!(matches!(
+            outcome,
+            LaunchAttemptOutcome::Aborted(WorkerRunStatus::TimedOut)
+        ));
+
+        let (cancel_tx, mut cancel_during_backoff_rx) = watch::channel(false);
+        let mut attempts = 0u32;
+        let outcome = launch_with_bounded_etxtbsy_retry(
+            || {
+                attempts += 1;
+                let _ = cancel_tx.send(true);
+                Err(std::io::Error::from_raw_os_error(libc::ETXTBSY))
+            },
+            &executable,
+            &mut cancel_during_backoff_rx,
+            far_deadline,
+            None,
+        )
+        .await;
+        assert_eq!(attempts, 1, "backoff cancellation must prevent another spawn");
+        assert!(matches!(
+            outcome,
+            LaunchAttemptOutcome::Aborted(WorkerRunStatus::Cancelled)
+        ));
+
+        let (_cancel_tx, mut deadline_during_backoff_rx) = watch::channel(false);
+        let mut attempts = 0u32;
+        let outcome = launch_with_bounded_etxtbsy_retry(
+            || {
+                attempts += 1;
+                Err(std::io::Error::from_raw_os_error(libc::ETXTBSY))
+            },
+            &executable,
+            &mut deadline_during_backoff_rx,
+            tokio::time::Instant::now() + Duration::from_millis(9),
+            None,
+        )
+        .await;
+        assert!(attempts <= 1, "deadline backoff must prevent another spawn");
+        assert!(matches!(
+            outcome,
+            LaunchAttemptOutcome::Aborted(WorkerRunStatus::TimedOut)
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn linux_executable_replacement_symlink_and_permission_drift_are_refused() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let root = fs::canonicalize(temp.path()).expect("canonicalize tempdir");
+        let far_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+
+        let executable = test_executable_file(&root, "replace-target", "#!/bin/sh\nexit 0\n");
+        let replacement = test_executable_file(&root, "replace-source", "#!/bin/sh\nexit 1\n");
+        let mut attempts = 0u32;
+        let outcome = launch_with_bounded_etxtbsy_retry(
+            || {
+                attempts += 1;
+                fs::rename(&replacement, &executable).expect("replace executable");
+                Err(std::io::Error::from_raw_os_error(libc::ETXTBSY))
+            },
+            &executable,
+            &mut cancel_rx,
+            far_deadline,
+            None,
+        )
+        .await;
+        assert_eq!(attempts, 1);
+        assert!(matches!(
+            outcome,
+            LaunchAttemptOutcome::Failed(WorkerError::SecurityViolation(_))
+        ));
+
+        let symlink_target = test_executable_file(&root, "symlink-target", "#!/bin/sh\nexit 0\n");
+        let symlink_path = test_executable_file(&root, "symlink-executable", "#!/bin/sh\nexit 0\n");
+        let mut attempts = 0u32;
+        let outcome = launch_with_bounded_etxtbsy_retry(
+            || {
+                attempts += 1;
+                fs::remove_file(&symlink_path).expect("remove regular path");
+                symlink(&symlink_target, &symlink_path).expect("replace with symlink");
+                Err(std::io::Error::from_raw_os_error(libc::ETXTBSY))
+            },
+            &symlink_path,
+            &mut cancel_rx,
+            far_deadline,
+            None,
+        )
+        .await;
+        assert_eq!(attempts, 1);
+        assert!(matches!(
+            outcome,
+            LaunchAttemptOutcome::Failed(WorkerError::SecurityViolation(_))
+        ));
+
+        let mode_path = test_executable_file(&root, "mode-executable", "#!/bin/sh\nexit 0\n");
+        let mut attempts = 0u32;
+        let outcome = launch_with_bounded_etxtbsy_retry(
+            || {
+                attempts += 1;
+                fs::set_permissions(&mode_path, fs::Permissions::from_mode(0o600))
+                    .expect("remove execute permission");
+                Err(std::io::Error::from_raw_os_error(libc::ETXTBSY))
+            },
+            &mode_path,
+            &mut cancel_rx,
+            far_deadline,
+            None,
+        )
+        .await;
+        assert_eq!(attempts, 1);
+        assert!(matches!(
+            outcome,
+            LaunchAttemptOutcome::Failed(WorkerError::InvalidSpec(_))
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    fn owned_temp_entries(prefix: &str) -> std::collections::BTreeSet<PathBuf> {
+        fs::read_dir(std::env::temp_dir())
+            .expect("read system tempdir")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(prefix))
+            })
+            .collect()
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn assert_no_new_owned_temp_entries(
+        prefix: &str,
+        before: &std::collections::BTreeSet<PathBuf>,
+    ) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            let after = owned_temp_entries(prefix);
+            let leaked = after
+                .difference(before)
+                .cloned()
+                .collect::<Vec<PathBuf>>();
+            if leaked.is_empty() {
+                return;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("no-child cleanup left owned temporary entries: {leaked:?}");
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn linux_codex_capture_and_agy_diagnostic_zero_child_exhaustion_cleanup_is_bounded() {
+        let _capture_temp_guard = CAPTURE_TEMP_TEST_LOCK.lock().await;
+        let temp = tempfile::Builder::new()
+            .prefix("tl-sup-zero-child-")
+            .tempdir()
+            .expect("create tempdir");
+        let root = fs::canonicalize(temp.path()).expect("canonicalize tempdir");
+        let workdir = root.join("work");
+        let bin_dir = root.join("bin");
+        fs::create_dir_all(&workdir).expect("create workdir");
+        fs::create_dir_all(workdir.join(".git")).expect("create .git");
+        fs::create_dir_all(&bin_dir).expect("create bin_dir");
+        let sentinel = workdir.join("unrelated-sentinel.txt");
+        fs::write(&sentinel, b"preserve unrelated data").expect("write sentinel");
+
+        let codex_executable = test_executable_file(
+            &bin_dir,
+            "fake-codex-held",
+            "#!/bin/sh\nprintf 'executed\\n' >> codex-executed.txt\nexit 0\n",
+        );
+        let _codex_writer = fs::OpenOptions::new()
+            .write(true)
+            .open(&codex_executable)
+            .expect("hold Codex executable open for write");
+        let codex_spec = crate::spec::AdvisoryWorkerSpec {
+            provider: WorkerProvider::CodexCli,
+            executable: codex_executable,
+            model: "gpt-6.1-sol".to_string(),
+            effort: Some("xhigh".to_string()),
+            allowed_models: BTreeSet::from(["gpt-6.1-sol".to_string()]),
+            session_id: None,
+            standalone: false,
+            working_directory: workdir.clone(),
+            allowed_write_paths: BTreeSet::new(),
+            prompt: "zero-child Codex cleanup".to_string(),
+            file_permissions: WorkerFilePermissions::ReadOnly,
+            budgets: ExecutionBudgets::default(),
+        };
+        let codex_validation = codex_spec.validate().expect("validate Codex spec");
+        let codex_before = owned_temp_entries("threadlane-codex-last-msg-");
+        let (_cancel_tx, mut codex_cancel_rx) = watch::channel(false);
+        let mut codex_attempts = Vec::new();
+        let mut codex_observer = |attempt: u32, err: &std::io::Error| {
+            assert_eq!(err.raw_os_error(), Some(libc::ETXTBSY));
+            codex_attempts.push(attempt);
+        };
+        let codex_inputs = SupervisedLaunchInputs {
+            provider: codex_validation.provider,
+            canonical_executable: codex_validation.canonical_executable,
+            canonical_workdir: codex_validation.canonical_working_directory,
+            resolved_model: codex_validation.resolved_model,
+            requested_session_id: None,
+            initial_argv: codex_validation.constructed_argv,
+            child_env: codex_validation.child_env,
+            budgets: codex_validation.budgets,
+        };
+        let codex_err = run_supervised_process_group_for_test(
+            codex_inputs,
+            |_| Ok(Vec::new()),
+            Some(AdvisoryResponseBudget::default()),
+            &mut codex_cancel_rx,
+            None,
+            None,
+            &mut codex_observer,
+        )
+        .await
+        .expect_err("held Codex executable must exhaust retries");
+        match codex_err {
+            WorkerError::Io(err) => assert_eq!(err.raw_os_error(), Some(libc::ETXTBSY)),
+            other => panic!("unexpected Codex exhaustion error: {other}"),
+        }
+        assert_eq!(codex_attempts, vec![1, 2, 3]);
+        assert!(!workdir.join("codex-executed.txt").exists());
+        assert_eq!(
+            fs::read(&sentinel).expect("read sentinel"),
+            b"preserve unrelated data"
+        );
+        assert_no_new_owned_temp_entries("threadlane-codex-last-msg-", &codex_before).await;
+
+        let agy_executable = test_executable_file(
+            &bin_dir,
+            "fake-agy-held",
+            "#!/bin/sh\nprintf 'executed\\n' >> agy-executed.txt\nexit 0\n",
+        );
+        let _agy_writer = fs::OpenOptions::new()
+            .write(true)
+            .open(&agy_executable)
+            .expect("hold AGY executable open for write");
+        let agy_before = owned_temp_entries("threadlane-agy-diagnostic-");
+        let (health_tx, _health_rx) = watch::channel(None);
+        let (_cancel_tx, mut agy_cancel_rx) = watch::channel(false);
+        let mut agy_attempts = Vec::new();
+        let mut agy_observer = |attempt: u32, err: &std::io::Error| {
+            assert_eq!(err.raw_os_error(), Some(libc::ETXTBSY));
+            agy_attempts.push(attempt);
+        };
+        let agy_inputs = SupervisedLaunchInputs {
+            provider: WorkerProvider::Antigravity,
+            canonical_executable: agy_executable,
+            canonical_workdir: workdir.clone(),
+            resolved_model: ResolvedModelTarget {
+                base_model: "gemini-4-argon-high".to_string(),
+                effort: Some("high".to_string()),
+                cli_model_arg: "gemini-4-argon-high".to_string(),
+            },
+            requested_session_id: None,
+            initial_argv: vec!["--model".to_string(), "gemini-4-argon-high".to_string()],
+            child_env: Vec::new(),
+            budgets: ExecutionBudgets::default(),
+        };
+        let agy_err = run_supervised_process_group_for_test(
+            agy_inputs,
+            |_| Ok(Vec::new()),
+            None,
+            &mut agy_cancel_rx,
+            None,
+            Some(health_tx),
+            &mut agy_observer,
+        )
+        .await
+        .expect_err("held AGY executable must exhaust retries");
+        match agy_err {
+            WorkerError::Io(err) => assert_eq!(err.raw_os_error(), Some(libc::ETXTBSY)),
+            other => panic!("unexpected AGY exhaustion error: {other}"),
+        }
+        assert_eq!(agy_attempts, vec![1, 2, 3]);
+        assert!(!workdir.join("agy-executed.txt").exists());
+        assert_eq!(
+            fs::read(&sentinel).expect("read sentinel"),
+            b"preserve unrelated data"
+        );
+        assert_no_new_owned_temp_entries("threadlane-agy-diagnostic-", &agy_before).await;
     }
 }

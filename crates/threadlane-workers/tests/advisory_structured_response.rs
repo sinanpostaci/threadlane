@@ -540,6 +540,7 @@ exit 0
     // Case 2: Missing terminal result event (`MissingResultEvidence` / `MissingTerminalFraming`)
     let missing_res_script = r#"#!/usr/bin/env sh
 set -eu
+printf 'executed\n' >> missing_result_executed.txt
 printf '%s\n' '{"event":"init","init":{"session_id":"agy-miss-1","model":"gemini-4-argon-high"}}'
 printf '%s\n' '{"event":"step_update","step_update":{"step_type":"thinking","message":"{\"plan\":true}"}}'
 exit 0
@@ -561,6 +562,12 @@ exit 0
     assert_eq!(
         miss_out.response_error.as_ref().map(|e| e.code),
         Some(AdvisoryResponseErrorCode::MissingTerminalFraming)
+    );
+    assert_eq!(
+        fs::read_to_string(workdir.join("missing_result_executed.txt"))
+            .expect("read missing-result execution marker"),
+        "executed\n",
+        "the missing-result fixture must execute exactly once"
     );
 
     // Case 3: Truncated / invalid JSON string inside a valid terminal `result.response`
@@ -1523,5 +1530,69 @@ exit 0
     assert_eq!(
         tool_only_out.response_error.as_ref().map(|e| e.code),
         Some(AdvisoryResponseErrorCode::SpoofedOrToolOutput)
+    );
+}
+
+#[tokio::test]
+async fn antigravity_held_writable_executable_surfaces_exact_etxtbsy_after_finite_retries_without_execution(
+) {
+    let temp = TempDir::new().expect("tempdir");
+    let workdir = temp.path().join("workdir");
+    let bin_dir = temp.path().join("bin");
+    fs::create_dir_all(&workdir).expect("create workdir");
+    fs::create_dir_all(&bin_dir).expect("create bin_dir");
+    let sentinel = workdir.join("unrelated-sentinel.txt");
+    fs::write(&sentinel, b"preserve unrelated data").expect("write sentinel");
+
+    let script = r#"#!/usr/bin/env sh
+set -eu
+printf 'executed\n' >> held_executable_executed.txt
+printf '%s\n' '{"event":"init","init":{"session_id":"agy-held-1","model":"gemini-4-argon-high"}}'
+printf '%s\n' '{"event":"result","result":{"status":"SUCCESS","response":"{\"ok\":true}"}}'
+"#;
+    let executable = write_executable_script(&bin_dir, "fake-agy-held-open", script);
+    let _held_writer = fs::OpenOptions::new()
+        .write(true)
+        .open(&executable)
+        .expect("hold executable open for writing");
+    let spec = AdvisoryWorkerSpec {
+        provider: WorkerProvider::Antigravity,
+        executable,
+        model: "gemini-4-argon-high".to_string(),
+        effort: Some("high".to_string()),
+        allowed_models: BTreeSet::from(["gemini-4-argon-high".to_string()]),
+        session_id: None,
+        standalone: false,
+        working_directory: workdir.clone(),
+        allowed_write_paths: BTreeSet::new(),
+        prompt: "held executable regression".to_string(),
+        file_permissions: WorkerFilePermissions::ReadOnly,
+        budgets: ExecutionBudgets::default(),
+    };
+
+    let started = std::time::Instant::now();
+    let err = run_advisory_worker_with_structured_result(
+        &spec,
+        AdvisoryResponseBudget::default(),
+    )
+    .await
+    .expect_err("a held writable executable must exhaust bounded ETXTBSY retries");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "ETXTBSY retry exhaustion must remain finite"
+    );
+    match err {
+        WorkerError::Io(err) => {
+            assert_eq!(err.raw_os_error(), Some(libc::ETXTBSY));
+        }
+        other => panic!("expected exact ETXTBSY IO refusal, got {other}"),
+    }
+    assert!(
+        !workdir.join("held_executable_executed.txt").exists(),
+        "exhausted retries must not execute the worker"
+    );
+    assert_eq!(
+        fs::read(&sentinel).expect("read sentinel"),
+        b"preserve unrelated data"
     );
 }
