@@ -137,7 +137,7 @@ fn codex_cli_exact_argv_permission_profile_and_mutable_or_invalid_spec_refusals(
     );
     assert_eq!(
         CODEX_ADVISORY_PERMISSION_PROFILE_CONFIG,
-        r#"permissions.threadlane-advisory={"filesystem"={"glob_scan_max_depth"=64,":minimal"="read",":workspace_roots"={"."="read","**/.env"="deny","**/.env.*"="deny","**/codex.toml"="deny","**/.codex.toml"="deny","**/.git"="deny","**/.git/**"="deny","**/.codex"="deny","**/.codex/**"="deny","**/.agents"="deny","**/.agents/**"="deny","**/.aws"="deny","**/.aws/**"="deny"},"/nix/store"="read"},"network"={"enabled"=false}}"#
+        r#"permissions.threadlane-advisory={"filesystem"={"glob_scan_max_depth"=64,":minimal"="read",":workspace_roots"={"."="read","**/.env"="deny","**/.env.*"="deny","**/codex.toml"="deny","**/.codex.toml"="deny","**/.git"="deny","*/**/.git/**"="deny","**/.codex"="deny","*/**/.codex/**"="deny","**/.agents"="deny","*/**/.agents/**"="deny","**/.aws"="deny","*/**/.aws/**"="deny",".git"="deny",".codex"="deny",".agents"="deny",".aws"="deny"},"/nix/store"="read"},"network"={"enabled"=false}}"#
     );
 
     // 3. Exact constructed argv and empty child_env on valid read-only AdvisoryWorkerSpec

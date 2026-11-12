@@ -216,10 +216,9 @@ pub const CODEX_PROJECT_CONFIG_MARKERS: [&str; 3] = [".codex", "codex.toml", ".c
 ///
 /// Codex's Linux sandbox glob scanner requires an explicit positive integer `glob_scan_max_depth`
 /// whenever `:workspace_roots` deny-read rules use recursive `**` patterns; without it, `codex exec --json`
-/// emits `type: "error"` warning events for each unbounded `**` rule. Because a finite scan depth
-/// alone leaves descendants deeper than the scan bound unexpanded and readable (even under a denied
-/// parent directory such as `.git`), [`validate_codex_advisory_workdir`] pairs this constant with a
-/// fail-closed, unpruned filesystem preflight capped at [`CODEX_ADVISORY_MAX_WORKDIR_DEPTH`]
+/// emits `type: "error"` warning events for each unbounded `**` rule. Because recursive protected-glob
+/// expansion is bounded by this scan depth, [`validate_codex_advisory_workdir`] pairs the constant with
+/// a fail-closed, unpruned filesystem preflight capped at [`CODEX_ADVISORY_MAX_WORKDIR_DEPTH`]
 /// (`CODEX_ADVISORY_GLOB_SCAN_MAX_DEPTH - CODEX_ADVISORY_GLOB_SCAN_DEPTH_MARGIN`).
 pub const CODEX_ADVISORY_GLOB_SCAN_MAX_DEPTH: usize = 64;
 
@@ -703,8 +702,9 @@ pub fn validate_advisory_read_only_workdir(
 ///    - any nested project-local Codex configuration marker ([`CODEX_PROJECT_CONFIG_MARKERS`]).
 ///
 /// No subdirectories are skipped or pruned during traversal: all directories (including `.git`/`.GIT`,
-/// `.aws`, and `.agents`) are traversed and enforced against the depth and entry bounds because a
-/// directory-level deny rule does not block descendant paths beyond `glob_scan_max_depth`.
+/// `.aws`, and `.agents`) are traversed and enforced against the depth and entry bounds because
+/// finite recursive protected-glob expansion remains depth-bounded and cannot cover arbitrarily
+/// deep nested protected trees.
 pub fn validate_codex_advisory_workdir(working_directory: &Path) -> Result<PathBuf, WorkerError> {
     let canonical_workdir = validate_advisory_read_only_workdir(working_directory)?;
     ensure_no_codex_project_config_in_hierarchy(&canonical_workdir)?;

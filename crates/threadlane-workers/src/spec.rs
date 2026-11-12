@@ -83,12 +83,15 @@ pub const CODEX_ADVISORY_PERMISSION_PROFILE_NAME: &str = "threadlane-advisory";
 /// permission profile for [`WorkerProvider::CodexCli`].
 ///
 /// Scopes filesystem reads to `:minimal`, `/nix/store`, and `.` inside `:workspace_roots` with
-/// explicit `glob_scan_max_depth=64` ([`CODEX_ADVISORY_GLOB_SCAN_MAX_DEPTH`]) and recursive exact
-/// plus descendant denials (`**/.env`, `**/.env.*`, `**/codex.toml`, `**/.codex.toml`, `**/.git`,
-/// `**/.git/**`, `**/.codex`, `**/.codex/**`, `**/.agents`, `**/.agents/**`, `**/.aws`,
-/// `**/.aws/**`), and disables network access (`"network"={"enabled"=false}`). Never combined with
-/// legacy `--sandbox` flags.
-pub const CODEX_ADVISORY_PERMISSION_PROFILE_CONFIG: &str = r#"permissions.threadlane-advisory={"filesystem"={"glob_scan_max_depth"=64,":minimal"="read",":workspace_roots"={"."="read","**/.env"="deny","**/.env.*"="deny","**/codex.toml"="deny","**/.codex.toml"="deny","**/.git"="deny","**/.git/**"="deny","**/.codex"="deny","**/.codex/**"="deny","**/.agents"="deny","**/.agents/**"="deny","**/.aws"="deny","**/.aws/**"="deny"},"/nix/store"="read"},"network"={"enabled"=false}}"#;
+/// explicit `glob_scan_max_depth=64` ([`CODEX_ADVISORY_GLOB_SCAN_MAX_DEPTH`]) and a static
+/// root/non-root protected-scope partition: exact root `.git`/`.codex`/`.agents`/`.aws` denies,
+/// protected basename globs, and non-root descendant globs (`*/**/.git/**`, `*/**/.codex/**`,
+/// `*/**/.agents/**`, `*/**/.aws/**`) that avoid expanding every root Git object path. Secret
+/// filename globs (`**/.env`, `**/.env.*`, `**/codex.toml`, `**/.codex.toml`) remain denied, and
+/// network access is disabled (`"network"={"enabled"=false}`). This is not a universal argument-cap
+/// guarantee; large nested protected trees can still exceed a finite OS helper argument limit.
+/// Never combined with legacy `--sandbox` flags.
+pub const CODEX_ADVISORY_PERMISSION_PROFILE_CONFIG: &str = r#"permissions.threadlane-advisory={"filesystem"={"glob_scan_max_depth"=64,":minimal"="read",":workspace_roots"={"."="read","**/.env"="deny","**/.env.*"="deny","**/codex.toml"="deny","**/.codex.toml"="deny","**/.git"="deny","*/**/.git/**"="deny","**/.codex"="deny","*/**/.codex/**"="deny","**/.agents"="deny","*/**/.agents/**"="deny","**/.aws"="deny","*/**/.aws/**"="deny",".git"="deny",".codex"="deny",".agents"="deny",".aws"="deny"},"/nix/store"="read"},"network"={"enabled"=false}}"#;
 
 /// Features explicitly disabled via `--disable <feature>` on [`WorkerProvider::CodexCli`]
 /// read-only advisory invocations.
