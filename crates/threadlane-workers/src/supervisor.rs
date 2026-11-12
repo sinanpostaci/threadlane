@@ -13,9 +13,10 @@ use crate::advisory_response::{
 };
 use crate::antigravity_diagnostics::start_owned_capture;
 use crate::error::WorkerError;
+#[cfg(target_os = "linux")]
+use crate::fs_safety::validate_executable_file;
 use crate::fs_safety::{
-    ensure_platform_supported, sanitize_and_redact, validate_executable_file,
-    validate_existing_canonical_dir,
+    ensure_platform_supported, sanitize_and_redact, validate_existing_canonical_dir,
 };
 use crate::opencode_collector::{
     self, OpenCodeCollectorContext, OpenCodeCollectorDiagnostic, OpenCodeCollectorError,
@@ -1509,11 +1510,13 @@ where
         progress_tx,
         health_observer,
         None,
+        None,
     )
     .await
 }
 
 #[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 async fn run_supervised_process_group_for_test<F>(
     inputs: SupervisedLaunchInputs,
     rebuild_argv_with_session: F,
@@ -1521,6 +1524,7 @@ async fn run_supervised_process_group_for_test<F>(
     cancel_rx: &mut watch::Receiver<bool>,
     progress_tx: Option<mpsc::Sender<NormalizedWorkerEvent>>,
     health_observer: Option<ProviderHealthObserver>,
+    on_launch_setup: Option<&mut (dyn FnMut(&[String]) + Send)>,
     on_spawn_error: &mut (dyn FnMut(u32, &std::io::Error) + Send),
 ) -> Result<(WorkerExecutionReport, Option<AdvisoryResponseCollector>), WorkerError>
 where
@@ -1533,11 +1537,13 @@ where
         cancel_rx,
         progress_tx,
         health_observer,
+        on_launch_setup,
         Some(on_spawn_error),
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_supervised_process_group_with_launch_observer<F>(
     inputs: SupervisedLaunchInputs,
     rebuild_argv_with_session: F,
@@ -1545,6 +1551,7 @@ async fn run_supervised_process_group_with_launch_observer<F>(
     cancel_rx: &mut watch::Receiver<bool>,
     progress_tx: Option<mpsc::Sender<NormalizedWorkerEvent>>,
     health_observer: Option<ProviderHealthObserver>,
+    on_launch_setup: Option<&mut (dyn FnMut(&[String]) + Send)>,
     on_spawn_error: Option<&mut (dyn FnMut(u32, &std::io::Error) + Send)>,
 ) -> Result<(WorkerExecutionReport, Option<AdvisoryResponseCollector>), WorkerError>
 where
@@ -1724,6 +1731,12 @@ where
             ),
             None,
         ));
+    }
+
+    // Test-only seam: expose the exact capture-bearing argv once, before any spawn attempt.
+    // Production always passes `None`, so the runtime launch policy is unchanged.
+    if let Some(observer) = on_launch_setup {
+        observer(&constructed_argv);
     }
 
     let mut cmd = Command::new(&canonical_executable);
@@ -3522,6 +3535,7 @@ printf '%s\n' '{{"event":"result","result":{{"status":"SUCCESS","response":"{{\"
             &mut cancel_rx,
             None,
             Some(health_tx),
+            None,
             &mut on_spawn_error,
         )
         .await
@@ -3638,6 +3652,7 @@ printf '%s\n' '{{"ok":true}}' > "$OUT"
             |_| Ok(Vec::new()),
             Some(AdvisoryResponseBudget::default()),
             &mut cancel_rx,
+            None,
             None,
             None,
             &mut on_spawn_error,
@@ -3892,37 +3907,32 @@ printf '%s\n' '{{"ok":true}}' > "$OUT"
         ));
     }
 
+    // Capture identity comes from the exact argv built for this invocation; shared temp prefixes
+    // are never used to attribute ownership or cleanup failures.
     #[cfg(target_os = "linux")]
-    fn owned_temp_entries(prefix: &str) -> std::collections::BTreeSet<PathBuf> {
-        fs::read_dir(std::env::temp_dir())
-            .expect("read system tempdir")
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .filter(|path| {
-                path.file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.starts_with(prefix))
-            })
-            .collect()
+    fn argv_option_path(argv: &[String], option: &str) -> PathBuf {
+        argv.windows(2)
+            .find(|window| window[0].as_str() == option)
+            .map(|window| PathBuf::from(window[1].as_str()))
+            .unwrap_or_else(|| panic!("argv must contain {option} capture path"))
     }
 
     #[cfg(target_os = "linux")]
-    async fn assert_no_new_owned_temp_entries(
-        prefix: &str,
-        before: &std::collections::BTreeSet<PathBuf>,
-    ) {
+    async fn assert_owned_capture_paths_removed(paths: &[PathBuf]) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
         loop {
-            let after = owned_temp_entries(prefix);
-            let leaked = after
-                .difference(before)
-                .cloned()
-                .collect::<Vec<PathBuf>>();
-            if leaked.is_empty() {
+            let remaining = paths
+                .iter()
+                .filter(|path| match fs::symlink_metadata(path) {
+                    Ok(_) => true,
+                    Err(err) => err.kind() != std::io::ErrorKind::NotFound,
+                })
+                .collect::<Vec<_>>();
+            if remaining.is_empty() {
                 return;
             }
             if tokio::time::Instant::now() >= deadline {
-                panic!("no-child cleanup left owned temporary entries: {leaked:?}");
+                panic!("no-child cleanup left exact owned capture paths: {remaining:?}");
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
@@ -3931,7 +3941,6 @@ printf '%s\n' '{{"ok":true}}' > "$OUT"
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn linux_codex_capture_and_agy_diagnostic_zero_child_exhaustion_cleanup_is_bounded() {
-        let _capture_temp_guard = CAPTURE_TEMP_TEST_LOCK.lock().await;
         let temp = tempfile::Builder::new()
             .prefix("tl-sup-zero-child-")
             .tempdir()
@@ -3969,13 +3978,8 @@ printf '%s\n' '{{"ok":true}}' > "$OUT"
             budgets: ExecutionBudgets::default(),
         };
         let codex_validation = codex_spec.validate().expect("validate Codex spec");
-        let codex_before = owned_temp_entries("threadlane-codex-last-msg-");
         let (_cancel_tx, mut codex_cancel_rx) = watch::channel(false);
         let mut codex_attempts = Vec::new();
-        let mut codex_observer = |attempt: u32, err: &std::io::Error| {
-            assert_eq!(err.raw_os_error(), Some(libc::ETXTBSY));
-            codex_attempts.push(attempt);
-        };
         let codex_inputs = SupervisedLaunchInputs {
             provider: codex_validation.provider,
             canonical_executable: codex_validation.canonical_executable,
@@ -3986,17 +3990,40 @@ printf '%s\n' '{{"ok":true}}' > "$OUT"
             child_env: codex_validation.child_env,
             budgets: codex_validation.budgets,
         };
-        let codex_err = run_supervised_process_group_for_test(
-            codex_inputs,
-            |_| Ok(Vec::new()),
-            Some(AdvisoryResponseBudget::default()),
-            &mut codex_cancel_rx,
-            None,
-            None,
-            &mut codex_observer,
-        )
-        .await
-        .expect_err("held Codex executable must exhaust retries");
+        let mut codex_capture_paths = Vec::new();
+        let codex_err = {
+            let mut codex_observer = |attempt: u32, err: &std::io::Error| {
+                assert_eq!(err.raw_os_error(), Some(libc::ETXTBSY));
+                codex_attempts.push(attempt);
+            };
+            let mut codex_launch_observer = |argv: &[String]| {
+                let output = argv_option_path(argv, "--output-last-message");
+                let directory = output
+                    .parent()
+                    .expect("Codex capture output path must have a parent")
+                    .to_path_buf();
+                assert!(
+                    fs::symlink_metadata(&directory).is_ok(),
+                    "Codex capture directory must exist before launch"
+                );
+                codex_capture_paths.push((output, directory));
+            };
+            match run_supervised_process_group_for_test(
+                codex_inputs,
+                |_| Ok(Vec::new()),
+                Some(AdvisoryResponseBudget::default()),
+                &mut codex_cancel_rx,
+                None,
+                None,
+                Some(&mut codex_launch_observer),
+                &mut codex_observer,
+            )
+            .await
+            {
+                Ok(_) => panic!("held Codex executable must exhaust retries"),
+                Err(err) => err,
+            }
+        };
         match codex_err {
             WorkerError::Io(err) => assert_eq!(err.raw_os_error(), Some(libc::ETXTBSY)),
             other => panic!("unexpected Codex exhaustion error: {other}"),
@@ -4007,7 +4034,17 @@ printf '%s\n' '{{"ok":true}}' > "$OUT"
             fs::read(&sentinel).expect("read sentinel"),
             b"preserve unrelated data"
         );
-        assert_no_new_owned_temp_entries("threadlane-codex-last-msg-", &codex_before).await;
+        assert_eq!(
+            codex_capture_paths.len(),
+            1,
+            "Codex capture setup must run exactly once"
+        );
+        let (codex_capture_output, codex_capture_directory) = &codex_capture_paths[0];
+        assert_owned_capture_paths_removed(&[
+            codex_capture_output.to_path_buf(),
+            codex_capture_directory.to_path_buf(),
+        ])
+        .await;
 
         let agy_executable = test_executable_file(
             &bin_dir,
@@ -4018,14 +4055,9 @@ printf '%s\n' '{{"ok":true}}' > "$OUT"
             .write(true)
             .open(&agy_executable)
             .expect("hold AGY executable open for write");
-        let agy_before = owned_temp_entries("threadlane-agy-diagnostic-");
         let (health_tx, _health_rx) = watch::channel(None);
         let (_cancel_tx, mut agy_cancel_rx) = watch::channel(false);
         let mut agy_attempts = Vec::new();
-        let mut agy_observer = |attempt: u32, err: &std::io::Error| {
-            assert_eq!(err.raw_os_error(), Some(libc::ETXTBSY));
-            agy_attempts.push(attempt);
-        };
         let agy_inputs = SupervisedLaunchInputs {
             provider: WorkerProvider::Antigravity,
             canonical_executable: agy_executable,
@@ -4040,17 +4072,44 @@ printf '%s\n' '{{"ok":true}}' > "$OUT"
             child_env: Vec::new(),
             budgets: ExecutionBudgets::default(),
         };
-        let agy_err = run_supervised_process_group_for_test(
-            agy_inputs,
-            |_| Ok(Vec::new()),
-            None,
-            &mut agy_cancel_rx,
-            None,
-            Some(health_tx),
-            &mut agy_observer,
-        )
-        .await
-        .expect_err("held AGY executable must exhaust retries");
+        let mut agy_capture_paths = Vec::new();
+        let agy_err = {
+            let mut agy_observer = |attempt: u32, err: &std::io::Error| {
+                assert_eq!(err.raw_os_error(), Some(libc::ETXTBSY));
+                agy_attempts.push(attempt);
+            };
+            let mut agy_launch_observer = |argv: &[String]| {
+                let log = argv_option_path(argv, "--log-file");
+                let directory = log
+                    .parent()
+                    .expect("AGY capture log path must have a parent")
+                    .to_path_buf();
+                assert!(
+                    fs::symlink_metadata(&log).is_ok(),
+                    "AGY capture log FIFO must exist before launch"
+                );
+                assert!(
+                    fs::symlink_metadata(&directory).is_ok(),
+                    "AGY capture directory must exist before launch"
+                );
+                agy_capture_paths.push((log, directory));
+            };
+            match run_supervised_process_group_for_test(
+                agy_inputs,
+                |_| Ok(Vec::new()),
+                None,
+                &mut agy_cancel_rx,
+                None,
+                Some(health_tx),
+                Some(&mut agy_launch_observer),
+                &mut agy_observer,
+            )
+            .await
+            {
+                Ok(_) => panic!("held AGY executable must exhaust retries"),
+                Err(err) => err,
+            }
+        };
         match agy_err {
             WorkerError::Io(err) => assert_eq!(err.raw_os_error(), Some(libc::ETXTBSY)),
             other => panic!("unexpected AGY exhaustion error: {other}"),
@@ -4061,6 +4120,16 @@ printf '%s\n' '{{"ok":true}}' > "$OUT"
             fs::read(&sentinel).expect("read sentinel"),
             b"preserve unrelated data"
         );
-        assert_no_new_owned_temp_entries("threadlane-agy-diagnostic-", &agy_before).await;
+        assert_eq!(
+            agy_capture_paths.len(),
+            1,
+            "AGY capture setup must run exactly once"
+        );
+        let (agy_capture_log, agy_capture_directory) = &agy_capture_paths[0];
+        assert_owned_capture_paths_removed(&[
+            agy_capture_log.to_path_buf(),
+            agy_capture_directory.to_path_buf(),
+        ])
+        .await;
     }
 }
