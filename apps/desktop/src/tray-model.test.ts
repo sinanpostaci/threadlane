@@ -19,6 +19,7 @@ import type {
   ObservationSnapshotRequest,
   ObservationSource,
   WorkspaceChatIdentity,
+  WorkspaceExternalResolution,
   WorkspaceJobHistory,
   WorkspaceJobSummary,
   WorkspaceNativeSample,
@@ -336,6 +337,25 @@ function makeJobHistory(
   };
 }
 
+function makeExternalResolution(
+  overrides: Partial<WorkspaceExternalResolution> = {}
+): WorkspaceExternalResolution {
+  return {
+    receipt_id: 'rcpt_tray_01',
+    request_key: 'req_tray_01',
+    preview_digest: 'digest_tray_01',
+    outcome: 'resolved_externally',
+    scope: 'job',
+    task_ids: [],
+    applicability: 'applicable',
+    summary: 'Resolved externally by the operator.',
+    evidence_refs: ['ev_tray_01'],
+    recorded_at_ms: NOW_MS - 1_000,
+    covered_attention: [],
+    ...overrides,
+  };
+}
+
 function makeWorkspaceSnapshot(
   overrides: {
     generated_at_ms?: number;
@@ -345,8 +365,7 @@ function makeWorkspaceSnapshot(
     job_histories?: WorkspaceJobHistory[];
     messages?: Partial<WorkspaceSnapshot['messages']>;
   } = {}
-): WorkspaceSnapshot {
-  const generatedAt = overrides.generated_at_ms ?? NOW_MS;
+): WorkspaceSnapshot {  const generatedAt = overrides.generated_at_ms ?? NOW_MS;
   return normalizeWorkspaceSnapshot({
     schema_version: WORKSPACE_SNAPSHOT_SCHEMA_VERSION,
     generated_at_ms: generatedAt,
@@ -1174,6 +1193,264 @@ test('historical failures never become current blockers, and unaccepted/unknown 
   assert.equal(parallelWorkerCalls.rows.length, 2);
   assert.equal(parallelWorkerCalls.rows[0]?.title, 'Coder slice B');
   assert.equal(parallelWorkerCalls.rows[1]?.title, 'Coder slice A');
+});
+
+test('projects full, partial, and historical external receipts without closing current blockers', () => {
+  const fullReceipt = makeExternalResolution({
+    receipt_id: 'rcpt_tray_full_01',
+    scope: 'job',
+    task_ids: ['task-full'],
+    summary: 'Full job resolved externally.',
+    evidence_refs: ['ev_tray_full_01', 'ev_tray_full_02'],
+  });
+  const fullSnapshot = makeWorkspaceSnapshot({
+    job_histories: [
+      makeJobHistory(
+        {
+          job_id: 'job-tray-full',
+          title: 'Full external job',
+          state: 'unknown',
+          execution_status: 'resolved_externally',
+          updated_at_ms: NOW_MS - 1_000,
+        },
+        {
+          tasks: [
+            makeTaskHistory({
+              task_id: 'task-full',
+              title: 'Full task',
+              status: 'completed',
+              current_attention: null,
+              attempts: [],
+            }),
+          ],
+          runs: [],
+          external_resolutions: [fullReceipt],
+          current_attention: null,
+        }
+      ),
+    ],
+  });
+  const fullModel = projectTrayModel(fullSnapshot, { nowMs: NOW_MS });
+  assert.equal(fullModel.status, 'ready');
+  assert.equal(fullModel.attentionCount, 0);
+  const fullRow = fullModel.rows.find((row) => row.jobId === 'job-tray-full');
+  assert.ok(fullRow);
+  assert.equal(fullRow.category, 'result');
+  assert.equal(fullRow.statusLabel, 'Resolved externally');
+  assert.equal(fullRow.receiptId, fullReceipt.receipt_id);
+  assert.deepEqual(fullRow.evidenceRefs, ['ev_tray_full_01', 'ev_tray_full_02']);
+  assert.equal(fullRow.externalResolutionScope, 'job');
+  assert.deepEqual(fullRow.externalResolutionTaskIds, ['task-full']);
+  assert.deepEqual(fullRow.historicalReceiptIds, []);
+  assert.deepEqual(fullModel.historicalReceipts, []);
+
+  const partialReceipt = makeExternalResolution({
+    receipt_id: 'rcpt_tray_partial_02',
+    scope: 'tasks',
+    task_ids: ['task-partial'],
+    summary: 'One task resolved externally.',
+    evidence_refs: ['ev_tray_partial_02'],
+  });
+  const partialSnapshot = makeWorkspaceSnapshot({
+    job_histories: [
+      makeJobHistory(
+        {
+          job_id: 'job-tray-partial',
+          title: 'Partial external job',
+          state: 'failed',
+          execution_status: 'failed',
+          updated_at_ms: NOW_MS - 2_000,
+        },
+        {
+          tasks: [
+            makeTaskHistory({
+              task_id: 'task-partial',
+              title: 'Partial task',
+              status: 'completed',
+              current_attention: null,
+              attempts: [],
+            }),
+            makeTaskHistory({
+              task_id: 'task-unrelated',
+              title: 'Unrelated task',
+              status: 'completed',
+              current_attention: null,
+              attempts: [],
+            }),
+          ],
+          runs: [],
+          external_resolutions: [partialReceipt],
+          current_attention: null,
+        }
+      ),
+    ],
+  });
+  const partialModel = projectTrayModel(partialSnapshot, { nowMs: NOW_MS });
+  assert.equal(partialModel.status, 'ready');
+  const partialRow = partialModel.rows.find(
+    (row) => row.jobId === 'job-tray-partial'
+  );
+  assert.ok(partialRow);
+  assert.equal(partialRow.category, 'result');
+  assert.equal(partialRow.statusLabel, 'Partially resolved externally');
+  assert.equal(partialRow.receiptId, partialReceipt.receipt_id);
+  assert.deepEqual(partialRow.evidenceRefs, ['ev_tray_partial_02']);
+  assert.equal(partialRow.externalResolutionScope, 'tasks');
+  assert.deepEqual(partialRow.externalResolutionTaskIds, ['task-partial']);
+  assert.equal(partialModel.pendingAcceptanceCount, 1);
+  assert.deepEqual(partialModel.historicalReceipts, []);
+
+  const blockedPartialReceipt = makeExternalResolution({
+    receipt_id: 'rcpt_tray_blocked_partial_03',
+    scope: 'tasks',
+    task_ids: ['task-history'],
+    summary: 'Applicable partial receipt still leaves backend attention open.',
+    evidence_refs: ['ev_tray_blocked_partial_03'],
+  });
+  const staleReceipt = makeExternalResolution({
+    receipt_id: 'rcpt_tray_stale_04',
+    scope: 'tasks',
+    task_ids: ['task-history'],
+    applicability: 'stale',
+    summary: 'Stale historical receipt.',
+    evidence_refs: ['ev_tray_stale_04'],
+    recorded_at_ms: NOW_MS - 3_000,
+  });
+  const unverifiedReceipt = makeExternalResolution({
+    receipt_id: 'rcpt_tray_unverified_05',
+    scope: 'job',
+    applicability: 'unverified',
+    summary: 'Unverified historical receipt.',
+    evidence_refs: ['ev_tray_unverified_05'],
+    recorded_at_ms: NOW_MS - 4_000,
+  });
+  const historySnapshot = makeWorkspaceSnapshot({
+    job_histories: [
+      makeJobHistory(
+        {
+          job_id: 'job-tray-history',
+          title: 'History receipt job',
+          state: 'needs_user',
+          execution_status: 'held',
+          updated_at_ms: NOW_MS - 3_000,
+        },
+        {
+          tasks: [
+            makeTaskHistory({
+              task_id: 'task-history',
+              title: 'Held task',
+              status: 'held',
+              current_attention: null,
+              attempts: [],
+            }),
+          ],
+          runs: [],
+          external_resolutions: [
+            blockedPartialReceipt,
+            staleReceipt,
+            unverifiedReceipt,
+          ],
+          current_attention: {
+            kind: 'needs_approval',
+            reason: 'Uncovered approval remains active.',
+            next_step: 'Approve in Codex.',
+            blocking_hold_ids: ['hold-tray-01'],
+            blocking_outbox_ids: [],
+            question_id: 'q-tray-01',
+            updated_at_ms: NOW_MS - 3_000,
+          },
+        }
+      ),
+    ],
+  });
+  const historyModel = projectTrayModel(historySnapshot, { nowMs: NOW_MS });
+  assert.equal(historyModel.status, 'ready');
+  assert.equal(historyModel.attentionCount, 1);
+  const attentionRow = historyModel.rows.find(
+    (row) => row.category === 'needs_human'
+  );
+  assert.ok(attentionRow);
+  assert.equal(attentionRow.jobId, 'job-tray-history');
+  assert.equal(attentionRow.statusLabel, 'Needs approval');
+  assert.equal(attentionRow.receiptId, blockedPartialReceipt.receipt_id);
+  assert.deepEqual(attentionRow.historicalReceiptIds.sort(), [
+    'rcpt_tray_stale_04',
+    'rcpt_tray_unverified_05',
+  ]);
+  assert.equal(historyModel.historicalReceipts.length, 2);
+  assert.deepEqual(
+    historyModel.historicalReceipts.map((item) => item.statusLabel).sort(),
+    ['Stale external receipt', 'Unverified external receipt']
+  );
+  assert.ok(
+    historyModel.historicalReceipts.every(
+      (item) => item.jobId === 'job-tray-history'
+    )
+  );
+  assert.deepEqual(
+    historyModel.historicalReceipts.find(
+      (item) => item.receiptId === 'rcpt_tray_stale_04'
+    )?.evidenceRefs,
+    ['ev_tray_stale_04']
+  );
+});
+
+test('keeps bounded tray receipt identity visible before long summaries and many task IDs', () => {
+  const receiptId = 'rcpt_tray_long_identity_01';
+  const taskIds = Array.from(
+    { length: 40 },
+    (_, index) => `task-long-${String(index).padStart(2, '0')}`
+  );
+  const longSummary = `External resolution summary ${'detail '.repeat(40)}`.trim();
+  const longReceipt = makeExternalResolution({
+    receipt_id: receiptId,
+    scope: 'tasks',
+    task_ids: taskIds,
+    summary: longSummary,
+    evidence_refs: ['ev_tray_long_01'],
+  });
+  const snapshot = makeWorkspaceSnapshot({
+    job_histories: [
+      makeJobHistory(
+        {
+          job_id: 'job-tray-long-receipt',
+          title: 'Long receipt job',
+          state: 'failed',
+          execution_status: 'failed',
+          updated_at_ms: NOW_MS - 1_000,
+        },
+        {
+          tasks: [
+            makeTaskHistory({
+              task_id: taskIds[0]!,
+              title: 'Covered partial task',
+              status: 'completed',
+              current_attention: null,
+              attempts: [],
+            }),
+          ],
+          runs: [],
+          external_resolutions: [longReceipt],
+          current_attention: null,
+        }
+      ),
+    ],
+  });
+
+  const model = projectTrayModel(snapshot, { nowMs: NOW_MS });
+  const row = model.rows.find((item) => item.jobId === 'job-tray-long-receipt');
+  assert.ok(row);
+  assert.equal(row.category, 'result');
+  assert.equal(row.statusLabel, 'Partially resolved externally');
+  assert.equal(row.receiptId, receiptId);
+  assert.equal(row.externalResolutionScope, 'tasks');
+  assert.ok(Array.from(row.detail).length <= WORKSPACE_TRAY_MAX_DETAIL_CHARS);
+  assert.ok(row.detail.startsWith(`Receipt ${receiptId}`));
+  assert.ok(row.detail.includes('Partial (40 tasks)'));
+  assert.ok(row.detail.includes('…'));
+  assert.equal(row.detail.includes(longSummary), false);
+  assert.equal(row.externalResolutionTaskIds.length, taskIds.length);
+  assert.deepEqual(row.evidenceRefs, ['ev_tray_long_01']);
 });
 
 test('retains producer timestamps across snapshot regeneration and refresh failure so sample age advances truthfully', async () => {

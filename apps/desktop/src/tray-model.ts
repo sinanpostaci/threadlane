@@ -29,6 +29,8 @@ import {
   isCanonicalUuid,
   projectWorkspaceSnapshot,
   type WorkspaceChatSidebarItem,
+  type WorkspaceExternalResolutionScope,
+  type WorkspaceExternalResolutionView,
   type WorkspaceJobView,
   type WorkspaceSelectedChatProjection,
 } from './app-model.ts';
@@ -120,6 +122,24 @@ export interface TrayCoworkerSummary {
   oldestStaleAgeMs: number | null;
 }
 
+export interface TrayHistoricalReceiptView {
+  receiptId: string;
+  jobId: string;
+  jobTitle: string;
+  projectLabel: string;
+  chatLabel: string;
+  applicability: 'stale' | 'unverified';
+  statusLabel: 'Stale external receipt' | 'Unverified external receipt';
+  scope: WorkspaceExternalResolutionScope;
+  scopeLabel: string;
+  taskIds: string[];
+  evidenceRefs: string[];
+  summary: string;
+  recordedAtMs: number | null;
+  ageLabel: string;
+  chatIdentity: WorkspaceChatIdentity;
+}
+
 export interface TrayRowView {
   key: string;
   category: TrayRowCategory;
@@ -137,6 +157,11 @@ export interface TrayRowView {
   threadUuid: string | null;
   jobId: string | null;
   codexTarget: CodexChatTarget | null;
+  receiptId: string | null;
+  evidenceRefs: string[];
+  externalResolutionScope: WorkspaceExternalResolutionScope | null;
+  externalResolutionTaskIds: string[];
+  historicalReceiptIds: string[];
 }
 
 export interface TrayProjection {
@@ -151,6 +176,7 @@ export interface TrayProjection {
   sourceNotice: string | null;
   coworkerSummary: TrayCoworkerSummary | null;
   rows: TrayRowView[];
+  historicalReceipts: TrayHistoricalReceiptView[];
   emptyMessage: string | null;
   unavailableReason: string | null;
 }
@@ -839,9 +865,75 @@ function makeUnavailableProjection(
     sourceNotice: null,
     coworkerSummary: null,
     rows: [],
+    historicalReceipts: [],
     emptyMessage: null,
     unavailableReason,
   };
+}
+
+interface CandidateReceiptMeta {
+  receiptId: string | null;
+  evidenceRefs: string[];
+  externalResolutionScope: WorkspaceExternalResolutionScope | null;
+  externalResolutionTaskIds: string[];
+  historicalReceiptIds: string[];
+}
+
+function emptyCandidateReceiptMeta(): CandidateReceiptMeta {
+  return {
+    receiptId: null,
+    evidenceRefs: [],
+    externalResolutionScope: null,
+    externalResolutionTaskIds: [],
+    historicalReceiptIds: [],
+  };
+}
+
+function buildJobCandidateReceiptMeta(
+  job: WorkspaceJobView | null | undefined,
+): CandidateReceiptMeta {
+  if (!job) {
+    return emptyCandidateReceiptMeta();
+  }
+  const primary = job.primaryExternalResolution;
+  return {
+    receiptId: primary?.receiptId ?? null,
+    evidenceRefs: primary ? [...primary.evidenceRefs] : [],
+    externalResolutionScope: primary?.scope ?? null,
+    externalResolutionTaskIds: primary ? [...primary.taskIds] : [],
+    historicalReceiptIds: job.historicalExternalResolutions.map(
+      (res) => res.receiptId,
+    ),
+  };
+}
+
+const TRAY_RECEIPT_IDENTITY_MAX_CHARS = 64;
+const TRAY_RECEIPT_SUMMARY_MAX_CHARS = 64;
+
+// Keep the actual receipt identity ahead of bounded summary text so the compact
+// tray detail limit cannot erase which receipt a result row represents.
+function formatExternalResolutionTrayDetail(
+  res: WorkspaceExternalResolutionView,
+): string {
+  const receiptTag = `Receipt ${truncateCodePoints(
+    res.receiptId,
+    TRAY_RECEIPT_IDENTITY_MAX_CHARS,
+  )}`;
+  const parts: string[] = [receiptTag];
+  if (res.scope === 'tasks') {
+    const taskCount = res.taskIds.length;
+    parts.push(`Partial (${taskCount} ${taskCount === 1 ? 'task' : 'tasks'})`);
+  }
+  const cleanSummary = trimOrNull(res.summary);
+  if (cleanSummary !== null) {
+    parts.push(
+      truncateCodePoints(cleanSummary, TRAY_RECEIPT_SUMMARY_MAX_CHARS),
+    );
+  }
+  return truncateCodePoints(
+    parts.join(' · '),
+    WORKSPACE_TRAY_MAX_DETAIL_CHARS,
+  );
 }
 
 interface CandidateRowMeta {
@@ -852,6 +944,7 @@ interface CandidateRowMeta {
   coworkerLabel: string | null;
   coworkerTone: TrayCoworkerTone | null;
   ageLabel: string;
+  receiptMeta: CandidateReceiptMeta;
 }
 
 interface RawTrayCandidate {
@@ -918,6 +1011,7 @@ export function projectTrayModel(
         sourceNotice: null,
         coworkerSummary: null,
         rows: [],
+        historicalReceipts: [],
         emptyMessage: null,
         unavailableReason: null,
       };
@@ -1004,6 +1098,11 @@ export function projectTrayModel(
   const workingCandidates: RawTrayCandidate[] = [];
   const realTerminalResultCandidates: RawTrayCandidate[] = [];
   const unacceptedCompletionCandidates: RawTrayCandidate[] = [];
+  const historicalReceiptEntries: Array<{
+    sortTs: number;
+    tieKey: string;
+    item: TrayHistoricalReceiptView;
+  }> = [];
 
   const candidateChats: WorkspaceChatSidebarItem[] = [
     ...activeChats,
@@ -1043,6 +1142,43 @@ export function projectTrayModel(
     const jobsById = new Map<string, WorkspaceJobView>();
     for (const job of chatJobs) {
       jobsById.set(job.jobId, job);
+      if (chat.lifecycle === 'active') {
+        for (const histRes of job.historicalExternalResolutions) {
+          if (
+            histRes.applicability === 'stale' ||
+            histRes.applicability === 'unverified'
+          ) {
+            const histStatusLabel =
+              histRes.applicability === 'stale'
+                ? 'Stale external receipt'
+                : 'Unverified external receipt';
+            historicalReceiptEntries.push({
+              sortTs:
+                histRes.recordedAtMs ??
+                job.updatedAtMs ??
+                Number.MIN_SAFE_INTEGER,
+              tieKey: `${chat.chatKey}\u0000hist\u0000${job.jobId}\u0000${histRes.receiptId}`,
+              item: {
+                receiptId: histRes.receiptId,
+                jobId: job.jobId,
+                jobTitle: job.title,
+                projectLabel: chat.projectLabel,
+                chatLabel: chat.threadLabel,
+                applicability: histRes.applicability,
+                statusLabel: histStatusLabel,
+                scope: histRes.scope,
+                scopeLabel: histRes.scopeLabel,
+                taskIds: [...histRes.taskIds],
+                evidenceRefs: [...histRes.evidenceRefs],
+                summary: histRes.summary,
+                recordedAtMs: histRes.recordedAtMs,
+                ageLabel: histRes.ageLabel,
+                chatIdentity: chat.identity,
+              },
+            });
+          }
+        }
+      }
     }
 
     const latestQuestionMessage =
@@ -1102,6 +1238,9 @@ export function projectTrayModel(
           coworkerLabel: isNativeBlocker ? null : (coworkerDesc?.label ?? null),
           coworkerTone: isNativeBlocker ? null : (coworkerDesc?.tone ?? null),
           ageLabel: formatAgeLabel(updatedAtMs, referenceNowMs),
+          receiptMeta: isNativeBlocker
+            ? emptyCandidateReceiptMeta()
+            : buildJobCandidateReceiptMeta(linkedJob),
         },
       });
     }
@@ -1118,7 +1257,16 @@ export function projectTrayModel(
           (task.statusRaw === 'unknown' ||
             task.currentAttempt?.statusRaw === 'unknown')
       );
-      if (job.stateRaw !== 'unknown' && !hasCurrentUnknownAttempt) {
+      const isSupersededOrExternallyResolvedState =
+        job.statusLabel === 'Superseded' ||
+        (job.stateRaw === 'unknown' &&
+          job.executionStatus.trim().toLowerCase() === 'resolved_externally' &&
+          job.hasApplicableFullExternalResolution &&
+          !hasCurrentUnknownAttempt);
+      if (
+        (job.stateRaw !== 'unknown' || isSupersededOrExternallyResolvedState) &&
+        !hasCurrentUnknownAttempt
+      ) {
         continue;
       }
       blockedJobIds.add(job.jobId);
@@ -1143,6 +1291,7 @@ export function projectTrayModel(
           coworkerLabel: coworkerDesc?.label ?? null,
           coworkerTone: coworkerDesc?.tone ?? null,
           ageLabel: formatAgeLabel(updatedAtMs, referenceNowMs),
+          receiptMeta: buildJobCandidateReceiptMeta(job),
         },
       });
     }
@@ -1171,6 +1320,7 @@ export function projectTrayModel(
           coworkerLabel: null,
           coworkerTone: 'working',
           ageLabel: formatAgeLabel(updatedAtMs, referenceNowMs),
+          receiptMeta: emptyCandidateReceiptMeta(),
         },
       });
     }
@@ -1262,6 +1412,7 @@ export function projectTrayModel(
           coworkerLabel: coworkerDesc?.label ?? null,
           coworkerTone: coworkerDesc?.tone ?? null,
           ageLabel: callEntry.ageLabel,
+          receiptMeta: emptyCandidateReceiptMeta(),
         },
       });
     }
@@ -1321,6 +1472,7 @@ export function projectTrayModel(
               coworkerLabel: coworkerDesc?.label ?? null,
               coworkerTone: coworkerDesc?.tone ?? null,
               ageLabel: callEntry.ageLabel,
+              receiptMeta: buildJobCandidateReceiptMeta(job),
             },
           });
         }
@@ -1358,6 +1510,7 @@ export function projectTrayModel(
           coworkerLabel: coworkerDesc?.label ?? null,
           coworkerTone: coworkerDesc?.tone ?? null,
           ageLabel: formatAgeLabel(updatedAtMs, referenceNowMs),
+          receiptMeta: buildJobCandidateReceiptMeta(job),
         },
       });
     }
@@ -1385,6 +1538,7 @@ export function projectTrayModel(
             coworkerLabel: coworkerDesc?.label ?? null,
             coworkerTone: coworkerDesc?.tone ?? null,
             ageLabel: callEntry.ageLabel,
+            receiptMeta: buildJobCandidateReceiptMeta(jobsById.get(jobId)),
           },
         });
       }
@@ -1409,6 +1563,7 @@ export function projectTrayModel(
 
       const updatedAtMs =
         job.result?.producedAtMs ?? job.updatedAtMs ?? chat.updatedAtMs;
+      const receiptMeta = buildJobCandidateReceiptMeta(job);
 
       if (job.isVerifiedAccepted) {
         accountedCompletedWorkerOnJob = true;
@@ -1432,19 +1587,14 @@ export function projectTrayModel(
             coworkerLabel: coworkerDesc?.label ?? null,
             coworkerTone: coworkerDesc?.tone ?? null,
             ageLabel: formatAgeLabel(updatedAtMs, referenceNowMs),
+            receiptMeta,
           },
         });
         continue;
       }
 
-      if (
-        job.stateRaw === 'failed' ||
-        job.acceptanceProof.status === 'rejected'
-      ) {
+      if (job.acceptanceProof.status === 'rejected') {
         accountedCompletedWorkerOnJob = true;
-        const isRejected =
-          job.stateRaw !== 'failed' &&
-          job.acceptanceProof.status === 'rejected';
         realTerminalResultCandidates.push({
           sortPriority: 0,
           updatedAtMs,
@@ -1454,17 +1604,126 @@ export function projectTrayModel(
           detail:
             trimOrNull(job.result?.summary) ??
             trimOrNull(job.summary) ??
-            (isRejected ? 'Closure review rejected candidate.' : 'Job failed.'),
+            'Closure review rejected candidate.',
           chatIdentity: chat.identity,
           jobId: job.jobId,
           meta: {
             tone: 'danger',
             projectLabel: chat.projectLabel,
             chatLabel: chat.threadLabel,
-            statusLabel: isRejected ? 'Closure rejected' : 'Failed',
+            statusLabel: 'Closure rejected',
             coworkerLabel: coworkerDesc?.label ?? null,
             coworkerTone: coworkerDesc?.tone ?? null,
             ageLabel: formatAgeLabel(updatedAtMs, referenceNowMs),
+            receiptMeta,
+          },
+        });
+        continue;
+      }
+
+      if (
+        job.hasApplicableFullExternalResolution &&
+        job.primaryExternalResolution !== null
+      ) {
+        accountedCompletedWorkerOnJob = true;
+        const primary = job.primaryExternalResolution;
+        const resUpdatedAtMs = primary.recordedAtMs ?? updatedAtMs;
+        realTerminalResultCandidates.push({
+          sortPriority: 0,
+          updatedAtMs: resUpdatedAtMs,
+          tieKey: `${chat.chatKey}\u0000res_ext_full\u0000${job.jobId}\u0000${primary.receiptId}`,
+          kind: 'result',
+          title: job.title,
+          detail: formatExternalResolutionTrayDetail(primary),
+          chatIdentity: chat.identity,
+          jobId: job.jobId,
+          meta: {
+            tone: 'neutral',
+            projectLabel: chat.projectLabel,
+            chatLabel: chat.threadLabel,
+            statusLabel: 'Resolved externally',
+            coworkerLabel: coworkerDesc?.label ?? null,
+            coworkerTone: coworkerDesc?.tone ?? null,
+            ageLabel: formatAgeLabel(resUpdatedAtMs, referenceNowMs),
+            receiptMeta,
+          },
+        });
+        continue;
+      }
+
+      const hasUncoveredTaskFailure = job.tasks.some(
+        (t) => !t.isExternallyResolved && t.tone === 'danger'
+      );
+
+      if (
+        job.stateRaw === 'failed' &&
+        (!job.hasApplicablePartialExternalResolution ||
+          job.tasks.length === 0 ||
+          hasUncoveredTaskFailure)
+      ) {
+        accountedCompletedWorkerOnJob = true;
+        realTerminalResultCandidates.push({
+          sortPriority: 0,
+          updatedAtMs,
+          tieKey: `${chat.chatKey}\u0000res_failed\u0000${job.jobId}`,
+          kind: 'result',
+          title: job.title,
+          detail:
+            trimOrNull(job.result?.summary) ??
+            trimOrNull(job.summary) ??
+            'Job failed.',
+          chatIdentity: chat.identity,
+          jobId: job.jobId,
+          meta: {
+            tone: 'danger',
+            projectLabel: chat.projectLabel,
+            chatLabel: chat.threadLabel,
+            statusLabel: 'Failed',
+            coworkerLabel: coworkerDesc?.label ?? null,
+            coworkerTone: coworkerDesc?.tone ?? null,
+            ageLabel: formatAgeLabel(updatedAtMs, referenceNowMs),
+            receiptMeta,
+          },
+        });
+        continue;
+      }
+
+      if (
+        job.hasApplicablePartialExternalResolution &&
+        job.primaryExternalResolution !== null
+      ) {
+        accountedCompletedWorkerOnJob = true;
+        const hasUncoveredCompletedTaskOutput = job.tasks.some(
+          (t) =>
+            !t.isExternallyResolved &&
+            !t.isVerifiedAccepted &&
+            (t.candidates.length > 0 ||
+              t.statusRaw === 'completed' ||
+              t.currentAttempt?.statusRaw === 'completed')
+        );
+        if (hasUncoveredCompletedTaskOutput) {
+          pendingAcceptanceCount += 1;
+        }
+        const primary = job.primaryExternalResolution;
+        const resUpdatedAtMs = primary.recordedAtMs ?? updatedAtMs;
+        realTerminalResultCandidates.push({
+          sortPriority: 0,
+          updatedAtMs: resUpdatedAtMs,
+          tieKey: `${chat.chatKey}\u0000res_ext_partial\u0000${job.jobId}\u0000${primary.receiptId}`,
+          kind: 'result',
+          title: job.title,
+          detail: formatExternalResolutionTrayDetail(primary),
+          chatIdentity: chat.identity,
+          jobId: job.jobId,
+          meta: {
+            tone: 'neutral',
+            projectLabel: chat.projectLabel,
+            chatLabel: chat.threadLabel,
+            statusLabel: 'Partially resolved externally',
+            coworkerLabel: coworkerDesc?.label ?? null,
+            coworkerTone: coworkerDesc?.tone ?? null,
+            ageLabel: formatAgeLabel(resUpdatedAtMs, referenceNowMs),
+            receiptMeta,
           },
         });
         continue;
@@ -1515,6 +1774,7 @@ export function projectTrayModel(
             coworkerLabel: coworkerDesc?.label ?? null,
             coworkerTone: coworkerDesc?.tone ?? null,
             ageLabel: formatAgeLabel(updatedAtMs, referenceNowMs),
+            receiptMeta,
           },
         });
       }
@@ -1555,10 +1815,21 @@ export function projectTrayModel(
           coworkerLabel: coworkerDesc?.label ?? null,
           coworkerTone: coworkerDesc?.tone ?? null,
           ageLabel: formatAgeLabel(updatedAtMs, referenceNowMs),
+          receiptMeta: emptyCandidateReceiptMeta(),
         },
       });
     }
   }
+
+  historicalReceiptEntries.sort((left, right) => {
+    if (right.sortTs !== left.sortTs) {
+      return right.sortTs - left.sortTs;
+    }
+    return compareText(left.tieKey, right.tieKey);
+  });
+  const historicalReceipts = historicalReceiptEntries.map(
+    (entry) => entry.item
+  );
 
   // Real terminal results always take precedence over unaccepted Worker/job outputs;
   // `boundWorkspaceCompactTrayRows` enforces the 3-row cap, 1-result cap, priority order,
@@ -1601,6 +1872,7 @@ export function projectTrayModel(
       coworkerLabel: null,
       coworkerTone: null,
       ageLabel: formatAgeLabel(row.updated_at_ms, referenceNowMs),
+      receiptMeta: emptyCandidateReceiptMeta(),
     };
     const codexTarget: CodexChatTarget | null =
       row.chat_identity !== null
@@ -1628,6 +1900,13 @@ export function projectTrayModel(
       threadUuid: row.chat_identity?.thread_uuid ?? null,
       jobId: row.job_id,
       codexTarget,
+      receiptId: meta.receiptMeta.receiptId,
+      evidenceRefs: [...meta.receiptMeta.evidenceRefs],
+      externalResolutionScope: meta.receiptMeta.externalResolutionScope,
+      externalResolutionTaskIds: [
+        ...meta.receiptMeta.externalResolutionTaskIds,
+      ],
+      historicalReceiptIds: [...meta.receiptMeta.historicalReceiptIds],
     };
   });
 
@@ -1669,6 +1948,7 @@ export function projectTrayModel(
       sourceNotice,
       coworkerSummary,
       rows: [],
+      historicalReceipts,
       emptyMessage,
       unavailableReason: null,
     };
@@ -1686,6 +1966,7 @@ export function projectTrayModel(
     sourceNotice,
     coworkerSummary,
     rows,
+    historicalReceipts,
     emptyMessage: null,
     unavailableReason: null,
   };

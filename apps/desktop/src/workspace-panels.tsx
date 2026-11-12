@@ -35,6 +35,14 @@ import type {
   WorkspaceScopedChatTarget,
 } from './app-contract.ts';
 import {
+  projectWorkspaceJobExternalResolutionViews,
+  projectWorkspaceTaskExternalResolutionState,
+} from './app-model.ts';
+import type {
+  WorkspaceCoveredAttentionView,
+  WorkspaceExternalResolutionView,
+} from './app-model.ts';
+import {
   DEFAULT_BOTTOM_FOLLOW_THRESHOLD_PX,
   computeAnchorScrollTop,
   createMessageScrollStore,
@@ -456,6 +464,222 @@ function compactSha(sha: string | null | undefined): string | null {
   return clean.length <= 12 ? clean : clean.slice(0, 12);
 }
 
+interface WorkspacePanelExternalResolutionEntry {
+  view: WorkspaceExternalResolutionView;
+  jobId: string;
+  jobTitle: string;
+  sourceId: string;
+}
+
+function collectWorkspacePanelExternalResolutionEntries(
+  jobHistories: readonly WorkspaceJobHistory[],
+  referenceNowMs: number,
+): WorkspacePanelExternalResolutionEntry[] {
+  const entries: Array<{
+    sortTs: number;
+    tieKey: string;
+    entry: WorkspacePanelExternalResolutionEntry;
+  }> = [];
+  for (const history of jobHistories) {
+    const views = projectWorkspaceJobExternalResolutionViews(
+      history.external_resolutions,
+      history.job.job_id,
+      referenceNowMs,
+    );
+    for (const view of views) {
+      entries.push({
+        sortTs: view.recordedAtMs ?? history.job.updated_at_ms ?? Number.MIN_SAFE_INTEGER,
+        tieKey: `${history.job.source_id}\u0000${history.job.job_id}\u0000${view.receiptId}`,
+        entry: {
+          view,
+          jobId: history.job.job_id,
+          jobTitle: history.job.title,
+          sourceId: history.job.source_id,
+        },
+      });
+    }
+  }
+  entries.sort((left, right) => {
+    if (right.sortTs !== left.sortTs) {
+      return right.sortTs - left.sortTs;
+    }
+    return left.tieKey.localeCompare(right.tieKey);
+  });
+  return entries.map((entry) => entry.entry);
+}
+
+function renderCoveredAttentionSection(
+  items: readonly WorkspaceCoveredAttentionView[],
+  heading: string,
+) {
+  if (items.length === 0) {
+    return null;
+  }
+  return (
+    <div className="tl-wp-section-list" data-covered-attention-section="true">
+      <h6 className="tl-wp-section-heading">
+        {heading} ({items.length})
+      </h6>
+      <ul className="tl-wp-sublist">
+        {items.map((covered) => (
+          <li
+            key={covered.key}
+            className="tl-wp-subitem"
+            data-covered-attention-key={covered.key}
+          >
+            <div className="tl-wp-kv-row">
+              <span className="tl-wp-pill" data-tone="neutral">
+                <span className="tl-wp-pill-label">{covered.attention.kindLabel}</span>
+              </span>
+              <span className="tl-wp-mono">
+                {covered.taskId ? `Task: ${covered.taskId}` : 'Job-level'}
+              </span>
+              <span>Covered: {formatTimestampOrFallback(covered.recordedAtMs)}</span>
+            </div>
+            <span>{covered.attention.reason}</span>
+            {covered.attention.nextStep && (
+              <span className="tl-wp-state-desc">Next step: {covered.attention.nextStep}</span>
+            )}
+            <div className="tl-wp-kv-row tl-wp-mono">
+              {covered.attention.questionId && (
+                <span>Question: {covered.attention.questionId}</span>
+              )}
+              {covered.attention.blockingHoldIds.length > 0 && (
+                <span>Holds: {covered.attention.blockingHoldIds.join(', ')}</span>
+              )}
+              {covered.attention.blockingOutboxIds.length > 0 && (
+                <span>
+                  Blocking outbox: {covered.attention.blockingOutboxIds.join(', ')}
+                </span>
+              )}
+            </div>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+function renderExternalResolutionCard(
+  entry: WorkspacePanelExternalResolutionEntry,
+  options: {
+    onInspectJob?: (scope: ActivityFeedScope) => void;
+    onSelectJob?: (scope: ActivityFeedScope) => void;
+    onInspectActivity?: (scope: ActivityFeedScope) => void;
+    showJobContext?: boolean;
+  } = {},
+) {
+  const res = entry.view;
+  const applicabilityTone = res.isApplicable ? 'neutral' : 'attention';
+  return (
+    <article
+      key={`${entry.sourceId}:${entry.jobId}:${res.receiptId}`}
+      className="tl-wp-callout"
+      data-kind="external-resolution"
+      data-external-resolution-receipt-id={res.receiptId}
+      data-external-resolution-applicability={res.applicability}
+      data-external-resolution-scope={res.scope}
+      data-external-resolution-history={res.isApplicable ? undefined : 'true'}
+    >
+      <div className="tl-wp-callout-title">
+        <span>{res.statusLabel}</span>
+        <span className="tl-wp-pill" data-tone={applicabilityTone}>
+          <span className="tl-wp-pill-label">{res.scopeLabel}</span>
+        </span>
+        {res.isFullJob && (
+          <span className="tl-wp-pill" data-tone="neutral">
+            <span className="tl-wp-pill-label">Full job</span>
+          </span>
+        )}
+        {res.isPartial && (
+          <span className="tl-wp-pill" data-tone="neutral">
+            <span className="tl-wp-pill-label">Partial</span>
+          </span>
+        )}
+      </div>
+      {options.showJobContext && (
+        <span className="tl-wp-state-desc">
+          {entry.jobTitle} · Job {entry.jobId}
+        </span>
+      )}
+      <span>{res.summary}</span>
+      {(options.onInspectJob || options.onSelectJob || options.onInspectActivity) && (
+        <div className="tl-wp-chat-actions">
+          {options.onInspectJob && (
+            <button
+              type="button"
+              className="tl-wp-btn tl-wp-btn-subtle"
+              onClick={() =>
+                options.onInspectJob?.({
+                  source_id: entry.sourceId,
+                  job_id: entry.jobId,
+                })
+              }
+            >
+              View job
+            </button>
+          )}
+          {options.onInspectActivity && (
+            <button
+              type="button"
+              className="tl-wp-btn tl-wp-btn-subtle"
+              onClick={() =>
+                options.onInspectActivity?.({
+                  source_id: entry.sourceId,
+                  job_id: entry.jobId,
+                })
+              }
+            >
+              View job activity
+            </button>
+          )}
+          {options.onSelectJob && (
+            <button
+              type="button"
+              className="tl-wp-btn tl-wp-btn-subtle"
+              onClick={() =>
+                options.onSelectJob?.({
+                  source_id: entry.sourceId,
+                  job_id: entry.jobId,
+                })
+              }
+            >
+              Open in Jobs
+            </button>
+          )}
+        </div>
+      )}
+      <details
+        className="tl-wp-message-details"
+        data-external-resolution-details={res.receiptId}
+      >
+        <summary className="tl-wp-message-details-summary">Receipt details</summary>
+        <div className="tl-wp-message-details-body">
+          <span className="tl-wp-mono">Receipt: {res.receiptId}</span>
+          <div className="tl-wp-kv-row tl-wp-mono">
+            {res.requestKey && <span>Request key: {res.requestKey}</span>}
+            {res.previewDigest && <span>Preview digest: {res.previewDigest}</span>}
+            {res.taskIds.length > 0 && <span>Tasks: {res.taskIds.join(', ')}</span>}
+            {res.recordedAtMs !== null && (
+              <span>Recorded: {formatTimestampOrFallback(res.recordedAtMs)}</span>
+            )}
+            <span>{res.ageLabel}</span>
+          </div>
+          {res.evidenceRefs.length > 0 && (
+            <div className="tl-wp-kv-row tl-wp-mono">
+              <span>Evidence: {res.evidenceRefs.join(', ')}</span>
+            </div>
+          )}
+          {renderCoveredAttentionSection(
+            res.coveredAttention,
+            res.isApplicable ? 'Covered attention' : 'Historical covered attention',
+          )}
+        </div>
+      </details>
+    </article>
+  );
+}
+
 export {
   doesJobBelongToChat,
   doesMessageBelongToChat,
@@ -486,6 +710,11 @@ function summarizeJobTruncation(truncation: WorkspaceJobHistoryTruncation): stri
   }
   if (truncation.combined_candidates_omitted > 0) {
     parts.push(`${truncation.combined_candidates_omitted} combined candidates omitted`);
+  }
+  if ((truncation.external_resolutions_omitted ?? 0) > 0) {
+    parts.push(
+      `${truncation.external_resolutions_omitted} external resolution receipts omitted`,
+    );
   }
   return parts;
 }
@@ -690,8 +919,10 @@ export function WorkspaceSurfaceTabs({
 export interface WorkspaceMessagesPanelProps {
   chat?: WorkspaceChatSummary | null;
   messages: WorkspaceMessagesWindow | null;
+  jobHistories?: readonly WorkspaceJobHistory[] | null;
   bounds?: WorkspaceSnapshotBounds | null;
   knownChatJobIds?: ReadonlySet<string>;
+  nowMs?: number | null;
   isActive?: boolean;
   loading?: boolean;
   error?: string | null;
@@ -706,8 +937,10 @@ export interface WorkspaceMessagesPanelProps {
 export function WorkspaceMessagesPanel({
   chat = null,
   messages,
+  jobHistories = null,
   bounds = null,
   knownChatJobIds,
+  nowMs = null,
   isActive = true,
   loading = false,
   error = null,
@@ -770,6 +1003,37 @@ export function WorkspaceMessagesPanel({
     () => orderWorkspaceMessageItems(scopedItems),
     [scopedItems],
   );
+
+  const referenceNowMs =
+    typeof nowMs === 'number' && Number.isFinite(nowMs) ? nowMs : Date.now();
+  const scopedJobHistories = useMemo(
+    () =>
+      jobHistories
+        ? filterJobsForChat(jobHistories, chat, knownChatJobIds)
+        : [],
+    [jobHistories, chat, knownChatJobIds],
+  );
+  const externalResolutionEntries = useMemo(
+    () =>
+      collectWorkspacePanelExternalResolutionEntries(
+        scopedJobHistories,
+        referenceNowMs,
+      ),
+    [scopedJobHistories, referenceNowMs],
+  );
+  const applicableExternalResolutions = externalResolutionEntries.filter(
+    (entry) => entry.view.isApplicable,
+  );
+  const historicalExternalResolutions = externalResolutionEntries.filter(
+    (entry) => !entry.view.isApplicable,
+  );
+  const receiptEntryByReceiptId = useMemo(() => {
+    const byReceiptId = new Map<string, WorkspacePanelExternalResolutionEntry>();
+    for (const entry of externalResolutionEntries) {
+      byReceiptId.set(entry.view.receiptId, entry);
+    }
+    return byReceiptId;
+  }, [externalResolutionEntries]);
 
   const latestRecordedDayMs = useMemo(() => {
     for (let idx = orderedItems.length - 1; idx >= 0; idx -= 1) {
@@ -1091,6 +1355,49 @@ export function WorkspaceMessagesPanel({
           data-messages-scroller="true"
           onScroll={handleScrollerScroll}
         >
+          {externalResolutionEntries.length > 0 && (
+            <div
+              className="tl-wp-section-list"
+              aria-label="External resolution receipts"
+              data-external-resolution-surface="messages"
+            >
+              <h4 className="tl-wp-section-heading">
+                External resolution receipts ({applicableExternalResolutions.length})
+              </h4>
+              {applicableExternalResolutions.length === 0 ? (
+                <span className="tl-wp-state-desc">
+                  No applicable external resolution receipts recorded for this chat.
+                </span>
+              ) : (
+                applicableExternalResolutions.map((entry) =>
+                  renderExternalResolutionCard(entry, {
+                    onInspectJob,
+                    showJobContext: true,
+                  }),
+                )
+              )}
+
+              {historicalExternalResolutions.length > 0 && (
+                <details
+                  className="tl-wp-disclosure"
+                  data-external-resolution-surface="messages-history"
+                  data-external-resolution-history-disclosure="true"
+                >
+                  <summary>
+                    External resolution history ({historicalExternalResolutions.length})
+                  </summary>
+                  <div className="tl-wp-disclosure-body">
+                    {historicalExternalResolutions.map((entry) =>
+                      renderExternalResolutionCard(entry, {
+                        onInspectJob,
+                        showJobContext: true,
+                      }),
+                    )}
+                  </div>
+                </details>
+              )}
+            </div>
+          )}
           {loading && !messages ? (
             <div className="tl-wp-state-card" data-state="loading" role="status">
               <h3 className="tl-wp-state-title">Loading messages…</h3>
@@ -1154,6 +1461,14 @@ export function WorkspaceMessagesPanel({
                 if (completeness.incomplete_reason) {
                   conciseWarnings.push(completeness.incomplete_reason);
                 }
+                const candidateReceiptEntry =
+                  receiptEntryByReceiptId.get(item.source_record_id) ?? null;
+                const linkedReceiptEntry =
+                  candidateReceiptEntry !== null &&
+                  (item.scope.job_id === null ||
+                    candidateReceiptEntry.jobId === item.scope.job_id)
+                    ? candidateReceiptEntry
+                    : null;
                 return (
                   <li
                     key={item.item_id}
@@ -1183,20 +1498,41 @@ export function WorkspaceMessagesPanel({
                         <span className="tl-wp-message-time">{conciseTime}</span>
                       </div>
 
-                      {item.scope.job_id && onInspectJob && (
+                      {(item.scope.job_id || linkedReceiptEntry) && (
                         <div className="tl-wp-message-meta-right">
-                          <button
-                            type="button"
-                            className="tl-wp-message-job-btn"
-                            onClick={() =>
-                              onInspectJob({
-                                source_id: item.scope.source_id,
-                                job_id: item.scope.job_id!,
-                              })
-                            }
-                          >
-                            View job
-                          </button>
+                          {linkedReceiptEntry && (
+                            <button
+                              type="button"
+                              className="tl-wp-message-job-btn"
+                              data-message-receipt-id={linkedReceiptEntry.view.receiptId}
+                              disabled={!onInspectJob}
+                              onClick={() => {
+                                if (!onInspectJob) {
+                                  return;
+                                }
+                                onInspectJob({
+                                  source_id: linkedReceiptEntry.sourceId,
+                                  job_id: linkedReceiptEntry.jobId,
+                                });
+                              }}
+                            >
+                              Receipt: {linkedReceiptEntry.view.receiptId}
+                            </button>
+                          )}
+                          {item.scope.job_id && onInspectJob && (
+                            <button
+                              type="button"
+                              className="tl-wp-message-job-btn"
+                              onClick={() =>
+                                onInspectJob({
+                                  source_id: item.scope.source_id,
+                                  job_id: item.scope.job_id!,
+                                })
+                              }
+                            >
+                              View job
+                            </button>
+                          )}
                         </div>
                       )}
                     </div>
@@ -1287,6 +1623,7 @@ export interface WorkspaceJobsPanelProps {
   bounds?: WorkspaceSnapshotBounds | null;
   jobsHasMore?: boolean;
   focusedJobId?: string | null;
+  nowMs?: number | null;
   loading?: boolean;
   error?: string | null;
   isStale?: boolean;
@@ -1506,8 +1843,17 @@ function renderTaskCandidateItem(candidate: WorkspaceTaskCandidate, task: Worksp
   );
 }
 
-function renderTaskHistoryCard(task: WorkspaceTaskHistory) {
+function renderTaskHistoryCard(
+  task: WorkspaceTaskHistory,
+  jobExternalResolutions: readonly WorkspaceExternalResolutionView[],
+  referenceNowMs: number,
+) {
   const proofMeta = formatAcceptanceStatusMeta(task.acceptance_proof.status);
+  const externalState = projectWorkspaceTaskExternalResolutionState(
+    task,
+    jobExternalResolutions,
+    referenceNowMs,
+  );
   return (
     <div key={task.task_id} className="tl-wp-task-card" data-task-id={task.task_id}>
       <div className="tl-wp-job-header">
@@ -1531,11 +1877,42 @@ function renderTaskHistoryCard(task: WorkspaceTaskHistory) {
           <span className="tl-wp-pill" data-tone={proofMeta.tone}>
             <span className="tl-wp-pill-label">{proofMeta.label}</span>
           </span>
+          {externalState.label && (
+            <span
+              className="tl-wp-pill"
+              data-tone="neutral"
+              data-task-external-resolution={externalState.label}
+            >
+              <span className="tl-wp-pill-label">{externalState.label}</span>
+            </span>
+          )}
         </div>
       </div>
 
       {task.current_attention && renderAttentionCallout(task.current_attention)}
       {task.historical_failure && renderHistoricalFailureCallout(task.historical_failure)}
+
+      {externalState.coveredAttention.length > 0 &&
+        renderCoveredAttentionSection(externalState.coveredAttention, 'Covered attention')}
+
+      {externalState.applicable.length > 0 && (
+        <div className="tl-wp-kv-row tl-wp-mono">
+          <span>
+            External receipts: {externalState.applicable.map((res) => res.receiptId).join(', ')}
+          </span>
+        </div>
+      )}
+
+      {externalState.historical.length > 0 && (
+        <div className="tl-wp-kv-row">
+          <span>
+            External receipt history:{' '}
+            {externalState.historical
+              .map((res) => `${res.statusLabel} (${res.receiptId})`)
+              .join(' · ')}
+          </span>
+        </div>
+      )}
 
       {task.attempts.length > 0 && (
         <div className="tl-wp-section-list">
@@ -1680,6 +2057,7 @@ export function WorkspaceJobsPanel({
   bounds = null,
   jobsHasMore = false,
   focusedJobId = null,
+  nowMs = null,
   loading = false,
   error = null,
   isStale = false,
@@ -1700,6 +2078,23 @@ export function WorkspaceJobsPanel({
     () => (jobHistories ? filterJobsForChat(jobHistories, chat, knownChatJobIds) : []),
     [jobHistories, chat, knownChatJobIds],
   );
+
+  const referenceNowMs =
+    typeof nowMs === 'number' && Number.isFinite(nowMs) ? nowMs : Date.now();
+  const externalResolutionsByJobKey = useMemo(() => {
+    const byJobKey = new Map<string, WorkspaceExternalResolutionView[]>();
+    for (const history of filteredJobs) {
+      byJobKey.set(
+        `${history.job.source_id}:${history.job.job_id}`,
+        projectWorkspaceJobExternalResolutionViews(
+          history.external_resolutions,
+          history.job.job_id,
+          referenceNowMs,
+        ),
+      );
+    }
+    return byJobKey;
+  }, [filteredJobs, referenceNowMs]);
 
   useEffect(() => {
     if (!focusedJobId) {
@@ -1839,6 +2234,50 @@ export function WorkspaceJobsPanel({
               history.current_attention && history.current_attention.kind !== 'none'
                 ? history.current_attention
                 : null;
+            const externalResolutions = externalResolutionsByJobKey.get(jobKey) ?? [];
+            const applicableExternalResolutions = externalResolutions.filter(
+              (res) => res.isApplicable,
+            );
+            const historicalExternalResolutions = externalResolutions.filter(
+              (res) => !res.isApplicable,
+            );
+            const hasApplicableFullExternalResolution =
+              applicableExternalResolutions.some((res) => res.scope === 'job');
+            const hasApplicablePartialExternalResolution =
+              !hasApplicableFullExternalResolution &&
+              applicableExternalResolutions.some((res) => res.scope === 'tasks');
+            const hasUnknownJobOrTaskEffect =
+              (job.state === 'unknown' &&
+                job.execution_status.trim().toLowerCase() !== 'resolved_externally') ||
+              history.tasks.some(
+                (task) =>
+                  task.status.trim().toLowerCase() === 'unknown' ||
+                  (task.current_attempt_no > 0 &&
+                    task.attempts.some(
+                      (attempt) =>
+                        attempt.attempt_no === task.current_attempt_no &&
+                        attempt.status.trim().toLowerCase() === 'unknown',
+                    )),
+              );
+            const hasAnyCurrentAttention =
+              activeAttention !== null ||
+              history.tasks.some(
+                (task) =>
+                  task.current_attention !== null &&
+                  task.current_attention.kind !== 'none',
+              );
+            const isActiveJobState =
+              job.state === 'running' ||
+              job.state === 'reviewing' ||
+              job.state === 'planning' ||
+              job.state === 'needs_user';
+            const isVerifiedAcceptedJob =
+              history.acceptance_proof.status === 'verified_accepted';
+            const showExternalResolutionHeaderPill =
+              !hasUnknownJobOrTaskEffect &&
+              !hasAnyCurrentAttention &&
+              !isActiveJobState &&
+              !isVerifiedAcceptedJob;
             const showJobSpinner = job.state === 'running' && !suppressLiveSpinner;
 
             return (
@@ -1869,6 +2308,28 @@ export function WorkspaceJobsPanel({
                         <span className="tl-wp-pill" data-tone="attention">
                           <span className="tl-wp-pill-label">
                             {formatAttentionKindLabel(activeAttention.kind)}
+                          </span>
+                        </span>
+                      )}
+                      {showExternalResolutionHeaderPill &&
+                        hasApplicableFullExternalResolution && (
+                        <span
+                          className="tl-wp-pill"
+                          data-tone="neutral"
+                          data-job-external-resolution="Resolved externally"
+                        >
+                          <span className="tl-wp-pill-label">Resolved externally</span>
+                        </span>
+                      )}
+                      {showExternalResolutionHeaderPill &&
+                        hasApplicablePartialExternalResolution && (
+                        <span
+                          className="tl-wp-pill"
+                          data-tone="neutral"
+                          data-job-external-resolution="Partially resolved externally"
+                        >
+                          <span className="tl-wp-pill-label">
+                            Partially resolved externally
                           </span>
                         </span>
                       )}
@@ -1944,6 +2405,59 @@ export function WorkspaceJobsPanel({
                     {history.historical_failure &&
                       renderHistoricalFailureCallout(history.historical_failure)}
 
+                    {applicableExternalResolutions.length > 0 && (
+                      <div
+                        className="tl-wp-section-list"
+                        aria-label="External resolution receipts"
+                        data-external-resolution-surface="jobs"
+                      >
+                        <h5 className="tl-wp-section-heading">
+                          External resolution receipts ({applicableExternalResolutions.length})
+                        </h5>
+                        {applicableExternalResolutions.map((res) =>
+                          renderExternalResolutionCard(
+                            {
+                              view: res,
+                              jobId: job.job_id,
+                              jobTitle: job.title,
+                              sourceId: job.source_id,
+                            },
+                            {
+                              onInspectActivity: onInspectActivityForJob,
+                            },
+                          ),
+                        )}
+                      </div>
+                    )}
+
+                    {historicalExternalResolutions.length > 0 && (
+                      <details
+                        className="tl-wp-disclosure"
+                        aria-label="External resolution history"
+                        data-external-resolution-surface="jobs-history"
+                        data-external-resolution-history-disclosure="true"
+                      >
+                        <summary>
+                          External resolution history ({historicalExternalResolutions.length})
+                        </summary>
+                        <div className="tl-wp-disclosure-body">
+                          {historicalExternalResolutions.map((res) =>
+                            renderExternalResolutionCard(
+                              {
+                                view: res,
+                                jobId: job.job_id,
+                                jobTitle: job.title,
+                                sourceId: job.source_id,
+                              },
+                              {
+                                onInspectActivity: onInspectActivityForJob,
+                              },
+                            ),
+                          )}
+                        </div>
+                      </details>
+                    )}
+
                     {renderAcceptanceProofBlock(history.acceptance_proof, 'Job acceptance proof')}
 
                     {history.result && renderJobResultBlock(history.result)}
@@ -1955,7 +2469,13 @@ export function WorkspaceJobsPanel({
                           No task records reported for this job.
                         </span>
                       ) : (
-                        history.tasks.map(renderTaskHistoryCard)
+                        history.tasks.map((task) =>
+                          renderTaskHistoryCard(
+                            task,
+                            externalResolutions,
+                            referenceNowMs,
+                          ),
+                        )
                       )}
                     </div>
 
@@ -2372,6 +2892,36 @@ export function WorkspaceActivityPanel({
     [chat, jobHistories, observation],
   );
 
+  const referenceNowMs =
+    typeof nowMs === 'number' && Number.isFinite(nowMs)
+      ? nowMs
+      : projection?.generatedAtMs ??
+        observation?.generated_at_ms ??
+        Date.now();
+  const scopedJobHistories = useMemo(
+    () =>
+      jobHistories
+        ? filterJobsForChat(jobHistories, chat, verifiedChatJobIds)
+        : [],
+    [jobHistories, chat, verifiedChatJobIds],
+  );
+  const externalResolutionEntries = useMemo(() => {
+    const entries = collectWorkspacePanelExternalResolutionEntries(
+      scopedJobHistories,
+      referenceNowMs,
+    );
+    if (!scope) {
+      return entries;
+    }
+    return entries.filter((entry) => entry.jobId === scope.job_id);
+  }, [scopedJobHistories, referenceNowMs, scope]);
+  const applicableExternalResolutions = externalResolutionEntries.filter(
+    (entry) => entry.view.isApplicable,
+  );
+  const historicalExternalResolutions = externalResolutionEntries.filter(
+    (entry) => !entry.view.isApplicable,
+  );
+
   // Selected-chat scope is always active when `chat` is non-null; a job filter intersects it and never bypasses it.
   const effectiveChatScopeActive = chat !== null;
 
@@ -2650,6 +3200,52 @@ export function WorkspaceActivityPanel({
       )}
 
       <div className="tl-wp-activity-scroller">
+        {externalResolutionEntries.length > 0 && (
+          <div
+            className="tl-wp-section-list"
+            aria-label="External resolution receipts"
+            data-external-resolution-surface="activity"
+          >
+            <h4 className="tl-wp-section-heading">
+              External resolution receipts ({applicableExternalResolutions.length})
+            </h4>
+            <span className="tl-wp-state-desc" data-external-resolution-note="true">
+              External resolution receipts are recorded in job history.
+            </span>
+            {applicableExternalResolutions.length === 0 ? (
+              <span className="tl-wp-state-desc">
+                No applicable external resolution receipts recorded for this activity scope.
+              </span>
+            ) : (
+              applicableExternalResolutions.map((entry) =>
+                renderExternalResolutionCard(entry, {
+                  onSelectJob,
+                  showJobContext: true,
+                }),
+              )
+            )}
+
+            {historicalExternalResolutions.length > 0 && (
+              <details
+                className="tl-wp-disclosure"
+                data-external-resolution-surface="activity-history"
+                data-external-resolution-history-disclosure="true"
+              >
+                <summary>
+                  External resolution history ({historicalExternalResolutions.length})
+                </summary>
+                <div className="tl-wp-disclosure-body">
+                  {historicalExternalResolutions.map((entry) =>
+                    renderExternalResolutionCard(entry, {
+                      onSelectJob,
+                      showJobContext: true,
+                    }),
+                  )}
+                </div>
+              </details>
+            )}
+          </div>
+        )}
         {loading && !observation ? (
           <div className="tl-wp-state-card" data-state="loading" role="status">
             <h3 className="tl-wp-state-title">Loading recent activity…</h3>
@@ -2676,13 +3272,19 @@ export function WorkspaceActivityPanel({
           </div>
         ) : displayedRows.length === 0 ? (
           <div className="tl-wp-state-card" data-state="empty" role="status">
-            <h3 className="tl-wp-state-title">No recorded activity</h3>
+            <h3 className="tl-wp-state-title">
+              {externalResolutionEntries.length > 0
+                ? 'No request activity recorded'
+                : 'No recorded activity'}
+            </h3>
             <p className="tl-wp-state-desc">
-              {scope
-                ? 'No recent activity is recorded for this job in the current chat.'
-                : chat
-                  ? 'No recent activity has been recorded for this chat yet.'
-                  : 'No recent activity has been recorded yet.'}
+              {externalResolutionEntries.length > 0
+                ? 'External resolution receipts are listed above. No request activity was recorded for this scope.'
+                : scope
+                  ? 'No recent activity is recorded for this job in the current chat.'
+                  : chat
+                    ? 'No recent activity has been recorded for this chat yet.'
+                    : 'No recent activity has been recorded yet.'}
             </p>
           </div>
         ) : (
@@ -2853,6 +3455,12 @@ export function WorkspaceChatPanels({
     evaluatedSample?.effective_configured_selection ?? chat?.configured_selection ?? null;
 
   const panelIsStale = isStale || effectiveAvailability === 'stale';
+  const referenceNowMs =
+    typeof nowMs === 'number' && Number.isFinite(nowMs)
+      ? nowMs
+      : snapshot?.generated_at_ms ??
+        resolvedObservation?.generated_at_ms ??
+        Date.now();
 
   const verifiedChatJobIds = useMemo(
     () => resolveVerifiedChatJobIds(chat, resolvedJobs, resolvedObservation),
@@ -3073,8 +3681,10 @@ export function WorkspaceChatPanels({
         <WorkspaceMessagesPanel
           chat={chat}
           messages={resolvedMessages}
+          jobHistories={resolvedJobs}
           bounds={resolvedBounds}
           knownChatJobIds={verifiedChatJobIds}
+          nowMs={referenceNowMs}
           isActive={activeTab === 'messages'}
           loading={loading}
           error={error}
@@ -3102,6 +3712,7 @@ export function WorkspaceChatPanels({
           bounds={resolvedBounds}
           jobsHasMore={Boolean(resolvedObservation?.jobs_has_more)}
           focusedJobId={activeFocusedJobId}
+          nowMs={referenceNowMs}
           loading={loading}
           error={error}
           isStale={panelIsStale}
@@ -3130,7 +3741,7 @@ export function WorkspaceChatPanels({
           error={error}
           isStale={panelIsStale}
           staleReason={staleReason}
-          nowMs={nowMs ?? resolvedObservation?.generated_at_ms ?? null}
+          nowMs={referenceNowMs}
           onRefresh={onRefresh}
           onClearScope={() => setScope(null)}
           onSelectJob={handleInspectJobFromMessagesOrActivity}

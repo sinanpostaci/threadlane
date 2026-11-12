@@ -21,11 +21,14 @@ import {
   writeProjectsArchiveCutoff,
   writeWorkspaceChatArchivePreferences,
   type ProjectsArchiveStorage,
+  type WorkspaceAttentionState,
   type WorkspaceChatIdentity,
   type WorkspaceChatPreferenceStorage,
+  type WorkspaceExternalResolution,
   type WorkspaceJobHistory,
   type WorkspaceNativeSample,
   type WorkspaceSnapshot,
+  type WorkspaceTaskHistory,
 } from './app-model.ts';
 import type {
   ObservationActor,
@@ -846,10 +849,94 @@ function makeWorkspaceJobHistoryRecord(
   };
 }
 
+function makeUnknownAcceptanceProof(): WorkspaceJobHistory['acceptance_proof'] {
+  return {
+    status: 'unknown',
+    accepted_candidate_id: null,
+    combined_candidate_id: null,
+    review_verdict_id: null,
+    review_receipt_id: null,
+    integration_receipt_id: null,
+    closure_reservation_id: null,
+    closure_verdict_id: null,
+    verified_at_ms: null,
+  };
+}
+
+function makeAttentionState(
+  kind: WorkspaceAttentionState['kind'],
+  reason: string,
+  overrides: Partial<WorkspaceAttentionState> = {},
+): WorkspaceAttentionState {
+  return {
+    kind,
+    reason,
+    next_step: 'Resolve this attention item in Codex.',
+    blocking_hold_ids: [],
+    blocking_outbox_ids: [],
+    question_id: null,
+    updated_at_ms: NOW_MS - 1_000,
+    ...overrides,
+  };
+}
+
+function makeExternalResolution(
+  overrides: Partial<WorkspaceExternalResolution> = {},
+): WorkspaceExternalResolution {
+  return {
+    receipt_id: 'rcpt_ext_01',
+    request_key: 'req_ext_01',
+    preview_digest: 'digest_ext_01',
+    outcome: 'resolved_externally',
+    scope: 'job',
+    task_ids: [],
+    applicability: 'applicable',
+    summary: 'Resolved externally by the operator.',
+    evidence_refs: ['ev_ext_01'],
+    recorded_at_ms: NOW_MS - 1_000,
+    covered_attention: [],
+    ...overrides,
+  };
+}
+
+function makeExternalTask(
+  overrides: Partial<WorkspaceTaskHistory> = {},
+): WorkspaceTaskHistory {
+  return {
+    task_id: 'task_ext_01',
+    title: 'External resolution task',
+    role: 'coder',
+    difficulty: 'medium',
+    stage: 'closed',
+    status: 'completed',
+    depends_on: [],
+    current_attempt_no: 1,
+    attempts: [
+      {
+        attempt_no: 1,
+        status: 'completed',
+        run_id: 'run_ext_01',
+        worker_id: 'wrk_ext_01',
+        outbox_id: null,
+        executor: null,
+        started_at_ms: NOW_MS - 8_000,
+        finished_at_ms: NOW_MS - 3_000,
+        summary: 'Worker completed the task slice.',
+      },
+    ],
+    candidates: [],
+    active_candidate_id: null,
+    accepted_candidate_id: null,
+    historical_failure: null,
+    current_attention: null,
+    acceptance_proof: makeUnknownAcceptanceProof(),
+    ...overrides,
+  };
+}
+
 function makeWorkspaceSnapshotFixture(
   overrides: Partial<WorkspaceSnapshot> = {},
-): WorkspaceSnapshot {
-  return normalizeWorkspaceSnapshot({
+): WorkspaceSnapshot {  return normalizeWorkspaceSnapshot({
     schema_version: WORKSPACE_SNAPSHOT_SCHEMA_VERSION,
     generated_at_ms: NOW_MS,
     sampling_policy: DEFAULT_WORKSPACE_SAMPLING_POLICY,
@@ -3558,5 +3645,549 @@ describe('projectWorkspaceSnapshot production projection', () => {
     assert.equal(viewFailed.tone, 'danger');
     assert.equal(viewUnknown.statusLabel, 'Status unknown');
     assert.equal(viewUnknown.tone, 'neutral');
+  });
+});
+
+describe('workspace external resolution projection', () => {
+  it('projects store-verified full, partial, stale, unverified, unknown, message, and activity receipts without closing blockers', () => {
+    const identity = makeChatIdentity({
+      source_id: 'src-a',
+      binding_id: 'bnd_ext_resolution',
+      thread_uuid: UUID_CHAT_C,
+      canonical_project_scope: '/work/alpha',
+    });
+
+    const fullReceipt = makeExternalResolution({
+      receipt_id: 'rcpt_ext_full_01',
+      request_key: 'req_ext_full_01',
+      preview_digest: 'digest_ext_full_01',
+      scope: 'job',
+      task_ids: ['task_ext_full_01'],
+      applicability: 'applicable',
+      summary: 'Operator resolved the full job externally.',
+      evidence_refs: ['ev_ext_full_01', 'ev_ext_full_02'],
+      recorded_at_ms: NOW_MS - 1_000,
+      covered_attention: [
+        {
+          task_id: null,
+          attention: makeAttentionState(
+            'needs_approval',
+            'Full job approval blocker covered by the receipt.',
+          ),
+        },
+        {
+          task_id: 'task_ext_full_01',
+          attention: makeAttentionState(
+            'on_hold',
+            'Task hold blocker covered by the receipt.',
+          ),
+        },
+      ],
+    });
+    const partialReceipt = makeExternalResolution({
+      receipt_id: 'rcpt_ext_partial_02',
+      request_key: 'req_ext_partial_02',
+      preview_digest: 'digest_ext_partial_02',
+      scope: 'tasks',
+      task_ids: ['task_ext_partial_01'],
+      applicability: 'applicable',
+      summary: 'Operator resolved one task externally.',
+      evidence_refs: ['ev_ext_partial_02'],
+      recorded_at_ms: NOW_MS - 2_000,
+      covered_attention: [
+        {
+          task_id: 'task_ext_partial_01',
+          attention: makeAttentionState(
+            'needs_user_input',
+            'Partial task question covered by the receipt.',
+          ),
+        },
+      ],
+    });
+    const staleReceipt = makeExternalResolution({
+      receipt_id: 'rcpt_ext_stale_03',
+      request_key: 'req_ext_stale_03',
+      preview_digest: 'digest_ext_stale_03',
+      scope: 'tasks',
+      task_ids: ['task_ext_history_01'],
+      applicability: 'stale',
+      summary: 'Historical stale external receipt.',
+      evidence_refs: ['ev_ext_stale_03'],
+      recorded_at_ms: NOW_MS - 3_000,
+      covered_attention: [
+        {
+          task_id: 'task_ext_history_01',
+          attention: makeAttentionState(
+            'on_hold',
+            'Stale receipt covered a historical task hold.',
+          ),
+        },
+      ],
+    });
+    const unverifiedReceipt = makeExternalResolution({
+      receipt_id: 'rcpt_ext_unverified_04',
+      request_key: 'req_ext_unverified_04',
+      preview_digest: 'digest_ext_unverified_04',
+      scope: 'job',
+      applicability: 'unverified',
+      summary: 'Historical unverified external receipt.',
+      evidence_refs: ['ev_ext_unverified_04'],
+      recorded_at_ms: NOW_MS - 4_000,
+      covered_attention: [
+        {
+          task_id: null,
+          attention: makeAttentionState(
+            'needs_approval',
+            'Unverified receipt claimed a historical job approval.',
+          ),
+        },
+      ],
+    });
+    const unknownReceipt = makeExternalResolution({
+      receipt_id: 'rcpt_ext_unknown_05',
+      scope: 'job',
+      task_ids: ['task_ext_unknown_04'],
+      applicability: 'applicable',
+      summary: 'Full receipt exists but the task effect remains unknown.',
+      evidence_refs: ['ev_ext_unknown_05'],
+      recorded_at_ms: NOW_MS - 5_000,
+    });
+
+    const fullHistory = makeWorkspaceJobHistoryRecord(identity, {
+      job: {
+        source_id: identity.source_id,
+        job_id: 'job_ext_full_01',
+        binding_id: identity.binding_id,
+        chat_identity: identity,
+        title: 'Externally resolved full job',
+        job_revision: 4,
+        state: 'unknown',
+        phase: 'external_resolution',
+        approval_status: 'approved',
+        execution_status: 'resolved_externally',
+        review_state: null,
+        created_at_ms: NOW_MS - 60_000,
+        updated_at_ms: NOW_MS - 1_000,
+        summary: 'Full job resolved externally.',
+      },
+      tasks: [
+        makeExternalTask({
+          task_id: 'task_ext_full_01',
+          title: 'Full job task',
+        }),
+      ],
+      external_resolutions: [fullReceipt],
+      current_attention: null,
+      acceptance_proof: makeUnknownAcceptanceProof(),
+    });
+
+    const partialHistory = makeWorkspaceJobHistoryRecord(identity, {
+      job: {
+        source_id: identity.source_id,
+        job_id: 'job_ext_partial_02',
+        binding_id: identity.binding_id,
+        chat_identity: identity,
+        title: 'Externally resolved partial job',
+        job_revision: 3,
+        state: 'failed',
+        phase: 'external_resolution',
+        approval_status: 'approved',
+        execution_status: 'failed',
+        review_state: null,
+        created_at_ms: NOW_MS - 55_000,
+        updated_at_ms: NOW_MS - 2_000,
+        summary: 'Partial external resolution retained unrelated task output.',
+      },
+      tasks: [
+        makeExternalTask({
+          task_id: 'task_ext_partial_01',
+          title: 'Partially resolved task',
+        }),
+        makeExternalTask({
+          task_id: 'task_ext_unrelated_02',
+          title: 'Unrelated task remains visible',
+        }),
+      ],
+      external_resolutions: [partialReceipt],
+      current_attention: null,
+      acceptance_proof: makeUnknownAcceptanceProof(),
+    });
+
+    const historyTask = makeExternalTask({
+      task_id: 'task_ext_history_01',
+      title: 'Historical receipt task',
+      status: 'held',
+      current_attention: makeAttentionState(
+        'on_hold',
+        'Task held while historical receipts exist.',
+        { blocking_hold_ids: ['hold_ext_hist'] },
+      ),
+    });
+    const historyHistory = makeWorkspaceJobHistoryRecord(identity, {
+      job: {
+        source_id: identity.source_id,
+        job_id: 'job_ext_history_03',
+        binding_id: identity.binding_id,
+        chat_identity: identity,
+        title: 'Historical receipt job',
+        job_revision: 2,
+        state: 'needs_user',
+        phase: 'approval',
+        approval_status: 'pending',
+        execution_status: 'held',
+        review_state: null,
+        created_at_ms: NOW_MS - 50_000,
+        updated_at_ms: NOW_MS - 3_000,
+        summary: 'Still blocked despite stale and unverified receipts.',
+      },
+      tasks: [historyTask],
+      external_resolutions: [staleReceipt, unverifiedReceipt],
+      current_attention: makeAttentionState(
+        'needs_approval',
+        'Uncovered job approval remains active.',
+        {
+          question_id: 'q_ext_history',
+          blocking_hold_ids: ['hold_ext_job'],
+          updated_at_ms: NOW_MS - 3_000,
+        },
+      ),
+      acceptance_proof: makeUnknownAcceptanceProof(),
+    });
+
+    const unknownHistory = makeWorkspaceJobHistoryRecord(identity, {
+      job: {
+        source_id: identity.source_id,
+        job_id: 'job_ext_unknown_04',
+        binding_id: identity.binding_id,
+        chat_identity: identity,
+        title: 'Unknown effect job',
+        job_revision: 1,
+        state: 'unknown',
+        phase: 'execution',
+        approval_status: 'approved',
+        execution_status: 'unknown',
+        review_state: null,
+        created_at_ms: NOW_MS - 45_000,
+        updated_at_ms: NOW_MS - 5_000,
+        summary: 'Unknown execution effect remains visible.',
+      },
+      tasks: [
+        makeExternalTask({
+          task_id: 'task_ext_unknown_04',
+          title: 'Unknown task effect',
+          status: 'unknown',
+          current_attention: null,
+        }),
+      ],
+      external_resolutions: [unknownReceipt],
+      current_attention: null,
+      acceptance_proof: makeUnknownAcceptanceProof(),
+    });
+
+    const receiptMessage = createSafeWorkspaceMessageItem({
+      source_kind: 'journal_summary',
+      source_record_id: fullReceipt.receipt_id,
+      source_order: { recorded_at_ms: NOW_MS - 1_000, source_seq: 1, sub_index: 0 },
+      scope: {
+        source_id: identity.source_id,
+        binding_id: identity.binding_id,
+        thread_uuid: identity.thread_uuid,
+        canonical_project_scope: identity.canonical_project_scope,
+        chat_identity: identity,
+        job_id: 'job_ext_full_01',
+      },
+      actor_role: 'operator',
+      raw_summary: 'Recorded external resolution receipt summary.',
+    });
+    const unrelatedQuestion = createSafeWorkspaceMessageItem({
+      source_kind: 'question_prompt',
+      source_record_id: 'q_ext_unrelated_01',
+      source_order: { recorded_at_ms: NOW_MS - 1_500, source_seq: 2, sub_index: 0 },
+      scope: {
+        source_id: identity.source_id,
+        binding_id: identity.binding_id,
+        thread_uuid: identity.thread_uuid,
+        canonical_project_scope: identity.canonical_project_scope,
+        chat_identity: identity,
+        job_id: 'job_ext_full_01',
+        task_id: 'task_ext_full_01',
+      },
+      actor_role: 'coworker',
+      raw_summary: 'Unrelated native question must stay visible.',
+    });
+    const staleReceiptMessage = createSafeWorkspaceMessageItem({
+      source_kind: 'journal_summary',
+      source_record_id: staleReceipt.receipt_id,
+      source_order: { recorded_at_ms: NOW_MS - 3_000, source_seq: 3, sub_index: 0 },
+      scope: {
+        source_id: identity.source_id,
+        binding_id: identity.binding_id,
+        thread_uuid: identity.thread_uuid,
+        canonical_project_scope: identity.canonical_project_scope,
+        chat_identity: identity,
+        job_id: 'job_ext_history_03',
+      },
+      actor_role: 'operator',
+      raw_summary: 'Historical stale receipt record.',
+    });
+    const proseOnlyMessage = createSafeWorkspaceMessageItem({
+      source_kind: 'journal_summary',
+      source_record_id: 'rec_ext_prose_only_01',
+      source_order: { recorded_at_ms: NOW_MS - 1_750, source_seq: 4, sub_index: 0 },
+      scope: {
+        source_id: identity.source_id,
+        binding_id: identity.binding_id,
+        thread_uuid: identity.thread_uuid,
+        canonical_project_scope: identity.canonical_project_scope,
+        chat_identity: identity,
+        job_id: 'job_ext_full_01',
+        task_id: 'task_ext_full_01',
+      },
+      actor_role: 'coworker',
+      raw_summary: 'Resolved externally according to prose only; no receipt identity.',
+    });
+
+    const ws = makeWorkspaceSnapshotFixture({
+      observation: makeSnapshot({
+        sources: [makeSource({ id: 'src-a', project_path: '/work/alpha' })],
+        jobs: [],
+        requests: [],
+      }),
+      chats: [
+        {
+          identity,
+          thread_label: 'External Resolution Chat',
+          project_label: 'Alpha Repo',
+          availability: 'available',
+          activity: 'idle',
+          configured_selection: createVerifiedConfiguredSelection('gpt-5.4', 'high'),
+          active_job_count: 1,
+          attention_count: 1,
+          updated_at_ms: NOW_MS - 1_000,
+        },
+      ],
+      native_samples: [
+        makeLiveNativeSample(identity, {
+          activity: 'idle',
+          observed_at_ms: NOW_MS - 1_500,
+          last_success_at_ms: NOW_MS - 1_500,
+        }),
+      ],
+      job_histories: [fullHistory, partialHistory, historyHistory, unknownHistory],
+      messages: {
+        availability: 'available',
+        items: [
+          receiptMessage,
+          unrelatedQuestion,
+          staleReceiptMessage,
+          proseOnlyMessage,
+        ],
+        max_items: MAX_WORKSPACE_MESSAGES_WINDOW,
+        omitted_count: 0,
+        has_more: false,
+        truncated: false,
+        requires_transcript: false,
+        allows_synthetic_user_messages: false,
+      },
+    });
+
+    const projected = projectWorkspaceSnapshot(ws, {
+      nowMs: NOW_MS,
+      selectedChatKey: formatWorkspaceChatIdentityKey(identity),
+      selectedTab: 'jobs',
+    });
+    const selectedChat = projected.selectedChat;
+    assert.ok(selectedChat);
+
+    const fullJob = selectedChat.jobs.items.find((job) => job.jobId === 'job_ext_full_01');
+    assert.ok(fullJob);
+    assert.equal(fullJob.statusLabel, 'Resolved externally');
+    assert.equal(fullJob.tone, 'neutral');
+    assert.equal(fullJob.isVerifiedAccepted, false);
+    assert.notEqual(fullJob.acceptanceLabel, 'Verified accepted');
+    assert.equal(fullJob.phase, 'external_resolution');
+    assert.equal(fullJob.hasApplicableFullExternalResolution, true);
+    assert.equal(fullJob.hasApplicablePartialExternalResolution, false);
+    assert.equal(fullJob.externalResolutionLabel, 'Resolved externally');
+    assert.equal(fullJob.primaryExternalResolutionReceiptId, fullReceipt.receipt_id);
+    assert.equal(fullJob.externalResolutions.length, 1);
+    assert.equal(fullJob.historicalExternalResolutions.length, 0);
+    assert.equal(fullJob.coveredAttention.length, 2);
+    assert.ok(fullJob.coveredAttention.some((covered) => covered.taskId === null));
+    assert.ok(
+      fullJob.coveredAttention.some(
+        (covered) => covered.taskId === 'task_ext_full_01',
+      ),
+    );
+    const fullTask = fullJob.tasks.find((task) => task.taskId === 'task_ext_full_01');
+    assert.ok(fullTask);
+    assert.equal(fullTask.isExternallyResolved, true);
+    assert.equal(fullTask.externalResolutionLabel, 'Resolved externally');
+    assert.equal(fullTask.coveredAttention.length, 1);
+
+    const partialJob = selectedChat.jobs.items.find(
+      (job) => job.jobId === 'job_ext_partial_02',
+    );
+    assert.ok(partialJob);
+    assert.equal(partialJob.statusLabel, 'Partially resolved externally');
+    assert.equal(partialJob.isVerifiedAccepted, false);
+    assert.equal(partialJob.hasApplicableFullExternalResolution, false);
+    assert.equal(partialJob.hasApplicablePartialExternalResolution, true);
+    assert.equal(partialJob.externalResolutionLabel, 'Partially resolved externally');
+    assert.equal(partialJob.primaryExternalResolutionReceiptId, partialReceipt.receipt_id);
+    const partialTask = partialJob.tasks.find(
+      (task) => task.taskId === 'task_ext_partial_01',
+    );
+    assert.ok(partialTask);
+    assert.equal(partialTask.isExternallyResolved, true);
+    assert.equal(partialTask.externalResolutionLabel, 'Partially resolved externally');
+    assert.equal(partialTask.coveredAttention.length, 1);
+    const unrelatedTask = partialJob.tasks.find(
+      (task) => task.taskId === 'task_ext_unrelated_02',
+    );
+    assert.ok(unrelatedTask);
+    assert.equal(unrelatedTask.isExternallyResolved, false);
+    assert.equal(unrelatedTask.externalResolutionLabel, null);
+    assert.equal(unrelatedTask.coveredAttention.length, 0);
+
+    const historyJob = selectedChat.jobs.items.find(
+      (job) => job.jobId === 'job_ext_history_03',
+    );
+    assert.ok(historyJob);
+    assert.equal(historyJob.statusLabel, 'Needs approval');
+    assert.equal(historyJob.hasApplicableFullExternalResolution, false);
+    assert.equal(historyJob.hasApplicablePartialExternalResolution, false);
+    assert.equal(historyJob.externalResolutionLabel, null);
+    assert.equal(historyJob.applicableExternalResolutions.length, 0);
+    assert.equal(historyJob.externalResolutions.length, 2);
+    assert.deepEqual(
+      historyJob.externalResolutions.map((res) => res.receiptId).sort(),
+      [staleReceipt.receipt_id, unverifiedReceipt.receipt_id].sort(),
+    );
+    assert.equal(historyJob.historicalExternalResolutions.length, 2);
+    assert.deepEqual(
+      historyJob.historicalExternalResolutions.map((res) => res.statusLabel).sort(),
+      ['Stale external receipt', 'Unverified external receipt'],
+    );
+    assert.equal(historyJob.coveredAttention.length, 0);
+    assert.equal(historyJob.currentAttention?.kind, 'needs_approval');
+    const historyTaskView = historyJob.tasks.find(
+      (task) => task.taskId === 'task_ext_history_01',
+    );
+    assert.ok(historyTaskView);
+    assert.equal(historyTaskView.currentAttention?.kind, 'on_hold');
+    assert.equal(historyTaskView.isExternallyResolved, false);
+    assert.equal(historyTaskView.coveredAttention.length, 0);
+    assert.equal(historyTaskView.historicalExternalResolutions.length, 2);
+
+    assert.equal(selectedChat.blockers.length, 2);
+    assert.equal(selectedChat.needsHumanCount, 1);
+    assert.deepEqual(
+      selectedChat.blockers.map((blocker) => blocker.origin).sort(),
+      ['job_attention', 'task_attention'],
+    );
+    assert.ok(
+      selectedChat.blockers.every(
+        (blocker) => blocker.jobId === 'job_ext_history_03',
+      ),
+    );
+    assert.ok(
+      selectedChat.coveredBlockers.some(
+        (covered) => covered.receiptId === fullReceipt.receipt_id,
+      ),
+    );
+    assert.ok(
+      selectedChat.coveredBlockers.every(
+        (covered) => covered.receiptId !== staleReceipt.receipt_id,
+      ),
+    );
+
+    const unknownJob = selectedChat.jobs.items.find(
+      (job) => job.jobId === 'job_ext_unknown_04',
+    );
+    assert.ok(unknownJob);
+    assert.equal(unknownJob.statusLabel, 'Status unknown');
+    assert.equal(unknownJob.isVerifiedAccepted, false);
+    assert.equal(unknownJob.hasApplicableFullExternalResolution, true);
+    assert.equal(unknownJob.externalResolutionLabel, 'Resolved externally');
+    const unknownTask = unknownJob.tasks.find(
+      (task) => task.taskId === 'task_ext_unknown_04',
+    );
+    assert.ok(unknownTask);
+    assert.equal(unknownTask.isExternallyResolved, false);
+    assert.equal(unknownTask.externalResolutionLabel, null);
+
+    const receiptMessageView = selectedChat.messages.items.find(
+      (item) => item.sourceRecordId === fullReceipt.receipt_id,
+    );
+    assert.ok(receiptMessageView);
+    assert.equal(receiptMessageView.linkedReceiptId, fullReceipt.receipt_id);
+    assert.equal(receiptMessageView.linkedReceiptApplicability, 'applicable');
+    assert.equal(
+      receiptMessageView.linkedJobExternalResolutionLabel,
+      'Resolved externally',
+    );
+    const unrelatedQuestionView = selectedChat.messages.items.find(
+      (item) => item.sourceRecordId === 'q_ext_unrelated_01',
+    );
+    assert.ok(unrelatedQuestionView);
+    assert.equal(unrelatedQuestionView.linkedReceiptId, null);
+    assert.equal(
+      unrelatedQuestionView.summary,
+      'Unrelated native question must stay visible.',
+    );
+    const proseOnlyView = selectedChat.messages.items.find(
+      (item) => item.sourceRecordId === 'rec_ext_prose_only_01',
+    );
+    assert.ok(proseOnlyView);
+    assert.equal(proseOnlyView.linkedReceiptId, null);
+    const staleMessageView = selectedChat.messages.items.find(
+      (item) => item.sourceRecordId === staleReceipt.receipt_id,
+    );
+    assert.ok(staleMessageView);
+    assert.equal(staleMessageView.linkedReceiptId, staleReceipt.receipt_id);
+    assert.equal(staleMessageView.linkedReceiptApplicability, 'stale');
+
+    assert.equal(selectedChat.messages.externalResolutions.length, 4);
+    const fullMessageReceipt = selectedChat.messages.externalResolutions.find(
+      (res) => res.receiptId === fullReceipt.receipt_id,
+    );
+    assert.ok(fullMessageReceipt);
+    assert.equal(fullMessageReceipt.isFullJob, true);
+    assert.equal(fullMessageReceipt.statusLabel, 'Resolved externally');
+    assert.equal(fullMessageReceipt.coveredAttention.length, 2);
+    const staleMessageReceipt = selectedChat.messages.externalResolutions.find(
+      (res) => res.receiptId === staleReceipt.receipt_id,
+    );
+    assert.ok(staleMessageReceipt);
+    assert.equal(staleMessageReceipt.isApplicable, false);
+    assert.equal(staleMessageReceipt.statusLabel, 'Stale external receipt');
+
+    assert.equal(selectedChat.activity.items.length, 0);
+    assert.equal(selectedChat.activity.receiptItems.length, 4);
+    const fullActivityReceipt = selectedChat.activity.receiptItems.find(
+      (res) => res.receiptId === fullReceipt.receipt_id,
+    );
+    assert.ok(fullActivityReceipt);
+    assert.equal(fullActivityReceipt.isFullJob, true);
+    assert.equal(fullActivityReceipt.isSyntheticProviderCall, false);
+    assert.equal(fullActivityReceipt.isSyntheticUserMessage, false);
+    assert.equal(fullActivityReceipt.isSyntheticDeliveryOrClosure, false);
+    assert.equal(fullActivityReceipt.completesChat, false);
+    assert.deepEqual(fullActivityReceipt.evidenceRefs, [
+      'ev_ext_full_01',
+      'ev_ext_full_02',
+    ]);
+    assert.equal(fullActivityReceipt.coveredAttention.length, 2);
+    const staleActivityReceipt = selectedChat.activity.receiptItems.find(
+      (res) => res.receiptId === staleReceipt.receipt_id,
+    );
+    assert.ok(staleActivityReceipt);
+    assert.equal(staleActivityReceipt.isApplicable, false);
+    assert.equal(staleActivityReceipt.statusLabel, 'Stale external receipt');
+
+    assert.equal(selectedChat.jobSummary.totalJobCount, 4);
+    assert.equal(selectedChat.jobSummary.externallyResolvedJobCount, 1);
+    assert.equal(selectedChat.jobSummary.partiallyResolvedJobCount, 1);
   });
 });

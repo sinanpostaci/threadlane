@@ -58,9 +58,15 @@ import type { BrandKey } from './types.ts';
 import {
   DEFAULT_WORKSPACE_CHAT_LIFECYCLE_FILTER,
   DEFAULT_WORKSPACE_CHAT_TAB,
+  MAX_WORKSPACE_EXTERNAL_RESOLUTIONS_PER_JOB,
   WORKSPACE_CHAT_ARCHIVE_STORAGE_KEY,
   WORKSPACE_CHAT_LIFECYCLE_FILTERS,
   WORKSPACE_CHAT_SURFACE_TABS,
+  WORKSPACE_EXTERNAL_RESOLUTION_APPLICABILITIES,
+  WORKSPACE_EXTERNAL_RESOLUTION_OUTCOMES,
+  WORKSPACE_EXTERNAL_RESOLUTION_SCOPES,
+  WORKSPACE_EXTERNAL_RESOLUTION_VIEW_CONTRACT,
+  WORKSPACE_EXTERNAL_RESOLUTION_VIEW_CONTRACT_VERSION,
   WORKSPACE_SURFACE_SEPARATION,
   boundWorkspaceCompactTrayRows,
   createUnavailableConfiguredSelection,
@@ -70,6 +76,8 @@ import {
   normalizeWorkspaceAcceptanceProofForJob,
   normalizeWorkspaceAcceptanceProofForTask,
   normalizeWorkspaceChatTab,
+  normalizeWorkspaceExternalResolution,
+  normalizeWorkspaceExternalResolutions,
   normalizeWorkspaceSnapshot,
   parseWorkspaceSnapshot,
   readWorkspaceChatArchivePreferences,
@@ -104,7 +112,13 @@ import type {
   WorkspaceCompactTrayRow,
   WorkspaceConfiguredSelection,
   WorkspaceConnectionState,
+  WorkspaceCoveredAttention,
   WorkspaceEvaluatedNativeSample,
+  WorkspaceExternalResolution,
+  WorkspaceExternalResolutionApplicability,
+  WorkspaceExternalResolutionOutcome,
+  WorkspaceExternalResolutionScope,
+  WorkspaceExternalResolutionViewContract,
   WorkspaceFreshnessState,
   WorkspaceHistoricalFailure,
   WorkspaceJobHistory,
@@ -130,10 +144,16 @@ import type {
 export {
   DEFAULT_WORKSPACE_CHAT_LIFECYCLE_FILTER,
   DEFAULT_WORKSPACE_CHAT_TAB,
+  MAX_WORKSPACE_EXTERNAL_RESOLUTIONS_PER_JOB,
   PROJECTS_ARCHIVE_STORAGE_KEY,
   WORKSPACE_CHAT_ARCHIVE_STORAGE_KEY,
   WORKSPACE_CHAT_LIFECYCLE_FILTERS,
   WORKSPACE_CHAT_SURFACE_TABS,
+  WORKSPACE_EXTERNAL_RESOLUTION_APPLICABILITIES,
+  WORKSPACE_EXTERNAL_RESOLUTION_OUTCOMES,
+  WORKSPACE_EXTERNAL_RESOLUTION_SCOPES,
+  WORKSPACE_EXTERNAL_RESOLUTION_VIEW_CONTRACT,
+  WORKSPACE_EXTERNAL_RESOLUTION_VIEW_CONTRACT_VERSION,
   WORKSPACE_SURFACE_SEPARATION,
   boundWorkspaceCompactTrayRows,
   evaluateWorkspaceNativeSampleAt,
@@ -142,6 +162,8 @@ export {
   normalizeWorkspaceAcceptanceProofForJob,
   normalizeWorkspaceAcceptanceProofForTask,
   normalizeWorkspaceChatTab,
+  normalizeWorkspaceExternalResolution,
+  normalizeWorkspaceExternalResolutions,
   normalizeWorkspaceSnapshot,
   parseWorkspaceSnapshot,
   readProjectsArchiveCutoff,
@@ -178,7 +200,13 @@ export {
   type WorkspaceCompactTrayRow,
   type WorkspaceConfiguredSelection,
   type WorkspaceConnectionState,
+  type WorkspaceCoveredAttention,
   type WorkspaceEvaluatedNativeSample,
+  type WorkspaceExternalResolution,
+  type WorkspaceExternalResolutionApplicability,
+  type WorkspaceExternalResolutionOutcome,
+  type WorkspaceExternalResolutionScope,
+  type WorkspaceExternalResolutionViewContract,
   type WorkspaceFreshnessState,
   type WorkspaceHistoricalFailure,
   type WorkspaceJobHistory,
@@ -1493,6 +1521,8 @@ export interface WorkspaceChatJobSummaryView {
   totalJobCount: number;
   activeJobCount: number;
   verifiedAcceptedJobCount: number;
+  externallyResolvedJobCount: number;
+  partiallyResolvedJobCount: number;
   pendingAcceptanceJobCount: number;
   failedJobCount: number;
   needsAttentionJobCount: number;
@@ -1550,6 +1580,7 @@ export interface WorkspaceChatSidebarItem {
   hasCurrentBlocker: boolean;
   needsHumanBadgeLabel: string | null;
   blockers: WorkspaceChatBlockerView[];
+  coveredBlockers: WorkspaceCoveredAttentionView[];
   primaryDotTone: StatusDotTone;
   statusSummaryLabel: string;
   canArchive: boolean;
@@ -1575,6 +1606,35 @@ export interface WorkspaceProjectGroupView {
   chats: WorkspaceChatSidebarItem[];
 }
 
+export type WorkspaceExternalResolutionStatusLabel =
+  | 'Resolved externally'
+  | 'Partially resolved externally'
+  | 'Stale external receipt'
+  | 'Unverified external receipt';
+
+export interface WorkspaceMessageExternalResolutionView {
+  sourceId: string;
+  jobId: string;
+  jobTitle: string;
+  receiptId: string;
+  requestKey: string | null;
+  previewDigest: string | null;
+  outcome: WorkspaceExternalResolutionOutcome;
+  scope: WorkspaceExternalResolutionScope;
+  scopeLabel: string;
+  taskIds: string[];
+  applicability: WorkspaceExternalResolutionApplicability;
+  statusLabel: WorkspaceExternalResolutionStatusLabel;
+  isApplicable: boolean;
+  isFullJob: boolean;
+  isPartial: boolean;
+  summary: string;
+  evidenceRefs: string[];
+  recordedAtMs: number | null;
+  ageLabel: string;
+  coveredAttention: WorkspaceCoveredAttentionView[];
+}
+
 export interface WorkspaceMessageItemView {
   itemId: string;
   sourceKind: WorkspaceSafeMessageSourceKind;
@@ -1593,6 +1653,12 @@ export interface WorkspaceMessageItemView {
   completeness: WorkspaceMessageCompleteness;
   isIncomplete: boolean;
   completenessNotices: string[];
+  linkedReceiptId: string | null;
+  linkedReceiptApplicability: WorkspaceExternalResolutionApplicability | null;
+  linkedJobExternalResolutionLabel: WorkspaceExternalResolutionStatusLabel | null;
+  linkedJobExternalResolutionScope: WorkspaceExternalResolutionScope | null;
+  linkedReceiptTaskIds: string[];
+  linkedReceiptEvidenceRefs: string[];
 }
 
 export interface WorkspaceChatMessagesSurface {
@@ -1600,6 +1666,7 @@ export interface WorkspaceChatMessagesSurface {
   availability: WorkspaceAvailabilityState;
   availabilityLabel: string;
   items: WorkspaceMessageItemView[];
+  externalResolutions: WorkspaceMessageExternalResolutionView[];
   maxItems: number;
   omittedCount: number;
   hasMore: boolean;
@@ -1635,6 +1702,39 @@ export interface WorkspaceAttentionView {
   questionId: string | null;
   updatedAtMs: number | null;
   ageLabel: string;
+}
+
+export interface WorkspaceCoveredAttentionView {
+  key: string;
+  receiptId: string;
+  applicability: WorkspaceExternalResolutionApplicability;
+  scope: WorkspaceExternalResolutionScope;
+  jobId: string;
+  taskId: string | null;
+  attention: WorkspaceAttentionView;
+  recordedAtMs: number | null;
+  ageLabel: string;
+}
+
+export interface WorkspaceExternalResolutionView {
+  receiptId: string;
+  requestKey: string | null;
+  previewDigest: string | null;
+  outcome: WorkspaceExternalResolutionOutcome;
+  scope: WorkspaceExternalResolutionScope;
+  scopeLabel: string;
+  taskIds: string[];
+  applicability: WorkspaceExternalResolutionApplicability;
+  statusLabel: WorkspaceExternalResolutionStatusLabel;
+  tone: StatusDotTone;
+  isApplicable: boolean;
+  isFullJob: boolean;
+  isPartial: boolean;
+  summary: string;
+  evidenceRefs: string[];
+  recordedAtMs: number | null;
+  ageLabel: string;
+  coveredAttention: WorkspaceCoveredAttentionView[];
 }
 
 export interface WorkspaceTaskAttemptView {
@@ -1691,6 +1791,11 @@ export interface WorkspaceTaskView {
   recordedAcceptedCandidateId: string | null;
   historicalFailure: WorkspaceHistoricalFailureView | null;
   currentAttention: WorkspaceAttentionView | null;
+  coveredAttention: WorkspaceCoveredAttentionView[];
+  externalResolutions: WorkspaceExternalResolutionView[];
+  historicalExternalResolutions: WorkspaceExternalResolutionView[];
+  isExternallyResolved: boolean;
+  externalResolutionLabel: 'Resolved externally' | 'Partially resolved externally' | null;
   acceptanceProof: WorkspaceAcceptanceProof;
   isVerifiedAccepted: boolean;
   acceptanceLabel: string;
@@ -1748,6 +1853,16 @@ export interface WorkspaceJobView {
   links: WorkspaceRecordLinks;
   historicalFailure: WorkspaceHistoricalFailureView | null;
   currentAttention: WorkspaceAttentionView | null;
+  coveredAttention: WorkspaceCoveredAttentionView[];
+  externalResolutions: WorkspaceExternalResolutionView[];
+  applicableExternalResolutions: WorkspaceExternalResolutionView[];
+  historicalExternalResolutions: WorkspaceExternalResolutionView[];
+  hasApplicableFullExternalResolution: boolean;
+  hasApplicablePartialExternalResolution: boolean;
+  externallyResolvedTaskIds: string[];
+  externalResolutionLabel: 'Resolved externally' | 'Partially resolved externally' | null;
+  primaryExternalResolutionReceiptId: string | null;
+  primaryExternalResolution: WorkspaceExternalResolutionView | null;
   acceptanceProof: WorkspaceAcceptanceProof;
   isVerifiedAccepted: boolean;
   acceptanceLabel: string;
@@ -1762,6 +1877,9 @@ export interface WorkspaceChatJobsSurface {
   totalJobCount: number;
   activeJobCount: number;
   verifiedAcceptedJobCount: number;
+  externallyResolvedJobCount: number;
+  partiallyResolvedJobCount: number;
+  historicalReceiptJobCount: number;
   historicalFailureJobCount: number;
   currentAttentionJobCount: number;
   jobHistoriesOmitted: number;
@@ -1836,10 +1954,43 @@ export interface WorkspaceActivityItemView {
   truncationNotice: string | null;
 }
 
+export interface WorkspaceActivityReceiptItemView {
+  receiptKey: string;
+  sourceId: string;
+  jobId: string;
+  jobTitle: string;
+  chatIdentity: WorkspaceChatIdentity;
+  receiptId: string;
+  requestKey: string | null;
+  previewDigest: string | null;
+  outcome: WorkspaceExternalResolutionOutcome;
+  scope: WorkspaceExternalResolutionScope;
+  scopeLabel: string;
+  taskIds: string[];
+  applicability: WorkspaceExternalResolutionApplicability;
+  statusLabel: WorkspaceExternalResolutionStatusLabel;
+  tone: StatusDotTone;
+  isApplicable: boolean;
+  isFullJob: boolean;
+  isPartial: boolean;
+  summary: string;
+  evidenceRefs: string[];
+  recordedAtMs: number | null;
+  ageLabel: string;
+  coveredAttention: WorkspaceCoveredAttentionView[];
+  completesChat: false;
+  isSyntheticProviderCall: false;
+  isSyntheticUserMessage: false;
+  isSyntheticDeliveryOrClosure: false;
+  statusNote: string;
+}
+
 export interface WorkspaceChatActivitySurface {
   kind: 'paginated_request_call_delivery_audit_feed';
   items: WorkspaceActivityItemView[];
+  receiptItems: WorkspaceActivityReceiptItemView[];
   totalScopedCount: number;
+  totalScopedReceiptCount: number;
   activeJobFilter: string | null;
   runningCount: number;
   hasMore: boolean;
@@ -1869,6 +2020,7 @@ export interface WorkspaceSelectedChatProjection {
   needsHumanCount: number;
   hasCurrentBlocker: boolean;
   blockers: WorkspaceChatBlockerView[];
+  coveredBlockers: WorkspaceCoveredAttentionView[];
   primaryBlocker: WorkspaceChatBlockerView | null;
   scopedTarget: WorkspaceScopedChatTarget;
   codexTarget: CodexChatTarget;
@@ -2620,6 +2772,229 @@ function projectAttentionStateView(
   };
 }
 
+function projectCoveredAttentionStateView(
+  attention: WorkspaceAttentionState,
+  referenceNowMs: number,
+): WorkspaceAttentionView {
+  const kindLabel =
+    attention.kind === 'none'
+      ? 'Attention cleared'
+      : formatAttentionKindLabel(attention.kind);
+  const fallbackReason = `${kindLabel} covered by external resolution receipt.`;
+  return {
+    kind: attention.kind,
+    kindLabel,
+    reason: attention.reason.length > 0 ? attention.reason : fallbackReason,
+    nextStep: attention.next_step,
+    blockingHoldIds: [...attention.blocking_hold_ids],
+    blockingOutboxIds: [...attention.blocking_outbox_ids],
+    questionId: attention.question_id,
+    updatedAtMs: attention.updated_at_ms,
+    ageLabel: formatAge(attention.updated_at_ms, referenceNowMs),
+  };
+}
+
+function formatExternalResolutionStatusLabel(
+  applicability: WorkspaceExternalResolutionApplicability,
+  scope: WorkspaceExternalResolutionScope,
+): WorkspaceExternalResolutionStatusLabel {
+  if (applicability === 'applicable') {
+    return scope === 'job' ? 'Resolved externally' : 'Partially resolved externally';
+  }
+  if (applicability === 'stale') {
+    return 'Stale external receipt';
+  }
+  return 'Unverified external receipt';
+}
+
+function formatExternalResolutionScopeLabel(
+  applicability: WorkspaceExternalResolutionApplicability,
+  scope: WorkspaceExternalResolutionScope,
+  taskIds: readonly string[],
+): string {
+  if (scope === 'job') {
+    if (applicability === 'stale') {
+      return 'Full job (stale)';
+    }
+    if (applicability === 'unverified') {
+      return 'Full job (unverified)';
+    }
+    return 'Full job';
+  }
+  const joinedTasks = taskIds.length > 0 ? taskIds.join(', ') : 'none';
+  if (applicability === 'stale') {
+    return `Tasks (stale: ${joinedTasks})`;
+  }
+  if (applicability === 'unverified') {
+    return `Tasks (unverified: ${joinedTasks})`;
+  }
+  return taskIds.length === 1
+    ? `Partial (1 task: ${taskIds[0]})`
+    : `Partial (${taskIds.length} tasks: ${joinedTasks})`;
+}
+
+export function projectWorkspaceJobExternalResolutionViews(
+  rawList: readonly WorkspaceExternalResolution[] | undefined,
+  jobId: string,
+  referenceNowMs: number,
+): WorkspaceExternalResolutionView[] {
+  const normalized = normalizeWorkspaceExternalResolutions(rawList);
+  const indexed = normalized.map((entry, idx) => {
+    const statusLabel = formatExternalResolutionStatusLabel(
+      entry.applicability,
+      entry.scope,
+    );
+    const isApplicable = entry.applicability === 'applicable';
+    const isFullJob = isApplicable && entry.scope === 'job';
+    const isPartial = isApplicable && entry.scope === 'tasks';
+    const summaryText =
+      entry.summary.length > 0 ? entry.summary : `${statusLabel} (${entry.receipt_id}).`;
+    const coveredAttention: WorkspaceCoveredAttentionView[] =
+      entry.covered_attention.map((cov, covIdx) => ({
+        key: `${jobId}\u0000${entry.receipt_id}\u0000cov\u0000${cov.task_id ?? 'job'}\u0000${covIdx}`,
+        receiptId: entry.receipt_id,
+        applicability: entry.applicability,
+        scope: entry.scope,
+        jobId,
+        taskId: cov.task_id,
+        attention: projectCoveredAttentionStateView(cov.attention, referenceNowMs),
+        recordedAtMs: cov.attention.updated_at_ms ?? entry.recorded_at_ms,
+        ageLabel: formatAge(
+          cov.attention.updated_at_ms ?? entry.recorded_at_ms,
+          referenceNowMs,
+        ),
+      }));
+
+    return {
+      idx,
+      view: {
+        receiptId: entry.receipt_id,
+        requestKey: entry.request_key,
+        previewDigest: entry.preview_digest,
+        outcome: entry.outcome,
+        scope: entry.scope,
+        scopeLabel: formatExternalResolutionScopeLabel(
+          entry.applicability,
+          entry.scope,
+          entry.task_ids,
+        ),
+        taskIds: [...entry.task_ids],
+        applicability: entry.applicability,
+        statusLabel,
+        tone: 'neutral' as StatusDotTone,
+        isApplicable,
+        isFullJob,
+        isPartial,
+        summary: summaryText,
+        evidenceRefs: [...entry.evidence_refs],
+        recordedAtMs: entry.recorded_at_ms,
+        ageLabel: formatAge(entry.recorded_at_ms, referenceNowMs),
+        coveredAttention,
+      },
+    };
+  });
+
+  indexed.sort((left, right) => {
+    const leftTs = left.view.recordedAtMs ?? Number.MIN_SAFE_INTEGER;
+    const rightTs = right.view.recordedAtMs ?? Number.MIN_SAFE_INTEGER;
+    if (rightTs !== leftTs) {
+      return rightTs - leftTs;
+    }
+    if (right.idx !== left.idx) {
+      return right.idx - left.idx;
+    }
+    return compareUtf8Lexical(left.view.receiptId, right.view.receiptId);
+  });
+
+  return indexed.map((item) => item.view);
+}
+
+export interface WorkspaceTaskExternalResolutionState {
+  applicable: WorkspaceExternalResolutionView[];
+  historical: WorkspaceExternalResolutionView[];
+  coveredAttention: WorkspaceCoveredAttentionView[];
+  isExternallyResolved: boolean;
+  label: 'Resolved externally' | 'Partially resolved externally' | null;
+}
+
+function deriveWorkspaceTaskExternalResolutionState(
+  task: WorkspaceTaskHistory,
+  jobExternalResolutions: readonly WorkspaceExternalResolutionView[],
+  currentAttention: WorkspaceAttentionView | null,
+  isVerifiedAccepted: boolean,
+): WorkspaceTaskExternalResolutionState {
+  const applicable = jobExternalResolutions.filter(
+    (res) =>
+      res.isApplicable &&
+      (res.scope === 'job' || res.taskIds.includes(task.task_id)),
+  );
+  const historical = jobExternalResolutions.filter(
+    (res) =>
+      !res.isApplicable &&
+      (res.scope === 'job' || res.taskIds.includes(task.task_id)),
+  );
+  const coveredAttention = applicable.flatMap((res) =>
+    res.coveredAttention.filter((cov) => cov.taskId === task.task_id),
+  );
+  const currentAttempt =
+    task.current_attempt_no > 0
+      ? (task.attempts.find(
+          (attempt) => attempt.attempt_no === task.current_attempt_no,
+        ) ?? null)
+      : null;
+  const hasUnknownTaskOrAttempt =
+    task.status.trim().toLowerCase() === 'unknown' ||
+    currentAttempt?.status.trim().toLowerCase() === 'unknown';
+  const hasActiveTaskOrAttempt =
+    isActiveWorkerRunStatus(task.status) ||
+    (currentAttempt !== null && isActiveWorkerRunStatus(currentAttempt.status));
+  const isExternallyResolved =
+    applicable.length > 0 &&
+    currentAttention === null &&
+    !isVerifiedAccepted &&
+    !hasUnknownTaskOrAttempt &&
+    !hasActiveTaskOrAttempt;
+  const label: WorkspaceTaskExternalResolutionState['label'] =
+    isExternallyResolved
+      ? applicable.some((res) => res.scope === 'job')
+        ? 'Resolved externally'
+        : 'Partially resolved externally'
+      : null;
+
+  return {
+    applicable,
+    historical,
+    coveredAttention,
+    isExternallyResolved,
+    label,
+  };
+}
+
+/**
+ * Derives a task's external-resolution coverage from the backend's
+ * store-verified job history projection. Never synthesizes applicability from
+ * summary prose, commit SHAs, or lineage links.
+ */
+export function projectWorkspaceTaskExternalResolutionState(
+  task: WorkspaceTaskHistory,
+  jobExternalResolutions: readonly WorkspaceExternalResolutionView[],
+  referenceNowMs: number,
+): WorkspaceTaskExternalResolutionState {
+  const acceptanceProof = normalizeWorkspaceAcceptanceProofForTask(
+    task.acceptance_proof,
+  );
+  const currentAttention = projectAttentionStateView(
+    task.current_attention,
+    referenceNowMs,
+  );
+  return deriveWorkspaceTaskExternalResolutionState(
+    task,
+    jobExternalResolutions,
+    currentAttention,
+    acceptanceProof.status === 'verified_accepted',
+  );
+}
+
 function projectWorkspaceTaskAttemptView(
   attempt: WorkspaceTaskAttempt,
   currentAttemptNo: number,
@@ -2657,6 +3032,7 @@ function projectWorkspaceTaskAttemptView(
 
 function projectWorkspaceTaskView(
   task: WorkspaceTaskHistory,
+  jobExternalResolutions: readonly WorkspaceExternalResolutionView[],
   referenceNowMs: number,
 ): WorkspaceTaskView {
   // Strictly enforce backend-verified task acceptance proof; never derive new proof from ID formats.
@@ -2770,6 +3146,13 @@ function projectWorkspaceTaskView(
     tone = 'danger';
   }
 
+  const externalResolutionState = deriveWorkspaceTaskExternalResolutionState(
+    task,
+    jobExternalResolutions,
+    currentAttention,
+    isVerifiedAccepted,
+  );
+
   return {
     taskId: task.task_id,
     title: task.title,
@@ -2790,6 +3173,11 @@ function projectWorkspaceTaskView(
     recordedAcceptedCandidateId: task.accepted_candidate_id,
     historicalFailure,
     currentAttention,
+    coveredAttention: externalResolutionState.coveredAttention,
+    externalResolutions: externalResolutionState.applicable,
+    historicalExternalResolutions: externalResolutionState.historical,
+    isExternallyResolved: externalResolutionState.isExternallyResolved,
+    externalResolutionLabel: externalResolutionState.label,
     acceptanceProof,
     isVerifiedAccepted,
     acceptanceLabel,
@@ -2822,6 +3210,11 @@ function buildJobTruncationNotices(truncation: WorkspaceJobHistoryTruncation): s
   if (truncation.combined_candidates_omitted > 0) {
     notices.push(
       `Bounded combined candidates: ${truncation.combined_candidates_omitted} older combined candidate(s) omitted.`,
+    );
+  }
+  if ((truncation.external_resolutions_omitted ?? 0) > 0) {
+    notices.push(
+      `Bounded external resolution history: ${truncation.external_resolutions_omitted} older receipt(s) omitted.`,
     );
   }
   return notices;
@@ -2862,7 +3255,58 @@ function projectWorkspaceJobView(
     }
   }
 
-  const tasks = history.tasks.map((t) => projectWorkspaceTaskView(t, referenceNowMs));
+  const externalResolutions = projectWorkspaceJobExternalResolutionViews(
+    history.external_resolutions,
+    history.job.job_id,
+    referenceNowMs,
+  );
+  const applicableExternalResolutions = externalResolutions.filter(
+    (res) => res.isApplicable,
+  );
+  const historicalExternalResolutions = externalResolutions.filter(
+    (res) => !res.isApplicable,
+  );
+  const coveredAttention = applicableExternalResolutions.flatMap(
+    (res) => res.coveredAttention,
+  );
+
+  const tasks = history.tasks.map((t) =>
+    projectWorkspaceTaskView(t, externalResolutions, referenceNowMs),
+  );
+  const hasApplicableFullExternalResolution = applicableExternalResolutions.some(
+    (res) => res.scope === 'job',
+  );
+  const hasApplicablePartialExternalResolution =
+    !hasApplicableFullExternalResolution &&
+    applicableExternalResolutions.some((res) => res.scope === 'tasks');
+  const externallyResolvedTaskIdSet = new Set<string>();
+  if (hasApplicableFullExternalResolution) {
+    for (const task of tasks) {
+      if (task.taskId !== 'unknown') {
+        externallyResolvedTaskIdSet.add(task.taskId);
+      }
+    }
+  }
+  for (const res of applicableExternalResolutions) {
+    for (const taskId of res.taskIds) {
+      externallyResolvedTaskIdSet.add(taskId);
+    }
+  }
+  const externallyResolvedTaskIds = Array.from(externallyResolvedTaskIdSet);
+  const primaryExternalResolution =
+    applicableExternalResolutions.find((res) => res.scope === 'job') ??
+    applicableExternalResolutions[0] ??
+    null;
+  const primaryExternalResolutionReceiptId =
+    primaryExternalResolution?.receiptId ?? null;
+  const externalResolutionLabel:
+    | 'Resolved externally'
+    | 'Partially resolved externally'
+    | null = hasApplicableFullExternalResolution
+    ? 'Resolved externally'
+    : hasApplicablePartialExternalResolution
+      ? 'Partially resolved externally'
+      : null;
   const combinedCandidates: WorkspaceCombinedCandidateView[] =
     history.combined_candidates.map((cc) => ({
       combinedCandidateId: cc.combined_candidate_id,
@@ -2907,6 +3351,19 @@ function projectWorkspaceJobView(
   );
   const taskAttention =
     currentAttention ?? tasks.find((t) => t.currentAttention !== null)?.currentAttention ?? null;
+  const hasUnknownTaskEffect = tasks.some(
+    (t) =>
+      !t.isVerifiedAccepted &&
+      (t.statusRaw.trim().toLowerCase() === 'unknown' ||
+        t.currentAttempt?.statusRaw.trim().toLowerCase() === 'unknown'),
+  );
+  const execLower = history.job.execution_status.trim().toLowerCase();
+  const hasUnknownJobEffect =
+    hasUnknownTaskEffect ||
+    (history.job.state === 'unknown' && execLower !== 'resolved_externally');
+  const hasUncoveredTaskFailure = tasks.some(
+    (t) => !t.isExternallyResolved && t.tone === 'danger',
+  );
 
   let statusLabel: string;
   let tone: StatusDotTone;
@@ -2919,9 +3376,6 @@ function projectWorkspaceJobView(
   } else if (isVerifiedAccepted) {
     statusLabel = 'Verified accepted';
     tone = 'success';
-  } else if (history.job.state === 'completed') {
-    statusLabel = 'Completed (unverified acceptance)';
-    tone = 'neutral';
   } else if (history.job.state === 'reviewing') {
     statusLabel = 'Reviewing';
     tone = 'working';
@@ -2931,9 +3385,6 @@ function projectWorkspaceJobView(
   } else if (history.job.state === 'planning') {
     statusLabel = 'Planning';
     tone = 'working';
-  } else if (history.job.state === 'ready') {
-    statusLabel = 'Ready';
-    tone = 'neutral';
   } else if (
     isRetiredSupersededPlanningJobFields(
       history.job.approval_status,
@@ -2946,6 +3397,24 @@ function projectWorkspaceJobView(
     )
   ) {
     statusLabel = 'Superseded';
+    tone = 'neutral';
+  } else if (hasUnknownJobEffect) {
+    statusLabel = 'Status unknown';
+    tone = 'neutral';
+  } else if (hasApplicableFullExternalResolution) {
+    statusLabel = 'Resolved externally';
+    tone = 'neutral';
+  } else if (
+    hasApplicablePartialExternalResolution &&
+    (history.job.state !== 'failed' || (tasks.length > 0 && !hasUncoveredTaskFailure))
+  ) {
+    statusLabel = 'Partially resolved externally';
+    tone = 'neutral';
+  } else if (history.job.state === 'completed') {
+    statusLabel = 'Completed (unverified acceptance)';
+    tone = 'neutral';
+  } else if (history.job.state === 'ready') {
+    statusLabel = 'Ready';
     tone = 'neutral';
   } else if (history.job.state === 'failed') {
     statusLabel = 'Failed';
@@ -2989,6 +3458,16 @@ function projectWorkspaceJobView(
     },
     historicalFailure,
     currentAttention,
+    coveredAttention,
+    externalResolutions,
+    applicableExternalResolutions,
+    historicalExternalResolutions,
+    hasApplicableFullExternalResolution,
+    hasApplicablePartialExternalResolution,
+    externallyResolvedTaskIds,
+    externalResolutionLabel,
+    primaryExternalResolutionReceiptId,
+    primaryExternalResolution,
     acceptanceProof,
     isVerifiedAccepted,
     acceptanceLabel,
@@ -3167,8 +3646,33 @@ function projectWorkspaceActivityItemView(
   };
 }
 
+function resolveLinkedMessageExternalResolution(
+  item: WorkspaceMessageItem,
+  jobViews: readonly WorkspaceJobView[],
+): WorkspaceExternalResolutionView | null {
+  const scopedJobs =
+    item.scope.job_id !== null
+      ? jobViews.filter((jv) => jv.jobId === item.scope.job_id)
+      : jobViews;
+
+  // A message links to a receipt only when the backend-recorded source record
+  // id is the receipt id itself. Never infer a receipt link from job scope,
+  // task scope, summary prose, commit lineage, or a primary receipt fallback.
+  for (const jv of scopedJobs) {
+    const exactMatch = jv.externalResolutions.find(
+      (res) => res.receiptId === item.source_record_id,
+    );
+    if (exactMatch) {
+      return exactMatch;
+    }
+  }
+
+  return null;
+}
+
 function projectMessageItemView(
   item: WorkspaceMessageItem,
+  jobViews: readonly WorkspaceJobView[],
   referenceNowMs: number,
 ): WorkspaceMessageItemView {
   const completenessNotices: string[] = [];
@@ -3197,6 +3701,8 @@ function projectMessageItemView(
     );
   }
 
+  const linkedRes = resolveLinkedMessageExternalResolution(item, jobViews);
+
   return {
     itemId: item.item_id,
     sourceKind: item.source_kind,
@@ -3218,7 +3724,125 @@ function projectMessageItemView(
     },
     isIncomplete: completenessNotices.length > 0,
     completenessNotices,
+    linkedReceiptId: linkedRes?.receiptId ?? null,
+    linkedReceiptApplicability: linkedRes?.applicability ?? null,
+    linkedJobExternalResolutionLabel: linkedRes?.statusLabel ?? null,
+    linkedJobExternalResolutionScope: linkedRes?.scope ?? null,
+    linkedReceiptTaskIds: linkedRes ? [...linkedRes.taskIds] : [],
+    linkedReceiptEvidenceRefs: linkedRes ? [...linkedRes.evidenceRefs] : [],
   };
+}
+
+function buildMessagesExternalResolutionViews(
+  jobViews: readonly WorkspaceJobView[],
+): WorkspaceMessageExternalResolutionView[] {
+  const entries: Array<{ sortTs: number; item: WorkspaceMessageExternalResolutionView }> = [];
+  for (const jv of jobViews) {
+    for (const res of jv.externalResolutions) {
+      entries.push({
+        sortTs: res.recordedAtMs ?? jv.updatedAtMs ?? Number.MIN_SAFE_INTEGER,
+        item: {
+          sourceId: jv.sourceId,
+          jobId: jv.jobId,
+          jobTitle: jv.title,
+          receiptId: res.receiptId,
+          requestKey: res.requestKey,
+          previewDigest: res.previewDigest,
+          outcome: res.outcome,
+          scope: res.scope,
+          scopeLabel: res.scopeLabel,
+          taskIds: [...res.taskIds],
+          applicability: res.applicability,
+          statusLabel: res.statusLabel,
+          isApplicable: res.isApplicable,
+          isFullJob: res.isFullJob,
+          isPartial: res.isPartial,
+          summary: res.summary,
+          evidenceRefs: [...res.evidenceRefs],
+          recordedAtMs: res.recordedAtMs,
+          ageLabel: res.ageLabel,
+          coveredAttention: res.coveredAttention.map((cov) => ({
+            ...cov,
+            attention: {
+              ...cov.attention,
+              blockingHoldIds: [...cov.attention.blockingHoldIds],
+              blockingOutboxIds: [...cov.attention.blockingOutboxIds],
+            },
+          })),
+        },
+      });
+    }
+  }
+  entries.sort((left, right) => {
+    if (right.sortTs !== left.sortTs) {
+      return right.sortTs - left.sortTs;
+    }
+    return compareUtf8Lexical(left.item.receiptId, right.item.receiptId);
+  });
+  return entries.map((entry) => entry.item);
+}
+
+function buildActivityReceiptItemViews(
+  jobViews: readonly WorkspaceJobView[],
+  chatIdentity: WorkspaceChatIdentity,
+): WorkspaceActivityReceiptItemView[] {
+  const entries: Array<{ sortTs: number; item: WorkspaceActivityReceiptItemView }> = [];
+  for (const jv of jobViews) {
+    for (const res of jv.externalResolutions) {
+      const statusNote = res.isApplicable
+        ? 'Recorded from store-verified job history receipt; no synthetic provider call, user message, delivery/ACK, or Closure verdict.'
+        : res.applicability === 'stale'
+          ? 'Historical stale external resolution receipt recorded in job history; does not resolve active work or close blockers.'
+          : 'Unverified external resolution receipt recorded in job history; does not resolve active work or close blockers.';
+      entries.push({
+        sortTs: res.recordedAtMs ?? jv.updatedAtMs ?? Number.MIN_SAFE_INTEGER,
+        item: {
+          receiptKey: `${jv.sourceId}\u0000${jv.jobId}\u0000${res.receiptId}`,
+          sourceId: jv.sourceId,
+          jobId: jv.jobId,
+          jobTitle: jv.title,
+          chatIdentity,
+          receiptId: res.receiptId,
+          requestKey: res.requestKey,
+          previewDigest: res.previewDigest,
+          outcome: res.outcome,
+          scope: res.scope,
+          scopeLabel: res.scopeLabel,
+          taskIds: [...res.taskIds],
+          applicability: res.applicability,
+          statusLabel: res.statusLabel,
+          tone: res.tone,
+          isApplicable: res.isApplicable,
+          isFullJob: res.isFullJob,
+          isPartial: res.isPartial,
+          summary: res.summary,
+          evidenceRefs: [...res.evidenceRefs],
+          recordedAtMs: res.recordedAtMs,
+          ageLabel: res.ageLabel,
+          coveredAttention: res.coveredAttention.map((cov) => ({
+            ...cov,
+            attention: {
+              ...cov.attention,
+              blockingHoldIds: [...cov.attention.blockingHoldIds],
+              blockingOutboxIds: [...cov.attention.blockingOutboxIds],
+            },
+          })),
+          completesChat: false,
+          isSyntheticProviderCall: false,
+          isSyntheticUserMessage: false,
+          isSyntheticDeliveryOrClosure: false,
+          statusNote,
+        },
+      });
+    }
+  }
+  entries.sort((left, right) => {
+    if (right.sortTs !== left.sortTs) {
+      return right.sortTs - left.sortTs;
+    }
+    return compareUtf8Lexical(left.item.receiptKey, right.item.receiptKey);
+  });
+  return entries.map((entry) => entry.item);
 }
 
 function computeChatWorkerSummary(
@@ -3385,14 +4009,29 @@ function computeChatJobSummary(
   ).length;
   const activeJobCount = Math.max(computedActiveJobs, summaryActiveJobCount);
   const verifiedAcceptedJobCount = jobViews.filter((j) => j.isVerifiedAccepted).length;
+  const externallyResolvedJobCount = jobViews.filter(
+    (j) =>
+      !j.isVerifiedAccepted &&
+      j.hasApplicableFullExternalResolution &&
+      j.statusLabel === 'Resolved externally',
+  ).length;
+  const partiallyResolvedJobCount = jobViews.filter(
+    (j) => !j.isVerifiedAccepted && j.hasApplicablePartialExternalResolution,
+  ).length;
   const pendingAcceptanceJobCount = jobViews.filter(
     (j) =>
       !j.isVerifiedAccepted &&
+      !(
+        j.hasApplicableFullExternalResolution &&
+        j.acceptanceProof.status !== 'pending_review'
+      ) &&
       (j.stateRaw === 'completed' ||
         j.executionStatus.trim().toLowerCase() === 'accepted' ||
         j.executionStatus.trim().toLowerCase() === 'completed'),
   ).length;
-  const failedJobCount = jobViews.filter((j) => j.stateRaw === 'failed').length;
+  const failedJobCount = jobViews.filter(
+    (j) => j.stateRaw === 'failed' && j.statusLabel !== 'Resolved externally',
+  ).length;
   const needsAttentionJobCount = new Set(
     jobViews
       .map((j, idx) => ({ job: j, idx }))
@@ -3428,6 +4067,13 @@ function computeChatJobSummary(
       verifiedAcceptedJobCount === 1
         ? '1 verified accepted job'
         : `${verifiedAcceptedJobCount} verified accepted jobs`;
+  } else if (externallyResolvedJobCount === totalJobCount && totalJobCount > 0) {
+    statusLabel =
+      externallyResolvedJobCount === 1
+        ? 'Resolved externally'
+        : `${externallyResolvedJobCount} jobs resolved externally`;
+  } else if (partiallyResolvedJobCount > 0 && totalJobCount === 1) {
+    statusLabel = 'Partially resolved externally';
   } else {
     statusLabel = `${totalJobCount} recorded job(s)`;
   }
@@ -3436,6 +4082,8 @@ function computeChatJobSummary(
     totalJobCount,
     activeJobCount,
     verifiedAcceptedJobCount,
+    externallyResolvedJobCount,
+    partiallyResolvedJobCount,
     pendingAcceptanceJobCount,
     failedJobCount,
     needsAttentionJobCount,
@@ -4273,6 +4921,17 @@ export function projectWorkspaceSnapshot(
     const hasCurrentBlocker = needsHumanCount > 0;
     const needsHumanBadgeLabel = formatNeedsHumanBadge(needsHumanCount);
 
+    const coveredBlockers = jobViews
+      .flatMap((jv) => jv.coveredAttention)
+      .sort((left, right) => {
+        const leftTs = left.recordedAtMs ?? Number.MIN_SAFE_INTEGER;
+        const rightTs = right.recordedAtMs ?? Number.MIN_SAFE_INTEGER;
+        if (rightTs !== leftTs) {
+          return rightTs - leftTs;
+        }
+        return compareUtf8Lexical(left.key, right.key);
+      });
+
     let updatedAtMs: number | null = acc.chatSummary?.updated_at_ms ?? null;
     const considerTs = (ts: number | null | undefined) => {
       if (typeof ts === 'number' && Number.isFinite(ts) && ts > 0) {
@@ -4284,6 +4943,9 @@ export function projectWorkspaceSnapshot(
     considerTs(acc.nativeSample?.observed_at_ms);
     for (const jv of jobViews) {
       considerTs(jv.updatedAtMs);
+      for (const res of jv.externalResolutions) {
+        considerTs(res.recordedAtMs);
+      }
     }
     for (const msg of acc.messageItems) {
       considerTs(msg.source_order.recorded_at_ms);
@@ -4355,6 +5017,7 @@ export function projectWorkspaceSnapshot(
       hasCurrentBlocker,
       needsHumanBadgeLabel,
       blockers,
+      coveredBlockers,
       primaryDotTone,
       statusSummaryLabel,
       canArchive: lifecycle === 'active',
@@ -4522,11 +5185,14 @@ export function projectWorkspaceSnapshot(
     const selectedAcc = accumulators.get(resolvedChatKey) ?? null;
     if (selectedSidebar && selectedAcc) {
       const sourceId = selectedSidebar.identity.source_id;
+      const jobViews = projectedJobsByChatKey.get(resolvedChatKey) ?? [];
 
       // 1. Messages surface (default tab; strictly 4-part scoped)
       const messageViews = selectedAcc.messageItems.map((m) =>
-        projectMessageItemView(m, referenceNowMs),
+        projectMessageItemView(m, jobViews, referenceNowMs),
       );
+      const messagesExternalResolutions =
+        buildMessagesExternalResolutionViews(jobViews);
       const unscopedMessagesCount =
         (unscopedMessagesBySource.get(sourceId) ?? 0) +
         (sourceId !== 'unknown' ? (unscopedMessagesBySource.get('unknown') ?? 0) : 0);
@@ -4565,6 +5231,7 @@ export function projectWorkspaceSnapshot(
         availability: ws.messages.availability,
         availabilityLabel: formatWorkspaceAvailabilityLabel(ws.messages.availability),
         items: messageViews,
+        externalResolutions: messagesExternalResolutions,
         maxItems: ws.messages.max_items,
         omittedCount: ws.messages.omitted_count,
         hasMore: ws.messages.has_more,
@@ -4582,7 +5249,6 @@ export function projectWorkspaceSnapshot(
       };
 
       // 2. Jobs surface (separate durable ledger; strictly 4-part scoped)
-      const jobViews = projectedJobsByChatKey.get(resolvedChatKey) ?? [];
       const unscopedJobsCount =
         (unscopedJobsBySource.get(sourceId) ?? 0) +
         (sourceId !== 'unknown' ? (unscopedJobsBySource.get('unknown') ?? 0) : 0);
@@ -4614,6 +5280,11 @@ export function projectWorkspaceSnapshot(
         totalJobCount: jobViews.length,
         activeJobCount: selectedSidebar.jobSummary.activeJobCount,
         verifiedAcceptedJobCount: selectedSidebar.jobSummary.verifiedAcceptedJobCount,
+        externallyResolvedJobCount: selectedSidebar.jobSummary.externallyResolvedJobCount,
+        partiallyResolvedJobCount: selectedSidebar.jobSummary.partiallyResolvedJobCount,
+        historicalReceiptJobCount: jobViews.filter(
+          (j) => j.historicalExternalResolutions.length > 0,
+        ).length,
         historicalFailureJobCount: jobViews.filter(
           (j) =>
             j.historicalFailure !== null ||
@@ -4631,11 +5302,19 @@ export function projectWorkspaceSnapshot(
 
       // 3. Activity surface (separate audit feed; strictly 4-part scoped, optional job sub-filter)
       const allScopedActivity = projectedActivityByChatKey.get(resolvedChatKey) ?? [];
+      const allScopedReceipts = buildActivityReceiptItemViews(
+        jobViews,
+        selectedSidebar.identity,
+      );
       const cleanJobFilter = validateCorrelationId(options.activityJobId ?? null);
       const visibleActivity =
         cleanJobFilter !== null
           ? allScopedActivity.filter((item) => item.jobId === cleanJobFilter)
           : allScopedActivity;
+      const visibleReceipts =
+        cleanJobFilter !== null
+          ? allScopedReceipts.filter((item) => item.jobId === cleanJobFilter)
+          : allScopedReceipts;
       const unscopedRequestsCount =
         (unscopedRequestsBySource.get(sourceId) ?? 0) +
         (sourceId !== 'unknown' ? (unscopedRequestsBySource.get('unknown') ?? 0) : 0) +
@@ -4662,7 +5341,9 @@ export function projectWorkspaceSnapshot(
       const activitySurface: WorkspaceChatActivitySurface = {
         kind: WORKSPACE_SURFACE_SEPARATION.activity_surface.kind,
         items: visibleActivity,
+        receiptItems: visibleReceipts,
         totalScopedCount: allScopedActivity.length,
+        totalScopedReceiptCount: allScopedReceipts.length,
         activeJobFilter: cleanJobFilter,
         runningCount: visibleActivity.filter((a) => a.running).length,
         hasMore: ws.observation.has_more,
@@ -4670,7 +5351,7 @@ export function projectWorkspaceSnapshot(
         nextCursor: ws.observation.next_cursor,
         unscopedWithheldCount: unscopedRequestsCount,
         emptyMessage:
-          visibleActivity.length === 0
+          visibleActivity.length === 0 && visibleReceipts.length === 0
             ? cleanJobFilter !== null
               ? `No activity requests recorded for job ${cleanJobFilter} in this chat.`
               : 'No activity requests recorded for this chat in the current window.'
@@ -4720,6 +5401,7 @@ export function projectWorkspaceSnapshot(
         needsHumanCount: selectedSidebar.needsHumanCount,
         hasCurrentBlocker: selectedSidebar.hasCurrentBlocker,
         blockers: selectedSidebar.blockers,
+        coveredBlockers: selectedSidebar.coveredBlockers,
         primaryBlocker: selectedSidebar.blockers[0] ?? null,
         scopedTarget: selectedSidebar.scopedTarget,
         codexTarget: selectedSidebar.codexTarget,

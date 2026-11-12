@@ -2,6 +2,7 @@ import { expect, type Locator, type Page, test } from '@playwright/test';
 import {
   BETA_CHAT_ONLY_SENTINEL,
   buildDisconnectedWorkspaceSnapshot,
+  buildExternalResolutionWorkspaceSnapshot,
   buildHistoricalFailureWorkspaceSnapshot,
   buildInteractiveWorkspaceSnapshot,
   buildPendingAcceptanceWorkspaceSnapshot,
@@ -11,6 +12,15 @@ import {
   CHAT_GAMMA_IDENTITY,
   CHAT_GAMMA_KEY,
   createChatMessageItem,
+  EXTERNAL_RESOLUTION_COVERED_JOB_REASON,
+  EXTERNAL_RESOLUTION_COVERED_TASK_REASON,
+  EXTERNAL_RESOLUTION_FULL_RECEIPT_ID,
+  EXTERNAL_RESOLUTION_FULL_SUMMARY,
+  EXTERNAL_RESOLUTION_PARTIAL_RECEIPT_ID,
+  EXTERNAL_RESOLUTION_PARTIAL_SUMMARY,
+  EXTERNAL_RESOLUTION_STALE_RECEIPT_ID,
+  EXTERNAL_RESOLUTION_UNRELATED_QUESTION,
+  EXTERNAL_RESOLUTION_UNVERIFIED_RECEIPT_ID,
   FIXTURE_BASE_NOW_MS,
   HISTORICAL_FAILURE_REASON,
   installWorkspaceTauriFixture,
@@ -38,6 +48,67 @@ function visibleActivityPanel(page: Page): Locator {
   return page
     .locator('.tl-wp-tabpanel[role="tabpanel"]:not([hidden]) .tl-wp-activity-panel')
     .first();
+}
+
+async function ensureDetailsOpen(details: Locator): Promise<void> {
+  await expect(details).toBeVisible();
+  const isOpen = await details.evaluate((el) => (el as HTMLDetailsElement).open);
+  if (!isOpen) {
+    await details.locator('summary').first().click();
+  }
+  await expect(details).toHaveJSProperty('open', true);
+}
+
+async function expectUsableMessagesScroller(messagesPanel: Locator): Promise<Locator> {
+  const scroller = messagesPanel.locator('[data-messages-scroller="true"]').first();
+  await expect(scroller).toBeVisible();
+  await expect
+    .poll(() => scroller.evaluate((el) => el.clientHeight))
+    .toBeGreaterThanOrEqual(120);
+  const metrics = await scroller.evaluate((el) => ({
+    clientHeight: el.clientHeight,
+    scrollHeight: el.scrollHeight,
+  }));
+  expect(metrics.clientHeight).toBeGreaterThanOrEqual(120);
+  expect(metrics.scrollHeight).toBeGreaterThanOrEqual(metrics.clientHeight);
+  return scroller;
+}
+
+async function expectInViewportWithinScroller(
+  scroller: Locator,
+  target: Locator,
+): Promise<void> {
+  await target.scrollIntoViewIfNeeded();
+  await expect(target).toBeVisible();
+  await expect
+    .poll(async () => {
+      const [scrollerBox, targetBox] = await Promise.all([
+        scroller.boundingBox(),
+        target.boundingBox(),
+      ]);
+      if (scrollerBox === null || targetBox === null) {
+        return false;
+      }
+      return (
+        scrollerBox.height >= 120 &&
+        targetBox.height > 0 &&
+        targetBox.y >= scrollerBox.y - 1 &&
+        targetBox.y + targetBox.height <= scrollerBox.y + scrollerBox.height + 1
+      );
+    })
+    .toBe(true);
+  const [scrollerBox, targetBox] = await Promise.all([
+    scroller.boundingBox(),
+    target.boundingBox(),
+  ]);
+  expect(scrollerBox).not.toBeNull();
+  expect(targetBox).not.toBeNull();
+  expect(scrollerBox!.height).toBeGreaterThanOrEqual(120);
+  expect(targetBox!.height).toBeGreaterThan(0);
+  expect(targetBox!.y).toBeGreaterThanOrEqual(scrollerBox!.y - 1);
+  expect(targetBox!.y + targetBox!.height).toBeLessThanOrEqual(
+    scrollerBox!.y + scrollerBox!.height + 1,
+  );
 }
 
 function lifecycleFilterControl(page: Page, kind: 'active' | 'archived'): Locator {
@@ -1408,5 +1479,365 @@ test.describe('Workspace semantic contract fixtures', () => {
     } finally {
       await controller.releaseStalledWorkspaceSnapshotReads().catch(() => {});
     }
+  });
+});
+
+test.describe('Workspace external resolution receipts', () => {
+  test('renders full, partial, stale, unverified, covered attention, and receipt navigation in wide layout', async ({
+    page,
+  }) => {
+    await installWorkspaceTauriFixture(page, {
+      workspaceSnapshot: buildExternalResolutionWorkspaceSnapshot(),
+    });
+    await page.setViewportSize({ width: 1040, height: 760 });
+    await page.goto('/');
+
+    const messagesPanel = page
+      .locator('.tl-wp-tabpanel[role="tabpanel"]:not([hidden]) .tl-wp-messages-panel')
+      .first();
+    await expect(messagesPanel).toBeVisible();
+    const messagesReceipts = messagesPanel.locator(
+      '[data-external-resolution-surface="messages"]',
+    );
+    await expect(messagesReceipts).toBeVisible();
+    const messagesScroller = await expectUsableMessagesScroller(messagesPanel);
+    const fullMessageReceiptButton = messagesPanel
+      .locator(`[data-message-receipt-id="${EXTERNAL_RESOLUTION_FULL_RECEIPT_ID}"]`)
+      .first();
+    await expectInViewportWithinScroller(messagesScroller, fullMessageReceiptButton);
+    const initialMessagesScrollerHeight = await messagesScroller.evaluate(
+      (el) => el.clientHeight,
+    );
+
+    const fullReceipt = messagesReceipts.locator(
+      `[data-external-resolution-receipt-id="${EXTERNAL_RESOLUTION_FULL_RECEIPT_ID}"]`,
+    );
+    await expect(fullReceipt).toBeVisible();
+    await expect(fullReceipt.getByText('Resolved externally').first()).toBeVisible();
+    await expect(fullReceipt.getByText('Full job').first()).toBeVisible();
+    await expect(fullReceipt.getByText(EXTERNAL_RESOLUTION_FULL_SUMMARY).first()).toBeVisible();
+    const fullReceiptDetails = fullReceipt
+      .locator('details[data-external-resolution-details]')
+      .first();
+    await ensureDetailsOpen(fullReceiptDetails);
+    await expect(
+      fullReceipt.getByText(`Receipt: ${EXTERNAL_RESOLUTION_FULL_RECEIPT_ID}`).first(),
+    ).toBeVisible();
+    await expect(fullReceipt.getByText('ev_ext_fixture_full_01').first()).toBeVisible();
+    await expect(
+      fullReceipt.getByText(EXTERNAL_RESOLUTION_COVERED_JOB_REASON).first(),
+    ).toBeVisible();
+    await expect(
+      fullReceipt.getByText(EXTERNAL_RESOLUTION_COVERED_TASK_REASON).first(),
+    ).toBeVisible();
+
+    const partialReceipt = messagesReceipts.locator(
+      `[data-external-resolution-receipt-id="${EXTERNAL_RESOLUTION_PARTIAL_RECEIPT_ID}"]`,
+    );
+    await expect(partialReceipt).toBeVisible();
+    await expect(
+      partialReceipt.getByText('Partially resolved externally').first(),
+    ).toBeVisible();
+    await expect(partialReceipt.getByText('Partial').first()).toBeVisible();
+    await expect(partialReceipt.getByText('task_ext_partial_01').first()).toBeVisible();
+
+    const messagesHistory = messagesReceipts.locator(
+      '[data-external-resolution-surface="messages-history"]',
+    );
+    await ensureDetailsOpen(messagesHistory);
+    await expect(messagesHistory.getByText('Stale external receipt').first()).toBeVisible();
+    await expect(
+      messagesHistory.getByText('Unverified external receipt').first(),
+    ).toBeVisible();
+    await expect(
+      messagesHistory.locator(
+        `[data-external-resolution-receipt-id="${EXTERNAL_RESOLUTION_STALE_RECEIPT_ID}"]`,
+      ),
+    ).toBeVisible();
+    await expect(
+      messagesHistory.locator(
+        `[data-external-resolution-receipt-id="${EXTERNAL_RESOLUTION_UNVERIFIED_RECEIPT_ID}"]`,
+      ),
+    ).toBeVisible();
+    await expect(messagesHistory.getByText('External resolution history (2)')).toBeVisible();
+    await expect(
+      messagesPanel.getByText(EXTERNAL_RESOLUTION_UNRELATED_QUESTION).first(),
+    ).toBeVisible();
+    const unrelatedMessageItem = messagesPanel
+      .locator('[data-message-item-id]')
+      .filter({ hasText: EXTERNAL_RESOLUTION_UNRELATED_QUESTION })
+      .first();
+    await expect(unrelatedMessageItem).toBeVisible();
+    await expect(unrelatedMessageItem.locator('[data-message-receipt-id]')).toHaveCount(0);
+    expect(
+      await messagesScroller.evaluate((el) => el.clientHeight),
+    ).toBe(initialMessagesScrollerHeight);
+    await expectUsableMessagesScroller(messagesPanel);
+    await expectInViewportWithinScroller(messagesScroller, fullMessageReceiptButton);
+
+    await fullMessageReceiptButton.click();
+    await expect(chatSurfaceTab(page, 'Jobs')).toHaveAttribute('aria-selected', 'true');
+
+    const jobsPanel = visibleJobsPanel(page);
+    const fullJobCard = jobsPanel.locator(
+      'article.tl-wp-job-card[data-job-id="job_ext_full_01"]',
+    );
+    await expect(fullJobCard).toBeVisible();
+    await expect(fullJobCard).toHaveAttribute('data-expanded', 'true');
+    await expect(fullJobCard.getByText('Resolved externally').first()).toBeVisible();
+    await expect(fullJobCard.getByText(EXTERNAL_RESOLUTION_FULL_SUMMARY).first()).toBeVisible();
+    const jobFullReceipt = fullJobCard
+      .locator(
+        `[data-external-resolution-receipt-id="${EXTERNAL_RESOLUTION_FULL_RECEIPT_ID}"]`,
+      )
+      .first();
+    await ensureDetailsOpen(
+      jobFullReceipt.locator('details[data-external-resolution-details]').first(),
+    );
+    await expect(
+      fullJobCard.getByText(`Receipt: ${EXTERNAL_RESOLUTION_FULL_RECEIPT_ID}`).first(),
+    ).toBeVisible();
+    await expect(
+      fullJobCard.getByText(/Phase:\s*external_resolution/).first(),
+    ).toBeVisible();
+    await expect(fullJobCard.getByText('Acceptance unverified').first()).toBeVisible();
+    await expect(fullJobCard.getByText('Status: completed').first()).toBeVisible();
+    await expect(
+      fullJobCard
+        .getByText('Real recorded job result remains visible alongside the external receipt.')
+        .first(),
+    ).toBeVisible();
+    await expect(
+      fullJobCard
+        .getByText(/Historical failure remains visible even after external resolution/)
+        .first(),
+    ).toBeVisible();
+    await expect(
+      fullJobCard.getByText(EXTERNAL_RESOLUTION_COVERED_JOB_REASON).first(),
+    ).toBeVisible();
+
+    const partialJobCard = jobsPanel.locator(
+      'article.tl-wp-job-card[data-job-id="job_ext_partial_02"]',
+    );
+    await expect(partialJobCard).toBeVisible();
+    await partialJobCard
+      .locator('button.tl-wp-job-row-btn, button[aria-expanded]')
+      .first()
+      .click();
+    await expect(
+      partialJobCard.getByText('Partially resolved externally').first(),
+    ).toBeVisible();
+    await expect(
+      partialJobCard.getByText(EXTERNAL_RESOLUTION_PARTIAL_SUMMARY).first(),
+    ).toBeVisible();
+    await expect(
+      partialJobCard.getByText('Unrelated task remains visible').first(),
+    ).toBeVisible();
+
+    const blockedJobCard = jobsPanel.locator(
+      'article.tl-wp-job-card[data-job-id="job_ext_blocked_03"]',
+    );
+    await expect(blockedJobCard).toBeVisible();
+    await blockedJobCard
+      .locator('button.tl-wp-job-row-btn, button[aria-expanded]')
+      .first()
+      .click();
+    await expect(
+      blockedJobCard
+        .getByText('Uncovered job approval remains active while stale and unverified receipts exist.')
+        .first(),
+    ).toBeVisible();
+    const blockedHistory = blockedJobCard.locator(
+      '[data-external-resolution-surface="jobs-history"]',
+    );
+    await ensureDetailsOpen(blockedHistory);
+    await expect(blockedHistory.getByText('Stale external receipt').first()).toBeVisible();
+    await expect(
+      blockedHistory.getByText('Unverified external receipt').first(),
+    ).toBeVisible();
+    const blockedUnverifiedReceipt = blockedHistory
+      .locator(
+        `[data-external-resolution-receipt-id="${EXTERNAL_RESOLUTION_UNVERIFIED_RECEIPT_ID}"]`,
+      )
+      .first();
+    await ensureDetailsOpen(
+      blockedUnverifiedReceipt
+        .locator('details[data-external-resolution-details]')
+        .first(),
+    );
+    await expect(
+      blockedHistory.getByText(EXTERNAL_RESOLUTION_COVERED_JOB_REASON).first(),
+    ).toBeVisible();
+
+    const unknownJobCard = jobsPanel.locator(
+      'article.tl-wp-job-card[data-job-id="job_ext_unknown_04"]',
+    );
+    await expect(unknownJobCard).toBeVisible();
+    await unknownJobCard
+      .locator('button.tl-wp-job-row-btn, button[aria-expanded]')
+      .first()
+      .click();
+    await expect(
+      unknownJobCard.locator('.tl-wp-pill-label', { hasText: /^Unknown$/ }),
+    ).toHaveCount(1);
+    await expect(unknownJobCard.getByText('Resolved externally').first()).toBeVisible();
+
+    await chatSurfaceTab(page, 'Activity').click();
+    const activityPanel = visibleActivityPanel(page);
+    const activityReceipts = activityPanel.locator(
+      '[data-external-resolution-surface="activity"]',
+    );
+    await expect(activityReceipts).toBeVisible();
+    await expect(
+      activityReceipts.locator(
+        `[data-external-resolution-receipt-id="${EXTERNAL_RESOLUTION_FULL_RECEIPT_ID}"]`,
+      ),
+    ).toBeVisible();
+    await expect(
+      activityReceipts.locator(
+        `[data-external-resolution-receipt-id="${EXTERNAL_RESOLUTION_PARTIAL_RECEIPT_ID}"]`,
+      ),
+    ).toBeVisible();
+    const activityHistory = activityPanel.locator(
+      '[data-external-resolution-surface="activity-history"]',
+    );
+    await ensureDetailsOpen(activityHistory);
+    await expect(activityHistory.getByText('Stale external receipt').first()).toBeVisible();
+    await expect(
+      activityHistory.getByText('Unverified external receipt').first(),
+    ).toBeVisible();
+    await expect(activityPanel.locator('article.tl-wp-activity-card')).toHaveCount(0);
+    await expect(
+      activityPanel.getByText('External resolution receipts are recorded in job history.'),
+    ).toBeVisible();
+
+    await activityReceipts
+      .locator(
+        `[data-external-resolution-receipt-id="${EXTERNAL_RESOLUTION_FULL_RECEIPT_ID}"]`,
+      )
+      .getByRole('button', { name: 'Open in Jobs' })
+      .click();
+    await expect(chatSurfaceTab(page, 'Jobs')).toHaveAttribute('aria-selected', 'true');
+    await expect(
+      visibleJobsPanel(page).locator(
+        'article.tl-wp-job-card[data-job-id="job_ext_full_01"]',
+      ),
+    ).toHaveAttribute('data-focused', 'true');
+  });
+
+  test('renders the same receipt coverage, blocker history, and unknown boundary in narrow layout', async ({
+    page,
+  }) => {
+    await installWorkspaceTauriFixture(page, {
+      workspaceSnapshot: buildExternalResolutionWorkspaceSnapshot(),
+    });
+    await page.setViewportSize({ width: 360, height: 500 });
+    await page.goto('/');
+
+    const messagesPanel = page
+      .locator('.tl-wp-tabpanel[role="tabpanel"]:not([hidden]) .tl-wp-messages-panel')
+      .first();
+    await expect(messagesPanel).toBeVisible();
+    const messagesScroller = await expectUsableMessagesScroller(messagesPanel);
+    const fullMessageReceiptButton = messagesPanel
+      .locator(`[data-message-receipt-id="${EXTERNAL_RESOLUTION_FULL_RECEIPT_ID}"]`)
+      .first();
+    await expectInViewportWithinScroller(messagesScroller, fullMessageReceiptButton);
+    const initialMessagesScrollerHeight = await messagesScroller.evaluate(
+      (el) => el.clientHeight,
+    );
+
+    const messagesReceipts = messagesPanel.locator(
+      '[data-external-resolution-surface="messages"]',
+    );
+    await expect(messagesReceipts).toBeVisible();
+    await expect(messagesReceipts.getByText('Resolved externally').first()).toBeVisible();
+    await expect(
+      messagesReceipts.getByText('Partially resolved externally').first(),
+    ).toBeVisible();
+    const narrowFullReceipt = messagesReceipts
+      .locator(
+        `[data-external-resolution-receipt-id="${EXTERNAL_RESOLUTION_FULL_RECEIPT_ID}"]`,
+      )
+      .first();
+    await ensureDetailsOpen(
+      narrowFullReceipt.locator('details[data-external-resolution-details]').first(),
+    );
+    await expect(
+      messagesReceipts.getByText(EXTERNAL_RESOLUTION_COVERED_JOB_REASON).first(),
+    ).toBeVisible();
+    const messagesHistory = messagesReceipts.locator(
+      '[data-external-resolution-surface="messages-history"]',
+    );
+    await ensureDetailsOpen(messagesHistory);
+    await expect(messagesHistory.getByText('Stale external receipt').first()).toBeVisible();
+    await expect(
+      messagesHistory.getByText('Unverified external receipt').first(),
+    ).toBeVisible();
+    await expect(
+      messagesPanel.getByText(EXTERNAL_RESOLUTION_UNRELATED_QUESTION).first(),
+    ).toBeVisible();
+    expect(
+      await messagesScroller.evaluate((el) => el.clientHeight),
+    ).toBe(initialMessagesScrollerHeight);
+    await expectUsableMessagesScroller(messagesPanel);
+    await expectInViewportWithinScroller(messagesScroller, fullMessageReceiptButton);
+
+    await fullMessageReceiptButton.click();
+    await expect(chatSurfaceTab(page, 'Jobs')).toHaveAttribute('aria-selected', 'true');
+
+    const jobsPanel = visibleJobsPanel(page);
+    const fullJobCard = jobsPanel.locator(
+      'article.tl-wp-job-card[data-job-id="job_ext_full_01"]',
+    );
+    await expect(fullJobCard).toHaveAttribute('data-expanded', 'true');
+    await expect(fullJobCard.getByText('Resolved externally').first()).toBeVisible();
+    const narrowJobFullReceipt = fullJobCard
+      .locator(
+        `[data-external-resolution-receipt-id="${EXTERNAL_RESOLUTION_FULL_RECEIPT_ID}"]`,
+      )
+      .first();
+    await ensureDetailsOpen(
+      narrowJobFullReceipt.locator('details[data-external-resolution-details]').first(),
+    );
+    await expect(
+      fullJobCard.getByText(EXTERNAL_RESOLUTION_COVERED_TASK_REASON).first(),
+    ).toBeVisible();
+
+    const blockedJobCard = jobsPanel.locator(
+      'article.tl-wp-job-card[data-job-id="job_ext_blocked_03"]',
+    );
+    await blockedJobCard
+      .locator('button.tl-wp-job-row-btn, button[aria-expanded]')
+      .first()
+      .click();
+    await expect(
+      blockedJobCard
+        .getByText('Uncovered job approval remains active while stale and unverified receipts exist.')
+        .first(),
+    ).toBeVisible();
+    const blockedHistory = blockedJobCard.locator(
+      '[data-external-resolution-surface="jobs-history"]',
+    );
+    await ensureDetailsOpen(blockedHistory);
+    await expect(blockedHistory.getByText('Stale external receipt').first()).toBeVisible();
+    await expect(
+      blockedHistory.getByText('Unverified external receipt').first(),
+    ).toBeVisible();
+
+    await chatSurfaceTab(page, 'Activity').click();
+    const activityPanel = visibleActivityPanel(page);
+    await expect(
+      activityPanel.locator('[data-external-resolution-surface="activity"]'),
+    ).toBeVisible();
+    const activityHistory = activityPanel.locator(
+      '[data-external-resolution-surface="activity-history"]',
+    );
+    await ensureDetailsOpen(activityHistory);
+    await expect(activityHistory.getByText('Stale external receipt').first()).toBeVisible();
+    await expect(
+      activityHistory.getByText('Unverified external receipt').first(),
+    ).toBeVisible();
+    await expect(activityPanel.locator('article.tl-wp-activity-card')).toHaveCount(0);
   });
 });

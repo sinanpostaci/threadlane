@@ -8,6 +8,7 @@ import {
   MAX_WORKSPACE_CANDIDATES_PER_TASK,
   MAX_WORKSPACE_CANONICAL_PATH_BYTES,
   MAX_WORKSPACE_COMBINED_CANDIDATES_PER_JOB,
+  MAX_WORKSPACE_EXTERNAL_RESOLUTIONS_PER_JOB,
   MAX_WORKSPACE_JOBS_PER_BINDING,
   MAX_WORKSPACE_LABEL_BYTES,
   MAX_WORKSPACE_MESSAGES_WINDOW,
@@ -18,6 +19,7 @@ import {
   MAX_WORKSPACE_RUNS_PER_JOB,
   MAX_WORKSPACE_TASKS_PER_JOB,
   OBSERVATION_SCHEMA_VERSION,
+  WORKSPACE_EXTERNAL_RESOLUTION_VIEW_CONTRACT_VERSION,
   WORKSPACE_METADATA_TIMEOUT_MS,
   WORKSPACE_SAMPLE_STALE_THRESHOLD_MS,
   WORKSPACE_SAMPLING_INTERVAL_MS,
@@ -46,7 +48,12 @@ import type {
   WorkspaceCombinedCandidate,
   WorkspaceConfiguredSelection,
   WorkspaceConnectionState,
+  WorkspaceCoveredAttention,
   WorkspaceEvaluatedNativeSample,
+  WorkspaceExternalResolution,
+  WorkspaceExternalResolutionApplicability,
+  WorkspaceExternalResolutionOutcome,
+  WorkspaceExternalResolutionScope,
   WorkspaceFreshnessState,
   WorkspaceHistoricalFailure,
   WorkspaceJobHistory,
@@ -84,6 +91,7 @@ export {
   MAX_WORKSPACE_CANDIDATES_PER_TASK,
   MAX_WORKSPACE_CANONICAL_PATH_BYTES,
   MAX_WORKSPACE_COMBINED_CANDIDATES_PER_JOB,
+  MAX_WORKSPACE_EXTERNAL_RESOLUTIONS_PER_JOB,
   MAX_WORKSPACE_JOBS_PER_BINDING,
   MAX_WORKSPACE_LABEL_BYTES,
   MAX_WORKSPACE_MESSAGES_WINDOW,
@@ -94,6 +102,7 @@ export {
   MAX_WORKSPACE_RUNS_PER_JOB,
   MAX_WORKSPACE_TASKS_PER_JOB,
   OBSERVATION_SCHEMA_VERSION,
+  WORKSPACE_EXTERNAL_RESOLUTION_VIEW_CONTRACT_VERSION,
   WORKSPACE_METADATA_TIMEOUT_MS,
   WORKSPACE_SAMPLE_STALE_THRESHOLD_MS,
   WORKSPACE_SAMPLING_INTERVAL_MS,
@@ -114,7 +123,12 @@ export type {
   WorkspaceCombinedCandidate,
   WorkspaceConfiguredSelection,
   WorkspaceConnectionState,
+  WorkspaceCoveredAttention,
   WorkspaceEvaluatedNativeSample,
+  WorkspaceExternalResolution,
+  WorkspaceExternalResolutionApplicability,
+  WorkspaceExternalResolutionOutcome,
+  WorkspaceExternalResolutionScope,
   WorkspaceFreshnessState,
   WorkspaceHistoricalFailure,
   WorkspaceJobHistory,
@@ -215,6 +229,61 @@ export function normalizeWorkspaceChatTab(value: unknown): WorkspaceChatSurfaceT
   }
   return DEFAULT_WORKSPACE_CHAT_TAB;
 }
+
+/**
+ * Ledger-independent desktop boundary contract (`workspace_external_resolution_view_v1`)
+ * for projecting backend-verified external resolution receipts across Messages, Jobs,
+ * Activity, app-model, and compact native tray surfaces.
+ */
+export const WORKSPACE_EXTERNAL_RESOLUTION_OUTCOMES: readonly WorkspaceExternalResolutionOutcome[] =
+  ['resolved_externally'] as const;
+export const WORKSPACE_EXTERNAL_RESOLUTION_SCOPES: readonly WorkspaceExternalResolutionScope[] = [
+  'job',
+  'tasks',
+] as const;
+export const WORKSPACE_EXTERNAL_RESOLUTION_APPLICABILITIES: readonly WorkspaceExternalResolutionApplicability[] =
+  ['applicable', 'stale', 'unverified'] as const;
+
+export interface WorkspaceExternalResolutionViewContract {
+  readonly version: typeof WORKSPACE_EXTERNAL_RESOLUTION_VIEW_CONTRACT_VERSION;
+  readonly max_external_resolutions_per_job: typeof MAX_WORKSPACE_EXTERNAL_RESOLUTIONS_PER_JOB;
+  readonly max_task_ids_per_resolution: typeof MAX_WORKSPACE_TASKS_PER_JOB;
+  readonly max_evidence_refs_per_resolution: typeof MAX_WORKSPACE_RECORD_LINKS_PER_LIST;
+  readonly max_covered_attention_per_resolution: typeof MAX_WORKSPACE_RECORD_LINKS_PER_LIST;
+  readonly max_summary_chars: typeof MAX_OBSERVATION_SUMMARY_CHARS;
+  readonly max_id_bytes: typeof MAX_WORKSPACE_LABEL_BYTES;
+  readonly requires_store_verified_applicability: true;
+  readonly forbids_frontend_proof_synthesis: true;
+  readonly forbids_synthetic_provider_calls: true;
+  readonly forbids_synthetic_user_messages: true;
+  readonly forbids_synthetic_delivery_or_closure_events: true;
+  readonly preserves_covered_attention_rows: true;
+  readonly full_job_label: 'Resolved externally';
+  readonly partial_tasks_label: 'Partially resolved externally';
+  readonly stale_receipt_label: 'Stale external receipt';
+  readonly unverified_receipt_label: 'Unverified external receipt';
+}
+
+export const WORKSPACE_EXTERNAL_RESOLUTION_VIEW_CONTRACT: WorkspaceExternalResolutionViewContract =
+  {
+    version: WORKSPACE_EXTERNAL_RESOLUTION_VIEW_CONTRACT_VERSION,
+    max_external_resolutions_per_job: MAX_WORKSPACE_EXTERNAL_RESOLUTIONS_PER_JOB,
+    max_task_ids_per_resolution: MAX_WORKSPACE_TASKS_PER_JOB,
+    max_evidence_refs_per_resolution: MAX_WORKSPACE_RECORD_LINKS_PER_LIST,
+    max_covered_attention_per_resolution: MAX_WORKSPACE_RECORD_LINKS_PER_LIST,
+    max_summary_chars: MAX_OBSERVATION_SUMMARY_CHARS,
+    max_id_bytes: MAX_WORKSPACE_LABEL_BYTES,
+    requires_store_verified_applicability: true,
+    forbids_frontend_proof_synthesis: true,
+    forbids_synthetic_provider_calls: true,
+    forbids_synthetic_user_messages: true,
+    forbids_synthetic_delivery_or_closure_events: true,
+    preserves_covered_attention_rows: true,
+    full_job_label: 'Resolved externally',
+    partial_tasks_label: 'Partially resolved externally',
+    stale_receipt_label: 'Stale external receipt',
+    unverified_receipt_label: 'Unverified external receipt',
+  };
 
 /** Per-chat Active / Archive lifecycle preferences keyed strictly by canonical `WorkspaceChatIdentity`. */
 export const WORKSPACE_CHAT_LIFECYCLE_FILTERS = ['active', 'archived'] as const;
@@ -1493,6 +1562,157 @@ function normalizeAttentionState(raw: unknown): WorkspaceAttentionState | null {
   };
 }
 
+function cleanDeduplicatedIdList(raw: unknown, maxItems: number): string[] {
+  if (!Array.isArray(raw)) {
+    return [];
+  }
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const item of raw) {
+    if (out.length >= maxItems) {
+      break;
+    }
+    const clean = validateCorrelationId(item);
+    if (clean !== null && clean !== 'unknown' && !seen.has(clean)) {
+      seen.add(clean);
+      out.push(clean);
+    }
+  }
+  return out;
+}
+
+function parseExternalResolutionApplicability(
+  raw: unknown,
+): WorkspaceExternalResolutionApplicability {
+  if (raw === 'applicable' || raw === 'stale' || raw === 'unverified') {
+    return raw;
+  }
+  return 'unverified';
+}
+
+function normalizeCoveredAttentionList(
+  raw: unknown,
+  declaredTaskIds: ReadonlySet<string>,
+): WorkspaceCoveredAttention[] {
+  if (!Array.isArray(raw)) {
+    return [];
+  }
+  const normalized: WorkspaceCoveredAttention[] = [];
+  for (const entry of raw) {
+    if (!isRecord(entry)) {
+      continue;
+    }
+    const attention = normalizeAttentionState(entry.attention);
+    if (attention === null) {
+      continue;
+    }
+    if (entry.task_id === null) {
+      normalized.push({ task_id: null, attention });
+      continue;
+    }
+    const cleanTaskId = validateCorrelationId(entry.task_id);
+    if (
+      cleanTaskId === null ||
+      cleanTaskId === 'unknown' ||
+      !declaredTaskIds.has(cleanTaskId)
+    ) {
+      // Invalid or undeclared task identities are quarantined rather than
+      // widened into job-level coverage.
+      continue;
+    }
+    normalized.push({ task_id: cleanTaskId, attention });
+  }
+  return capTail(normalized, MAX_WORKSPACE_RECORD_LINKS_PER_LIST).items;
+}
+
+/**
+ * Normalizes a single `WorkspaceExternalResolution` record from the backend's
+ * store-verified projection. Never synthesizes proof or applicability from prose,
+ * commit SHAs, or lineage links.
+ */
+export function normalizeWorkspaceExternalResolution(
+  raw: unknown,
+): WorkspaceExternalResolution | null {
+  if (!isRecord(raw)) {
+    return null;
+  }
+  const receiptId = validateCorrelationId(raw.receipt_id);
+  if (receiptId === null || receiptId === 'unknown') {
+    return null;
+  }
+  if (raw.outcome !== 'resolved_externally') {
+    return null;
+  }
+  if (raw.scope !== 'job' && raw.scope !== 'tasks') {
+    return null;
+  }
+  const taskIds = cleanDeduplicatedIdList(raw.task_ids, MAX_WORKSPACE_TASKS_PER_JOB);
+  let applicability = parseExternalResolutionApplicability(raw.applicability);
+  if (raw.scope === 'tasks' && taskIds.length === 0 && applicability === 'applicable') {
+    applicability = 'unverified';
+  }
+  const cleanRequestKey = validateCorrelationId(raw.request_key);
+  const cleanPreviewDigest = validateCorrelationId(raw.preview_digest);
+  return {
+    receipt_id: receiptId,
+    request_key:
+      cleanRequestKey !== null && cleanRequestKey !== 'unknown' ? cleanRequestKey : null,
+    preview_digest:
+      cleanPreviewDigest !== null && cleanPreviewDigest !== 'unknown' ? cleanPreviewDigest : null,
+    outcome: 'resolved_externally',
+    scope: raw.scope,
+    task_ids: taskIds,
+    applicability,
+    summary: sanitizeWorkspaceSummary(raw.summary),
+    evidence_refs: cleanDeduplicatedIdList(raw.evidence_refs, MAX_WORKSPACE_RECORD_LINKS_PER_LIST),
+    recorded_at_ms: cleanPositiveIntOrNull(raw.recorded_at_ms),
+    covered_attention: normalizeCoveredAttentionList(
+      raw.covered_attention,
+      new Set(taskIds),
+    ),
+  };
+}
+
+function normalizeExternalResolutionListWithOmissions(raw: unknown): {
+  items: WorkspaceExternalResolution[];
+  omitted: number;
+} {
+  if (!Array.isArray(raw)) {
+    return { items: [], omitted: 0 };
+  }
+  const parsed: WorkspaceExternalResolution[] = [];
+  let invalidCount = 0;
+  for (const item of raw) {
+    const clean = normalizeWorkspaceExternalResolution(item);
+    if (clean !== null) {
+      parsed.push(clean);
+    } else {
+      invalidCount += 1;
+    }
+  }
+  const deduplicatedRev: WorkspaceExternalResolution[] = [];
+  const seenReceipts = new Set<string>();
+  for (let idx = parsed.length - 1; idx >= 0; idx -= 1) {
+    const entry = parsed[idx]!;
+    if (!seenReceipts.has(entry.receipt_id)) {
+      seenReceipts.add(entry.receipt_id);
+      deduplicatedRev.push(entry);
+    }
+  }
+  deduplicatedRev.reverse();
+  const capped = capTail(deduplicatedRev, MAX_WORKSPACE_EXTERNAL_RESOLUTIONS_PER_JOB);
+  return {
+    items: capped.items,
+    omitted: invalidCount + (parsed.length - deduplicatedRev.length) + capped.omitted,
+  };
+}
+
+export function normalizeWorkspaceExternalResolutions(
+  raw: unknown,
+): WorkspaceExternalResolution[] {
+  return normalizeExternalResolutionListWithOmissions(raw).items;
+}
+
 function normalizeExecutor(raw: unknown): ObservationExecutor | null {
   if (!isRecord(raw)) {
     return null;
@@ -1730,7 +1950,27 @@ export function normalizeWorkspaceJobHistory(raw: unknown): WorkspaceJobHistory 
     : [];
   const cappedCombined = capTail(rawCombined, MAX_WORKSPACE_COMBINED_CANDIDATES_PER_JOB);
 
+  const cappedExternalResolutions = normalizeExternalResolutionListWithOmissions(
+    obj.external_resolutions,
+  );
+
   const rawTrunc = isRecord(obj.truncation) ? obj.truncation : {};
+  const externalResolutionsOmitted =
+    cleanNonNegativeInt(rawTrunc.external_resolutions_omitted, 0) +
+    cappedExternalResolutions.omitted;
+  const truncation: WorkspaceJobHistoryTruncation = {
+    tasks_omitted: cleanNonNegativeInt(rawTrunc.tasks_omitted, 0) + tasksOmittedExtra,
+    attempts_omitted: cleanNonNegativeInt(rawTrunc.attempts_omitted, 0) + attemptsOmittedExtra,
+    candidates_omitted:
+      cleanNonNegativeInt(rawTrunc.candidates_omitted, 0) + candidatesOmittedExtra,
+    runs_omitted: cleanNonNegativeInt(rawTrunc.runs_omitted, 0) + cappedRuns.omitted,
+    outbox_omitted: cleanNonNegativeInt(rawTrunc.outbox_omitted, 0) + cappedOutbox.omitted,
+    combined_candidates_omitted:
+      cleanNonNegativeInt(rawTrunc.combined_candidates_omitted, 0) + cappedCombined.omitted,
+    ...(externalResolutionsOmitted > 0
+      ? { external_resolutions_omitted: externalResolutionsOmitted }
+      : {}),
+  };
 
   return {
     job: normalizeJobSummary(obj.job),
@@ -1743,16 +1983,8 @@ export function normalizeWorkspaceJobHistory(raw: unknown): WorkspaceJobHistory 
     historical_failure: normalizeHistoricalFailure(obj.historical_failure),
     current_attention: normalizeAttentionState(obj.current_attention),
     acceptance_proof: normalizeWorkspaceAcceptanceProofForJob(obj.acceptance_proof),
-    truncation: {
-      tasks_omitted: cleanNonNegativeInt(rawTrunc.tasks_omitted, 0) + tasksOmittedExtra,
-      attempts_omitted: cleanNonNegativeInt(rawTrunc.attempts_omitted, 0) + attemptsOmittedExtra,
-      candidates_omitted:
-        cleanNonNegativeInt(rawTrunc.candidates_omitted, 0) + candidatesOmittedExtra,
-      runs_omitted: cleanNonNegativeInt(rawTrunc.runs_omitted, 0) + cappedRuns.omitted,
-      outbox_omitted: cleanNonNegativeInt(rawTrunc.outbox_omitted, 0) + cappedOutbox.omitted,
-      combined_candidates_omitted:
-        cleanNonNegativeInt(rawTrunc.combined_candidates_omitted, 0) + cappedCombined.omitted,
-    },
+    external_resolutions: cappedExternalResolutions.items,
+    truncation,
   };
 }
 

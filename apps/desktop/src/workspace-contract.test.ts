@@ -43,13 +43,20 @@ import {
   MAX_WORKSPACE_ATTEMPTS_PER_TASK,
   MAX_WORKSPACE_CANDIDATES_PER_TASK,
   MAX_WORKSPACE_COMBINED_CANDIDATES_PER_JOB,
+  MAX_WORKSPACE_EXTERNAL_RESOLUTIONS_PER_JOB,
   MAX_WORKSPACE_JOBS_PER_BINDING,
   MAX_WORKSPACE_MESSAGES_WINDOW,
   MAX_WORKSPACE_NATIVE_SAMPLES_PER_SOURCE,
   MAX_WORKSPACE_NATIVE_SAMPLE_SIDECAR_BYTES,
   MAX_WORKSPACE_OUTBOX_PER_JOB,
+  MAX_WORKSPACE_RECORD_LINKS_PER_LIST,
   MAX_WORKSPACE_RUNS_PER_JOB,
   MAX_WORKSPACE_TASKS_PER_JOB,
+  WORKSPACE_EXTERNAL_RESOLUTION_APPLICABILITIES,
+  WORKSPACE_EXTERNAL_RESOLUTION_OUTCOMES,
+  WORKSPACE_EXTERNAL_RESOLUTION_SCOPES,
+  WORKSPACE_EXTERNAL_RESOLUTION_VIEW_CONTRACT,
+  WORKSPACE_EXTERNAL_RESOLUTION_VIEW_CONTRACT_VERSION,
   WORKSPACE_METADATA_TIMEOUT_MS,
   WORKSPACE_SAFE_MESSAGE_SOURCE_KINDS,
   WORKSPACE_SAMPLE_STALE_THRESHOLD_MS,
@@ -63,6 +70,8 @@ import {
   evaluateWorkspaceNativeSampleAt,
   formatWorkspaceChatIdentityKey,
   normalizeWorkspaceChatSummary,
+  normalizeWorkspaceExternalResolution,
+  normalizeWorkspaceExternalResolutions,
   normalizeWorkspaceJobHistory,
   normalizeWorkspaceNativeSample,
   normalizeWorkspaceSnapshot,
@@ -81,6 +90,7 @@ import {
 import type {
   ObservationProcessInstance,
   WorkspaceChatIdentity,
+  WorkspaceExternalResolution,
   WorkspaceJobHistory,
   WorkspaceNativeSample,
 } from './workspace-contract.ts';
@@ -1052,6 +1062,394 @@ test('job history separates attempts/runs/outbox/candidates/links/failure/attent
   });
   assert.equal(backed.tasks[0]!.acceptance_proof.status, 'verified_accepted');
   assert.equal(backed.acceptance_proof.status, 'verified_accepted');
+});
+
+test('external resolution view contract is ledger-independent, backward-compatible, store-verified, and bounded', () => {
+  assert.equal(
+    WORKSPACE_EXTERNAL_RESOLUTION_VIEW_CONTRACT_VERSION,
+    'workspace_external_resolution_view_v1',
+  );
+  assert.deepEqual(WORKSPACE_EXTERNAL_RESOLUTION_OUTCOMES, ['resolved_externally']);
+  assert.deepEqual(WORKSPACE_EXTERNAL_RESOLUTION_SCOPES, ['job', 'tasks']);
+  assert.deepEqual(WORKSPACE_EXTERNAL_RESOLUTION_APPLICABILITIES, [
+    'applicable',
+    'stale',
+    'unverified',
+  ]);
+  assert.equal(
+    WORKSPACE_EXTERNAL_RESOLUTION_VIEW_CONTRACT.version,
+    WORKSPACE_EXTERNAL_RESOLUTION_VIEW_CONTRACT_VERSION,
+  );
+  assert.equal(
+    WORKSPACE_EXTERNAL_RESOLUTION_VIEW_CONTRACT.max_external_resolutions_per_job,
+    MAX_WORKSPACE_EXTERNAL_RESOLUTIONS_PER_JOB,
+  );
+  assert.equal(
+    WORKSPACE_EXTERNAL_RESOLUTION_VIEW_CONTRACT.max_external_resolutions_per_job,
+    MAX_WORKSPACE_RECORD_LINKS_PER_LIST,
+  );
+  assert.equal(
+    WORKSPACE_EXTERNAL_RESOLUTION_VIEW_CONTRACT.max_summary_chars,
+    MAX_OBSERVATION_SUMMARY_CHARS,
+  );
+  assert.equal(
+    WORKSPACE_EXTERNAL_RESOLUTION_VIEW_CONTRACT.requires_store_verified_applicability,
+    true,
+  );
+  assert.equal(
+    WORKSPACE_EXTERNAL_RESOLUTION_VIEW_CONTRACT.forbids_frontend_proof_synthesis,
+    true,
+  );
+  assert.equal(
+    WORKSPACE_EXTERNAL_RESOLUTION_VIEW_CONTRACT.preserves_covered_attention_rows,
+    true,
+  );
+  assert.equal(
+    WORKSPACE_EXTERNAL_RESOLUTION_VIEW_CONTRACT.full_job_label,
+    'Resolved externally',
+  );
+  assert.equal(
+    WORKSPACE_EXTERNAL_RESOLUTION_VIEW_CONTRACT.partial_tasks_label,
+    'Partially resolved externally',
+  );
+
+  const baseJob = {
+    source_id: 'default',
+    job_id: 'job_ext_contract_01',
+    binding_id: 'bnd_chat_alpha',
+    chat_identity: sampleIdentity(),
+    title: 'External contract job',
+    state: 'completed',
+    approval_status: 'approved',
+    execution_status: 'completed',
+  };
+
+  const absent = normalizeWorkspaceJobHistory({ job: baseJob });
+  assert.deepEqual(absent.external_resolutions, []);
+  assert.equal(absent.truncation.external_resolutions_omitted, undefined);
+
+  for (const raw of [
+    undefined,
+    null,
+    {},
+    'not-a-list',
+    [null, 42, {}, { receipt_id: 'bad id', outcome: 'resolved_externally', scope: 'job' }],
+  ]) {
+    assert.deepEqual(normalizeWorkspaceExternalResolutions(raw), []);
+  }
+
+  const full = normalizeWorkspaceExternalResolution({
+    receipt_id: 'rcpt_contract_01',
+    request_key: 'req_contract_01',
+    preview_digest: 'digest_contract_01',
+    outcome: 'resolved_externally',
+    scope: 'job',
+    task_ids: [],
+    applicability: 'applicable',
+    summary: 'Resolved externally by the operator.',
+    evidence_refs: ['ev_contract_01'],
+    recorded_at_ms: 1_000,
+    covered_attention: [
+      {
+        task_id: null,
+        attention: {
+          kind: 'needs_approval',
+          reason: 'Approval covered by the external receipt.',
+          next_step: 'No further approval is required.',
+          blocking_hold_ids: ['hold_contract_01'],
+          blocking_outbox_ids: ['outbox_contract_01'],
+          question_id: 'q_contract_01',
+          updated_at_ms: 1_000,
+        },
+      },
+    ],
+  });
+  assert.ok(full);
+  assert.equal(full.outcome, 'resolved_externally');
+  assert.equal(full.scope, 'job');
+  assert.equal(full.applicability, 'applicable');
+  assert.equal(full.covered_attention.length, 1);
+  assert.equal(full.covered_attention[0]?.task_id, null);
+  assert.deepEqual(full.covered_attention[0]?.attention.blocking_hold_ids, [
+    'hold_contract_01',
+  ]);
+
+  const missingApplicability = normalizeWorkspaceExternalResolution({
+    ...full,
+    applicability: undefined,
+  });
+  assert.equal(missingApplicability?.applicability, 'unverified');
+
+  const tasksWithoutValidIds = normalizeWorkspaceExternalResolution({
+    ...full,
+    scope: 'tasks',
+    task_ids: ['unknown', 'bad id'],
+  });
+  assert.equal(tasksWithoutValidIds?.applicability, 'unverified');
+
+  assert.equal(
+    normalizeWorkspaceExternalResolution({ ...full, outcome: 'completed' }),
+    null,
+  );
+  assert.equal(
+    normalizeWorkspaceExternalResolution({ ...full, scope: 'thread' }),
+    null,
+  );
+  assert.equal(
+    normalizeWorkspaceExternalResolution({ ...full, receipt_id: 'bad id' }),
+    null,
+  );
+
+  const malformed = normalizeWorkspaceExternalResolution({
+    ...full,
+    request_key: 'bad key!',
+    preview_digest: 'bad digest!',
+    task_ids: ['task_1', 'bad id', 'task_1'],
+    evidence_refs: ['ev_1', 'bad ref', 'ev_1'],
+    summary: 'X'.repeat(260),
+    covered_attention: [
+      {
+        task_id: 'task_1',
+        attention: {
+          kind: 'on_hold',
+          reason: 'Held task.',
+          next_step: null,
+          blocking_hold_ids: ['hold_1'],
+          blocking_outbox_ids: [],
+          question_id: null,
+          updated_at_ms: 1_000,
+        },
+      },
+      {
+        task_id: 'bad id',
+        attention: {
+          kind: 'unknown',
+          reason: 'Unknown task.',
+          next_step: null,
+          blocking_hold_ids: [],
+          blocking_outbox_ids: [],
+          question_id: null,
+          updated_at_ms: 1_000,
+        },
+      },
+      { task_id: 'task_2', attention: null },
+      {
+        task_id: 'task_3',
+        attention: {
+          kind: 'needs_user_input',
+          reason: 'Question covered.',
+          next_step: 'Answer in Codex.',
+          blocking_hold_ids: [],
+          blocking_outbox_ids: [],
+          question_id: 'q_1',
+          updated_at_ms: 1_000,
+        },
+      },
+    ],
+  });
+  assert.ok(malformed);
+  assert.equal(malformed.request_key, null);
+  assert.equal(malformed.preview_digest, null);
+  assert.deepEqual(malformed.task_ids, ['task_1']);
+  assert.deepEqual(malformed.evidence_refs, ['ev_1']);
+  assert.equal(Array.from(malformed.summary).length, MAX_OBSERVATION_SUMMARY_CHARS);
+  assert.equal(malformed.covered_attention.length, 1);
+  assert.equal(malformed.covered_attention[0]?.task_id, 'task_1');
+  assert.equal(
+    malformed.covered_attention.some(
+      (covered) => covered.task_id === null || covered.task_id === 'task_3',
+    ),
+    false,
+  );
+
+  const partialMalformedCoverage = normalizeWorkspaceExternalResolution({
+    receipt_id: 'rcpt_contract_partial_malformed',
+    outcome: 'resolved_externally',
+    scope: 'tasks',
+    task_ids: ['task_a'],
+    applicability: 'applicable',
+    summary: 'Partial receipt with a malformed covered task identity.',
+    covered_attention: [
+      {
+        task_id: 'task_a',
+        attention: {
+          kind: 'on_hold',
+          reason: 'Task A is covered.',
+          next_step: null,
+          blocking_hold_ids: ['hold_a'],
+          blocking_outbox_ids: [],
+          question_id: null,
+          updated_at_ms: 1_000,
+        },
+      },
+      {
+        task_id: 'bad id',
+        attention: {
+          kind: 'unknown',
+          reason: 'Malformed identity must not become job-level coverage.',
+          next_step: null,
+          blocking_hold_ids: [],
+          blocking_outbox_ids: [],
+          question_id: null,
+          updated_at_ms: 1_000,
+        },
+      },
+      {
+        task_id: 'task_b',
+        attention: {
+          kind: 'needs_approval',
+          reason: 'Undeclared task B must not be invented as covered.',
+          next_step: null,
+          blocking_hold_ids: ['hold_b'],
+          blocking_outbox_ids: [],
+          question_id: null,
+          updated_at_ms: 1_000,
+        },
+      },
+    ],
+  });
+  assert.ok(partialMalformedCoverage);
+  assert.deepEqual(partialMalformedCoverage.task_ids, ['task_a']);
+  assert.equal(partialMalformedCoverage.covered_attention.length, 1);
+  assert.equal(partialMalformedCoverage.covered_attention[0]?.task_id, 'task_a');
+
+  const explicitJobLevelCoverage = normalizeWorkspaceExternalResolution({
+    ...partialMalformedCoverage,
+    receipt_id: 'rcpt_contract_explicit_job_level',
+    covered_attention: [
+      {
+        task_id: null,
+        attention: {
+          kind: 'needs_approval',
+          reason: 'Explicit job-level coverage remains.',
+          next_step: null,
+          blocking_hold_ids: ['hold_job'],
+          blocking_outbox_ids: [],
+          question_id: null,
+          updated_at_ms: 1_000,
+        },
+      },
+      {
+        task_id: 'bad id',
+        attention: {
+          kind: 'unknown',
+          reason: 'Malformed identity is still excluded.',
+          next_step: null,
+          blocking_hold_ids: [],
+          blocking_outbox_ids: [],
+          question_id: null,
+          updated_at_ms: 1_000,
+        },
+      },
+    ],
+  });
+  assert.ok(explicitJobLevelCoverage);
+  assert.equal(explicitJobLevelCoverage.covered_attention.length, 1);
+  assert.equal(explicitJobLevelCoverage.covered_attention[0]?.task_id, null);
+
+  const many: WorkspaceExternalResolution[] = Array.from(
+    { length: MAX_WORKSPACE_EXTERNAL_RESOLUTIONS_PER_JOB + 3 },
+    (_, idx) => ({
+      ...full,
+      receipt_id: `rcpt_contract_${String(idx).padStart(3, '0')}`,
+      recorded_at_ms: 1_000 + idx,
+    }),
+  );
+  const boundedHistory = normalizeWorkspaceJobHistory({
+    job: baseJob,
+    external_resolutions: many,
+  });
+  assert.equal(
+    boundedHistory.external_resolutions?.length,
+    MAX_WORKSPACE_EXTERNAL_RESOLUTIONS_PER_JOB,
+  );
+  assert.equal(boundedHistory.truncation.external_resolutions_omitted, 3);
+  assert.equal(
+    boundedHistory.external_resolutions?.[0]?.receipt_id,
+    'rcpt_contract_003',
+  );
+
+  const duplicateHistory = normalizeWorkspaceJobHistory({
+    job: baseJob,
+    external_resolutions: [
+      { ...full, receipt_id: 'rcpt_duplicate_01', summary: 'Older receipt.', recorded_at_ms: 1_000 },
+      { ...full, receipt_id: 'rcpt_duplicate_01', summary: 'Newer receipt.', recorded_at_ms: 2_000 },
+    ],
+  });
+  assert.equal(duplicateHistory.external_resolutions?.length, 1);
+  assert.equal(duplicateHistory.external_resolutions?.[0]?.summary, 'Newer receipt.');
+  assert.equal(duplicateHistory.truncation.external_resolutions_omitted, 1);
+
+  const oversized = normalizeWorkspaceExternalResolution({
+    ...full,
+    task_ids: Array.from(
+      { length: MAX_WORKSPACE_TASKS_PER_JOB + 5 },
+      (_, idx) => `task_${idx}`,
+    ),
+    evidence_refs: Array.from(
+      { length: MAX_WORKSPACE_RECORD_LINKS_PER_LIST + 5 },
+      (_, idx) => `ev_${idx}`,
+    ),
+    covered_attention: Array.from(
+      { length: MAX_WORKSPACE_RECORD_LINKS_PER_LIST + 5 },
+      (_, idx) => ({
+        task_id: `task_${idx}`,
+        attention: {
+          kind: 'on_hold',
+          reason: `Covered ${idx}.`,
+          next_step: null,
+          blocking_hold_ids: [],
+          blocking_outbox_ids: [],
+          question_id: null,
+          updated_at_ms: 1_000,
+        },
+      }),
+    ),
+  });
+  assert.equal(oversized?.task_ids.length, MAX_WORKSPACE_TASKS_PER_JOB);
+  assert.equal(
+    oversized?.evidence_refs.length,
+    MAX_WORKSPACE_RECORD_LINKS_PER_LIST,
+  );
+  assert.equal(
+    oversized?.covered_attention.length,
+    MAX_WORKSPACE_RECORD_LINKS_PER_LIST,
+  );
+
+  const legacyObservation: ObservationSnapshot = {
+    schema_version: 1,
+    generated_at_ms: 1_000,
+    sources: [],
+    jobs: [
+      {
+        source_id: 'default',
+        id: 'job_legacy_external_01',
+        project_label: 'Legacy',
+        project_path: null,
+        title: 'Legacy job',
+        thread_uuid: null,
+        thread_label: null,
+        binding_id: null,
+        plan_id: null,
+        plan_revision: null,
+        state: 'completed',
+        approval_status: 'approved',
+        execution_status: 'completed',
+        review_state: null,
+        updated_at_ms: 1_000,
+        active_call_count: 0,
+        tasks: [],
+        summary: 'Legacy snapshot without external resolutions.',
+      },
+    ],
+    requests: [],
+    next_cursor: null,
+    has_more: false,
+    jobs_has_more: false,
+    warnings: [],
+  };
+  const upgraded = upgradeLegacyObservationSnapshot(legacyObservation);
+  assert.deepEqual(upgraded.job_histories[0]?.external_resolutions, []);
 });
 
 test('Messages projection accepts only safe sources, rejects transcripts/synthetic turns, and preserves ordering and completeness', () => {

@@ -195,6 +195,10 @@ export const MAX_WORKSPACE_RUNS_PER_JOB = 256 as const;
 export const MAX_WORKSPACE_OUTBOX_PER_JOB = 256 as const;
 export const MAX_WORKSPACE_COMBINED_CANDIDATES_PER_JOB = 32 as const;
 export const MAX_WORKSPACE_RECORD_LINKS_PER_LIST = 64 as const;
+export const MAX_WORKSPACE_EXTERNAL_RESOLUTIONS_PER_JOB =
+  MAX_WORKSPACE_RECORD_LINKS_PER_LIST;
+export const WORKSPACE_EXTERNAL_RESOLUTION_VIEW_CONTRACT_VERSION =
+  'workspace_external_resolution_view_v1' as const;
 
 export const WORKSPACE_SAMPLING_INTERVAL_MS = 2_000 as const;
 export const WORKSPACE_METADATA_TIMEOUT_MS = 750 as const;
@@ -239,6 +243,15 @@ export type WorkspaceAttentionKind =
   | 'review_required'
   | 'none'
   | 'unknown';
+
+export type WorkspaceExternalResolutionOutcome = 'resolved_externally';
+
+export type WorkspaceExternalResolutionScope = 'job' | 'tasks';
+
+export type WorkspaceExternalResolutionApplicability =
+  | 'applicable'
+  | 'stale'
+  | 'unverified';
 
 export type WorkspaceSafeMessageSourceKind =
   | 'work_brief_summary'
@@ -484,6 +497,25 @@ export interface WorkspaceJobSummary {
   summary: string | null;
 }
 
+export interface WorkspaceCoveredAttention {
+  task_id: string | null;
+  attention: WorkspaceAttentionState;
+}
+
+export interface WorkspaceExternalResolution {
+  receipt_id: string;
+  request_key: string | null;
+  preview_digest: string | null;
+  outcome: WorkspaceExternalResolutionOutcome;
+  scope: WorkspaceExternalResolutionScope;
+  task_ids: string[];
+  applicability: WorkspaceExternalResolutionApplicability;
+  summary: string;
+  evidence_refs: string[];
+  recorded_at_ms: number | null;
+  covered_attention: WorkspaceCoveredAttention[];
+}
+
 export interface WorkspaceJobHistoryTruncation {
   tasks_omitted: number;
   attempts_omitted: number;
@@ -491,6 +523,7 @@ export interface WorkspaceJobHistoryTruncation {
   runs_omitted: number;
   outbox_omitted: number;
   combined_candidates_omitted: number;
+  external_resolutions_omitted?: number;
 }
 
 export interface WorkspaceJobHistory {
@@ -504,6 +537,7 @@ export interface WorkspaceJobHistory {
   historical_failure: WorkspaceHistoricalFailure | null;
   current_attention: WorkspaceAttentionState | null;
   acceptance_proof: WorkspaceAcceptanceProof;
+  external_resolutions?: WorkspaceExternalResolution[];
   truncation: WorkspaceJobHistoryTruncation;
 }
 

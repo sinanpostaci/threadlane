@@ -32,11 +32,13 @@ import {
   type WorkspaceAcceptanceProof,
   type WorkspaceChatIdentity,
   type WorkspaceChatSummary,
+  type WorkspaceExternalResolution,
   type WorkspaceJobHistory,
   type WorkspaceMessageItem,
   type WorkspaceNativeSample,
   type WorkspaceSafeMessageSourceKind,
   type WorkspaceSnapshot,
+  type WorkspaceTaskHistory,
 } from '../../src/workspace-contract.ts';
 
 export const FIXTURE_BASE_NOW_MS = 1_780_000_000_000;
@@ -81,6 +83,28 @@ export const PENDING_ACCEPTANCE_SUMMARY =
   'Worker candidate cand_pending_01 finished compiling; awaiting review and Closure acceptance.';
 export const VERIFIED_ACCEPTED_SUMMARY =
   'Closure verified combined candidate comb_accepted_02 and recorded final acceptance.';
+
+export const EXTERNAL_RESOLUTION_FULL_RECEIPT_ID = 'rcpt_ext_fixture_full_01';
+export const EXTERNAL_RESOLUTION_PARTIAL_RECEIPT_ID = 'rcpt_ext_fixture_partial_02';
+export const EXTERNAL_RESOLUTION_STALE_RECEIPT_ID = 'rcpt_ext_fixture_stale_03';
+export const EXTERNAL_RESOLUTION_UNVERIFIED_RECEIPT_ID = 'rcpt_ext_fixture_unverified_04';
+export const EXTERNAL_RESOLUTION_UNKNOWN_RECEIPT_ID = 'rcpt_ext_fixture_unknown_05';
+export const EXTERNAL_RESOLUTION_FULL_SUMMARY =
+  'Full job was resolved outside Threadlane by explicit operator action.';
+export const EXTERNAL_RESOLUTION_PARTIAL_SUMMARY =
+  'One task was resolved outside Threadlane while unrelated task output remains visible.';
+export const EXTERNAL_RESOLUTION_STALE_SUMMARY =
+  'Historical stale external receipt remains visible without closing active blockers.';
+export const EXTERNAL_RESOLUTION_UNVERIFIED_SUMMARY =
+  'Historical unverified external receipt remains visible without closing active blockers.';
+export const EXTERNAL_RESOLUTION_UNKNOWN_SUMMARY =
+  'A full receipt exists, but the recorded task effect is still unknown.';
+export const EXTERNAL_RESOLUTION_COVERED_JOB_REASON =
+  'Covered job-level approval blocker remains in receipt history.';
+export const EXTERNAL_RESOLUTION_COVERED_TASK_REASON =
+  'Covered task-level hold blocker remains in receipt history.';
+export const EXTERNAL_RESOLUTION_UNRELATED_QUESTION =
+  'UNRELATED_QUESTION_SENTINEL: Keep this native question visible and unlinked from any receipt.';
 
 const CODEX_COWORKER_ACTOR: ObservationActor = {
   label: 'Codex Coworker',
@@ -1592,6 +1616,496 @@ export function buildPendingAcceptanceWorkspaceSnapshot(): WorkspaceSnapshot {
           summary: VERIFIED_ACCEPTED_SUMMARY,
           recordedAtMs: FIXTURE_BASE_NOW_MS - 20_000,
         }),
+      ],
+    },
+  });
+}
+
+export function buildExternalResolutionWorkspaceSnapshot(): WorkspaceSnapshot {
+  const base = buildInteractiveWorkspaceSnapshot();
+  const alphaChat = base.chats.find(
+    (chat) => chat.identity.binding_id === CHAT_ALPHA_IDENTITY.binding_id,
+  )!;
+  const alphaSample = base.native_samples.find(
+    (sample) => sample.chat_identity.binding_id === CHAT_ALPHA_IDENTITY.binding_id,
+  )!;
+
+  const createAttention = (
+    kind: NonNullable<WorkspaceTaskHistory['current_attention']>['kind'],
+    reason: string,
+    overrides: Partial<
+      NonNullable<WorkspaceTaskHistory['current_attention']>
+    > = {},
+  ): NonNullable<WorkspaceTaskHistory['current_attention']> => ({
+    kind,
+    reason,
+    next_step: 'Resolve this item in Codex.',
+    blocking_hold_ids: [],
+    blocking_outbox_ids: [],
+    question_id: null,
+    updated_at_ms: FIXTURE_BASE_NOW_MS - 1_000,
+    ...overrides,
+  });
+
+  const emptyTruncation = (): WorkspaceJobHistory['truncation'] => ({
+    tasks_omitted: 0,
+    attempts_omitted: 0,
+    candidates_omitted: 0,
+    runs_omitted: 0,
+    outbox_omitted: 0,
+    combined_candidates_omitted: 0,
+  });
+
+  const createLinks = (
+    planId: string,
+    sourceRequestIds: string[] = [],
+  ): WorkspaceJobHistory['links'] => ({
+    source_plan_id: planId,
+    source_plan_revision: 1,
+    source_approval_id: `apr_${planId}`,
+    source_work_brief_id: `wb_${planId}`,
+    planning_grant_id: null,
+    planning_reservation_id: null,
+    supersedes_job_id: null,
+    superseded_by_job_id: null,
+    parent_job_id: null,
+    follow_up_job_ids: [],
+    architect_advice_ids: [],
+    source_request_ids: sourceRequestIds,
+  });
+
+  const createTask = (
+    overrides: Partial<WorkspaceTaskHistory> &
+      Pick<WorkspaceTaskHistory, 'task_id' | 'title'>,
+  ): WorkspaceTaskHistory => ({
+    task_id: overrides.task_id,
+    title: overrides.title,
+    role: 'coder',
+    difficulty: 'hard',
+    stage: 'closed',
+    status: 'completed',
+    depends_on: [],
+    current_attempt_no: 1,
+    attempts: [
+      {
+        attempt_no: 1,
+        status: 'completed',
+        run_id: `run_${overrides.task_id}`,
+        worker_id: `wrk_${overrides.task_id}`,
+        outbox_id: null,
+        executor: AGY_WORKER_EXECUTOR,
+        started_at_ms: FIXTURE_BASE_NOW_MS - 20_000,
+        finished_at_ms: FIXTURE_BASE_NOW_MS - 10_000,
+        summary: 'Worker completed the task slice.',
+      },
+    ],
+    candidates: [],
+    active_candidate_id: null,
+    accepted_candidate_id: null,
+    historical_failure: null,
+    current_attention: null,
+    acceptance_proof: createEmptyAcceptanceProof('not_accepted'),
+    ...overrides,
+  });
+
+  const fullReceipt: WorkspaceExternalResolution = {
+    receipt_id: EXTERNAL_RESOLUTION_FULL_RECEIPT_ID,
+    request_key: 'req_ext_fixture_full_01',
+    preview_digest: 'digest_ext_fixture_full_01',
+    outcome: 'resolved_externally',
+    scope: 'job',
+    task_ids: ['task_ext_full_01'],
+    applicability: 'applicable',
+    summary: EXTERNAL_RESOLUTION_FULL_SUMMARY,
+    evidence_refs: ['ev_ext_fixture_full_01', 'ev_ext_fixture_full_02'],
+    recorded_at_ms: FIXTURE_BASE_NOW_MS - 1_000,
+    covered_attention: [
+      {
+        task_id: null,
+        attention: createAttention(
+          'needs_approval',
+          EXTERNAL_RESOLUTION_COVERED_JOB_REASON,
+          { blocking_hold_ids: ['hold_ext_fixture_job'] },
+        ),
+      },
+      {
+        task_id: 'task_ext_full_01',
+        attention: createAttention(
+          'on_hold',
+          EXTERNAL_RESOLUTION_COVERED_TASK_REASON,
+          { blocking_hold_ids: ['hold_ext_fixture_task'] },
+        ),
+      },
+    ],
+  };
+
+  const partialReceipt: WorkspaceExternalResolution = {
+    receipt_id: EXTERNAL_RESOLUTION_PARTIAL_RECEIPT_ID,
+    request_key: 'req_ext_fixture_partial_02',
+    preview_digest: 'digest_ext_fixture_partial_02',
+    outcome: 'resolved_externally',
+    scope: 'tasks',
+    task_ids: ['task_ext_partial_01'],
+    applicability: 'applicable',
+    summary: EXTERNAL_RESOLUTION_PARTIAL_SUMMARY,
+    evidence_refs: ['ev_ext_fixture_partial_02'],
+    recorded_at_ms: FIXTURE_BASE_NOW_MS - 2_000,
+    covered_attention: [
+      {
+        task_id: 'task_ext_partial_01',
+        attention: createAttention(
+          'needs_user_input',
+          EXTERNAL_RESOLUTION_COVERED_TASK_REASON,
+          { question_id: 'q_ext_fixture_partial_task' },
+        ),
+      },
+    ],
+  };
+
+  const staleReceipt: WorkspaceExternalResolution = {
+    receipt_id: EXTERNAL_RESOLUTION_STALE_RECEIPT_ID,
+    request_key: 'req_ext_fixture_stale_03',
+    preview_digest: 'digest_ext_fixture_stale_03',
+    outcome: 'resolved_externally',
+    scope: 'tasks',
+    task_ids: ['task_ext_blocked_03'],
+    applicability: 'stale',
+    summary: EXTERNAL_RESOLUTION_STALE_SUMMARY,
+    evidence_refs: ['ev_ext_fixture_stale_03'],
+    recorded_at_ms: FIXTURE_BASE_NOW_MS - 3_000,
+    covered_attention: [
+      {
+        task_id: 'task_ext_blocked_03',
+        attention: createAttention(
+          'on_hold',
+          EXTERNAL_RESOLUTION_COVERED_TASK_REASON,
+          { blocking_hold_ids: ['hold_ext_fixture_stale'] },
+        ),
+      },
+    ],
+  };
+
+  const unverifiedReceipt: WorkspaceExternalResolution = {
+    receipt_id: EXTERNAL_RESOLUTION_UNVERIFIED_RECEIPT_ID,
+    request_key: 'req_ext_fixture_unverified_04',
+    preview_digest: 'digest_ext_fixture_unverified_04',
+    outcome: 'resolved_externally',
+    scope: 'job',
+    task_ids: [],
+    applicability: 'unverified',
+    summary: EXTERNAL_RESOLUTION_UNVERIFIED_SUMMARY,
+    evidence_refs: ['ev_ext_fixture_unverified_04'],
+    recorded_at_ms: FIXTURE_BASE_NOW_MS - 4_000,
+    covered_attention: [
+      {
+        task_id: null,
+        attention: createAttention(
+          'needs_approval',
+          EXTERNAL_RESOLUTION_COVERED_JOB_REASON,
+          { blocking_hold_ids: ['hold_ext_fixture_unverified'] },
+        ),
+      },
+    ],
+  };
+
+  const unknownReceipt: WorkspaceExternalResolution = {
+    receipt_id: EXTERNAL_RESOLUTION_UNKNOWN_RECEIPT_ID,
+    request_key: 'req_ext_fixture_unknown_05',
+    preview_digest: 'digest_ext_fixture_unknown_05',
+    outcome: 'resolved_externally',
+    scope: 'job',
+    task_ids: ['task_ext_unknown_04'],
+    applicability: 'applicable',
+    summary: EXTERNAL_RESOLUTION_UNKNOWN_SUMMARY,
+    evidence_refs: ['ev_ext_fixture_unknown_05'],
+    recorded_at_ms: FIXTURE_BASE_NOW_MS - 5_000,
+    covered_attention: [],
+  };
+
+  const fullHistory: WorkspaceJobHistory = {
+    job: {
+      source_id: FIXTURE_SOURCE_ID,
+      job_id: 'job_ext_full_01',
+      binding_id: CHAT_ALPHA_IDENTITY.binding_id,
+      chat_identity: CHAT_ALPHA_IDENTITY,
+      title: 'Externally Resolved Full Job',
+      job_revision: 4,
+      state: 'unknown',
+      phase: 'external_resolution',
+      approval_status: 'approved',
+      execution_status: 'resolved_externally',
+      review_state: null,
+      created_at_ms: FIXTURE_BASE_NOW_MS - 90_000,
+      updated_at_ms: FIXTURE_BASE_NOW_MS - 1_000,
+      summary: EXTERNAL_RESOLUTION_FULL_SUMMARY,
+    },
+    tasks: [
+      createTask({
+        task_id: 'task_ext_full_01',
+        title: 'Full job task',
+      }),
+    ],
+    runs: [],
+    outbox: [],
+    combined_candidates: [],
+    result: {
+      outcome: 'completed',
+      summary: 'Real recorded job result remains visible alongside the external receipt.',
+      produced_at_ms: FIXTURE_BASE_NOW_MS - 6_000,
+      delivery_stage: 'result_ready',
+      closure_verdict_id: null,
+    },
+    links: createLinks('plan_ext_full_01', ['req_ext_fixture_full_01']),
+    historical_failure: {
+      failure_id: 'fail_ext_fixture_full_01',
+      stage: 'worker_execution',
+      failed_at_ms: FIXTURE_BASE_NOW_MS - 30_000,
+      task_id: 'task_ext_full_01',
+      attempt_no: 1,
+      run_id: 'run_task_ext_full_01',
+      outbox_id: null,
+      reason: 'Historical failure remains visible even after external resolution.',
+      superseded_or_resolved: true,
+    },
+    current_attention: null,
+    acceptance_proof: createEmptyAcceptanceProof('unknown'),
+    external_resolutions: [fullReceipt],
+    truncation: emptyTruncation(),
+  };
+
+  const partialHistory: WorkspaceJobHistory = {
+    job: {
+      source_id: FIXTURE_SOURCE_ID,
+      job_id: 'job_ext_partial_02',
+      binding_id: CHAT_ALPHA_IDENTITY.binding_id,
+      chat_identity: CHAT_ALPHA_IDENTITY,
+      title: 'Externally Resolved Partial Job',
+      job_revision: 3,
+      state: 'failed',
+      phase: 'external_resolution',
+      approval_status: 'approved',
+      execution_status: 'failed',
+      review_state: null,
+      created_at_ms: FIXTURE_BASE_NOW_MS - 85_000,
+      updated_at_ms: FIXTURE_BASE_NOW_MS - 2_000,
+      summary: EXTERNAL_RESOLUTION_PARTIAL_SUMMARY,
+    },
+    tasks: [
+      createTask({
+        task_id: 'task_ext_partial_01',
+        title: 'Partially resolved task',
+      }),
+      createTask({
+        task_id: 'task_ext_unrelated_02',
+        title: 'Unrelated task remains visible',
+      }),
+    ],
+    runs: [],
+    outbox: [],
+    combined_candidates: [],
+    result: null,
+    links: createLinks('plan_ext_partial_02', ['req_ext_fixture_partial_02']),
+    historical_failure: null,
+    current_attention: null,
+    acceptance_proof: createEmptyAcceptanceProof('unknown'),
+    external_resolutions: [partialReceipt],
+    truncation: emptyTruncation(),
+  };
+
+  const blockedHistory: WorkspaceJobHistory = {
+    job: {
+      source_id: FIXTURE_SOURCE_ID,
+      job_id: 'job_ext_blocked_03',
+      binding_id: CHAT_ALPHA_IDENTITY.binding_id,
+      chat_identity: CHAT_ALPHA_IDENTITY,
+      title: 'Blocked With Historical Receipts',
+      job_revision: 2,
+      state: 'needs_user',
+      phase: 'approval',
+      approval_status: 'pending',
+      execution_status: 'held',
+      review_state: null,
+      created_at_ms: FIXTURE_BASE_NOW_MS - 80_000,
+      updated_at_ms: FIXTURE_BASE_NOW_MS - 3_000,
+      summary: 'Uncovered approval remains active despite historical receipts.',
+    },
+    tasks: [
+      createTask({
+        task_id: 'task_ext_blocked_03',
+        title: 'Held task with historical receipts',
+        status: 'held',
+        current_attention: createAttention(
+          'on_hold',
+          'Task hold remains active while stale and unverified receipts exist.',
+          {
+            blocking_hold_ids: ['hold_ext_fixture_blocked_task'],
+            question_id: 'q_ext_fixture_blocked_task',
+          },
+        ),
+      }),
+    ],
+    runs: [],
+    outbox: [],
+    combined_candidates: [],
+    result: null,
+    links: createLinks('plan_ext_blocked_03', []),
+    historical_failure: null,
+    current_attention: createAttention(
+      'needs_approval',
+      'Uncovered job approval remains active while stale and unverified receipts exist.',
+      {
+        blocking_hold_ids: ['hold_ext_fixture_blocked_job'],
+        question_id: 'q_ext_fixture_blocked_job',
+        updated_at_ms: FIXTURE_BASE_NOW_MS - 3_000,
+      },
+    ),
+    acceptance_proof: createEmptyAcceptanceProof('unknown'),
+    external_resolutions: [staleReceipt, unverifiedReceipt],
+    truncation: emptyTruncation(),
+  };
+
+  const unknownHistory: WorkspaceJobHistory = {
+    job: {
+      source_id: FIXTURE_SOURCE_ID,
+      job_id: 'job_ext_unknown_04',
+      binding_id: CHAT_ALPHA_IDENTITY.binding_id,
+      chat_identity: CHAT_ALPHA_IDENTITY,
+      title: 'Unknown Effect With Full Receipt',
+      job_revision: 1,
+      state: 'unknown',
+      phase: 'execution',
+      approval_status: 'approved',
+      execution_status: 'unknown',
+      review_state: null,
+      created_at_ms: FIXTURE_BASE_NOW_MS - 75_000,
+      updated_at_ms: FIXTURE_BASE_NOW_MS - 5_000,
+      summary: 'Unknown task effect remains visible even with a full receipt.',
+    },
+    tasks: [
+      createTask({
+        task_id: 'task_ext_unknown_04',
+        title: 'Unknown task effect',
+        status: 'unknown',
+        current_attention: null,
+      }),
+    ],
+    runs: [],
+    outbox: [],
+    combined_candidates: [],
+    result: null,
+    links: createLinks('plan_ext_unknown_04', []),
+    historical_failure: null,
+    current_attention: null,
+    acceptance_proof: createEmptyAcceptanceProof('unknown'),
+    external_resolutions: [unknownReceipt],
+    truncation: emptyTruncation(),
+  };
+
+  const receiptMessage = createSafeWorkspaceMessageItem({
+    source_kind: 'journal_summary',
+    source_record_id: EXTERNAL_RESOLUTION_FULL_RECEIPT_ID,
+    source_order: {
+      recorded_at_ms: FIXTURE_BASE_NOW_MS - 1_000,
+      source_seq: 501,
+      sub_index: 0,
+    },
+    scope: {
+      source_id: CHAT_ALPHA_IDENTITY.source_id,
+      binding_id: CHAT_ALPHA_IDENTITY.binding_id,
+      thread_uuid: CHAT_ALPHA_IDENTITY.thread_uuid,
+      canonical_project_scope: CHAT_ALPHA_IDENTITY.canonical_project_scope,
+      chat_identity: CHAT_ALPHA_IDENTITY,
+      job_id: 'job_ext_full_01',
+    },
+    actor_role: 'operator',
+    raw_summary: 'Backend-recorded external resolution receipt summary.',
+  });
+  const partialReceiptMessage = createSafeWorkspaceMessageItem({
+    source_kind: 'journal_summary',
+    source_record_id: EXTERNAL_RESOLUTION_PARTIAL_RECEIPT_ID,
+    source_order: {
+      recorded_at_ms: FIXTURE_BASE_NOW_MS - 2_000,
+      source_seq: 502,
+      sub_index: 0,
+    },
+    scope: {
+      source_id: CHAT_ALPHA_IDENTITY.source_id,
+      binding_id: CHAT_ALPHA_IDENTITY.binding_id,
+      thread_uuid: CHAT_ALPHA_IDENTITY.thread_uuid,
+      canonical_project_scope: CHAT_ALPHA_IDENTITY.canonical_project_scope,
+      chat_identity: CHAT_ALPHA_IDENTITY,
+      job_id: 'job_ext_partial_02',
+    },
+    actor_role: 'operator',
+    raw_summary: 'Backend-recorded partial external resolution receipt summary.',
+  });
+  const staleReceiptMessage = createSafeWorkspaceMessageItem({
+    source_kind: 'journal_summary',
+    source_record_id: EXTERNAL_RESOLUTION_STALE_RECEIPT_ID,
+    source_order: {
+      recorded_at_ms: FIXTURE_BASE_NOW_MS - 3_000,
+      source_seq: 503,
+      sub_index: 0,
+    },
+    scope: {
+      source_id: CHAT_ALPHA_IDENTITY.source_id,
+      binding_id: CHAT_ALPHA_IDENTITY.binding_id,
+      thread_uuid: CHAT_ALPHA_IDENTITY.thread_uuid,
+      canonical_project_scope: CHAT_ALPHA_IDENTITY.canonical_project_scope,
+      chat_identity: CHAT_ALPHA_IDENTITY,
+      job_id: 'job_ext_blocked_03',
+    },
+    actor_role: 'operator',
+    raw_summary: 'Backend-recorded stale external resolution receipt summary.',
+  });
+  const unrelatedQuestion = createSafeWorkspaceMessageItem({
+    source_kind: 'question_prompt',
+    source_record_id: 'q_ext_fixture_unrelated_01',
+    source_order: {
+      recorded_at_ms: FIXTURE_BASE_NOW_MS - 1_500,
+      source_seq: 504,
+      sub_index: 0,
+    },
+    scope: {
+      source_id: CHAT_ALPHA_IDENTITY.source_id,
+      binding_id: CHAT_ALPHA_IDENTITY.binding_id,
+      thread_uuid: CHAT_ALPHA_IDENTITY.thread_uuid,
+      canonical_project_scope: CHAT_ALPHA_IDENTITY.canonical_project_scope,
+      chat_identity: CHAT_ALPHA_IDENTITY,
+      job_id: 'job_ext_full_01',
+      task_id: 'task_ext_full_01',
+    },
+    actor_role: 'coworker',
+    raw_summary: EXTERNAL_RESOLUTION_UNRELATED_QUESTION,
+  });
+
+  return parseWorkspaceSnapshot({
+    ...base,
+    observation: {
+      ...base.observation,
+      jobs: [],
+      requests: [],
+      warnings: [],
+      warning_contexts: [],
+    },
+    chats: [
+      {
+        ...alphaChat,
+        thread_label: 'External Resolution Chat',
+        active_job_count: 1,
+        attention_count: 1,
+        updated_at_ms: FIXTURE_BASE_NOW_MS - 1_000,
+      },
+    ],
+    native_samples: [{ ...alphaSample, activity: 'idle' }],
+    job_histories: [fullHistory, partialHistory, blockedHistory, unknownHistory],
+    messages: {
+      ...base.messages,
+      items: [
+        receiptMessage,
+        partialReceiptMessage,
+        staleReceiptMessage,
+        unrelatedQuestion,
       ],
     },
   });
