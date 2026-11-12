@@ -10843,6 +10843,20 @@ async fn external_resolution_full_job_blocks_execution_and_driver_but_preserves_
     )
     .expect("create execution gateway");
 
+    let agy_count_before = read_invocation_count(&fixture.agy_count_file);
+    let mut sessions_before: Vec<_> = fs::read_dir(&fixture.sessions_dir)
+        .expect("read sessions before driver refusals")
+        .map(|entry| {
+            entry
+                .expect("session entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    sessions_before.sort();
+    let head_before = fs::read_to_string(fixture.repo_dir.join(".git/HEAD")).expect("read HEAD");
+
     let preview_error = gateway
         .preview_execution(&threadlane_native::PreviewExecutionParams {
             job_id: job.job_id.clone(),
@@ -10861,19 +10875,6 @@ async fn external_resolution_full_job_blocks_execution_and_driver_but_preserves_
     assert_eq!(start_error.code(), NativeErrorCode::UnsupportedCapability);
     assert!(start_error.message().contains(receipt.receipt_id.as_str()));
 
-    let agy_count_before = read_invocation_count(&fixture.agy_count_file);
-    let mut sessions_before: Vec<_> = fs::read_dir(&fixture.sessions_dir)
-        .expect("read sessions before driver refusals")
-        .map(|entry| {
-            entry
-                .expect("session entry")
-                .file_name()
-                .to_string_lossy()
-                .into_owned()
-        })
-        .collect();
-    sessions_before.sort();
-    let head_before = fs::read_to_string(fixture.repo_dir.join(".git/HEAD")).expect("read HEAD");
     let driver = threadlane_native::coworker_driver::CoworkerCodeDriver::open_from_dirs(
         &state_dir,
         &fixture.registry_dir,
