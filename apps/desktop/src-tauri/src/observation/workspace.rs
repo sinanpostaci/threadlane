@@ -15,8 +15,7 @@ use threadlane_core::observation::{
     WorkspaceActivityState, WorkspaceAttentionKind, WorkspaceAttentionState,
     WorkspaceAvailabilityState, WorkspaceChatIdentity, WorkspaceChatSummary,
     WorkspaceConfiguredSelection, WorkspaceCoveredAttention, WorkspaceExternalResolutionScope,
-    WorkspaceJobHistory, WorkspaceJobSummary,
-    WorkspaceMessageCandidateInput, WorkspaceMessageItem,
+    WorkspaceJobHistory, WorkspaceJobSummary, WorkspaceMessageCandidateInput, WorkspaceMessageItem,
     WorkspaceMessageScope, WorkspaceMessageSourceOrder, WorkspaceMessagesWindow,
     WorkspaceNativeSample, WorkspaceRecordLinks, WorkspaceSampleReconcileDecision,
     WorkspaceSamplingPolicy, WorkspaceSnapshot, WorkspaceSnapshotBounds, WorkspaceTaskHistory,
@@ -26,8 +25,8 @@ use threadlane_core::observation::{
 use threadlane_core::MAX_WORKER_PATH_BYTES;
 use threadlane_native::coworker_observation::{
     read_legacy_plan_external_resolutions_readonly, read_scoped_workspace_job_histories,
-    LegacyPlanObservationScope, VerifiedLegacyPlanExternalResolutions,
-    WorkspaceHistoryDiagnostic, WorkspaceHistoryDiagnosticKind, WorkspaceHistoryStores,
+    LegacyPlanObservationScope, VerifiedLegacyPlanExternalResolutions, WorkspaceHistoryDiagnostic,
+    WorkspaceHistoryDiagnosticKind, WorkspaceHistoryStores,
 };
 use threadlane_native::coworker_workflow::{CoworkerBindingLedger, CoworkerJobRecord};
 use threadlane_native::native_chat_observation::read_workspace_native_samples_readonly;
@@ -523,8 +522,11 @@ fn project_single_source_workspace(
             _ => None,
         };
 
-        let legacy_task_ids: Vec<String> =
-            legacy_job.tasks.iter().map(|task| task.id.clone()).collect();
+        let legacy_task_ids: Vec<String> = legacy_job
+            .tasks
+            .iter()
+            .map(|task| task.id.clone())
+            .collect();
         let verified_external_resolutions = match (
             verified_chat.as_ref(),
             legacy_job.binding_id.as_deref(),
@@ -549,9 +551,8 @@ fn project_single_source_workspace(
                     plan_revision,
                     task_ids: &legacy_task_ids,
                 };
-                match read_legacy_plan_external_resolutions_readonly(
-                    chat_identity, &stores, &scope,
-                ) {
+                match read_legacy_plan_external_resolutions_readonly(chat_identity, &stores, &scope)
+                {
                     Ok(verified) => {
                         record_history_diagnostics(
                             source_id,
@@ -687,8 +688,7 @@ impl ChatJobStats {
             })
         });
         let covered_by_full_external_resolution = history.external_resolutions.iter().any(|res| {
-            res.applicability.is_applicable()
-                && res.scope == WorkspaceExternalResolutionScope::Job
+            res.applicability.is_applicable() && res.scope == WorkspaceExternalResolutionScope::Job
         });
         let needs_attention = has_explicit_attention
             || has_task_attention
@@ -1093,7 +1093,7 @@ fn build_legacy_fallback_job_history(
             title: t.title.clone(),
             status: t.status.clone(),
             depends_on: t.depends_on.clone(),
-            current_attention: legacy_task_attention(&t.id, &t.status, job.updated_at_ms),
+            current_attention: legacy_task_attention(&t.status, job.updated_at_ms),
             acceptance_proof: WorkspaceAcceptanceProof::unknown(),
             ..WorkspaceTaskHistory::default()
         })
@@ -1147,8 +1147,8 @@ fn build_legacy_fallback_job_history(
             .iter()
             .all(|task| task.current_attention.is_none())
     {
-        // Partial or absent coverage must not let the original raw user-attention state disappear
-        // after all task-level needs were covered by multiple task-scoped receipts.
+        // Partial or absent coverage must not let the original raw actionable attention state
+        // disappear after all task-level needs were covered by multiple task-scoped receipts.
         history.current_attention = legacy_job_attention(history.job.state, job.updated_at_ms);
     }
     let full_external_resolution = full_coverage_proven
@@ -1166,31 +1166,29 @@ fn build_legacy_fallback_job_history(
     history.normalized()
 }
 
+/// Projects only concrete actionable legacy task evidence.
+///
+/// `not_approved` and unclassified `unknown` statuses remain informational raw task state. The
+/// legacy DTO cannot distinguish an unverified observation from a real unresolved effect, so it
+/// must not fabricate a live human-attention request from those statuses. Ordinary reason prose
+/// uses short generic English and never repeats opaque task identifiers; typed task IDs remain in
+/// [`WorkspaceTaskHistory::task_id`].
 fn legacy_task_attention(
-    task_id: &str,
     status: &str,
     updated_at_ms: Option<i64>,
 ) -> Option<WorkspaceAttentionState> {
     let (kind, reason) = match status {
         "native_route_required" => (
             WorkspaceAttentionKind::NeedsUserInput,
-            format!("Task {task_id} requires the native Codex route."),
+            "A task requires the native Codex route.".to_string(),
         ),
         "failed" | "timed_out" => (
             WorkspaceAttentionKind::BlockedFailure,
-            format!("Task {task_id} is recorded as failed in the legacy observation."),
+            "A task is recorded as failed or timed out in the legacy observation.".to_string(),
         ),
         "ready_for_review" => (
             WorkspaceAttentionKind::ReviewRequired,
-            format!("Task {task_id} is recorded as ready for review."),
-        ),
-        "unknown" => (
-            WorkspaceAttentionKind::Unknown,
-            format!("Task {task_id} has an unknown legacy observation outcome."),
-        ),
-        "not_approved" => (
-            WorkspaceAttentionKind::Unknown,
-            format!("Task {task_id} is not covered by the recorded approval."),
+            "A task is recorded as ready for review.".to_string(),
         ),
         _ => return None,
     };
@@ -1205,6 +1203,11 @@ fn legacy_task_attention(
     })
 }
 
+/// Projects only concrete actionable legacy job evidence.
+///
+/// A generic `unknown` job state remains informational uncertainty. `needs_user` is an explicit
+/// actionable state even when the legacy DTO lacks safe task-level detail; the conservative
+/// [`WorkspaceAttentionKind::Unknown`] kind avoids inventing a more specific request category.
 fn legacy_job_attention(
     state: ObservationJobState,
     updated_at_ms: Option<i64>,
@@ -1213,11 +1216,6 @@ fn legacy_job_attention(
         ObservationJobState::NeedsUser => (
             WorkspaceAttentionKind::Unknown,
             "The legacy observation records a user-attention requirement without task-level detail."
-                .to_string(),
-        ),
-        ObservationJobState::Unknown => (
-            WorkspaceAttentionKind::Unknown,
-            "The legacy observation state is unknown and cannot be independently verified."
                 .to_string(),
         ),
         ObservationJobState::Failed => (
@@ -1257,8 +1255,11 @@ fn resolution_covers_all_displayed_tasks(
 }
 
 fn apply_legacy_external_resolution_coverage(history: &mut WorkspaceJobHistory) {
-    let displayed_task_ids: BTreeSet<String> =
-        history.tasks.iter().map(|task| task.task_id.clone()).collect();
+    let displayed_task_ids: BTreeSet<String> = history
+        .tasks
+        .iter()
+        .map(|task| task.task_id.clone())
+        .collect();
     let mut resolutions = std::mem::take(&mut history.external_resolutions);
 
     for resolution in &mut resolutions {
@@ -1277,10 +1278,12 @@ fn apply_legacy_external_resolution_coverage(history: &mut WorkspaceJobHistory) 
         if covers_all_displayed {
             if let Some(attention) = history.current_attention.take() {
                 if legacy_attention_is_coverable(&attention) {
-                    resolution.covered_attention.push(WorkspaceCoveredAttention {
-                        task_id: None,
-                        attention,
-                    });
+                    resolution
+                        .covered_attention
+                        .push(WorkspaceCoveredAttention {
+                            task_id: None,
+                            attention,
+                        });
                 } else {
                     history.current_attention = Some(attention);
                 }
@@ -1295,10 +1298,12 @@ fn apply_legacy_external_resolution_coverage(history: &mut WorkspaceJobHistory) 
                 continue;
             };
             if legacy_attention_is_coverable(&attention) {
-                resolution.covered_attention.push(WorkspaceCoveredAttention {
-                    task_id: Some(task.task_id.clone()),
-                    attention,
-                });
+                resolution
+                    .covered_attention
+                    .push(WorkspaceCoveredAttention {
+                        task_id: Some(task.task_id.clone()),
+                        attention,
+                    });
             } else {
                 task.current_attention = Some(attention);
             }

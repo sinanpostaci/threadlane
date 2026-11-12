@@ -26,11 +26,9 @@ use threadlane_host::{
 use threadlane_native::coworker_observation::workspace_history::{
     project_coworker_job_history, project_coworker_job_record,
     read_legacy_plan_external_resolutions_readonly, read_scoped_workspace_job_histories,
-    LegacyPlanObservationScope, VerifiedLegacyPlanExternalResolutions,
-    WorkspaceHistoryDiagnostic, WorkspaceHistoryDiagnosticKind, WorkspaceHistoryStores,
-    WorkspaceJobLineageContext,
+    LegacyPlanObservationScope, VerifiedLegacyPlanExternalResolutions, WorkspaceHistoryDiagnostic,
+    WorkspaceHistoryDiagnosticKind, WorkspaceHistoryStores, WorkspaceJobLineageContext,
 };
-use threadlane_native::fs_safety::acquire_cross_process_lock;
 use threadlane_native::coworker_workflow::candidate::{
     AssembleOperationsFinalCandidateRequest, CoworkerCandidateService,
     ExecuteFinalCandidateClosureRequest, StructuredClosureModelResponse,
@@ -44,19 +42,18 @@ use threadlane_native::coworker_workflow::{
     ControllerConfigurationPreview, ControllerJobRuntimeState, ControllerPolicyStore,
     ControllerRoleExecutionBudget, ControllerRoleUsageCounters, CoworkerBindingLedger,
     CoworkerJobOwnershipKey, CoworkerJobOwnershipStore, CoworkerJobPhase, CoworkerJobRecord,
-    CoworkerLedgerMutationOutcome,
-    CoworkerPlanningService, CoworkerTaskRecord, CoworkerTaskStage, CoworkerWorkflowStore,
-    CreateCoworkerJobRequest, FinalizeTaskOutboxRequest, FreezeControllerExecutionEnvelopeRequest,
-    FrozenApprovalLinkage, FrozenCheckCommandSpec, FrozenCheckExecutionStatus, FrozenCheckKind,
-    FrozenCheckSubject, FrozenCheckTargetKind, FrozenControllerCapabilityEnvelope,
-    FrozenControllerExecutionEnvelope, OutboxDispatchKind, OutboxDispatchRecord,
-    OutboxDispatchStatus, PendingControllerEffect, PendingControllerEffectKind,
-    PendingControllerEffectStatus, PlanningAdviceGrant, PlanningCallBudget,
-    PlanningCallReservation, PlanningGrantStatus, PlanningGrantUsage, PlanningReadOnlyCapabilities,
-    PlanningReservationStatus, PlanningResultRef, RecordTaskReviewVerdictRequest,
-    ReserveTaskOutboxRequest, ReviewVerdictOutcome, StructuredReviewVerdict,
-    TaskAttemptExecutionArtifacts, TaskAttemptRef, TaskCandidateRef, TaskInterfaceOwnershipSpec,
-    WorkBrief, WorkBriefKind, WorkflowHoldReason, WorkflowHoldRecord,
+    CoworkerLedgerMutationOutcome, CoworkerPlanningService, CoworkerTaskRecord, CoworkerTaskStage,
+    CoworkerWorkflowStore, CreateCoworkerJobRequest, FinalizeTaskOutboxRequest,
+    FreezeControllerExecutionEnvelopeRequest, FrozenApprovalLinkage, FrozenCheckCommandSpec,
+    FrozenCheckExecutionStatus, FrozenCheckKind, FrozenCheckSubject, FrozenCheckTargetKind,
+    FrozenControllerCapabilityEnvelope, FrozenControllerExecutionEnvelope, OutboxDispatchKind,
+    OutboxDispatchRecord, OutboxDispatchStatus, PendingControllerEffect,
+    PendingControllerEffectKind, PendingControllerEffectStatus, PlanningAdviceGrant,
+    PlanningCallBudget, PlanningCallReservation, PlanningGrantStatus, PlanningGrantUsage,
+    PlanningReadOnlyCapabilities, PlanningReservationStatus, PlanningResultRef,
+    RecordTaskReviewVerdictRequest, ReserveTaskOutboxRequest, ReviewVerdictOutcome,
+    StructuredReviewVerdict, TaskAttemptExecutionArtifacts, TaskAttemptRef, TaskCandidateRef,
+    TaskInterfaceOwnershipSpec, WorkBrief, WorkBriefKind, WorkflowHoldReason, WorkflowHoldRecord,
 };
 use threadlane_native::error::NativeErrorCode;
 use threadlane_native::external_resolution::{
@@ -65,6 +62,7 @@ use threadlane_native::external_resolution::{
     ExternalResolutionService, ExternalResolutionTarget, RecordExternalResolutionRequest,
     EXTERNAL_RESOLUTION_PREVIEW_DOMAIN, EXTERNAL_RESOLUTION_RECEIPT_DOMAIN,
 };
+use threadlane_native::fs_safety::acquire_cross_process_lock;
 use threadlane_native::profile_flow::{
     ExecutionPolicy, PolicyAllowRule, RoleExecutionRoute, SelectedRoleChoice,
 };
@@ -83,8 +81,8 @@ use threadlane_workers::{
     DEFAULT_TIMEOUT_MS,
 };
 use threadlane_workflow::{
-    compile_plan_revision, Difficulty, ModelChoice, ModelDefinition, PlanChange, PlanStatus,
-    PlanStore, PlanTask, RegistryChange, RegistryStore, RoleAssignment, ToolAdapter,
+    compile_plan_revision, Difficulty, ModelChoice, ModelDefinition, PlanChange, PlanRevision,
+    PlanStatus, PlanStore, PlanTask, RegistryChange, RegistryStore, RoleAssignment, ToolAdapter,
     ToolDefinition, WorkflowProfile, WorkflowRole,
 };
 
@@ -8374,10 +8372,8 @@ async fn awaiting_approval_preserves_higher_priority_fences_causal_ambiguity_and
 const EXT_HIST_SOURCE: &str = "default";
 const EXT_HIST_BINDING: &str = "bnd_history_external";
 const EXT_HIST_THREAD: &str = "550e8400-e29b-41d4-a716-446655440000";
-const EXT_HIST_HEX64_A: &str =
-    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-const EXT_HIST_HEX64_B: &str =
-    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const EXT_HIST_HEX64_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const EXT_HIST_HEX64_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
 struct ExternalHistoryFixture {
     _tmp: TempDir,
@@ -8530,12 +8526,15 @@ fn setup_external_history_fixture() -> ExternalHistoryFixture {
             },
         )
         .expect("publish external plan");
-    let compiled =
-        compile_plan_revision(&plan, &registry_snapshot).expect("compile external plan");
+    let compiled = compile_plan_revision(&plan, &registry_snapshot).expect("compile external plan");
 
     let authority = Arc::new(
-        AuthorityStore::open(&authority_dir, Arc::clone(&registry), Arc::clone(&plan_store))
-            .expect("open external authority"),
+        AuthorityStore::open(
+            &authority_dir,
+            Arc::clone(&registry),
+            Arc::clone(&plan_store),
+        )
+        .expect("open external authority"),
     );
     let summary = authority
         .approve_at(
@@ -8549,10 +8548,7 @@ fn setup_external_history_fixture() -> ExternalHistoryFixture {
                 repository_path: repo.clone(),
                 base_commit: base_commit.clone(),
                 approved_task_ids: vec!["task-alpha".to_string(), "task-beta".to_string()],
-                approved_write_paths: vec![
-                    "src/alpha.rs".to_string(),
-                    "src/beta.rs".to_string(),
-                ],
+                approved_write_paths: vec!["src/alpha.rs".to_string(), "src/beta.rs".to_string()],
                 max_parallel: 2,
                 budgets: ExecutionBudgets::default(),
             },
@@ -8652,7 +8648,9 @@ fn setup_external_history_fixture() -> ExternalHistoryFixture {
         admission_markers: BTreeMap::new(),
         external_resolutions: Vec::new(),
     };
-    ledger.validate(EXT_HIST_BINDING).expect("valid external ledger");
+    ledger
+        .validate(EXT_HIST_BINDING)
+        .expect("valid external ledger");
     write_private_json(
         &store
             .ledger_path_for_binding(EXT_HIST_BINDING)
@@ -8753,7 +8751,8 @@ fn ext_create_legacy_plan_with_approved_ids(
         "task-legacy-beta".to_string(),
     ];
     let (published, approval) = {
-        let registry = Arc::new(RegistryStore::open(&fixture.registry_dir).expect("legacy registry"));
+        let registry =
+            Arc::new(RegistryStore::open(&fixture.registry_dir).expect("legacy registry"));
         let registry_snapshot = registry.snapshot().expect("legacy registry snapshot");
         assert_eq!(registry_snapshot.revision, fixture.registry_revision);
         let plans = Arc::new(PlanStore::open(&fixture.plans).expect("legacy plans"));
@@ -8908,11 +8907,7 @@ fn ext_read_legacy_history_scope(
         plan_revision,
         task_ids,
     };
-    read_legacy_plan_external_resolutions_readonly(
-        &ext_chat_identity(fixture),
-        &stores,
-        &scope,
-    )
+    read_legacy_plan_external_resolutions_readonly(&ext_chat_identity(fixture), &stores, &scope)
 }
 
 fn ext_publish_newer_legacy_revision(
@@ -9134,7 +9129,9 @@ fn ext_resign_receipt(receipt: &mut ExternalResolutionReceipt) {
         &serde_json::to_vec(&(EXTERNAL_RESOLUTION_RECEIPT_DOMAIN, &canonical_receipt))
             .expect("serialize external receipt digest"),
     );
-    receipt.validate_integrity().expect("resigned external receipt");
+    receipt
+        .validate_integrity()
+        .expect("resigned external receipt");
 }
 
 fn ext_rewrite_receipt(fixture: &ExternalHistoryFixture, receipt: ExternalResolutionReceipt) {
@@ -9182,10 +9179,7 @@ fn external_resolution_history_full_and_partial_cover_only_current_attention() {
         full_resolution.outcome,
         WorkspaceExternalResolutionOutcome::ResolvedExternally
     );
-    assert_eq!(
-        full_resolution.scope,
-        WorkspaceExternalResolutionScope::Job
-    );
+    assert_eq!(full_resolution.scope, WorkspaceExternalResolutionScope::Job);
     assert_eq!(
         full_resolution.applicability,
         WorkspaceExternalResolutionApplicability::Applicable
@@ -9275,7 +9269,9 @@ fn external_resolution_history_full_and_partial_cover_only_current_attention() {
         .expect("partial beta task");
     assert!(alpha.current_attention.is_none());
     assert_eq!(
-        beta.current_attention.as_ref().map(|attention| attention.kind),
+        beta.current_attention
+            .as_ref()
+            .map(|attention| attention.kind),
         Some(WorkspaceAttentionKind::BlockedFailure)
     );
     assert_eq!(
@@ -9427,10 +9423,7 @@ fn legacy_plan_external_resolution_history_full_and_partial_positive_readonly() 
         full_resolution.applicability,
         WorkspaceExternalResolutionApplicability::Applicable
     );
-    assert_eq!(
-        full_resolution.scope,
-        WorkspaceExternalResolutionScope::Job
-    );
+    assert_eq!(full_resolution.scope, WorkspaceExternalResolutionScope::Job);
     assert_eq!(
         full_resolution.outcome,
         WorkspaceExternalResolutionOutcome::ResolvedExternally
@@ -9547,13 +9540,9 @@ fn legacy_plan_external_resolution_old_revision_receipt_is_stale_after_newer_pub
         snapshot_private_dir_sha256(&fixture.authority_dir),
         snapshot_private_dir_sha256(&fixture.sessions),
     );
-    let verified = ext_read_legacy_history_scope(
-        &fixture,
-        &legacy.plan_id,
-        newer.revision,
-        &newer_task_ids,
-    )
-    .expect("old revision legacy history read");
+    let verified =
+        ext_read_legacy_history_scope(&fixture, &legacy.plan_id, newer.revision, &newer_task_ids)
+            .expect("old revision legacy history read");
     let after = (
         snapshot_private_dir_sha256(&fixture.plans),
         snapshot_private_dir_sha256(&fixture.authority_dir),
@@ -9638,8 +9627,9 @@ fn legacy_plan_external_resolution_history_rejects_claimed_ambiguous_foreign_and
         ExternalResolutionScope::FullJob,
     );
     {
-        let registry =
-            Arc::new(RegistryStore::open(&ambiguous_fixture.registry_dir).expect("ambiguous registry"));
+        let registry = Arc::new(
+            RegistryStore::open(&ambiguous_fixture.registry_dir).expect("ambiguous registry"),
+        );
         let plans = Arc::new(PlanStore::open(&ambiguous_fixture.plans).expect("ambiguous plans"));
         let authority = AuthorityStore::open(
             &ambiguous_fixture.authority_dir,
@@ -9709,8 +9699,8 @@ fn legacy_plan_external_resolution_history_rejects_claimed_ambiguous_foreign_and
     tampered.project.base_commit = "f".repeat(40);
     ext_resign_receipt(&mut tampered);
     ext_rewrite_receipt(&tampered_fixture, tampered);
-    let tampered_verified = ext_read_legacy_history(&tampered_fixture, &tampered_legacy)
-        .expect("tampered legacy read");
+    let tampered_verified =
+        ext_read_legacy_history(&tampered_fixture, &tampered_legacy).expect("tampered legacy read");
     assert_eq!(tampered_verified.resolutions().len(), 1);
     assert_eq!(
         tampered_verified.resolutions()[0].applicability,
@@ -9747,12 +9737,10 @@ fn external_resolution_history_refuses_active_locks_and_unsealed_stopped_runtime
     );
     assert_eq!(baseline_history.job.execution_status, "resolved_externally");
 
-    let launch_guard = HostLaunchIntentLock::try_acquire(
-        &fixture.sessions,
-        &fixture.approval.approval_id,
-    )
-    .expect("acquire launch intent lock")
-    .expect("launch intent lock available");
+    let launch_guard =
+        HostLaunchIntentLock::try_acquire(&fixture.sessions, &fixture.approval.approval_id)
+            .expect("acquire launch intent lock")
+            .expect("launch intent lock available");
     let before_launch = snapshot_private_dir_sha256(&fixture.sessions);
     let launch_read = read_external_history(&fixture, true);
     assert_eq!(
@@ -9781,12 +9769,9 @@ fn external_resolution_history_refuses_active_locks_and_unsealed_stopped_runtime
     ));
     let ownership_store =
         CoworkerJobOwnershipStore::new(&ownership_dir).expect("open ownership store");
-    let ownership_key = CoworkerJobOwnershipKey::new(
-        EXT_HIST_BINDING,
-        EXT_HIST_THREAD,
-        &fixture.job_id,
-    )
-    .expect("ownership key");
+    let ownership_key =
+        CoworkerJobOwnershipKey::new(EXT_HIST_BINDING, EXT_HIST_THREAD, &fixture.job_id)
+            .expect("ownership key");
     let owner_guard = ownership_store
         .try_acquire_job_option(&ownership_key, 1_700_000_080_000)
         .expect("acquire ownership lock")
@@ -9904,13 +9889,8 @@ fn external_resolution_history_refuses_active_locks_and_unsealed_stopped_runtime
         execution_binding: None,
         recorded_at_ms: 1_700_000_070_000,
     };
-    record_task_dispatch_intent(
-        &session_dir,
-        &fixture.approval,
-        &runtime_binding_id,
-        intent,
-    )
-    .expect("record unsealed task dispatch intent");
+    record_task_dispatch_intent(&session_dir, &fixture.approval, &runtime_binding_id, intent)
+        .expect("record unsealed task dispatch intent");
     let _ = fs::remove_file(session_dir.join("task-receipts.lock"));
     let before_unsealed = snapshot_private_dir_sha256(&fixture.sessions);
     let unsealed_read = read_external_history(&fixture, true);
@@ -9984,10 +9964,7 @@ fn external_resolution_history_refuses_active_locks_and_unsealed_stopped_runtime
         .tasks
         .iter()
         .all(|task| task.current_attention.is_none()));
-    assert_eq!(
-        sealed_history.job.execution_status,
-        "resolved_externally"
-    );
+    assert_eq!(sealed_history.job.execution_status, "resolved_externally");
 }
 
 #[test]

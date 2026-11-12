@@ -9,21 +9,20 @@ mod unix_workspace_tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use threadlane_core::observation::{
-        current_observation_time_ms, serialize_workspace_native_sample_sidecar,
-        ObservationJobState, ObservationSnapshotRequest, ObservationSourceAvailability,
-        WorkspaceAcceptanceStatus, WorkspaceActivityState, WorkspaceAttentionKind,
-        WorkspaceAvailabilityState, WorkspaceCapabilityState, WorkspaceChatIdentity,
-        WorkspaceConfiguredSelection,
-        WorkspaceConnectionState, WorkspaceExternalResolutionApplicability,
-        WorkspaceExternalResolutionScope, WorkspaceFreshnessState, WorkspaceMessageSourceKind,
-        WorkspaceNativeCapabilities, WorkspaceNativeSample, WorkspaceSampleConnection,
-        WorkspaceSelectionEvidence,
-    };
     use threadlane_authority::{
         compute_record_subject_digest, derive_approval_id, verify_approval_record_integrity,
         ApprovalRecord, ApprovedTaskRecord, APPROVALS_FILE_NAME, AUTHORITY_POLICY_VERSION,
         AUTHORITY_SCHEMA_VERSION,
+    };
+    use threadlane_core::observation::{
+        current_observation_time_ms, serialize_workspace_native_sample_sidecar, ObservationJob,
+        ObservationJobState, ObservationSnapshotRequest, ObservationSourceAvailability,
+        ObservationTask, WorkspaceAcceptanceStatus, WorkspaceActivityState, WorkspaceAttentionKind,
+        WorkspaceAvailabilityState, WorkspaceCapabilityState, WorkspaceChatIdentity,
+        WorkspaceConfiguredSelection, WorkspaceConnectionState,
+        WorkspaceExternalResolutionApplicability, WorkspaceExternalResolutionScope,
+        WorkspaceFreshnessState, WorkspaceMessageSourceKind, WorkspaceNativeCapabilities,
+        WorkspaceNativeSample, WorkspaceSampleConnection, WorkspaceSelectionEvidence,
     };
     use threadlane_core::Core;
     use threadlane_native::coworker_observation::{
@@ -448,8 +447,7 @@ mod unix_workspace_tests {
         approved_task_ids: &[String],
         created_at_ms: i64,
     ) -> ApprovalRecord {
-        let approved_set: BTreeSet<&str> =
-            approved_task_ids.iter().map(String::as_str).collect();
+        let approved_set: BTreeSet<&str> = approved_task_ids.iter().map(String::as_str).collect();
         let approved_tasks: Vec<ApprovedTaskRecord> = published
             .tasks
             .iter()
@@ -634,6 +632,44 @@ mod unix_workspace_tests {
             difficulty: Difficulty::Medium,
             depends_on: Vec::new(),
             allowed_write_paths: vec!["src/lib.rs".to_string()],
+        }
+    }
+
+    fn legacy_observation_job(
+        job_id: &str,
+        state: ObservationJobState,
+        approval_status: &str,
+        execution_status: &str,
+        tasks: Vec<ObservationTask>,
+    ) -> ObservationJob {
+        ObservationJob {
+            source_id: "default".to_string(),
+            id: job_id.to_string(),
+            project_label: "Legacy fallback project".to_string(),
+            project_path: None,
+            title: "Legacy fallback job".to_string(),
+            thread_uuid: None,
+            thread_label: None,
+            binding_id: Some("bnd_ws_legacy_fallback_01".to_string()),
+            plan_id: Some(job_id.to_string()),
+            plan_revision: Some(1),
+            state,
+            approval_status: approval_status.to_string(),
+            execution_status: execution_status.to_string(),
+            review_state: None,
+            updated_at_ms: Some(1_700_000_300_000),
+            active_call_count: 0,
+            tasks,
+            summary: None,
+        }
+    }
+
+    fn legacy_observation_task(id: &str, title: &str, status: &str) -> ObservationTask {
+        ObservationTask {
+            id: id.to_string(),
+            title: title.to_string(),
+            status: status.to_string(),
+            depends_on: Vec::new(),
         }
     }
 
@@ -1013,10 +1049,7 @@ mod unix_workspace_tests {
             ObservationJobState::Unknown,
             "external resolution is a logical outcome, not Completed"
         );
-        assert_eq!(
-            resolved_history.job.execution_status,
-            "resolved_externally"
-        );
+        assert_eq!(resolved_history.job.execution_status, "resolved_externally");
         assert_eq!(
             resolved_history.acceptance_proof.status,
             WorkspaceAcceptanceStatus::Unknown
@@ -1956,6 +1989,323 @@ mod unix_workspace_tests {
     }
 
     #[test]
+    fn workspace_snapshot_legacy_draft_and_unapproved_plans_stay_informational_planning() {
+        let tree = TestTree::new("legacy-informational-planning");
+        let stores = TestStores::new(&tree, "stores");
+        let app_data = tree.dir("app-data");
+        let binding_id = "bnd_ws_legacy_info_01";
+
+        let plan_store = PlanStore::open(&stores.plans).expect("open legacy informational plans");
+        plan_store
+            .change_at(
+                0,
+                PlanChange::SaveDraft {
+                    plan_id: "plan_ws_legacy_info_draft".to_string(),
+                    binding_id: binding_id.to_string(),
+                    profile_id: "profile-main".to_string(),
+                    profile_revision: 1,
+                    summary: "Legacy informational draft summary".to_string(),
+                    tasks: vec![legacy_plan_task("task-legacy-draft", "Legacy draft task")],
+                },
+                1_700_000_320_000,
+            )
+            .expect("save informational legacy draft");
+        let unapproved = plan_store
+            .change_at(
+                0,
+                PlanChange::SaveDraft {
+                    plan_id: "plan_ws_legacy_info_unapproved".to_string(),
+                    binding_id: binding_id.to_string(),
+                    profile_id: "profile-main".to_string(),
+                    profile_revision: 1,
+                    summary: "Legacy informational unapproved summary".to_string(),
+                    tasks: vec![legacy_plan_task(
+                        "task-legacy-unapproved",
+                        "Legacy unapproved task",
+                    )],
+                },
+                1_700_000_321_000,
+            )
+            .expect("save informational legacy unapproved plan");
+        plan_store
+            .change_at(
+                unapproved.revision,
+                PlanChange::Publish {
+                    plan_id: unapproved.plan_id.clone(),
+                    revision: unapproved.revision,
+                },
+                1_700_000_321_500,
+            )
+            .expect("publish informational legacy unapproved plan");
+        drop(plan_store);
+
+        let before_read = snapshot_tree_fingerprints(tree.path());
+        let service = ObservationService::new(stores.config(&app_data));
+        let snap = service
+            .workspace_snapshot(None)
+            .expect("workspace_snapshot with informational legacy plans");
+        let after_read = snapshot_tree_fingerprints(tree.path());
+        assert_eq!(
+            before_read, after_read,
+            "informational legacy fallback reads must not write files"
+        );
+
+        for (job_id, expected_approval, task_id) in [
+            ("plan_ws_legacy_info_draft", "draft", "task-legacy-draft"),
+            (
+                "plan_ws_legacy_info_unapproved",
+                "unapproved",
+                "task-legacy-unapproved",
+            ),
+        ] {
+            let history = snap
+                .job_histories
+                .iter()
+                .find(|history| history.job.job_id == job_id)
+                .unwrap_or_else(|| panic!("missing informational legacy history {job_id}"));
+            assert_eq!(history.job.state, ObservationJobState::Planning);
+            assert_eq!(history.job.approval_status, expected_approval);
+            assert_eq!(history.job.execution_status, "not_started");
+            assert!(
+                history.external_resolutions.is_empty(),
+                "the informational fixture has no external resolution receipt"
+            );
+            assert!(
+                history.current_attention.is_none(),
+                "unapproved/not_started job {job_id} must not invent current attention"
+            );
+            assert_eq!(history.tasks.len(), 1);
+            let task = &history.tasks[0];
+            assert_eq!(task.task_id, task_id);
+            assert_eq!(task.status, "not_approved");
+            assert!(
+                task.current_attention.is_none(),
+                "unapproved task {task_id} must remain informational"
+            );
+            assert_eq!(
+                task.acceptance_proof.status,
+                WorkspaceAcceptanceStatus::Unknown,
+                "informational planning must not claim acceptance"
+            );
+        }
+        assert!(
+            snap.chats.is_empty(),
+            "unapproved plan-only fixtures have no verified chat identity"
+        );
+    }
+
+    #[test]
+    fn workspace_legacy_fallback_keeps_unknown_observation_informational() {
+        let job = legacy_observation_job(
+            "job_legacy_unknown_information",
+            ObservationJobState::Unknown,
+            "unknown",
+            "unknown",
+            vec![
+                legacy_observation_task("task-legacy-unknown", "Legacy unknown task", "unknown"),
+                legacy_observation_task(
+                    "task-legacy-not-approved",
+                    "Legacy not approved task",
+                    "not_approved",
+                ),
+                legacy_observation_task(
+                    "task-legacy-not-started",
+                    "Legacy not started task",
+                    "not_started",
+                ),
+            ],
+        );
+
+        let history = super::super::build_legacy_fallback_job_history(&job, None, None);
+        assert_eq!(history.job.state, ObservationJobState::Unknown);
+        assert_eq!(history.job.approval_status, "unknown");
+        assert_eq!(history.job.execution_status, "unknown");
+        assert!(history.job.chat_identity.is_none());
+        assert!(
+            history.current_attention.is_none(),
+            "generic unknown job state must stay informational"
+        );
+        assert!(history.external_resolutions.is_empty());
+
+        let unknown_task = &history.tasks[0];
+        assert_eq!(unknown_task.task_id, "task-legacy-unknown");
+        assert_eq!(unknown_task.status, "unknown");
+        assert!(
+            unknown_task.current_attention.is_none(),
+            "unclassified unknown task evidence must not invent a human request"
+        );
+        assert_eq!(
+            unknown_task.acceptance_proof.status,
+            WorkspaceAcceptanceStatus::Unknown
+        );
+
+        let not_approved_task = &history.tasks[1];
+        assert_eq!(not_approved_task.task_id, "task-legacy-not-approved");
+        assert_eq!(not_approved_task.status, "not_approved");
+        assert!(not_approved_task.current_attention.is_none());
+        assert_eq!(
+            not_approved_task.acceptance_proof.status,
+            WorkspaceAcceptanceStatus::Unknown
+        );
+
+        let not_started_task = &history.tasks[2];
+        assert_eq!(not_started_task.task_id, "task-legacy-not-started");
+        assert_eq!(not_started_task.status, "not_started");
+        assert!(not_started_task.current_attention.is_none());
+        assert_eq!(
+            not_started_task.acceptance_proof.status,
+            WorkspaceAcceptanceStatus::Unknown
+        );
+    }
+
+    #[test]
+    fn workspace_legacy_fallback_preserves_actionable_evidence_without_id_prose() {
+        let opaque_ids = [
+            "task-legacy-failed-opaque",
+            "task-legacy-timeout-opaque",
+            "task-legacy-review-opaque",
+            "task-legacy-native-opaque",
+            "task-legacy-not-approved-opaque",
+            "task-legacy-unknown-opaque",
+        ];
+        let job = legacy_observation_job(
+            "job_legacy_actionable_information",
+            ObservationJobState::NeedsUser,
+            "approved",
+            "unknown",
+            vec![
+                legacy_observation_task(opaque_ids[0], "Legacy failed task", "failed"),
+                legacy_observation_task(opaque_ids[1], "Legacy timed out task", "timed_out"),
+                legacy_observation_task(opaque_ids[2], "Legacy review task", "ready_for_review"),
+                legacy_observation_task(
+                    opaque_ids[3],
+                    "Legacy native task",
+                    "native_route_required",
+                ),
+                legacy_observation_task(opaque_ids[4], "Legacy not approved task", "not_approved"),
+                legacy_observation_task(opaque_ids[5], "Legacy unknown task", "unknown"),
+            ],
+        );
+
+        let history = super::super::build_legacy_fallback_job_history(&job, None, None);
+        assert!(
+            history.current_attention.is_none(),
+            "task-specific evidence must remain on the task rows"
+        );
+        for (task_id, expected_status, expected_kind) in [
+            (
+                opaque_ids[0],
+                "failed",
+                WorkspaceAttentionKind::BlockedFailure,
+            ),
+            (
+                opaque_ids[1],
+                "timed_out",
+                WorkspaceAttentionKind::BlockedFailure,
+            ),
+            (
+                opaque_ids[2],
+                "ready_for_review",
+                WorkspaceAttentionKind::ReviewRequired,
+            ),
+            (
+                opaque_ids[3],
+                "native_route_required",
+                WorkspaceAttentionKind::NeedsUserInput,
+            ),
+        ] {
+            let task = history
+                .tasks
+                .iter()
+                .find(|task| task.task_id == task_id)
+                .unwrap_or_else(|| panic!("missing actionable legacy task {task_id}"));
+            assert_eq!(task.status, expected_status);
+            let attention = task
+                .current_attention
+                .as_ref()
+                .unwrap_or_else(|| panic!("missing actionable attention for {task_id}"));
+            assert_eq!(attention.kind, expected_kind);
+            assert!(
+                !attention.reason.contains(task_id),
+                "ordinary reason prose must not repeat opaque task id {task_id}"
+            );
+            for opaque_id in opaque_ids {
+                assert!(
+                    !attention.reason.contains(opaque_id),
+                    "ordinary reason prose must not repeat any opaque task id"
+                );
+            }
+        }
+        for task_id in [opaque_ids[4], opaque_ids[5]] {
+            let task = history
+                .tasks
+                .iter()
+                .find(|task| task.task_id == task_id)
+                .unwrap_or_else(|| panic!("missing informational legacy task {task_id}"));
+            assert!(
+                task.current_attention.is_none(),
+                "informational task {task_id} must not invent attention"
+            );
+            assert_eq!(
+                task.acceptance_proof.status,
+                WorkspaceAcceptanceStatus::Unknown
+            );
+        }
+
+        let needs_user_job = legacy_observation_job(
+            "job_legacy_needs_user_fallback",
+            ObservationJobState::NeedsUser,
+            "approved",
+            "not_started",
+            vec![legacy_observation_task(
+                "task-legacy-informational-fallback",
+                "Legacy informational task",
+                "not_approved",
+            )],
+        );
+        let needs_user_history =
+            super::super::build_legacy_fallback_job_history(&needs_user_job, None, None);
+        let needs_user_attention = needs_user_history
+            .current_attention
+            .as_ref()
+            .expect("explicit NeedsUser job state must keep its actionable fallback");
+        assert!(!needs_user_attention
+            .reason
+            .contains("job_legacy_needs_user_fallback"));
+        assert!(!needs_user_attention
+            .reason
+            .contains("task-legacy-informational-fallback"));
+        assert!(
+            needs_user_history
+                .tasks
+                .iter()
+                .all(|task| task.current_attention.is_none()),
+            "the NeedsUser fallback must not fabricate task-level attention"
+        );
+
+        let failed_job = legacy_observation_job(
+            "job_legacy_failed_fallback",
+            ObservationJobState::Failed,
+            "approved",
+            "failed",
+            vec![legacy_observation_task(
+                "task-legacy-informational-failed-job",
+                "Legacy informational task",
+                "not_approved",
+            )],
+        );
+        let failed_history =
+            super::super::build_legacy_fallback_job_history(&failed_job, None, None);
+        assert_eq!(
+            failed_history
+                .current_attention
+                .as_ref()
+                .map(|attention| attention.kind),
+            Some(WorkspaceAttentionKind::BlockedFailure)
+        );
+    }
+
+    #[test]
     fn workspace_snapshot_projects_real_legacy_plan_external_resolution_without_coworker_job() {
         let tree = TestTree::new("legacy-external-resolution");
         let stores = TestStores::new(&tree, "stores");
@@ -2032,7 +2382,11 @@ mod unix_workspace_tests {
         );
         assert_eq!(history.links.source_plan_revision, Some(plan.revision));
         assert_eq!(
-            history.job.chat_identity.as_ref().map(|id| id.binding_id.as_str()),
+            history
+                .job
+                .chat_identity
+                .as_ref()
+                .map(|id| id.binding_id.as_str()),
             Some(binding_id)
         );
         assert_eq!(history.external_resolutions.len(), 1);
@@ -2176,6 +2530,13 @@ mod unix_workspace_tests {
             resolution.covered_attention[0].attention.kind,
             WorkspaceAttentionKind::NeedsUserInput
         );
+        assert!(
+            !resolution.covered_attention[0]
+                .attention
+                .reason
+                .contains(alpha),
+            "covered attention prose must not repeat the typed task id"
+        );
 
         let alpha_task = history
             .tasks
@@ -2190,13 +2551,21 @@ mod unix_workspace_tests {
         assert_eq!(alpha_task.status, "native_route_required");
         assert!(alpha_task.current_attention.is_none());
         assert_eq!(beta_task.status, "not_approved");
+        assert!(
+            beta_task.current_attention.is_none(),
+            "the unapproved displayed task must remain informational and uncovered"
+        );
         assert_eq!(
-            beta_task
-                .current_attention
-                .as_ref()
-                .map(|attention| attention.kind),
-            Some(WorkspaceAttentionKind::Unknown),
-            "the unapproved displayed task must remain uncovered"
+            beta_task.acceptance_proof.status,
+            WorkspaceAcceptanceStatus::Unknown,
+            "unapproved displayed work must not claim acceptance or resolution"
+        );
+        assert!(
+            resolution
+                .covered_attention
+                .iter()
+                .all(|covered| covered.task_id.as_deref() != Some(beta)),
+            "the subset receipt must not overclaim the remaining unapproved task"
         );
         assert_eq!(history.job.state, ObservationJobState::NeedsUser);
         assert_ne!(history.job.execution_status, "resolved_externally");
@@ -2326,9 +2695,10 @@ mod unix_workspace_tests {
             BTreeSet::from([alpha, beta]),
             "both prior task attention details must be preserved under the receipt"
         );
-        assert!(resolution.covered_attention.iter().all(|covered| {
-            covered.attention.kind == WorkspaceAttentionKind::NeedsUserInput
-        }));
+        assert!(resolution
+            .covered_attention
+            .iter()
+            .all(|covered| { covered.attention.kind == WorkspaceAttentionKind::NeedsUserInput }));
         assert!(history.current_attention.is_none());
         assert!(history
             .tasks
@@ -2463,7 +2833,10 @@ mod unix_workspace_tests {
                 .iter()
                 .map(|resolution| resolution.receipt_id.as_str())
                 .collect::<BTreeSet<_>>(),
-            BTreeSet::from([alpha_receipt.receipt_id.as_str(), beta_receipt.receipt_id.as_str()])
+            BTreeSet::from([
+                alpha_receipt.receipt_id.as_str(),
+                beta_receipt.receipt_id.as_str()
+            ])
         );
         for resolution in &history.external_resolutions {
             assert_eq!(resolution.covered_attention.len(), 1);
@@ -2549,7 +2922,8 @@ mod unix_workspace_tests {
             expected_runtime_revision: None,
             request_key: "req_ws_legacy_stale_01".to_string(),
             created_at_ms: 1_700_000_415_000,
-            explanation: "The original legacy revision was resolved outside Threadlane.".to_string(),
+            explanation: "The original legacy revision was resolved outside Threadlane."
+                .to_string(),
             evidence_refs: vec![ExternalResolutionEvidenceRef::ArtifactRef {
                 reference: "issue-legacy-ws-stale".to_string(),
             }],
