@@ -11,10 +11,11 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use threadlane_workers::{
-    build_antigravity_task_files_settings_json, execute_worker_task, run_worker, AdvisoryWorkerSpec,
-    DiffViolationKind, ExecutionBudgets, FieldEvidence, OpenCodeRuleEffect, WorkAcceptanceState,
-    WorkerError, WorkerFilePermissions, WorkerProvider, WorkerRunStatus, WorkerSpec,
-    WorktreeManager, AGY_READ_PERMISSION_TOOL, AGY_WRITE_PERMISSION_TOOLS, MAX_PROMPT_BYTES,
+    build_antigravity_task_files_settings_json, execute_worker_task, run_worker,
+    AdvisoryWorkerSpec, DiffViolationKind, ExecutionBudgets, FieldEvidence, OpenCodeRuleEffect,
+    WorkAcceptanceState, WorkerError, WorkerFilePermissions, WorkerProvider, WorkerRunStatus,
+    WorkerSpec, WorktreeManager, AGY_READ_PERMISSION_TOOL, AGY_WRITE_PERMISSION_TOOLS,
+    MAX_PROMPT_BYTES,
 };
 use tokio::sync::watch;
 
@@ -32,7 +33,9 @@ fn read_nul_delimited_argv(path: &Path) -> Vec<Vec<u8>> {
         Some(&0),
         "argv capture must be NUL-terminated without a text-line delimiter"
     );
-    bytes.pop().expect("NUL-terminated argv capture must contain a trailing delimiter");
+    bytes
+        .pop()
+        .expect("NUL-terminated argv capture must contain a trailing delimiter");
     if bytes.is_empty() {
         return Vec::new();
     }
@@ -649,8 +652,7 @@ async fn rejects_opencode_task_files_and_unsafe_glob_or_rule_metacharacters_befo
     let oc_effective_prompt = oc_argv.last().expect("OpenCode effective prompt");
     assert!(oc_effective_prompt.starts_with("[THREADLANE_OPENCODE_TASK_FILES_CONTRACT] "));
     assert!(oc_effective_prompt.contains(&format!("`{clean_workdir_str}`")));
-    assert!(oc_effective_prompt
-        .ends_with("[THREADLANE_TASK_INSTRUCTION] Valid OpenCode TaskFiles"));
+    assert!(oc_effective_prompt.ends_with("[THREADLANE_TASK_INSTRUCTION] Valid OpenCode TaskFiles"));
 
     let mut oc_bad_task_files = env.opencode_spec(
         spy_bin.clone(),
@@ -809,9 +811,7 @@ fn opencode_task_files_prologue_uses_exact_canonical_cwd_inside_and_outside_work
         "task checkout must be an owned mutable worktree inside work_area_root"
     );
 
-    let outside_dir = env
-        .root_dir
-        .join("outside canonical workdir café 日本語");
+    let outside_dir = env.root_dir.join("outside canonical workdir café 日本語");
     fs::create_dir_all(&outside_dir).expect("create outside canonical workdir");
     assert!(
         outside_dir.strip_prefix(&env.work_area).is_err(),
@@ -871,8 +871,7 @@ fn opencode_task_files_prologue_uses_exact_canonical_cwd_inside_and_outside_work
             .split_once("[THREADLANE_TASK_INSTRUCTION] ")
             .expect("actual OpenCode argv must carry the task instruction boundary");
         assert!(
-            contract_header
-                .starts_with("[THREADLANE_OPENCODE_TASK_FILES_CONTRACT] "),
+            contract_header.starts_with("[THREADLANE_OPENCODE_TASK_FILES_CONTRACT] "),
             "every mutable OpenCode TaskFiles cwd must receive the canonical prologue"
         );
         assert_eq!(retained_prompt, caller_prompt);
@@ -2081,9 +2080,8 @@ fn opencode_task_files_prompt_pins_actual_worktree_scopes_without_changing_permi
         ),
         "contract must distinguish explicit directory subtrees from exact files"
     );
-    assert!(contract_header.contains(
-        "OpenCode built-in file tools `read`, `glob`, `grep`, `edit`, and `write`"
-    ));
+    assert!(contract_header
+        .contains("OpenCode built-in file tools `read`, `glob`, `grep`, `edit`, and `write`"));
     assert!(
         !contract_header.contains("read_file")
             && !contract_header.contains("edit_file")
@@ -2306,7 +2304,10 @@ printf '{{"type":"step_finish","sessionID":"sess-201","part":{{"type":"step-fini
 
     let mut explicit_scopes = BTreeSet::new();
     for index in 0..4 {
-        explicit_scopes.insert(format!("crates/{}/directory-{index}/", "scope-dir-".repeat(8)));
+        explicit_scopes.insert(format!(
+            "crates/{}/directory-{index}/",
+            "scope-dir-".repeat(8)
+        ));
         explicit_scopes.insert(format!("docs/{}/file-{index}.md", "scope-file-".repeat(8)));
     }
     assert_eq!(explicit_scopes.len(), 8);
@@ -2425,10 +2426,7 @@ printf '{{"type":"step_finish","sessionID":"sess-201","part":{{"type":"step-fini
         over_spec_json_before,
         serde_json::to_vec(&over_spec).expect("serialize over-bound spec after rejection")
     );
-    assert_eq!(
-        over_digest_before,
-        sha256_hex(over_spec.prompt.as_bytes())
-    );
+    assert_eq!(over_digest_before, sha256_hex(over_spec.prompt.as_bytes()));
 }
 
 #[tokio::test]
@@ -2543,14 +2541,12 @@ Line 4: the final trailing newline follows.\n"
             .count(),
         1
     );
-    assert!(contract_header.contains(
-        &format!(
-            "`{}`",
-            checkout
-                .to_str()
-                .expect("utf8 captured task worktree checkout")
-        )
-    ));
+    assert!(contract_header.contains(&format!(
+        "`{}`",
+        checkout
+            .to_str()
+            .expect("utf8 captured task worktree checkout")
+    )));
     assert!(!contract_header.contains(source_repo_str));
     assert!(!contract_header.contains(decoy_checkout_str));
     assert!(contract_header.contains(
