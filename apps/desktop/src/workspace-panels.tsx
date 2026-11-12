@@ -560,6 +560,21 @@ function renderCoveredAttentionSection(
   );
 }
 
+function formatExternalResolutionScopeBadge(
+  view: WorkspaceExternalResolutionView,
+): string {
+  if (view.scope === 'job') {
+    return view.applicability === 'applicable'
+      ? 'Full job'
+      : `Full job (${view.applicability})`;
+  }
+  const taskCount = view.taskIds.length;
+  const taskCountLabel = `${taskCount} ${taskCount === 1 ? 'task' : 'tasks'}`;
+  return view.applicability === 'applicable'
+    ? `Partial · ${taskCountLabel}`
+    : `Partial · ${taskCountLabel} (${view.applicability})`;
+}
+
 function renderExternalResolutionCard(
   entry: WorkspacePanelExternalResolutionEntry,
   options: {
@@ -584,7 +599,9 @@ function renderExternalResolutionCard(
       <div className="tl-wp-callout-title">
         <span>{res.statusLabel}</span>
         <span className="tl-wp-pill" data-tone={applicabilityTone}>
-          <span className="tl-wp-pill-label">{res.scopeLabel}</span>
+          <span className="tl-wp-pill-label">
+            {formatExternalResolutionScopeBadge(res)}
+          </span>
         </span>
         {res.isFullJob && (
           <span className="tl-wp-pill" data-tone="neutral">
@@ -598,9 +615,7 @@ function renderExternalResolutionCard(
         )}
       </div>
       {options.showJobContext && (
-        <span className="tl-wp-state-desc">
-          {entry.jobTitle} · Job {entry.jobId}
-        </span>
+        <span className="tl-wp-state-desc">{entry.jobTitle}</span>
       )}
       <span>{res.summary}</span>
       {(options.onInspectJob || options.onSelectJob || options.onInspectActivity) && (
@@ -657,6 +672,7 @@ function renderExternalResolutionCard(
         <div className="tl-wp-message-details-body">
           <span className="tl-wp-mono">Receipt: {res.receiptId}</span>
           <div className="tl-wp-kv-row tl-wp-mono">
+            <span>Job: {entry.jobId}</span>
             {res.requestKey && <span>Request key: {res.requestKey}</span>}
             {res.previewDigest && <span>Preview digest: {res.previewDigest}</span>}
             {res.taskIds.length > 0 && <span>Tasks: {res.taskIds.join(', ')}</span>}

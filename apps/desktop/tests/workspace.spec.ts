@@ -1516,6 +1516,13 @@ test.describe('Workspace external resolution receipts', () => {
     await expect(fullReceipt.getByText('Resolved externally').first()).toBeVisible();
     await expect(fullReceipt.getByText('Full job').first()).toBeVisible();
     await expect(fullReceipt.getByText(EXTERNAL_RESOLUTION_FULL_SUMMARY).first()).toBeVisible();
+    await expect(
+      fullReceipt.locator('.tl-wp-state-desc').first(),
+    ).toHaveText('Externally Resolved Full Job');
+    await expect(fullReceipt.getByText('Job: job_ext_full_01').first()).toBeHidden();
+    await expect(fullReceipt.getByText('task_ext_full_01').first()).toBeHidden();
+    await expectUsableMessagesScroller(messagesPanel);
+    await expectInViewportWithinScroller(messagesScroller, fullMessageReceiptButton);
     const fullReceiptDetails = fullReceipt
       .locator('details[data-external-resolution-details]')
       .first();
@@ -1523,6 +1530,10 @@ test.describe('Workspace external resolution receipts', () => {
     await expect(
       fullReceipt.getByText(`Receipt: ${EXTERNAL_RESOLUTION_FULL_RECEIPT_ID}`).first(),
     ).toBeVisible();
+    await expect(
+      fullReceipt.getByText('Job: job_ext_full_01').first(),
+    ).toBeVisible();
+    await expect(fullReceipt.getByText('task_ext_full_01').first()).toBeVisible();
     await expect(fullReceipt.getByText('ev_ext_fixture_full_01').first()).toBeVisible();
     await expect(
       fullReceipt.getByText(EXTERNAL_RESOLUTION_COVERED_JOB_REASON).first(),
@@ -1538,8 +1549,25 @@ test.describe('Workspace external resolution receipts', () => {
     await expect(
       partialReceipt.getByText('Partially resolved externally').first(),
     ).toBeVisible();
-    await expect(partialReceipt.getByText('Partial').first()).toBeVisible();
-    await expect(partialReceipt.getByText('task_ext_partial_01').first()).toBeVisible();
+    await expect(partialReceipt.getByText('Partial · 1 task').first()).toBeVisible();
+    await expect(
+      partialReceipt.locator('.tl-wp-state-desc').first(),
+    ).toHaveText('Externally Resolved Partial Job');
+    await expect(partialReceipt.getByText('job_ext_partial_02').first()).toBeHidden();
+    await expect(partialReceipt.getByText('task_ext_partial_01').first()).toBeHidden();
+    await expectUsableMessagesScroller(messagesPanel);
+    await expectInViewportWithinScroller(messagesScroller, fullMessageReceiptButton);
+    await ensureDetailsOpen(
+      partialReceipt.locator('details[data-external-resolution-details]').first(),
+    );
+    await expect(
+      partialReceipt.getByText('job_ext_partial_02').first(),
+    ).toBeVisible();
+    await expect(
+      partialReceipt.getByText('task_ext_partial_01').first(),
+    ).toBeVisible();
+    await expectUsableMessagesScroller(messagesPanel);
+    await expectInViewportWithinScroller(messagesScroller, fullMessageReceiptButton);
 
     const messagesHistory = messagesReceipts.locator(
       '[data-external-resolution-surface="messages-history"]',
@@ -1549,15 +1577,49 @@ test.describe('Workspace external resolution receipts', () => {
     await expect(
       messagesHistory.getByText('Unverified external receipt').first(),
     ).toBeVisible();
-    await expect(
-      messagesHistory.locator(
+    const staleHistoryReceipt = messagesHistory
+      .locator(
         `[data-external-resolution-receipt-id="${EXTERNAL_RESOLUTION_STALE_RECEIPT_ID}"]`,
-      ),
+      )
+      .first();
+    await expect(staleHistoryReceipt).toBeVisible();
+    await expect(
+      staleHistoryReceipt.getByText('Partial · 1 task (stale)').first(),
     ).toBeVisible();
     await expect(
-      messagesHistory.locator(
+      staleHistoryReceipt.locator('.tl-wp-state-desc').first(),
+    ).toHaveText('Blocked With Historical Receipts');
+    await expect(staleHistoryReceipt.getByText('job_ext_blocked_03').first()).toBeHidden();
+    await expect(staleHistoryReceipt.getByText('task_ext_blocked_03').first()).toBeHidden();
+    await ensureDetailsOpen(
+      staleHistoryReceipt.locator('details[data-external-resolution-details]').first(),
+    );
+    await expect(
+      staleHistoryReceipt.getByText('job_ext_blocked_03').first(),
+    ).toBeVisible();
+    await expect(
+      staleHistoryReceipt.getByText('task_ext_blocked_03').first(),
+    ).toBeVisible();
+
+    const unverifiedHistoryReceipt = messagesHistory
+      .locator(
         `[data-external-resolution-receipt-id="${EXTERNAL_RESOLUTION_UNVERIFIED_RECEIPT_ID}"]`,
-      ),
+      )
+      .first();
+    await expect(unverifiedHistoryReceipt).toBeVisible();
+    await expect(
+      unverifiedHistoryReceipt.getByText('Full job (unverified)').first(),
+    ).toBeVisible();
+    await expect(
+      unverifiedHistoryReceipt.getByText('job_ext_blocked_03').first(),
+    ).toBeHidden();
+    await ensureDetailsOpen(
+      unverifiedHistoryReceipt
+        .locator('details[data-external-resolution-details]')
+        .first(),
+    );
+    await expect(
+      unverifiedHistoryReceipt.getByText('job_ext_blocked_03').first(),
     ).toBeVisible();
     await expect(messagesHistory.getByText('External resolution history (2)')).toBeVisible();
     await expect(
@@ -1591,12 +1653,17 @@ test.describe('Workspace external resolution receipts', () => {
         `[data-external-resolution-receipt-id="${EXTERNAL_RESOLUTION_FULL_RECEIPT_ID}"]`,
       )
       .first();
+    await expect(jobFullReceipt.getByText('Full job').first()).toBeVisible();
+    await expect(jobFullReceipt.getByText('Job: job_ext_full_01').first()).toBeHidden();
+    await expect(jobFullReceipt.getByText('task_ext_full_01').first()).toBeHidden();
     await ensureDetailsOpen(
       jobFullReceipt.locator('details[data-external-resolution-details]').first(),
     );
     await expect(
       fullJobCard.getByText(`Receipt: ${EXTERNAL_RESOLUTION_FULL_RECEIPT_ID}`).first(),
     ).toBeVisible();
+    await expect(jobFullReceipt.getByText('job_ext_full_01').first()).toBeVisible();
+    await expect(jobFullReceipt.getByText('task_ext_full_01').first()).toBeVisible();
     await expect(
       fullJobCard.getByText(/Phase:\s*external_resolution/).first(),
     ).toBeVisible();
@@ -1632,6 +1699,24 @@ test.describe('Workspace external resolution receipts', () => {
     ).toBeVisible();
     await expect(
       partialJobCard.getByText('Unrelated task remains visible').first(),
+    ).toBeVisible();
+    const jobPartialReceipt = partialJobCard
+      .locator(
+        `[data-external-resolution-receipt-id="${EXTERNAL_RESOLUTION_PARTIAL_RECEIPT_ID}"]`,
+      )
+      .first();
+    await expect(jobPartialReceipt).toBeVisible();
+    await expect(jobPartialReceipt.getByText('Partial · 1 task').first()).toBeVisible();
+    await expect(jobPartialReceipt.getByText('job_ext_partial_02').first()).toBeHidden();
+    await expect(jobPartialReceipt.getByText('task_ext_partial_01').first()).toBeHidden();
+    await ensureDetailsOpen(
+      jobPartialReceipt.locator('details[data-external-resolution-details]').first(),
+    );
+    await expect(
+      jobPartialReceipt.getByText('job_ext_partial_02').first(),
+    ).toBeVisible();
+    await expect(
+      jobPartialReceipt.getByText('task_ext_partial_01').first(),
     ).toBeVisible();
 
     const blockedJobCard = jobsPanel.locator(
@@ -1693,10 +1778,53 @@ test.describe('Workspace external resolution receipts', () => {
         `[data-external-resolution-receipt-id="${EXTERNAL_RESOLUTION_FULL_RECEIPT_ID}"]`,
       ),
     ).toBeVisible();
+    const activityFullReceipt = activityReceipts
+      .locator(
+        `[data-external-resolution-receipt-id="${EXTERNAL_RESOLUTION_FULL_RECEIPT_ID}"]`,
+      )
+      .first();
+    await expect(activityFullReceipt).toBeVisible();
     await expect(
-      activityReceipts.locator(
+      activityFullReceipt.locator('.tl-wp-state-desc').first(),
+    ).toHaveText('Externally Resolved Full Job');
+    await expect(activityFullReceipt.getByText('Job: job_ext_full_01').first()).toBeHidden();
+    await expect(activityFullReceipt.getByText('task_ext_full_01').first()).toBeHidden();
+    await ensureDetailsOpen(
+      activityFullReceipt.locator('details[data-external-resolution-details]').first(),
+    );
+    await expect(
+      activityFullReceipt.getByText('Job: job_ext_full_01').first(),
+    ).toBeVisible();
+    await expect(activityFullReceipt.getByText('task_ext_full_01').first()).toBeVisible();
+
+    const activityPartialReceipt = activityReceipts
+      .locator(
         `[data-external-resolution-receipt-id="${EXTERNAL_RESOLUTION_PARTIAL_RECEIPT_ID}"]`,
-      ),
+      )
+      .first();
+    await expect(activityPartialReceipt).toBeVisible();
+    await expect(
+      activityPartialReceipt.getByText('Partial · 1 task').first(),
+    ).toBeVisible();
+    await expect(
+      activityPartialReceipt.locator('.tl-wp-state-desc').first(),
+    ).toHaveText('Externally Resolved Partial Job');
+    await expect(
+      activityPartialReceipt.getByText('job_ext_partial_02').first(),
+    ).toBeHidden();
+    await expect(
+      activityPartialReceipt.getByText('task_ext_partial_01').first(),
+    ).toBeHidden();
+    await ensureDetailsOpen(
+      activityPartialReceipt
+        .locator('details[data-external-resolution-details]')
+        .first(),
+    );
+    await expect(
+      activityPartialReceipt.getByText('job_ext_partial_02').first(),
+    ).toBeVisible();
+    await expect(
+      activityPartialReceipt.getByText('task_ext_partial_01').first(),
     ).toBeVisible();
     const activityHistory = activityPanel.locator(
       '[data-external-resolution-surface="activity-history"]',
@@ -1705,6 +1833,29 @@ test.describe('Workspace external resolution receipts', () => {
     await expect(activityHistory.getByText('Stale external receipt').first()).toBeVisible();
     await expect(
       activityHistory.getByText('Unverified external receipt').first(),
+    ).toBeVisible();
+    const activityStaleReceipt = activityHistory
+      .locator(
+        `[data-external-resolution-receipt-id="${EXTERNAL_RESOLUTION_STALE_RECEIPT_ID}"]`,
+      )
+      .first();
+    await expect(activityStaleReceipt).toBeVisible();
+    await expect(
+      activityStaleReceipt.getByText('Partial · 1 task (stale)').first(),
+    ).toBeVisible();
+    await expect(
+      activityStaleReceipt.locator('.tl-wp-state-desc').first(),
+    ).toHaveText('Blocked With Historical Receipts');
+    await expect(activityStaleReceipt.getByText('job_ext_blocked_03').first()).toBeHidden();
+    await expect(activityStaleReceipt.getByText('task_ext_blocked_03').first()).toBeHidden();
+    await ensureDetailsOpen(
+      activityStaleReceipt.locator('details[data-external-resolution-details]').first(),
+    );
+    await expect(
+      activityStaleReceipt.getByText('job_ext_blocked_03').first(),
+    ).toBeVisible();
+    await expect(
+      activityStaleReceipt.getByText('task_ext_blocked_03').first(),
     ).toBeVisible();
     await expect(activityPanel.locator('article.tl-wp-activity-card')).toHaveCount(0);
     await expect(
@@ -1760,12 +1911,52 @@ test.describe('Workspace external resolution receipts', () => {
         `[data-external-resolution-receipt-id="${EXTERNAL_RESOLUTION_FULL_RECEIPT_ID}"]`,
       )
       .first();
+    await expect(narrowFullReceipt.getByText('Full job').first()).toBeVisible();
+    await expect(
+      narrowFullReceipt.locator('.tl-wp-state-desc').first(),
+    ).toHaveText('Externally Resolved Full Job');
+    await expect(narrowFullReceipt.getByText('Job: job_ext_full_01').first()).toBeHidden();
+    await expect(narrowFullReceipt.getByText('task_ext_full_01').first()).toBeHidden();
+    await expectUsableMessagesScroller(messagesPanel);
+    await expectInViewportWithinScroller(messagesScroller, fullMessageReceiptButton);
     await ensureDetailsOpen(
       narrowFullReceipt.locator('details[data-external-resolution-details]').first(),
     );
     await expect(
+      narrowFullReceipt.getByText('Job: job_ext_full_01').first(),
+    ).toBeVisible();
+    await expect(narrowFullReceipt.getByText('task_ext_full_01').first()).toBeVisible();
+    await expect(
       messagesReceipts.getByText(EXTERNAL_RESOLUTION_COVERED_JOB_REASON).first(),
     ).toBeVisible();
+
+    const narrowPartialReceipt = messagesReceipts
+      .locator(
+        `[data-external-resolution-receipt-id="${EXTERNAL_RESOLUTION_PARTIAL_RECEIPT_ID}"]`,
+      )
+      .first();
+    await expect(narrowPartialReceipt).toBeVisible();
+    await expect(
+      narrowPartialReceipt.getByText('Partial · 1 task').first(),
+    ).toBeVisible();
+    await expect(
+      narrowPartialReceipt.locator('.tl-wp-state-desc').first(),
+    ).toHaveText('Externally Resolved Partial Job');
+    await expect(narrowPartialReceipt.getByText('job_ext_partial_02').first()).toBeHidden();
+    await expect(narrowPartialReceipt.getByText('task_ext_partial_01').first()).toBeHidden();
+    await expectUsableMessagesScroller(messagesPanel);
+    await expectInViewportWithinScroller(messagesScroller, fullMessageReceiptButton);
+    await ensureDetailsOpen(
+      narrowPartialReceipt.locator('details[data-external-resolution-details]').first(),
+    );
+    await expect(
+      narrowPartialReceipt.getByText('job_ext_partial_02').first(),
+    ).toBeVisible();
+    await expect(
+      narrowPartialReceipt.getByText('task_ext_partial_01').first(),
+    ).toBeVisible();
+    await expectUsableMessagesScroller(messagesPanel);
+    await expectInViewportWithinScroller(messagesScroller, fullMessageReceiptButton);
     const messagesHistory = messagesReceipts.locator(
       '[data-external-resolution-surface="messages-history"]',
     );
@@ -1797,9 +1988,18 @@ test.describe('Workspace external resolution receipts', () => {
         `[data-external-resolution-receipt-id="${EXTERNAL_RESOLUTION_FULL_RECEIPT_ID}"]`,
       )
       .first();
+    await expect(narrowJobFullReceipt.getByText('Full job').first()).toBeVisible();
+    await expect(narrowJobFullReceipt.getByText('Job: job_ext_full_01').first()).toBeHidden();
+    await expect(narrowJobFullReceipt.getByText('task_ext_full_01').first()).toBeHidden();
     await ensureDetailsOpen(
       narrowJobFullReceipt.locator('details[data-external-resolution-details]').first(),
     );
+    await expect(
+      narrowJobFullReceipt.getByText('job_ext_full_01').first(),
+    ).toBeVisible();
+    await expect(
+      narrowJobFullReceipt.getByText('task_ext_full_01').first(),
+    ).toBeVisible();
     await expect(
       fullJobCard.getByText(EXTERNAL_RESOLUTION_COVERED_TASK_REASON).first(),
     ).toBeVisible();
@@ -1824,11 +2024,96 @@ test.describe('Workspace external resolution receipts', () => {
     await expect(
       blockedHistory.getByText('Unverified external receipt').first(),
     ).toBeVisible();
+    const narrowBlockedStaleReceipt = blockedHistory
+      .locator(
+        `[data-external-resolution-receipt-id="${EXTERNAL_RESOLUTION_STALE_RECEIPT_ID}"]`,
+      )
+      .first();
+    await expect(narrowBlockedStaleReceipt).toBeVisible();
+    await expect(
+      narrowBlockedStaleReceipt.getByText('Partial · 1 task (stale)').first(),
+    ).toBeVisible();
+    await expect(
+      narrowBlockedStaleReceipt.locator('.tl-wp-state-desc').first(),
+    ).toHaveText('Blocked With Historical Receipts');
+    await expect(
+      narrowBlockedStaleReceipt.getByText('job_ext_blocked_03').first(),
+    ).toBeHidden();
+    await expect(
+      narrowBlockedStaleReceipt.getByText('task_ext_blocked_03').first(),
+    ).toBeHidden();
+    await ensureDetailsOpen(
+      narrowBlockedStaleReceipt
+        .locator('details[data-external-resolution-details]')
+        .first(),
+    );
+    await expect(
+      narrowBlockedStaleReceipt.getByText('job_ext_blocked_03').first(),
+    ).toBeVisible();
+    await expect(
+      narrowBlockedStaleReceipt.getByText('task_ext_blocked_03').first(),
+    ).toBeVisible();
 
     await chatSurfaceTab(page, 'Activity').click();
     const activityPanel = visibleActivityPanel(page);
+    const narrowActivityReceipts = activityPanel.locator(
+      '[data-external-resolution-surface="activity"]',
+    );
+    await expect(narrowActivityReceipts).toBeVisible();
+    const narrowActivityFullReceipt = narrowActivityReceipts
+      .locator(
+        `[data-external-resolution-receipt-id="${EXTERNAL_RESOLUTION_FULL_RECEIPT_ID}"]`,
+      )
+      .first();
+    await expect(narrowActivityFullReceipt).toBeVisible();
     await expect(
-      activityPanel.locator('[data-external-resolution-surface="activity"]'),
+      narrowActivityFullReceipt.locator('.tl-wp-state-desc').first(),
+    ).toHaveText('Externally Resolved Full Job');
+    await expect(
+      narrowActivityFullReceipt.getByText('Job: job_ext_full_01').first(),
+    ).toBeHidden();
+    await expect(
+      narrowActivityFullReceipt.getByText('task_ext_full_01').first(),
+    ).toBeHidden();
+    await ensureDetailsOpen(
+      narrowActivityFullReceipt
+        .locator('details[data-external-resolution-details]')
+        .first(),
+    );
+    await expect(
+      narrowActivityFullReceipt.getByText('Job: job_ext_full_01').first(),
+    ).toBeVisible();
+    await expect(
+      narrowActivityFullReceipt.getByText('task_ext_full_01').first(),
+    ).toBeVisible();
+    const narrowActivityPartialReceipt = narrowActivityReceipts
+      .locator(
+        `[data-external-resolution-receipt-id="${EXTERNAL_RESOLUTION_PARTIAL_RECEIPT_ID}"]`,
+      )
+      .first();
+    await expect(narrowActivityPartialReceipt).toBeVisible();
+    await expect(
+      narrowActivityPartialReceipt.getByText('Partial · 1 task').first(),
+    ).toBeVisible();
+    await expect(
+      narrowActivityPartialReceipt.locator('.tl-wp-state-desc').first(),
+    ).toHaveText('Externally Resolved Partial Job');
+    await expect(
+      narrowActivityPartialReceipt.getByText('job_ext_partial_02').first(),
+    ).toBeHidden();
+    await expect(
+      narrowActivityPartialReceipt.getByText('task_ext_partial_01').first(),
+    ).toBeHidden();
+    await ensureDetailsOpen(
+      narrowActivityPartialReceipt
+        .locator('details[data-external-resolution-details]')
+        .first(),
+    );
+    await expect(
+      narrowActivityPartialReceipt.getByText('job_ext_partial_02').first(),
+    ).toBeVisible();
+    await expect(
+      narrowActivityPartialReceipt.getByText('task_ext_partial_01').first(),
     ).toBeVisible();
     const activityHistory = activityPanel.locator(
       '[data-external-resolution-surface="activity-history"]',

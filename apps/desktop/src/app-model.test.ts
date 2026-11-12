@@ -4148,7 +4148,17 @@ describe('workspace external resolution projection', () => {
     assert.equal(staleMessageView.linkedReceiptId, staleReceipt.receipt_id);
     assert.equal(staleMessageView.linkedReceiptApplicability, 'stale');
 
-    assert.equal(selectedChat.messages.externalResolutions.length, 4);
+    assert.equal(selectedChat.messages.externalResolutions.length, 5);
+    assert.deepEqual(
+      selectedChat.messages.externalResolutions.map((res) => res.receiptId).sort(),
+      [
+        fullReceipt.receipt_id,
+        partialReceipt.receipt_id,
+        staleReceipt.receipt_id,
+        unverifiedReceipt.receipt_id,
+        unknownReceipt.receipt_id,
+      ].sort(),
+    );
     const fullMessageReceipt = selectedChat.messages.externalResolutions.find(
       (res) => res.receiptId === fullReceipt.receipt_id,
     );
@@ -4164,7 +4174,17 @@ describe('workspace external resolution projection', () => {
     assert.equal(staleMessageReceipt.statusLabel, 'Stale external receipt');
 
     assert.equal(selectedChat.activity.items.length, 0);
-    assert.equal(selectedChat.activity.receiptItems.length, 4);
+    assert.equal(selectedChat.activity.receiptItems.length, 5);
+    assert.deepEqual(
+      selectedChat.activity.receiptItems.map((res) => res.receiptId).sort(),
+      [
+        fullReceipt.receipt_id,
+        partialReceipt.receipt_id,
+        staleReceipt.receipt_id,
+        unverifiedReceipt.receipt_id,
+        unknownReceipt.receipt_id,
+      ].sort(),
+    );
     const fullActivityReceipt = selectedChat.activity.receiptItems.find(
       (res) => res.receiptId === fullReceipt.receipt_id,
     );
