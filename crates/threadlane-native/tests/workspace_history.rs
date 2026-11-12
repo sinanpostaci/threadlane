@@ -14,7 +14,7 @@ use tempfile::TempDir;
 use threadlane_authority::{AuthorityStore, OperatorApprovalRequest};
 use threadlane_core::observation::{
     ObservationJobState, WorkspaceAcceptanceProof, WorkspaceAcceptanceStatus,
-    WorkspaceAttentionKind, WorkspaceChatIdentity,
+    WorkspaceAttentionKind, WorkspaceChatIdentity, WorkspaceJobHistory,
 };
 use threadlane_host::{prepare_session_dir, HostSessionLock, WORK_AREA_SUBDIR};
 use threadlane_native::coworker_observation::workspace_history::{
@@ -34,17 +34,18 @@ use threadlane_native::coworker_workflow::{
     ControllerConfigurationPreview, ControllerJobRuntimeState, ControllerPolicyStore,
     ControllerRoleExecutionBudget, ControllerRoleUsageCounters, CoworkerBindingLedger,
     CoworkerJobOwnershipKey, CoworkerJobOwnershipStore, CoworkerJobPhase, CoworkerJobRecord,
-    CoworkerTaskRecord, CoworkerTaskStage, CoworkerWorkflowStore, CreateCoworkerJobRequest,
-    FinalizeTaskOutboxRequest, FreezeControllerExecutionEnvelopeRequest, FrozenApprovalLinkage,
-    FrozenCheckCommandSpec, FrozenCheckExecutionStatus, FrozenCheckKind, FrozenCheckSubject,
-    FrozenCheckTargetKind, FrozenControllerCapabilityEnvelope, FrozenControllerExecutionEnvelope,
-    OutboxDispatchKind, OutboxDispatchRecord, OutboxDispatchStatus, PendingControllerEffect,
-    PendingControllerEffectKind, PendingControllerEffectStatus, PlanningAdviceGrant,
-    PlanningCallBudget, PlanningCallReservation, PlanningGrantStatus, PlanningGrantUsage,
-    PlanningReadOnlyCapabilities, PlanningReservationStatus, PlanningResultRef,
-    RecordTaskReviewVerdictRequest, ReserveTaskOutboxRequest, ReviewVerdictOutcome,
-    StructuredReviewVerdict, TaskAttemptExecutionArtifacts, TaskAttemptRef, TaskCandidateRef,
-    TaskInterfaceOwnershipSpec, WorkBrief, WorkBriefKind, WorkflowHoldReason, WorkflowHoldRecord,
+    CoworkerPlanningService, CoworkerTaskRecord, CoworkerTaskStage, CoworkerWorkflowStore,
+    CreateCoworkerJobRequest, FinalizeTaskOutboxRequest, FreezeControllerExecutionEnvelopeRequest,
+    FrozenApprovalLinkage, FrozenCheckCommandSpec, FrozenCheckExecutionStatus, FrozenCheckKind,
+    FrozenCheckSubject, FrozenCheckTargetKind, FrozenControllerCapabilityEnvelope,
+    FrozenControllerExecutionEnvelope, OutboxDispatchKind, OutboxDispatchRecord,
+    OutboxDispatchStatus, PendingControllerEffect, PendingControllerEffectKind,
+    PendingControllerEffectStatus, PlanningAdviceGrant, PlanningCallBudget,
+    PlanningCallReservation, PlanningGrantStatus, PlanningGrantUsage, PlanningReadOnlyCapabilities,
+    PlanningReservationStatus, PlanningResultRef, RecordTaskReviewVerdictRequest,
+    ReserveTaskOutboxRequest, ReviewVerdictOutcome, StructuredReviewVerdict,
+    TaskAttemptExecutionArtifacts, TaskAttemptRef, TaskCandidateRef, TaskInterfaceOwnershipSpec,
+    WorkBrief, WorkBriefKind, WorkflowHoldReason, WorkflowHoldRecord,
 };
 use threadlane_native::error::NativeErrorCode;
 use threadlane_native::profile_flow::{
@@ -4152,6 +4153,47 @@ fn retires_attention_for_store_verified_obsolete_planning_jobs_across_two_step_l
         .expect("workflow ledger path");
     write_private_json(&ledger_path, &ledger);
 
+    {
+        let plan_store = PlanStore::open(&plans_dir).expect("open plan store");
+        for (idx, pid) in ["plan_obs_02", "plan_obs_03", "plan_obs_04"]
+            .into_iter()
+            .enumerate()
+        {
+            let draft = plan_store
+                .change_at(
+                    0,
+                    PlanChange::SaveDraft {
+                        plan_id: pid.to_string(),
+                        binding_id: BINDING_A.to_string(),
+                        profile_id: "profile-default".to_string(),
+                        profile_revision: 1,
+                        summary: format!("Published plan for {pid}"),
+                        tasks: vec![PlanTask {
+                            id: "task-obs-01".to_string(),
+                            title: "Implement slice".to_string(),
+                            instruction: "Update src/lib.rs".to_string(),
+                            role: WorkflowRole::Coder,
+                            difficulty: Difficulty::Hard,
+                            depends_on: Vec::new(),
+                            allowed_write_paths: vec!["src/lib.rs".to_string()],
+                        }],
+                    },
+                    1_700_000_049_000 + idx as i64,
+                )
+                .expect("save plan draft");
+            plan_store
+                .change(
+                    draft.revision,
+                    PlanChange::Publish {
+                        plan_id: pid.to_string(),
+                        revision: draft.revision,
+                    },
+                )
+                .expect("publish plan draft");
+        }
+    }
+    remove_lockfiles_in_dir(&plans_dir);
+
     let mut entries_before: Vec<_> = fs::read_dir(&plans_dir)
         .expect("read plans_dir before")
         .map(|e| e.expect("entry").file_name())
@@ -4332,11 +4374,17 @@ fn forged_lineage_context_unrelated_jobs_and_scope_or_revision_mismatches_do_not
     let pure_await =
         project_coworker_job_history(&chat_a, &job_forged_await, None, Some(&forged_ctx))
             .expect("pure await projection");
-    assert_eq!(pure_await.job.approval_status, "superseded");
-    assert_eq!(pure_await.job.state, ObservationJobState::NeedsUser);
+    // A public caller-supplied supersession link must not mint an approval-status claim for an
+    // unproved AwaitingApproval job that retains truthful `Unknown` attention.
+    assert_eq!(pure_await.job.approval_status, "unknown");
+    assert_eq!(pure_await.job.state, ObservationJobState::Unknown);
     assert_eq!(
         pure_await.current_attention.as_ref().map(|a| a.kind),
-        Some(WorkspaceAttentionKind::NeedsApproval)
+        Some(WorkspaceAttentionKind::Unknown)
+    );
+    assert_eq!(
+        pure_await.links.superseded_by_job_id.as_deref(),
+        Some("job_claimed_successor_99")
     );
     let pure_held =
         project_coworker_job_history(&chat_a, &job_forged_held, None, Some(&forged_ctx))
@@ -4620,15 +4668,19 @@ fn forged_lineage_context_unrelated_jobs_and_scope_or_revision_mismatches_do_not
     let h_unrel = find_job(&job_unrel_old.job_id);
     assert_eq!(
         h_unrel.current_attention.as_ref().map(|a| a.kind),
-        Some(WorkspaceAttentionKind::NeedsApproval)
+        Some(WorkspaceAttentionKind::Unknown)
     );
+    assert_eq!(h_unrel.job.state, ObservationJobState::Unknown);
+    assert_eq!(h_unrel.job.approval_status, "unknown");
     assert_eq!(h_unrel.links.superseded_by_job_id, None);
 
     let h_rev = find_job(&job_rev_old.job_id);
     assert_eq!(
         h_rev.current_attention.as_ref().map(|a| a.kind),
-        Some(WorkspaceAttentionKind::NeedsApproval)
+        Some(WorkspaceAttentionKind::Unknown)
     );
+    assert_eq!(h_rev.job.state, ObservationJobState::Unknown);
+    assert_eq!(h_rev.job.approval_status, "unknown");
     assert_eq!(h_rev.links.superseded_by_job_id, None);
 
     let h_repo = find_job(&job_repo_old.job_id);
@@ -4641,8 +4693,10 @@ fn forged_lineage_context_unrelated_jobs_and_scope_or_revision_mismatches_do_not
     let h_auth = find_job(&job_auth_old.job_id);
     assert_eq!(
         h_auth.current_attention.as_ref().map(|a| a.kind),
-        Some(WorkspaceAttentionKind::NeedsApproval)
+        Some(WorkspaceAttentionKind::Unknown)
     );
+    assert_eq!(h_auth.job.state, ObservationJobState::Unknown);
+    assert_eq!(h_auth.job.approval_status, "unknown");
     assert_eq!(h_auth.links.superseded_by_job_id, None);
 }
 
@@ -6609,7 +6663,7 @@ fn cyclic_and_dangling_amendment_lineages_preserve_attention_and_isolate_foreign
         Some(WorkspaceAttentionKind::OnHold)
     );
     assert_eq!(h_cyc_a.job.state, ObservationJobState::NeedsUser);
-    assert_eq!(h_cyc_a.job.approval_status, "pending_approval");
+    assert_eq!(h_cyc_a.job.approval_status, "unknown");
     assert_eq!(
         h_cyc_a.acceptance_proof,
         WorkspaceAcceptanceProof::unknown()
@@ -6691,4 +6745,1595 @@ fn cyclic_and_dangling_amendment_lineages_preserve_attention_and_isolate_foreign
         reversed_read.jobs, forward_read.jobs,
         "reversed ledger order must yield identical projections for cycles and dangling links"
     );
+}
+
+// ============================================================================
+// Truthful awaiting-plan attention & current-publication metadata witness
+// ============================================================================
+
+const EXPECTED_VERIFIED_PENDING_PLAN_REASON: &str =
+    "The latest recorded published plan referenced by this job has no approval linked to the job.";
+const EXPECTED_UNVERIFIED_PENDING_PLAN_REASON: &str =
+    "This job records an awaiting-approval state, but its current published plan could not be verified.";
+const EXPECTED_PENDING_PLAN_NEXT_STEP: &str =
+    "Inspect the current plan and approval evidence before deciding whether approval or a revised plan is needed.";
+
+fn sample_two_task_plan_dag() -> Vec<PlanTask> {
+    vec![
+        PlanTask {
+            id: "task-prep".to_string(),
+            title: "Prepare contracts".to_string(),
+            instruction: "Update src/prep.rs".to_string(),
+            role: WorkflowRole::Coder,
+            difficulty: Difficulty::Medium,
+            depends_on: Vec::new(),
+            allowed_write_paths: vec!["src/prep.rs".to_string()],
+        },
+        PlanTask {
+            id: "task-impl".to_string(),
+            title: "Implement projection".to_string(),
+            instruction: "Update src/impl.rs".to_string(),
+            role: WorkflowRole::Coder,
+            difficulty: Difficulty::Hard,
+            depends_on: vec!["task-prep".to_string()],
+            allowed_write_paths: vec!["src/impl.rs".to_string()],
+        },
+    ]
+}
+
+fn save_plan_draft_in_store(
+    plan_store: &PlanStore,
+    expected_rev: u64,
+    plan_id: &str,
+    binding_id: &str,
+    profile_id: &str,
+    profile_revision: u64,
+    now_ms: i64,
+) -> threadlane_workflow::PlanRevision {
+    plan_store
+        .change_at(
+            expected_rev,
+            PlanChange::SaveDraft {
+                plan_id: plan_id.to_string(),
+                binding_id: binding_id.to_string(),
+                profile_id: profile_id.to_string(),
+                profile_revision,
+                summary: format!("Plan summary for {plan_id}"),
+                tasks: sample_two_task_plan_dag(),
+            },
+            now_ms,
+        )
+        .expect("save plan draft in store")
+}
+
+#[test]
+fn awaiting_approval_verified_current_published_plan_metadata_projects_bounded_needs_approval() {
+    let tmp = TempDir::new().expect("tempdir");
+    let plans_dir = make_private_dir(&tmp.path().join("plans-verified-pos"));
+    let repo_dir = make_private_dir(&tmp.path().join("repo-verified-pos"));
+    let (base_commit, _) = init_phase2_git_repo(&repo_dir);
+    let chat =
+        WorkspaceChatIdentity::new(SOURCE_A, BINDING_A, THREAD_A, &repo_dir.to_string_lossy())
+            .expect("valid chat identity");
+
+    let base = CanonicalProjectBaseRef::resolve_and_validate(&repo_dir, &base_commit)
+        .expect("resolve positive fixture project base");
+    let planning_policy = sample_planning_policy();
+    let policy_digest = planning_policy.digest().expect("planning policy digest");
+    let grant_id = "grt_pos_current_0123456789abcdef";
+
+    // Create 3 active-published plans (`Published`, `Received`, `Applied`) in the real PlanStore.
+    {
+        let plan_store = PlanStore::open(&plans_dir).expect("open plan store");
+        for (idx, (pid, status_step)) in [
+            ("plan_pos_published", 0u8),
+            ("plan_pos_received", 1u8),
+            ("plan_pos_applied", 2u8),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let draft = save_plan_draft_in_store(
+                &plan_store,
+                0,
+                pid,
+                BINDING_A,
+                "profile-default",
+                1,
+                1_700_000_010_000 + idx as i64,
+            );
+            let published = plan_store
+                .change(
+                    draft.revision,
+                    PlanChange::Publish {
+                        plan_id: pid.to_string(),
+                        revision: draft.revision,
+                    },
+                )
+                .expect("publish plan");
+            if status_step >= 1 {
+                plan_store
+                    .change(
+                        published.revision,
+                        PlanChange::Receive {
+                            plan_id: pid.to_string(),
+                            revision: published.revision,
+                        },
+                    )
+                    .expect("mark plan received");
+            }
+            if status_step >= 2 {
+                plan_store
+                    .change(
+                        published.revision,
+                        PlanChange::Apply {
+                            plan_id: pid.to_string(),
+                            revision: published.revision,
+                        },
+                    )
+                    .expect("mark plan applied");
+            }
+        }
+    }
+
+    let mut task_interfaces = BTreeMap::new();
+    task_interfaces.insert(
+        "task-prep".to_string(),
+        TaskInterfaceOwnershipSpec {
+            owned_interfaces: vec!["iface_prep".to_string()],
+            consumed_interfaces: Vec::new(),
+        },
+    );
+    task_interfaces.insert(
+        "task-impl".to_string(),
+        TaskInterfaceOwnershipSpec {
+            owned_interfaces: vec!["iface_impl".to_string()],
+            consumed_interfaces: vec!["iface_prep".to_string()],
+        },
+    );
+
+    let (b_pub, d_pub) = sample_work_brief(
+        "brf_pos_pub",
+        BINDING_A,
+        THREAD_A,
+        base.clone(),
+        WorkBriefKind::NewJob,
+        "Published head plan job",
+    );
+    let dependency_file_blobs = CoworkerPlanningService::compute_dependency_file_blobs(
+        &base,
+        &["src/alpha.rs".to_string()],
+    )
+    .expect("compute positive fixture dependency file blobs");
+    let arch_ctx = ArchitectContextDependencies {
+        project_base: base.clone(),
+        work_brief_digest: d_pub.clone(),
+        plan_digest: None,
+        policy_digest: policy_digest.clone(),
+        dependency_file_blobs,
+        interface_ownership_digests: BTreeMap::new(),
+        accepted_predecessor_trees: BTreeMap::new(),
+    };
+    let arch_ctx_digest = arch_ctx.context_digest().expect("architect context digest");
+    let advice_id = "adv_pos_current_0123456789abcdef";
+    let arch_choice = sample_architect_choice();
+    let arch_res = PlanningCallReservation {
+        reservation_id: "rsv_arch_pos_01".to_string(),
+        request_key: "req_arch_pos_01".to_string(),
+        role: WorkflowRole::Architect,
+        difficulty: Some(Difficulty::Hard),
+        selected_choice: arch_choice.clone(),
+        context_digest: arch_ctx_digest.clone(),
+        call_project_base: Some(base.clone()),
+        status: PlanningReservationStatus::Completed,
+        reserved_at_ms: 1_700_000_020_000,
+        updated_at_ms: 1_700_000_021_000,
+        run_id: Some("run_00000000-0000-4000-8000-000000000500".to_string()),
+        report_artifact_id: Some("pca_arch_pos_01".to_string()),
+        output_digest: Some(HEX64_A.to_string()),
+        diagnostic: None,
+    };
+    let arch_advice = ArchitectAdviceRecord {
+        advice_id: advice_id.to_string(),
+        request_key: "req_arch_pos_01".to_string(),
+        grant_id: grant_id.to_string(),
+        reservation_id: "rsv_arch_pos_01".to_string(),
+        binding_id: BINDING_A.to_string(),
+        thread_uuid: THREAD_A.to_string(),
+        selected_choice: arch_choice,
+        context_dependencies: arch_ctx,
+        context_digest: arch_ctx_digest,
+        decision_summary: "Bound awaiting-approval wording to recorded metadata".to_string(),
+        decision_digest: HEX64_A.to_string(),
+        report_artifact_id: Some("pca_arch_pos_01".to_string()),
+        status: ArchitectDecisionStatus::AcceptedIntoBrief,
+        created_at_ms: 1_700_000_021_000,
+    };
+    arch_advice.validate().expect("valid architect advice");
+
+    let (res_pub, mut pr_pub) = sample_completed_orchestrator_reservation_and_result(
+        BINDING_A,
+        THREAD_A,
+        grant_id,
+        "job_pos_published_01",
+        "pos_pub",
+        &d_pub,
+        &base,
+        &policy_digest,
+        "plan_pos_published",
+        "run_00000000-0000-4000-8000-000000000501",
+    );
+    pr_pub.task_interfaces = task_interfaces.clone();
+    pr_pub.architect_advice_ids = vec![advice_id.to_string()];
+    let job_pub = CoworkerJobRecord {
+        job_id: "job_pos_published_01".to_string(),
+        job_revision: 2,
+        create_request_key: "req_job_pos_pub".to_string(),
+        binding_id: BINDING_A.to_string(),
+        thread_uuid: THREAD_A.to_string(),
+        phase: CoworkerJobPhase::AwaitingApproval,
+        work_brief: b_pub,
+        work_brief_digest: d_pub,
+        supersedes_job_id: None,
+        planning_result: Some(pr_pub),
+        approval_linkage: None,
+        tasks: Vec::new(),
+        holds: Vec::new(),
+        outbox: Vec::new(),
+        combined_candidates: Vec::new(),
+    };
+
+    let (b_rcv, d_rcv) = sample_work_brief(
+        "brf_pos_rcv",
+        BINDING_A,
+        THREAD_A,
+        base.clone(),
+        WorkBriefKind::NewJob,
+        "Received head plan job",
+    );
+    let (res_rcv, mut pr_rcv) = sample_completed_orchestrator_reservation_and_result(
+        BINDING_A,
+        THREAD_A,
+        grant_id,
+        "job_pos_received_02",
+        "pos_rcv",
+        &d_rcv,
+        &base,
+        &policy_digest,
+        "plan_pos_received",
+        "run_00000000-0000-4000-8000-000000000502",
+    );
+    pr_rcv.plan_status = PlanStatus::Received;
+    pr_rcv.task_interfaces = task_interfaces.clone();
+    let job_rcv = CoworkerJobRecord {
+        job_id: "job_pos_received_02".to_string(),
+        job_revision: 2,
+        create_request_key: "req_job_pos_rcv".to_string(),
+        binding_id: BINDING_A.to_string(),
+        thread_uuid: THREAD_A.to_string(),
+        phase: CoworkerJobPhase::AwaitingApproval,
+        work_brief: b_rcv,
+        work_brief_digest: d_rcv,
+        supersedes_job_id: None,
+        planning_result: Some(pr_rcv),
+        approval_linkage: None,
+        tasks: Vec::new(),
+        holds: Vec::new(),
+        outbox: Vec::new(),
+        combined_candidates: Vec::new(),
+    };
+
+    let (b_app, d_app) = sample_work_brief(
+        "brf_pos_app",
+        BINDING_A,
+        THREAD_A,
+        base.clone(),
+        WorkBriefKind::NewJob,
+        "Applied head plan job",
+    );
+    let (res_app, mut pr_app) = sample_completed_orchestrator_reservation_and_result(
+        BINDING_A,
+        THREAD_A,
+        grant_id,
+        "job_pos_applied_03",
+        "pos_app",
+        &d_app,
+        &base,
+        &policy_digest,
+        "plan_pos_applied",
+        "run_00000000-0000-4000-8000-000000000503",
+    );
+    pr_app.plan_status = PlanStatus::Applied;
+    pr_app.task_interfaces = task_interfaces;
+    let job_app = CoworkerJobRecord {
+        job_id: "job_pos_applied_03".to_string(),
+        job_revision: 2,
+        create_request_key: "req_job_pos_app".to_string(),
+        binding_id: BINDING_A.to_string(),
+        thread_uuid: THREAD_A.to_string(),
+        phase: CoworkerJobPhase::AwaitingApproval,
+        work_brief: b_app,
+        work_brief_digest: d_app,
+        supersedes_job_id: None,
+        planning_result: Some(pr_app),
+        approval_linkage: None,
+        tasks: Vec::new(),
+        holds: Vec::new(),
+        outbox: Vec::new(),
+        combined_candidates: Vec::new(),
+    };
+
+    // Unrelated in-flight Planning job in the same scope with an unfinalized reservation must not
+    // invalidate independent jobs whose published PlanStore heads are already verified.
+    let (b_inflight, d_inflight) = sample_work_brief(
+        "brf_pos_inflight",
+        BINDING_A,
+        THREAD_A,
+        base.clone(),
+        WorkBriefKind::NewJob,
+        "Independent in-flight planning job",
+    );
+    let inflight_choice = sample_orchestrator_choice();
+    let inflight_ctx = production_orchestrator_context_digest(
+        BINDING_A,
+        THREAD_A,
+        grant_id,
+        "profile-default",
+        1,
+        &policy_digest,
+        "job_pos_inflight_04",
+        &d_inflight,
+        &base,
+        None,
+        0,
+        &inflight_choice,
+    );
+    let res_inflight = PlanningCallReservation {
+        reservation_id: "rsv_pos_inflight_04".to_string(),
+        request_key: "req_pos_inflight_04".to_string(),
+        role: WorkflowRole::Orchestrator,
+        difficulty: Some(Difficulty::Hard),
+        selected_choice: inflight_choice,
+        context_digest: inflight_ctx,
+        call_project_base: Some(base.clone()),
+        status: PlanningReservationStatus::ReservedBeforeEffect,
+        reserved_at_ms: 1_700_000_030_000,
+        updated_at_ms: 1_700_000_030_000,
+        run_id: None,
+        report_artifact_id: None,
+        output_digest: None,
+        diagnostic: None,
+    };
+    let job_inflight = CoworkerJobRecord {
+        job_id: "job_pos_inflight_04".to_string(),
+        job_revision: 1,
+        create_request_key: "req_job_pos_inflight".to_string(),
+        binding_id: BINDING_A.to_string(),
+        thread_uuid: THREAD_A.to_string(),
+        phase: CoworkerJobPhase::Planning,
+        work_brief: b_inflight,
+        work_brief_digest: d_inflight,
+        supersedes_job_id: None,
+        planning_result: None,
+        approval_linkage: None,
+        tasks: Vec::new(),
+        holds: Vec::new(),
+        outbox: Vec::new(),
+        combined_candidates: Vec::new(),
+    };
+
+    let grant = PlanningAdviceGrant {
+        grant_id: grant_id.to_string(),
+        create_request_key: "req_grant_pos_current".to_string(),
+        binding_id: BINDING_A.to_string(),
+        thread_uuid: THREAD_A.to_string(),
+        project_base: base,
+        profile_id: "profile-default".to_string(),
+        registry_revision: 1,
+        policy: planning_policy,
+        policy_digest,
+        capabilities: PlanningReadOnlyCapabilities::strict_read_only(),
+        budget: PlanningCallBudget {
+            max_total_calls: 8,
+            max_orchestrator_calls: 6,
+            max_architect_calls: 2,
+            max_timeout_ms_per_call: DEFAULT_TIMEOUT_MS,
+            max_output_bytes_per_call: DEFAULT_MAX_STDOUT_BYTES,
+        },
+        usage: PlanningGrantUsage {
+            reserved_total_calls: 5,
+            completed_calls: 4,
+            failed_calls: 0,
+            unknown_effect_calls: 0,
+            refused_before_effect_calls: 0,
+            reserved_orchestrator_calls: 4,
+            reserved_architect_calls: 1,
+        },
+        status: PlanningGrantStatus::Active,
+        created_at_ms: 1_700_000_005_000,
+        expires_at_ms: 1_700_003_605_000,
+        revoked_at_ms: None,
+        revoked_reason: None,
+        operator_attested: true,
+        native_per_call_identity_verified: false,
+        scoped_profile_dependency_proof: None,
+        reservations: vec![arch_res, res_pub, res_rcv, res_app, res_inflight],
+    };
+    grant.validate().expect("valid positive planning grant");
+
+    let workflow_store = CoworkerWorkflowStore::new(&plans_dir).expect("open workflow store");
+    let ledger = CoworkerBindingLedger {
+        schema_version: 1,
+        binding_id: BINDING_A.to_string(),
+        thread_uuid: Some(THREAD_A.to_string()),
+        ledger_revision: 4,
+        planning_grants: vec![grant],
+        architect_advice: vec![arch_advice],
+        jobs: vec![
+            job_pub.clone(),
+            job_rcv.clone(),
+            job_app.clone(),
+            job_inflight.clone(),
+        ],
+        admission_markers: BTreeMap::new(),
+    };
+    ledger.validate(BINDING_A).expect("valid positive ledger");
+    let ledger_path = workflow_store
+        .ledger_path_for_binding(BINDING_A)
+        .expect("workflow ledger path");
+    write_private_json(&ledger_path, &ledger);
+
+    remove_lockfiles_in_dir(&plans_dir);
+    let hashes_before = snapshot_private_dir_sha256(&plans_dir);
+
+    let stores = WorkspaceHistoryStores::new(&plans_dir);
+    let read =
+        read_scoped_workspace_job_histories(&chat, &stores).expect("read positive histories");
+
+    assert_no_lock_or_wal_files(&plans_dir);
+    assert_eq!(snapshot_private_dir_sha256(&plans_dir), hashes_before);
+    assert!(!read.degraded);
+    assert_eq!(read.rejected_scope_count, 0);
+    assert_eq!(read.jobs.len(), 4);
+
+    for (job_id, expected_plan_id) in [
+        (&job_pub.job_id, "plan_pos_published"),
+        (&job_rcv.job_id, "plan_pos_received"),
+        (&job_app.job_id, "plan_pos_applied"),
+    ] {
+        let hist = find_projected_job(&read.jobs, job_id);
+        let attn = hist
+            .current_attention
+            .as_ref()
+            .expect("positive awaiting-approval job must carry live attention");
+        assert_eq!(attn.kind, WorkspaceAttentionKind::NeedsApproval);
+        assert_eq!(attn.reason, EXPECTED_VERIFIED_PENDING_PLAN_REASON);
+        assert!(!attn.reason.to_ascii_lowercase().contains("human"));
+        assert_eq!(
+            attn.next_step.as_deref(),
+            Some(EXPECTED_PENDING_PLAN_NEXT_STEP)
+        );
+        assert_eq!(hist.job.state, ObservationJobState::NeedsUser);
+        assert_eq!(hist.job.approval_status, "pending_approval");
+        assert_eq!(hist.job.execution_status, "not_started");
+        assert_eq!(hist.job.review_state, None);
+        assert_eq!(hist.links.source_plan_id.as_deref(), Some(expected_plan_id));
+        assert_eq!(hist.links.source_plan_revision, Some(1));
+        assert_eq!(hist.acceptance_proof, WorkspaceAcceptanceProof::unknown());
+        assert_eq!(hist.result, None);
+    }
+
+    let h_inflight = find_projected_job(&read.jobs, &job_inflight.job_id);
+    assert_eq!(h_inflight.job.state, ObservationJobState::Planning);
+    assert_eq!(h_inflight.job.approval_status, "draft");
+    assert_eq!(h_inflight.current_attention, None);
+}
+
+fn assert_unknown_awaiting_job(jobs: &[WorkspaceJobHistory], job_id: &str) {
+    let hist = find_projected_job(jobs, job_id);
+    let attn = hist
+        .current_attention
+        .as_ref()
+        .expect("unverified awaiting-approval job must retain one live attention unit");
+    assert_eq!(attn.kind, WorkspaceAttentionKind::Unknown);
+    assert_eq!(attn.reason, EXPECTED_UNVERIFIED_PENDING_PLAN_REASON);
+    assert_eq!(
+        attn.next_step.as_deref(),
+        Some(EXPECTED_PENDING_PLAN_NEXT_STEP)
+    );
+    assert_eq!(hist.job.state, ObservationJobState::Unknown);
+    assert_ne!(hist.job.state, ObservationJobState::NeedsUser);
+    assert_eq!(hist.job.approval_status, "unknown");
+    assert_eq!(hist.job.execution_status, "not_started");
+    assert_eq!(hist.job.review_state, None);
+    assert_eq!(hist.acceptance_proof, WorkspaceAcceptanceProof::unknown());
+}
+
+#[test]
+fn awaiting_approval_legacy_noref_missing_or_corrupt_store_projects_unknown_without_mutation() {
+    let tmp = TempDir::new().expect("tempdir");
+    let plans_dir = make_private_dir(&tmp.path().join("plans-missing-corrupt"));
+    let repo_dir = make_private_dir(&tmp.path().join("repo-missing-corrupt"));
+    let chat =
+        WorkspaceChatIdentity::new(SOURCE_A, BINDING_A, THREAD_A, &repo_dir.to_string_lossy())
+            .expect("valid chat identity");
+
+    let base = sample_project_base(&repo_dir);
+    let planning_policy = sample_planning_policy();
+    let policy_digest = planning_policy.digest().expect("planning policy digest");
+    let grant_id = "grt_missing_store_0123456789abcd";
+
+    // 1. Legacy awaiting-approval job with no PlanningResultRef and no approval linkage.
+    let (b_legacy, d_legacy) = sample_work_brief(
+        "brf_legacy_noref",
+        BINDING_A,
+        THREAD_A,
+        base.clone(),
+        WorkBriefKind::NewJob,
+        "Legacy awaiting approval job without PlanningResultRef",
+    );
+    let job_legacy = CoworkerJobRecord {
+        job_id: "job_legacy_noref_01".to_string(),
+        job_revision: 1,
+        create_request_key: "req_legacy_noref_01".to_string(),
+        binding_id: BINDING_A.to_string(),
+        thread_uuid: THREAD_A.to_string(),
+        phase: CoworkerJobPhase::AwaitingApproval,
+        work_brief: b_legacy,
+        work_brief_digest: d_legacy,
+        supersedes_job_id: None,
+        planning_result: None,
+        approval_linkage: None,
+        tasks: Vec::new(),
+        holds: Vec::new(),
+        outbox: Vec::new(),
+        combined_candidates: Vec::new(),
+    };
+
+    // 2. Job with valid grant, completed Orchestrator reservation, and PlanningResultRef.
+    let (b_ref, d_ref) = sample_work_brief(
+        "brf_missing_plan_ref",
+        BINDING_A,
+        THREAD_A,
+        base.clone(),
+        WorkBriefKind::NewJob,
+        "Awaiting approval job whose PlanStore entry is missing",
+    );
+    let (res_ref, pr_ref) = sample_completed_orchestrator_reservation_and_result(
+        BINDING_A,
+        THREAD_A,
+        grant_id,
+        "job_missing_plan_ref_02",
+        "miss_ref",
+        &d_ref,
+        &base,
+        &policy_digest,
+        "plan_missing_tuple_02",
+        "run_00000000-0000-4000-8000-000000000601",
+    );
+    let job_with_ref = CoworkerJobRecord {
+        job_id: "job_missing_plan_ref_02".to_string(),
+        job_revision: 2,
+        create_request_key: "req_missing_plan_ref_02".to_string(),
+        binding_id: BINDING_A.to_string(),
+        thread_uuid: THREAD_A.to_string(),
+        phase: CoworkerJobPhase::AwaitingApproval,
+        work_brief: b_ref,
+        work_brief_digest: d_ref,
+        supersedes_job_id: None,
+        planning_result: Some(pr_ref),
+        approval_linkage: None,
+        tasks: Vec::new(),
+        holds: Vec::new(),
+        outbox: Vec::new(),
+        combined_candidates: Vec::new(),
+    };
+
+    let grant = PlanningAdviceGrant {
+        grant_id: grant_id.to_string(),
+        create_request_key: "req_grant_missing_store".to_string(),
+        binding_id: BINDING_A.to_string(),
+        thread_uuid: THREAD_A.to_string(),
+        project_base: base,
+        profile_id: "profile-default".to_string(),
+        registry_revision: 1,
+        policy: planning_policy,
+        policy_digest,
+        capabilities: PlanningReadOnlyCapabilities::strict_read_only(),
+        budget: PlanningCallBudget {
+            max_total_calls: 4,
+            max_orchestrator_calls: 4,
+            max_architect_calls: 2,
+            max_timeout_ms_per_call: DEFAULT_TIMEOUT_MS,
+            max_output_bytes_per_call: DEFAULT_MAX_STDOUT_BYTES,
+        },
+        usage: PlanningGrantUsage {
+            reserved_total_calls: 1,
+            completed_calls: 1,
+            failed_calls: 0,
+            unknown_effect_calls: 0,
+            refused_before_effect_calls: 0,
+            reserved_orchestrator_calls: 1,
+            reserved_architect_calls: 0,
+        },
+        status: PlanningGrantStatus::Active,
+        created_at_ms: 1_700_000_010_000,
+        expires_at_ms: 1_700_003_610_000,
+        revoked_at_ms: None,
+        revoked_reason: None,
+        operator_attested: true,
+        native_per_call_identity_verified: false,
+        scoped_profile_dependency_proof: None,
+        reservations: vec![res_ref],
+    };
+    grant.validate().expect("valid grant");
+
+    let workflow_store = CoworkerWorkflowStore::new(&plans_dir).expect("open workflow store");
+    let ledger = CoworkerBindingLedger {
+        schema_version: 1,
+        binding_id: BINDING_A.to_string(),
+        thread_uuid: Some(THREAD_A.to_string()),
+        ledger_revision: 2,
+        planning_grants: vec![grant],
+        architect_advice: Vec::new(),
+        jobs: vec![job_legacy.clone(), job_with_ref.clone()],
+        admission_markers: BTreeMap::new(),
+    };
+    ledger.validate(BINDING_A).expect("valid workflow ledger");
+    let ledger_path = workflow_store
+        .ledger_path_for_binding(BINDING_A)
+        .expect("workflow ledger path");
+    write_private_json(&ledger_path, &ledger);
+
+    // Case A: `plans.json` does not exist on disk -> must not create `plans.json` or `plans.lock`.
+    let hashes_no_store = snapshot_private_dir_sha256(&plans_dir);
+    let stores = WorkspaceHistoryStores::new(&plans_dir);
+    let read_no_store =
+        read_scoped_workspace_job_histories(&chat, &stores).expect("read without plans.json");
+    assert!(!plans_dir.join("plans.json").exists());
+    assert_no_lock_or_wal_files(&plans_dir);
+    assert_eq!(snapshot_private_dir_sha256(&plans_dir), hashes_no_store);
+    assert!(!read_no_store.degraded);
+    assert_eq!(read_no_store.jobs.len(), 2);
+
+    assert_unknown_awaiting_job(&read_no_store.jobs, &job_legacy.job_id);
+    assert_unknown_awaiting_job(&read_no_store.jobs, &job_with_ref.job_id);
+    let h_ref_no_store = find_projected_job(&read_no_store.jobs, &job_with_ref.job_id);
+    assert_eq!(
+        h_ref_no_store.links.source_plan_id.as_deref(),
+        Some("plan_missing_tuple_02")
+    );
+    assert_eq!(h_ref_no_store.links.source_plan_revision, Some(1));
+
+    // Case B: `plans.json` exists with an unrelated published plan, missing `plan_missing_tuple_02`.
+    {
+        let plan_store = PlanStore::open(&plans_dir).expect("open plan store");
+        let draft = save_plan_draft_in_store(
+            &plan_store,
+            0,
+            "plan_unrelated_present_99",
+            BINDING_A,
+            "profile-default",
+            1,
+            1_700_000_020_000,
+        );
+        plan_store
+            .change(
+                draft.revision,
+                PlanChange::Publish {
+                    plan_id: "plan_unrelated_present_99".to_string(),
+                    revision: draft.revision,
+                },
+            )
+            .expect("publish unrelated plan");
+    }
+    remove_lockfiles_in_dir(&plans_dir);
+    let hashes_missing_tuple = snapshot_private_dir_sha256(&plans_dir);
+    let read_missing_tuple =
+        read_scoped_workspace_job_histories(&chat, &stores).expect("read missing plan tuple");
+    assert_no_lock_or_wal_files(&plans_dir);
+    assert_eq!(
+        snapshot_private_dir_sha256(&plans_dir),
+        hashes_missing_tuple
+    );
+    assert!(!read_missing_tuple.degraded);
+    assert_eq!(read_missing_tuple.jobs.len(), 2);
+    assert_unknown_awaiting_job(&read_missing_tuple.jobs, &job_legacy.job_id);
+    assert_unknown_awaiting_job(&read_missing_tuple.jobs, &job_with_ref.job_id);
+
+    // Case C: Corrupt `plans.json` sets `PlanLookupDegraded` while preserving all job history.
+    let plans_json_path = plans_dir.join("plans.json");
+    fs::write(&plans_json_path, b"{not valid json").expect("write corrupt plans.json");
+    fs::set_permissions(&plans_json_path, fs::Permissions::from_mode(0o600))
+        .expect("chmod 0600 corrupt plans.json");
+    let hashes_corrupt = snapshot_private_dir_sha256(&plans_dir);
+    let read_corrupt =
+        read_scoped_workspace_job_histories(&chat, &stores).expect("read with corrupt plans.json");
+    assert_no_lock_or_wal_files(&plans_dir);
+    assert_eq!(snapshot_private_dir_sha256(&plans_dir), hashes_corrupt);
+    assert!(read_corrupt.degraded);
+    let has_plan_lookup_diag = read_corrupt
+        .diagnostics
+        .iter()
+        .any(|d| d.kind == WorkspaceHistoryDiagnosticKind::PlanLookupDegraded);
+    assert!(has_plan_lookup_diag);
+    assert_eq!(read_corrupt.jobs.len(), 2);
+    assert_unknown_awaiting_job(&read_corrupt.jobs, &job_legacy.job_id);
+    assert_unknown_awaiting_job(&read_corrupt.jobs, &job_with_ref.job_id);
+}
+
+#[test]
+fn awaiting_approval_stale_head_profile_mismatch_and_forged_caller_context_remain_unknown() {
+    let tmp = TempDir::new().expect("tempdir");
+    let plans_dir = make_private_dir(&tmp.path().join("plans-stale-mismatch"));
+    let repo_dir = make_private_dir(&tmp.path().join("repo-stale-mismatch"));
+    let chat =
+        WorkspaceChatIdentity::new(SOURCE_A, BINDING_A, THREAD_A, &repo_dir.to_string_lossy())
+            .expect("valid chat identity");
+
+    let base = sample_project_base(&repo_dir);
+    let planning_policy = sample_planning_policy();
+    let policy_digest = planning_policy.digest().expect("planning policy digest");
+    let grant_id = "grt_stale_mismatch_0123456789abc";
+
+    {
+        let plan_store = PlanStore::open(&plans_dir).expect("open plan store");
+
+        // 1. Stale head A: `r1` Published (`is_active_published() == true`), plus newer `r2` Draft.
+        let r1_draft = save_plan_draft_in_store(
+            &plan_store,
+            0,
+            "plan_stale_newer_draft",
+            BINDING_A,
+            "profile-default",
+            1,
+            1_700_000_010_000,
+        );
+        let r1_pub = plan_store
+            .change(
+                r1_draft.revision,
+                PlanChange::Publish {
+                    plan_id: "plan_stale_newer_draft".to_string(),
+                    revision: r1_draft.revision,
+                },
+            )
+            .expect("publish r1");
+        let _r2_draft = save_plan_draft_in_store(
+            &plan_store,
+            r1_pub.revision,
+            "plan_stale_newer_draft",
+            BINDING_A,
+            "profile-default",
+            1,
+            1_700_000_011_000,
+        );
+
+        // 2. Stale head B: `r1` Superseded + newer `r2` Published.
+        let s1_draft = save_plan_draft_in_store(
+            &plan_store,
+            0,
+            "plan_stale_superseded",
+            BINDING_A,
+            "profile-default",
+            1,
+            1_700_000_012_000,
+        );
+        let s1_pub = plan_store
+            .change(
+                s1_draft.revision,
+                PlanChange::Publish {
+                    plan_id: "plan_stale_superseded".to_string(),
+                    revision: s1_draft.revision,
+                },
+            )
+            .expect("publish s1");
+        let s2_draft = save_plan_draft_in_store(
+            &plan_store,
+            s1_pub.revision,
+            "plan_stale_superseded",
+            BINDING_A,
+            "profile-default",
+            1,
+            1_700_000_013_000,
+        );
+        plan_store
+            .change(
+                s2_draft.revision,
+                PlanChange::Publish {
+                    plan_id: "plan_stale_superseded".to_string(),
+                    revision: s2_draft.revision,
+                },
+            )
+            .expect("publish s2 superseding s1");
+
+        // 3. Unpublished `Draft` r1 in PlanStore.
+        save_plan_draft_in_store(
+            &plan_store,
+            0,
+            "plan_only_draft",
+            BINDING_A,
+            "profile-default",
+            1,
+            1_700_000_014_000,
+        );
+
+        // 4. Published head with mismatched `profile_id`.
+        let wp = save_plan_draft_in_store(
+            &plan_store,
+            0,
+            "plan_wrong_profile",
+            BINDING_A,
+            "profile-other",
+            1,
+            1_700_000_015_000,
+        );
+        plan_store
+            .change(
+                wp.revision,
+                PlanChange::Publish {
+                    plan_id: "plan_wrong_profile".to_string(),
+                    revision: wp.revision,
+                },
+            )
+            .expect("publish wrong-profile plan");
+
+        // 5. Published head with mismatched `profile_revision` (`2 != 1`).
+        let wr = save_plan_draft_in_store(
+            &plan_store,
+            0,
+            "plan_wrong_prof_rev",
+            BINDING_A,
+            "profile-default",
+            2,
+            1_700_000_016_000,
+        );
+        plan_store
+            .change(
+                wr.revision,
+                PlanChange::Publish {
+                    plan_id: "plan_wrong_prof_rev".to_string(),
+                    revision: wr.revision,
+                },
+            )
+            .expect("publish wrong-profile-revision plan");
+
+        // 6. Published head owned by another binding (`BINDING_B`).
+        let wb = save_plan_draft_in_store(
+            &plan_store,
+            0,
+            "plan_other_binding",
+            BINDING_B,
+            "profile-default",
+            1,
+            1_700_000_017_000,
+        );
+        plan_store
+            .change(
+                wb.revision,
+                PlanChange::Publish {
+                    plan_id: "plan_other_binding".to_string(),
+                    revision: wb.revision,
+                },
+            )
+            .expect("publish other-binding plan");
+
+        // 7. Published head where job's `task_interfaces` names a task absent from `plan_rev.tasks`
+        //    (also used as an authentic published `PlanRevision` for forged caller-context testing).
+        let ti = save_plan_draft_in_store(
+            &plan_store,
+            0,
+            "plan_missing_iface_task",
+            BINDING_A,
+            "profile-default",
+            1,
+            1_700_000_018_000,
+        );
+        plan_store
+            .change(
+                ti.revision,
+                PlanChange::Publish {
+                    plan_id: "plan_missing_iface_task".to_string(),
+                    revision: ti.revision,
+                },
+            )
+            .expect("publish task-interface mismatch plan");
+    }
+
+    // Confirm `plan_stale_newer_draft` r1 is genuinely `Published` (`is_active_published()`) in snapshot!
+    let snap = PlanStore::read_snapshot_readonly_at(&plans_dir).expect("read plan snapshot");
+    let stale_r1 = snap
+        .iter()
+        .find(|r| r.plan_id == "plan_stale_newer_draft" && r.revision == 1)
+        .expect("stale r1 exists");
+    assert_eq!(stale_r1.status, PlanStatus::Published);
+    assert!(stale_r1.status.is_active_published());
+
+    let mut reservations = Vec::new();
+    let mut jobs = Vec::new();
+    for (idx, (suffix, plan_id, add_phantom_task)) in [
+        ("st_drf", "plan_stale_newer_draft", false),
+        ("st_sup", "plan_stale_superseded", false),
+        ("on_drf", "plan_only_draft", false),
+        ("wr_prf", "plan_wrong_profile", false),
+        ("wr_rev", "plan_wrong_prof_rev", false),
+        ("wr_bnd", "plan_other_binding", false),
+        ("wr_tsk", "plan_missing_iface_task", true),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let job_id = format!("job_mismatch_{suffix}");
+        let (brief, brief_digest) = sample_work_brief(
+            &format!("brf_{suffix}"),
+            BINDING_A,
+            THREAD_A,
+            base.clone(),
+            WorkBriefKind::NewJob,
+            &format!("Mismatch case {suffix}"),
+        );
+        let run_id = format!("run_00000000-0000-4000-8000-00000000070{idx}");
+        let (res, mut pr) = sample_completed_orchestrator_reservation_and_result(
+            BINDING_A,
+            THREAD_A,
+            grant_id,
+            &job_id,
+            suffix,
+            &brief_digest,
+            &base,
+            &policy_digest,
+            plan_id,
+            &run_id,
+        );
+        if add_phantom_task {
+            pr.task_interfaces.insert(
+                "task-nonexistent-99".to_string(),
+                TaskInterfaceOwnershipSpec {
+                    owned_interfaces: vec!["iface_ghost".to_string()],
+                    consumed_interfaces: Vec::new(),
+                },
+            );
+        }
+        reservations.push(res);
+        jobs.push(CoworkerJobRecord {
+            job_id,
+            job_revision: 2,
+            create_request_key: format!("req_job_{suffix}"),
+            binding_id: BINDING_A.to_string(),
+            thread_uuid: THREAD_A.to_string(),
+            phase: CoworkerJobPhase::AwaitingApproval,
+            work_brief: brief,
+            work_brief_digest: brief_digest,
+            supersedes_job_id: None,
+            planning_result: Some(pr),
+            approval_linkage: None,
+            tasks: Vec::new(),
+            holds: Vec::new(),
+            outbox: Vec::new(),
+            combined_candidates: Vec::new(),
+        });
+    }
+
+    let res_count = reservations.len() as u32;
+    let grant = PlanningAdviceGrant {
+        grant_id: grant_id.to_string(),
+        create_request_key: "req_grant_stale_mismatch".to_string(),
+        binding_id: BINDING_A.to_string(),
+        thread_uuid: THREAD_A.to_string(),
+        project_base: base.clone(),
+        profile_id: "profile-default".to_string(),
+        registry_revision: 1,
+        policy: planning_policy,
+        policy_digest: policy_digest.clone(),
+        capabilities: PlanningReadOnlyCapabilities::strict_read_only(),
+        budget: PlanningCallBudget {
+            max_total_calls: 16,
+            max_orchestrator_calls: 16,
+            max_architect_calls: 2,
+            max_timeout_ms_per_call: DEFAULT_TIMEOUT_MS,
+            max_output_bytes_per_call: DEFAULT_MAX_STDOUT_BYTES,
+        },
+        usage: PlanningGrantUsage {
+            reserved_total_calls: res_count,
+            completed_calls: res_count,
+            failed_calls: 0,
+            unknown_effect_calls: 0,
+            refused_before_effect_calls: 0,
+            reserved_orchestrator_calls: res_count,
+            reserved_architect_calls: 0,
+        },
+        status: PlanningGrantStatus::Active,
+        created_at_ms: 1_700_000_005_000,
+        expires_at_ms: 1_700_003_605_000,
+        revoked_at_ms: None,
+        revoked_reason: None,
+        operator_attested: true,
+        native_per_call_identity_verified: false,
+        scoped_profile_dependency_proof: None,
+        reservations,
+    };
+    grant.validate().expect("valid grant");
+
+    let workflow_store = CoworkerWorkflowStore::new(&plans_dir).expect("open workflow store");
+    let ledger = CoworkerBindingLedger {
+        schema_version: 1,
+        binding_id: BINDING_A.to_string(),
+        thread_uuid: Some(THREAD_A.to_string()),
+        ledger_revision: 3,
+        planning_grants: vec![grant],
+        architect_advice: Vec::new(),
+        jobs: jobs.clone(),
+        admission_markers: BTreeMap::new(),
+    };
+    ledger.validate(BINDING_A).expect("valid ledger");
+    let ledger_path = workflow_store
+        .ledger_path_for_binding(BINDING_A)
+        .expect("workflow ledger path");
+    write_private_json(&ledger_path, &ledger);
+
+    remove_lockfiles_in_dir(&plans_dir);
+    let hashes_before = snapshot_private_dir_sha256(&plans_dir);
+    let stores = WorkspaceHistoryStores::new(&plans_dir);
+    let read =
+        read_scoped_workspace_job_histories(&chat, &stores).expect("read stale/mismatch cases");
+    assert_no_lock_or_wal_files(&plans_dir);
+    assert_eq!(snapshot_private_dir_sha256(&plans_dir), hashes_before);
+    assert!(!read.degraded);
+    assert_eq!(read.jobs.len(), jobs.len());
+
+    for job in &jobs {
+        let hist = find_projected_job(&read.jobs, &job.job_id);
+        let attn = hist
+            .current_attention
+            .as_ref()
+            .expect("mismatch/stale awaiting job must preserve live Unknown attention");
+        assert_eq!(
+            attn.kind,
+            WorkspaceAttentionKind::Unknown,
+            "job {} must not claim NeedsApproval",
+            job.job_id
+        );
+        assert_eq!(attn.reason, EXPECTED_UNVERIFIED_PENDING_PLAN_REASON);
+        assert_eq!(
+            attn.next_step.as_deref(),
+            Some(EXPECTED_PENDING_PLAN_NEXT_STEP)
+        );
+        assert_eq!(hist.job.state, ObservationJobState::Unknown);
+        assert_eq!(hist.job.approval_status, "unknown");
+        assert_eq!(hist.job.execution_status, "not_started");
+        assert_eq!(hist.links.source_plan_revision, Some(1));
+        assert_eq!(hist.links.superseded_by_job_id, None);
+        assert_eq!(hist.acceptance_proof, WorkspaceAcceptanceProof::unknown());
+    }
+
+    // Pure `project_coworker_job_record` / `project_coworker_job_history` with a real active-published
+    // `PlanRevision` supplied via public `WorkspaceJobLineageContext` must NEVER mint `NeedsApproval`.
+    let valid_published_rev = snap
+        .into_iter()
+        .find(|r| r.plan_id == "plan_missing_iface_task" && r.revision == 1)
+        .expect("published PlanRevision from snapshot");
+    assert_eq!(valid_published_rev.status, PlanStatus::Published);
+    let (b_pure, d_pure) = sample_work_brief(
+        "brf_pure_forged_ctx",
+        BINDING_A,
+        THREAD_A,
+        base.clone(),
+        WorkBriefKind::NewJob,
+        "Pure caller projection with matching published PlanRevision",
+    );
+    let (_, pr_pure) = sample_completed_orchestrator_reservation_and_result(
+        BINDING_A,
+        THREAD_A,
+        grant_id,
+        "job_pure_forged_ctx_99",
+        "pure99",
+        &d_pure,
+        &base,
+        &policy_digest,
+        "plan_missing_iface_task",
+        "run_00000000-0000-4000-8000-000000000799",
+    );
+    let job_pure = CoworkerJobRecord {
+        job_id: "job_pure_forged_ctx_99".to_string(),
+        job_revision: 2,
+        create_request_key: "req_pure_forged_ctx_99".to_string(),
+        binding_id: BINDING_A.to_string(),
+        thread_uuid: THREAD_A.to_string(),
+        phase: CoworkerJobPhase::AwaitingApproval,
+        work_brief: b_pure,
+        work_brief_digest: d_pure,
+        supersedes_job_id: None,
+        planning_result: Some(pr_pure),
+        approval_linkage: None,
+        tasks: Vec::new(),
+        holds: Vec::new(),
+        outbox: Vec::new(),
+        combined_candidates: Vec::new(),
+    };
+    job_pure.validate().expect("valid job_pure");
+
+    let forged_plan_ctx = WorkspaceJobLineageContext {
+        plan_revision: Some(valid_published_rev),
+        ..WorkspaceJobLineageContext::default()
+    };
+    let pure_ctx = project_coworker_job_history(&chat, &job_pure, None, Some(&forged_plan_ctx))
+        .expect("pure projection with matching PlanRevision context");
+    let pure_no_ctx =
+        project_coworker_job_record(&chat, &job_pure, None).expect("pure record projection");
+
+    for projected in [&pure_ctx, &pure_no_ctx] {
+        let attn = projected
+            .current_attention
+            .as_ref()
+            .expect("pure projection must carry Unknown attention");
+        assert_eq!(attn.kind, WorkspaceAttentionKind::Unknown);
+        assert_eq!(attn.reason, EXPECTED_UNVERIFIED_PENDING_PLAN_REASON);
+        assert_eq!(
+            attn.next_step.as_deref(),
+            Some(EXPECTED_PENDING_PLAN_NEXT_STEP)
+        );
+        assert_eq!(projected.job.state, ObservationJobState::Unknown);
+        assert_eq!(projected.job.approval_status, "unknown");
+        assert_eq!(projected.job.execution_status, "not_started");
+
+        let wire = serde_json::to_value(projected).expect("serialize WorkspaceJobHistory");
+        assert_eq!(wire["current_attention"]["kind"], "unknown");
+        assert_eq!(wire["job"]["state"], "unknown");
+        assert_eq!(wire["job"]["approval_status"], "unknown");
+    }
+}
+
+#[tokio::test]
+async fn awaiting_approval_preserves_higher_priority_fences_causal_ambiguity_and_historical_acceptance(
+) {
+    let fixture = setup_accepted_history_fixture().await;
+    let chat = WorkspaceChatIdentity::new(
+        SOURCE_A,
+        BINDING_A,
+        THREAD_A,
+        &fixture.repo_dir.to_string_lossy(),
+    )
+    .expect("valid chat");
+
+    // Advance the historical accepted job's plan (`plan-hist-acc-01`) to a newer Draft r2 and then
+    // Published r2; historical acceptance on r1 must stay VerifiedAccepted/Completed across both!
+    let r2_draft = save_plan_draft_in_store(
+        &fixture.plans,
+        1,
+        "plan-hist-acc-01",
+        BINDING_A,
+        "profile-coworker",
+        3,
+        1_700_000_300_000,
+    );
+    let draft_head_stores = WorkspaceHistoryStores::new(&fixture.plans_dir)
+        .with_plan_store(&fixture.plans)
+        .with_authority_store(&fixture.authority)
+        .with_sessions_dir(&fixture.sessions_dir);
+    let draft_head_read = read_scoped_workspace_job_histories(&chat, &draft_head_stores)
+        .expect("read historical accepted job after newer Draft r2");
+    assert_eq!(
+        find_projected_job(&draft_head_read.jobs, &fixture.job_id)
+            .acceptance_proof
+            .status,
+        WorkspaceAcceptanceStatus::VerifiedAccepted
+    );
+
+    fixture
+        .plans
+        .change(
+            r2_draft.revision,
+            PlanChange::Publish {
+                plan_id: "plan-hist-acc-01".to_string(),
+                revision: r2_draft.revision,
+            },
+        )
+        .expect("publish r2 of historical accepted plan");
+
+    // Create published PlanStore heads for higher-priority hold/effect/causal-taint jobs in BINDING_A.
+    for (idx, pid) in [
+        "plan_prio_effect_unknown",
+        "plan_prio_clarify_hold",
+        "plan_prio_tainted_fork",
+        "plan_prio_clean_head",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let draft = save_plan_draft_in_store(
+            &fixture.plans,
+            0,
+            pid,
+            BINDING_A,
+            "profile-default",
+            1,
+            1_700_000_310_000 + idx as i64,
+        );
+        fixture
+            .plans
+            .change(
+                draft.revision,
+                PlanChange::Publish {
+                    plan_id: pid.to_string(),
+                    revision: draft.revision,
+                },
+            )
+            .expect("publish priority test plan");
+    }
+
+    let repo_dir = &fixture.repo_dir;
+    let base_commit = &fixture.base_commit;
+    let base = CanonicalProjectBaseRef::resolve_and_validate(repo_dir, base_commit)
+        .expect("resolve canonical project_base");
+    let planning_policy = sample_planning_policy();
+    let policy_digest = planning_policy.digest().expect("planning policy digest");
+    let grant_id = "grt_prio_compat_0123456789abcdef";
+
+    // 1. AwaitingApproval with real published head + UnknownEffectReconciliationRequired hold -> UnresolvedEffect.
+    let (b_eff, d_eff) = sample_work_brief(
+        "brf_prio_eff",
+        BINDING_A,
+        THREAD_A,
+        base.clone(),
+        WorkBriefKind::NewJob,
+        "Awaiting approval fenced by unresolved effect hold",
+    );
+    let (res_eff, pr_eff) = sample_completed_orchestrator_reservation_and_result(
+        BINDING_A,
+        THREAD_A,
+        grant_id,
+        "job_prio_eff_01",
+        "pr_eff",
+        &d_eff,
+        &base,
+        &policy_digest,
+        "plan_prio_effect_unknown",
+        "run_00000000-0000-4000-8000-000000000801",
+    );
+    let job_eff = CoworkerJobRecord {
+        job_id: "job_prio_eff_01".to_string(),
+        job_revision: 3,
+        create_request_key: "req_prio_eff_01".to_string(),
+        binding_id: BINDING_A.to_string(),
+        thread_uuid: THREAD_A.to_string(),
+        phase: CoworkerJobPhase::AwaitingApproval,
+        work_brief: b_eff,
+        work_brief_digest: d_eff,
+        supersedes_job_id: None,
+        planning_result: Some(pr_eff),
+        approval_linkage: None,
+        tasks: Vec::new(),
+        holds: vec![WorkflowHoldRecord {
+            hold_id: "hld_prio_eff_01".to_string(),
+            request_key: "req_hld_prio_eff_01".to_string(),
+            reason: WorkflowHoldReason::UnknownEffectReconciliationRequired,
+            detail: "Interrupted external receipt requires reconciliation".to_string(),
+            directly_affected_task_ids: Vec::new(),
+            affected_write_paths: Vec::new(),
+            affected_interfaces: Vec::new(),
+            holds_entire_job: true,
+            active: true,
+            created_at_job_revision: 3,
+            resolved_at_job_revision: None,
+            resolution_note: None,
+        }],
+        outbox: Vec::new(),
+        combined_candidates: Vec::new(),
+    };
+
+    // 2. AwaitingApproval with real published head + ConversationClarificationPending hold -> NeedsUserInput.
+    let (b_clr, d_clr) = sample_work_brief(
+        "brf_prio_clr",
+        BINDING_A,
+        THREAD_A,
+        base.clone(),
+        WorkBriefKind::NewJob,
+        "Awaiting approval paused on clarification hold",
+    );
+    let (res_clr, pr_clr) = sample_completed_orchestrator_reservation_and_result(
+        BINDING_A,
+        THREAD_A,
+        grant_id,
+        "job_prio_clr_02",
+        "pr_clr",
+        &d_clr,
+        &base,
+        &policy_digest,
+        "plan_prio_clarify_hold",
+        "run_00000000-0000-4000-8000-000000000802",
+    );
+    let job_clr = CoworkerJobRecord {
+        job_id: "job_prio_clr_02".to_string(),
+        job_revision: 3,
+        create_request_key: "req_prio_clr_02".to_string(),
+        binding_id: BINDING_A.to_string(),
+        thread_uuid: THREAD_A.to_string(),
+        phase: CoworkerJobPhase::AwaitingApproval,
+        work_brief: b_clr,
+        work_brief_digest: d_clr,
+        supersedes_job_id: None,
+        planning_result: Some(pr_clr),
+        approval_linkage: None,
+        tasks: Vec::new(),
+        holds: vec![WorkflowHoldRecord {
+            hold_id: "hld_prio_clr_02".to_string(),
+            request_key: "req_hld_prio_clr_02".to_string(),
+            reason: WorkflowHoldReason::ConversationClarificationPending,
+            detail: "Confirm target schema before approval".to_string(),
+            directly_affected_task_ids: Vec::new(),
+            affected_write_paths: Vec::new(),
+            affected_interfaces: Vec::new(),
+            holds_entire_job: true,
+            active: true,
+            created_at_job_revision: 3,
+            resolved_at_job_revision: None,
+            resolution_note: None,
+        }],
+        outbox: Vec::new(),
+        combined_candidates: Vec::new(),
+    };
+
+    // 3. Conflicting amendment fork (`fork_root -> {fork_a, fork_b}`) where `fork_a` has a real
+    //    published head in PlanStore: causal lineage taint must refuse positive `NeedsApproval`.
+    let (b_froot, d_froot) = sample_work_brief(
+        "brf_fork_root",
+        BINDING_A,
+        THREAD_A,
+        base.clone(),
+        WorkBriefKind::NewJob,
+        "Ambiguous fork root",
+    );
+    let job_fork_root = CoworkerJobRecord {
+        job_id: "job_prio_fork_root_03".to_string(),
+        job_revision: 3,
+        create_request_key: "req_fork_root_03".to_string(),
+        binding_id: BINDING_A.to_string(),
+        thread_uuid: THREAD_A.to_string(),
+        phase: CoworkerJobPhase::Held,
+        work_brief: b_froot,
+        work_brief_digest: d_froot,
+        supersedes_job_id: None,
+        planning_result: None,
+        approval_linkage: None,
+        tasks: Vec::new(),
+        holds: vec![
+            sample_amendment_hold("hld_fk_a", "amend_req_fork_a_04", 2, "Fork A"),
+            sample_amendment_hold("hld_fk_b", "amend_req_fork_b_05", 3, "Fork B"),
+        ],
+        outbox: Vec::new(),
+        combined_candidates: Vec::new(),
+    };
+    let (b_fa, d_fa) = sample_work_brief(
+        "brf_fork_a",
+        BINDING_A,
+        THREAD_A,
+        base.clone(),
+        WorkBriefKind::Amendment {
+            target_job_id: job_fork_root.job_id.clone(),
+            target_job_revision: 1,
+            amendment_reason: "Fork A".to_string(),
+        },
+        "Tainted fork branch with published plan",
+    );
+    let (res_fa, pr_fa) = sample_completed_orchestrator_reservation_and_result(
+        BINDING_A,
+        THREAD_A,
+        grant_id,
+        "job_prio_fork_a_04",
+        "pr_fka",
+        &d_fa,
+        &base,
+        &policy_digest,
+        "plan_prio_tainted_fork",
+        "run_00000000-0000-4000-8000-000000000804",
+    );
+    let job_fork_a = CoworkerJobRecord {
+        job_id: "job_prio_fork_a_04".to_string(),
+        job_revision: 2,
+        create_request_key: "req_fork_a_04".to_string(),
+        binding_id: BINDING_A.to_string(),
+        thread_uuid: THREAD_A.to_string(),
+        phase: CoworkerJobPhase::AwaitingApproval,
+        work_brief: b_fa,
+        work_brief_digest: d_fa,
+        supersedes_job_id: Some(job_fork_root.job_id.clone()),
+        planning_result: Some(pr_fa),
+        approval_linkage: None,
+        tasks: Vec::new(),
+        holds: Vec::new(),
+        outbox: Vec::new(),
+        combined_candidates: Vec::new(),
+    };
+    let (b_fb, d_fb) = sample_work_brief(
+        "brf_fork_b",
+        BINDING_A,
+        THREAD_A,
+        base.clone(),
+        WorkBriefKind::Amendment {
+            target_job_id: job_fork_root.job_id.clone(),
+            target_job_revision: 2,
+            amendment_reason: "Fork B".to_string(),
+        },
+        "Competing fork branch",
+    );
+    let job_fork_b = CoworkerJobRecord {
+        job_id: "job_prio_fork_b_05".to_string(),
+        job_revision: 1,
+        create_request_key: "req_fork_b_05".to_string(),
+        binding_id: BINDING_A.to_string(),
+        thread_uuid: THREAD_A.to_string(),
+        phase: CoworkerJobPhase::Planning,
+        work_brief: b_fb,
+        work_brief_digest: d_fb,
+        supersedes_job_id: Some(job_fork_root.job_id.clone()),
+        planning_result: None,
+        approval_linkage: None,
+        tasks: Vec::new(),
+        holds: Vec::new(),
+        outbox: Vec::new(),
+        combined_candidates: Vec::new(),
+    };
+
+    // 4. Clean independent AwaitingApproval job in the same ledger -> keeps positive NeedsApproval.
+    let (b_clean, d_clean) = sample_work_brief(
+        "brf_prio_clean",
+        BINDING_A,
+        THREAD_A,
+        base.clone(),
+        WorkBriefKind::NewJob,
+        "Untainted current published head",
+    );
+    let (res_clean, pr_clean) = sample_completed_orchestrator_reservation_and_result(
+        BINDING_A,
+        THREAD_A,
+        grant_id,
+        "job_prio_clean_06",
+        "pr_cln",
+        &d_clean,
+        &base,
+        &policy_digest,
+        "plan_prio_clean_head",
+        "run_00000000-0000-4000-8000-000000000806",
+    );
+    let job_clean = CoworkerJobRecord {
+        job_id: "job_prio_clean_06".to_string(),
+        job_revision: 2,
+        create_request_key: "req_prio_clean_06".to_string(),
+        binding_id: BINDING_A.to_string(),
+        thread_uuid: THREAD_A.to_string(),
+        phase: CoworkerJobPhase::AwaitingApproval,
+        work_brief: b_clean,
+        work_brief_digest: d_clean,
+        supersedes_job_id: None,
+        planning_result: Some(pr_clean),
+        approval_linkage: None,
+        tasks: Vec::new(),
+        holds: Vec::new(),
+        outbox: Vec::new(),
+        combined_candidates: Vec::new(),
+    };
+
+    let grant = PlanningAdviceGrant {
+        grant_id: grant_id.to_string(),
+        create_request_key: "req_grant_prio_compat".to_string(),
+        binding_id: BINDING_A.to_string(),
+        thread_uuid: THREAD_A.to_string(),
+        project_base: base,
+        profile_id: "profile-default".to_string(),
+        registry_revision: 1,
+        policy: planning_policy,
+        policy_digest,
+        capabilities: PlanningReadOnlyCapabilities::strict_read_only(),
+        budget: PlanningCallBudget {
+            max_total_calls: 8,
+            max_orchestrator_calls: 8,
+            max_architect_calls: 2,
+            max_timeout_ms_per_call: DEFAULT_TIMEOUT_MS,
+            max_output_bytes_per_call: DEFAULT_MAX_STDOUT_BYTES,
+        },
+        usage: PlanningGrantUsage {
+            reserved_total_calls: 4,
+            completed_calls: 4,
+            failed_calls: 0,
+            unknown_effect_calls: 0,
+            refused_before_effect_calls: 0,
+            reserved_orchestrator_calls: 4,
+            reserved_architect_calls: 0,
+        },
+        status: PlanningGrantStatus::Active,
+        created_at_ms: 1_700_000_305_000,
+        expires_at_ms: 1_700_003_905_000,
+        revoked_at_ms: None,
+        revoked_reason: None,
+        operator_attested: true,
+        native_per_call_identity_verified: false,
+        scoped_profile_dependency_proof: None,
+        reservations: vec![res_eff, res_clr, res_fa, res_clean],
+    };
+    grant.validate().expect("valid priority grant");
+
+    let mut ledger = fixture
+        .workflow_store
+        .read_binding_ledger(BINDING_A)
+        .expect("read fixture workflow ledger");
+    ledger.planning_grants.push(grant);
+    ledger.jobs.extend([
+        job_eff.clone(),
+        job_clr.clone(),
+        job_fork_root,
+        job_fork_a.clone(),
+        job_fork_b,
+        job_clean.clone(),
+    ]);
+    ledger
+        .validate(BINDING_A)
+        .expect("combined priority + accepted ledger must validate");
+    let ledger_path = fixture
+        .workflow_store
+        .ledger_path_for_binding(BINDING_A)
+        .expect("ledger path");
+    write_private_json(&ledger_path, &ledger);
+
+    remove_lockfiles_in_dir(&fixture.plans_dir);
+    let hashes_before = snapshot_private_dir_sha256(&fixture.plans_dir);
+
+    let stores = WorkspaceHistoryStores::new(&fixture.plans_dir)
+        .with_plan_store(&fixture.plans)
+        .with_authority_store(&fixture.authority)
+        .with_sessions_dir(&fixture.sessions_dir);
+    let read = read_scoped_workspace_job_histories(&chat, &stores)
+        .expect("read combined priority and historical acceptance fixture");
+
+    assert_no_lock_or_wal_files(&fixture.plans_dir);
+    assert_eq!(
+        snapshot_private_dir_sha256(&fixture.plans_dir),
+        hashes_before
+    );
+    assert!(!read.degraded);
+    assert_eq!(read.rejected_scope_count, 0);
+
+    // Historical accepted job referencing r1 stays VerifiedAccepted/Completed even after r2 is published!
+    let h_acc = find_projected_job(&read.jobs, &fixture.job_id);
+    assert_eq!(
+        h_acc.acceptance_proof.status,
+        WorkspaceAcceptanceStatus::VerifiedAccepted
+    );
+    assert_eq!(h_acc.job.state, ObservationJobState::Completed);
+    assert_eq!(h_acc.current_attention, None);
+
+    // UnresolvedEffect outranks VerifiedCurrentPublishedPlanMetadata.
+    let h_eff = find_projected_job(&read.jobs, &job_eff.job_id);
+    assert_eq!(
+        h_eff.current_attention.as_ref().map(|a| a.kind),
+        Some(WorkspaceAttentionKind::UnresolvedEffect)
+    );
+    assert_eq!(h_eff.job.state, ObservationJobState::Unknown);
+    assert_eq!(h_eff.job.execution_status, "unknown");
+    assert_eq!(h_eff.job.review_state.as_deref(), Some("unresolved"));
+
+    // Active ConversationClarificationPending hold outranks VerifiedCurrentPublishedPlanMetadata.
+    let h_clr = find_projected_job(&read.jobs, &job_clr.job_id);
+    assert_eq!(
+        h_clr.current_attention.as_ref().map(|a| a.kind),
+        Some(WorkspaceAttentionKind::NeedsUserInput)
+    );
+    assert_eq!(h_clr.job.state, ObservationJobState::NeedsUser);
+
+    // Causal lineage taint refuses VerifiedCurrentPublishedPlanMetadata even when PlanStore has head.
+    let h_fa = find_projected_job(&read.jobs, &job_fork_a.job_id);
+    assert_eq!(
+        h_fa.current_attention.as_ref().map(|a| a.kind),
+        Some(WorkspaceAttentionKind::Unknown)
+    );
+    assert_eq!(h_fa.job.state, ObservationJobState::Unknown);
+    assert_eq!(h_fa.job.approval_status, "unknown");
+    assert_eq!(h_fa.links.superseded_by_job_id, None);
+
+    // Untainted standalone current head in the same snapshot still projects bounded NeedsApproval.
+    let h_clean = find_projected_job(&read.jobs, &job_clean.job_id);
+    assert_eq!(
+        h_clean.current_attention.as_ref().map(|a| a.kind),
+        Some(WorkspaceAttentionKind::NeedsApproval)
+    );
+    assert_eq!(h_clean.job.state, ObservationJobState::NeedsUser);
+    assert_eq!(h_clean.job.approval_status, "pending_approval");
 }

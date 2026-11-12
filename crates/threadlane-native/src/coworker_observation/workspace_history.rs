@@ -42,6 +42,18 @@
 //!   component conservatively clear canonical `superseded_by_job_id` and refuse obsolete-planning
 //!   attention retirement regardless of ledger vector order. Scope-rejected foreign records never
 //!   mint proof or poison verified local components.
+//! - **Store-backed awaiting-plan publication metadata**: [`WorkspaceAttentionKind::NeedsApproval`],
+//!   [`ObservationJobState::NeedsUser`], and `approval_status = "pending_approval"` for an
+//!   unapproved [`CoworkerJobPhase::AwaitingApproval`] job are emitted only when
+//!   [`read_scoped_workspace_job_histories`] verifies a current active-published [`PlanRevision`]
+//!   head and matching profile/grant/reservation metadata from the same read-only [`PlanStore`]
+//!   snapshot, using bounded wording that describes recorded plan/approval metadata without
+//!   claiming authenticated human intent or exact artifact content. Missing, unreadable, stale, or
+//!   pure caller-supplied plan context projects [`WorkspaceAttentionKind::Unknown`],
+//!   [`ObservationJobState::Unknown`], and `approval_status = "unknown"` without clearing
+//!   attention or triggering raw `NeedsUser` fallback resurrection. A caller-supplied
+//!   `superseded_by_job_id` link alone never mints `approval_status = "superseded"` for that
+//!   unproved awaiting-approval state.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
@@ -320,7 +332,7 @@ pub fn read_scoped_workspace_job_histories(
     };
 
     let mut plan_lookup_degraded = false;
-    let plan_revisions_by_key = load_plan_revisions_readonly(
+    let plan_snapshot = load_plan_revisions_readonly(
         chat_identity,
         stores,
         &mut degraded,
@@ -381,8 +393,12 @@ pub fn read_scoped_workspace_job_histories(
                     .as_ref()
                     .map(|pr| (pr.plan_id.as_str(), pr.plan_revision))
             });
-        let plan_revision = target_plan_key
-            .and_then(|(pid, rev)| plan_revisions_by_key.get(&(pid.to_string(), rev)).cloned());
+        let plan_revision = target_plan_key.and_then(|(pid, rev)| {
+            plan_snapshot
+                .revisions_by_key
+                .get(&(pid.to_string(), rev))
+                .cloned()
+        });
 
         let mut approval_record = None;
         if let (Some(linkage), Some(records_map)) = (
@@ -483,6 +499,19 @@ pub fn read_scoped_workspace_job_histories(
             &lineage,
         );
 
+        let verified_current_published_plan = if verified_obsolete_planning.is_none() {
+            verify_current_published_plan_metadata_readonly(
+                chat_identity,
+                &ledger,
+                entry,
+                &lineage,
+                &plan_snapshot,
+                plan_lookup_degraded,
+            )
+        } else {
+            None
+        };
+
         let verified_acceptance = if job.phase == CoworkerJobPhase::Completed {
             let store_ctx = HistoricalStoreVerificationContext {
                 stores,
@@ -516,6 +545,7 @@ pub fn read_scoped_workspace_job_histories(
             Some(&context),
             verified_acceptance.as_ref(),
             verified_obsolete_planning.as_ref(),
+            verified_current_published_plan.as_ref(),
         ) {
             Ok(history) => projected_jobs.push(history),
             Err(diag) => {
@@ -540,8 +570,9 @@ pub fn read_scoped_workspace_job_histories(
 /// Pure helper projecting a single typed [`CoworkerJobRecord`] and optional
 /// [`ControllerJobRuntimeState`] into a normalized [`WorkspaceJobHistory`] for `chat_identity`.
 ///
-/// Without store-backed receipt and Closure ledger verification, `acceptance_proof` always remains
-/// [`WorkspaceAcceptanceProof::unknown`].
+/// Without store-backed receipt, Closure, and [`PlanStore`] head verification, `acceptance_proof`
+/// always remains [`WorkspaceAcceptanceProof::unknown`] and unapproved awaiting-approval records
+/// project [`WorkspaceAttentionKind::Unknown`] (`ObservationJobState::Unknown` / `approval_status = "unknown"`).
 pub fn project_coworker_job_record(
     chat_identity: &WorkspaceChatIdentity,
     job: &CoworkerJobRecord,
@@ -556,16 +587,18 @@ pub fn project_coworker_job_record(
 ///
 /// Validates `source_id`, `binding_id`, `thread_uuid`, `canonical_project_scope`, brief/planning
 /// base consistency, approval linkage, and runtime envelope identity before projecting. Without
-/// store-backed receipt and Closure ledger verification, `acceptance_proof` always remains
-/// [`WorkspaceAcceptanceProof::unknown`], and caller-supplied [`WorkspaceJobLineageContext`]
-/// never suppresses live planning attention.
+/// store-backed receipt, Closure, and [`PlanStore`] head verification, `acceptance_proof` always
+/// remains [`WorkspaceAcceptanceProof::unknown`], and caller-supplied
+/// [`WorkspaceJobLineageContext`] neither suppresses live planning attention nor mints a current
+/// published-plan witness or an `approval_status = "superseded"` claim for unproved
+/// awaiting-approval `Unknown` attention.
 pub fn project_coworker_job_history(
     chat_identity: &WorkspaceChatIdentity,
     job: &CoworkerJobRecord,
     runtime: Option<&ControllerJobRuntimeState>,
     context: Option<&WorkspaceJobLineageContext>,
 ) -> Result<WorkspaceJobHistory, WorkspaceHistoryDiagnostic> {
-    project_coworker_job_history_internal(chat_identity, job, runtime, context, None, None)
+    project_coworker_job_history_internal(chat_identity, job, runtime, context, None, None, None)
 }
 
 struct PrevalidatedScopedJob<'a> {
@@ -578,6 +611,9 @@ struct PrevalidatedScopedJob<'a> {
 
 #[derive(Debug, Clone, Copy)]
 struct VerifiedObsoletePlanningSupersession;
+
+#[derive(Debug, Clone, Copy)]
+struct VerifiedCurrentPublishedPlanMetadata;
 
 #[derive(Debug, Clone)]
 struct VerifiedHistoricalTaskAcceptance {
@@ -613,6 +649,7 @@ fn project_coworker_job_history_internal(
     context: Option<&WorkspaceJobLineageContext>,
     verified_acceptance: Option<&VerifiedHistoricalJobAcceptance>,
     verified_obsolete_planning: Option<&VerifiedObsoletePlanningSupersession>,
+    verified_current_published_plan: Option<&VerifiedCurrentPublishedPlanMetadata>,
 ) -> Result<WorkspaceJobHistory, WorkspaceHistoryDiagnostic> {
     chat_identity.validate().map_err(|_| {
         WorkspaceHistoryDiagnostic::new(
@@ -656,7 +693,13 @@ fn project_coworker_job_history_internal(
     let current_attention = if verified_acceptance.is_some() {
         None
     } else {
-        derive_job_current_attention(job, runtime, &projected_tasks, verified_obsolete_planning)
+        derive_job_current_attention(
+            job,
+            runtime,
+            &projected_tasks,
+            verified_obsolete_planning,
+            verified_current_published_plan,
+        )
     };
     let links = project_record_links(job, context);
     let result = project_job_result(job, runtime, runtime_missing, verified_acceptance);
@@ -671,6 +714,7 @@ fn project_coworker_job_history_internal(
         current_attention.as_ref(),
         verified_acceptance,
         verified_obsolete_planning,
+        verified_current_published_plan,
     );
 
     let acceptance_proof = match verified_acceptance {
@@ -1121,6 +1165,142 @@ fn job_has_ambiguous_planning_reservation(
         }
     }
     false
+}
+
+fn verify_current_published_plan_metadata_readonly<'l>(
+    chat_identity: &WorkspaceChatIdentity,
+    ledger: &CoworkerBindingLedger,
+    entry: &PrevalidatedScopedJob<'l>,
+    lineage: &ValidatedScopedLineage<'l>,
+    plan_snapshot: &ReadOnlyPlanSnapshot,
+    plan_lookup_degraded: bool,
+) -> Option<VerifiedCurrentPublishedPlanMetadata> {
+    let job = entry.job;
+    if job.phase != CoworkerJobPhase::AwaitingApproval
+        || job.approval_linkage.is_some()
+        || !job.tasks.is_empty()
+        || !job.outbox.is_empty()
+        || !job.combined_candidates.is_empty()
+        || job.holds.iter().any(|h| h.active)
+        || entry.runtime_missing_or_degraded
+        || entry.runtime_opt.is_some()
+    {
+        return None;
+    }
+    let job_id = job.job_id.as_str();
+    if lineage.tainted_job_ids.contains(job_id)
+        || lineage.superseded_by_target.contains_key(job_id)
+        || lineage.follow_ups_by_target.contains_key(job_id)
+    {
+        return None;
+    }
+
+    let pr = job.planning_result.as_ref()?;
+    pr.validate().ok()?;
+    if pr.project_base != job.work_brief.project_base
+        || pr.work_brief_digest != job.work_brief_digest
+        || !pr.plan_status.is_active_published()
+    {
+        return None;
+    }
+
+    let grant = ledger
+        .planning_grants
+        .iter()
+        .find(|g| g.grant_id == pr.grant_id)?;
+    if grant.binding_id != chat_identity.binding_id
+        || grant.thread_uuid != chat_identity.thread_uuid
+        || grant.project_base.repository_path != chat_identity.canonical_project_scope
+        || grant.profile_id != pr.profile_id
+        || grant.registry_revision != pr.registry_revision
+        || grant.policy_digest != pr.policy_digest
+    {
+        return None;
+    }
+
+    let reservation = grant
+        .reservations
+        .iter()
+        .find(|r| r.reservation_id == pr.reservation_id)?;
+    if reservation.role != WorkflowRole::Orchestrator
+        || reservation.status != PlanningReservationStatus::Completed
+        || reservation.request_key != pr.request_key
+        || reservation.selected_choice != pr.selected_choice
+        || reservation.run_id.as_deref() != Some(pr.run_id.as_str())
+        || reservation.report_artifact_id.as_deref() != Some(pr.report_artifact_id.as_str())
+        || reservation.output_digest.as_deref() != Some(pr.output_digest.as_str())
+    {
+        return None;
+    }
+    if let Some(ref call_base) = reservation.call_project_base {
+        if call_base != &pr.project_base {
+            return None;
+        }
+    }
+
+    for adv_id in &pr.architect_advice_ids {
+        let adv = ledger
+            .architect_advice
+            .iter()
+            .find(|a| &a.advice_id == adv_id)?;
+        if adv.binding_id != chat_identity.binding_id
+            || adv.thread_uuid != chat_identity.thread_uuid
+            || adv.context_dependencies.project_base.repository_path
+                != chat_identity.canonical_project_scope
+        {
+            return None;
+        }
+    }
+
+    for g in &ledger.planning_grants {
+        for res in &g.reservations {
+            if !matches!(
+                res.status,
+                PlanningReservationStatus::ReservedBeforeEffect
+                    | PlanningReservationStatus::EffectUnknown
+            ) {
+                continue;
+            }
+            let linked_via_result = g.grant_id == pr.grant_id
+                && (res.reservation_id == pr.reservation_id || res.request_key == pr.request_key);
+            let linked_via_advice = ledger.architect_advice.iter().any(|adv| {
+                adv.grant_id == g.grant_id
+                    && adv.reservation_id == res.reservation_id
+                    && adv.context_dependencies.work_brief_digest == job.work_brief_digest
+            });
+            if linked_via_result || linked_via_advice {
+                return None;
+            }
+        }
+    }
+
+    if plan_lookup_degraded || !plan_snapshot.loaded {
+        return None;
+    }
+    let plan_rev = entry.plan_revision.as_ref()?;
+    if plan_rev.binding_id != chat_identity.binding_id
+        || plan_rev.plan_id != pr.plan_id
+        || plan_rev.revision != pr.plan_revision
+        || plan_rev.profile_id != pr.profile_id
+        || plan_rev.profile_revision != pr.registry_revision
+        || !plan_rev.status.is_active_published()
+    {
+        return None;
+    }
+    let plan_id = pr.plan_id.as_str();
+    if plan_snapshot.latest_revision_by_plan.get(plan_id) != Some(&pr.plan_revision) {
+        return None;
+    }
+    if plan_rev.tasks.is_empty() {
+        return None;
+    }
+    for tid in pr.task_interfaces.keys() {
+        if !plan_rev.tasks.iter().any(|t| &t.id == tid) {
+            return None;
+        }
+    }
+
+    Some(VerifiedCurrentPublishedPlanMetadata)
 }
 
 fn validate_job_and_companion_scopes(
@@ -2309,11 +2489,19 @@ fn derive_job_historical_failure(
         .cloned()
 }
 
+const VERIFIED_PENDING_PLAN_ATTENTION_REASON: &str =
+    "The latest recorded published plan referenced by this job has no approval linked to the job.";
+const UNVERIFIED_PENDING_PLAN_ATTENTION_REASON: &str =
+    "This job records an awaiting-approval state, but its current published plan could not be verified.";
+const PENDING_PLAN_ATTENTION_NEXT_STEP: &str =
+    "Inspect the current plan and approval evidence before deciding whether approval or a revised plan is needed.";
+
 fn derive_job_current_attention(
     job: &CoworkerJobRecord,
     runtime: Option<&ControllerJobRuntimeState>,
     projected_tasks: &[WorkspaceTaskHistory],
     verified_obsolete_planning: Option<&VerifiedObsoletePlanningSupersession>,
+    verified_current_published_plan: Option<&VerifiedCurrentPublishedPlanMetadata>,
 ) -> Option<WorkspaceAttentionState> {
     let mut blocking_outbox_ids: Vec<String> = job
         .outbox
@@ -2404,10 +2592,21 @@ fn derive_job_current_attention(
         && job.approval_linkage.is_none()
         && verified_obsolete_planning.is_none()
     {
+        let (kind, reason) = if verified_current_published_plan.is_some() {
+            (
+                WorkspaceAttentionKind::NeedsApproval,
+                VERIFIED_PENDING_PLAN_ATTENTION_REASON.to_string(),
+            )
+        } else {
+            (
+                WorkspaceAttentionKind::Unknown,
+                UNVERIFIED_PENDING_PLAN_ATTENTION_REASON.to_string(),
+            )
+        };
         return Some(WorkspaceAttentionState {
-            kind: WorkspaceAttentionKind::NeedsApproval,
-            reason: "Published workflow plan is waiting on explicit human approval.".to_string(),
-            next_step: Some("Review and approve the published plan scope.".to_string()),
+            kind,
+            reason,
+            next_step: Some(PENDING_PLAN_ATTENTION_NEXT_STEP.to_string()),
             blocking_hold_ids,
             blocking_outbox_ids: Vec::new(),
             question_id: None,
@@ -2472,6 +2671,18 @@ fn derive_job_current_attention(
             reason: "Candidate output is awaiting review or closure verification.".to_string(),
             next_step: None,
             blocking_hold_ids: Vec::new(),
+            blocking_outbox_ids: Vec::new(),
+            question_id: None,
+            updated_at_ms: None,
+        });
+    }
+
+    if job.phase == CoworkerJobPhase::AwaitingApproval && verified_obsolete_planning.is_none() {
+        return Some(WorkspaceAttentionState {
+            kind: WorkspaceAttentionKind::Unknown,
+            reason: UNVERIFIED_PENDING_PLAN_ATTENTION_REASON.to_string(),
+            next_step: Some(PENDING_PLAN_ATTENTION_NEXT_STEP.to_string()),
+            blocking_hold_ids,
             blocking_outbox_ids: Vec::new(),
             question_id: None,
             updated_at_ms: None,
@@ -2871,16 +3082,28 @@ fn project_job_summary(
     current_attention: Option<&WorkspaceAttentionState>,
     verified_acceptance: Option<&VerifiedHistoricalJobAcceptance>,
     verified_obsolete_planning: Option<&VerifiedObsoletePlanningSupersession>,
+    verified_current_published_plan: Option<&VerifiedCurrentPublishedPlanMetadata>,
 ) -> WorkspaceJobSummary {
     let phase_str = job_phase_name(job.phase);
-    let approval_status = if context.is_some_and(|c| c.superseded_by_job_id.is_some()) {
+    // A supersession link alone is not private proof of obsolete-planning retirement.
+    // Unproved awaiting-approval Unknown attention keeps its truthful unknown approval status.
+    let unproved_awaiting_approval_unknown = job.phase == CoworkerJobPhase::AwaitingApproval
+        && job.approval_linkage.is_none()
+        && verified_obsolete_planning.is_none()
+        && verified_current_published_plan.is_none()
+        && current_attention.is_some_and(|a| a.kind == WorkspaceAttentionKind::Unknown);
+    let approval_status = if unproved_awaiting_approval_unknown {
+        "unknown"
+    } else if context.is_some_and(|c| c.superseded_by_job_id.is_some()) {
         "superseded"
     } else if job.approval_linkage.is_some() {
         "approved"
+    } else if verified_current_published_plan.is_some() {
+        "pending_approval"
     } else if matches!(job.phase, CoworkerJobPhase::AwaitingApproval)
         || job.planning_result.is_some()
     {
-        "pending_approval"
+        "unknown"
     } else {
         "draft"
     };
@@ -2912,10 +3135,19 @@ fn project_job_summary(
                     "unknown",
                     Some("unresolved".to_string()),
                 )
-            } else if verified_obsolete_planning.is_some() && current_attention.is_none() {
-                (ObservationJobState::Unknown, "not_started", None)
-            } else {
+            } else if verified_current_published_plan.is_some()
+                || current_attention.is_some_and(|a| {
+                    matches!(
+                        a.kind,
+                        WorkspaceAttentionKind::NeedsApproval
+                            | WorkspaceAttentionKind::NeedsUserInput
+                            | WorkspaceAttentionKind::OnHold
+                    )
+                })
+            {
                 (ObservationJobState::NeedsUser, "not_started", None)
+            } else {
+                (ObservationJobState::Unknown, "not_started", None)
             }
         }
         CoworkerJobPhase::Held => {
@@ -3187,24 +3419,43 @@ fn find_matching_controller_effect<'a>(
     })
 }
 
+#[derive(Default)]
+struct ReadOnlyPlanSnapshot {
+    loaded: bool,
+    revisions_by_key: BTreeMap<(String, u64), PlanRevision>,
+    latest_revision_by_plan: BTreeMap<String, u64>,
+}
+
 fn load_plan_revisions_readonly(
     chat_identity: &WorkspaceChatIdentity,
     stores: &WorkspaceHistoryStores<'_>,
     degraded: &mut bool,
     plan_lookup_degraded: &mut bool,
     diagnostics: &mut Vec<WorkspaceHistoryDiagnostic>,
-) -> BTreeMap<(String, u64), PlanRevision> {
-    let mut map = BTreeMap::new();
+) -> ReadOnlyPlanSnapshot {
+    let mut snapshot = ReadOnlyPlanSnapshot::default();
     let plan_dir = stores.plan_store.map_or(stores.plans_dir, PlanStore::dir);
-    if stores.plan_store.is_none() && !plan_dir.join("plans.json").is_file() {
-        return map;
+    if stores.plan_store.is_none()
+        && matches!(
+            fs::symlink_metadata(plan_dir.join("plans.json")),
+            Err(ref err) if err.kind() == ErrorKind::NotFound
+        )
+    {
+        return snapshot;
     }
 
     match PlanStore::read_snapshot_readonly_at(plan_dir) {
         Ok(revisions) => {
+            snapshot.loaded = true;
             for rev in revisions {
+                let max_rev = snapshot
+                    .latest_revision_by_plan
+                    .entry(rev.plan_id.clone())
+                    .or_insert(rev.revision);
+                *max_rev = (*max_rev).max(rev.revision);
                 if rev.binding_id == chat_identity.binding_id {
-                    map.insert((rev.plan_id.clone(), rev.revision), rev);
+                    let key = (rev.plan_id.clone(), rev.revision);
+                    snapshot.revisions_by_key.insert(key, rev);
                 }
             }
         }
@@ -3218,7 +3469,7 @@ fn load_plan_revisions_readonly(
             ));
         }
     }
-    map
+    snapshot
 }
 
 fn load_authority_records_readonly(
