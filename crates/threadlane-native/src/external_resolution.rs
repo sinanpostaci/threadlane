@@ -2153,38 +2153,7 @@ impl ExternalResolutionService {
 
     fn verify_host_quiescent_readonly(&self, approval: &ApprovalRecord) -> Result<(), NativeError> {
         let sessions_dir = self.require_verified_sessions_dir()?;
-        let launch_lock_path = sessions_dir
-            .join(LAUNCH_INTENTS_SUBDIR)
-            .join(format!("{}.lock", approval.approval_id));
-        if probe_existing_lockfile_busy_readonly(&launch_lock_path)? {
-            return Err(invalid(
-                "host launch-intent lock is currently held by an active startup process",
-            ));
-        }
-        verify_host_launch_intent_state(&sessions_dir, approval)?;
-
-        let session_dir_candidate = sessions_dir.join(&approval.approval_id);
-        let _ = validate_absolute_no_symlink_components(&session_dir_candidate, "session_dir")?;
-        match fs::symlink_metadata(&session_dir_candidate) {
-            Ok(_) => {
-                let session_dir = verify_existing_session_dir(&sessions_dir, &approval.approval_id)
-                    .map_err(map_host_error)?;
-                if probe_existing_lockfile_busy_readonly(&session_dir.join(HOST_LOCK_FILENAME))? {
-                    return Err(invalid(
-                        "live ApprovedHost session lock is currently held for this approval",
-                    ));
-                }
-                verify_stopped_host_session_contents(&session_dir, approval)
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(err) => Err(NativeError::new(
-                NativeErrorCode::IoError,
-                format!(
-                    "cannot inspect host session directory metadata: {}",
-                    sanitize_diagnostic_text(&err.to_string())
-                ),
-            )),
-        }
+        verify_host_quiescence_readonly(&sessions_dir, approval)
     }
 
     fn acquire_and_verify_host_guards(
@@ -2639,7 +2608,7 @@ fn owner_target_id_for_preview(preview: &ExternalResolutionPreview) -> Result<St
     }
 }
 
-fn verify_no_ambiguous_planning_reservations(
+pub(crate) fn verify_no_ambiguous_planning_reservations(
     ledger: &CoworkerBindingLedger,
 ) -> Result<(), NativeError> {
     for grant in &ledger.planning_grants {
@@ -2688,7 +2657,7 @@ fn verify_planning_command_ledger_quiescent(
     Ok(())
 }
 
-fn verify_job_quiescent(job: &CoworkerJobRecord) -> Result<(), NativeError> {
+pub(crate) fn verify_job_quiescent(job: &CoworkerJobRecord) -> Result<(), NativeError> {
     for outbox in &job.outbox {
         if outbox.status.blocks_replay_and_new_dispatch() {
             let code =
@@ -2769,6 +2738,50 @@ fn verify_job_tasks_match_approval(
         }
     }
     Ok(())
+}
+
+/// Complete read-only host quiescence proof for an already-verified private sessions root and a
+/// verified [`ApprovalRecord`].
+///
+/// Probes the launch-intent lock and durable intent state, the ApprovedHost session lock, manifest
+/// phase/PID/supervisor readiness, runtime-state supervisor lock and terminal snapshot, and unsealed
+/// task dispatch intents without creating directories, locks, caches, or runtime state.
+pub(crate) fn verify_host_quiescence_readonly(
+    sessions_dir: &Path,
+    approval: &ApprovalRecord,
+) -> Result<(), NativeError> {
+    let launch_lock_path = sessions_dir
+        .join(LAUNCH_INTENTS_SUBDIR)
+        .join(format!("{}.lock", approval.approval_id));
+    if probe_existing_lockfile_busy_readonly(&launch_lock_path)? {
+        return Err(invalid(
+            "host launch-intent lock is currently held by an active startup process",
+        ));
+    }
+    verify_host_launch_intent_state(sessions_dir, approval)?;
+
+    let session_dir_candidate = sessions_dir.join(&approval.approval_id);
+    let _ = validate_absolute_no_symlink_components(&session_dir_candidate, "session_dir")?;
+    match fs::symlink_metadata(&session_dir_candidate) {
+        Ok(_) => {
+            let session_dir = verify_existing_session_dir(sessions_dir, &approval.approval_id)
+                .map_err(map_host_error)?;
+            if probe_existing_lockfile_busy_readonly(&session_dir.join(HOST_LOCK_FILENAME))? {
+                return Err(invalid(
+                    "live ApprovedHost session lock is currently held for this approval",
+                ));
+            }
+            verify_stopped_host_session_contents(&session_dir, approval)
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(NativeError::new(
+            NativeErrorCode::IoError,
+            format!(
+                "cannot inspect host session directory metadata: {}",
+                sanitize_diagnostic_text(&err.to_string())
+            ),
+        )),
+    }
 }
 
 fn verify_host_launch_intent_state(

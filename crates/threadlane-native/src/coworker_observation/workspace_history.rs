@@ -76,8 +76,8 @@ use threadlane_core::observation::{
     WorkspaceRunRecord, WorkspaceTaskAttempt, WorkspaceTaskCandidate, WorkspaceTaskHistory,
 };
 use threadlane_host::{
-    read_host_launch_intent_optional, read_host_manifest_optional, verify_existing_private_dir,
-    verify_existing_session_dir, HostLaunchIntentStatus, HostPhase, WORK_AREA_SUBDIR,
+    read_host_manifest_optional, verify_existing_private_dir, verify_existing_session_dir,
+    WORK_AREA_SUBDIR,
 };
 use threadlane_operations::{
     inspect_job_integration_intent_readonly, load_integration_receipt, load_review_receipt,
@@ -101,8 +101,9 @@ use crate::coworker_workflow::{
     TaskCandidateRef, WorkBriefKind, WorkflowHoldReason, WorkflowHoldRecord,
 };
 use crate::external_resolution::{
-    evaluate_receipt_applicability, ExternalResolutionApplicability, ExternalResolutionReceipt,
-    ExternalResolutionScope, ExternalResolutionTarget,
+    evaluate_receipt_applicability, verify_host_quiescence_readonly, verify_job_quiescent,
+    verify_no_ambiguous_planning_reservations, ExternalResolutionApplicability,
+    ExternalResolutionReceipt, ExternalResolutionScope, ExternalResolutionTarget,
 };
 use crate::fs_safety::constant_time_str_eq;
 
@@ -1020,20 +1021,16 @@ fn filter_job_for_covered_task_attention(
             task.unresolved_outbox_id = None;
         }
     }
-    filtered.outbox.retain(|outbox| {
-        !outbox
-            .task_id
-            .as_ref()
-            .is_some_and(|task_id| covered_task_ids.contains(task_id))
-    });
+    // Only exact attention-covered outbox/effect rows are removed. Task-level filtering would also
+    // hide unrelated unresolved effects that were never part of the covered attention witness.
+    filtered
+        .outbox
+        .retain(|outbox| !covered_outbox_ids.contains(&outbox.outbox_id));
     let filtered_runtime = runtime.map(|runtime| {
         let mut filtered_runtime = runtime.clone();
         filtered_runtime.pending_effects.retain(|effect_id, effect| {
             !covered_outbox_ids.contains(effect_id)
-                && !effect
-                    .task_id
-                    .as_ref()
-                    .is_some_and(|task_id| covered_task_ids.contains(task_id))
+                && !covered_outbox_ids.contains(&effect.effect_id)
         });
         filtered_runtime
     });
@@ -1094,6 +1091,486 @@ fn verify_scoped_external_resolutions_readonly(
         resolutions.push(projected);
     }
     VerifiedExternalResolutionHistory { resolutions }
+}
+
+/// Selector for a genuine legacy plan-only observation job.
+///
+/// The selector is only a lookup key. It never mints receipt applicability: the reader
+/// independently verifies the private binding ledger, exact published plan revision, unique
+/// matching approval/task membership, canonical project/base evidence, ownership, host, planning,
+/// and conversational-change state before returning an applicable resolution.
+#[derive(Debug, Clone, Copy)]
+pub struct LegacyPlanObservationScope<'a> {
+    /// Verified four-part chat binding identifier.
+    pub binding_id: &'a str,
+    /// Verified native thread UUID.
+    pub thread_uuid: &'a str,
+    /// Verified canonical non-symlink project root.
+    pub canonical_project_scope: &'a str,
+    /// Durable legacy plan identifier (`ObservationJob.id`).
+    pub plan_id: &'a str,
+    /// Exact published plan revision displayed by the legacy observation job.
+    pub plan_revision: u64,
+    /// Exact task identifiers displayed by the legacy observation job.
+    pub task_ids: &'a [String],
+}
+
+/// Opaque store-backed external resolution result for a legacy plan-only observation job.
+///
+/// Only [`read_legacy_plan_external_resolutions_readonly`] constructs non-empty values with an
+/// applicable receipt. Caller-supplied lineage, pure projectors, and public DTOs can never mint
+/// applicability or coverage through this type.
+#[derive(Debug, Clone, Default)]
+pub struct VerifiedLegacyPlanExternalResolutions {
+    resolutions: Vec<WorkspaceExternalResolution>,
+    full_job_applicable: bool,
+    diagnostics: Vec<WorkspaceHistoryDiagnostic>,
+}
+
+impl VerifiedLegacyPlanExternalResolutions {
+    /// Returns the independently verified receipt projections in ledger order.
+    #[must_use]
+    pub fn resolutions(&self) -> &[WorkspaceExternalResolution] {
+        &self.resolutions
+    }
+
+    /// Returns `true` only when an applicable full-plan receipt covers the legacy job.
+    #[must_use]
+    pub const fn has_applicable_full_job(&self) -> bool {
+        self.full_job_applicable
+    }
+
+    /// Returns sanitized read-only verification diagnostics collected while classifying receipts.
+    #[must_use]
+    pub fn diagnostics(&self) -> &[WorkspaceHistoryDiagnostic] {
+        &self.diagnostics
+    }
+}
+
+/// Reads and verifies external resolution receipts targeting a legacy plan-only observation job.
+///
+/// The lookup never invents a Coworker job identity and never writes to the ledger, plan, authority,
+/// ownership, host, or conversational-change stores. Receipts are returned with `Unverified`
+/// applicability whenever required evidence is missing, active, ambiguous, tampered, or unreadable.
+pub fn read_legacy_plan_external_resolutions_readonly(
+    chat_identity: &WorkspaceChatIdentity,
+    stores: &WorkspaceHistoryStores<'_>,
+    scope: &LegacyPlanObservationScope<'_>,
+) -> Result<VerifiedLegacyPlanExternalResolutions, WorkspaceHistoryDiagnostic> {
+    validate_chat_identity_and_canonical_repo_on_disk(chat_identity)?;
+
+    if scope.binding_id != chat_identity.binding_id.as_str()
+        || scope.thread_uuid != chat_identity.thread_uuid.as_str()
+        || scope.canonical_project_scope != chat_identity.canonical_project_scope.as_str()
+    {
+        return Err(WorkspaceHistoryDiagnostic::new(
+            WorkspaceHistoryDiagnosticKind::ScopeRejected,
+            Some(scope.plan_id),
+            "Legacy plan observation scope does not match the verified chat identity.",
+        ));
+    }
+    if scope.plan_revision == 0 {
+        return Err(WorkspaceHistoryDiagnostic::new(
+            WorkspaceHistoryDiagnosticKind::ScopeRejected,
+            Some(scope.plan_id),
+            "Legacy plan observation scope has an invalid zero plan revision.",
+        ));
+    }
+
+    match fs::symlink_metadata(stores.plans_dir) {
+        Ok(_) => {}
+        Err(err) if err.kind() == ErrorKind::NotFound => {
+            return Err(WorkspaceHistoryDiagnostic::new(
+                WorkspaceHistoryDiagnosticKind::MissingStore,
+                Some(scope.plan_id),
+                "Workflow plans store directory is absent; legacy external resolution lookup is unavailable.",
+            ));
+        }
+        Err(_) => {
+            return Err(WorkspaceHistoryDiagnostic::new(
+                WorkspaceHistoryDiagnosticKind::DegradedStore,
+                Some(scope.plan_id),
+                "Workflow plans store directory metadata could not be verified.",
+            ));
+        }
+    }
+
+    let workflow_store = CoworkerWorkflowStore::new(stores.plans_dir).map_err(|_| {
+        WorkspaceHistoryDiagnostic::new(
+            WorkspaceHistoryDiagnosticKind::DegradedStore,
+            Some(scope.plan_id),
+            "Workflow plans store directory failed private non-symlink validation.",
+        )
+    })?;
+    let ledger = workflow_store
+        .read_binding_ledger(scope.binding_id)
+        .map_err(|_| {
+            WorkspaceHistoryDiagnostic::new(
+                WorkspaceHistoryDiagnosticKind::DegradedStore,
+                Some(scope.plan_id),
+                "Binding workflow ledger failed read-only integrity validation.",
+            )
+        })?;
+    if let Some(ref pinned_thread) = ledger.thread_uuid {
+        if pinned_thread.as_str() != scope.thread_uuid {
+            return Err(WorkspaceHistoryDiagnostic::new(
+                WorkspaceHistoryDiagnosticKind::ScopeRejected,
+                Some(scope.plan_id),
+                "Binding workflow ledger is pinned to a different native thread UUID.",
+            ));
+        }
+    }
+
+    let matching_receipts: Vec<&ExternalResolutionReceipt> = ledger
+        .external_resolutions
+        .iter()
+        .filter(|receipt| {
+            matches!(
+                &receipt.target,
+                ExternalResolutionTarget::LegacyPlan {
+                    plan_id,
+                    plan_revision,
+                } if plan_id.as_str() == scope.plan_id
+                    && *plan_revision == scope.plan_revision
+            )
+        })
+        .collect();
+    if matching_receipts.is_empty() {
+        return Ok(VerifiedLegacyPlanExternalResolutions::default());
+    }
+
+    let mut _degraded = false;
+    let mut _plan_lookup_degraded = false;
+    let mut diagnostics = Vec::new();
+    let plan_snapshot = load_plan_revisions_readonly(
+        chat_identity,
+        stores,
+        &mut _degraded,
+        &mut _plan_lookup_degraded,
+        &mut diagnostics,
+    );
+    let authority_records_by_id =
+        load_authority_records_readonly(stores, &mut _degraded, &mut diagnostics);
+    let authority_store_configured =
+        stores.authority_store.is_some() || stores.authority_dir.is_some();
+    let verified_sessions_root =
+        verify_sessions_root_readonly(stores.sessions_dir, &mut _degraded, &mut diagnostics);
+    let policy_store = ControllerPolicyStore::new(stores.plans_dir).ok();
+    let approval_records: Vec<ApprovalRecord> = authority_records_by_id
+        .as_ref()
+        .map(|records| records.values().cloned().collect())
+        .unwrap_or_default();
+    let plan_revisions: Vec<PlanRevision> =
+        plan_snapshot.revisions_by_key.values().cloned().collect();
+
+    let mut verified = VerifiedLegacyPlanExternalResolutions::default();
+    for receipt in matching_receipts {
+        let mut projected = project_external_resolution_receipt(receipt);
+        let (applicability, verification_error) =
+            classify_legacy_plan_external_resolution_applicability_readonly(
+                chat_identity,
+                scope,
+                receipt,
+                &ledger,
+                &plan_snapshot,
+                &approval_records,
+                &plan_revisions,
+                authority_store_configured,
+                policy_store.as_ref(),
+                stores,
+                verified_sessions_root,
+            );
+        projected.applicability = applicability;
+        if let Some(message) = verification_error {
+            diagnostics.push(WorkspaceHistoryDiagnostic::new(
+                WorkspaceHistoryDiagnosticKind::ExternalResolutionVerificationFailed,
+                Some(scope.plan_id),
+                message,
+            ));
+        }
+        if applicability.is_applicable()
+            && projected.scope == WorkspaceExternalResolutionScope::Job
+        {
+            verified.full_job_applicable = true;
+        }
+        verified.resolutions.push(projected);
+    }
+    verified.diagnostics = diagnostics;
+    Ok(verified)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn classify_legacy_plan_external_resolution_applicability_readonly(
+    chat_identity: &WorkspaceChatIdentity,
+    scope: &LegacyPlanObservationScope<'_>,
+    receipt: &ExternalResolutionReceipt,
+    ledger: &CoworkerBindingLedger,
+    plan_snapshot: &ReadOnlyPlanSnapshot,
+    approval_records: &[ApprovalRecord],
+    plan_revisions: &[PlanRevision],
+    authority_store_configured: bool,
+    policy_store: Option<&ControllerPolicyStore>,
+    stores: &WorkspaceHistoryStores<'_>,
+    verified_sessions_root: Option<&Path>,
+) -> (
+    WorkspaceExternalResolutionApplicability,
+    Option<&'static str>,
+) {
+    if let Err(message) =
+        verify_legacy_plan_receipt_identity_and_project(receipt, chat_identity, scope)
+    {
+        return (
+            WorkspaceExternalResolutionApplicability::Unverified,
+            Some(message),
+        );
+    }
+    if !plan_snapshot.loaded {
+        return (
+            WorkspaceExternalResolutionApplicability::Unverified,
+            Some("Plan evidence is missing for legacy external resolution applicability."),
+        );
+    }
+    let Some(plan) = plan_snapshot
+        .revisions_by_key
+        .get(&(scope.plan_id.to_string(), scope.plan_revision))
+    else {
+        return (
+            WorkspaceExternalResolutionApplicability::Unverified,
+            Some("Legacy plan revision is missing from the current PlanStore."),
+        );
+    };
+    if plan.binding_id != chat_identity.binding_id {
+        return (
+            WorkspaceExternalResolutionApplicability::Unverified,
+            Some("Legacy plan revision belongs to a different binding."),
+        );
+    }
+
+    let plan_task_ids: BTreeSet<&str> = plan.tasks.iter().map(|task| task.id.as_str()).collect();
+    let scope_task_ids: BTreeSet<&str> = scope.task_ids.iter().map(String::as_str).collect();
+    if scope_task_ids.len() != scope.task_ids.len() || scope_task_ids != plan_task_ids {
+        return (
+            WorkspaceExternalResolutionApplicability::Unverified,
+            Some("Legacy observation task set does not exactly match the published plan revision."),
+        );
+    }
+
+    if !authority_store_configured || approval_records.is_empty() {
+        return (
+            WorkspaceExternalResolutionApplicability::Unverified,
+            Some("Authority evidence is missing for legacy external resolution applicability."),
+        );
+    }
+    let matching_approvals: Vec<&ApprovalRecord> = approval_records
+        .iter()
+        .filter(|approval| {
+            approval.plan_id.as_str() == scope.plan_id
+                && approval.plan_revision == scope.plan_revision
+        })
+        .collect();
+    if matching_approvals.len() != 1 {
+        return (
+            WorkspaceExternalResolutionApplicability::Unverified,
+            Some(
+                "Legacy plan revision is not uniquely linked to a single verified ApprovalRecord.",
+            ),
+        );
+    }
+    let approval = matching_approvals[0];
+    if approval.binding_id != chat_identity.binding_id
+        || approval.thread_uuid != chat_identity.thread_uuid
+        || approval.repository_path != receipt.project.canonical_repo_root
+        || approval.base_commit != receipt.project.base_commit
+        || Some(approval.approval_id.as_str()) != receipt.approval_id.as_deref()
+        || Some(approval.subject_digest.as_str()) != receipt.approval_subject_digest.as_deref()
+        || Some(approval.plan_digest.as_str()) != receipt.plan_digest.as_deref()
+    {
+        return (
+            WorkspaceExternalResolutionApplicability::Unverified,
+            Some("Legacy approval evidence does not match immutable receipt scope."),
+        );
+    }
+
+    let approved_task_ids: BTreeSet<&str> = approval
+        .approved_task_ids
+        .iter()
+        .map(String::as_str)
+        .collect();
+    if approved_task_ids.is_empty()
+        || approved_task_ids.len() != approval.approved_task_ids.len()
+        || !approved_task_ids.is_subset(&plan_task_ids)
+    {
+        return (
+            WorkspaceExternalResolutionApplicability::Unverified,
+            Some("Legacy approval task membership is empty, duplicate, or outside the plan revision."),
+        );
+    }
+    match &receipt.scope {
+        ExternalResolutionScope::FullJob => {
+            let mut expected = approval.approved_task_ids.clone();
+            expected.sort();
+            if expected != receipt.resolved_task_ids {
+                return (
+                    WorkspaceExternalResolutionApplicability::Unverified,
+                    Some("Full legacy receipt does not cover the exact approved task set."),
+                );
+            }
+        }
+        ExternalResolutionScope::Tasks { task_ids } => {
+            if task_ids != &receipt.resolved_task_ids
+                || task_ids.is_empty()
+                || task_ids
+                    .iter()
+                    .any(|task_id| !approved_task_ids.contains(task_id.as_str()))
+            {
+                return (
+                    WorkspaceExternalResolutionApplicability::Unverified,
+                    Some("Task-scoped legacy receipt references a task outside the approved set."),
+                );
+            }
+        }
+    }
+
+    if ledger.jobs.iter().any(|job| {
+        job.planning_result
+            .as_ref()
+            .is_some_and(|result| result.plan_id.as_str() == scope.plan_id)
+            || job
+                .approval_linkage
+                .as_ref()
+                .is_some_and(|linkage| linkage.plan_id.as_str() == scope.plan_id)
+    }) {
+        return (WorkspaceExternalResolutionApplicability::Stale, None);
+    }
+
+    match evaluate_receipt_applicability(
+        receipt,
+        ledger,
+        approval_records,
+        plan_revisions,
+        None,
+        stores.plans_dir,
+    ) {
+        Ok(ExternalResolutionApplicability::Stale { .. }) => {
+            return (WorkspaceExternalResolutionApplicability::Stale, None);
+        }
+        Ok(ExternalResolutionApplicability::Applicable) => {}
+        Err(_) => {
+            return (
+                WorkspaceExternalResolutionApplicability::Unverified,
+                Some(
+                    "Legacy external resolution applicability evaluation failed read-only validation.",
+                ),
+            );
+        }
+    }
+
+    if let Some(policy_store) = policy_store {
+        match policy_store.get_binding_ledger_revision_readonly(&chat_identity.binding_id) {
+            Ok(current_controller_revision)
+                if current_controller_revision < receipt.source_controller_ledger_revision =>
+            {
+                return (
+                    WorkspaceExternalResolutionApplicability::Unverified,
+                    Some(
+                        "Legacy external resolution receipt controller ledger revision is ahead of current controller state.",
+                    ),
+                );
+            }
+            Ok(_) => {}
+            Err(_) => {
+                return (
+                    WorkspaceExternalResolutionApplicability::Unverified,
+                    Some(
+                        "Controller ledger revision could not be verified for legacy external resolution applicability.",
+                    ),
+                );
+            }
+        }
+    } else if receipt.source_controller_ledger_revision > 0 {
+        return (
+            WorkspaceExternalResolutionApplicability::Unverified,
+            Some(
+                "Controller ledger evidence is missing for legacy external resolution applicability.",
+            ),
+        );
+    }
+
+    if verify_no_ambiguous_planning_reservations(ledger).is_err() {
+        return (
+            WorkspaceExternalResolutionApplicability::Unverified,
+            Some("Current planning reservations are ambiguous or pending reconciliation."),
+        );
+    }
+    if !verify_no_active_owner_readonly(
+        stores.plans_dir,
+        chat_identity,
+        &approval.approval_id,
+    ) {
+        return (
+            WorkspaceExternalResolutionApplicability::Unverified,
+            Some("Current legacy approval ownership evidence does not permit applicability."),
+        );
+    }
+    let Some(sessions_root) = verified_sessions_root else {
+        return (
+            WorkspaceExternalResolutionApplicability::Unverified,
+            Some("Current legacy host session evidence is missing or not quiescent."),
+        );
+    };
+    if verify_host_quiescence_readonly(sessions_root, approval).is_err() {
+        return (
+            WorkspaceExternalResolutionApplicability::Unverified,
+            Some("Current legacy host session evidence is missing or not quiescent."),
+        );
+    }
+
+    (WorkspaceExternalResolutionApplicability::Applicable, None)
+}
+
+fn verify_legacy_plan_receipt_identity_and_project(
+    receipt: &ExternalResolutionReceipt,
+    chat_identity: &WorkspaceChatIdentity,
+    scope: &LegacyPlanObservationScope<'_>,
+) -> Result<(), &'static str> {
+    receipt
+        .validate_integrity()
+        .map_err(|_| "External resolution receipt failed immutable digest verification.")?;
+    if receipt.binding_id.as_str() != scope.binding_id
+        || receipt.thread_uuid.as_str() != scope.thread_uuid
+        || receipt.binding_id != chat_identity.binding_id
+        || receipt.thread_uuid != chat_identity.thread_uuid
+    {
+        return Err("Legacy external resolution receipt binding or thread scope does not match.");
+    }
+    let ExternalResolutionTarget::LegacyPlan {
+        plan_id,
+        plan_revision,
+    } = &receipt.target
+    else {
+        return Err("External resolution receipt does not target a legacy plan.");
+    };
+    if plan_id.as_str() != scope.plan_id || *plan_revision != scope.plan_revision {
+        return Err("External resolution receipt targets a different legacy plan revision.");
+    }
+    if receipt.source_job_revision.is_some()
+        || receipt.source_runtime_revision.is_some()
+        || receipt.work_brief_digest.is_some()
+        || receipt.envelope_digest.is_some()
+    {
+        return Err("Legacy external resolution receipt contains Coworker job/runtime evidence.");
+    }
+    if receipt.project.base_tree_sha.is_some()
+        || receipt.project.canonical_repo_root.as_path()
+            != Path::new(&chat_identity.canonical_project_scope)
+        || receipt.project.canonical_repo_root.as_path()
+            != Path::new(scope.canonical_project_scope)
+    {
+        return Err(
+            "Legacy external resolution receipt canonical project/base/tree does not match scope.",
+        );
+    }
+    Ok(())
 }
 
 fn project_external_resolution_receipt(
@@ -1253,6 +1730,29 @@ fn classify_external_resolution_applicability_readonly(
             Some("Current controller runtime evidence does not match the external resolution receipt."),
         );
     }
+    if runtime.is_some_and(|runtime| {
+        runtime
+            .pending_effects
+            .values()
+            .any(|effect| effect.status.blocks_replay())
+    }) {
+        return (
+            WorkspaceExternalResolutionApplicability::Unverified,
+            Some("Current controller runtime still has unresolved pending effects."),
+        );
+    }
+    if verify_job_quiescent(job).is_err() {
+        return (
+            WorkspaceExternalResolutionApplicability::Unverified,
+            Some("Current job outbox or task execution evidence is not quiescent."),
+        );
+    }
+    if verify_no_ambiguous_planning_reservations(ledger).is_err() {
+        return (
+            WorkspaceExternalResolutionApplicability::Unverified,
+            Some("Current planning reservations are ambiguous or pending reconciliation."),
+        );
+    }
     if !verify_no_active_job_owner_readonly(stores.plans_dir, chat_identity, job) {
         return (
             WorkspaceExternalResolutionApplicability::Unverified,
@@ -1268,11 +1768,13 @@ fn classify_external_resolution_applicability_readonly(
                 Some("Bound approval evidence is missing for external resolution applicability."),
             );
         };
-        if !verify_receipt_host_quiescent_readonly(
-            stores.sessions_dir,
-            verified_sessions_root,
-            approval,
-        ) {
+        let Some(sessions_root) = verified_sessions_root else {
+            return (
+                WorkspaceExternalResolutionApplicability::Unverified,
+                Some("Current host session evidence is missing or not quiescent."),
+            );
+        };
+        if verify_host_quiescence_readonly(sessions_root, approval).is_err() {
             return (
                 WorkspaceExternalResolutionApplicability::Unverified,
                 Some("Current host session evidence is missing or not quiescent."),
@@ -1501,6 +2003,14 @@ fn verify_no_active_job_owner_readonly(
     chat_identity: &WorkspaceChatIdentity,
     job: &CoworkerJobRecord,
 ) -> bool {
+    verify_no_active_owner_readonly(plans_dir, chat_identity, &job.job_id)
+}
+
+fn verify_no_active_owner_readonly(
+    plans_dir: &Path,
+    chat_identity: &WorkspaceChatIdentity,
+    owner_target_id: &str,
+) -> bool {
     let ownership_dir = coworker_driver_dir(plans_dir);
     match fs::symlink_metadata(&ownership_dir) {
         Err(err) if err.kind() == ErrorKind::NotFound => return true,
@@ -1514,46 +2024,13 @@ fn verify_no_active_job_owner_readonly(
     let Ok(key) = CoworkerJobOwnershipKey::new(
         chat_identity.binding_id.as_str(),
         chat_identity.thread_uuid.as_str(),
-        job.job_id.as_str(),
+        owner_target_id,
     ) else {
         return false;
     };
     match store.inspect_job_lock(&key) {
         Ok(CoworkerJobLockState::Absent | CoworkerJobLockState::UnlockedStaleFile { .. }) => true,
         Ok(CoworkerJobLockState::HeldByActiveProcess { .. }) | Err(_) => false,
-    }
-}
-
-fn verify_receipt_host_quiescent_readonly(
-    sessions_dir: Option<&Path>,
-    verified_sessions_root: Option<&Path>,
-    approval: &ApprovalRecord,
-) -> bool {
-    if sessions_dir.is_none() {
-        return false;
-    }
-    let Some(sessions_root) = verified_sessions_root else {
-        return false;
-    };
-    match read_host_launch_intent_optional(sessions_root, approval) {
-        Ok(None) => {}
-        Ok(Some(intent)) if intent.status == HostLaunchIntentStatus::ReconciledReady => {}
-        Ok(Some(_)) | Err(_) => return false,
-    }
-    let session_dir = sessions_root.join(&approval.approval_id);
-    match fs::symlink_metadata(&session_dir) {
-        Err(err) if err.kind() == ErrorKind::NotFound => true,
-        Err(_) => false,
-        Ok(_) => {
-            let Ok(session_dir) = verify_existing_session_dir(sessions_root, &approval.approval_id)
-            else {
-                return false;
-            };
-            matches!(
-                read_host_manifest_optional(&session_dir, approval),
-                Ok(Some(manifest)) if manifest.phase == HostPhase::Stopped
-            )
-        }
     }
 }
 

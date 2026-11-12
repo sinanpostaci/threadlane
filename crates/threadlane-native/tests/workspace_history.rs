@@ -11,17 +11,26 @@ use std::sync::Arc;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
-use threadlane_authority::{AuthorityStore, OperatorApprovalRequest};
+use threadlane_authority::{ApprovalRecord, AuthorityStore, OperatorApprovalRequest};
 use threadlane_core::observation::{
     ObservationJobState, WorkspaceAcceptanceProof, WorkspaceAcceptanceStatus,
     WorkspaceAttentionKind, WorkspaceChatIdentity, WorkspaceExternalResolutionApplicability,
     WorkspaceExternalResolutionOutcome, WorkspaceExternalResolutionScope, WorkspaceJobHistory,
 };
-use threadlane_host::{prepare_session_dir, HostSessionLock, WORK_AREA_SUBDIR};
-use threadlane_native::coworker_observation::workspace_history::{
-    project_coworker_job_history, project_coworker_job_record, read_scoped_workspace_job_histories,
-    WorkspaceHistoryDiagnosticKind, WorkspaceHistoryStores, WorkspaceJobLineageContext,
+use threadlane_core::Core;
+use threadlane_host::{
+    prepare_session_dir, record_task_dispatch_intent, record_task_receipt, HostLaunchIntentLock,
+    HostPhase, HostSessionLock, HostSessionManifest, TaskDispatchIntent, TaskRunReceipt,
+    WORK_AREA_SUBDIR,
 };
+use threadlane_native::coworker_observation::workspace_history::{
+    project_coworker_job_history, project_coworker_job_record,
+    read_legacy_plan_external_resolutions_readonly, read_scoped_workspace_job_histories,
+    LegacyPlanObservationScope, VerifiedLegacyPlanExternalResolutions,
+    WorkspaceHistoryDiagnostic, WorkspaceHistoryDiagnosticKind, WorkspaceHistoryStores,
+    WorkspaceJobLineageContext,
+};
+use threadlane_native::fs_safety::acquire_cross_process_lock;
 use threadlane_native::coworker_workflow::candidate::{
     AssembleOperationsFinalCandidateRequest, CoworkerCandidateService,
     ExecuteFinalCandidateClosureRequest, StructuredClosureModelResponse,
@@ -8379,6 +8388,8 @@ struct ExternalHistoryFixture {
     sessions: PathBuf,
     store: CoworkerWorkflowStore,
     job_id: String,
+    registry_revision: u64,
+    approval: ApprovalRecord,
 }
 
 fn ext_sample_choice(difficulty: Difficulty) -> SelectedRoleChoice {
@@ -8415,16 +8426,13 @@ fn setup_external_history_fixture() -> ExternalHistoryFixture {
     let tmp = TempDir::new().expect("external history tempdir");
     let root = fs::canonicalize(tmp.path()).expect("canonicalize external history root");
     let repo = make_private_dir(&root.join("repo"));
-    fs::write(repo.join(".git"), b"gitdir: disposable fixture\n")
-        .expect("write external history .git marker");
-    fs::set_permissions(repo.join(".git"), fs::Permissions::from_mode(0o600))
-        .expect("chmod external history .git marker");
+    let (base_commit, base_tree_sha) = init_phase2_git_repo(&repo);
+    let fake_agy = root.join("bin/fake-agy");
+    write_executable_script(&fake_agy, "#!/bin/sh\nexit 0\n");
     let plans = make_private_dir(&root.join("plans"));
     let authority_dir = make_private_dir(&root.join("authority"));
     let registry_dir = make_private_dir(&root.join("registry"));
     let sessions = make_private_dir(&root.join("sessions"));
-    let base_commit = "1".repeat(40);
-    let base_tree_sha = "2".repeat(40);
 
     let registry = Arc::new(RegistryStore::open(&registry_dir).expect("open external registry"));
     registry
@@ -8435,7 +8443,7 @@ fn setup_external_history_fixture() -> ExternalHistoryFixture {
                     id: "tool-agy".to_string(),
                     label: "Antigravity CLI".to_string(),
                     adapter: ToolAdapter::Antigravity,
-                    executable_path: None,
+                    executable_path: Some(fake_agy.clone()),
                     enabled: true,
                 },
             },
@@ -8661,6 +8669,8 @@ fn setup_external_history_fixture() -> ExternalHistoryFixture {
         sessions,
         store,
         job_id,
+        registry_revision,
+        approval,
     }
 }
 
@@ -8697,6 +8707,216 @@ fn read_external_history(
     };
     read_scoped_workspace_job_histories(&ext_chat_identity(fixture), &stores)
         .expect("external scoped history read")
+}
+
+struct LegacyExternalHistoryFixture {
+    plan_id: String,
+    plan_revision: u64,
+    task_ids: Vec<String>,
+    approval: ApprovalRecord,
+}
+
+fn ext_remove_lockfiles_recursive(dir: &Path) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            ext_remove_lockfiles_recursive(&path);
+        } else if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(".lock"))
+        {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+fn ext_create_legacy_plan(fixture: &ExternalHistoryFixture) -> LegacyExternalHistoryFixture {
+    let base_commit = fixture.approval.base_commit.clone();
+    let plan_id = "plan_history_legacy".to_string();
+    let task_ids = vec![
+        "task-legacy-alpha".to_string(),
+        "task-legacy-beta".to_string(),
+    ];
+    let (published, approval) = {
+        let registry = Arc::new(RegistryStore::open(&fixture.registry_dir).expect("legacy registry"));
+        let registry_snapshot = registry.snapshot().expect("legacy registry snapshot");
+        assert_eq!(registry_snapshot.revision, fixture.registry_revision);
+        let plans = Arc::new(PlanStore::open(&fixture.plans).expect("legacy plans"));
+        let draft = plans
+            .change_at(
+                0,
+                PlanChange::SaveDraft {
+                    plan_id: plan_id.clone(),
+                    binding_id: EXT_HIST_BINDING.to_string(),
+                    profile_id: "profile-history-external".to_string(),
+                    profile_revision: fixture.registry_revision,
+                    summary: "Legacy plan-only external history fixture".to_string(),
+                    tasks: vec![
+                        PlanTask {
+                            id: task_ids[0].clone(),
+                            title: "Legacy alpha task".to_string(),
+                            instruction: "Do legacy alpha work".to_string(),
+                            role: WorkflowRole::Coder,
+                            difficulty: Difficulty::Hard,
+                            depends_on: Vec::new(),
+                            allowed_write_paths: vec!["src/legacy.rs".to_string()],
+                        },
+                        PlanTask {
+                            id: task_ids[1].clone(),
+                            title: "Legacy beta task".to_string(),
+                            instruction: "Do legacy beta work".to_string(),
+                            role: WorkflowRole::Coder,
+                            difficulty: Difficulty::Hard,
+                            depends_on: Vec::new(),
+                            allowed_write_paths: vec!["src/legacy.rs".to_string()],
+                        },
+                    ],
+                },
+                1_700_000_000_000,
+            )
+            .expect("save legacy plan draft");
+        let published = plans
+            .change(
+                draft.revision,
+                PlanChange::Publish {
+                    plan_id: draft.plan_id.clone(),
+                    revision: draft.revision,
+                },
+            )
+            .expect("publish legacy plan");
+        let compiled = compile_plan_revision(&published, &registry_snapshot)
+            .expect("compile legacy published plan");
+        let authority = AuthorityStore::open(
+            &fixture.authority_dir,
+            Arc::clone(&registry),
+            Arc::clone(&plans),
+        )
+        .expect("legacy authority");
+        let summary = authority
+            .approve_at(
+                OperatorApprovalRequest {
+                    binding_id: EXT_HIST_BINDING.to_string(),
+                    thread_uuid: EXT_HIST_THREAD.to_string(),
+                    plan_id: published.plan_id.clone(),
+                    plan_revision: published.revision,
+                    expected_registry_revision: fixture.registry_revision,
+                    expected_plan_digest: compiled.plan_digest.clone(),
+                    repository_path: fixture.repo.clone(),
+                    base_commit,
+                    approved_task_ids: task_ids.clone(),
+                    approved_write_paths: vec!["src/legacy.rs".to_string()],
+                    max_parallel: 2,
+                    budgets: ExecutionBudgets::default(),
+                },
+                1_700_000_001_500,
+            )
+            .expect("approve legacy plan");
+        let approval = authority
+            .get_for_operator(&summary.approval_id)
+            .expect("load legacy approval");
+        (published, approval)
+    };
+    LegacyExternalHistoryFixture {
+        plan_id,
+        plan_revision: published.revision,
+        task_ids,
+        approval,
+    }
+}
+
+fn ext_record_legacy_receipt(
+    fixture: &ExternalHistoryFixture,
+    legacy: &LegacyExternalHistoryFixture,
+    request_key: &str,
+    scope: ExternalResolutionScope,
+) -> ExternalResolutionReceipt {
+    let service = ext_service(fixture);
+    let request = RecordExternalResolutionRequest {
+        binding_id: EXT_HIST_BINDING.to_string(),
+        thread_uuid: EXT_HIST_THREAD.to_string(),
+        canonical_repo_root: fixture.repo.clone(),
+        target: ExternalResolutionTarget::LegacyPlan {
+            plan_id: legacy.plan_id.clone(),
+            plan_revision: legacy.plan_revision,
+        },
+        scope,
+        expected_ledger_revision: None,
+        expected_job_revision: None,
+        expected_runtime_revision: None,
+        request_key: request_key.to_string(),
+        created_at_ms: 1_700_000_200_000,
+        explanation: "Legacy plan resolved externally by the history fixture operator".to_string(),
+        evidence_refs: vec![ExternalResolutionEvidenceRef::ArtifactRef {
+            reference: "issue-legacy-77".to_string(),
+        }],
+    };
+    let preview = service.preview(&request).expect("legacy receipt preview");
+    service
+        .record(
+            &request,
+            &ExternalResolutionConfirmation {
+                trusted_local_attested: true,
+                thread_uuid: preview.thread_uuid.clone(),
+                preview_digest: preview.preview_digest.clone(),
+            },
+        )
+        .expect("legacy receipt record")
+}
+
+fn ext_read_legacy_history(
+    fixture: &ExternalHistoryFixture,
+    legacy: &LegacyExternalHistoryFixture,
+) -> Result<VerifiedLegacyPlanExternalResolutions, WorkspaceHistoryDiagnostic> {
+    let stores = WorkspaceHistoryStores::new(&fixture.plans)
+        .with_authority_dir(&fixture.authority_dir)
+        .with_sessions_dir(&fixture.sessions);
+    let project_scope = fixture.repo.to_string_lossy().into_owned();
+    let scope = LegacyPlanObservationScope {
+        binding_id: EXT_HIST_BINDING,
+        thread_uuid: EXT_HIST_THREAD,
+        canonical_project_scope: &project_scope,
+        plan_id: &legacy.plan_id,
+        plan_revision: legacy.plan_revision,
+        task_ids: &legacy.task_ids,
+    };
+    read_legacy_plan_external_resolutions_readonly(
+        &ext_chat_identity(fixture),
+        &stores,
+        &scope,
+    )
+}
+
+fn ext_install_stopped_session(fixture: &ExternalHistoryFixture) -> (PathBuf, String) {
+    let session_dir = make_private_dir(&fixture.sessions.join(&fixture.approval.approval_id));
+    let runtime_state_dir = make_private_dir(&session_dir.join("runtime-state"));
+    let database_path = runtime_state_dir.join("state.db");
+    let mut core = Core::open(&database_path).expect("open disposable stopped runtime");
+    let binding = core
+        .create_binding(EXT_HIST_THREAD, "External history runtime")
+        .expect("create stopped runtime binding");
+    drop(core);
+
+    fs::write(session_dir.join("host.lock"), b"").expect("write empty host.lock");
+    fs::set_permissions(
+        session_dir.join("host.lock"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .expect("chmod host.lock");
+    let manifest = HostSessionManifest::from_approval_record(
+        &fixture.approval,
+        Some(binding.binding_id.clone()),
+        HostPhase::Stopped,
+        None,
+        None,
+        1_700_000_050_000,
+        1_700_000_060_000,
+    );
+    write_private_json(&session_dir.join("host-manifest.json"), &manifest);
+    (session_dir, binding.binding_id)
 }
 
 fn ext_record_receipt(
@@ -9099,4 +9319,605 @@ fn external_resolution_history_stale_unverified_forged_and_tampered_records_fail
             .is_err(),
         "tampered project/base receipt must fail closed"
     );
+}
+
+#[test]
+fn legacy_plan_external_resolution_history_full_and_partial_positive_readonly() {
+    let full_fixture = setup_external_history_fixture();
+    let full_legacy = ext_create_legacy_plan(&full_fixture);
+    let full_receipt = ext_record_legacy_receipt(
+        &full_fixture,
+        &full_legacy,
+        "req_legacy_history_full_01",
+        ExternalResolutionScope::FullJob,
+    );
+    ext_remove_lockfiles_recursive(&full_fixture.plans);
+    ext_remove_lockfiles_recursive(&full_fixture.authority_dir);
+    let full_before = (
+        snapshot_private_dir_sha256(&full_fixture.plans),
+        snapshot_private_dir_sha256(&full_fixture.authority_dir),
+        snapshot_private_dir_sha256(&full_fixture.sessions),
+    );
+    let full_verified =
+        ext_read_legacy_history(&full_fixture, &full_legacy).expect("full legacy history read");
+    let full_after = (
+        snapshot_private_dir_sha256(&full_fixture.plans),
+        snapshot_private_dir_sha256(&full_fixture.authority_dir),
+        snapshot_private_dir_sha256(&full_fixture.sessions),
+    );
+    assert_eq!(
+        full_before, full_after,
+        "legacy external resolution reads must not create locks, caches, or other files"
+    );
+    assert_eq!(full_verified.resolutions().len(), 1);
+    let full_resolution = &full_verified.resolutions()[0];
+    assert_eq!(full_resolution.receipt_id, full_receipt.receipt_id);
+    assert_eq!(
+        full_resolution.applicability,
+        WorkspaceExternalResolutionApplicability::Applicable
+    );
+    assert_eq!(
+        full_resolution.scope,
+        WorkspaceExternalResolutionScope::Job
+    );
+    assert_eq!(
+        full_resolution.outcome,
+        WorkspaceExternalResolutionOutcome::ResolvedExternally
+    );
+    assert_eq!(
+        full_resolution.task_ids,
+        vec![
+            "task-legacy-alpha".to_string(),
+            "task-legacy-beta".to_string()
+        ]
+    );
+    assert!(full_verified.has_applicable_full_job());
+    assert!(full_verified.diagnostics().is_empty());
+
+    let partial_fixture = setup_external_history_fixture();
+    let partial_legacy = ext_create_legacy_plan(&partial_fixture);
+    let partial_receipt = ext_record_legacy_receipt(
+        &partial_fixture,
+        &partial_legacy,
+        "req_legacy_history_partial_01",
+        ExternalResolutionScope::Tasks {
+            task_ids: vec!["task-legacy-alpha".to_string()],
+        },
+    );
+    ext_remove_lockfiles_recursive(&partial_fixture.plans);
+    ext_remove_lockfiles_recursive(&partial_fixture.authority_dir);
+    let partial_before = (
+        snapshot_private_dir_sha256(&partial_fixture.plans),
+        snapshot_private_dir_sha256(&partial_fixture.authority_dir),
+        snapshot_private_dir_sha256(&partial_fixture.sessions),
+    );
+    let partial_verified = ext_read_legacy_history(&partial_fixture, &partial_legacy)
+        .expect("partial legacy history read");
+    let partial_after = (
+        snapshot_private_dir_sha256(&partial_fixture.plans),
+        snapshot_private_dir_sha256(&partial_fixture.authority_dir),
+        snapshot_private_dir_sha256(&partial_fixture.sessions),
+    );
+    assert_eq!(partial_before, partial_after);
+    assert_eq!(partial_verified.resolutions().len(), 1);
+    let partial_resolution = &partial_verified.resolutions()[0];
+    assert_eq!(partial_resolution.receipt_id, partial_receipt.receipt_id);
+    assert_eq!(
+        partial_resolution.applicability,
+        WorkspaceExternalResolutionApplicability::Applicable
+    );
+    assert_eq!(
+        partial_resolution.scope,
+        WorkspaceExternalResolutionScope::Tasks
+    );
+    assert_eq!(
+        partial_resolution.task_ids,
+        vec!["task-legacy-alpha".to_string()]
+    );
+    assert!(!partial_verified.has_applicable_full_job());
+}
+
+#[test]
+fn legacy_plan_external_resolution_history_rejects_claimed_ambiguous_foreign_and_tampered_scope() {
+    let claimed_fixture = setup_external_history_fixture();
+    let claimed_legacy = ext_create_legacy_plan(&claimed_fixture);
+    ext_record_legacy_receipt(
+        &claimed_fixture,
+        &claimed_legacy,
+        "req_legacy_history_claimed_01",
+        ExternalResolutionScope::FullJob,
+    );
+    claimed_fixture
+        .store
+        .transact_binding_ledger(EXT_HIST_BINDING, None, |ledger| {
+            let job = ledger
+                .jobs
+                .iter_mut()
+                .find(|job| job.job_id == claimed_fixture.job_id)
+                .expect("claimed fixture job");
+            let linkage = job
+                .approval_linkage
+                .as_mut()
+                .expect("claimed fixture approval linkage");
+            linkage.plan_id = claimed_legacy.plan_id.clone();
+            linkage.plan_revision = claimed_legacy.plan_revision;
+            linkage.plan_digest = claimed_legacy.approval.plan_digest.clone();
+            Ok(CoworkerLedgerMutationOutcome::Mutated(()))
+        })
+        .expect("write claimed legacy plan");
+    let claimed_verified =
+        ext_read_legacy_history(&claimed_fixture, &claimed_legacy).expect("claimed legacy read");
+    assert_eq!(claimed_verified.resolutions().len(), 1);
+    assert_eq!(
+        claimed_verified.resolutions()[0].applicability,
+        WorkspaceExternalResolutionApplicability::Stale
+    );
+    assert!(claimed_verified.resolutions()[0]
+        .covered_attention
+        .is_empty());
+    assert!(!claimed_verified.has_applicable_full_job());
+
+    let ambiguous_fixture = setup_external_history_fixture();
+    let ambiguous_legacy = ext_create_legacy_plan(&ambiguous_fixture);
+    ext_record_legacy_receipt(
+        &ambiguous_fixture,
+        &ambiguous_legacy,
+        "req_legacy_history_ambiguous_01",
+        ExternalResolutionScope::FullJob,
+    );
+    {
+        let registry =
+            Arc::new(RegistryStore::open(&ambiguous_fixture.registry_dir).expect("ambiguous registry"));
+        let plans = Arc::new(PlanStore::open(&ambiguous_fixture.plans).expect("ambiguous plans"));
+        let authority = AuthorityStore::open(
+            &ambiguous_fixture.authority_dir,
+            Arc::clone(&registry),
+            Arc::clone(&plans),
+        )
+        .expect("ambiguous authority");
+        authority
+            .approve_at(
+                OperatorApprovalRequest {
+                    binding_id: EXT_HIST_BINDING.to_string(),
+                    thread_uuid: EXT_HIST_THREAD.to_string(),
+                    plan_id: ambiguous_legacy.plan_id.clone(),
+                    plan_revision: ambiguous_legacy.plan_revision,
+                    expected_registry_revision: ambiguous_fixture.registry_revision,
+                    expected_plan_digest: ambiguous_legacy.approval.plan_digest.clone(),
+                    repository_path: ambiguous_fixture.repo.clone(),
+                    base_commit: ambiguous_fixture.approval.base_commit.clone(),
+                    approved_task_ids: ambiguous_legacy.task_ids.clone(),
+                    approved_write_paths: vec!["src/legacy.rs".to_string()],
+                    max_parallel: 1,
+                    budgets: ExecutionBudgets::default(),
+                },
+                1_700_000_002_500,
+            )
+            .expect("record ambiguous legacy approval");
+    }
+    let ambiguous_verified = ext_read_legacy_history(&ambiguous_fixture, &ambiguous_legacy)
+        .expect("ambiguous legacy read");
+    assert_eq!(ambiguous_verified.resolutions().len(), 1);
+    assert_eq!(
+        ambiguous_verified.resolutions()[0].applicability,
+        WorkspaceExternalResolutionApplicability::Unverified
+    );
+    assert!(ambiguous_verified.resolutions()[0]
+        .covered_attention
+        .is_empty());
+    assert!(!ambiguous_verified.has_applicable_full_job());
+
+    let foreign_fixture = setup_external_history_fixture();
+    let foreign_legacy = ext_create_legacy_plan(&foreign_fixture);
+    ext_record_legacy_receipt(
+        &foreign_fixture,
+        &foreign_legacy,
+        "req_legacy_history_foreign_01",
+        ExternalResolutionScope::FullJob,
+    );
+    let foreign_scope = LegacyExternalHistoryFixture {
+        plan_id: "plan_history_external".to_string(),
+        plan_revision: 1,
+        task_ids: foreign_legacy.task_ids.clone(),
+        approval: foreign_legacy.approval.clone(),
+    };
+    let foreign_verified =
+        ext_read_legacy_history(&foreign_fixture, &foreign_scope).expect("foreign legacy read");
+    assert!(foreign_verified.resolutions().is_empty());
+
+    let tampered_fixture = setup_external_history_fixture();
+    let tampered_legacy = ext_create_legacy_plan(&tampered_fixture);
+    let tampered_receipt = ext_record_legacy_receipt(
+        &tampered_fixture,
+        &tampered_legacy,
+        "req_legacy_history_tampered_01",
+        ExternalResolutionScope::FullJob,
+    );
+    let mut tampered = tampered_receipt;
+    tampered.project.base_commit = "f".repeat(40);
+    ext_resign_receipt(&mut tampered);
+    ext_rewrite_receipt(&tampered_fixture, tampered);
+    let tampered_verified = ext_read_legacy_history(&tampered_fixture, &tampered_legacy)
+        .expect("tampered legacy read");
+    assert_eq!(tampered_verified.resolutions().len(), 1);
+    assert_eq!(
+        tampered_verified.resolutions()[0].applicability,
+        WorkspaceExternalResolutionApplicability::Unverified
+    );
+    assert!(tampered_verified.resolutions()[0]
+        .covered_attention
+        .is_empty());
+}
+
+#[test]
+fn external_resolution_history_refuses_active_locks_and_unsealed_stopped_runtime_after_valid_receipt(
+) {
+    let fixture = setup_external_history_fixture();
+    ext_add_mixed_blockers(&fixture);
+    let receipt = ext_record_receipt(
+        &fixture,
+        "req_history_lock_host_01",
+        ExternalResolutionScope::FullJob,
+    );
+    ext_remove_lockfiles_recursive(&fixture.plans);
+    ext_remove_lockfiles_recursive(&fixture.authority_dir);
+    ext_remove_lockfiles_recursive(&fixture.sessions);
+
+    let baseline = read_external_history(&fixture, true);
+    let baseline_history = baseline
+        .jobs
+        .iter()
+        .find(|history| history.job.job_id == fixture.job_id)
+        .expect("baseline external history");
+    assert_eq!(
+        baseline_history.external_resolutions[0].applicability,
+        WorkspaceExternalResolutionApplicability::Applicable
+    );
+    assert_eq!(baseline_history.job.execution_status, "resolved_externally");
+
+    let launch_guard = HostLaunchIntentLock::try_acquire(
+        &fixture.sessions,
+        &fixture.approval.approval_id,
+    )
+    .expect("acquire launch intent lock")
+    .expect("launch intent lock available");
+    let before_launch = snapshot_private_dir_sha256(&fixture.sessions);
+    let launch_read = read_external_history(&fixture, true);
+    assert_eq!(
+        before_launch,
+        snapshot_private_dir_sha256(&fixture.sessions),
+        "read-only receipt lookup must not mutate sessions while the launch lock is held"
+    );
+    let launch_history = launch_read
+        .jobs
+        .iter()
+        .find(|history| history.job.job_id == fixture.job_id)
+        .expect("launch-locked external history");
+    assert_eq!(
+        launch_history.external_resolutions[0].applicability,
+        WorkspaceExternalResolutionApplicability::Unverified
+    );
+    assert!(launch_history.external_resolutions[0]
+        .covered_attention
+        .is_empty());
+    assert!(launch_history.current_attention.is_some());
+    assert_ne!(launch_history.job.execution_status, "resolved_externally");
+    drop(launch_guard);
+
+    let ownership_dir = make_private_dir(&threadlane_native::coworker_driver::coworker_driver_dir(
+        &fixture.plans,
+    ));
+    let ownership_store =
+        CoworkerJobOwnershipStore::new(&ownership_dir).expect("open ownership store");
+    let ownership_key = CoworkerJobOwnershipKey::new(
+        EXT_HIST_BINDING,
+        EXT_HIST_THREAD,
+        &fixture.job_id,
+    )
+    .expect("ownership key");
+    let owner_guard = ownership_store
+        .try_acquire_job_option(&ownership_key, 1_700_000_080_000)
+        .expect("acquire ownership lock")
+        .expect("ownership lock available");
+    let before_owner = (
+        snapshot_private_dir_sha256(&fixture.plans),
+        snapshot_private_dir_sha256(&fixture.sessions),
+    );
+    let owner_read = read_external_history(&fixture, true);
+    assert_eq!(
+        before_owner,
+        (
+            snapshot_private_dir_sha256(&fixture.plans),
+            snapshot_private_dir_sha256(&fixture.sessions),
+        ),
+        "read-only receipt lookup must not mutate plans or sessions while owned"
+    );
+    let owner_history = owner_read
+        .jobs
+        .iter()
+        .find(|history| history.job.job_id == fixture.job_id)
+        .expect("owned external history");
+    assert_eq!(
+        owner_history.external_resolutions[0].applicability,
+        WorkspaceExternalResolutionApplicability::Unverified
+    );
+    assert!(owner_history.external_resolutions[0]
+        .covered_attention
+        .is_empty());
+    assert!(owner_history.current_attention.is_some());
+    drop(owner_guard);
+
+    let (session_dir, runtime_binding_id) = ext_install_stopped_session(&fixture);
+    let quiescent_read = read_external_history(&fixture, true);
+    let quiescent_history = quiescent_read
+        .jobs
+        .iter()
+        .find(|history| history.job.job_id == fixture.job_id)
+        .expect("quiescent stopped external history");
+    assert_eq!(
+        quiescent_history.external_resolutions[0].applicability,
+        WorkspaceExternalResolutionApplicability::Applicable,
+        "a stopped host session without active locks or unsealed intents remains applicable"
+    );
+
+    let host_guard = HostSessionLock::acquire(&session_dir, &fixture.approval.approval_id)
+        .expect("acquire host session lock");
+    let before_host = snapshot_private_dir_sha256(&fixture.sessions);
+    let host_read = read_external_history(&fixture, true);
+    assert_eq!(
+        before_host,
+        snapshot_private_dir_sha256(&fixture.sessions),
+        "read-only receipt lookup must not mutate sessions while the host lock is held"
+    );
+    let host_history = host_read
+        .jobs
+        .iter()
+        .find(|history| history.job.job_id == fixture.job_id)
+        .expect("host-locked external history");
+    assert_eq!(
+        host_history.external_resolutions[0].applicability,
+        WorkspaceExternalResolutionApplicability::Unverified
+    );
+    assert!(host_history.external_resolutions[0]
+        .covered_attention
+        .is_empty());
+    assert!(host_history.current_attention.is_some());
+    drop(host_guard);
+
+    let runtime_state_dir = session_dir.join("runtime-state");
+    let supervisor_guard = acquire_cross_process_lock(
+        &runtime_state_dir,
+        "supervisor.lock",
+        "external_history_supervisor_lock",
+    )
+    .expect("acquire supervisor lock");
+    let before_supervisor = snapshot_private_dir_sha256(&fixture.sessions);
+    let supervisor_read = read_external_history(&fixture, true);
+    assert_eq!(
+        before_supervisor,
+        snapshot_private_dir_sha256(&fixture.sessions),
+        "read-only receipt lookup must not mutate sessions while the supervisor lock is held"
+    );
+    let supervisor_history = supervisor_read
+        .jobs
+        .iter()
+        .find(|history| history.job.job_id == fixture.job_id)
+        .expect("supervisor-locked external history");
+    assert_eq!(
+        supervisor_history.external_resolutions[0].applicability,
+        WorkspaceExternalResolutionApplicability::Unverified
+    );
+    assert!(supervisor_history.external_resolutions[0]
+        .covered_attention
+        .is_empty());
+    drop(supervisor_guard);
+    fs::remove_file(runtime_state_dir.join("supervisor.lock")).expect("remove supervisor lock");
+
+    let approved_task = fixture
+        .approval
+        .tasks
+        .first()
+        .expect("fixture approval task");
+    let intent = TaskDispatchIntent {
+        task_id: approved_task.task_id.clone(),
+        task_digest: approved_task.task_digest.clone(),
+        profile_id: approved_task
+            .profile_id
+            .clone()
+            .expect("approved worker profile id"),
+        command_key: approved_task
+            .command_key
+            .clone()
+            .expect("approved worker command key"),
+        execution_binding: None,
+        recorded_at_ms: 1_700_000_070_000,
+    };
+    record_task_dispatch_intent(
+        &session_dir,
+        &fixture.approval,
+        &runtime_binding_id,
+        intent,
+    )
+    .expect("record unsealed task dispatch intent");
+    let _ = fs::remove_file(session_dir.join("task-receipts.lock"));
+    let before_unsealed = snapshot_private_dir_sha256(&fixture.sessions);
+    let unsealed_read = read_external_history(&fixture, true);
+    assert_eq!(
+        before_unsealed,
+        snapshot_private_dir_sha256(&fixture.sessions),
+        "read-only receipt lookup must not mutate sessions while an unsealed intent exists"
+    );
+    let unsealed_history = unsealed_read
+        .jobs
+        .iter()
+        .find(|history| history.job.job_id == fixture.job_id)
+        .expect("unsealed external history");
+    assert_eq!(
+        unsealed_history.external_resolutions[0].applicability,
+        WorkspaceExternalResolutionApplicability::Unverified
+    );
+    assert!(unsealed_history.external_resolutions[0]
+        .covered_attention
+        .is_empty());
+    assert!(unsealed_history.current_attention.is_some());
+
+    record_task_receipt(
+        &session_dir,
+        &fixture.approval,
+        &runtime_binding_id,
+        TaskRunReceipt {
+            task_id: approved_task.task_id.clone(),
+            task_digest: approved_task.task_digest.clone(),
+            profile_id: approved_task
+                .profile_id
+                .clone()
+                .expect("approved worker profile id"),
+            command_key: approved_task
+                .command_key
+                .clone()
+                .expect("approved worker command key"),
+            run_id: "run_history_unsealed_01".to_string(),
+            worker_id: "wrk_history_unsealed_01".to_string(),
+            execution_binding: None,
+            recorded_at_ms: 1_700_000_071_000,
+        },
+    )
+    .expect("seal task run receipt");
+    let _ = fs::remove_file(session_dir.join("task-receipts.lock"));
+    let before_sealed = snapshot_private_dir_sha256(&fixture.sessions);
+    let sealed_read = read_external_history(&fixture, true);
+    assert_eq!(
+        before_sealed,
+        snapshot_private_dir_sha256(&fixture.sessions),
+        "read-only receipt lookup must not mutate sessions after the task receipt is sealed"
+    );
+    let sealed_history = sealed_read
+        .jobs
+        .iter()
+        .find(|history| history.job.job_id == fixture.job_id)
+        .expect("sealed external history");
+    assert_eq!(
+        sealed_history.external_resolutions[0].receipt_id,
+        receipt.receipt_id
+    );
+    assert_eq!(
+        sealed_history.external_resolutions[0].applicability,
+        WorkspaceExternalResolutionApplicability::Applicable
+    );
+    assert!(!sealed_history.external_resolutions[0]
+        .covered_attention
+        .is_empty());
+    assert!(sealed_history.current_attention.is_none());
+    assert!(sealed_history
+        .tasks
+        .iter()
+        .all(|task| task.current_attention.is_none()));
+    assert_eq!(
+        sealed_history.job.execution_status,
+        "resolved_externally"
+    );
+}
+
+#[test]
+fn external_resolution_history_partial_coverage_keeps_multiple_uncovered_unknown_blockers() {
+    let fixture = setup_external_history_fixture();
+    ext_write_current_job(&fixture, |job| {
+        job.job_revision = 2;
+        for (task_id, reason, detail) in [
+            (
+                "task-alpha",
+                WorkflowHoldReason::ConversationClarificationPending,
+                "Alpha still needs an operator answer.",
+            ),
+            (
+                "task-beta",
+                WorkflowHoldReason::UnknownEffectReconciliationRequired,
+                "Beta still has an ambiguous external effect.",
+            ),
+        ] {
+            let hold_id = format!("hold_mixed_{task_id}");
+            job.holds.push(WorkflowHoldRecord {
+                hold_id: hold_id.clone(),
+                request_key: format!("req_{hold_id}"),
+                reason,
+                detail: detail.to_string(),
+                directly_affected_task_ids: vec![task_id.to_string()],
+                affected_write_paths: Vec::new(),
+                affected_interfaces: Vec::new(),
+                holds_entire_job: false,
+                active: true,
+                created_at_job_revision: 2,
+                resolved_at_job_revision: None,
+                resolution_note: None,
+            });
+            let task = job
+                .tasks
+                .iter_mut()
+                .find(|task| task.task_id == task_id)
+                .expect("mixed blocker task");
+            task.stage = CoworkerTaskStage::Held;
+            task.stage_before_hold = Some(CoworkerTaskStage::ReadyToDispatch);
+            task.active_hold_ids.push(hold_id);
+        }
+    });
+    ext_record_receipt(
+        &fixture,
+        "req_history_mixed_unknown_01",
+        ExternalResolutionScope::Tasks {
+            task_ids: vec!["task-alpha".to_string()],
+        },
+    );
+    let read = read_external_history(&fixture, true);
+    let history = read
+        .jobs
+        .iter()
+        .find(|history| history.job.job_id == fixture.job_id)
+        .expect("mixed unknown external history");
+    let resolution = &history.external_resolutions[0];
+    assert_eq!(
+        resolution.applicability,
+        WorkspaceExternalResolutionApplicability::Applicable
+    );
+    assert_eq!(resolution.covered_attention.len(), 1);
+    assert_eq!(
+        resolution.covered_attention[0].task_id.as_deref(),
+        Some("task-alpha")
+    );
+    assert_eq!(
+        resolution.covered_attention[0].attention.kind,
+        WorkspaceAttentionKind::NeedsUserInput
+    );
+    assert_eq!(
+        resolution.covered_attention[0].attention.reason,
+        "Alpha still needs an operator answer."
+    );
+    let alpha = history
+        .tasks
+        .iter()
+        .find(|task| task.task_id == "task-alpha")
+        .expect("mixed alpha task");
+    assert!(alpha.current_attention.is_none());
+    let beta = history
+        .tasks
+        .iter()
+        .find(|task| task.task_id == "task-beta")
+        .expect("mixed beta task");
+    assert_eq!(
+        beta.current_attention
+            .as_ref()
+            .map(|attention| attention.kind),
+        Some(WorkspaceAttentionKind::UnresolvedEffect)
+    );
+    assert!(beta
+        .current_attention
+        .as_ref()
+        .is_some_and(|attention| attention.reason.contains("ambiguous external effect")));
+    assert_eq!(
+        history
+            .current_attention
+            .as_ref()
+            .map(|attention| attention.kind),
+        Some(WorkspaceAttentionKind::UnresolvedEffect)
+    );
+    assert_ne!(history.job.execution_status, "resolved_externally");
 }

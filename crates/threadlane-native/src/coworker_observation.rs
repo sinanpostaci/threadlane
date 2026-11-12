@@ -55,7 +55,9 @@ use crate::profile_flow::SelectedRoleChoice;
 pub mod workspace_history;
 
 pub use workspace_history::{
-    project_coworker_job_history, project_coworker_job_record, read_scoped_workspace_job_histories,
+    project_coworker_job_history, project_coworker_job_record,
+    read_legacy_plan_external_resolutions_readonly, read_scoped_workspace_job_histories,
+    LegacyPlanObservationScope, VerifiedLegacyPlanExternalResolutions,
     WorkspaceHistoryDiagnostic, WorkspaceHistoryDiagnosticKind, WorkspaceHistoryStores,
     WorkspaceJobLineageContext, WorkspaceScopedHistoryRead,
 };

@@ -24,8 +24,9 @@ use threadlane_core::observation::{
 };
 use threadlane_core::MAX_WORKER_PATH_BYTES;
 use threadlane_native::coworker_observation::{
-    read_scoped_workspace_job_histories, WorkspaceHistoryDiagnostic,
-    WorkspaceHistoryDiagnosticKind, WorkspaceHistoryStores,
+    read_legacy_plan_external_resolutions_readonly, read_scoped_workspace_job_histories,
+    LegacyPlanObservationScope, VerifiedLegacyPlanExternalResolutions,
+    WorkspaceHistoryDiagnostic, WorkspaceHistoryDiagnosticKind, WorkspaceHistoryStores,
 };
 use threadlane_native::coworker_workflow::{CoworkerBindingLedger, CoworkerJobRecord};
 use threadlane_native::native_chat_observation::read_workspace_native_samples_readonly;
@@ -521,7 +522,56 @@ fn project_single_source_workspace(
             _ => None,
         };
 
-        let mut legacy_history = build_legacy_fallback_job_history(legacy_job, verified_chat);
+        let legacy_task_ids: Vec<String> =
+            legacy_job.tasks.iter().map(|task| task.id.clone()).collect();
+        let verified_external_resolutions = match (
+            verified_chat.as_ref(),
+            legacy_job.binding_id.as_deref(),
+            legacy_job.thread_uuid.as_deref(),
+            legacy_job.project_path.as_deref(),
+            legacy_job.plan_id.as_deref(),
+            legacy_job.plan_revision,
+        ) {
+            (
+                Some(chat_identity),
+                Some(binding_id),
+                Some(thread_uuid),
+                Some(project_scope),
+                Some(plan_id),
+                Some(plan_revision),
+            ) => {
+                let scope = LegacyPlanObservationScope {
+                    binding_id,
+                    thread_uuid,
+                    canonical_project_scope: project_scope,
+                    plan_id,
+                    plan_revision,
+                    task_ids: &legacy_task_ids,
+                };
+                match read_legacy_plan_external_resolutions_readonly(
+                    chat_identity, &stores, &scope,
+                ) {
+                    Ok(verified) => {
+                        record_history_diagnostics(
+                            source_id,
+                            verified.diagnostics(),
+                            warning_collector,
+                        );
+                        Some(verified)
+                    }
+                    Err(diag) => {
+                        record_history_diagnostics(source_id, &[diag], warning_collector);
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+        let mut legacy_history = build_legacy_fallback_job_history(
+            legacy_job,
+            verified_chat,
+            verified_external_resolutions.as_ref(),
+        );
         attach_correlated_request_ids(&mut legacy_history, projected_requests);
 
         if let Some(ref chat_id) = legacy_history.job.chat_identity {
@@ -1032,6 +1082,7 @@ fn derive_project_label(canonical_project_scope: &str) -> String {
 fn build_legacy_fallback_job_history(
     job: &ObservationJob,
     verified_chat: Option<WorkspaceChatIdentity>,
+    verified_external_resolutions: Option<&VerifiedLegacyPlanExternalResolutions>,
 ) -> WorkspaceJobHistory {
     let tasks = job
         .tasks
@@ -1046,7 +1097,9 @@ fn build_legacy_fallback_job_history(
         })
         .collect();
 
-    WorkspaceJobHistory {
+    let full_external_resolution =
+        verified_external_resolutions.is_some_and(|verified| verified.has_applicable_full_job());
+    let mut history = WorkspaceJobHistory {
         job: WorkspaceJobSummary {
             source_id: job.source_id.clone(),
             job_id: job.id.clone(),
@@ -1070,9 +1123,18 @@ fn build_legacy_fallback_job_history(
             ..WorkspaceRecordLinks::default()
         },
         acceptance_proof: WorkspaceAcceptanceProof::unknown(),
+        external_resolutions: verified_external_resolutions
+            .map(|verified| verified.resolutions().to_vec())
+            .unwrap_or_default(),
         ..WorkspaceJobHistory::default()
+    };
+    if full_external_resolution {
+        // External resolution is a separate logical token: preserve the old fallback identity,
+        // stored phase/outcomes, tasks, and acceptance proof without fabricating completion.
+        history.job.state = ObservationJobState::Unknown;
+        history.job.execution_status = "resolved_externally".to_string();
     }
-    .normalized()
+    history.normalized()
 }
 
 fn attach_correlated_request_ids(
@@ -1402,16 +1464,6 @@ fn collect_legacy_job_message_candidates(
     legacy_history: &WorkspaceJobHistory,
     out: &mut Vec<WorkspaceMessageCandidateInput>,
 ) {
-    let Some(ref summary) = legacy_job.summary else {
-        return;
-    };
-    if summary.trim().is_empty() {
-        return;
-    }
-    let Some(ref plan_id) = legacy_job.plan_id else {
-        return;
-    };
-    let plan_rev = legacy_job.plan_revision.unwrap_or(0);
     let chat_id = legacy_history.job.chat_identity.clone();
 
     let scope = WorkspaceMessageScope {
@@ -1426,20 +1478,51 @@ fn collect_legacy_job_message_candidates(
         attempt_no: None,
     };
 
-    out.push(WorkspaceMessageCandidateInput {
-        source_kind: "plan_summary".to_string(),
-        source_record_id: format!("{plan_id}_r{plan_rev}"),
-        source_order: WorkspaceMessageSourceOrder {
-            recorded_at_ms: legacy_job.updated_at_ms,
-            source_seq: plan_rev,
-            sub_index: 0,
-        },
-        scope,
-        actor_role: Some("operator".to_string()),
-        raw_summary: summary.clone(),
-        upstream_truncated: false,
-        incomplete_reason: None,
-    });
+    if let (Some(summary), Some(plan_id)) = (&legacy_job.summary, &legacy_job.plan_id) {
+        if !summary.trim().is_empty() {
+            let plan_rev = legacy_job.plan_revision.unwrap_or(0);
+            out.push(WorkspaceMessageCandidateInput {
+                source_kind: "plan_summary".to_string(),
+                source_record_id: format!("{plan_id}_r{plan_rev}"),
+                source_order: WorkspaceMessageSourceOrder {
+                    recorded_at_ms: legacy_job.updated_at_ms,
+                    source_seq: plan_rev,
+                    sub_index: 0,
+                },
+                scope: scope.clone(),
+                actor_role: Some("operator".to_string()),
+                raw_summary: summary.clone(),
+                upstream_truncated: false,
+                incomplete_reason: None,
+            });
+        }
+    }
+
+    // Store-verified legacy-plan external resolution receipts keep the actual receipt ID as the
+    // message identity so Jobs, Messages, and Activity can link the same row without a journal.
+    for (idx, resolution) in legacy_history.external_resolutions.iter().enumerate() {
+        if resolution.summary.trim().is_empty() {
+            continue;
+        }
+        let completed = resolution.applicability.is_applicable();
+        out.push(WorkspaceMessageCandidateInput {
+            source_kind: "attention_summary".to_string(),
+            source_record_id: resolution.receipt_id.clone(),
+            source_order: WorkspaceMessageSourceOrder {
+                recorded_at_ms: resolution.recorded_at_ms.or(legacy_job.updated_at_ms),
+                source_seq: legacy_job.plan_revision.unwrap_or(0),
+                sub_index: idx as u32,
+            },
+            scope: scope.clone(),
+            actor_role: Some("operator".to_string()),
+            raw_summary: resolution.summary.clone(),
+            upstream_truncated: false,
+            incomplete_reason: (!completed).then_some(
+                "External resolution receipt is stale or unverified; it does not close blockers."
+                    .to_string(),
+            ),
+        });
+    }
 }
 
 fn collect_request_journal_message_candidates(
