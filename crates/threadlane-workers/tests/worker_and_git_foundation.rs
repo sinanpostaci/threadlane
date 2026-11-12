@@ -2813,3 +2813,35 @@ printf '{"event":"result","result":{"conversation_id":"s-argon","status":"SUCCES
         ]
     );
 }
+
+#[tokio::test]
+async fn already_cancelled_launch_returns_no_child_semantics_without_execution() {
+    let env = TestEnv::new();
+    let workdir = env.root_dir.join("pre-cancelled-dir");
+    fs::create_dir_all(&workdir).expect("create workdir");
+    let cancel_bin = env.write_fake_executable(
+        "pre-cancelled-worker",
+        r#"
+printf 'executed\n' >> pre_cancel_executed.txt
+printf '{"type":"system","subtype":"init","model":"gemini-4-argon-high","effort":"high"}\n'
+printf '{"type":"result","subtype":"success","model":"gemini-4-argon-high","effort":"high","result":"done"}\n'
+"#,
+    );
+    let spec = env.antigravity_spec(cancel_bin, "pre-cancel test");
+    let (cancel_tx, mut cancel_rx) = watch::channel(false);
+    cancel_tx.send(true).expect("send pre-cancel");
+
+    let report = run_worker_with_cancel(&spec, &workdir, &mut cancel_rx)
+        .await
+        .expect("pre-cancelled run returns a report");
+
+    assert_eq!(report.status, WorkerRunStatus::Cancelled);
+    assert_eq!(report.process_group_id, None);
+    assert_eq!(report.exit_code, None);
+    assert_eq!(report.signal, None);
+    assert_eq!(report.evidence.total_lines, 0);
+    assert!(
+        !workdir.join("pre_cancel_executed.txt").exists(),
+        "a pre-cancelled launch must not execute the worker"
+    );
+}

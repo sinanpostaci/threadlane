@@ -370,8 +370,8 @@ impl WorkerFilePermissions {
         matches!(self, Self::ReadOnly)
     }
 
-    /// Returns `true` when constructing the final launch argv for Antigravity requires the
-    /// canonical working directory (`TaskFiles` or `ReadOnly`).
+    /// Returns `true` when constructing the final launch argv requires the canonical working
+    /// directory (`TaskFiles` or `ReadOnly`).
     pub fn requires_workdir_argv(self) -> bool {
         matches!(self, Self::TaskFiles | Self::ReadOnly)
     }
@@ -1671,6 +1671,69 @@ configs (`.gemini`, `.codex`, `.opencode`, `.claude`, `.agents`, `.git`, `AGENTS
 Persist changes only within declared task write scopes: [{scopes_summary}]. \
 {AGY_TASK_FILES_PROMPT_BOUNDARY}{task_prompt}"
     )
+}
+
+/// Unambiguous delimiter separating the session-local OpenCode `task_files` execution contract
+/// from the caller's verbatim task prompt.
+pub(crate) const OPENCODE_TASK_FILES_PROMPT_BOUNDARY: &str = "[THREADLANE_TASK_INSTRUCTION] ";
+
+/// Builds the session-local OpenCode `task_files` prompt from the validated actual task
+/// `canonical_workdir`, declared `allowed_write_paths`, and the caller's `task_prompt`.
+///
+/// The prologue states the authoritative working directory, instructs the model to prefer
+/// repository-relative paths and derive absolute paths only by joining `canonical_workdir`, and
+/// enumerates the declared write scopes exactly as the generated OpenCode V2 permission rules do:
+/// trailing-`/` entries are explicit directory subtrees, while bare entries are exact files only.
+/// It limits the worker to the OpenCode built-in `read`, `glob`, `grep`, `edit`, and `write` tools,
+/// forbids shell/build/test/format/Git/subagent/web/MCP execution, forbids temporary or control
+/// configuration edits, and requires reporting any out-of-scope path instead of probing outside
+/// the declared scopes. Preserves `task_prompt` byte-for-byte after
+/// [`OPENCODE_TASK_FILES_PROMPT_BOUNDARY`].
+///
+/// Returns [`WorkerError::InvalidSpec`] if the already validated canonical `canonical_workdir`
+/// is not valid UTF-8, rather than substituting a lossy path.
+pub(crate) fn build_opencode_task_files_prompt(
+    canonical_workdir: &Path,
+    allowed_write_paths: &BTreeSet<String>,
+    task_prompt: &str,
+) -> Result<String, WorkerError> {
+    let canonical_workdir_str = canonical_workdir.to_str().ok_or_else(|| {
+        WorkerError::InvalidSpec(format!(
+            "canonical task working directory `{}` is not valid UTF-8 and cannot be used for the OpenCode task_files prologue",
+            canonical_workdir.display()
+        ))
+    })?;
+    let clean_workdir = canonical_workdir_str.trim_end_matches('/');
+    let mut scope_descriptions = Vec::with_capacity(allowed_write_paths.len());
+    for entry in allowed_write_paths {
+        let clean_entry = entry.strip_suffix('/').unwrap_or(entry.as_str());
+        if entry.ends_with('/') {
+            scope_descriptions.push(format!(
+                "`{clean_entry}/` (directory subtree `{clean_entry}` and `{clean_entry}/**`)"
+            ));
+        } else {
+            scope_descriptions.push(format!(
+                "`{clean_entry}` (exact file only; no descendant `/**`)"
+            ));
+        }
+    }
+    let scopes_summary = scope_descriptions.join(", ");
+
+    Ok(format!(
+        "[THREADLANE_OPENCODE_TASK_FILES_CONTRACT] Session-local OpenCode task_files execution contract: \
+canonical task working directory (authoritative checkout root for every file operation): `{clean_workdir}`. \
+Prefer repository-relative paths under `{clean_workdir}` for every tool; if a tool requires an absolute path, \
+derive it ONLY by joining this exact canonical root with the repository-relative path \
+(`{clean_workdir}/<repo-relative-path>`). Never infer or invent checkout names or paths from approval, job, run, \
+task, or worktree identifiers; never substitute source-repository paths for `{clean_workdir}`; and do not probe \
+for an alternative working directory. Use only the OpenCode built-in file tools `read`, `glob`, `grep`, `edit`, \
+and `write`. Never run or request shell/terminal commands, builds, tests, linters, formatters, `git`, subagents, \
+web/browser, or MCP tools from this worker; the parent controller runs all checks and Git operations. Do not \
+create temporary files or edit provider/control configuration, `AGENTS.md`, or `.env*` paths. If a needed path is \
+outside the declared write scopes, report it instead of probing outside the scopes or treating the rest of the \
+repository as read-only. Persist changes only within declared task write scopes: [{scopes_summary}]. \
+{OPENCODE_TASK_FILES_PROMPT_BOUNDARY}{task_prompt}"
+    ))
 }
 
 /// Builds the structured OpenCode 2.2.0 V2 [`OpenCodeConfigContent`] for a validated model target,

@@ -790,17 +790,27 @@ exit 0
         Some(AdvisoryResponseErrorCode::StreamOutputOverflow)
     );
 
-    // 2. Cancellation reaps process group and reports `Cancelled`
+    // 2. Mid-flight cancellation reaps the process group and reports `Cancelled`
     let slow_script = r#"#!/usr/bin/env sh
 set -eu
+printf 'started\n' >> codex_cancel_started.txt
 printf '%s\n' '{"type":"thread.started","thread_id":"thread-cancel-1"}'
 sleep 30 &
 wait
 "#;
     let fake_slow = write_executable_script(&bin_dir, "fake-codex-slow", slow_script);
     let cancel_spec = sample_codex_advisory_spec(fake_slow.clone(), workdir.clone(), "cancel test");
-    let (cancel_tx, mut cancel_rx) = watch::channel(true);
-    let _ = cancel_tx.send(true);
+    let (cancel_tx, mut cancel_rx) = watch::channel(false);
+    let cancel_marker = workdir.join("codex_cancel_started.txt");
+    tokio::spawn(async move {
+        for _ in 0..100 {
+            if cancel_marker.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let _ = cancel_tx.send(true);
+    });
     let cancel_out = run_advisory_worker_with_structured_result_and_cancel(
         &cancel_spec,
         AdvisoryResponseBudget::default(),
@@ -814,6 +824,11 @@ wait
     assert_eq!(
         cancel_out.response_error.as_ref().map(|e| e.code),
         Some(AdvisoryResponseErrorCode::WorkerExecutionFailed)
+    );
+    assert_eq!(
+        fs::read_to_string(workdir.join("codex_cancel_started.txt"))
+            .expect("read cancellation execution marker"),
+        "started\n"
     );
 
     // 3. Timeout reaps process group and reports `TimedOut`
@@ -2081,7 +2096,7 @@ async fn codex_advisory_output_last_message_rejects_missing_empty_invalid_oversi
     fs::create_dir_all(&bin_dir).expect("create bin_dir");
 
     let dummy = write_executable_script(&bin_dir, "fake-init-cap", "#!/usr/bin/env sh\nexit 0\n");
-    let mut spec = sample_codex_advisory_spec(dummy, workdir, "capture safety checks");
+    let mut spec = sample_codex_advisory_spec(dummy, workdir.clone(), "capture safety checks");
 
     let clean_single_stream = r#"{"type":"thread.started","thread_id":"01972d12-3456-7000-8000-000000000910"}
 {"type":"turn.started"}
@@ -2143,6 +2158,8 @@ exit 0
     let bad_utf8_script = format!(
         r#"#!/usr/bin/env sh
 set -eu
+printf 'executed\n' >> invalid_utf8_executed.txt
+printf 'Text file busy\n' >&2
 OUT=""
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -2168,6 +2185,12 @@ exit 0
     assert_eq!(
         bad_utf8_out.response_error.as_ref().map(|e| e.code),
         Some(AdvisoryResponseErrorCode::InvalidStructuredJson)
+    );
+    assert_eq!(
+        fs::read_to_string(workdir.join("invalid_utf8_executed.txt"))
+            .expect("read invalid-UTF8 execution marker"),
+        "executed\n",
+        "stderr text and invalid capture bytes must not trigger a retry"
     );
 
     // 4. Oversized capture file exceeding `AdvisoryResponseBudget` (even if stream item fit) -> `ResponseTooLarge`
@@ -2690,5 +2713,54 @@ wait
     assert!(
         !recorded_out_path.parent().unwrap().exists(),
         "cancelled run must remove private --output-last-message directory"
+    );
+}
+
+#[tokio::test]
+async fn codex_held_writable_executable_surfaces_exact_etxtbsy_after_finite_retries_without_capture_or_execution(
+) {
+    let temp = TempDir::new().expect("tempdir");
+    let workdir = temp.path().join("workdir");
+    let bin_dir = temp.path().join("bin");
+    fs::create_dir_all(&workdir).expect("create workdir");
+    fs::create_dir_all(workdir.join(".git")).expect("create .git");
+    fs::create_dir_all(&bin_dir).expect("create bin_dir");
+    let sentinel = workdir.join("unrelated-sentinel.txt");
+    fs::write(&sentinel, b"preserve unrelated data").expect("write sentinel");
+
+    let script = r#"#!/usr/bin/env sh
+set -eu
+printf 'executed\n' >> codex_held_executed.txt
+exit 0
+"#;
+    let executable = write_executable_script(&bin_dir, "fake-codex-held-open", script);
+    let _held_writer = fs::OpenOptions::new()
+        .write(true)
+        .open(&executable)
+        .expect("hold executable open for writing");
+    let spec =
+        sample_codex_advisory_spec(executable, workdir.clone(), "held executable regression");
+
+    let started = std::time::Instant::now();
+    let err = run_advisory_worker_with_structured_result(&spec, AdvisoryResponseBudget::default())
+        .await
+        .expect_err("a held writable executable must exhaust bounded ETXTBSY retries");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "ETXTBSY retry exhaustion must remain finite"
+    );
+    match err {
+        WorkerError::Io(err) => {
+            assert_eq!(err.raw_os_error(), Some(libc::ETXTBSY));
+        }
+        other => panic!("expected exact ETXTBSY IO refusal, got {other}"),
+    }
+    assert!(
+        !workdir.join("codex_held_executed.txt").exists(),
+        "exhausted retries must not execute the worker"
+    );
+    assert_eq!(
+        fs::read(&sentinel).expect("read sentinel"),
+        b"preserve unrelated data"
     );
 }

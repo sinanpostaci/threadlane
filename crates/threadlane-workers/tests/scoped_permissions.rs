@@ -8,14 +8,42 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use threadlane_workers::{
-    build_antigravity_task_files_settings_json, execute_worker_task, run_worker, DiffViolationKind,
-    ExecutionBudgets, FieldEvidence, WorkAcceptanceState, WorkerError, WorkerFilePermissions,
-    WorkerProvider, WorkerRunStatus, WorkerSpec, WorktreeManager, AGY_READ_PERMISSION_TOOL,
-    AGY_WRITE_PERMISSION_TOOLS,
+    build_antigravity_task_files_settings_json, execute_worker_task, run_worker,
+    AdvisoryWorkerSpec, DiffViolationKind, ExecutionBudgets, FieldEvidence, OpenCodeRuleEffect,
+    WorkAcceptanceState, WorkerError, WorkerFilePermissions, WorkerProvider, WorkerRunStatus,
+    WorkerSpec, WorktreeManager, AGY_READ_PERMISSION_TOOL, AGY_WRITE_PERMISSION_TOOLS,
+    MAX_PROMPT_BYTES,
 };
 use tokio::sync::watch;
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn read_nul_delimited_argv(path: &Path) -> Vec<Vec<u8>> {
+    let mut bytes = fs::read(path).expect("read NUL-delimited argv capture");
+    assert_eq!(
+        bytes.last(),
+        Some(&0),
+        "argv capture must be NUL-terminated without a text-line delimiter"
+    );
+    bytes
+        .pop()
+        .expect("NUL-terminated argv capture must contain a trailing delimiter");
+    if bytes.is_empty() {
+        return Vec::new();
+    }
+    bytes
+        .split(|byte| *byte == 0)
+        .map(|arg| arg.to_vec())
+        .collect()
+}
 
 struct ScopedTestEnv {
     _temp_dir: TempDir,
@@ -569,9 +597,11 @@ async fn rejects_opencode_task_files_and_unsafe_glob_or_rule_metacharacters_befo
         ),
     );
 
-    // 1. OpenCodeV2 with valid TaskFiles passes static validation and builds clean argv (without
-    // Antigravity `--settings`), whereas OpenCodeV2 TaskFiles with unsafe metacharacters or
-    // protected control paths fails before creating work_area_root or spawning the process.
+    // 1. OpenCodeV2 with valid TaskFiles passes static validation and exposes workdir-dependent
+    // argv metadata. The static preview keeps the bare caller prompt, while the actual
+    // build_argv_for_workdir invocation receives the canonical-cwd prologue without Antigravity
+    // `--settings`. Unsafe metacharacters or protected control paths fail before creating
+    // work_area_root or spawning the process.
     let clean_workdir = env.root_dir.join("clean-workdir");
     fs::create_dir_all(&clean_workdir).expect("create clean_workdir");
 
@@ -584,12 +614,45 @@ async fn rejects_opencode_task_files_and_unsafe_glob_or_rule_metacharacters_befo
         .validate()
         .expect("OpenCodeV2 TaskFiles must pass static validation");
     assert_eq!(oc_report.file_permissions, WorkerFilePermissions::TaskFiles);
-    assert!(!oc_report.workdir_argv_resolution_required);
-    assert!(oc_report.argv_resolution_note.is_none());
+    assert!(
+        oc_report.workdir_argv_resolution_required,
+        "OpenCode TaskFiles actual argv depends on the canonical working directory"
+    );
+    let oc_note = oc_report
+        .argv_resolution_note
+        .as_deref()
+        .expect("OpenCode TaskFiles must document workdir-dependent argv resolution");
+    assert!(oc_note.contains("static base preview"));
+    assert!(oc_note.contains("prologue"));
+    assert!(oc_note.contains("canonical task working directory"));
+    assert!(oc_note.contains("build_argv_for_workdir"));
+    assert_eq!(
+        oc_report.constructed_argv.last().map(String::as_str),
+        Some("Valid OpenCode TaskFiles"),
+        "static preview must not pretend the workdir prologue is already resolved"
+    );
+    assert!(!oc_report
+        .constructed_argv
+        .iter()
+        .any(|arg| arg.contains("THREADLANE_OPENCODE_TASK_FILES_CONTRACT")));
+    let static_oc_err = valid_oc_task_files
+        .build_argv()
+        .expect_err("OpenCode TaskFiles build_argv must require a canonical workdir");
+    assert!(matches!(
+        static_oc_err,
+        WorkerError::InvalidSpec(ref msg)
+            if msg.contains("task_files") && msg.contains("build_argv_for_workdir")
+    ));
+
+    let clean_workdir_str = clean_workdir.to_str().expect("utf8 clean workdir");
     let oc_argv = valid_oc_task_files
         .build_argv_for_workdir(&clean_workdir)
         .expect("OpenCodeV2 build_argv_for_workdir");
     assert!(!oc_argv.iter().any(|arg| arg == "--settings"));
+    let oc_effective_prompt = oc_argv.last().expect("OpenCode effective prompt");
+    assert!(oc_effective_prompt.starts_with("[THREADLANE_OPENCODE_TASK_FILES_CONTRACT] "));
+    assert!(oc_effective_prompt.contains(&format!("`{clean_workdir_str}`")));
+    assert!(oc_effective_prompt.ends_with("[THREADLANE_TASK_INSTRUCTION] Valid OpenCode TaskFiles"));
 
     let mut oc_bad_task_files = env.opencode_spec(
         spy_bin.clone(),
@@ -722,6 +785,124 @@ async fn rejects_opencode_task_files_and_unsafe_glob_or_rule_metacharacters_befo
         build_antigravity_task_files_settings_json(Path::new("/"), &env.default_allowed_paths())
             .is_err(),
         "filesystem root `/` must be rejected for TaskFiles"
+    );
+}
+
+#[test]
+fn opencode_task_files_prologue_uses_exact_canonical_cwd_inside_and_outside_work_area() {
+    let env = ScopedTestEnv::new();
+    let noop_bin = env.write_fake_executable("opencode-cwd-contract-noop", "exit 0");
+    let allowed_write_paths = env.default_allowed_paths();
+
+    let manager = WorktreeManager::new(&env.repo_dir, &env.work_area, &env.base_commit)
+        .expect("create WorktreeManager for OpenCode cwd contract test");
+    let manifest = manager
+        .create_task_worktree(
+            "run-opencode-cwd",
+            "task-opencode-cwd",
+            &allowed_write_paths,
+        )
+        .expect("create OpenCode cwd contract task worktree");
+    let checkout = manifest.checkout_path.clone();
+    assert!(
+        checkout
+            .strip_prefix(&env.work_area)
+            .is_ok_and(|relative| !relative.as_os_str().is_empty()),
+        "task checkout must be an owned mutable worktree inside work_area_root"
+    );
+
+    let outside_dir = env.root_dir.join("outside canonical workdir café 日本語");
+    fs::create_dir_all(&outside_dir).expect("create outside canonical workdir");
+    assert!(
+        outside_dir.strip_prefix(&env.work_area).is_err(),
+        "outside fixture must not reside inside work_area_root"
+    );
+
+    let caller_prompt =
+        "Use the exact canonical cwd.\nNever infer a checkout path from metadata.\n";
+    let spec = env.opencode_spec(noop_bin, caller_prompt, WorkerFilePermissions::TaskFiles);
+    let spec_json_before =
+        serde_json::to_vec(&spec).expect("serialize OpenCode spec before cwd contract");
+    let instruction_digest_before = sha256_hex(spec.prompt.as_bytes());
+
+    for (cwd, expected_inside_work_area) in [
+        (checkout.as_path(), true),
+        (outside_dir.as_path(), false),
+        (env.repo_dir.as_path(), false),
+    ] {
+        let canonical_cwd = fs::canonicalize(cwd).expect("canonicalize cwd fixture");
+        assert_eq!(
+            canonical_cwd.as_path(),
+            cwd,
+            "fixture path must already be canonical"
+        );
+        assert_eq!(
+            canonical_cwd
+                .strip_prefix(&env.work_area)
+                .is_ok_and(|relative| !relative.as_os_str().is_empty()),
+            expected_inside_work_area
+        );
+        let canonical_cwd_str = canonical_cwd.to_str().expect("utf8 canonical cwd");
+
+        let report = spec
+            .validate()
+            .expect("valid OpenCode TaskFiles spec must validate for every mutable cwd");
+        assert!(report.workdir_argv_resolution_required);
+        assert!(report
+            .argv_resolution_note
+            .as_deref()
+            .is_some_and(|note| note.contains("prologue")
+                && note.contains("canonical task working directory")));
+        assert_eq!(
+            report.constructed_argv.last().map(String::as_str),
+            Some(caller_prompt),
+            "static report must remain a bare-prompt preview for every cwd"
+        );
+
+        let config_before = spec
+            .build_opencode_config_for_workdir(&canonical_cwd)
+            .expect("build OpenCode config before cwd argv");
+        let argv = spec
+            .build_argv_for_workdir(&canonical_cwd)
+            .expect("OpenCode TaskFiles must resolve prologue for every valid mutable cwd");
+        assert_eq!(argv.len(), 10);
+        let effective_prompt = argv.last().expect("OpenCode effective prompt");
+        let (contract_header, retained_prompt) = effective_prompt
+            .split_once("[THREADLANE_TASK_INSTRUCTION] ")
+            .expect("actual OpenCode argv must carry the task instruction boundary");
+        assert!(
+            contract_header.starts_with("[THREADLANE_OPENCODE_TASK_FILES_CONTRACT] "),
+            "every mutable OpenCode TaskFiles cwd must receive the canonical prologue"
+        );
+        assert_eq!(retained_prompt, caller_prompt);
+        assert_eq!(
+            contract_header
+                .matches("[THREADLANE_OPENCODE_TASK_FILES_CONTRACT]")
+                .count(),
+            1
+        );
+        assert!(
+            contract_header.contains(&format!("`{canonical_cwd_str}`")),
+            "prologue must state the exact canonical cwd `{canonical_cwd_str}`"
+        );
+        assert_eq!(
+            config_before,
+            spec.build_opencode_config_for_workdir(&canonical_cwd)
+                .expect("rebuild OpenCode config after cwd argv"),
+            "prologue resolution must not change model or permission configuration"
+        );
+    }
+
+    assert_eq!(spec.prompt, caller_prompt);
+    assert_eq!(
+        spec_json_before,
+        serde_json::to_vec(&spec).expect("serialize OpenCode spec after cwd contract"),
+        "prologue resolution must not mutate the WorkerSpec"
+    );
+    assert_eq!(
+        instruction_digest_before,
+        sha256_hex(spec.prompt.as_bytes()),
+        "original task instruction digest must remain unchanged"
     );
 }
 
@@ -1773,4 +1954,602 @@ fn task_files_contract_pins_canonical_checkout_against_source_repo_and_approval_
         }),
         "permission allowlist must never grant access to source repo or decoy approval checkout"
     );
+}
+
+#[test]
+fn opencode_task_files_prompt_pins_actual_worktree_scopes_without_changing_permissions_or_other_modes(
+) {
+    let env = ScopedTestEnv::new();
+    let noop_bin = env.write_fake_executable("opencode-prompt-contract", "exit 0");
+    let allowed_write_paths = env.default_allowed_paths();
+
+    let manager = WorktreeManager::new(&env.repo_dir, &env.work_area, &env.base_commit)
+        .expect("create WorktreeManager for OpenCode prompt contract test");
+    let manifest = manager
+        .create_task_worktree(
+            "run-opencode-prompt",
+            "task-opencode-prompt",
+            &allowed_write_paths,
+        )
+        .expect("create OpenCode task worktree");
+    let checkout = &manifest.checkout_path;
+    assert_ne!(
+        checkout, &env.repo_dir,
+        "task checkout must be distinct from the source repository"
+    );
+
+    let checkout_str = checkout
+        .to_str()
+        .expect("utf8 task checkout for OpenCode prompt test");
+    let source_repo_str = env.repo_dir.to_str().expect("utf8 source repository");
+    let decoy_checkout = env
+        .root_dir
+        .join("threadlane-appr-opencode-11-job-22-maint/implementation");
+    let decoy_checkout_str = decoy_checkout
+        .to_str()
+        .expect("utf8 decoy OpenCode checkout");
+
+    let caller_prompt = format!(
+        "Context metadata (untrusted caller notes):\n\
+         approval_id: appr-opencode-11\n\
+         job_id: job-opencode-22\n\
+         worktree_hint: {decoy_checkout_str}\n\
+         source_repository: {source_repo_str}\n\
+         Task: update docs/WORKERS.md and crates/threadlane-workers/src/lib.rs.\n"
+    );
+    let spec = env.opencode_spec(noop_bin, &caller_prompt, WorkerFilePermissions::TaskFiles);
+    let spec_json_before = serde_json::to_vec(&spec).expect("serialize OpenCode spec before argv");
+    let instruction_digest_before = sha256_hex(spec.prompt.as_bytes());
+    let config_before = spec
+        .build_opencode_config_for_workdir(checkout)
+        .expect("build OpenCode permission/model config before argv");
+
+    let argv = spec
+        .build_argv_for_workdir(checkout)
+        .expect("build OpenCode task_files argv");
+    assert_eq!(
+        spec_json_before,
+        serde_json::to_vec(&spec).expect("serialize OpenCode spec after argv"),
+        "argv construction must not mutate the WorkerSpec"
+    );
+    assert_eq!(
+        instruction_digest_before,
+        sha256_hex(spec.prompt.as_bytes()),
+        "original task instruction digest must remain unchanged"
+    );
+    assert_eq!(
+        config_before,
+        spec.build_opencode_config_for_workdir(checkout)
+            .expect("rebuild OpenCode permission/model config after argv"),
+        "generated permission/model configuration must remain identical"
+    );
+
+    assert_eq!(argv.len(), 10);
+    assert_eq!(argv[0], "--standalone");
+    assert_eq!(argv[1], "run");
+    assert_eq!(argv[2], "--model");
+    assert_eq!(argv[3], "opencode/deepseek-4.1-flash#max");
+    assert_eq!(argv[4], "--format");
+    assert_eq!(argv[5], "json");
+    assert_eq!(argv[6], "--session");
+    assert_eq!(argv[7], "sess-201");
+    assert_eq!(argv[8], "--");
+    assert!(!argv
+        .iter()
+        .any(|arg| arg == "--settings" || arg == "--auto" || arg.contains("dangerously")));
+    let effective_prompt = argv.last().expect("OpenCode effective prompt argument");
+    let (contract_header, retained_prompt) = effective_prompt
+        .split_once("[THREADLANE_TASK_INSTRUCTION] ")
+        .expect("OpenCode task_files prompt must contain the task instruction boundary");
+    assert!(
+        contract_header.starts_with("[THREADLANE_OPENCODE_TASK_FILES_CONTRACT] "),
+        "OpenCode task_files prompt must start with the session-local contract"
+    );
+    assert_eq!(
+        retained_prompt, caller_prompt,
+        "caller prompt must remain verbatim after the contract boundary"
+    );
+    assert_eq!(
+        effective_prompt
+            .matches("[THREADLANE_TASK_INSTRUCTION] ")
+            .count(),
+        1,
+        "contract must contain exactly one task instruction boundary"
+    );
+
+    assert!(
+        contract_header.contains(&format!("`{checkout_str}`")),
+        "contract must state the exact actual task working directory"
+    );
+    assert!(
+        !contract_header.contains(source_repo_str),
+        "contract must never substitute the source repository path"
+    );
+    assert!(
+        !contract_header.contains(decoy_checkout_str),
+        "contract must never infer paths from approval/job/worktree identifiers"
+    );
+    assert!(contract_header.contains("Prefer repository-relative paths"));
+    assert!(
+        contract_header.contains(&format!("`{checkout_str}/<repo-relative-path>`")),
+        "contract must derive absolute paths only by joining the exact task root"
+    );
+    assert!(
+        contract_header.contains(
+            "[`crates/threadlane-workers/` (directory subtree `crates/threadlane-workers` and `crates/threadlane-workers/**`), `docs/WORKERS.md` (exact file only; no descendant `/**`)]"
+        ),
+        "contract must distinguish explicit directory subtrees from exact files"
+    );
+    assert!(contract_header
+        .contains("OpenCode built-in file tools `read`, `glob`, `grep`, `edit`, and `write`"));
+    assert!(
+        !contract_header.contains("read_file")
+            && !contract_header.contains("edit_file")
+            && !contract_header.contains("view_file")
+            && !contract_header.contains("list_dir"),
+        "OpenCode contract must list only OpenCode built-in file tools"
+    );
+    for forbidden in [
+        "shell/terminal",
+        "builds",
+        "tests",
+        "formatters",
+        "`git`",
+        "subagents",
+        "web/browser",
+        "MCP tools",
+        "parent controller runs all checks and Git operations",
+        "temporary files",
+        "`AGENTS.md`",
+        "`.env*`",
+        "outside the declared write scopes",
+        "read-only",
+    ] {
+        assert!(
+            contract_header.contains(forbidden),
+            "contract must explain `{forbidden}`"
+        );
+    }
+
+    let config_value: Value =
+        serde_json::from_str(&config_before).expect("parse OpenCode permission/model config");
+    assert_eq!(config_value["update"], "disable");
+    assert_eq!(config_value["default_agent"], "build");
+    assert_eq!(config_value["model"]["providerID"], "opencode");
+    assert_eq!(config_value["model"]["model"], "deepseek-4.1-flash");
+    assert_eq!(config_value["model"]["variant"], "max");
+    assert_eq!(
+        config_value["agents"]
+            .as_object()
+            .expect("OpenCode pinned agents")
+            .len(),
+        4
+    );
+
+    let content = spec
+        .build_opencode_config_content_for_workdir(checkout)
+        .expect("build structured OpenCode config");
+    for allowed_edit in [
+        "crates/threadlane-workers/src/lib.rs",
+        "crates/threadlane-workers/new_module.rs",
+        "docs/WORKERS.md",
+    ] {
+        assert_eq!(
+            content.evaluate_permission(None, "edit", allowed_edit),
+            OpenCodeRuleEffect::Allow,
+            "declared scope `{allowed_edit}` must remain writable"
+        );
+    }
+    for denied_edit in [
+        "docs/WORKERS.md/child.md",
+        "crates/threadlane-core/src/lib.rs",
+        "external_resolution.rs",
+        "newmodule.rs",
+        "AGENTS.md",
+        ".env",
+        ".git/config",
+        ".opencode/config.json",
+        ".local/state",
+        "/tmp/outside",
+    ] {
+        assert_eq!(
+            content.evaluate_permission(None, "edit", denied_edit),
+            OpenCodeRuleEffect::Deny,
+            "unapproved or protected path `{denied_edit}` must remain denied"
+        );
+        assert_eq!(
+            content.evaluate_permission(Some("build"), "edit", denied_edit),
+            OpenCodeRuleEffect::Deny,
+            "build-agent writes to `{denied_edit}` must remain denied"
+        );
+    }
+    assert_eq!(
+        content.evaluate_permission(None, "read", ".env"),
+        OpenCodeRuleEffect::Deny
+    );
+    for denied_action in ["shell", "subagent", "web"] {
+        assert_eq!(
+            content.evaluate_permission(None, denied_action, "git status"),
+            OpenCodeRuleEffect::Deny,
+            "OpenCode task_files must not grant `{denied_action}`"
+        );
+    }
+
+    // Antigravity TaskFiles keeps its existing contract bytes and never receives the OpenCode
+    // prologue.
+    let agy_bin = env.write_fake_executable("opencode-repair-noop-agy", "exit 0");
+    let agy_workdir = env.root_dir.join("opencode-repair-agy-workdir");
+    fs::create_dir_all(&agy_workdir).expect("create AGY unaffected workdir");
+    let agy_spec = env.antigravity_spec(
+        agy_bin,
+        "AGY contract unchanged",
+        WorkerFilePermissions::TaskFiles,
+    );
+    let agy_argv = agy_spec
+        .build_argv_for_workdir(&agy_workdir)
+        .expect("build unchanged AGY task_files argv");
+    let agy_prompt = agy_argv.last().expect("AGY prompt argument");
+    assert!(agy_prompt.starts_with("[THREADLANE_AGY_TASK_FILES_CONTRACT] "));
+    assert!(!agy_prompt.contains("[THREADLANE_OPENCODE_TASK_FILES_CONTRACT]"));
+    assert_eq!(
+        agy_prompt
+            .split_once("[THREADLANE_TASK_INSTRUCTION] ")
+            .expect("AGY task instruction boundary")
+            .1,
+        "AGY contract unchanged"
+    );
+
+    // OpenCode Inherit keeps the bare prompt and no permission rules.
+    let inherit_bin = env.write_fake_executable("opencode-repair-noop-inherit", "exit 0");
+    let inherit_spec = env.opencode_spec(
+        inherit_bin,
+        "Inherit prompt unchanged",
+        WorkerFilePermissions::Inherit,
+    );
+    let inherit_argv = inherit_spec
+        .build_argv_for_workdir(checkout)
+        .expect("build unchanged OpenCode inherit argv");
+    assert_eq!(
+        inherit_argv.last().map(String::as_str),
+        Some("Inherit prompt unchanged")
+    );
+    assert!(!inherit_argv
+        .iter()
+        .any(|arg| arg.contains("THREADLANE_OPENCODE_TASK_FILES_CONTRACT")));
+    let inherit_content = inherit_spec
+        .build_opencode_config_content_for_workdir(checkout)
+        .expect("build unchanged OpenCode inherit config");
+    assert!(inherit_content.permissions.is_none());
+
+    // OpenCode read-only advisory keeps the bare prompt and read-only permissions.
+    let advisory_bin = env.write_fake_executable("opencode-repair-noop-advisory", "exit 0");
+    let advisory_dir = env.root_dir.join("opencode-repair-advisory");
+    fs::create_dir_all(&advisory_dir).expect("create OpenCode advisory workdir");
+    let advisory_spec = AdvisoryWorkerSpec {
+        provider: WorkerProvider::OpenCodeV2,
+        executable: advisory_bin,
+        model: "opencode/deepseek-4.1-flash".to_string(),
+        effort: Some("max".to_string()),
+        allowed_models: BTreeSet::new(),
+        session_id: None,
+        standalone: true,
+        working_directory: advisory_dir.clone(),
+        allowed_write_paths: BTreeSet::new(),
+        prompt: "Advisory prompt unchanged".to_string(),
+        file_permissions: WorkerFilePermissions::ReadOnly,
+        budgets: ExecutionBudgets::default(),
+    };
+    let advisory_argv = advisory_spec
+        .build_argv_for_workdir(&advisory_dir)
+        .expect("build unchanged OpenCode advisory argv");
+    assert_eq!(
+        advisory_argv.last().map(String::as_str),
+        Some("Advisory prompt unchanged")
+    );
+    assert!(!advisory_argv
+        .iter()
+        .any(|arg| arg.contains("THREADLANE_OPENCODE_TASK_FILES_CONTRACT")));
+    let advisory_content = advisory_spec
+        .build_opencode_config_content()
+        .expect("build unchanged OpenCode advisory config");
+    assert_eq!(
+        advisory_content.evaluate_permission(None, "read", "src/lib.rs"),
+        OpenCodeRuleEffect::Allow
+    );
+    assert_eq!(
+        advisory_content.evaluate_permission(None, "edit", "src/lib.rs"),
+        OpenCodeRuleEffect::Deny
+    );
+    assert_eq!(
+        advisory_content.evaluate_permission(None, "shell", "git status"),
+        OpenCodeRuleEffect::Deny
+    );
+}
+
+#[tokio::test]
+async fn opencode_task_files_effective_prompt_bound_counts_canonical_cwd_and_explicit_scopes_before_provider_spawn(
+) {
+    let env = ScopedTestEnv::new();
+    let boundary_marker = env.root_dir.join("opencode_boundary_spawned.marker");
+    let over_marker = env.root_dir.join("opencode_over_bound_spawned.marker");
+    let boundary_bin = env.write_fake_executable(
+        "opencode-boundary-bin",
+        &format!(
+            r#"
+printf 'spawned\n' > '{}'
+printf '{{"type":"step_start","sessionID":"sess-201","part":{{"type":"step-start","model":"opencode/deepseek-4.1-flash#max"}}}}\n'
+printf '{{"type":"step_finish","sessionID":"sess-201","part":{{"type":"step-finish","reason":"stop"}}}}\n'
+"#,
+            boundary_marker.display()
+        ),
+    );
+    let over_bin = env.write_fake_executable(
+        "opencode-over-bound-bin",
+        &format!(
+            r#"
+printf 'spawned\n' > '{}'
+printf '{{"type":"step_start","sessionID":"sess-201","part":{{"type":"step-start","model":"opencode/deepseek-4.1-flash#max"}}}}\n'
+printf '{{"type":"step_finish","sessionID":"sess-201","part":{{"type":"step-finish","reason":"stop"}}}}\n'
+"#,
+            over_marker.display()
+        ),
+    );
+
+    let long_workdir = env
+        .root_dir
+        .join(format!("canonical-cwd-{}", "a".repeat(96)))
+        .join(format!("nested-{}", "b".repeat(96)));
+    fs::create_dir_all(&long_workdir).expect("create long canonical workdir");
+    let long_workdir_str = long_workdir.to_str().expect("utf8 long canonical workdir");
+
+    let mut explicit_scopes = BTreeSet::new();
+    for index in 0..4 {
+        explicit_scopes.insert(format!(
+            "crates/{}/directory-{index}/",
+            "scope-dir-".repeat(8)
+        ));
+        explicit_scopes.insert(format!("docs/{}/file-{index}.md", "scope-file-".repeat(8)));
+    }
+    assert_eq!(explicit_scopes.len(), 8);
+    assert!(explicit_scopes.iter().any(|scope| scope.ends_with('/')));
+    assert!(explicit_scopes.iter().any(|scope| !scope.ends_with('/')));
+
+    let mut spec = env.opencode_spec(
+        boundary_bin.clone(),
+        "probe",
+        WorkerFilePermissions::TaskFiles,
+    );
+    spec.allowed_write_paths = explicit_scopes.clone();
+
+    let probe_argv = spec
+        .build_argv_for_workdir(&long_workdir)
+        .expect("probe actual OpenCode task_files argv");
+    let probe_effective_prompt = probe_argv.last().expect("probe effective prompt");
+    assert!(probe_effective_prompt.ends_with("probe"));
+    assert!(probe_effective_prompt.contains(long_workdir_str));
+    for scope in &explicit_scopes {
+        let clean_scope = scope.strip_suffix('/').unwrap_or(scope.as_str());
+        assert!(
+            probe_effective_prompt.contains(clean_scope),
+            "prologue must include explicit scope `{scope}` counted by the effective prompt bound"
+        );
+    }
+    let prologue_and_boundary_bytes = probe_effective_prompt
+        .len()
+        .checked_sub("probe".len())
+        .expect("probe prompt suffix is present");
+    let boundary_prompt_len = MAX_PROMPT_BYTES
+        .checked_sub(prologue_and_boundary_bytes)
+        .expect("canonical prologue and scopes must leave room inside MAX_PROMPT_BYTES");
+    let boundary_prompt = "b".repeat(boundary_prompt_len);
+    assert!(
+        boundary_prompt.len() <= MAX_PROMPT_BYTES,
+        "the original prompt stays within the pre-existing prompt cap; only the effective prompt reaches the boundary"
+    );
+
+    let mut boundary_spec = spec.clone();
+    boundary_spec.executable = boundary_bin;
+    boundary_spec.prompt = boundary_prompt.clone();
+    let boundary_spec_json_before =
+        serde_json::to_vec(&boundary_spec).expect("serialize boundary spec before argv");
+    let boundary_digest_before = sha256_hex(boundary_spec.prompt.as_bytes());
+    let boundary_config_before = boundary_spec
+        .build_opencode_config_for_workdir(&long_workdir)
+        .expect("build boundary OpenCode config before argv");
+
+    let boundary_argv = boundary_spec
+        .build_argv_for_workdir(&long_workdir)
+        .expect("effective prompt exactly at MAX_PROMPT_BYTES must be accepted");
+    let boundary_effective_prompt = boundary_argv.last().expect("boundary effective prompt");
+    assert_eq!(boundary_effective_prompt.len(), MAX_PROMPT_BYTES);
+    let (_, boundary_retained_prompt) = boundary_effective_prompt
+        .split_once("[THREADLANE_TASK_INSTRUCTION] ")
+        .expect("boundary prompt must retain the task instruction boundary");
+    assert_eq!(boundary_retained_prompt, boundary_prompt);
+
+    let boundary_report = run_worker(&boundary_spec, &long_workdir)
+        .await
+        .expect("boundary-sized effective OpenCode task_files prompt must launch");
+    assert_eq!(boundary_report.status, WorkerRunStatus::Succeeded);
+    assert!(
+        boundary_marker.exists(),
+        "boundary-sized effective prompt must reach the provider"
+    );
+    assert_eq!(boundary_spec.prompt, boundary_prompt);
+    assert_eq!(
+        boundary_spec_json_before,
+        serde_json::to_vec(&boundary_spec).expect("serialize boundary spec after argv")
+    );
+    assert_eq!(
+        boundary_digest_before,
+        sha256_hex(boundary_spec.prompt.as_bytes())
+    );
+    assert_eq!(
+        boundary_config_before,
+        boundary_spec
+            .build_opencode_config_for_workdir(&long_workdir)
+            .expect("rebuild boundary OpenCode config after argv")
+    );
+
+    let mut over_spec = spec;
+    over_spec.executable = over_bin;
+    over_spec.prompt = "c".repeat(boundary_prompt_len + 1);
+    assert!(
+        over_spec.prompt.len() <= MAX_PROMPT_BYTES,
+        "the over-bound fixture must fail on the effective prompt cap, not the original prompt cap"
+    );
+    let over_prompt = over_spec.prompt.clone();
+    let over_spec_json_before =
+        serde_json::to_vec(&over_spec).expect("serialize over-bound spec before argv");
+    let over_digest_before = sha256_hex(over_spec.prompt.as_bytes());
+
+    let over_argv_error = over_spec
+        .build_argv_for_workdir(&long_workdir)
+        .expect_err("effective prompt one byte over MAX_PROMPT_BYTES must fail before argv");
+    assert!(matches!(
+        over_argv_error,
+        WorkerError::InvalidSpec(ref msg)
+            if msg.contains("effective OpenCode task_files prompt")
+                && msg.contains(&MAX_PROMPT_BYTES.to_string())
+    ));
+
+    let over_run_error = run_worker(&over_spec, &long_workdir)
+        .await
+        .expect_err("over-bound effective prompt must fail before provider spawn");
+    assert!(matches!(over_run_error, WorkerError::InvalidSpec(_)));
+    assert!(
+        !over_marker.exists(),
+        "over-bound effective prompt must never reach the provider"
+    );
+    assert_eq!(over_spec.prompt, over_prompt);
+    assert_eq!(
+        over_spec_json_before,
+        serde_json::to_vec(&over_spec).expect("serialize over-bound spec after rejection")
+    );
+    assert_eq!(over_digest_before, sha256_hex(over_spec.prompt.as_bytes()));
+}
+
+#[tokio::test]
+async fn opencode_task_files_effective_prompt_and_config_reach_fake_cli_in_actual_task_worktree() {
+    let env = ScopedTestEnv::new();
+    let capture_bin = env.write_fake_executable(
+        "opencode-task-files-capture",
+        r#"
+for arg in "$@"; do
+    printf '%s\000' "$arg" >> opencode_received_argv.bin
+done
+printf '%s' "$OPENCODE_CONFIG_CONTENT" > opencode_received_config.json
+printf '{"type":"step_start","sessionID":"sess-201","part":{"type":"step-start","model":"opencode/deepseek-4.1-flash#max"}}\n'
+printf '{"type":"step_finish","sessionID":"sess-201","part":{"type":"step-finish","reason":"stop"}}\n'
+"#,
+    );
+
+    let manager = WorktreeManager::new(&env.repo_dir, &env.work_area, &env.base_commit)
+        .expect("create WorktreeManager for OpenCode capture test");
+    let manifest = manager
+        .create_task_worktree(
+            "run-opencode-capture",
+            "task-opencode-capture",
+            &env.default_allowed_paths(),
+        )
+        .expect("create OpenCode capture task worktree");
+    let checkout = &manifest.checkout_path;
+    assert_ne!(
+        checkout, &env.repo_dir,
+        "fake CLI must run inside the actual task worktree, not the source repository"
+    );
+
+    let source_repo_str = env.repo_dir.to_str().expect("utf8 source repository");
+    let decoy_checkout = env
+        .root_dir
+        .join("threadlane-appr-opencode-33-job-44-maint/implementation");
+    let decoy_checkout_str = decoy_checkout
+        .to_str()
+        .expect("utf8 decoy OpenCode capture checkout");
+    let caller_prompt = format!(
+        "Line 1: update docs/WORKERS.md; worktree_hint: {decoy_checkout_str}; source_repository: {source_repo_str}; preserve exact bytes & symbols!\n\
+Line 2 — naïve café, 日本語, кириллица, हिन्दी, emoji 🚀.\n\
+Line 3:\ttabs, spaces, quotes \" and backslashes \\\\ stay exact.\n\
+Line 4: the final trailing newline follows.\n"
+    );
+    let spec = env.opencode_spec(
+        capture_bin,
+        &caller_prompt,
+        WorkerFilePermissions::TaskFiles,
+    );
+    let expected_argv = spec
+        .build_argv_for_workdir(checkout)
+        .expect("build expected OpenCode task_files argv");
+    let expected_config = spec
+        .build_opencode_config_for_workdir(checkout)
+        .expect("build expected OpenCode permission/model config");
+
+    let report = run_worker(&spec, checkout)
+        .await
+        .expect("run OpenCode task_files worker with fake CLI");
+    assert_eq!(report.status, WorkerRunStatus::Succeeded);
+    assert_eq!(
+        report.constructed_argv, expected_argv,
+        "supervised launch argv must preserve the task_files contract"
+    );
+
+    let received_argv_bytes = read_nul_delimited_argv(&checkout.join("opencode_received_argv.bin"));
+    let expected_argv_bytes: Vec<Vec<u8>> = expected_argv
+        .iter()
+        .map(|arg| arg.as_bytes().to_vec())
+        .collect();
+    assert_eq!(
+        received_argv_bytes, expected_argv_bytes,
+        "NUL-delimited capture must preserve every actual argv byte exactly, including multiline Unicode prompt bytes"
+    );
+    let captured_config = fs::read_to_string(checkout.join("opencode_received_config.json"))
+        .expect("read captured OPENCODE_CONFIG_CONTENT");
+    assert_eq!(
+        captured_config, expected_config,
+        "child OpenCode process must receive the unchanged permission/model config bytes"
+    );
+
+    let effective_prompt_bytes = received_argv_bytes
+        .last()
+        .expect("captured effective prompt bytes");
+    let boundary: &[u8] = b"[THREADLANE_TASK_INSTRUCTION] ";
+    let boundary_index = effective_prompt_bytes
+        .windows(boundary.len())
+        .position(|window| window == boundary)
+        .expect("captured prompt must contain the task instruction boundary");
+    assert_eq!(
+        effective_prompt_bytes
+            .windows(boundary.len())
+            .filter(|window| *window == boundary)
+            .count(),
+        1,
+        "captured prompt must contain exactly one task instruction boundary"
+    );
+    let contract_header_bytes = &effective_prompt_bytes[..boundary_index];
+    let retained_prompt_bytes = &effective_prompt_bytes[boundary_index + boundary.len()..];
+    assert_eq!(
+        retained_prompt_bytes,
+        caller_prompt.as_bytes(),
+        "captured prompt must preserve the original multiline Unicode task instruction byte-for-byte"
+    );
+    let contract_header =
+        std::str::from_utf8(contract_header_bytes).expect("UTF-8 captured contract header");
+    assert!(contract_header.starts_with("[THREADLANE_OPENCODE_TASK_FILES_CONTRACT] "));
+    assert_eq!(
+        contract_header
+            .matches("[THREADLANE_OPENCODE_TASK_FILES_CONTRACT]")
+            .count(),
+        1
+    );
+    assert!(contract_header.contains(&format!(
+        "`{}`",
+        checkout
+            .to_str()
+            .expect("utf8 captured task worktree checkout")
+    )));
+    assert!(!contract_header.contains(source_repo_str));
+    assert!(!contract_header.contains(decoy_checkout_str));
+    assert!(contract_header.contains(
+        "[`crates/threadlane-workers/` (directory subtree `crates/threadlane-workers` and `crates/threadlane-workers/**`), `docs/WORKERS.md` (exact file only; no descendant `/**`)]"
+    ));
 }
