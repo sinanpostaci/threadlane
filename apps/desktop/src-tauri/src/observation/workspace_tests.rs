@@ -32,6 +32,10 @@ mod unix_workspace_tests {
         ReviewVerdictOutcome, StructuredReviewVerdict, TaskCandidateRef, WorkBrief, WorkBriefKind,
         WorkflowHoldReason, WorkflowHoldRecord, COWORKER_WORKFLOW_SCHEMA_VERSION,
     };
+    use threadlane_native::external_resolution::{
+        ExternalResolutionConfirmation, ExternalResolutionEvidenceRef, ExternalResolutionScope,
+        ExternalResolutionService, ExternalResolutionTarget, RecordExternalResolutionRequest,
+    };
     use threadlane_native::native_chat_observation::{
         compute_observation_source_id, write_workspace_native_sample_sidecar,
     };
@@ -421,6 +425,11 @@ mod unix_workspace_tests {
         let stores = TestStores::new(&tree, "stores");
         let app_data = tree.dir("app-data");
         let project = tree.dir("workspace-repo");
+        // Store-backed external resolution proves the repository path from the frozen project
+        // base; it never invokes Git. A non-symlink marker is enough for path validation.
+        fs::write(project.join(".git"), b"gitdir: disposable fixture\n")
+            .expect("write disposable .git marker");
+        set_mode(&project.join(".git"), 0o600);
         let source_id = stores.canonical_source_id();
         let binding_id = "bnd_ws_readonly_01";
         let thread_uuid = "0196ed00-0000-7000-8000-000000000101";
@@ -701,6 +710,116 @@ mod unix_workspace_tests {
                 .summary
                 .contains("DO_NOT_LEAK_PROVIDER_INSTRUCTION_SENTINEL")),
             "task instruction prompts must never enter Messages"
+        );
+
+        // Record a real external resolution receipt through the store-backed service, then verify
+        // workspace, ObservationJob, ChatJobStats, and Messages all consume the same result.
+        let external_service = ExternalResolutionService::new(
+            &stores.plans,
+            &stores.authority,
+            &stores.registry,
+            Some(&stores.sessions),
+        )
+        .expect("open external resolution service");
+        let request = RecordExternalResolutionRequest {
+            binding_id: binding_id.to_string(),
+            thread_uuid: thread_uuid.to_string(),
+            canonical_repo_root: project.clone(),
+            target: ExternalResolutionTarget::Job {
+                job_id: "job_ws_01".to_string(),
+            },
+            scope: ExternalResolutionScope::FullJob,
+            expected_ledger_revision: Some(1),
+            expected_job_revision: Some(1),
+            expected_runtime_revision: None,
+            request_key: "req_ws_external_01".to_string(),
+            created_at_ms: 1_700_000_200_000,
+            explanation: "Resolved externally by the workspace fixture operator.".to_string(),
+            evidence_refs: vec![ExternalResolutionEvidenceRef::ArtifactRef {
+                reference: "issue-ws-42".to_string(),
+            }],
+        };
+        let preview = external_service
+            .preview(&request)
+            .expect("preview external resolution");
+        let receipt = external_service
+            .record(
+                &request,
+                &ExternalResolutionConfirmation {
+                    trusted_local_attested: true,
+                    thread_uuid: preview.thread_uuid.clone(),
+                    preview_digest: preview.preview_digest.clone(),
+                },
+            )
+            .expect("record external resolution");
+        let after_record = snapshot_tree_fingerprints(tree.path());
+        let snap_ext = service
+            .workspace_snapshot(None)
+            .expect("workspace_snapshot after external resolution");
+        let after_read = snapshot_tree_fingerprints(tree.path());
+        assert_eq!(
+            after_record, after_read,
+            "store-backed workspace reads must not write after a real receipt record"
+        );
+
+        let resolved_history = snap_ext
+            .job_histories
+            .iter()
+            .find(|history| history.job.job_id == "job_ws_01")
+            .expect("resolved job history");
+        assert_eq!(resolved_history.external_resolutions.len(), 1);
+        let resolution = &resolved_history.external_resolutions[0];
+        assert_eq!(resolution.receipt_id, receipt.receipt_id);
+        assert_eq!(
+            resolution.applicability,
+            threadlane_core::observation::WorkspaceExternalResolutionApplicability::Applicable
+        );
+        assert_eq!(
+            resolution.scope,
+            threadlane_core::observation::WorkspaceExternalResolutionScope::Job
+        );
+        assert_eq!(
+            resolution.outcome,
+            threadlane_core::observation::WorkspaceExternalResolutionOutcome::ResolvedExternally
+        );
+        assert!(!resolution.covered_attention.is_empty());
+        assert!(resolved_history.current_attention.is_none());
+        assert_eq!(
+            resolved_history.job.phase.as_deref(),
+            Some("awaiting_approval"),
+            "stored phase remains unchanged"
+        );
+        assert_eq!(
+            resolved_history.job.state,
+            ObservationJobState::Unknown,
+            "external resolution is a logical outcome, not Completed"
+        );
+        assert_eq!(
+            resolved_history.job.execution_status,
+            "resolved_externally"
+        );
+        assert_eq!(
+            resolved_history.acceptance_proof.status,
+            WorkspaceAcceptanceStatus::Unknown
+        );
+        assert_eq!(snap_ext.chats[0].attention_count, 0);
+        assert!(snap_ext.observation.jobs.iter().any(|job| {
+            job.id == "job_ws_01"
+                && job.state == ObservationJobState::Unknown
+                && job.execution_status == "resolved_externally"
+        }));
+        assert!(snap_ext.messages.items.iter().any(|message| {
+            message.source_record_id == receipt.receipt_id
+                && message.scope.job_id.as_deref() == Some("job_ws_01")
+                && message.summary == resolution.summary
+        }));
+        assert!(
+            snap_ext
+                .messages
+                .items
+                .iter()
+                .any(|message| message.summary == turkish_brief),
+            "unrelated safe Messages rows stay visible after external resolution"
         );
     }
 

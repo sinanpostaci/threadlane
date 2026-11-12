@@ -2183,6 +2183,7 @@ mod completion_proof_tests {
             historical_failure: None,
             current_attention: None,
             acceptance_proof: WorkspaceAcceptanceProof::unknown(),
+            external_resolutions: Vec::new(),
             truncation: WorkspaceJobHistoryTruncation::default(),
         };
 

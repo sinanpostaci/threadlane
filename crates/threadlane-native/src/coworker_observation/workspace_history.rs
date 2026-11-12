@@ -69,13 +69,15 @@ use threadlane_core::observation::{
     validate_correlation_id, ObservationDeliveryStage, ObservationExecutor, ObservationJobState,
     WorkspaceAcceptanceProof, WorkspaceAcceptanceStatus, WorkspaceAttentionKind,
     WorkspaceAttentionState, WorkspaceChatIdentity, WorkspaceCombinedCandidate,
+    WorkspaceCoveredAttention, WorkspaceExternalResolution, WorkspaceExternalResolutionApplicability,
+    WorkspaceExternalResolutionOutcome, WorkspaceExternalResolutionScope,
     WorkspaceHistoricalFailure, WorkspaceJobHistory, WorkspaceJobHistoryTruncation,
     WorkspaceJobResult, WorkspaceJobSummary, WorkspaceOutboxRecord, WorkspaceRecordLinks,
     WorkspaceRunRecord, WorkspaceTaskAttempt, WorkspaceTaskCandidate, WorkspaceTaskHistory,
 };
 use threadlane_host::{
-    read_host_manifest_optional, verify_existing_private_dir, verify_existing_session_dir,
-    WORK_AREA_SUBDIR,
+    read_host_launch_intent_optional, read_host_manifest_optional, verify_existing_private_dir,
+    verify_existing_session_dir, HostLaunchIntentStatus, HostPhase, WORK_AREA_SUBDIR,
 };
 use threadlane_operations::{
     inspect_job_integration_intent_readonly, load_integration_receipt, load_review_receipt,
@@ -85,17 +87,22 @@ use threadlane_operations::{
 use threadlane_workers::{resolve_model_target, WorkerProvider, WorkerRunStatus};
 use threadlane_workflow::{Difficulty, PlanRevision, PlanStore, ToolAdapter, WorkflowRole};
 
+use crate::coworker_driver::coworker_driver_dir;
 use crate::coworker_observation::CoworkerObservationExecutorSpec;
 use crate::coworker_workflow::{
     read_persisted_candidate_check_report, read_persisted_job_integration_report,
     CombinedCandidateIdentity, CombinedCandidateStatus, ControllerJobRuntimeState,
-    ControllerPolicyStore, CoworkerBindingLedger, CoworkerJobPhase, CoworkerJobRecord,
-    CoworkerTaskRecord, CoworkerTaskStage, CoworkerWorkflowStore, FrozenCheckExecutionStatus,
-    FrozenCheckSubject, FrozenCheckTargetKind, OutboxDispatchKind, OutboxDispatchRecord,
-    OutboxDispatchStatus, PendingControllerEffect, PendingControllerEffectKind,
-    PendingControllerEffectStatus, PlanningReservationStatus, ReviewVerdictOutcome,
-    TaskAttemptExecutionArtifacts, TaskAttemptRef, TaskCandidateRef, WorkBriefKind,
-    WorkflowHoldReason, WorkflowHoldRecord,
+    ControllerPolicyStore, CoworkerBindingLedger, CoworkerJobLockState, CoworkerJobOwnershipKey,
+    CoworkerJobOwnershipStore, CoworkerJobPhase, CoworkerJobRecord, CoworkerTaskRecord,
+    CoworkerTaskStage, CoworkerWorkflowStore, FrozenCheckExecutionStatus, FrozenCheckSubject,
+    FrozenCheckTargetKind, OutboxDispatchKind, OutboxDispatchRecord, OutboxDispatchStatus,
+    PendingControllerEffect, PendingControllerEffectKind, PendingControllerEffectStatus,
+    PlanningReservationStatus, ReviewVerdictOutcome, TaskAttemptExecutionArtifacts, TaskAttemptRef,
+    TaskCandidateRef, WorkBriefKind, WorkflowHoldReason, WorkflowHoldRecord,
+};
+use crate::external_resolution::{
+    evaluate_receipt_applicability, ExternalResolutionApplicability, ExternalResolutionReceipt,
+    ExternalResolutionScope, ExternalResolutionTarget,
 };
 use crate::fs_safety::constant_time_str_eq;
 
@@ -118,6 +125,10 @@ pub enum WorkspaceHistoryDiagnosticKind {
     SessionLookupDegraded,
     /// Persisted review, integration, check, or Closure receipt chain failed read-only verification; acceptance remained unknown.
     AcceptanceVerificationFailed,
+    /// A persisted external resolution receipt could not be independently linked to current scope,
+    /// revision, authority, plan, runtime, ownership, or host evidence; applicability remained
+    /// unverified and covered attention was not retired.
+    ExternalResolutionVerificationFailed,
 }
 
 /// Sanitized read-only diagnostic emitted during workspace job history projection.
@@ -341,11 +352,18 @@ pub fn read_scoped_workspace_job_histories(
     );
     let authority_records_by_id =
         load_authority_records_readonly(stores, &mut degraded, &mut diagnostics);
-    let authority_store_degraded = (stores.authority_store.is_some()
-        || stores.authority_dir.is_some())
-        && authority_records_by_id.is_none();
+    let authority_store_configured =
+        stores.authority_store.is_some() || stores.authority_dir.is_some();
+    let authority_store_degraded =
+        authority_store_configured && authority_records_by_id.is_none();
     let verified_sessions_root =
         verify_sessions_root_readonly(stores.sessions_dir, &mut degraded, &mut diagnostics);
+    let all_approval_records: Vec<ApprovalRecord> = authority_records_by_id
+        .as_ref()
+        .map(|records| records.values().cloned().collect())
+        .unwrap_or_default();
+    let all_plan_revisions: Vec<PlanRevision> =
+        plan_snapshot.revisions_by_key.values().cloned().collect();
 
     // Pre-validate every job and its companion records against the verified 4-part scope before
     // building lineage maps or minting store-backed obsolete-planning retirement evidence.
@@ -456,12 +474,29 @@ pub fn read_scoped_workspace_job_histories(
             continue;
         }
 
+        let external_resolutions = verify_scoped_external_resolutions_readonly(
+            chat_identity,
+            job,
+            runtime_opt.as_ref(),
+            &ledger,
+            &plan_snapshot,
+            &all_approval_records,
+            &all_plan_revisions,
+            authority_records_by_id.as_ref(),
+            authority_store_configured,
+            policy_store.as_ref(),
+            stores,
+            verified_sessions_root,
+            &mut diagnostics,
+        );
+
         admitted_jobs.push(PrevalidatedScopedJob {
             job,
             runtime_opt,
             plan_revision,
             approval_record,
             runtime_missing_or_degraded,
+            external_resolutions,
         });
     }
 
@@ -546,6 +581,7 @@ pub fn read_scoped_workspace_job_histories(
             verified_acceptance.as_ref(),
             verified_obsolete_planning.as_ref(),
             verified_current_published_plan.as_ref(),
+            Some(&entry.external_resolutions),
         ) {
             Ok(history) => projected_jobs.push(history),
             Err(diag) => {
@@ -598,7 +634,9 @@ pub fn project_coworker_job_history(
     runtime: Option<&ControllerJobRuntimeState>,
     context: Option<&WorkspaceJobLineageContext>,
 ) -> Result<WorkspaceJobHistory, WorkspaceHistoryDiagnostic> {
-    project_coworker_job_history_internal(chat_identity, job, runtime, context, None, None, None)
+    project_coworker_job_history_internal(
+        chat_identity, job, runtime, context, None, None, None, None,
+    )
 }
 
 struct PrevalidatedScopedJob<'a> {
@@ -607,6 +645,7 @@ struct PrevalidatedScopedJob<'a> {
     plan_revision: Option<PlanRevision>,
     approval_record: Option<ApprovalRecord>,
     runtime_missing_or_degraded: bool,
+    external_resolutions: VerifiedExternalResolutionHistory,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -614,6 +653,14 @@ struct VerifiedObsoletePlanningSupersession;
 
 #[derive(Debug, Clone, Copy)]
 struct VerifiedCurrentPublishedPlanMetadata;
+
+/// Private store-backed external resolution proof. Only
+/// [`read_scoped_workspace_job_histories`] constructs this value; pure caller-supplied lineage or
+/// public history contexts can never mint it.
+#[derive(Debug, Clone, Default)]
+struct VerifiedExternalResolutionHistory {
+    resolutions: Vec<WorkspaceExternalResolution>,
+}
 
 #[derive(Debug, Clone)]
 struct VerifiedHistoricalTaskAcceptance {
@@ -642,6 +689,7 @@ struct HistoricalStoreVerificationContext<'a, 'b> {
     authority_store_degraded: bool,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn project_coworker_job_history_internal(
     chat_identity: &WorkspaceChatIdentity,
     job: &CoworkerJobRecord,
@@ -650,6 +698,7 @@ fn project_coworker_job_history_internal(
     verified_acceptance: Option<&VerifiedHistoricalJobAcceptance>,
     verified_obsolete_planning: Option<&VerifiedObsoletePlanningSupersession>,
     verified_current_published_plan: Option<&VerifiedCurrentPublishedPlanMetadata>,
+    verified_external_resolutions: Option<&VerifiedExternalResolutionHistory>,
 ) -> Result<WorkspaceJobHistory, WorkspaceHistoryDiagnostic> {
     chat_identity.validate().map_err(|_| {
         WorkspaceHistoryDiagnostic::new(
@@ -690,7 +739,7 @@ fn project_coworker_job_history_internal(
 
     let historical_failure =
         derive_job_historical_failure(job, runtime, &projected_tasks, verified_acceptance);
-    let current_attention = if verified_acceptance.is_some() {
+    let mut current_attention = if verified_acceptance.is_some() {
         None
     } else {
         derive_job_current_attention(
@@ -701,9 +750,28 @@ fn project_coworker_job_history_internal(
             verified_current_published_plan,
         )
     };
+    let (external_resolutions, full_job_externally_resolved) =
+        if verified_acceptance.is_some() {
+            (
+                verified_external_resolutions
+                    .map(|verified| verified.resolutions.clone())
+                    .unwrap_or_default(),
+                false,
+            )
+        } else {
+            apply_external_resolution_coverage(
+                job,
+                runtime,
+                verified_obsolete_planning,
+                verified_current_published_plan,
+                &mut projected_tasks,
+                &mut current_attention,
+                verified_external_resolutions,
+            )
+        };
     let links = project_record_links(job, context);
     let result = project_job_result(job, runtime, runtime_missing, verified_acceptance);
-    let job_summary = project_job_summary(
+    let mut job_summary = project_job_summary(
         chat_identity,
         job,
         runtime,
@@ -716,6 +784,10 @@ fn project_coworker_job_history_internal(
         verified_obsolete_planning,
         verified_current_published_plan,
     );
+    if full_job_externally_resolved && verified_acceptance.is_none() {
+        job_summary.state = ObservationJobState::Unknown;
+        job_summary.execution_status = "resolved_externally".to_string();
+    }
 
     let acceptance_proof = match verified_acceptance {
         Some(vjob) => WorkspaceAcceptanceProof {
@@ -743,10 +815,746 @@ fn project_coworker_job_history_internal(
         historical_failure,
         current_attention,
         acceptance_proof,
+        external_resolutions,
         truncation: WorkspaceJobHistoryTruncation::default(),
     };
 
     Ok(raw_history.normalized())
+}
+
+fn attention_is_externally_coverable(attention: &WorkspaceAttentionState) -> bool {
+    !matches!(
+        attention.kind,
+        WorkspaceAttentionKind::None
+            | WorkspaceAttentionKind::Unknown
+            | WorkspaceAttentionKind::UnresolvedEffect
+    )
+}
+
+fn collect_covered_attention_ids(
+    attention: &WorkspaceAttentionState,
+    covered_hold_ids: &mut BTreeSet<String>,
+    covered_outbox_ids: &mut BTreeSet<String>,
+) {
+    covered_hold_ids.extend(attention.blocking_hold_ids.iter().cloned());
+    covered_outbox_ids.extend(attention.blocking_outbox_ids.iter().cloned());
+}
+
+fn apply_external_resolution_coverage(
+    job: &CoworkerJobRecord,
+    runtime: Option<&ControllerJobRuntimeState>,
+    verified_obsolete_planning: Option<&VerifiedObsoletePlanningSupersession>,
+    verified_current_published_plan: Option<&VerifiedCurrentPublishedPlanMetadata>,
+    projected_tasks: &mut [WorkspaceTaskHistory],
+    current_attention: &mut Option<WorkspaceAttentionState>,
+    verified: Option<&VerifiedExternalResolutionHistory>,
+) -> (Vec<WorkspaceExternalResolution>, bool) {
+    let Some(verified) = verified else {
+        return (Vec::new(), false);
+    };
+    if verified.resolutions.is_empty() {
+        return (Vec::new(), false);
+    }
+
+    let mut resolutions = verified.resolutions.clone();
+    let mut any_full_job = false;
+    let mut full_job_attention_covered = false;
+    let mut covered_task_ids = BTreeSet::new();
+    let mut covered_hold_ids = BTreeSet::new();
+    let mut covered_outbox_ids = BTreeSet::new();
+
+    for resolution in &mut resolutions {
+        if !resolution.applicability.is_applicable() {
+            continue;
+        }
+        let mut covered_rows = Vec::new();
+        match resolution.scope {
+            WorkspaceExternalResolutionScope::Job => {
+                any_full_job = true;
+                if let Some(attention) = current_attention
+                    .as_ref()
+                    .filter(|attention| attention_is_externally_coverable(attention))
+                {
+                    covered_rows.push(WorkspaceCoveredAttention {
+                        task_id: None,
+                        attention: attention.clone(),
+                    });
+                    collect_covered_attention_ids(
+                        attention,
+                        &mut covered_hold_ids,
+                        &mut covered_outbox_ids,
+                    );
+                    full_job_attention_covered = true;
+                }
+                for task in projected_tasks.iter() {
+                    let Some(attention) = task
+                        .current_attention
+                        .as_ref()
+                        .filter(|attention| attention_is_externally_coverable(attention))
+                    else {
+                        continue;
+                    };
+                    covered_task_ids.insert(task.task_id.clone());
+                    collect_covered_attention_ids(
+                        attention,
+                        &mut covered_hold_ids,
+                        &mut covered_outbox_ids,
+                    );
+                    covered_rows.push(WorkspaceCoveredAttention {
+                        task_id: Some(task.task_id.clone()),
+                        attention: attention.clone(),
+                    });
+                }
+            }
+            WorkspaceExternalResolutionScope::Tasks => {
+                for task_id in &resolution.task_ids {
+                    let Some(task) = projected_tasks
+                        .iter()
+                        .find(|task| &task.task_id == task_id)
+                    else {
+                        continue;
+                    };
+                    let Some(attention) = task
+                        .current_attention
+                        .as_ref()
+                        .filter(|attention| attention_is_externally_coverable(attention))
+                    else {
+                        continue;
+                    };
+                    covered_task_ids.insert(task.task_id.clone());
+                    collect_covered_attention_ids(
+                        attention,
+                        &mut covered_hold_ids,
+                        &mut covered_outbox_ids,
+                    );
+                    covered_rows.push(WorkspaceCoveredAttention {
+                        task_id: Some(task.task_id.clone()),
+                        attention: attention.clone(),
+                    });
+                }
+            }
+            WorkspaceExternalResolutionScope::Unknown => {}
+        }
+        resolution.covered_attention = covered_rows;
+    }
+
+    if any_full_job && full_job_attention_covered {
+        *current_attention = None;
+    }
+    for task in projected_tasks.iter_mut() {
+        if covered_task_ids.contains(&task.task_id)
+            && task
+                .current_attention
+                .as_ref()
+                .is_some_and(attention_is_externally_coverable)
+        {
+            task.current_attention = None;
+        }
+    }
+
+    if any_full_job && full_job_attention_covered {
+        // The full receipt already covered all explicit job-level attention. Re-derive only from
+        // remaining unresolved/unknown blockers instead of resurrecting a phase-level need.
+        let mut residual = Vec::new();
+        for task in projected_tasks.iter() {
+            if let Some(attention) = task.current_attention.as_ref() {
+                residual.push(attention.clone());
+            }
+        }
+        if let Some(first) = residual.first() {
+            *current_attention = Some(first.clone());
+        }
+    } else {
+        let (filtered_job, filtered_runtime) = filter_job_for_covered_task_attention(
+            job,
+            runtime,
+            &covered_task_ids,
+            &covered_hold_ids,
+            &covered_outbox_ids,
+        );
+        *current_attention = derive_job_current_attention(
+            &filtered_job,
+            filtered_runtime.as_ref(),
+            projected_tasks,
+            verified_obsolete_planning,
+            verified_current_published_plan,
+        );
+    }
+
+    let all_attention_clear = current_attention.is_none()
+        && projected_tasks
+            .iter()
+            .all(|task| task.current_attention.is_none());
+    (resolutions, any_full_job && all_attention_clear)
+}
+
+fn filter_job_for_covered_task_attention(
+    job: &CoworkerJobRecord,
+    runtime: Option<&ControllerJobRuntimeState>,
+    covered_task_ids: &BTreeSet<String>,
+    covered_hold_ids: &BTreeSet<String>,
+    covered_outbox_ids: &BTreeSet<String>,
+) -> (CoworkerJobRecord, Option<ControllerJobRuntimeState>) {
+    let mut filtered = job.clone();
+    filtered.holds.retain(|hold| {
+        if !covered_hold_ids.contains(&hold.hold_id) {
+            return true;
+        }
+        hold.holds_entire_job
+            || hold
+                .directly_affected_task_ids
+                .iter()
+                .any(|task_id| !covered_task_ids.contains(task_id))
+    });
+    for task in &mut filtered.tasks {
+        if !covered_task_ids.contains(&task.task_id) {
+            continue;
+        }
+        task.active_hold_ids
+            .retain(|hold_id| !covered_hold_ids.contains(hold_id));
+        if task
+            .unresolved_outbox_id
+            .as_ref()
+            .is_some_and(|outbox_id| covered_outbox_ids.contains(outbox_id))
+        {
+            task.unresolved_outbox_id = None;
+        }
+    }
+    filtered.outbox.retain(|outbox| {
+        !outbox
+            .task_id
+            .as_ref()
+            .is_some_and(|task_id| covered_task_ids.contains(task_id))
+    });
+    let filtered_runtime = runtime.map(|runtime| {
+        let mut filtered_runtime = runtime.clone();
+        filtered_runtime.pending_effects.retain(|effect_id, effect| {
+            !covered_outbox_ids.contains(effect_id)
+                && !effect
+                    .task_id
+                    .as_ref()
+                    .is_some_and(|task_id| covered_task_ids.contains(task_id))
+        });
+        filtered_runtime
+    });
+    (filtered, filtered_runtime)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_scoped_external_resolutions_readonly(
+    chat_identity: &WorkspaceChatIdentity,
+    job: &CoworkerJobRecord,
+    runtime: Option<&ControllerJobRuntimeState>,
+    verified_ledger: &CoworkerBindingLedger,
+    plan_snapshot: &ReadOnlyPlanSnapshot,
+    approval_records: &[ApprovalRecord],
+    plan_revisions: &[PlanRevision],
+    authority_records_by_id: Option<&BTreeMap<String, ApprovalRecord>>,
+    authority_store_configured: bool,
+    policy_store: Option<&ControllerPolicyStore>,
+    stores: &WorkspaceHistoryStores<'_>,
+    verified_sessions_root: Option<&Path>,
+    diagnostics: &mut Vec<WorkspaceHistoryDiagnostic>,
+) -> VerifiedExternalResolutionHistory {
+    let mut resolutions = Vec::new();
+    for receipt in verified_ledger.external_resolutions.iter() {
+        let ExternalResolutionTarget::Job { job_id } = &receipt.target else {
+            // Legacy-plan receipts cannot be attached to a Coworker job history without inventing
+            // a job identity. Their stored history remains untouched in the binding ledger.
+            continue;
+        };
+        if job_id != &job.job_id {
+            continue;
+        }
+
+        let mut projected = project_external_resolution_receipt(receipt);
+        let (applicability, verification_error) = classify_external_resolution_applicability_readonly(
+            chat_identity,
+            job,
+            runtime,
+            receipt,
+            verified_ledger,
+            plan_snapshot,
+            approval_records,
+            plan_revisions,
+            authority_records_by_id,
+            authority_store_configured,
+            policy_store,
+            stores,
+            verified_sessions_root,
+        );
+        projected.applicability = applicability;
+        if let Some(message) = verification_error {
+            diagnostics.push(WorkspaceHistoryDiagnostic::new(
+                WorkspaceHistoryDiagnosticKind::ExternalResolutionVerificationFailed,
+                Some(&job.job_id),
+                message,
+            ));
+        }
+        resolutions.push(projected);
+    }
+    VerifiedExternalResolutionHistory { resolutions }
+}
+
+fn project_external_resolution_receipt(
+    receipt: &ExternalResolutionReceipt,
+) -> WorkspaceExternalResolution {
+    let scope = match &receipt.scope {
+        ExternalResolutionScope::FullJob => WorkspaceExternalResolutionScope::Job,
+        ExternalResolutionScope::Tasks { .. } => WorkspaceExternalResolutionScope::Tasks,
+    };
+    let evidence_refs = receipt
+        .evidence_refs
+        .iter()
+        .map(|evidence| match evidence {
+            crate::external_resolution::ExternalResolutionEvidenceRef::CommitSha { commit_sha } => {
+                commit_sha.clone()
+            }
+            crate::external_resolution::ExternalResolutionEvidenceRef::ArtifactRef {
+                reference,
+            } => reference.clone(),
+            crate::external_resolution::ExternalResolutionEvidenceRef::ProviderText { text } => {
+                text.clone()
+            }
+            crate::external_resolution::ExternalResolutionEvidenceRef::JsonSelfAttestation {
+                claim,
+            } => claim.clone(),
+        })
+        .collect();
+    WorkspaceExternalResolution {
+        receipt_id: receipt.receipt_id.clone(),
+        request_key: Some(receipt.request_key.clone()),
+        preview_digest: Some(receipt.preview_digest.clone()),
+        outcome: WorkspaceExternalResolutionOutcome::ResolvedExternally,
+        scope,
+        task_ids: receipt.resolved_task_ids.clone(),
+        applicability: WorkspaceExternalResolutionApplicability::Unverified,
+        summary: receipt.explanation.clone(),
+        evidence_refs,
+        recorded_at_ms: i64::try_from(receipt.created_at_ms)
+            .ok()
+            .filter(|value| *value > 0),
+        covered_attention: Vec::new(),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn classify_external_resolution_applicability_readonly(
+    chat_identity: &WorkspaceChatIdentity,
+    job: &CoworkerJobRecord,
+    runtime: Option<&ControllerJobRuntimeState>,
+    receipt: &ExternalResolutionReceipt,
+    ledger: &CoworkerBindingLedger,
+    plan_snapshot: &ReadOnlyPlanSnapshot,
+    approval_records: &[ApprovalRecord],
+    plan_revisions: &[PlanRevision],
+    authority_records_by_id: Option<&BTreeMap<String, ApprovalRecord>>,
+    authority_store_configured: bool,
+    policy_store: Option<&ControllerPolicyStore>,
+    stores: &WorkspaceHistoryStores<'_>,
+    verified_sessions_root: Option<&Path>,
+) -> (
+    WorkspaceExternalResolutionApplicability,
+    Option<&'static str>,
+) {
+    if let Err(message) = verify_receipt_identity_and_project(receipt, chat_identity, job) {
+        return (
+            WorkspaceExternalResolutionApplicability::Unverified,
+            Some(message),
+        );
+    }
+    let Some(source_job_revision) = receipt.source_job_revision else {
+        return (
+            WorkspaceExternalResolutionApplicability::Unverified,
+            Some("External resolution receipt for a job is missing source_job_revision."),
+        );
+    };
+    if source_job_revision > job.job_revision {
+        return (
+            WorkspaceExternalResolutionApplicability::Unverified,
+            Some("External resolution receipt source_job_revision is ahead of the current job."),
+        );
+    }
+
+    if source_job_revision == job.job_revision {
+        if let Err(message) = verify_exact_current_job_receipt_links(
+            receipt,
+            job,
+            plan_snapshot,
+            authority_records_by_id,
+            authority_store_configured,
+        ) {
+            return (
+                WorkspaceExternalResolutionApplicability::Unverified,
+                Some(message),
+            );
+        }
+    }
+
+    if let Some(policy_store) = policy_store {
+        match policy_store.get_binding_ledger_revision_readonly(&job.binding_id) {
+            Ok(current_controller_revision)
+                if current_controller_revision < receipt.source_controller_ledger_revision =>
+            {
+                return (
+                    WorkspaceExternalResolutionApplicability::Unverified,
+                    Some(
+                        "External resolution receipt controller ledger revision is ahead of current controller state.",
+                    ),
+                );
+            }
+            Ok(_) => {}
+            Err(_) => {
+                return (
+                    WorkspaceExternalResolutionApplicability::Unverified,
+                    Some(
+                        "Controller ledger revision could not be verified for external resolution applicability.",
+                    ),
+                );
+            }
+        }
+    } else if receipt.source_controller_ledger_revision > 0 {
+        return (
+            WorkspaceExternalResolutionApplicability::Unverified,
+            Some(
+                "Controller ledger evidence is missing for external resolution applicability.",
+            ),
+        );
+    }
+
+    let applicability = match evaluate_receipt_applicability(
+        receipt,
+        ledger,
+        approval_records,
+        plan_revisions,
+        runtime,
+        stores.plans_dir,
+    ) {
+        Ok(ExternalResolutionApplicability::Stale { .. }) => {
+            return (
+                WorkspaceExternalResolutionApplicability::Stale,
+                None,
+            );
+        }
+        Ok(ExternalResolutionApplicability::Applicable) => {
+            WorkspaceExternalResolutionApplicability::Applicable
+        }
+        Err(_) => {
+            return (
+                WorkspaceExternalResolutionApplicability::Unverified,
+                Some("External resolution applicability evaluation failed read-only validation."),
+            );
+        }
+    };
+
+    if !verify_current_runtime_evidence(job, runtime, receipt) {
+        return (
+            WorkspaceExternalResolutionApplicability::Unverified,
+            Some("Current controller runtime evidence does not match the external resolution receipt."),
+        );
+    }
+    if !verify_no_active_job_owner_readonly(stores.plans_dir, chat_identity, job) {
+        return (
+            WorkspaceExternalResolutionApplicability::Unverified,
+            Some("Current job ownership evidence does not permit external resolution applicability."),
+        );
+    }
+    if receipt.approval_id.is_some() {
+        let Some(approval) = receipt.approval_id.as_deref().and_then(|approval_id| {
+            authority_records_by_id.and_then(|records| records.get(approval_id))
+        }) else {
+            return (
+                WorkspaceExternalResolutionApplicability::Unverified,
+                Some("Bound approval evidence is missing for external resolution applicability."),
+            );
+        };
+        if !verify_receipt_host_quiescent_readonly(
+            stores.sessions_dir,
+            verified_sessions_root,
+            approval,
+        ) {
+            return (
+                WorkspaceExternalResolutionApplicability::Unverified,
+                Some("Current host session evidence is missing or not quiescent."),
+            );
+        }
+    }
+
+    (applicability, None)
+}
+
+fn verify_receipt_identity_and_project(
+    receipt: &ExternalResolutionReceipt,
+    chat_identity: &WorkspaceChatIdentity,
+    job: &CoworkerJobRecord,
+) -> Result<(), &'static str> {
+    receipt
+        .validate_integrity()
+        .map_err(|_| "External resolution receipt failed immutable digest verification.")?;
+    if receipt.binding_id != chat_identity.binding_id
+        || receipt.thread_uuid != chat_identity.thread_uuid
+        || job.binding_id != chat_identity.binding_id
+        || job.thread_uuid != chat_identity.thread_uuid
+    {
+        return Err("External resolution receipt binding or thread scope does not match the job.");
+    }
+    let ExternalResolutionTarget::Job { job_id } = &receipt.target else {
+        return Err("External resolution receipt does not target a Coworker job.");
+    };
+    if job_id != &job.job_id {
+        return Err("External resolution receipt targets a different Coworker job.");
+    }
+    let chat_project = Path::new(&chat_identity.canonical_project_scope);
+    let job_project = Path::new(&job.work_brief.project_base.repository_path);
+    if receipt.project.canonical_repo_root.as_path() != chat_project
+        || receipt.project.canonical_repo_root.as_path() != job_project
+        || receipt.project.base_commit != job.work_brief.project_base.base_commit
+        || receipt.project.base_tree_sha.as_deref()
+            != Some(job.work_brief.project_base.base_tree_sha.as_str())
+    {
+        return Err(
+            "External resolution receipt canonical project/base does not match the job and chat scope.",
+        );
+    }
+    Ok(())
+}
+
+fn verify_exact_current_job_receipt_links(
+    receipt: &ExternalResolutionReceipt,
+    job: &CoworkerJobRecord,
+    plan_snapshot: &ReadOnlyPlanSnapshot,
+    authority_records_by_id: Option<&BTreeMap<String, ApprovalRecord>>,
+    authority_store_configured: bool,
+) -> Result<(), &'static str> {
+    let recomputed_brief_digest = job
+        .work_brief
+        .digest()
+        .map_err(|_| "Current job work brief digest could not be recomputed.")?;
+    if recomputed_brief_digest != job.work_brief_digest
+        || receipt.work_brief_digest.as_deref() != Some(job.work_brief_digest.as_str())
+    {
+        return Err("External resolution work brief digest does not match the current job.");
+    }
+
+    let mut current_task_ids: Vec<String> =
+        job.tasks.iter().map(|task| task.task_id.clone()).collect();
+    current_task_ids.sort();
+    match &receipt.scope {
+        ExternalResolutionScope::FullJob => {
+            if receipt.resolved_task_ids != current_task_ids {
+                return Err(
+                    "Full-job external resolution receipt does not cover the exact current task set.",
+                );
+            }
+        }
+        ExternalResolutionScope::Tasks { task_ids } => {
+            if task_ids != &receipt.resolved_task_ids
+                || task_ids
+                    .iter()
+                    .any(|task_id| !current_task_ids.contains(task_id))
+            {
+                return Err(
+                    "Task-scoped external resolution receipt references a task absent from the current job.",
+                );
+            }
+        }
+    }
+
+    match (&receipt.plan_id, receipt.plan_revision) {
+        (Some(plan_id), Some(plan_revision)) => {
+            if !plan_snapshot.loaded {
+                return Err("Plan evidence is missing for external resolution applicability.");
+            }
+            let plan = plan_snapshot
+                .revisions_by_key
+                .get(&(plan_id.clone(), plan_revision))
+                .ok_or("External resolution plan revision is missing from the current PlanStore.")?;
+            if plan.binding_id != receipt.binding_id {
+                return Err("External resolution plan revision belongs to a different binding.");
+            }
+            let mut linked = false;
+            if let Some(planning_result) = job.planning_result.as_ref() {
+                linked = true;
+                if &planning_result.plan_id != plan_id
+                    || planning_result.plan_revision != plan_revision
+                    || receipt.plan_digest.as_deref()
+                        != Some(planning_result.plan_digest.as_str())
+                {
+                    return Err(
+                        "External resolution plan link drifted from the job planning result.",
+                    );
+                }
+            }
+            if let Some(approval_linkage) = job.approval_linkage.as_ref() {
+                linked = true;
+                if &approval_linkage.plan_id != plan_id
+                    || approval_linkage.plan_revision != plan_revision
+                    || receipt.plan_digest.as_deref()
+                        != Some(approval_linkage.plan_digest.as_str())
+                {
+                    return Err(
+                        "External resolution plan link drifted from the job approval linkage.",
+                    );
+                }
+            }
+            if !linked {
+                return Err("External resolution plan link has no job planning/approval owner.");
+            }
+        }
+        (None, None) => {
+            if job.planning_result.is_some() || job.approval_linkage.is_some() {
+                return Err(
+                    "External resolution receipt omits plan links recorded on the current job.",
+                );
+            }
+        }
+        _ => {
+            return Err("External resolution receipt has incomplete plan/revision linkage.");
+        }
+    }
+
+    match (&receipt.approval_id, &receipt.approval_subject_digest) {
+        (Some(approval_id), Some(subject_digest)) => {
+            if !authority_store_configured {
+                return Err(
+                    "Authority evidence is missing for external resolution applicability.",
+                );
+            }
+            let approval = authority_records_by_id
+                .and_then(|records| records.get(approval_id))
+                .ok_or("External resolution approval is missing from the current authority store.")?;
+            if approval.binding_id != receipt.binding_id
+                || approval.thread_uuid != receipt.thread_uuid
+                || approval.repository_path != receipt.project.canonical_repo_root
+                || approval.base_commit != receipt.project.base_commit
+                || approval.subject_digest != *subject_digest
+                || receipt.plan_digest.as_deref() != Some(approval.plan_digest.as_str())
+            {
+                return Err(
+                    "External resolution approval linkage does not match immutable receipt scope.",
+                );
+            }
+            let Some(linkage) = job.approval_linkage.as_ref() else {
+                return Err("External resolution approval has no current job approval linkage.");
+            };
+            if &linkage.approval_id != approval_id
+                || linkage.approval_subject_digest != *subject_digest
+            {
+                return Err("External resolution approval drifted from the current job linkage.");
+            }
+            if linkage.verify_matches_approval(approval).is_err() {
+                return Err(
+                    "External resolution approval failed independent linkage verification.",
+                );
+            }
+            if let Some(ref plan_id) = receipt.plan_id {
+                if &approval.plan_id != plan_id || receipt.plan_revision != Some(approval.plan_revision)
+                {
+                    return Err("External resolution approval plan/revision link drifted.");
+                }
+            }
+            if receipt
+                .resolved_task_ids
+                .iter()
+                .any(|task_id| !approval.approved_task_ids.contains(task_id))
+            {
+                return Err(
+                    "External resolution task scope is not contained in the approved task set.",
+                );
+            }
+        }
+        (None, None) => {
+            if job.approval_linkage.is_some() {
+                return Err(
+                    "External resolution receipt omits approval linkage recorded on the current job.",
+                );
+            }
+        }
+        _ => {
+            return Err(
+                "External resolution receipt has incomplete approval/subject digest linkage.",
+            );
+        }
+    }
+    Ok(())
+}
+
+fn verify_current_runtime_evidence(
+    job: &CoworkerJobRecord,
+    runtime: Option<&ControllerJobRuntimeState>,
+    receipt: &ExternalResolutionReceipt,
+) -> bool {
+    match (receipt.source_runtime_revision, runtime) {
+        (None, None) => !job_expects_controller_runtime(job),
+        (Some(expected_revision), Some(runtime)) => {
+            runtime.runtime_revision == expected_revision
+                && receipt.envelope_digest.as_deref()
+                    == Some(runtime.envelope.envelope_digest.as_str())
+                && runtime.envelope.verify_matches_job(job).is_ok()
+        }
+        _ => false,
+    }
+}
+
+fn verify_no_active_job_owner_readonly(
+    plans_dir: &Path,
+    chat_identity: &WorkspaceChatIdentity,
+    job: &CoworkerJobRecord,
+) -> bool {
+    let ownership_dir = coworker_driver_dir(plans_dir);
+    match fs::symlink_metadata(&ownership_dir) {
+        Err(err) if err.kind() == ErrorKind::NotFound => return true,
+        Err(_) => return false,
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => return false,
+        Ok(_) => {}
+    }
+    let Ok(store) = CoworkerJobOwnershipStore::new(&ownership_dir) else {
+        return false;
+    };
+    let Ok(key) = CoworkerJobOwnershipKey::new(
+        chat_identity.binding_id.as_str(),
+        chat_identity.thread_uuid.as_str(),
+        job.job_id.as_str(),
+    ) else {
+        return false;
+    };
+    match store.inspect_job_lock(&key) {
+        Ok(CoworkerJobLockState::Absent | CoworkerJobLockState::UnlockedStaleFile { .. }) => true,
+        Ok(CoworkerJobLockState::HeldByActiveProcess { .. }) | Err(_) => false,
+    }
+}
+
+fn verify_receipt_host_quiescent_readonly(
+    sessions_dir: Option<&Path>,
+    verified_sessions_root: Option<&Path>,
+    approval: &ApprovalRecord,
+) -> bool {
+    if sessions_dir.is_none() {
+        return false;
+    }
+    let Some(sessions_root) = verified_sessions_root else {
+        return false;
+    };
+    match read_host_launch_intent_optional(sessions_root, approval) {
+        Ok(None) => {}
+        Ok(Some(intent)) if intent.status == HostLaunchIntentStatus::ReconciledReady => {}
+        Ok(Some(_)) | Err(_) => return false,
+    }
+    let session_dir = sessions_root.join(&approval.approval_id);
+    match fs::symlink_metadata(&session_dir) {
+        Err(err) if err.kind() == ErrorKind::NotFound => true,
+        Err(_) => false,
+        Ok(_) => {
+            let Ok(session_dir) = verify_existing_session_dir(sessions_root, &approval.approval_id)
+            else {
+                return false;
+            };
+            matches!(
+                read_host_manifest_optional(&session_dir, approval),
+                Ok(Some(manifest)) if manifest.phase == HostPhase::Stopped
+            )
+        }
+    }
 }
 
 fn validate_chat_identity_and_canonical_repo_on_disk(

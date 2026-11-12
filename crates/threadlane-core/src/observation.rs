@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -3254,6 +3255,9 @@ pub const MAX_WORKSPACE_COMBINED_CANDIDATES_PER_JOB: usize = 32;
 /// Maximum correlated link identifiers retained per list inside [`WorkspaceRecordLinks`] (`64`).
 pub const MAX_WORKSPACE_RECORD_LINKS_PER_LIST: usize = 64;
 
+/// Maximum store-verified external resolution receipts retained per job history (`64`).
+pub const MAX_WORKSPACE_EXTERNAL_RESOLUTIONS_PER_JOB: usize = 64;
+
 /// Initial native observation sampling interval in milliseconds (`2,000 ms` / `2 s`).
 pub const WORKSPACE_SAMPLING_INTERVAL_MS: u64 = 2_000;
 
@@ -5374,6 +5378,234 @@ impl WorkspaceJobSummary {
     }
 }
 
+/// Logical outcome recorded by a store-verified external resolution receipt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceExternalResolutionOutcome {
+    /// Work was explicitly resolved outside the normal Threadlane workflow.
+    ResolvedExternally,
+    /// Unrecognized future outcome token; normalized receipts are rejected.
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
+/// Explicit coverage scope of a store-verified external resolution receipt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceExternalResolutionScope {
+    /// The receipt covers the entire current job.
+    Job,
+    /// The receipt covers only the explicitly listed task identifiers.
+    Tasks,
+    /// Unrecognized future scope token; normalized receipts are rejected.
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
+/// Read-time applicability of a preserved external resolution receipt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceExternalResolutionApplicability {
+    /// The receipt still matches the exact current target scope and evidence.
+    Applicable,
+    /// The receipt is preserved as history but no longer matches the current target revision,
+    /// runtime, plan, approval, or conversational-change evidence.
+    Stale,
+    /// Applicability could not be independently verified from the available read-only evidence.
+    #[default]
+    Unverified,
+    /// Unrecognized future applicability token; normalized as unverified.
+    #[serde(other)]
+    Unknown,
+}
+
+impl WorkspaceExternalResolutionApplicability {
+    /// Returns `true` only for [`Self::Applicable`].
+    #[must_use]
+    pub const fn is_applicable(self) -> bool {
+        matches!(self, Self::Applicable)
+    }
+}
+
+/// Attention row closed by an applicable external resolution receipt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct WorkspaceCoveredAttention {
+    /// Task owning the closed attention row, or `None` for explicit job-level attention.
+    #[serde(default)]
+    pub task_id: Option<String>,
+    /// Preserved attention details that were covered by the receipt.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub attention: WorkspaceAttentionState,
+}
+
+/// Store-verified external resolution receipt projected into a [`WorkspaceJobHistory`].
+///
+/// Applicability is a logical read-time attestation derived from the private binding ledger and
+/// independent workflow, plan, authority, controller-runtime, ownership, host, and conversational
+/// change evidence. It is not a durability/fsync witness and never grants execution authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct WorkspaceExternalResolution {
+    /// Immutable receipt identifier (`exr_<32hex>`).
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub receipt_id: String,
+    /// Immutable caller-supplied idempotency key when valid.
+    #[serde(default)]
+    pub request_key: Option<String>,
+    /// Operator-confirmed preview digest when valid.
+    #[serde(default)]
+    pub preview_digest: Option<String>,
+    /// Logical outcome; only `resolved_externally` is accepted.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub outcome: WorkspaceExternalResolutionOutcome,
+    /// Explicit full-job or task-subset coverage.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub scope: WorkspaceExternalResolutionScope,
+    /// Sorted concrete task identifiers declared by the receipt.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub task_ids: Vec<String>,
+    /// Read-time applicability classified by the store-backed reader.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub applicability: WorkspaceExternalResolutionApplicability,
+    /// Sanitized operator explanation (`<= 240` chars).
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub summary: String,
+    /// Bounded informational evidence references.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub evidence_refs: Vec<String>,
+    /// Receipt creation timestamp in milliseconds since Unix epoch.
+    #[serde(default)]
+    pub recorded_at_ms: Option<i64>,
+    /// Exact current attention rows closed by this applicable receipt.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub covered_attention: Vec<WorkspaceCoveredAttention>,
+}
+
+impl WorkspaceExternalResolution {
+    fn normalized(&self) -> Option<Self> {
+        let receipt_id = validate_correlation_id(&self.receipt_id)?;
+        if self.outcome != WorkspaceExternalResolutionOutcome::ResolvedExternally
+            || self.scope == WorkspaceExternalResolutionScope::Unknown
+        {
+            return None;
+        }
+        let task_ids = clean_deduplicated_id_list(&self.task_ids, MAX_WORKSPACE_TASKS_PER_JOB);
+        let mut applicability = match self.applicability {
+            WorkspaceExternalResolutionApplicability::Unknown => {
+                WorkspaceExternalResolutionApplicability::Unverified
+            }
+            other => other,
+        };
+        if self.scope == WorkspaceExternalResolutionScope::Tasks
+            && task_ids.is_empty()
+            && applicability == WorkspaceExternalResolutionApplicability::Applicable
+        {
+            applicability = WorkspaceExternalResolutionApplicability::Unverified;
+        }
+        let declared_tasks: BTreeSet<&str> = task_ids.iter().map(String::as_str).collect();
+        let covered_attention_all: Vec<WorkspaceCoveredAttention> = self
+            .covered_attention
+            .iter()
+            .filter_map(|covered| {
+                let attention = covered.attention.normalized();
+                match covered.task_id.as_deref() {
+                    None => Some(WorkspaceCoveredAttention {
+                        task_id: None,
+                        attention,
+                    }),
+                    Some(raw_task_id) => {
+                        let task_id = validate_correlation_id(raw_task_id)?;
+                        if !declared_tasks.contains(task_id.as_str()) {
+                            return None;
+                        }
+                        Some(WorkspaceCoveredAttention {
+                            task_id: Some(task_id),
+                            attention,
+                        })
+                    }
+                }
+            })
+            .collect();
+        let (covered_attention, _) = cap_tail(
+            covered_attention_all,
+            MAX_WORKSPACE_RECORD_LINKS_PER_LIST,
+        );
+
+        Some(Self {
+            receipt_id,
+            request_key: clean_opt_id(self.request_key.as_deref()),
+            preview_digest: clean_opt_id(self.preview_digest.as_deref()),
+            outcome: WorkspaceExternalResolutionOutcome::ResolvedExternally,
+            scope: self.scope,
+            task_ids,
+            applicability,
+            summary: sanitize_workspace_summary(&self.summary),
+            evidence_refs: clean_deduplicated_id_list(
+                &self.evidence_refs,
+                MAX_WORKSPACE_RECORD_LINKS_PER_LIST,
+            ),
+            recorded_at_ms: self.recorded_at_ms.filter(|&v| v > 0),
+            covered_attention,
+        })
+    }
+}
+
+fn clean_deduplicated_id_list(items: &[String], max_items: usize) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    let mut out = Vec::new();
+    for item in items {
+        if out.len() >= max_items {
+            break;
+        }
+        let Some(clean) = validate_correlation_id(item) else {
+            continue;
+        };
+        if seen.insert(clean.clone()) {
+            out.push(clean);
+        }
+    }
+    out
+}
+
+fn normalize_external_resolutions_with_omissions(
+    items: &[WorkspaceExternalResolution],
+) -> (Vec<WorkspaceExternalResolution>, usize) {
+    let mut invalid_count = 0usize;
+    let parsed: Vec<WorkspaceExternalResolution> = items
+        .iter()
+        .filter_map(|item| {
+            let normalized = item.normalized();
+            if normalized.is_none() {
+                invalid_count += 1;
+            }
+            normalized
+        })
+        .collect();
+
+    let mut seen_receipts = BTreeSet::new();
+    let mut deduplicated_rev = Vec::with_capacity(parsed.len());
+    for item in parsed.iter().rev() {
+        if seen_receipts.insert(item.receipt_id.clone()) {
+            deduplicated_rev.push(item.clone());
+        }
+    }
+    deduplicated_rev.reverse();
+    let duplicate_count = parsed.len().saturating_sub(deduplicated_rev.len());
+    let (retained, cap_omitted) =
+        cap_tail(deduplicated_rev, MAX_WORKSPACE_EXTERNAL_RESOLUTIONS_PER_JOB);
+    (
+        retained,
+        invalid_count
+            .saturating_add(duplicate_count)
+            .saturating_add(cap_omitted),
+    )
+}
+
+fn is_zero_usize(value: &usize) -> bool {
+    *value == 0
+}
+
 /// Explicit per-collection omission accounting when [`WorkspaceJobHistory`] hits ledger bounds.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct WorkspaceJobHistoryTruncation {
@@ -5395,12 +5627,21 @@ pub struct WorkspaceJobHistoryTruncation {
     /// Combined candidates omitted beyond [`MAX_WORKSPACE_COMBINED_CANDIDATES_PER_JOB`] (`32`).
     #[serde(default, deserialize_with = "deserialize_null_default")]
     pub combined_candidates_omitted: usize,
+    /// External resolution receipts omitted because they were invalid, duplicate, or beyond
+    /// [`MAX_WORKSPACE_EXTERNAL_RESOLUTIONS_PER_JOB`] (`64`). Omitted when zero for wire
+    /// compatibility with older snapshots.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_null_default",
+        skip_serializing_if = "is_zero_usize"
+    )]
+    pub external_resolutions_omitted: usize,
 }
 
 /// Complete bounded job history projection (`<= 64` jobs/binding, `<= 500` total) with separated
 /// `job`, `tasks` (`current_attempt_no`, `attempts`, `candidates`), `runs`, `outbox`,
-/// `combined_candidates`, `result`, `links`, `historical_failure`, `current_attention`, and
-/// verified `acceptance_proof`.
+/// `combined_candidates`, `result`, `links`, `historical_failure`, `current_attention`,
+/// verified `acceptance_proof`, and store-verified `external_resolutions`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct WorkspaceJobHistory {
     /// Job header summary.
@@ -5433,6 +5674,14 @@ pub struct WorkspaceJobHistory {
     /// Verified job-level acceptance proof (requires `combined_candidate_id` + `closure_verdict_id`).
     #[serde(default, deserialize_with = "deserialize_null_default")]
     pub acceptance_proof: WorkspaceAcceptanceProof,
+    /// Store-verified external resolution receipts and their read-time applicability.
+    /// Omitted when empty so legacy snapshots retain their original wire shape.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_null_default",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub external_resolutions: Vec<WorkspaceExternalResolution>,
     /// Omission counts recorded when capping child collections.
     #[serde(default, deserialize_with = "deserialize_null_default")]
     pub truncation: WorkspaceJobHistoryTruncation,
@@ -5476,6 +5725,9 @@ impl WorkspaceJobHistory {
         let (combined_candidates, combined_omitted_extra) =
             cap_tail(all_combined, MAX_WORKSPACE_COMBINED_CANDIDATES_PER_JOB);
 
+        let (external_resolutions, external_resolutions_omitted_extra) =
+            normalize_external_resolutions_with_omissions(&self.external_resolutions);
+
         Self {
             job: self.job.normalized(),
             tasks,
@@ -5493,6 +5745,7 @@ impl WorkspaceJobHistory {
                 .as_ref()
                 .map(WorkspaceAttentionState::normalized),
             acceptance_proof: self.acceptance_proof.normalized_for_job(),
+            external_resolutions,
             truncation: WorkspaceJobHistoryTruncation {
                 tasks_omitted: self
                     .truncation
@@ -5518,6 +5771,10 @@ impl WorkspaceJobHistory {
                     .truncation
                     .combined_candidates_omitted
                     .saturating_add(combined_omitted_extra),
+                external_resolutions_omitted: self
+                    .truncation
+                    .external_resolutions_omitted
+                    .saturating_add(external_resolutions_omitted_extra),
             },
         }
     }

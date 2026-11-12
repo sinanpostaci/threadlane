@@ -128,7 +128,10 @@ Each native sample carries:
   - **Task `verified_accepted`** requires a valid `accepted_candidate_id` **and** at least one of `review_verdict_id` or `review_receipt_id`; otherwise `verified_accepted` degrades to `unknown`.
   - **Job `verified_accepted`** requires both a valid `combined_candidate_id` **and** an accepted `closure_verdict_id`; otherwise `verified_accepted` degrades to `unknown`.
   - Worker completion or verification checks alone never satisfy `verified_accepted`.
-- `truncation`: `WorkspaceJobHistoryTruncation` counting omitted tasks, attempts, task candidates, runs, outbox entries, and combined candidates.
+- `external_resolutions`: optional `WorkspaceExternalResolution[]` projected only from real private-ledger `external_resolution_receipts_v1` records (`receipt_id`, `request_key`, `preview_digest`, `outcome: 'resolved_externally'`, `scope: 'job' | 'tasks'`, `task_ids`, `applicability: 'applicable' | 'stale' | 'unverified'`, `summary`, `evidence_refs`, `recorded_at_ms`, `covered_attention`). The field defaults to an empty list and is omitted when empty for backward-compatible sparse/legacy payloads.
+- `truncation`: `WorkspaceJobHistoryTruncation` counting omitted tasks, attempts, task candidates, runs, outbox entries, combined candidates, and invalid/duplicate/overflow external resolution receipts in optional `external_resolutions_omitted` (omitted from JSON when zero).
+
+External resolution applicability is re-evaluated on every store-backed read from current job revision, controller runtime, plan, approval, conversational-change, job-ownership, and host evidence. It is a logical attestation, not a process-local durability/fsync witness. `applicable` full-job coverage may retire only the exact current coverable attention rows and task-scoped coverage only its declared tasks; `stale` and `unverified` history remains visible and never hides `unknown`, unresolved outbox/effect, unrelated task, or new native human-question blockers. A fully covered job may project the separate logical `execution_status: 'resolved_externally'` with `state: 'unknown'`, but never `completed` or `verified_accepted`, and stored phases, worker outcomes, real results, holds, envelopes, review/integration/Closure proof, and ACK state remain unchanged. Older readers that do not know the field simply see the prior history shape; no bidirectional mixed-version compatibility beyond that omission is claimed.
 
 ---
 
@@ -201,6 +204,7 @@ Existing observation bounds are preserved without increase, and new sidecar, `Me
 | `MAX_WORKSPACE_RUNS_PER_JOB` | `256` | Maximum projected `WorkspaceRunRecord` entries per job |
 | `MAX_WORKSPACE_OUTBOX_PER_JOB` | `256` | Maximum projected `WorkspaceOutboxRecord` entries per job |
 | `MAX_WORKSPACE_COMBINED_CANDIDATES_PER_JOB` | `32` | Maximum projected `WorkspaceCombinedCandidate` entries per job |
+| `MAX_WORKSPACE_EXTERNAL_RESOLUTIONS_PER_JOB` | `64` | Maximum projected `WorkspaceExternalResolution` receipts per job (invalid/duplicate/overflow rows counted in `external_resolutions_omitted`) |
 
 ---
 
@@ -211,4 +215,4 @@ Behavioral parity and failure/degradation invariants are verified across both la
 - `crates/threadlane-core/tests/workspace_observation_contract.rs`
 - `apps/desktop/src/workspace-contract.test.ts`
 
-Both test suites share an identical golden `WorkspaceSnapshot` JSON fixture and test legacy `ObservationSnapshot` / `ObservationActor` compatibility, sparse/future enum degradation to `unknown` / `unavailable`, four-part `WorkspaceChatIdentity` validation, `producer_epoch` + `ObservationProcessInstance` + monotonic `sequence` reconciliation, availability vs. activity separation, `selected_model` / `selected_effort` configuration evidence labeling, `2 s / 750 ms / 10 s` sampling and snapshot non-reset of sample age, receipt-backed task/job `acceptance_proof`, safe `Messages` source filtering, multi-byte UTF-8 / emoji boundaries, frontend surface/archive/tray contracts, and all numeric bounds.
+Both test suites share an identical golden `WorkspaceSnapshot` JSON fixture and test legacy `ObservationSnapshot` / `ObservationActor` compatibility, sparse/future enum degradation to `unknown` / `unavailable`, four-part `WorkspaceChatIdentity` validation, `producer_epoch` + `ObservationProcessInstance` + monotonic `sequence` reconciliation, availability vs. activity separation, `selected_model` / `selected_effort` configuration evidence labeling, `2 s / 750 ms / 10 s` sampling and snapshot non-reset of sample age, receipt-backed task/job `acceptance_proof`, store-verified external resolution history and omission accounting, safe `Messages` source filtering, multi-byte UTF-8 / emoji boundaries, frontend surface/archive/tray contracts, and all numeric bounds. Native history and Tauri fixture suites additionally exercise real `ExternalResolutionService` record receipts for full/partial coverage, mixed blockers, stale/unverified/forged/tampered evidence, and read-only no-write snapshots after recording.

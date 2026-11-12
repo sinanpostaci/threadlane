@@ -835,6 +835,7 @@ fn job_history_separates_records_links_failures_attention_and_acceptance_proof()
             // Missing closure_verdict_id!
             ..WorkspaceAcceptanceProof::unknown()
         },
+        external_resolutions: Vec::new(),
         truncation: WorkspaceJobHistoryTruncation::default(),
     };
 
@@ -1721,4 +1722,156 @@ fn legacy_observation_upgrade_keeps_unknown_completed_and_failed_out_of_attentio
         assert!(direct.job_histories[0].current_attention.is_none());
         assert!(direct.job_histories[0].historical_failure.is_none());
     }
+}
+
+#[test]
+fn external_resolution_history_is_backward_compatible_bounded_and_deduplicated() {
+    let base_job = WorkspaceJobSummary {
+        source_id: "default".to_string(),
+        job_id: "job_external_contract_01".to_string(),
+        binding_id: Some("bnd_chat_alpha".to_string()),
+        ..WorkspaceJobSummary::default()
+    };
+    let absent = WorkspaceJobHistory {
+        job: base_job.clone(),
+        ..WorkspaceJobHistory::default()
+    }
+    .normalized();
+    assert!(absent.external_resolutions.is_empty());
+    assert_eq!(absent.truncation.external_resolutions_omitted, 0);
+    let absent_json = serde_json::to_value(&absent).expect("serialize absent receipt field");
+    assert!(absent_json.get("external_resolutions").is_none());
+    assert!(absent_json["truncation"]
+        .get("external_resolutions_omitted")
+        .is_none());
+
+    let attention = WorkspaceAttentionState {
+        kind: WorkspaceAttentionKind::NeedsApproval,
+        reason: "Approval covered by an external receipt.".to_string(),
+        next_step: Some("No further approval is required.".to_string()),
+        blocking_hold_ids: vec!["hold_external_01".to_string()],
+        blocking_outbox_ids: vec!["outbox_external_01".to_string()],
+        question_id: Some("q_external_01".to_string()),
+        updated_at_ms: Some(1_000),
+    };
+    let valid = WorkspaceExternalResolution {
+        receipt_id: "rcpt_external_01".to_string(),
+        request_key: Some("req_external_01".to_string()),
+        preview_digest: Some("digest_external_01".to_string()),
+        outcome: WorkspaceExternalResolutionOutcome::ResolvedExternally,
+        scope: WorkspaceExternalResolutionScope::Job,
+        task_ids: vec!["task_external_01".to_string()],
+        applicability: WorkspaceExternalResolutionApplicability::Applicable,
+        summary: "Resolved externally by the operator.".to_string(),
+        evidence_refs: vec!["ev_external_01".to_string()],
+        recorded_at_ms: Some(1_000),
+        covered_attention: vec![WorkspaceCoveredAttention {
+            task_id: None,
+            attention: attention.clone(),
+        }],
+    };
+    let invalid = WorkspaceExternalResolution {
+        receipt_id: "bad receipt id".to_string(),
+        ..valid.clone()
+    };
+    let unknown_outcome = WorkspaceExternalResolution {
+        receipt_id: "rcpt_external_unknown_outcome".to_string(),
+        outcome: WorkspaceExternalResolutionOutcome::Unknown,
+        ..valid.clone()
+    };
+    let duplicate_newer = WorkspaceExternalResolution {
+        summary: "Newer receipt wins.".to_string(),
+        recorded_at_ms: Some(2_000),
+        covered_attention: vec![
+            WorkspaceCoveredAttention {
+                task_id: None,
+                attention: attention.clone(),
+            },
+            WorkspaceCoveredAttention {
+                task_id: Some("bad task id".to_string()),
+                attention: attention.clone(),
+            },
+            WorkspaceCoveredAttention {
+                task_id: Some("task_not_declared".to_string()),
+                attention: attention.clone(),
+            },
+        ],
+        evidence_refs: vec!["ev_external_01".to_string(), "bad ref!".to_string()],
+        ..valid.clone()
+    };
+    let empty_task_scope = WorkspaceExternalResolution {
+        receipt_id: "rcpt_external_empty_tasks".to_string(),
+        scope: WorkspaceExternalResolutionScope::Tasks,
+        task_ids: Vec::new(),
+        applicability: WorkspaceExternalResolutionApplicability::Applicable,
+        ..valid.clone()
+    };
+    let history = WorkspaceJobHistory {
+        job: base_job.clone(),
+        external_resolutions: vec![
+            invalid,
+            valid.clone(),
+            duplicate_newer,
+            unknown_outcome,
+            empty_task_scope,
+        ],
+        ..WorkspaceJobHistory::default()
+    }
+    .normalized();
+
+    assert_eq!(history.external_resolutions.len(), 2);
+    assert_eq!(history.external_resolutions[0].receipt_id, "rcpt_external_01");
+    assert_eq!(history.external_resolutions[0].summary, "Newer receipt wins.");
+    assert_eq!(
+        history.external_resolutions[0].covered_attention.len(),
+        1,
+        "invalid or undeclared task rows must not become job-level coverage"
+    );
+    assert_eq!(
+        history.external_resolutions[1].applicability,
+        WorkspaceExternalResolutionApplicability::Unverified
+    );
+    assert_eq!(
+        history.truncation.external_resolutions_omitted,
+        3,
+        "invalid outcome, invalid identity, and duplicate rows are counted"
+    );
+
+    let many: Vec<WorkspaceExternalResolution> = (0..MAX_WORKSPACE_EXTERNAL_RESOLUTIONS_PER_JOB + 3)
+        .map(|idx| WorkspaceExternalResolution {
+            receipt_id: format!("rcpt_external_{idx:03}"),
+            recorded_at_ms: Some(1_000 + idx as i64),
+            ..valid.clone()
+        })
+        .collect();
+    let bounded = WorkspaceJobHistory {
+        job: base_job,
+        external_resolutions: many,
+        ..WorkspaceJobHistory::default()
+    }
+    .normalized();
+    assert_eq!(
+        bounded.external_resolutions.len(),
+        MAX_WORKSPACE_EXTERNAL_RESOLUTIONS_PER_JOB
+    );
+    assert_eq!(
+        bounded.external_resolutions[0].receipt_id,
+        "rcpt_external_003"
+    );
+    assert_eq!(bounded.truncation.external_resolutions_omitted, 3);
+
+    let json = serde_json::to_value(&bounded).expect("serialize external resolution history");
+    assert_eq!(json["external_resolutions"][0]["outcome"], "resolved_externally");
+    assert_eq!(json["external_resolutions"][0]["scope"], "job");
+    assert_eq!(
+        json["external_resolutions"][0]["applicability"],
+        "applicable"
+    );
+    assert_eq!(
+        json["external_resolutions"][0]["covered_attention"][0]["task_id"],
+        serde_json::Value::Null
+    );
+    let reparsed: WorkspaceJobHistory =
+        serde_json::from_value(json).expect("reparse external resolution history");
+    assert_eq!(reparsed, bounded);
 }

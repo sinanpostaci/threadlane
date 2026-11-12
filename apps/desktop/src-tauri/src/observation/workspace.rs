@@ -13,8 +13,9 @@ use threadlane_core::observation::{
     ObservationJob, ObservationJobState, ObservationRequest, ObservationSnapshotRequest,
     ReadonlyCoreStateSnapshot, WorkspaceAcceptanceProof, WorkspaceAcceptanceStatus,
     WorkspaceActivityState, WorkspaceAttentionKind, WorkspaceAvailabilityState,
-    WorkspaceChatIdentity, WorkspaceChatSummary, WorkspaceConfiguredSelection, WorkspaceJobHistory,
-    WorkspaceJobSummary, WorkspaceMessageCandidateInput, WorkspaceMessageItem,
+    WorkspaceChatIdentity, WorkspaceChatSummary, WorkspaceConfiguredSelection,
+    WorkspaceExternalResolutionScope, WorkspaceJobHistory, WorkspaceJobSummary,
+    WorkspaceMessageCandidateInput, WorkspaceMessageItem,
     WorkspaceMessageScope, WorkspaceMessageSourceOrder, WorkspaceMessagesWindow,
     WorkspaceNativeSample, WorkspaceRecordLinks, WorkspaceSampleReconcileDecision,
     WorkspaceSamplingPolicy, WorkspaceSnapshot, WorkspaceSnapshotBounds, WorkspaceTaskHistory,
@@ -261,6 +262,11 @@ impl ObservationService {
             &chat_by_source_job,
             &chats_by_source_binding_thread,
             &mut message_candidates,
+        );
+
+        reconcile_observation_jobs_with_external_resolutions(
+            &mut observation.jobs,
+            &all_job_histories,
         );
 
         let (bounded_samples, extra_samples_omitted) =
@@ -615,12 +621,28 @@ impl ChatJobStats {
         if is_active {
             self.active_job_count += 1;
         }
-        let needs_attention = history.current_attention.as_ref().is_some_and(|attn| {
+        let has_explicit_attention = history.current_attention.as_ref().is_some_and(|attn| {
             !matches!(
                 attn.kind,
                 WorkspaceAttentionKind::None | WorkspaceAttentionKind::Unknown
             )
-        }) || history.job.state == ObservationJobState::NeedsUser;
+        });
+        let has_task_attention = history.tasks.iter().any(|task| {
+            task.current_attention.as_ref().is_some_and(|attn| {
+                !matches!(
+                    attn.kind,
+                    WorkspaceAttentionKind::None | WorkspaceAttentionKind::Unknown
+                )
+            })
+        });
+        let covered_by_full_external_resolution = history.external_resolutions.iter().any(|res| {
+            res.applicability.is_applicable()
+                && res.scope == WorkspaceExternalResolutionScope::Job
+        });
+        let needs_attention = has_explicit_attention
+            || has_task_attention
+            || (history.job.state == ObservationJobState::NeedsUser
+                && !covered_by_full_external_resolution);
         if needs_attention {
             self.attention_count += 1;
         }
@@ -629,6 +651,43 @@ impl ChatJobStats {
                 self.max_updated_at_ms = Some(ts);
             }
         }
+    }
+}
+
+/// Applies the same store-verified external-resolution result to legacy `ObservationJob` reads.
+///
+/// Only an applicable full-job receipt that leaves no current attention replaces the projection
+/// state with `unknown` plus the separate logical `resolved_externally` execution token. It never
+/// fabricates `completed`, `verified_accepted`, worker outcomes, task stages, or delivery/ACK state.
+fn reconcile_observation_jobs_with_external_resolutions(
+    observation_jobs: &mut [ObservationJob],
+    histories: &[WorkspaceJobHistory],
+) {
+    for observation_job in observation_jobs.iter_mut() {
+        if observation_job.state == ObservationJobState::Completed {
+            continue;
+        }
+        let Some(history) = histories.iter().find(|history| {
+            history.job.source_id == observation_job.source_id
+                && history.job.job_id == observation_job.id
+        }) else {
+            continue;
+        };
+        let has_applicable_full_receipt = history.external_resolutions.iter().any(|resolution| {
+            resolution.applicability.is_applicable()
+                && resolution.scope == WorkspaceExternalResolutionScope::Job
+        });
+        if !has_applicable_full_receipt
+            || history.current_attention.is_some()
+            || history
+                .tasks
+                .iter()
+                .any(|task| task.current_attention.is_some())
+        {
+            continue;
+        }
+        observation_job.state = ObservationJobState::Unknown;
+        observation_job.execution_status = "resolved_externally".to_string();
     }
 }
 
@@ -1260,7 +1319,33 @@ fn collect_coworker_job_message_candidates(
         }
     }
 
-    // 5. Live attention or pending user question summary.
+    // 5. Store-verified external resolution receipts. The message identity is the real receipt ID,
+    // so Messages and Activity can link the same receipt without requiring a journal record.
+    for (idx, resolution) in history.external_resolutions.iter().enumerate() {
+        if resolution.summary.trim().is_empty() {
+            continue;
+        }
+        let completed = resolution.applicability.is_applicable();
+        out.push(WorkspaceMessageCandidateInput {
+            source_kind: "attention_summary".to_string(),
+            source_record_id: resolution.receipt_id.clone(),
+            source_order: WorkspaceMessageSourceOrder {
+                recorded_at_ms: resolution.recorded_at_ms.or(history.job.updated_at_ms),
+                source_seq: history.job.job_revision.unwrap_or(0),
+                sub_index: idx as u32,
+            },
+            scope: job_scope.clone(),
+            actor_role: Some("operator".to_string()),
+            raw_summary: resolution.summary.clone(),
+            upstream_truncated: false,
+            incomplete_reason: (!completed).then_some(
+                "External resolution receipt is stale or unverified; it does not close blockers."
+                    .to_string(),
+            ),
+        });
+    }
+
+    // 6. Live attention or pending user question summary.
     if let Some(ref attn) = history.current_attention {
         if !matches!(
             attn.kind,

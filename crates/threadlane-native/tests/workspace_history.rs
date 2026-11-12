@@ -14,7 +14,8 @@ use tempfile::TempDir;
 use threadlane_authority::{AuthorityStore, OperatorApprovalRequest};
 use threadlane_core::observation::{
     ObservationJobState, WorkspaceAcceptanceProof, WorkspaceAcceptanceStatus,
-    WorkspaceAttentionKind, WorkspaceChatIdentity, WorkspaceJobHistory,
+    WorkspaceAttentionKind, WorkspaceChatIdentity, WorkspaceExternalResolutionApplicability,
+    WorkspaceExternalResolutionOutcome, WorkspaceExternalResolutionScope, WorkspaceJobHistory,
 };
 use threadlane_host::{prepare_session_dir, HostSessionLock, WORK_AREA_SUBDIR};
 use threadlane_native::coworker_observation::workspace_history::{
@@ -34,6 +35,7 @@ use threadlane_native::coworker_workflow::{
     ControllerConfigurationPreview, ControllerJobRuntimeState, ControllerPolicyStore,
     ControllerRoleExecutionBudget, ControllerRoleUsageCounters, CoworkerBindingLedger,
     CoworkerJobOwnershipKey, CoworkerJobOwnershipStore, CoworkerJobPhase, CoworkerJobRecord,
+    CoworkerLedgerMutationOutcome,
     CoworkerPlanningService, CoworkerTaskRecord, CoworkerTaskStage, CoworkerWorkflowStore,
     CreateCoworkerJobRequest, FinalizeTaskOutboxRequest, FreezeControllerExecutionEnvelopeRequest,
     FrozenApprovalLinkage, FrozenCheckCommandSpec, FrozenCheckExecutionStatus, FrozenCheckKind,
@@ -48,6 +50,12 @@ use threadlane_native::coworker_workflow::{
     WorkBrief, WorkBriefKind, WorkflowHoldReason, WorkflowHoldRecord,
 };
 use threadlane_native::error::NativeErrorCode;
+use threadlane_native::external_resolution::{
+    ExternalResolutionConfirmation, ExternalResolutionEvidenceRef, ExternalResolutionPreview,
+    ExternalResolutionProjectRef, ExternalResolutionReceipt, ExternalResolutionScope,
+    ExternalResolutionService, ExternalResolutionTarget, RecordExternalResolutionRequest,
+    EXTERNAL_RESOLUTION_PREVIEW_DOMAIN, EXTERNAL_RESOLUTION_RECEIPT_DOMAIN,
+};
 use threadlane_native::profile_flow::{
     ExecutionPolicy, PolicyAllowRule, RoleExecutionRoute, SelectedRoleChoice,
 };
@@ -8348,4 +8356,747 @@ async fn awaiting_approval_preserves_higher_priority_fences_causal_ambiguity_and
     );
     assert_eq!(h_clean.job.state, ObservationJobState::NeedsUser);
     assert_eq!(h_clean.job.approval_status, "pending_approval");
+}
+
+// ---------------------------------------------------------------------------
+// Store-backed external resolution receipt history coverage.
+// ---------------------------------------------------------------------------
+
+const EXT_HIST_SOURCE: &str = "default";
+const EXT_HIST_BINDING: &str = "bnd_history_external";
+const EXT_HIST_THREAD: &str = "550e8400-e29b-41d4-a716-446655440000";
+const EXT_HIST_HEX64_A: &str =
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const EXT_HIST_HEX64_B: &str =
+    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+struct ExternalHistoryFixture {
+    _tmp: TempDir,
+    repo: PathBuf,
+    plans: PathBuf,
+    authority_dir: PathBuf,
+    registry_dir: PathBuf,
+    sessions: PathBuf,
+    store: CoworkerWorkflowStore,
+    job_id: String,
+}
+
+fn ext_sample_choice(difficulty: Difficulty) -> SelectedRoleChoice {
+    SelectedRoleChoice {
+        tool_id: "tool-agy".to_string(),
+        adapter: ToolAdapter::Antigravity,
+        route: headless_route(),
+        model_id: "model-argon".to_string(),
+        model_arg: "gemini-4-argon-high".to_string(),
+        effort: Some("high".to_string()),
+        matched_difficulty: Some(difficulty),
+    }
+}
+
+fn ext_controller_policy() -> ExecutionPolicy {
+    ExecutionPolicy {
+        schema_version: 1,
+        policy_id: "policy-history-external".to_string(),
+        allow_rules: vec![PolicyAllowRule {
+            tool_id: "tool-agy".to_string(),
+            model_id: "model-argon".to_string(),
+            efforts: vec!["high".to_string()],
+            allow_no_effort: false,
+            roles: vec![
+                WorkflowRole::Coder,
+                WorkflowRole::Reviewer,
+                WorkflowRole::Closure,
+            ],
+        }],
+    }
+}
+
+fn setup_external_history_fixture() -> ExternalHistoryFixture {
+    let tmp = TempDir::new().expect("external history tempdir");
+    let root = fs::canonicalize(tmp.path()).expect("canonicalize external history root");
+    let repo = make_private_dir(&root.join("repo"));
+    fs::write(repo.join(".git"), b"gitdir: disposable fixture\n")
+        .expect("write external history .git marker");
+    fs::set_permissions(repo.join(".git"), fs::Permissions::from_mode(0o600))
+        .expect("chmod external history .git marker");
+    let plans = make_private_dir(&root.join("plans"));
+    let authority_dir = make_private_dir(&root.join("authority"));
+    let registry_dir = make_private_dir(&root.join("registry"));
+    let sessions = make_private_dir(&root.join("sessions"));
+    let base_commit = "1".repeat(40);
+    let base_tree_sha = "2".repeat(40);
+
+    let registry = Arc::new(RegistryStore::open(&registry_dir).expect("open external registry"));
+    registry
+        .apply(
+            0,
+            RegistryChange::UpsertTool {
+                tool: ToolDefinition {
+                    id: "tool-agy".to_string(),
+                    label: "Antigravity CLI".to_string(),
+                    adapter: ToolAdapter::Antigravity,
+                    executable_path: None,
+                    enabled: true,
+                },
+            },
+        )
+        .expect("upsert external tool");
+    registry
+        .apply(
+            1,
+            RegistryChange::UpsertModels {
+                models: vec![ModelDefinition {
+                    id: "model-argon".to_string(),
+                    tool_id: "tool-agy".to_string(),
+                    label: "Gemini 4 Argon High".to_string(),
+                    model_arg: "gemini-4-argon-high".to_string(),
+                    efforts: vec!["high".to_string()],
+                    allow_no_effort: false,
+                }],
+            },
+        )
+        .expect("upsert external model");
+    registry
+        .apply(
+            2,
+            RegistryChange::UpsertProfile {
+                profile: WorkflowProfile {
+                    decision_advisor: None,
+                    id: "profile-history-external".to_string(),
+                    name: "History External".to_string(),
+                    assignments: vec![RoleAssignment {
+                        role: WorkflowRole::Coder,
+                        difficulty: Some(Difficulty::Hard),
+                        choice: ModelChoice {
+                            model_id: "model-argon".to_string(),
+                            effort: Some("high".to_string()),
+                        },
+                    }],
+                },
+            },
+        )
+        .expect("upsert external profile");
+    let registry_snapshot = registry.snapshot().expect("external registry snapshot");
+    let registry_revision = registry_snapshot.revision;
+
+    let plan_store = Arc::new(PlanStore::open(&plans).expect("open external plans"));
+    let draft = plan_store
+        .change_at(
+            0,
+            PlanChange::SaveDraft {
+                plan_id: "plan_history_external".to_string(),
+                binding_id: EXT_HIST_BINDING.to_string(),
+                profile_id: "profile-history-external".to_string(),
+                profile_revision: registry_revision,
+                summary: "External history fixture plan".to_string(),
+                tasks: vec![
+                    PlanTask {
+                        id: "task-alpha".to_string(),
+                        title: "Alpha task".to_string(),
+                        instruction: "Do alpha work".to_string(),
+                        role: WorkflowRole::Coder,
+                        difficulty: Difficulty::Hard,
+                        depends_on: Vec::new(),
+                        allowed_write_paths: vec!["src/alpha.rs".to_string()],
+                    },
+                    PlanTask {
+                        id: "task-beta".to_string(),
+                        title: "Beta task".to_string(),
+                        instruction: "Do beta work".to_string(),
+                        role: WorkflowRole::Coder,
+                        difficulty: Difficulty::Hard,
+                        depends_on: Vec::new(),
+                        allowed_write_paths: vec!["src/beta.rs".to_string()],
+                    },
+                ],
+            },
+            1_700_000_000_000,
+        )
+        .expect("save external plan draft");
+    let plan = plan_store
+        .change(
+            draft.revision,
+            PlanChange::Publish {
+                plan_id: draft.plan_id.clone(),
+                revision: draft.revision,
+            },
+        )
+        .expect("publish external plan");
+    let compiled =
+        compile_plan_revision(&plan, &registry_snapshot).expect("compile external plan");
+
+    let authority = Arc::new(
+        AuthorityStore::open(&authority_dir, Arc::clone(&registry), Arc::clone(&plan_store))
+            .expect("open external authority"),
+    );
+    let summary = authority
+        .approve_at(
+            OperatorApprovalRequest {
+                binding_id: EXT_HIST_BINDING.to_string(),
+                thread_uuid: EXT_HIST_THREAD.to_string(),
+                plan_id: plan.plan_id.clone(),
+                plan_revision: plan.revision,
+                expected_registry_revision: registry_revision,
+                expected_plan_digest: compiled.plan_digest.clone(),
+                repository_path: repo.clone(),
+                base_commit: base_commit.clone(),
+                approved_task_ids: vec!["task-alpha".to_string(), "task-beta".to_string()],
+                approved_write_paths: vec![
+                    "src/alpha.rs".to_string(),
+                    "src/beta.rs".to_string(),
+                ],
+                max_parallel: 2,
+                budgets: ExecutionBudgets::default(),
+            },
+            1_700_000_001_000,
+        )
+        .expect("approve external plan");
+    let approval = authority
+        .get_for_operator(&summary.approval_id)
+        .expect("load external approval");
+
+    let project_base = CanonicalProjectBaseRef {
+        repository_path: repo.to_string_lossy().into_owned(),
+        base_commit,
+        base_tree_sha: base_tree_sha.clone(),
+    };
+    let approval_linkage = FrozenApprovalLinkage::from_approval_and_policy(
+        &approval,
+        base_tree_sha,
+        &ext_controller_policy(),
+    )
+    .expect("bind external approval linkage");
+    let tasks = plan
+        .tasks
+        .iter()
+        .map(|task| {
+            let approved = approval
+                .tasks
+                .iter()
+                .find(|candidate| candidate.task_id == task.id)
+                .expect("approved external task");
+            CoworkerTaskRecord {
+                task_id: task.id.clone(),
+                task_digest: approved.task_digest.clone(),
+                role: task.role,
+                difficulty: task.difficulty,
+                selected_choice: ext_sample_choice(task.difficulty),
+                depends_on: approved.depends_on.clone(),
+                write_paths: approved.allowed_write_paths.clone(),
+                owned_interfaces: Vec::new(),
+                consumed_interfaces: Vec::new(),
+                stage: CoworkerTaskStage::ReadyToDispatch,
+                stage_before_hold: None,
+                current_attempt_no: 0,
+                active_candidate_id: None,
+                accepted_candidate_id: None,
+                dependency_input_commit: None,
+                dependency_input_tree_sha: None,
+                accepted_predecessor_receipts: Vec::new(),
+                attempts: Vec::new(),
+                candidates: Vec::new(),
+                active_hold_ids: Vec::new(),
+                unresolved_outbox_id: None,
+            }
+        })
+        .collect();
+    let work_brief = WorkBrief {
+        brief_id: "brf_history_external".to_string(),
+        binding_id: EXT_HIST_BINDING.to_string(),
+        thread_uuid: EXT_HIST_THREAD.to_string(),
+        project_base,
+        kind: WorkBriefKind::NewJob,
+        summary: "External history fixture job".to_string(),
+        confirmed_requirements: vec!["Preserve stored phase and results".to_string()],
+        proposed_additions: Vec::new(),
+        assumptions: Vec::new(),
+        open_questions: Vec::new(),
+        accepted_architect_decisions: Vec::new(),
+    };
+    let work_brief_digest = work_brief.digest().expect("external work brief digest");
+    let job_id = "job_0123456789abcdef0123456789abcdef".to_string();
+    let job = CoworkerJobRecord {
+        job_id: job_id.clone(),
+        job_revision: 1,
+        create_request_key: "req_create_history_external".to_string(),
+        binding_id: EXT_HIST_BINDING.to_string(),
+        thread_uuid: EXT_HIST_THREAD.to_string(),
+        phase: CoworkerJobPhase::Executing,
+        work_brief,
+        work_brief_digest,
+        supersedes_job_id: None,
+        planning_result: None,
+        approval_linkage: Some(approval_linkage),
+        tasks,
+        holds: Vec::new(),
+        outbox: Vec::new(),
+        combined_candidates: Vec::new(),
+    };
+    let store = CoworkerWorkflowStore::new(&plans).expect("open external workflow store");
+    let ledger = CoworkerBindingLedger {
+        schema_version: 1,
+        binding_id: EXT_HIST_BINDING.to_string(),
+        thread_uuid: Some(EXT_HIST_THREAD.to_string()),
+        ledger_revision: 1,
+        planning_grants: Vec::new(),
+        architect_advice: Vec::new(),
+        jobs: vec![job],
+        admission_markers: BTreeMap::new(),
+        external_resolutions: Vec::new(),
+    };
+    ledger.validate(EXT_HIST_BINDING).expect("valid external ledger");
+    write_private_json(
+        &store
+            .ledger_path_for_binding(EXT_HIST_BINDING)
+            .expect("external ledger path"),
+        &ledger,
+    );
+
+    ExternalHistoryFixture {
+        _tmp: tmp,
+        repo,
+        plans,
+        authority_dir,
+        registry_dir,
+        sessions,
+        store,
+        job_id,
+    }
+}
+
+fn ext_service(fixture: &ExternalHistoryFixture) -> ExternalResolutionService {
+    ExternalResolutionService::new(
+        &fixture.plans,
+        &fixture.authority_dir,
+        &fixture.registry_dir,
+        Some(&fixture.sessions),
+    )
+    .expect("open external resolution service")
+}
+
+fn ext_chat_identity(fixture: &ExternalHistoryFixture) -> WorkspaceChatIdentity {
+    WorkspaceChatIdentity::new(
+        EXT_HIST_SOURCE,
+        EXT_HIST_BINDING,
+        EXT_HIST_THREAD,
+        fixture.repo.to_string_lossy().as_ref(),
+    )
+    .expect("external chat identity")
+}
+
+fn read_external_history(
+    fixture: &ExternalHistoryFixture,
+    with_authority_and_sessions: bool,
+) -> threadlane_native::coworker_observation::WorkspaceScopedHistoryRead {
+    let stores = if with_authority_and_sessions {
+        WorkspaceHistoryStores::new(&fixture.plans)
+            .with_authority_dir(&fixture.authority_dir)
+            .with_sessions_dir(&fixture.sessions)
+    } else {
+        WorkspaceHistoryStores::new(&fixture.plans)
+    };
+    read_scoped_workspace_job_histories(&ext_chat_identity(fixture), &stores)
+        .expect("external scoped history read")
+}
+
+fn ext_record_receipt(
+    fixture: &ExternalHistoryFixture,
+    request_key: &str,
+    scope: ExternalResolutionScope,
+) -> ExternalResolutionReceipt {
+    let service = ext_service(fixture);
+    let current_job_revision = fixture
+        .store
+        .read_binding_ledger(EXT_HIST_BINDING)
+        .expect("read external job revision")
+        .jobs
+        .iter()
+        .find(|job| job.job_id == fixture.job_id)
+        .expect("external fixture job revision")
+        .job_revision;
+    let request = RecordExternalResolutionRequest {
+        binding_id: EXT_HIST_BINDING.to_string(),
+        thread_uuid: EXT_HIST_THREAD.to_string(),
+        canonical_repo_root: fixture.repo.clone(),
+        target: ExternalResolutionTarget::Job {
+            job_id: fixture.job_id.clone(),
+        },
+        scope,
+        expected_ledger_revision: None,
+        expected_job_revision: Some(current_job_revision),
+        expected_runtime_revision: None,
+        request_key: request_key.to_string(),
+        created_at_ms: 1_700_000_200_000,
+        explanation: "Resolved externally by the history fixture operator".to_string(),
+        evidence_refs: vec![ExternalResolutionEvidenceRef::ArtifactRef {
+            reference: "issue-history-77".to_string(),
+        }],
+    };
+    let preview = service.preview(&request).expect("external receipt preview");
+    service
+        .record(
+            &request,
+            &ExternalResolutionConfirmation {
+                trusted_local_attested: true,
+                thread_uuid: preview.thread_uuid.clone(),
+                preview_digest: preview.preview_digest.clone(),
+            },
+        )
+        .expect("external receipt record")
+}
+
+fn ext_write_current_job(
+    fixture: &ExternalHistoryFixture,
+    mutate: impl FnOnce(&mut CoworkerJobRecord),
+) {
+    fixture
+        .store
+        .transact_binding_ledger(EXT_HIST_BINDING, None, |ledger| {
+            let job = ledger
+                .jobs
+                .iter_mut()
+                .find(|job| job.job_id == fixture.job_id)
+                .expect("external fixture job");
+            mutate(job);
+            Ok(CoworkerLedgerMutationOutcome::Mutated(()))
+        })
+        .expect("mutate external fixture job");
+}
+
+fn ext_add_mixed_blockers(fixture: &ExternalHistoryFixture) {
+    ext_write_current_job(fixture, |job| {
+        job.job_revision = 2;
+        job.holds.push(WorkflowHoldRecord {
+            hold_id: "hold_history_alpha".to_string(),
+            request_key: "req_hold_history_alpha".to_string(),
+            reason: WorkflowHoldReason::ConversationClarificationPending,
+            detail: "Alpha requires an operator answer.".to_string(),
+            directly_affected_task_ids: vec!["task-alpha".to_string()],
+            affected_write_paths: vec!["src/alpha.rs".to_string()],
+            affected_interfaces: Vec::new(),
+            holds_entire_job: false,
+            active: true,
+            created_at_job_revision: 2,
+            resolved_at_job_revision: None,
+            resolution_note: None,
+        });
+        let alpha = job
+            .tasks
+            .iter_mut()
+            .find(|task| task.task_id == "task-alpha")
+            .expect("foreign alpha task");
+        alpha.stage = CoworkerTaskStage::Held;
+        alpha.stage_before_hold = Some(CoworkerTaskStage::ReadyToDispatch);
+        alpha.active_hold_ids.push("hold_history_alpha".to_string());
+        let beta = job
+            .tasks
+            .iter_mut()
+            .find(|task| task.task_id == "task-beta")
+            .expect("foreign beta task");
+        beta.stage = CoworkerTaskStage::Blocked;
+    });
+}
+
+fn ext_preview_from_receipt(receipt: &ExternalResolutionReceipt) -> ExternalResolutionPreview {
+    ExternalResolutionPreview {
+        interface_version: receipt.interface_version.clone(),
+        schema_version: receipt.schema_version,
+        binding_id: receipt.binding_id.clone(),
+        thread_uuid: receipt.thread_uuid.clone(),
+        project: receipt.project.clone(),
+        target: receipt.target.clone(),
+        scope: receipt.scope.clone(),
+        resolved_task_ids: receipt.resolved_task_ids.clone(),
+        source_ledger_revision: receipt.source_ledger_revision,
+        resulting_ledger_revision: receipt.recorded_ledger_revision,
+        source_job_revision: receipt.source_job_revision,
+        source_controller_ledger_revision: receipt.source_controller_ledger_revision,
+        source_runtime_revision: receipt.source_runtime_revision,
+        work_brief_digest: receipt.work_brief_digest.clone(),
+        plan_id: receipt.plan_id.clone(),
+        plan_revision: receipt.plan_revision,
+        plan_digest: receipt.plan_digest.clone(),
+        approval_id: receipt.approval_id.clone(),
+        approval_subject_digest: receipt.approval_subject_digest.clone(),
+        envelope_digest: receipt.envelope_digest.clone(),
+        request_key: receipt.request_key.clone(),
+        created_at_ms: receipt.created_at_ms,
+        explanation: receipt.explanation.clone(),
+        evidence_refs: receipt.evidence_refs.clone(),
+        request_digest: receipt.request_digest.clone(),
+        preview_digest: String::new(),
+    }
+}
+
+fn ext_resign_receipt(receipt: &mut ExternalResolutionReceipt) {
+    let mut preview = ext_preview_from_receipt(receipt);
+    let mut canonical = preview.clone();
+    canonical.preview_digest.clear();
+    preview.preview_digest = threadlane_native::coworker_workflow::sha256_hex(
+        &serde_json::to_vec(&(EXTERNAL_RESOLUTION_PREVIEW_DOMAIN, &canonical))
+            .expect("serialize external preview digest"),
+    );
+    receipt.preview_digest = preview.preview_digest;
+    let mut canonical_receipt = receipt.clone();
+    canonical_receipt.receipt_digest.clear();
+    receipt.receipt_digest = threadlane_native::coworker_workflow::sha256_hex(
+        &serde_json::to_vec(&(EXTERNAL_RESOLUTION_RECEIPT_DOMAIN, &canonical_receipt))
+            .expect("serialize external receipt digest"),
+    );
+    receipt.validate_integrity().expect("resigned external receipt");
+}
+
+fn ext_rewrite_receipt(fixture: &ExternalHistoryFixture, receipt: ExternalResolutionReceipt) {
+    let mut ledger = fixture
+        .store
+        .read_binding_ledger(EXT_HIST_BINDING)
+        .expect("read external ledger for rewrite");
+    ledger.external_resolutions = vec![receipt];
+    write_private_json(
+        &fixture
+            .store
+            .ledger_path_for_binding(EXT_HIST_BINDING)
+            .expect("external ledger path"),
+        &ledger,
+    );
+}
+
+#[test]
+fn external_resolution_history_full_and_partial_cover_only_current_attention() {
+    let full_fixture = setup_external_history_fixture();
+    ext_add_mixed_blockers(&full_fixture);
+    let full_receipt = ext_record_receipt(
+        &full_fixture,
+        "req_history_full_01",
+        ExternalResolutionScope::FullJob,
+    );
+    remove_lockfiles_in_dir(&full_fixture.plans);
+    let hashes_before_read = snapshot_private_dir_sha256(&full_fixture.plans);
+    let full_read = read_external_history(&full_fixture, true);
+    assert_eq!(
+        snapshot_private_dir_sha256(&full_fixture.plans),
+        hashes_before_read,
+        "store-backed external history reads must not write"
+    );
+    assert_no_lock_or_wal_files(&full_fixture.plans);
+    let full_history = full_read
+        .jobs
+        .iter()
+        .find(|history| history.job.job_id == full_fixture.job_id)
+        .expect("full external history");
+    assert_eq!(full_history.external_resolutions.len(), 1);
+    let full_resolution = &full_history.external_resolutions[0];
+    assert_eq!(full_resolution.receipt_id, full_receipt.receipt_id);
+    assert_eq!(
+        full_resolution.outcome,
+        WorkspaceExternalResolutionOutcome::ResolvedExternally
+    );
+    assert_eq!(
+        full_resolution.scope,
+        WorkspaceExternalResolutionScope::Job
+    );
+    assert_eq!(
+        full_resolution.applicability,
+        WorkspaceExternalResolutionApplicability::Applicable
+    );
+    assert_eq!(full_history.current_attention, None);
+    assert!(full_history
+        .tasks
+        .iter()
+        .all(|task| task.current_attention.is_none()));
+    assert_eq!(full_history.job.phase.as_deref(), Some("executing"));
+    assert_eq!(full_history.job.state, ObservationJobState::Unknown);
+    assert_eq!(full_history.job.execution_status, "resolved_externally");
+    assert_eq!(
+        full_history.acceptance_proof.status,
+        WorkspaceAcceptanceStatus::Unknown
+    );
+    assert_eq!(full_history.result, None);
+    assert!(full_resolution.covered_attention.len() >= 3);
+    assert!(full_resolution.covered_attention.iter().any(|covered| {
+        covered.task_id.is_none()
+            && covered.attention.kind == WorkspaceAttentionKind::NeedsUserInput
+    }));
+    assert!(full_resolution.covered_attention.iter().any(|covered| {
+        covered.task_id.as_deref() == Some("task-alpha")
+            && covered.attention.kind == WorkspaceAttentionKind::NeedsUserInput
+    }));
+    assert!(full_resolution.covered_attention.iter().any(|covered| {
+        covered.task_id.as_deref() == Some("task-beta")
+            && covered.attention.kind == WorkspaceAttentionKind::BlockedFailure
+    }));
+
+    let unverified_read = read_external_history(&full_fixture, false);
+    let unverified_history = unverified_read
+        .jobs
+        .iter()
+        .find(|history| history.job.job_id == full_fixture.job_id)
+        .expect("unverified external history");
+    assert_eq!(
+        unverified_history.external_resolutions[0].applicability,
+        WorkspaceExternalResolutionApplicability::Unverified
+    );
+    assert!(unverified_history.current_attention.is_some());
+    assert!(unverified_history
+        .tasks
+        .iter()
+        .any(|task| task.current_attention.is_some()));
+
+    let partial_fixture = setup_external_history_fixture();
+    ext_add_mixed_blockers(&partial_fixture);
+    ext_record_receipt(
+        &partial_fixture,
+        "req_history_partial_01",
+        ExternalResolutionScope::Tasks {
+            task_ids: vec!["task-alpha".to_string()],
+        },
+    );
+    let partial_read = read_external_history(&partial_fixture, true);
+    let partial_history = partial_read
+        .jobs
+        .iter()
+        .find(|history| history.job.job_id == partial_fixture.job_id)
+        .expect("partial external history");
+    let partial_resolution = &partial_history.external_resolutions[0];
+    assert_eq!(
+        partial_resolution.scope,
+        WorkspaceExternalResolutionScope::Tasks
+    );
+    assert_eq!(
+        partial_resolution.applicability,
+        WorkspaceExternalResolutionApplicability::Applicable
+    );
+    assert_eq!(partial_resolution.task_ids, vec!["task-alpha".to_string()]);
+    assert_eq!(partial_resolution.covered_attention.len(), 1);
+    assert_eq!(
+        partial_resolution.covered_attention[0].task_id.as_deref(),
+        Some("task-alpha")
+    );
+    let alpha = partial_history
+        .tasks
+        .iter()
+        .find(|task| task.task_id == "task-alpha")
+        .expect("partial alpha task");
+    let beta = partial_history
+        .tasks
+        .iter()
+        .find(|task| task.task_id == "task-beta")
+        .expect("partial beta task");
+    assert!(alpha.current_attention.is_none());
+    assert_eq!(
+        beta.current_attention.as_ref().map(|attention| attention.kind),
+        Some(WorkspaceAttentionKind::BlockedFailure)
+    );
+    assert_eq!(
+        partial_history
+            .current_attention
+            .as_ref()
+            .map(|attention| attention.kind),
+        Some(WorkspaceAttentionKind::BlockedFailure)
+    );
+    assert_ne!(partial_history.job.execution_status, "resolved_externally");
+}
+
+#[test]
+fn external_resolution_history_stale_unverified_forged_and_tampered_records_fail_closed() {
+    let stale_fixture = setup_external_history_fixture();
+    ext_add_mixed_blockers(&stale_fixture);
+    ext_record_receipt(
+        &stale_fixture,
+        "req_history_stale_01",
+        ExternalResolutionScope::FullJob,
+    );
+    ext_write_current_job(&stale_fixture, |job| {
+        job.job_revision = 3;
+        job.outbox.push(OutboxDispatchRecord {
+            outbox_id: "obx_history_unknown".to_string(),
+            request_key: "req_history_unknown".to_string(),
+            kind: OutboxDispatchKind::TaskAttemptDispatch,
+            task_id: Some("task-beta".to_string()),
+            attempt_no: 1,
+            role: WorkflowRole::Coder,
+            subject_digest: EXT_HIST_HEX64_A.to_string(),
+            status: OutboxDispatchStatus::EffectUnknown,
+            reserved_at_job_revision: 3,
+            updated_at_job_revision: 3,
+            run_id: None,
+            worker_id: None,
+            receipt_id: None,
+            diagnostic: Some("Unknown effect must remain visible.".to_string()),
+        });
+    });
+    let stale_read = read_external_history(&stale_fixture, true);
+    let stale_history = stale_read
+        .jobs
+        .iter()
+        .find(|history| history.job.job_id == stale_fixture.job_id)
+        .expect("stale external history");
+    assert_eq!(
+        stale_history.external_resolutions[0].applicability,
+        WorkspaceExternalResolutionApplicability::Stale
+    );
+    assert!(stale_history.external_resolutions[0]
+        .covered_attention
+        .is_empty());
+    assert_eq!(
+        stale_history
+            .current_attention
+            .as_ref()
+            .map(|attention| attention.kind),
+        Some(WorkspaceAttentionKind::UnresolvedEffect)
+    );
+
+    let forged_fixture = setup_external_history_fixture();
+    ext_add_mixed_blockers(&forged_fixture);
+    let forged_receipt = ext_record_receipt(
+        &forged_fixture,
+        "req_history_forged_01",
+        ExternalResolutionScope::FullJob,
+    );
+    let mut forged = forged_receipt;
+    forged.work_brief_digest = Some(EXT_HIST_HEX64_B.to_string());
+    ext_resign_receipt(&mut forged);
+    ext_rewrite_receipt(&forged_fixture, forged);
+    let forged_read = read_external_history(&forged_fixture, true);
+    let forged_history = forged_read
+        .jobs
+        .iter()
+        .find(|history| history.job.job_id == forged_fixture.job_id)
+        .expect("forged external history");
+    assert_eq!(
+        forged_history.external_resolutions[0].applicability,
+        WorkspaceExternalResolutionApplicability::Unverified
+    );
+    assert!(forged_history.external_resolutions[0]
+        .covered_attention
+        .is_empty());
+    assert!(forged_history.current_attention.is_some());
+    assert!(forged_history
+        .tasks
+        .iter()
+        .any(|task| task.current_attention.is_some()));
+
+    let tampered_fixture = setup_external_history_fixture();
+    ext_add_mixed_blockers(&tampered_fixture);
+    let tampered_receipt = ext_record_receipt(
+        &tampered_fixture,
+        "req_history_tampered_01",
+        ExternalResolutionScope::FullJob,
+    );
+    let mut tampered = tampered_receipt;
+    tampered.project = ExternalResolutionProjectRef {
+        canonical_repo_root: tampered_fixture.repo.clone(),
+        base_commit: "f".repeat(40),
+        base_tree_sha: Some("e".repeat(40)),
+    };
+    ext_resign_receipt(&mut tampered);
+    ext_rewrite_receipt(&tampered_fixture, tampered);
+    let stores = WorkspaceHistoryStores::new(&tampered_fixture.plans)
+        .with_authority_dir(&tampered_fixture.authority_dir)
+        .with_sessions_dir(&tampered_fixture.sessions);
+    assert!(
+        read_scoped_workspace_job_histories(&ext_chat_identity(&tampered_fixture), &stores,)
+            .is_err(),
+        "tampered project/base receipt must fail closed"
+    );
 }
