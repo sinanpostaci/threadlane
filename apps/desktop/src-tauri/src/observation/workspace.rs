@@ -1099,7 +1099,11 @@ fn build_legacy_fallback_job_history(
         })
         .collect();
     let has_task_attention = tasks.iter().any(|task| task.current_attention.is_some());
-    let current_attention = if has_task_attention {
+    // A failed legacy job is independent evidence from a ready-for-review or native-route task.
+    // Keep its concrete failure attention instead of letting any task-level attention erase it.
+    // An aggregate NeedsUser fallback remains suppressed while a task already carries the
+    // specific human action, avoiding a duplicate generic request.
+    let current_attention = if job.state == ObservationJobState::NeedsUser && has_task_attention {
         None
     } else {
         legacy_job_attention(job.state, job.updated_at_ms)

@@ -10,9 +10,9 @@ mod unix_workspace_tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use threadlane_authority::{
-        compute_record_subject_digest, derive_approval_id, verify_approval_record_integrity,
-        ApprovalRecord, ApprovedTaskRecord, APPROVALS_FILE_NAME, AUTHORITY_POLICY_VERSION,
-        AUTHORITY_SCHEMA_VERSION,
+        compute_authority_core_digest, compute_record_subject_digest, derive_approval_id,
+        derive_command_key, derive_profile_id, verify_approval_record_integrity, ApprovalRecord,
+        ApprovedTaskRecord, APPROVALS_FILE_NAME, AUTHORITY_POLICY_VERSION, AUTHORITY_SCHEMA_VERSION,
     };
     use threadlane_core::observation::{
         current_observation_time_ms, serialize_workspace_native_sample_sidecar, ObservationJob,
@@ -24,7 +24,10 @@ mod unix_workspace_tests {
         WorkspaceFreshnessState, WorkspaceMessageSourceKind, WorkspaceNativeCapabilities,
         WorkspaceNativeSample, WorkspaceSampleConnection, WorkspaceSelectionEvidence,
     };
-    use threadlane_core::Core;
+    use threadlane_core::{
+        Command, CommandOutput, Core, WorkerAcceptanceState, WorkerCompletionRecord,
+        WorkerOutcomeSummary, WorkerStatus, WorkerWorktreeUpdate,
+    };
     use threadlane_native::coworker_observation::{
         read_scoped_workspace_job_histories, WorkspaceHistoryDiagnosticKind, WorkspaceHistoryStores,
     };
@@ -49,11 +52,16 @@ mod unix_workspace_tests {
         ExecutionPolicy, PolicyAllowRule, RoleExecutionRoute, SelectedRoleChoice,
         EXECUTION_POLICY_SCHEMA_VERSION,
     };
+    use threadlane_host::{
+        write_host_manifest, HostPhase, HostSessionManifest, TaskDispatchIntent, TaskRunReceipt,
+        RUNTIME_STATE_SUBDIR, TASK_RECEIPTS_FILENAME, TASK_RECEIPTS_SCHEMA_VERSION,
+    };
     use threadlane_plans::{
         compile_plan_revision, Difficulty, ModelChoice, ModelDefinition, PlanChange, PlanRevision,
         PlanStore, PlanTask, RegistrySnapshot, RoleAssignment, ToolAdapter, ToolDefinition,
         WorkflowProfile, WorkflowRole,
     };
+    use threadlane_workers::{WorkerFilePermissions, WorkerProvider};
 
     use crate::observation::{ObservationService, ObservationSourceConfig};
 
@@ -671,6 +679,483 @@ mod unix_workspace_tests {
             status: status.to_string(),
             depends_on: Vec::new(),
         }
+    }
+
+    #[derive(Clone, Copy)]
+    enum LegacyWorkerOutcome {
+        ReadyForReview,
+        Failed,
+    }
+
+    fn make_private_dir(path: &Path) {
+        fs::create_dir_all(path)
+            .unwrap_or_else(|err| panic!("create private dir {}: {err}", path.display()));
+        set_mode(path, 0o700);
+    }
+
+    fn write_private_json(path: &Path, value: &serde_json::Value) {
+        let bytes = serde_json::to_vec_pretty(value).expect("serialize private JSON");
+        fs::write(path, bytes)
+            .unwrap_or_else(|err| panic!("write private JSON {}: {err}", path.display()));
+        set_mode(path, 0o600);
+    }
+
+    fn make_legacy_worker_approval(
+        published: &PlanRevision,
+        binding_id: &str,
+        thread_uuid: &str,
+        project: &Path,
+        approved_task_ids: &[String],
+        created_at_ms: i64,
+    ) -> ApprovalRecord {
+        let approved_set: BTreeSet<&str> = approved_task_ids.iter().map(String::as_str).collect();
+        let approved_tasks: Vec<ApprovedTaskRecord> = published
+            .tasks
+            .iter()
+            .filter(|task| approved_set.contains(task.id.as_str()))
+            .map(|task| ApprovedTaskRecord {
+                task_id: task.id.clone(),
+                title: task.title.clone(),
+                instruction: task.instruction.clone(),
+                instruction_digest: sha256_hex(task.instruction.as_bytes()),
+                role: task.role,
+                difficulty: task.difficulty,
+                tool_id: "antigravity_cli".to_string(),
+                adapter: ToolAdapter::Antigravity,
+                provider: Some(WorkerProvider::Antigravity),
+                canonical_executable: Some(PathBuf::from("/bin/sh")),
+                model_id: "model-flash".to_string(),
+                model_arg: "opencode-go/deepseek-v4.1-flash".to_string(),
+                base_model: "deepseek-v4.1-flash".to_string(),
+                effort: Some("max".to_string()),
+                cli_model_arg: Some("opencode-go/deepseek-v4.1-flash".to_string()),
+                standalone: Some(false),
+                file_permissions: Some(WorkerFilePermissions::TaskFiles),
+                depends_on: task.depends_on.clone(),
+                allowed_write_paths: task.allowed_write_paths.clone(),
+                task_digest: sha256_hex(task.id.as_bytes()),
+                profile_id: None,
+                command_key: None,
+            })
+            .collect();
+        assert_eq!(
+            approved_tasks.len(),
+            approved_task_ids.len(),
+            "legacy worker fixture approval must reference only tasks in the published revision"
+        );
+        let mut approval = ApprovalRecord {
+            approval_id: String::new(),
+            subject_digest: String::new(),
+            policy_version: AUTHORITY_POLICY_VERSION,
+            binding_id: binding_id.to_string(),
+            thread_uuid: thread_uuid.to_string(),
+            plan_id: published.plan_id.clone(),
+            plan_revision: published.revision,
+            profile_id: published.profile_id.clone(),
+            registry_revision: published.profile_revision,
+            plan_digest: sha256_hex(b"legacy worker workspace plan digest"),
+            repository_path: project.to_path_buf(),
+            base_commit: "1111111111111111111111111111111111111111".to_string(),
+            approved_task_ids: approved_tasks
+                .iter()
+                .map(|task| task.task_id.clone())
+                .collect(),
+            approved_write_paths: vec!["src/lib.rs".to_string()],
+            max_parallel: 1,
+            budgets: Default::default(),
+            tasks: approved_tasks,
+            created_at_ms,
+        };
+        let core_digest =
+            compute_authority_core_digest(&approval).expect("legacy worker authority core digest");
+        for task in &mut approval.tasks {
+            task.profile_id = Some(derive_profile_id(
+                &core_digest,
+                &task.task_id,
+                &task.task_digest,
+            ));
+            task.command_key = Some(derive_command_key(
+                &core_digest,
+                &task.task_id,
+                &task.task_digest,
+            ));
+        }
+        approval.subject_digest =
+            compute_record_subject_digest(&approval).expect("legacy worker subject digest");
+        approval.approval_id = derive_approval_id(&approval.subject_digest);
+        approval
+    }
+
+    fn write_legacy_worker_plan_and_approval_with_tasks(
+        stores: &TestStores,
+        binding_id: &str,
+        thread_uuid: &str,
+        project: &Path,
+        plan_id: &str,
+        plan_tasks: Vec<PlanTask>,
+        approved_task_ids: &[String],
+        approval_created_at_ms: i64,
+    ) -> (PlanRevision, ApprovalRecord) {
+        let plan_store = PlanStore::open(&stores.plans).expect("open legacy worker PlanStore");
+        let draft = plan_store
+            .change_at(
+                0,
+                PlanChange::SaveDraft {
+                    plan_id: plan_id.to_string(),
+                    binding_id: binding_id.to_string(),
+                    profile_id: "profile-main".to_string(),
+                    profile_revision: 1,
+                    summary: "Legacy worker plan-only workspace summary".to_string(),
+                    tasks: plan_tasks,
+                },
+                1_700_000_300_000,
+            )
+            .expect("save legacy worker plan draft");
+        let published = plan_store
+            .change_at(
+                draft.revision,
+                PlanChange::Publish {
+                    plan_id: draft.plan_id.clone(),
+                    revision: draft.revision,
+                },
+                1_700_000_300_500,
+            )
+            .expect("publish legacy worker plan");
+        drop(plan_store);
+
+        let approval = make_legacy_worker_approval(
+            &published,
+            binding_id,
+            thread_uuid,
+            project,
+            approved_task_ids,
+            approval_created_at_ms,
+        );
+        write_legacy_approvals_ledger(stores, std::slice::from_ref(&approval));
+        (published, approval)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_legacy_worker(
+        core: &mut Core,
+        session_binding_id: &str,
+        task: &ApprovedTaskRecord,
+        session_dir: &Path,
+        sequence: usize,
+        outcome: LegacyWorkerOutcome,
+        started_at_ms: i64,
+    ) -> (TaskDispatchIntent, TaskRunReceipt) {
+        let profile_digest = "c".repeat(64);
+        let command_key = task.command_key.clone().expect("worker command key");
+        let profile_id = task.profile_id.clone().expect("worker profile id");
+        let started = match core
+            .execute(
+                session_binding_id,
+                Command::StartWorker {
+                    command_key: command_key.clone(),
+                    profile_id: profile_id.clone(),
+                    profile_digest: profile_digest.clone(),
+                    provider: "antigravity".to_string(),
+                    requested_model: task.base_model.clone(),
+                    requested_effort: task.effort.clone().unwrap_or_default(),
+                    base_commit: "1111111111111111111111111111111111111111".to_string(),
+                    execution_binding: None,
+                    instruction: task.instruction.clone(),
+                    now_ms: started_at_ms,
+                },
+            )
+            .expect("start legacy worker")
+        {
+            CommandOutput::Worker(worker) => worker,
+            other => panic!("unexpected legacy worker output: {other:?}"),
+        };
+        let claim = core
+            .claim_worker(
+                session_binding_id,
+                &started.run_id,
+                started.revision,
+                &profile_digest,
+                started_at_ms + 10,
+            )
+            .expect("claim legacy worker");
+        core.record_worker_running(
+            &claim,
+            WorkerWorktreeUpdate {
+                run_worktree_id: format!("wt-run-legacy-{sequence}"),
+                run_worktree_path: session_dir
+                    .join(format!("work-area/runs/wt-run-legacy-{sequence}"))
+                    .to_string_lossy()
+                    .into_owned(),
+                run_branch_name: format!("tl/run/wt-run-legacy-{sequence}"),
+                task_worktree_id: format!("wt-task-legacy-{sequence}"),
+                task_worktree_path: session_dir
+                    .join(format!("work-area/tasks/wt-task-legacy-{sequence}"))
+                    .to_string_lossy()
+                    .into_owned(),
+                task_branch_name: format!("tl/task/wt-task-legacy-{sequence}"),
+                base_commit: "1111111111111111111111111111111111111111".to_string(),
+            },
+            started_at_ms + 20,
+        )
+        .expect("record legacy worker running");
+        let (status, acceptance_state, head_commit, exit_code, final_summary, failure_reason) =
+            match outcome {
+                LegacyWorkerOutcome::ReadyForReview => (
+                    WorkerStatus::Completed,
+                    WorkerAcceptanceState::ReadyForReview,
+                    Some("d".repeat(40)),
+                    Some(0),
+                    Some("Legacy worker completed implementation.".to_string()),
+                    None,
+                ),
+                LegacyWorkerOutcome::Failed => (
+                    WorkerStatus::Failed,
+                    WorkerAcceptanceState::ExecutionFailed,
+                    None,
+                    Some(1),
+                    None,
+                    Some("Legacy worker fixture failure.".to_string()),
+                ),
+            };
+        core.record_worker_outcome(
+            &claim,
+            WorkerCompletionRecord {
+                status,
+                observed_model: Some(task.base_model.clone()),
+                observed_effort: task.effort.clone(),
+                head_commit,
+                dropped_live_events: 0,
+                outcome: WorkerOutcomeSummary {
+                    provider_retry_high_water: None,
+                    provider_health: None,
+                    exit_code,
+                    signal: None,
+                    duration_ms: Some(100),
+                    timed_out: false,
+                    cancelled: false,
+                    cancel_requested_before_completion: false,
+                    missing_model_evidence: false,
+                    missing_effort_evidence: false,
+                    provider_error: matches!(outcome, LegacyWorkerOutcome::Failed),
+                    incomplete_cleanup: false,
+                    rejected_by_diff_gate: false,
+                    stdout_truncated: false,
+                    stderr_truncated: false,
+                    acceptance_state,
+                    changed_paths_count: 1,
+                    changed_paths_preview: vec!["src/lib.rs".to_string()],
+                    violation_count: 0,
+                    violation_summaries: Vec::new(),
+                    final_summary,
+                    failure_reason,
+                    report_artifact_id: None,
+                },
+            },
+            started_at_ms + 100,
+        )
+        .expect("record legacy worker outcome");
+
+        (
+            TaskDispatchIntent {
+                task_id: task.task_id.clone(),
+                task_digest: task.task_digest.clone(),
+                profile_id,
+                command_key: command_key.clone(),
+                execution_binding: None,
+                recorded_at_ms: started_at_ms,
+            },
+            TaskRunReceipt {
+                task_id: task.task_id.clone(),
+                task_digest: task.task_digest.clone(),
+                profile_id: task.profile_id.clone().expect("worker profile id"),
+                command_key,
+                run_id: started.run_id,
+                worker_id: started.worker_id,
+                execution_binding: None,
+                recorded_at_ms: started_at_ms + 90,
+            },
+        )
+    }
+
+    fn acknowledge_legacy_worker_events(core: &mut Core, session_binding_id: &str) {
+        let mut acked_seq = 0u64;
+        loop {
+            let now_ms = 1_700_000_650_000 + acked_seq as i64;
+            let batch = match core
+                .execute(
+                    session_binding_id,
+                    Command::PullEvents {
+                        after_seq: Some(acked_seq),
+                        limit: 64,
+                        now_ms,
+                    },
+                )
+                .expect("pull legacy worker events")
+            {
+                CommandOutput::EventBatch(batch) => batch,
+                other => panic!("unexpected legacy worker event batch output: {other:?}"),
+            };
+            if batch.events.is_empty() {
+                break;
+            }
+            let batch_id = batch.batch_id.clone();
+            let to_seq = batch.to_seq;
+            let has_more = batch.has_more;
+            let ack = match core
+                .execute(
+                    session_binding_id,
+                    Command::AcknowledgeEvents {
+                        command_key: format!("ack_legacy_worker_events_{acked_seq}"),
+                        batch_id,
+                        now_ms: now_ms + 1,
+                    },
+                )
+                .expect("acknowledge legacy worker events")
+            {
+                CommandOutput::AckResult(ack) => ack,
+                other => panic!("unexpected legacy worker event ack output: {other:?}"),
+            };
+            assert_eq!(ack.acked_seq, to_seq);
+            acked_seq = ack.acked_seq;
+            if !has_more {
+                break;
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write_legacy_worker_host_fixture(
+        stores: &TestStores,
+        binding_id: &str,
+        thread_uuid: &str,
+        project: &Path,
+        plan_id: &str,
+        plan_tasks: Vec<PlanTask>,
+        outcomes: Vec<LegacyWorkerOutcome>,
+        manifest_phase: HostPhase,
+    ) -> (PlanRevision, ApprovalRecord) {
+        assert_eq!(
+            plan_tasks.len(),
+            outcomes.len(),
+            "legacy worker fixture needs one outcome per plan task"
+        );
+        let approved_task_ids: Vec<String> =
+            plan_tasks.iter().map(|task| task.id.clone()).collect();
+        let (plan, approval) = write_legacy_worker_plan_and_approval_with_tasks(
+            stores,
+            binding_id,
+            thread_uuid,
+            project,
+            plan_id,
+            plan_tasks,
+            &approved_task_ids,
+            1_700_000_321_000,
+        );
+
+        let session_dir = stores.sessions.join(&approval.approval_id);
+        make_private_dir(&session_dir);
+        let runtime_dir = session_dir.join(RUNTIME_STATE_SUBDIR);
+        make_private_dir(&runtime_dir);
+        let mut core =
+            Core::open(&runtime_dir.join("state.db")).expect("open legacy worker runtime DB");
+        let binding = core
+            .create_binding(thread_uuid, "Legacy worker host fixture")
+            .expect("create legacy worker runtime binding");
+        let session_binding_id = binding.binding_id.clone();
+
+        let mut intents = Vec::with_capacity(approval.tasks.len());
+        let mut receipts = Vec::with_capacity(approval.tasks.len());
+        for (sequence, (task, outcome)) in approval.tasks.iter().zip(outcomes.iter()).enumerate() {
+            let (intent, receipt) = record_legacy_worker(
+                &mut core,
+                &session_binding_id,
+                task,
+                &session_dir,
+                sequence,
+                *outcome,
+                1_700_000_500_000 + (sequence as i64) * 1_000,
+            );
+            intents.push(intent);
+            receipts.push(receipt);
+        }
+        acknowledge_legacy_worker_events(&mut core, &session_binding_id);
+        drop(core);
+
+        let payload = serde_json::json!({
+            "schema_version": TASK_RECEIPTS_SCHEMA_VERSION,
+            "approval_id": approval.approval_id,
+            "subject_digest": approval.subject_digest,
+            "session_binding_id": session_binding_id,
+            "pending_intents": intents,
+            "receipts": receipts,
+        });
+        write_private_json(&session_dir.join(TASK_RECEIPTS_FILENAME), &payload);
+
+        let manifest = HostSessionManifest::from_approval_record(
+            &approval,
+            Some(session_binding_id),
+            manifest_phase,
+            None,
+            None,
+            1_700_000_330_000,
+            1_700_000_600_000,
+        );
+        write_host_manifest(&session_dir, &manifest)
+            .expect("write legacy worker host manifest");
+        (plan, approval)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_legacy_plan_resolution(
+        stores: &TestStores,
+        binding_id: &str,
+        thread_uuid: &str,
+        project: &Path,
+        plan_id: &str,
+        plan_revision: u64,
+        request_key: &str,
+        created_at_ms: u64,
+        scope: ExternalResolutionScope,
+    ) -> threadlane_native::external_resolution::ExternalResolutionReceipt {
+        let external_service = ExternalResolutionService::new(
+            &stores.plans,
+            &stores.authority,
+            &stores.registry,
+            Some(&stores.sessions),
+        )
+        .expect("open legacy worker external resolution service");
+        let request = RecordExternalResolutionRequest {
+            binding_id: binding_id.to_string(),
+            thread_uuid: thread_uuid.to_string(),
+            canonical_repo_root: project.to_path_buf(),
+            target: ExternalResolutionTarget::LegacyPlan {
+                plan_id: plan_id.to_string(),
+                plan_revision,
+            },
+            scope,
+            expected_ledger_revision: None,
+            expected_job_revision: None,
+            expected_runtime_revision: None,
+            request_key: request_key.to_string(),
+            created_at_ms,
+            explanation: "The failed legacy job was resolved outside Threadlane.".to_string(),
+            evidence_refs: vec![ExternalResolutionEvidenceRef::ArtifactRef {
+                reference: format!("issue-{request_key}"),
+            }],
+        };
+        let preview = external_service
+            .preview(&request)
+            .expect("preview legacy worker external resolution");
+        external_service
+            .record(
+                &request,
+                &ExternalResolutionConfirmation {
+                    trusted_local_attested: true,
+                    thread_uuid: preview.thread_uuid.clone(),
+                    preview_digest: preview.preview_digest.clone(),
+                },
+            )
+            .expect("record legacy worker external resolution")
     }
 
     #[test]
@@ -3033,5 +3518,429 @@ mod unix_workspace_tests {
             message.source_record_id == receipt.receipt_id
                 && message.scope.job_id.as_deref() == Some(old_plan.plan_id.as_str())
         }));
+    }
+
+    #[test]
+    fn workspace_snapshot_legacy_failed_host_manifest_preserves_job_failure_with_ready_review_task() {
+        let tree = TestTree::new("legacy-failed-host-manifest");
+        let stores = TestStores::new(&tree, "stores");
+        let app_data = tree.dir("app-data");
+        let project = tree.dir("legacy-failed-host-project");
+        fs::write(project.join(".git"), b"gitdir: disposable fixture\n")
+            .expect("write disposable legacy failed-host .git marker");
+        set_mode(&project.join(".git"), 0o600);
+        let binding_id = "bnd_ws_legacy_failed_host_01";
+        let thread_uuid = "0196ed00-0000-7000-8000-000000000801";
+        let task_id = "task-legacy-failed-host-review";
+        let (plan, _approval) = write_legacy_worker_host_fixture(
+            &stores,
+            binding_id,
+            thread_uuid,
+            &project,
+            "plan_ws_legacy_failed_host_01",
+            vec![legacy_plan_task(task_id, "Legacy failed-host review task")],
+            vec![LegacyWorkerOutcome::ReadyForReview],
+            HostPhase::Failed,
+        );
+        let before_read = snapshot_tree_fingerprints(tree.path());
+
+        let service = ObservationService::new(stores.config(&app_data));
+        let snap = service
+            .workspace_snapshot(None)
+            .expect("workspace_snapshot with failed legacy host manifest");
+        let after_read = snapshot_tree_fingerprints(tree.path());
+        assert_eq!(
+            before_read, after_read,
+            "failed-host legacy fallback reads must not create locks, caches, or other files"
+        );
+
+        let history = snap
+            .job_histories
+            .iter()
+            .find(|history| history.job.job_id == plan.plan_id)
+            .expect("legacy failed-host fallback job history");
+        assert_eq!(history.job.source_id, stores.canonical_source_id());
+        assert!(history.external_resolutions.is_empty());
+        assert_eq!(history.job.state, ObservationJobState::Failed);
+        assert_eq!(history.job.execution_status, "failed");
+        assert_eq!(history.job.review_state.as_deref(), Some("pending_review"));
+        let job_attention = history
+            .current_attention
+            .as_ref()
+            .expect("independent failed job attention must remain current");
+        assert_eq!(
+            job_attention.kind,
+            WorkspaceAttentionKind::BlockedFailure
+        );
+        assert!(
+            job_attention.reason.contains("failed job"),
+            "the current attention must retain the job-level failure witness, not a promoted task row"
+        );
+        assert!(!job_attention.reason.contains(plan.plan_id.as_str()));
+        assert!(!job_attention.reason.contains(task_id));
+        let task = history
+            .tasks
+            .iter()
+            .find(|task| task.task_id == task_id)
+            .expect("legacy failed-host review task");
+        assert_eq!(task.status, "ready_for_review");
+        let task_attention = task
+            .current_attention
+            .as_ref()
+            .expect("ready-for-review task attention must remain on the task row");
+        assert_eq!(task_attention.kind, WorkspaceAttentionKind::ReviewRequired);
+        assert!(!task_attention.reason.contains(task_id));
+        assert_eq!(
+            task.acceptance_proof.status,
+            WorkspaceAcceptanceStatus::Unknown
+        );
+
+        assert!(snap.observation.jobs.iter().any(|job| {
+            job.id == plan.plan_id
+                && job.state == ObservationJobState::Failed
+                && job.execution_status == "failed"
+                && job.tasks.iter().any(|task| {
+                    task.id == task_id && task.status == "ready_for_review"
+                })
+        }));
+        assert_eq!(
+            snap.chats
+                .iter()
+                .find(|chat| chat.identity.binding_id == binding_id)
+                .map(|chat| (chat.active_job_count, chat.attention_count)),
+            Some((0, 1)),
+            "the failed job and its review task must produce one chat attention row"
+        );
+        assert_eq!(
+            snap.messages
+                .items
+                .iter()
+                .filter(|message| {
+                    message.source_kind == WorkspaceMessageSourceKind::QuestionPrompt
+                        && message.scope.job_id.as_deref() == Some(plan.plan_id.as_str())
+                })
+                .count(),
+            0,
+            "job-level failure fallback must not manufacture a duplicate human question"
+        );
+    }
+
+    #[test]
+    fn workspace_snapshot_legacy_failed_job_full_receipt_covers_job_and_task_attention() {
+        let tree = TestTree::new("legacy-failed-job-full-resolution");
+        let stores = TestStores::new(&tree, "stores");
+        let app_data = tree.dir("app-data");
+        let project = tree.dir("legacy-failed-job-full-project");
+        fs::write(project.join(".git"), b"gitdir: disposable fixture\n")
+            .expect("write disposable legacy failed-job full .git marker");
+        set_mode(&project.join(".git"), 0o600);
+        let binding_id = "bnd_ws_legacy_failed_full_01";
+        let thread_uuid = "0196ed00-0000-7000-8000-000000000802";
+        let failed_task_id = "task-legacy-job-failed";
+        let review_task_id = "task-legacy-job-review";
+        let (plan, _approval) = write_legacy_worker_host_fixture(
+            &stores,
+            binding_id,
+            thread_uuid,
+            &project,
+            "plan_ws_legacy_failed_full_01",
+            vec![
+                legacy_plan_task(failed_task_id, "Legacy failed job task"),
+                legacy_plan_task(review_task_id, "Legacy ready review task"),
+            ],
+            vec![
+                LegacyWorkerOutcome::Failed,
+                LegacyWorkerOutcome::ReadyForReview,
+            ],
+            // Keep the real record API on a quiescent Stopped host so host proof stays strict.
+            // The independent Failed job evidence comes from the terminal failed worker task;
+            // the Failed-manifest-only observation shape is covered by the no-receipt test.
+            HostPhase::Stopped,
+        );
+        let receipt = record_legacy_plan_resolution(
+            &stores,
+            binding_id,
+            thread_uuid,
+            &project,
+            &plan.plan_id,
+            plan.revision,
+            "req_ws_legacy_failed_full_01",
+            1_700_000_701_000,
+            ExternalResolutionScope::FullJob,
+        );
+        let before_read = snapshot_tree_fingerprints(tree.path());
+
+        let service = ObservationService::new(stores.config(&app_data));
+        let snap = service
+            .workspace_snapshot(None)
+            .expect("workspace_snapshot with failed legacy job full resolution");
+        let after_read = snapshot_tree_fingerprints(tree.path());
+        assert_eq!(
+            before_read, after_read,
+            "full failed-job legacy fallback reads must not create locks, caches, or other files"
+        );
+
+        let history = snap
+            .job_histories
+            .iter()
+            .find(|history| history.job.job_id == plan.plan_id)
+            .expect("legacy failed-job full fallback history");
+        assert_eq!(history.external_resolutions.len(), 1);
+        let resolution = &history.external_resolutions[0];
+        assert_eq!(resolution.receipt_id, receipt.receipt_id);
+        assert_eq!(
+            resolution.applicability,
+            WorkspaceExternalResolutionApplicability::Applicable
+        );
+        assert_eq!(resolution.scope, WorkspaceExternalResolutionScope::Job);
+        assert_eq!(
+            resolution
+                .task_ids
+                .iter()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([failed_task_id, review_task_id])
+        );
+        assert_eq!(
+            resolution.covered_attention.len(),
+            3,
+            "the closed job failure and both task attention details must be retained"
+        );
+        let covered_job = resolution
+            .covered_attention
+            .iter()
+            .find(|covered| covered.task_id.is_none())
+            .expect("covered job-level failure attention");
+        assert_eq!(
+            covered_job.attention.kind,
+            WorkspaceAttentionKind::BlockedFailure
+        );
+        assert!(
+            covered_job.attention.reason.contains("failed job"),
+            "the covered job entry must preserve the job-level failure witness"
+        );
+        let covered_tasks: BTreeMap<&str, WorkspaceAttentionKind> = resolution
+            .covered_attention
+            .iter()
+            .filter_map(|covered| {
+                Some((
+                    covered.task_id.as_deref()?,
+                    covered.attention.kind,
+                ))
+            })
+            .collect();
+        assert_eq!(
+            covered_tasks,
+            BTreeMap::from([
+                (failed_task_id, WorkspaceAttentionKind::BlockedFailure),
+                (review_task_id, WorkspaceAttentionKind::ReviewRequired),
+            ])
+        );
+        assert!(history.current_attention.is_none());
+        assert!(history
+            .tasks
+            .iter()
+            .all(|task| task.current_attention.is_none()));
+        assert_eq!(history.job.state, ObservationJobState::Unknown);
+        assert_eq!(history.job.execution_status, "resolved_externally");
+        assert_eq!(
+            history.acceptance_proof.status,
+            WorkspaceAcceptanceStatus::Unknown
+        );
+        assert_eq!(
+            history
+                .tasks
+                .iter()
+                .map(|task| (task.task_id.as_str(), task.status.as_str()))
+                .collect::<BTreeMap<_, _>>(),
+            BTreeMap::from([
+                (failed_task_id, "failed"),
+                (review_task_id, "ready_for_review"),
+            ])
+        );
+
+        assert!(snap.observation.jobs.iter().any(|job| {
+            job.id == plan.plan_id
+                && job.state == ObservationJobState::Unknown
+                && job.execution_status == "resolved_externally"
+                && job.tasks.iter().any(|task| {
+                    task.id == review_task_id && task.status == "ready_for_review"
+                })
+        }));
+        assert_eq!(
+            snap.chats
+                .iter()
+                .find(|chat| chat.identity.binding_id == binding_id)
+                .map(|chat| (chat.active_job_count, chat.attention_count)),
+            Some((0, 0))
+        );
+        assert!(snap.messages.items.iter().any(|message| {
+            message.source_record_id == receipt.receipt_id
+                && message.scope.job_id.as_deref() == Some(plan.plan_id.as_str())
+        }));
+        assert_eq!(
+            snap.messages
+                .items
+                .iter()
+                .filter(|message| {
+                    message.source_kind == WorkspaceMessageSourceKind::QuestionPrompt
+                        && message.scope.job_id.as_deref() == Some(plan.plan_id.as_str())
+                })
+                .count(),
+            0,
+            "covered job and task attention must not create duplicate human questions"
+        );
+    }
+
+    #[test]
+    fn workspace_snapshot_legacy_failed_job_partial_receipt_keeps_job_failure_current() {
+        let tree = TestTree::new("legacy-failed-job-partial-resolution");
+        let stores = TestStores::new(&tree, "stores");
+        let app_data = tree.dir("app-data");
+        let project = tree.dir("legacy-failed-job-partial-project");
+        fs::write(project.join(".git"), b"gitdir: disposable fixture\n")
+            .expect("write disposable legacy failed-job partial .git marker");
+        set_mode(&project.join(".git"), 0o600);
+        let binding_id = "bnd_ws_legacy_failed_partial_01";
+        let thread_uuid = "0196ed00-0000-7000-8000-000000000803";
+        let failed_task_id = "task-legacy-job-failed";
+        let review_task_id = "task-legacy-job-review";
+        let (plan, _approval) = write_legacy_worker_host_fixture(
+            &stores,
+            binding_id,
+            thread_uuid,
+            &project,
+            "plan_ws_legacy_failed_partial_01",
+            vec![
+                legacy_plan_task(failed_task_id, "Legacy failed job task"),
+                legacy_plan_task(review_task_id, "Legacy ready review task"),
+            ],
+            vec![
+                LegacyWorkerOutcome::Failed,
+                LegacyWorkerOutcome::ReadyForReview,
+            ],
+            HostPhase::Stopped,
+        );
+        let receipt = record_legacy_plan_resolution(
+            &stores,
+            binding_id,
+            thread_uuid,
+            &project,
+            &plan.plan_id,
+            plan.revision,
+            "req_ws_legacy_failed_partial_01",
+            1_700_000_702_000,
+            ExternalResolutionScope::Tasks {
+                task_ids: vec![review_task_id.to_string()],
+            },
+        );
+        let before_read = snapshot_tree_fingerprints(tree.path());
+
+        let service = ObservationService::new(stores.config(&app_data));
+        let snap = service
+            .workspace_snapshot(None)
+            .expect("workspace_snapshot with failed legacy job partial resolution");
+        let after_read = snapshot_tree_fingerprints(tree.path());
+        assert_eq!(
+            before_read, after_read,
+            "partial failed-job legacy fallback reads must not create locks, caches, or other files"
+        );
+
+        let history = snap
+            .job_histories
+            .iter()
+            .find(|history| history.job.job_id == plan.plan_id)
+            .expect("legacy failed-job partial fallback history");
+        assert_eq!(history.external_resolutions.len(), 1);
+        let resolution = &history.external_resolutions[0];
+        assert_eq!(resolution.receipt_id, receipt.receipt_id);
+        assert_eq!(
+            resolution.applicability,
+            WorkspaceExternalResolutionApplicability::Applicable
+        );
+        assert_eq!(
+            resolution.scope,
+            WorkspaceExternalResolutionScope::Tasks
+        );
+        assert_eq!(resolution.task_ids, vec![review_task_id.to_string()]);
+        assert_eq!(resolution.covered_attention.len(), 1);
+        assert_eq!(
+            resolution.covered_attention[0].task_id.as_deref(),
+            Some(review_task_id)
+        );
+        assert_eq!(
+            resolution.covered_attention[0].attention.kind,
+            WorkspaceAttentionKind::ReviewRequired
+        );
+        let job_attention = history
+            .current_attention
+            .as_ref()
+            .expect("partial task coverage must not erase the job failure");
+        assert_eq!(
+            job_attention.kind,
+            WorkspaceAttentionKind::BlockedFailure
+        );
+        assert!(
+            job_attention.reason.contains("failed job"),
+            "partial task coverage must retain the job-level failure witness"
+        );
+        assert!(!job_attention.reason.contains(plan.plan_id.as_str()));
+        let failed_task = history
+            .tasks
+            .iter()
+            .find(|task| task.task_id == failed_task_id)
+            .expect("legacy failed job task");
+        assert_eq!(failed_task.status, "failed");
+        assert_eq!(
+            failed_task
+                .current_attention
+                .as_ref()
+                .map(|attention| attention.kind),
+            Some(WorkspaceAttentionKind::BlockedFailure)
+        );
+        let review_task = history
+            .tasks
+            .iter()
+            .find(|task| task.task_id == review_task_id)
+            .expect("legacy review task");
+        assert_eq!(review_task.status, "ready_for_review");
+        assert!(review_task.current_attention.is_none());
+        assert_eq!(history.job.state, ObservationJobState::Failed);
+        assert_eq!(history.job.execution_status, "failed");
+        assert_ne!(history.job.execution_status, "resolved_externally");
+        assert_eq!(
+            history.acceptance_proof.status,
+            WorkspaceAcceptanceStatus::Unknown
+        );
+
+        assert!(snap.observation.jobs.iter().any(|job| {
+            job.id == plan.plan_id
+                && job.state == ObservationJobState::Failed
+                && job.execution_status != "resolved_externally"
+        }));
+        assert_eq!(
+            snap.chats
+                .iter()
+                .find(|chat| chat.identity.binding_id == binding_id)
+                .map(|chat| (chat.active_job_count, chat.attention_count)),
+            Some((0, 1)),
+            "the residual job failure must keep exactly one chat attention row"
+        );
+        assert!(snap.messages.items.iter().any(|message| {
+            message.source_record_id == receipt.receipt_id
+                && message.scope.job_id.as_deref() == Some(plan.plan_id.as_str())
+        }));
+        assert_eq!(
+            snap.messages
+                .items
+                .iter()
+                .filter(|message| {
+                    message.source_kind == WorkspaceMessageSourceKind::QuestionPrompt
+                        && message.scope.job_id.as_deref() == Some(plan.plan_id.as_str())
+                })
+                .count(),
+            0,
+            "partial task coverage must not create a duplicate human question"
+        );
     }
 }
