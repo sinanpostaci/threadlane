@@ -2096,7 +2096,7 @@ async fn codex_advisory_output_last_message_rejects_missing_empty_invalid_oversi
     fs::create_dir_all(&bin_dir).expect("create bin_dir");
 
     let dummy = write_executable_script(&bin_dir, "fake-init-cap", "#!/usr/bin/env sh\nexit 0\n");
-    let mut spec = sample_codex_advisory_spec(dummy, workdir, "capture safety checks");
+    let mut spec = sample_codex_advisory_spec(dummy, workdir.clone(), "capture safety checks");
 
     let clean_single_stream = r#"{"type":"thread.started","thread_id":"01972d12-3456-7000-8000-000000000910"}
 {"type":"turn.started"}
