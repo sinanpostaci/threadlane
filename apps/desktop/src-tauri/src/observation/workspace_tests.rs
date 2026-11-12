@@ -12,7 +12,8 @@ mod unix_workspace_tests {
     use threadlane_authority::{
         compute_authority_core_digest, compute_record_subject_digest, derive_approval_id,
         derive_command_key, derive_profile_id, verify_approval_record_integrity, ApprovalRecord,
-        ApprovedTaskRecord, APPROVALS_FILE_NAME, AUTHORITY_POLICY_VERSION, AUTHORITY_SCHEMA_VERSION,
+        ApprovedTaskRecord, APPROVALS_FILE_NAME, AUTHORITY_POLICY_VERSION,
+        AUTHORITY_SCHEMA_VERSION,
     };
     use threadlane_core::observation::{
         current_observation_time_ms, serialize_workspace_native_sample_sidecar, ObservationJob,
@@ -27,6 +28,10 @@ mod unix_workspace_tests {
     use threadlane_core::{
         Command, CommandOutput, Core, WorkerAcceptanceState, WorkerCompletionRecord,
         WorkerOutcomeSummary, WorkerStatus, WorkerWorktreeUpdate,
+    };
+    use threadlane_host::{
+        write_host_manifest, HostPhase, HostSessionManifest, TaskDispatchIntent, TaskRunReceipt,
+        RUNTIME_STATE_SUBDIR, TASK_RECEIPTS_FILENAME, TASK_RECEIPTS_SCHEMA_VERSION,
     };
     use threadlane_native::coworker_observation::{
         read_scoped_workspace_job_histories, WorkspaceHistoryDiagnosticKind, WorkspaceHistoryStores,
@@ -51,10 +56,6 @@ mod unix_workspace_tests {
     use threadlane_native::profile_flow::{
         ExecutionPolicy, PolicyAllowRule, RoleExecutionRoute, SelectedRoleChoice,
         EXECUTION_POLICY_SCHEMA_VERSION,
-    };
-    use threadlane_host::{
-        write_host_manifest, HostPhase, HostSessionManifest, TaskDispatchIntent, TaskRunReceipt,
-        RUNTIME_STATE_SUBDIR, TASK_RECEIPTS_FILENAME, TASK_RECEIPTS_SCHEMA_VERSION,
     };
     use threadlane_plans::{
         compile_plan_revision, Difficulty, ModelChoice, ModelDefinition, PlanChange, PlanRevision,
@@ -1096,8 +1097,7 @@ mod unix_workspace_tests {
             1_700_000_330_000,
             1_700_000_600_000,
         );
-        write_host_manifest(&session_dir, &manifest)
-            .expect("write legacy worker host manifest");
+        write_host_manifest(&session_dir, &manifest).expect("write legacy worker host manifest");
         (plan, approval)
     }
 
@@ -3546,7 +3546,8 @@ mod unix_workspace_tests {
     }
 
     #[test]
-    fn workspace_snapshot_legacy_failed_host_manifest_preserves_job_failure_with_ready_review_task() {
+    fn workspace_snapshot_legacy_failed_host_manifest_preserves_job_failure_with_ready_review_task()
+    {
         let tree = TestTree::new("legacy-failed-host-manifest");
         let stores = TestStores::new(&tree, "stores");
         let app_data = tree.dir("app-data");
@@ -3593,10 +3594,7 @@ mod unix_workspace_tests {
             .current_attention
             .as_ref()
             .expect("independent failed job attention must remain current");
-        assert_eq!(
-            job_attention.kind,
-            WorkspaceAttentionKind::BlockedFailure
-        );
+        assert_eq!(job_attention.kind, WorkspaceAttentionKind::BlockedFailure);
         assert!(
             job_attention.reason.contains("failed job"),
             "the current attention must retain the job-level failure witness, not a promoted task row"
@@ -3624,9 +3622,10 @@ mod unix_workspace_tests {
             job.id == plan.plan_id
                 && job.state == ObservationJobState::Failed
                 && job.execution_status == "failed"
-                && job.tasks.iter().any(|task| {
-                    task.id == task_id && task.status == "ready_for_review"
-                })
+                && job
+                    .tasks
+                    .iter()
+                    .any(|task| task.id == task_id && task.status == "ready_for_review")
         }));
         assert_eq!(
             snap.chats
@@ -3747,12 +3746,7 @@ mod unix_workspace_tests {
         let covered_tasks: BTreeMap<&str, WorkspaceAttentionKind> = resolution
             .covered_attention
             .iter()
-            .filter_map(|covered| {
-                Some((
-                    covered.task_id.as_deref()?,
-                    covered.attention.kind,
-                ))
-            })
+            .filter_map(|covered| Some((covered.task_id.as_deref()?, covered.attention.kind)))
             .collect();
         assert_eq!(
             covered_tasks,
@@ -3788,9 +3782,10 @@ mod unix_workspace_tests {
             job.id == plan.plan_id
                 && job.state == ObservationJobState::Unknown
                 && job.execution_status == "resolved_externally"
-                && job.tasks.iter().any(|task| {
-                    task.id == review_task_id && task.status == "ready_for_review"
-                })
+                && job
+                    .tasks
+                    .iter()
+                    .any(|task| task.id == review_task_id && task.status == "ready_for_review")
         }));
         assert_eq!(
             snap.chats
@@ -3883,10 +3878,7 @@ mod unix_workspace_tests {
             resolution.applicability,
             WorkspaceExternalResolutionApplicability::Applicable
         );
-        assert_eq!(
-            resolution.scope,
-            WorkspaceExternalResolutionScope::Tasks
-        );
+        assert_eq!(resolution.scope, WorkspaceExternalResolutionScope::Tasks);
         assert_eq!(resolution.task_ids, vec![review_task_id.to_string()]);
         assert_eq!(resolution.covered_attention.len(), 1);
         assert_eq!(
@@ -3901,10 +3893,7 @@ mod unix_workspace_tests {
             .current_attention
             .as_ref()
             .expect("partial task coverage must not erase the job failure");
-        assert_eq!(
-            job_attention.kind,
-            WorkspaceAttentionKind::BlockedFailure
-        );
+        assert_eq!(job_attention.kind, WorkspaceAttentionKind::BlockedFailure);
         assert!(
             job_attention.reason.contains("failed job"),
             "partial task coverage must retain the job-level failure witness"
