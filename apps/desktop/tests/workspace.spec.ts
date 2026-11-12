@@ -1040,8 +1040,91 @@ test.describe('Workspace semantic contract fixtures', () => {
   test('distinguishes superseded historical attempt failures from active human approval attention', async ({
     page,
   }) => {
+    const baseSnapshot = buildHistoricalFailureWorkspaceSnapshot();
+    const fixtureSourceId = baseSnapshot.job_histories[0]?.job.source_id ?? 'default';
+    const retiredPlanningHistory = {
+      job: {
+        source_id: fixtureSourceId,
+        job_id: 'job_retired_plan_draft_01',
+        binding_id: CHAT_BETA_SAME_PROJECT_IDENTITY.binding_id,
+        chat_identity: CHAT_BETA_SAME_PROJECT_IDENTITY,
+        title: 'Retired Initial Plan Draft',
+        job_revision: 2,
+        state: 'unknown' as const,
+        phase: 'held',
+        approval_status: 'superseded',
+        execution_status: 'not_started',
+        review_state: null,
+        created_at_ms: FIXTURE_BASE_NOW_MS - 90_000,
+        updated_at_ms: FIXTURE_BASE_NOW_MS - 45_000,
+        summary: 'Initial unstarted planning brief superseded before approval.',
+      },
+      tasks: [],
+      runs: [],
+      outbox: [],
+      combined_candidates: [],
+      result: null,
+      links: {
+        source_plan_id: 'plan_attn_01',
+        source_plan_revision: 1,
+        source_approval_id: null,
+        source_work_brief_id: 'brf_attn_01',
+        planning_grant_id: null,
+        planning_reservation_id: null,
+        supersedes_job_id: null,
+        superseded_by_job_id: 'job_active_attention_02',
+        parent_job_id: null,
+        follow_up_job_ids: ['job_active_attention_02'],
+        architect_advice_ids: [],
+        source_request_ids: [],
+      },
+      historical_failure: null,
+      current_attention: null,
+      acceptance_proof: {
+        status: 'unknown' as const,
+        accepted_candidate_id: null,
+        combined_candidate_id: null,
+        review_verdict_id: null,
+        review_receipt_id: null,
+        integration_receipt_id: null,
+        closure_reservation_id: null,
+        closure_verdict_id: null,
+        verified_at_ms: null,
+      },
+      truncation: {
+        tasks_omitted: 0,
+        attempts_omitted: 0,
+        candidates_omitted: 0,
+        runs_omitted: 0,
+        outbox_omitted: 0,
+        combined_candidates_omitted: 0,
+      },
+    };
+    const genuineFailedHistory = {
+      ...retiredPlanningHistory,
+      job: {
+        ...retiredPlanningHistory.job,
+        job_id: 'job_cancelled_legacy_03',
+        title: 'Cancelled Legacy Experiment',
+        state: 'failed' as const,
+        phase: 'cancelled',
+        approval_status: 'superseded',
+        execution_status: 'stopped',
+        updated_at_ms: FIXTURE_BASE_NOW_MS - 50_000,
+        summary: 'Explicitly cancelled job remains truthfully Failed.',
+      },
+    };
+    const augmentedSnapshot = parseWorkspaceSnapshot({
+      ...baseSnapshot,
+      job_histories: [
+        ...baseSnapshot.job_histories,
+        retiredPlanningHistory,
+        genuineFailedHistory,
+      ],
+    });
+
     await installWorkspaceTauriFixture(page, {
-      workspaceSnapshot: buildHistoricalFailureWorkspaceSnapshot(),
+      workspaceSnapshot: augmentedSnapshot,
     });
     await page.setViewportSize({ width: 1040, height: 760 });
     await page.goto('/');
@@ -1076,11 +1159,39 @@ test.describe('Workspace semantic contract fixtures', () => {
       recoveredJobCard.getByText(/awaiting.*approval|needs approval/i),
     ).toHaveCount(0);
 
-    // Switch to sibling chat Beta where active approval attention is genuinely pending.
+    // Switch to sibling chat Beta where active approval attention is genuinely pending alongside a retired planning draft.
     await sidebar.getByText('Release Verification Gate').first().click();
     await chatSurfaceTab(page, 'Jobs').click();
 
-    const approvalJobCard = visibleJobsPanel(page)
+    const betaJobsPanel = visibleJobsPanel(page);
+    const retiredPlanCard = betaJobsPanel
+      .locator('article.tl-wp-job-card')
+      .filter({ hasText: 'Retired Initial Plan Draft' })
+      .first();
+    await expect(retiredPlanCard).toBeVisible();
+    await expect(
+      retiredPlanCard.locator('.tl-wp-pill[data-tone="neutral"] .tl-wp-pill-label', {
+        hasText: /^Superseded$/,
+      }),
+    ).toHaveCount(1);
+    await expect(
+      retiredPlanCard.locator('.tl-wp-pill .tl-wp-pill-label', {
+        hasText: /^(Failed|Unknown|Needs user|Needs approval|On hold)$/i,
+      }),
+    ).toHaveCount(0);
+
+    const genuineFailedCard = betaJobsPanel
+      .locator('article.tl-wp-job-card')
+      .filter({ hasText: 'Cancelled Legacy Experiment' })
+      .first();
+    await expect(genuineFailedCard).toBeVisible();
+    await expect(
+      genuineFailedCard.locator('.tl-wp-pill[data-tone="danger"] .tl-wp-pill-label', {
+        hasText: /^Failed$/,
+      }),
+    ).toHaveCount(1);
+
+    const approvalJobCard = betaJobsPanel
       .locator('article.tl-wp-job-card')
       .filter({ hasText: 'Plan Approval Gate' })
       .first();

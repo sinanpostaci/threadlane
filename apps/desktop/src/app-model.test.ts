@@ -2403,4 +2403,1160 @@ describe('projectWorkspaceSnapshot production projection', () => {
       null,
     );
   });
+
+  it('counts distinct actionable job IDs per chat in needsHumanCount while preserving all job and task blocker detail rows', () => {
+    const idSingleJob = makeChatIdentity({
+      source_id: 'src-a',
+      binding_id: 'bnd_attn_single',
+      thread_uuid: UUID_CHAT_A,
+      canonical_project_scope: '/work/alpha',
+    });
+    const idMultiTaskCauses = makeChatIdentity({
+      source_id: 'src-a',
+      binding_id: 'bnd_attn_tasks',
+      thread_uuid: UUID_CHAT_B,
+      canonical_project_scope: '/work/alpha',
+    });
+    const idTwoJobsSameProse = makeChatIdentity({
+      source_id: 'src-a',
+      binding_id: 'bnd_attn_two_jobs',
+      thread_uuid: UUID_CHAT_C,
+      canonical_project_scope: '/work/alpha',
+    });
+    const idSecondScopeSameJobId = makeChatIdentity({
+      source_id: 'src-a',
+      binding_id: 'bnd_attn_two_jobs',
+      thread_uuid: UUID_CHAT_C,
+      canonical_project_scope: '/work/alpha-wt',
+    });
+
+    const makeAttentionTask = (
+      taskId: string,
+      kind: 'needs_user_input' | 'blocked_failure' | 'review_required',
+      reason: string,
+      questionId: string | null = null,
+    ): WorkspaceJobHistory['tasks'][number] => ({
+      task_id: taskId,
+      title: `Task ${taskId}`,
+      role: 'coder',
+      difficulty: 'medium',
+      stage: 'execution',
+      status: 'blocked',
+      depends_on: [],
+      current_attempt_no: 1,
+      attempts: [],
+      candidates: [],
+      active_candidate_id: null,
+      accepted_candidate_id: null,
+      historical_failure: null,
+      current_attention: {
+        kind,
+        reason,
+        next_step: 'Respond or reconcile in Codex.',
+        blocking_hold_ids: [`hold_${taskId}`],
+        blocking_outbox_ids: [],
+        question_id: questionId,
+        updated_at_ms: NOW_MS - 1_500,
+      },
+      acceptance_proof: {
+        status: 'unknown',
+        accepted_candidate_id: null,
+        combined_candidate_id: null,
+        review_verdict_id: null,
+        review_receipt_id: null,
+        integration_receipt_id: null,
+        closure_reservation_id: null,
+        closure_verdict_id: null,
+        verified_at_ms: null,
+      },
+    });
+
+    // 1. One job blocker + two task blockers on the same job => badge counts 1, all 3 detail rows remain.
+    const jobWithTwoTaskBlockers = makeWorkspaceJobHistoryRecord(idSingleJob, {
+      job: {
+        source_id: idSingleJob.source_id,
+        job_id: 'job_one_with_two_tasks',
+        binding_id: idSingleJob.binding_id,
+        chat_identity: idSingleJob,
+        title: 'Migration package',
+        job_revision: 4,
+        state: 'needs_user',
+        phase: 'held',
+        approval_status: 'approved',
+        execution_status: 'held',
+        review_state: null,
+        created_at_ms: NOW_MS - 30_000,
+        updated_at_ms: NOW_MS - 1_000,
+        summary: 'Job held pending clarification and review.',
+      },
+      tasks: [
+        makeAttentionTask(
+          'task_clarify_01',
+          'needs_user_input',
+          'Clarify migration rollback behavior.',
+          'q_task_01',
+        ),
+        makeAttentionTask(
+          'task_review_02',
+          'review_required',
+          'Review candidate diff before integration.',
+        ),
+      ],
+      current_attention: {
+        kind: 'needs_user_input',
+        reason: 'Job awaits operator clarification.',
+        next_step: 'Answer the pending question in Codex.',
+        blocking_hold_ids: ['hold_job_01'],
+        blocking_outbox_ids: [],
+        question_id: 'q_task_01',
+        updated_at_ms: NOW_MS - 1_000,
+      },
+    });
+
+    // 2. Multiple distinct task attention causes inside ONE job (no job-level current_attention) => badge counts 1, all 3 task rows remain.
+    const jobWithThreeTaskCauses = makeWorkspaceJobHistoryRecord(idMultiTaskCauses, {
+      job: {
+        source_id: idMultiTaskCauses.source_id,
+        job_id: 'job_three_task_causes',
+        binding_id: idMultiTaskCauses.binding_id,
+        chat_identity: idMultiTaskCauses,
+        title: 'Multi-task execution job',
+        job_revision: 5,
+        state: 'needs_user',
+        phase: 'execution',
+        approval_status: 'approved',
+        execution_status: 'running',
+        review_state: 'pending_review',
+        created_at_ms: NOW_MS - 25_000,
+        updated_at_ms: NOW_MS - 1_200,
+        summary: 'Three tasks require operator action.',
+      },
+      tasks: [
+        makeAttentionTask('t_input', 'needs_user_input', 'Specify target schema name.'),
+        makeAttentionTask('t_fail', 'blocked_failure', 'Sandbox check failed with exit 1.'),
+        makeAttentionTask('t_review', 'review_required', 'Candidate awaits structured review.'),
+      ],
+      current_attention: null,
+    });
+
+    // 3. Two distinct jobs in the same chat sharing identical prose => badge counts 2;
+    //    and a job in another chat sharing the exact same job_id + identical prose stays scoped per chat.
+    const sharedReasonProse = 'Plan revision awaits explicit operator approval in Codex.';
+    const sharedNextStepProse = 'Open Codex and approve or amend the plan.';
+    const jobProseA = makeWorkspaceJobHistoryRecord(idTwoJobsSameProse, {
+      job: {
+        source_id: idTwoJobsSameProse.source_id,
+        job_id: 'job_shared_local_id',
+        binding_id: idTwoJobsSameProse.binding_id,
+        chat_identity: idTwoJobsSameProse,
+        title: 'Identical approval title',
+        job_revision: 2,
+        state: 'needs_user',
+        phase: 'awaiting_approval',
+        approval_status: 'awaiting_approval',
+        execution_status: 'not_started',
+        review_state: null,
+        created_at_ms: NOW_MS - 20_000,
+        updated_at_ms: NOW_MS - 1_100,
+        summary: sharedReasonProse,
+      },
+      current_attention: {
+        kind: 'needs_approval',
+        reason: sharedReasonProse,
+        next_step: sharedNextStepProse,
+        blocking_hold_ids: [],
+        blocking_outbox_ids: [],
+        question_id: null,
+        updated_at_ms: NOW_MS - 1_100,
+      },
+    });
+    const jobProseB = makeWorkspaceJobHistoryRecord(idTwoJobsSameProse, {
+      job: {
+        source_id: idTwoJobsSameProse.source_id,
+        job_id: 'job_second_distinct_id',
+        binding_id: idTwoJobsSameProse.binding_id,
+        chat_identity: idTwoJobsSameProse,
+        title: 'Identical approval title',
+        job_revision: 2,
+        state: 'needs_user',
+        phase: 'awaiting_approval',
+        approval_status: 'awaiting_approval',
+        execution_status: 'not_started',
+        review_state: null,
+        created_at_ms: NOW_MS - 19_000,
+        updated_at_ms: NOW_MS - 900,
+        summary: sharedReasonProse,
+      },
+      current_attention: {
+        kind: 'needs_approval',
+        reason: sharedReasonProse,
+        next_step: sharedNextStepProse,
+        blocking_hold_ids: [],
+        blocking_outbox_ids: [],
+        question_id: null,
+        updated_at_ms: NOW_MS - 900,
+      },
+    });
+    const jobOtherChatSameIdAndProse = makeWorkspaceJobHistoryRecord(
+      idSecondScopeSameJobId,
+      {
+        job: {
+          source_id: idSecondScopeSameJobId.source_id,
+          job_id: 'job_shared_local_id',
+          binding_id: idSecondScopeSameJobId.binding_id,
+          chat_identity: idSecondScopeSameJobId,
+          title: 'Identical approval title',
+          job_revision: 2,
+          state: 'needs_user',
+          phase: 'awaiting_approval',
+          approval_status: 'awaiting_approval',
+          execution_status: 'not_started',
+          review_state: null,
+          created_at_ms: NOW_MS - 18_000,
+          updated_at_ms: NOW_MS - 800,
+          summary: sharedReasonProse,
+        },
+        current_attention: {
+          kind: 'needs_approval',
+          reason: sharedReasonProse,
+          next_step: sharedNextStepProse,
+          blocking_hold_ids: [],
+          blocking_outbox_ids: [],
+          question_id: null,
+          updated_at_ms: NOW_MS - 800,
+        },
+      },
+    );
+
+    const ws = makeWorkspaceSnapshotFixture({
+      native_samples: [
+        makeLiveNativeSample(idSingleJob, { activity: 'idle' }),
+        makeLiveNativeSample(idMultiTaskCauses, { activity: 'working' }),
+        makeLiveNativeSample(idTwoJobsSameProse, { activity: 'idle' }),
+        makeLiveNativeSample(idSecondScopeSameJobId, { activity: 'idle' }),
+      ],
+      job_histories: [
+        jobWithTwoTaskBlockers,
+        jobWithThreeTaskCauses,
+        jobProseA,
+        jobProseB,
+        jobOtherChatSameIdAndProse,
+      ],
+    });
+
+    const keySingle = formatWorkspaceChatIdentityKey(idSingleJob)!;
+    const projSingle = projectWorkspaceSnapshot(ws, {
+      nowMs: NOW_MS,
+      selectedChatKey: keySingle,
+    });
+    const sidebarSingle = projSingle.visibleProjects
+      .flatMap((p) => p.chats)
+      .find((c) => c.chatKey === keySingle)!;
+    assert.equal(sidebarSingle.needsHumanCount, 1);
+    assert.equal(sidebarSingle.needsHumanBadgeLabel, '1 needs you');
+    assert.equal(projSingle.selectedChat?.needsHumanCount, 1);
+    assert.equal(projSingle.selectedChat?.blockers.length, 3);
+    assert.deepEqual(
+      projSingle.selectedChat?.blockers.map((b) => b.origin),
+      ['job_attention', 'task_attention', 'task_attention'],
+    );
+
+    const keyMultiTask = formatWorkspaceChatIdentityKey(idMultiTaskCauses)!;
+    const projMultiTask = projectWorkspaceSnapshot(ws, {
+      nowMs: NOW_MS,
+      selectedChatKey: keyMultiTask,
+    });
+    const sidebarMultiTask = projMultiTask.visibleProjects
+      .flatMap((p) => p.chats)
+      .find((c) => c.chatKey === keyMultiTask)!;
+    assert.equal(sidebarMultiTask.needsHumanCount, 1);
+    assert.equal(sidebarMultiTask.needsHumanBadgeLabel, '1 needs you');
+    assert.equal(projMultiTask.selectedChat?.needsHumanCount, 1);
+    assert.equal(projMultiTask.selectedChat?.blockers.length, 3);
+    assert.deepEqual(
+      projMultiTask.selectedChat?.blockers.map((b) => b.kind),
+      ['needs_user_input', 'blocked_failure', 'review_required'],
+    );
+
+    const keyTwoJobs = formatWorkspaceChatIdentityKey(idTwoJobsSameProse)!;
+    const projTwoJobs = projectWorkspaceSnapshot(ws, {
+      nowMs: NOW_MS,
+      selectedChatKey: keyTwoJobs,
+    });
+    const sidebarTwoJobs = projTwoJobs.visibleProjects
+      .flatMap((p) => p.chats)
+      .find((c) => c.chatKey === keyTwoJobs)!;
+    assert.equal(sidebarTwoJobs.needsHumanCount, 2);
+    assert.equal(sidebarTwoJobs.needsHumanBadgeLabel, '2 need you');
+    assert.equal(projTwoJobs.selectedChat?.needsHumanCount, 2);
+    assert.equal(projTwoJobs.selectedChat?.blockers.length, 2);
+
+    const keyOtherChat = formatWorkspaceChatIdentityKey(idSecondScopeSameJobId)!;
+    const sidebarOtherChat = projTwoJobs.visibleProjects
+      .flatMap((p) => p.chats)
+      .find((c) => c.chatKey === keyOtherChat)!;
+    assert.equal(sidebarOtherChat.needsHumanCount, 1);
+    // 1 (idSingleJob) + 1 (idMultiTaskCauses) + 2 (idTwoJobsSameProse) + 1 (idSecondScopeSameJobId) = 5
+    assert.equal(projTwoJobs.activeNeedsHumanCount, 5);
+    assert.equal(projTwoJobs.totalNeedsHumanCount, 5);
+  });
+
+  it('retains independent native waiting signals, preserves standalone question and waiting-request identities, and enforces chatSummary.attention_count lower bound', () => {
+    const idNativeAndJob = makeChatIdentity({
+      source_id: 'src-a',
+      binding_id: 'bnd_native_plus_job',
+      thread_uuid: UUID_CHAT_A,
+      canonical_project_scope: '/work/alpha',
+    });
+    const idStandaloneSignals = makeChatIdentity({
+      source_id: 'src-a',
+      binding_id: 'bnd_standalone_signals',
+      thread_uuid: UUID_CHAT_B,
+      canonical_project_scope: '/work/alpha',
+    });
+    const idOmittedLowerBound = makeChatIdentity({
+      source_id: 'src-a',
+      binding_id: 'bnd_omitted_bound',
+      thread_uuid: UUID_CHAT_C,
+      canonical_project_scope: '/work/alpha',
+    });
+
+    // Chat 1: 1 actionable job (with 1 job blocker + 1 task blocker) AND independent native `waiting_for_input` => count = 2.
+    const jobAlongsideNative = makeWorkspaceJobHistoryRecord(idNativeAndJob, {
+      job: {
+        source_id: idNativeAndJob.source_id,
+        job_id: 'job_alongside_native',
+        binding_id: idNativeAndJob.binding_id,
+        chat_identity: idNativeAndJob,
+        title: 'Coworker waiting for input',
+        job_revision: 3,
+        state: 'needs_user',
+        phase: 'held',
+        approval_status: 'approved',
+        execution_status: 'held',
+        review_state: null,
+        created_at_ms: NOW_MS - 15_000,
+        updated_at_ms: NOW_MS - 1_000,
+        summary: 'Coworker is waiting for your input in Codex.',
+      },
+      tasks: [
+        {
+          task_id: 'task_alongside_native',
+          title: 'Subtask held',
+          role: 'coder',
+          difficulty: 'easy',
+          stage: 'execution',
+          status: 'held',
+          depends_on: [],
+          current_attempt_no: 1,
+          attempts: [],
+          candidates: [],
+          active_candidate_id: null,
+          accepted_candidate_id: null,
+          historical_failure: null,
+          current_attention: {
+            kind: 'on_hold',
+            reason: 'Coworker is waiting for your input in Codex.',
+            next_step: 'Respond in Codex.',
+            blocking_hold_ids: ['hold_sub_01'],
+            blocking_outbox_ids: [],
+            question_id: null,
+            updated_at_ms: NOW_MS - 1_000,
+          },
+          acceptance_proof: {
+            status: 'unknown',
+            accepted_candidate_id: null,
+            combined_candidate_id: null,
+            review_verdict_id: null,
+            review_receipt_id: null,
+            integration_receipt_id: null,
+            closure_reservation_id: null,
+            closure_verdict_id: null,
+            verified_at_ms: null,
+          },
+        },
+      ],
+      current_attention: {
+        kind: 'needs_user_input',
+        reason: 'Coworker is waiting for your input in Codex.',
+        next_step: 'Respond in Codex.',
+        blocking_hold_ids: ['hold_main_01'],
+        blocking_outbox_ids: [],
+        question_id: null,
+        updated_at_ms: NOW_MS - 1_000,
+      },
+    });
+
+    // Chat 2: 1 actionable job with question_id 'q_job_linked', 1 standalone record matching 'q_job_linked',
+    // 2 unrelated standalone question records ('q_standalone_01', 'q_standalone_02') with `job_id: 'unknown'` and identical prose,
+    // 2 unrelated standalone waiting requests ('req_standalone_01', 'req_standalone_02') with `job_id: null` and identical prose,
+    // plus 1 waiting request linked to 'job_linked_q'.
+    const identicalStandaloneQuestionProse = 'Confirm target environment before proceeding.';
+    const jobLinkedQuestion = makeWorkspaceJobHistoryRecord(idStandaloneSignals, {
+      job: {
+        source_id: idStandaloneSignals.source_id,
+        job_id: 'job_linked_q',
+        binding_id: idStandaloneSignals.binding_id,
+        chat_identity: idStandaloneSignals,
+        title: 'Job with linked question',
+        job_revision: 2,
+        state: 'needs_user',
+        phase: 'briefing',
+        approval_status: 'not_requested',
+        execution_status: 'not_started',
+        review_state: null,
+        created_at_ms: NOW_MS - 20_000,
+        updated_at_ms: NOW_MS - 1_500,
+        summary: identicalStandaloneQuestionProse,
+      },
+      current_attention: {
+        kind: 'needs_user_input',
+        reason: identicalStandaloneQuestionProse,
+        next_step: 'Answer question in Codex.',
+        blocking_hold_ids: [],
+        blocking_outbox_ids: [],
+        question_id: 'q_job_linked',
+        updated_at_ms: NOW_MS - 1_500,
+      },
+    });
+    const makeStandaloneQuestionRecord = (
+      questionId: string,
+      updatedAtMs: number,
+    ): WorkspaceJobHistory =>
+      makeWorkspaceJobHistoryRecord(idStandaloneSignals, {
+        job: {
+          source_id: idStandaloneSignals.source_id,
+          job_id: 'unknown',
+          binding_id: idStandaloneSignals.binding_id,
+          chat_identity: idStandaloneSignals,
+          title: 'Standalone briefing question',
+          job_revision: 1,
+          state: 'needs_user',
+          phase: 'briefing',
+          approval_status: 'not_requested',
+          execution_status: 'not_started',
+          review_state: null,
+          created_at_ms: NOW_MS - 18_000,
+          updated_at_ms: updatedAtMs,
+          summary: identicalStandaloneQuestionProse,
+        },
+        current_attention: {
+          kind: 'needs_user_input',
+          reason: identicalStandaloneQuestionProse,
+          next_step: 'Answer question in Codex.',
+          blocking_hold_ids: [],
+          blocking_outbox_ids: [],
+          question_id: questionId,
+          updated_at_ms: updatedAtMs,
+        },
+      });
+
+    const identicalWaitingReqSummary = 'Waiting for operator confirmation on standalone request.';
+    const reqStandalone1 = makeRequest({
+      source_id: idStandaloneSignals.source_id,
+      id: 'req_standalone_01',
+      job_id: null,
+      binding_id: idStandaloneSignals.binding_id,
+      thread_uuid: idStandaloneSignals.thread_uuid,
+      title: 'Standalone request',
+      summary: identicalWaitingReqSummary,
+      state: 'waiting_for_user',
+      updated_at_ms: NOW_MS - 900,
+    });
+    const reqStandalone2 = makeRequest({
+      source_id: idStandaloneSignals.source_id,
+      id: 'req_standalone_02',
+      job_id: null,
+      binding_id: idStandaloneSignals.binding_id,
+      thread_uuid: idStandaloneSignals.thread_uuid,
+      title: 'Standalone request',
+      summary: identicalWaitingReqSummary,
+      state: 'waiting_for_user',
+      updated_at_ms: NOW_MS - 800,
+    });
+    const reqJobLinked = makeRequest({
+      source_id: idStandaloneSignals.source_id,
+      id: 'req_linked_to_job',
+      job_id: 'job_linked_q',
+      binding_id: idStandaloneSignals.binding_id,
+      thread_uuid: idStandaloneSignals.thread_uuid,
+      title: 'Job-linked waiting request',
+      summary: identicalWaitingReqSummary,
+      state: 'waiting_for_user',
+      updated_at_ms: NOW_MS - 700,
+    });
+
+    // Chat 3: Backend chatSummary.attention_count (4) exceeds visible actionable jobs (1) because older histories were omitted.
+    const jobVisibleUnderBound = makeWorkspaceJobHistoryRecord(idOmittedLowerBound, {
+      job: {
+        source_id: idOmittedLowerBound.source_id,
+        job_id: 'job_visible_01',
+        binding_id: idOmittedLowerBound.binding_id,
+        chat_identity: idOmittedLowerBound,
+        title: 'Visible attention job',
+        job_revision: 2,
+        state: 'needs_user',
+        phase: 'awaiting_approval',
+        approval_status: 'awaiting_approval',
+        execution_status: 'not_started',
+        review_state: null,
+        created_at_ms: NOW_MS - 12_000,
+        updated_at_ms: NOW_MS - 600,
+        summary: 'Approval pending.',
+      },
+      current_attention: {
+        kind: 'needs_approval',
+        reason: 'Plan awaits approval.',
+        next_step: 'Approve in Codex.',
+        blocking_hold_ids: [],
+        blocking_outbox_ids: [],
+        question_id: null,
+        updated_at_ms: NOW_MS - 600,
+      },
+    });
+
+    const ws = makeWorkspaceSnapshotFixture({
+      observation: makeSnapshot({
+        sources: [makeSource({ id: 'src-a', project_path: '/work/alpha' })],
+        requests: [reqStandalone1, reqStandalone2, reqJobLinked],
+      }),
+      chats: [
+        {
+          identity: idNativeAndJob,
+          thread_label: 'Native + Job Chat',
+          project_label: 'Alpha Repo',
+          availability: 'available',
+          activity: 'waiting_for_input',
+          configured_selection: createVerifiedConfiguredSelection('gpt-5.4', 'high'),
+          active_job_count: 1,
+          attention_count: 1,
+          updated_at_ms: NOW_MS - 1_000,
+        },
+        {
+          identity: idStandaloneSignals,
+          thread_label: 'Standalone Questions & Requests',
+          project_label: 'Alpha Repo',
+          availability: 'available',
+          activity: 'idle',
+          configured_selection: createVerifiedConfiguredSelection('gpt-5.4', 'high'),
+          active_job_count: 1,
+          attention_count: 1,
+          updated_at_ms: NOW_MS - 700,
+        },
+        {
+          identity: idOmittedLowerBound,
+          thread_label: 'Bounded Omission Chat',
+          project_label: 'Alpha Repo',
+          availability: 'available',
+          activity: 'idle',
+          configured_selection: createVerifiedConfiguredSelection('gpt-5.4', 'high'),
+          active_job_count: 4,
+          attention_count: 4,
+          updated_at_ms: NOW_MS - 600,
+        },
+      ],
+      native_samples: [
+        makeLiveNativeSample(idNativeAndJob, { activity: 'waiting_for_input' }),
+        makeLiveNativeSample(idStandaloneSignals, { activity: 'idle' }),
+        makeLiveNativeSample(idOmittedLowerBound, { activity: 'idle' }),
+      ],
+      job_histories: [
+        jobAlongsideNative,
+        jobLinkedQuestion,
+        makeStandaloneQuestionRecord('q_job_linked', NOW_MS - 1_400),
+        makeStandaloneQuestionRecord('q_standalone_01', NOW_MS - 1_300),
+        makeStandaloneQuestionRecord('q_standalone_02', NOW_MS - 1_200),
+        jobVisibleUnderBound,
+      ],
+      bounds: {
+        native_samples_omitted: 0,
+        job_histories_omitted: 3,
+        messages_omitted: 0,
+        requests_capped: false,
+        jobs_capped: true,
+      },
+    });
+
+    // Verify Chat 1: independent native waiting_for_input is retained alongside job attention (1 job + 1 native = 2).
+    const keyNative = formatWorkspaceChatIdentityKey(idNativeAndJob)!;
+    const projNative = projectWorkspaceSnapshot(ws, {
+      nowMs: NOW_MS,
+      selectedChatKey: keyNative,
+    });
+    assert.equal(projNative.selectedChat?.needsHumanCount, 2);
+    assert.equal(projNative.selectedChat?.blockers.length, 3);
+    assert.deepEqual(
+      projNative.selectedChat?.blockers.map((b) => b.origin),
+      ['native_chat', 'job_attention', 'task_attention'],
+    );
+
+    // Verify Chat 2: standalone questions and waiting requests retain explicit IDs (`jobId === null`), unique keys, and independent counts.
+    const keyStandalone = formatWorkspaceChatIdentityKey(idStandaloneSignals)!;
+    const projStandalone = projectWorkspaceSnapshot(ws, {
+      nowMs: NOW_MS,
+      selectedChatKey: keyStandalone,
+    });
+    const standaloneBlockers = projStandalone.selectedChat!.blockers;
+    // 1 job_linked_q + 3 standalone question records + 2 standalone waiting requests (reqJobLinked suppressed by job_linked_q) = 6 detail rows
+    assert.equal(standaloneBlockers.length, 6);
+    assert.equal(
+      new Set(standaloneBlockers.map((b) => b.key)).size,
+      standaloneBlockers.length,
+    );
+    const unlinkedQuestionBlockers = standaloneBlockers.filter(
+      (b) => b.origin === 'job_attention' && b.jobId === null,
+    );
+    assert.deepEqual(
+      unlinkedQuestionBlockers.map((b) => b.questionId).sort(),
+      ['q_job_linked', 'q_standalone_01', 'q_standalone_02'],
+    );
+    const unlinkedRequestBlockers = standaloneBlockers.filter(
+      (b) => b.origin === 'request_waiting_for_user',
+    );
+    assert.deepEqual(
+      unlinkedRequestBlockers.map((b) => b.requestId).sort(),
+      ['req_standalone_01', 'req_standalone_02'],
+    );
+    assert.ok(unlinkedRequestBlockers.every((b) => b.jobId === null));
+    // Distinct count = 1 (job_linked_q) + 2 (q_standalone_01, q_standalone_02; q_job_linked matched by explicit ID) + 2 (req_standalone_01, req_standalone_02) = 5.
+    assert.equal(projStandalone.selectedChat?.needsHumanCount, 5);
+
+    // Verify Chat 3: backend chatSummary.attention_count (4) > visible distinct units (1) preserves lower bound 4.
+    const keyBound = formatWorkspaceChatIdentityKey(idOmittedLowerBound)!;
+    const projBound = projectWorkspaceSnapshot(ws, {
+      nowMs: NOW_MS,
+      selectedChatKey: keyBound,
+    });
+    const sidebarBound = projBound.visibleProjects
+      .flatMap((p) => p.chats)
+      .find((c) => c.chatKey === keyBound)!;
+    assert.equal(projBound.selectedChat?.blockers.length, 1);
+    assert.equal(projBound.selectedChat?.needsHumanCount, 4);
+    assert.equal(sidebarBound.needsHumanCount, 4);
+    assert.equal(sidebarBound.needsHumanBadgeLabel, '4 need you');
+  });
+
+  it('adds independent native, question, and request attention units on top of bounded backend job attention_count', () => {
+    const idBoundedNative = makeChatIdentity({
+      source_id: 'src-a',
+      binding_id: 'bnd_bounded_50_native',
+      thread_uuid: UUID_CHAT_A,
+      canonical_project_scope: '/work/alpha',
+    });
+    const idBoundedQuestionsAndRequests = makeChatIdentity({
+      source_id: 'src-a',
+      binding_id: 'bnd_bounded_50_qr',
+      thread_uuid: UUID_CHAT_B,
+      canonical_project_scope: '/work/alpha',
+    });
+
+    const jobVisA1 = makeWorkspaceJobHistoryRecord(idBoundedNative, {
+      job: {
+        source_id: idBoundedNative.source_id,
+        job_id: 'job_vis_a1',
+        binding_id: idBoundedNative.binding_id,
+        chat_identity: idBoundedNative,
+        title: 'Visible job A1',
+        job_revision: 2,
+        state: 'needs_user',
+        phase: 'held',
+        approval_status: 'approved',
+        execution_status: 'stopped',
+        review_state: null,
+        created_at_ms: NOW_MS - 20_000,
+        updated_at_ms: NOW_MS - 2_000,
+        summary: 'Held waiting for operator.',
+      },
+      tasks: [
+        {
+          task_id: 'task_vis_a1',
+          title: 'Task A1',
+          role: 'coder',
+          difficulty: 'medium',
+          stage: 'held',
+          status: 'held',
+          current_attempt_no: 1,
+          active_candidate_id: null,
+          accepted_candidate_id: null,
+          depends_on: [],
+          attempts: [],
+          candidates: [],
+          acceptance_proof: {
+            status: 'unknown',
+            accepted_candidate_id: null,
+            combined_candidate_id: null,
+            review_verdict_id: null,
+            review_receipt_id: null,
+            integration_receipt_id: null,
+            closure_reservation_id: null,
+            closure_verdict_id: null,
+            verified_at_ms: null,
+          },
+          historical_failure: null,
+          current_attention: {
+            kind: 'on_hold',
+            reason: 'Task A1 held on same job.',
+            next_step: 'Resolve hold in Codex.',
+            blocking_hold_ids: ['hld_a1'],
+            blocking_outbox_ids: [],
+            question_id: null,
+            updated_at_ms: NOW_MS - 2_000,
+          },
+        },
+      ],
+      current_attention: {
+        kind: 'on_hold',
+        reason: 'Job A1 held.',
+        next_step: 'Resolve hold in Codex.',
+        blocking_hold_ids: ['hld_a1'],
+        blocking_outbox_ids: [],
+        question_id: null,
+        updated_at_ms: NOW_MS - 2_000,
+      },
+    });
+
+    const jobVisA2 = makeWorkspaceJobHistoryRecord(idBoundedNative, {
+      job: {
+        source_id: idBoundedNative.source_id,
+        job_id: 'job_vis_a2',
+        binding_id: idBoundedNative.binding_id,
+        chat_identity: idBoundedNative,
+        title: 'Visible job A2',
+        job_revision: 2,
+        state: 'needs_user',
+        phase: 'awaiting_approval',
+        approval_status: 'pending_approval',
+        execution_status: 'not_started',
+        review_state: null,
+        created_at_ms: NOW_MS - 15_000,
+        updated_at_ms: NOW_MS - 1_500,
+        summary: 'Plan awaits approval.',
+      },
+      current_attention: {
+        kind: 'needs_approval',
+        reason: 'Approve plan A2.',
+        next_step: 'Review and approve in Codex.',
+        blocking_hold_ids: [],
+        blocking_outbox_ids: [],
+        question_id: null,
+        updated_at_ms: NOW_MS - 1_500,
+      },
+    });
+
+    const jobVisB1 = makeWorkspaceJobHistoryRecord(idBoundedQuestionsAndRequests, {
+      job: {
+        source_id: idBoundedQuestionsAndRequests.source_id,
+        job_id: 'job_vis_b1',
+        binding_id: idBoundedQuestionsAndRequests.binding_id,
+        chat_identity: idBoundedQuestionsAndRequests,
+        title: 'Visible job B1',
+        job_revision: 2,
+        state: 'needs_user',
+        phase: 'briefing',
+        approval_status: 'draft',
+        execution_status: 'not_started',
+        review_state: null,
+        created_at_ms: NOW_MS - 14_000,
+        updated_at_ms: NOW_MS - 1_400,
+        summary: 'Waiting on linked question.',
+      },
+      current_attention: {
+        kind: 'needs_user_input',
+        reason: 'Confirm migration target.',
+        next_step: 'Reply in Codex.',
+        blocking_hold_ids: [],
+        blocking_outbox_ids: [],
+        question_id: 'q_bounded_linked',
+        updated_at_ms: NOW_MS - 1_400,
+      },
+    });
+
+    const jobVisB2 = makeWorkspaceJobHistoryRecord(idBoundedQuestionsAndRequests, {
+      job: {
+        source_id: idBoundedQuestionsAndRequests.source_id,
+        job_id: 'job_vis_b2',
+        binding_id: idBoundedQuestionsAndRequests.binding_id,
+        chat_identity: idBoundedQuestionsAndRequests,
+        title: 'Visible job B2',
+        job_revision: 2,
+        state: 'needs_user',
+        phase: 'awaiting_approval',
+        approval_status: 'pending_approval',
+        execution_status: 'not_started',
+        review_state: null,
+        created_at_ms: NOW_MS - 13_000,
+        updated_at_ms: NOW_MS - 1_300,
+        summary: 'Awaiting approval.',
+      },
+      current_attention: {
+        kind: 'needs_approval',
+        reason: 'Approve plan B2.',
+        next_step: 'Approve in Codex.',
+        blocking_hold_ids: [],
+        blocking_outbox_ids: [],
+        question_id: null,
+        updated_at_ms: NOW_MS - 1_300,
+      },
+    });
+
+    const makeUnlinkedQuestionForB = (questionId: string | null, updatedAtMs: number) =>
+      makeWorkspaceJobHistoryRecord(idBoundedQuestionsAndRequests, {
+        job: {
+          source_id: idBoundedQuestionsAndRequests.source_id,
+          job_id: 'unknown',
+          binding_id: idBoundedQuestionsAndRequests.binding_id,
+          chat_identity: idBoundedQuestionsAndRequests,
+          title: 'Standalone question signal',
+          job_revision: 1,
+          state: 'needs_user',
+          phase: 'briefing',
+          approval_status: 'draft',
+          execution_status: 'not_started',
+          review_state: null,
+          created_at_ms: updatedAtMs,
+          updated_at_ms: updatedAtMs,
+          summary: 'Identical standalone question prose.',
+        },
+        current_attention: {
+          kind: 'needs_user_input',
+          reason: 'Identical standalone question prose.',
+          next_step: 'Reply in Codex.',
+          blocking_hold_ids: [],
+          blocking_outbox_ids: [],
+          question_id: questionId,
+          updated_at_ms: updatedAtMs,
+        },
+      });
+
+    const reqBoundedUnmatched1 = makeRequest({
+      source_id: idBoundedQuestionsAndRequests.source_id,
+      id: 'req_bounded_unmatched_01',
+      job_id: null,
+      binding_id: idBoundedQuestionsAndRequests.binding_id,
+      thread_uuid: idBoundedQuestionsAndRequests.thread_uuid,
+      title: 'Standalone waiting request',
+      summary: 'Identical waiting request summary.',
+      state: 'waiting_for_user',
+      updated_at_ms: NOW_MS - 900,
+    });
+    const reqBoundedUnmatched2 = makeRequest({
+      source_id: idBoundedQuestionsAndRequests.source_id,
+      id: 'req_bounded_unmatched_02',
+      job_id: null,
+      binding_id: idBoundedQuestionsAndRequests.binding_id,
+      thread_uuid: idBoundedQuestionsAndRequests.thread_uuid,
+      title: 'Standalone waiting request',
+      summary: 'Identical waiting request summary.',
+      state: 'waiting_for_user',
+      updated_at_ms: NOW_MS - 800,
+    });
+    const reqBoundedCorrelatedToJob = makeRequest({
+      source_id: idBoundedQuestionsAndRequests.source_id,
+      id: 'req_bounded_linked_b2',
+      job_id: 'job_vis_b2',
+      binding_id: idBoundedQuestionsAndRequests.binding_id,
+      thread_uuid: idBoundedQuestionsAndRequests.thread_uuid,
+      title: 'Job-correlated waiting request',
+      summary: 'Identical waiting request summary.',
+      state: 'waiting_for_user',
+      updated_at_ms: NOW_MS - 700,
+    });
+
+    const ws = makeWorkspaceSnapshotFixture({
+      observation: makeSnapshot({
+        sources: [makeSource({ id: 'src-a', project_path: '/work/alpha' })],
+        requests: [
+          reqBoundedUnmatched1,
+          reqBoundedUnmatched2,
+          reqBoundedCorrelatedToJob,
+        ],
+      }),
+      chats: [
+        {
+          identity: idBoundedNative,
+          thread_label: 'Bounded 50 + Native Input',
+          project_label: 'Alpha Repo',
+          availability: 'available',
+          activity: 'waiting_for_input',
+          configured_selection: createVerifiedConfiguredSelection('gpt-5.4', 'high'),
+          active_job_count: 50,
+          attention_count: 50,
+          updated_at_ms: NOW_MS - 500,
+        },
+        {
+          identity: idBoundedQuestionsAndRequests,
+          thread_label: 'Bounded 50 + Standalone Questions/Requests',
+          project_label: 'Alpha Repo',
+          availability: 'available',
+          activity: 'idle',
+          configured_selection: createVerifiedConfiguredSelection('gpt-5.4', 'high'),
+          active_job_count: 50,
+          attention_count: 50,
+          updated_at_ms: NOW_MS - 400,
+        },
+      ],
+      native_samples: [
+        makeLiveNativeSample(idBoundedNative, { activity: 'waiting_for_input' }),
+        makeLiveNativeSample(idBoundedQuestionsAndRequests, { activity: 'idle' }),
+      ],
+      job_histories: [
+        jobVisA1,
+        jobVisA2,
+        jobVisB1,
+        jobVisB2,
+        makeUnlinkedQuestionForB('q_bounded_linked', NOW_MS - 1_200),
+        makeUnlinkedQuestionForB('q_bounded_unmatched_01', NOW_MS - 1_100),
+        makeUnlinkedQuestionForB('q_bounded_unmatched_02', NOW_MS - 1_000),
+        makeUnlinkedQuestionForB(null, NOW_MS - 950),
+      ],
+      bounds: {
+        native_samples_omitted: 0,
+        job_histories_omitted: 96,
+        messages_omitted: 0,
+        requests_capped: false,
+        jobs_capped: true,
+      },
+    });
+
+    // Chat A: Math.max(visibleDistinctJobs=2, backendAttentionCount=50) + independentNative=1 => 51.
+    const keyA = formatWorkspaceChatIdentityKey(idBoundedNative)!;
+    const projA = projectWorkspaceSnapshot(ws, {
+      nowMs: NOW_MS,
+      selectedChatKey: keyA,
+    });
+    const sidebarA = projA.visibleProjects
+      .flatMap((p) => p.chats)
+      .find((c) => c.chatKey === keyA)!;
+    assert.equal(projA.selectedChat?.needsHumanCount, 51);
+    assert.equal(sidebarA.needsHumanCount, 51);
+    assert.equal(sidebarA.needsHumanBadgeLabel, '51 need you');
+    // All 4 detail rows (native_chat + job_vis_a1 job + task_vis_a1 + job_vis_a2) remain visible.
+    assert.equal(projA.selectedChat?.blockers.length, 4);
+
+    // Chat B: Math.max(visibleDistinctJobs=2, backendAttentionCount=50)
+    // + 2 unmatched questions + 2 unmatched waiting_for_user requests + 1 unmatched fallback unit => 55.
+    const keyB = formatWorkspaceChatIdentityKey(idBoundedQuestionsAndRequests)!;
+    const projB = projectWorkspaceSnapshot(ws, {
+      nowMs: NOW_MS,
+      selectedChatKey: keyB,
+    });
+    const sidebarB = projB.visibleProjects
+      .flatMap((p) => p.chats)
+      .find((c) => c.chatKey === keyB)!;
+    assert.equal(projB.selectedChat?.needsHumanCount, 55);
+    assert.equal(sidebarB.needsHumanCount, 55);
+    assert.equal(sidebarB.needsHumanBadgeLabel, '55 need you');
+    // 2 job blockers + 4 unlinked question/fallback records + 2 standalone waiting requests = 8 detail rows preserved.
+    assert.equal(projB.selectedChat?.blockers.length, 8);
+    // Project roll-up sums per-chat totals across separate scopes: 51 + 55 = 106.
+    assert.equal(projB.visibleProjects[0]?.needsHumanCount, 106);
+  });
+
+  it('renders store-retired superseded unstarted planning jobs as Superseded without inflating human-attention or failed-job counts', () => {
+    const id = makeChatIdentity({
+      source_id: 'src-a',
+      binding_id: 'bnd_retired_planning',
+      thread_uuid: UUID_CHAT_A,
+      canonical_project_scope: '/work/alpha',
+    });
+
+    const retiredAwaitingApproval = makeWorkspaceJobHistoryRecord(id, {
+      job: {
+        source_id: id.source_id,
+        job_id: 'job_retired_awaiting_01',
+        binding_id: id.binding_id,
+        chat_identity: id,
+        title: 'Initial planning draft',
+        job_revision: 2,
+        state: 'unknown',
+        phase: 'awaiting_approval',
+        approval_status: 'superseded',
+        execution_status: 'not_started',
+        review_state: null,
+        created_at_ms: NOW_MS - 50_000,
+        updated_at_ms: NOW_MS - 30_000,
+        summary: 'Obsolete unapproved plan superseded by amended job.',
+      },
+      links: {
+        source_plan_id: 'plan_01',
+        source_plan_revision: 1,
+        source_approval_id: null,
+        source_work_brief_id: 'wb_01',
+        planning_grant_id: null,
+        planning_reservation_id: null,
+        supersedes_job_id: null,
+        superseded_by_job_id: 'job_retired_held_02',
+        parent_job_id: null,
+        follow_up_job_ids: [],
+        architect_advice_ids: [],
+        source_request_ids: [],
+      },
+      current_attention: null,
+    });
+
+    const retiredHeldAmendment = makeWorkspaceJobHistoryRecord(id, {
+      job: {
+        source_id: id.source_id,
+        job_id: 'job_retired_held_02',
+        binding_id: id.binding_id,
+        chat_identity: id,
+        title: 'First amended planning draft',
+        job_revision: 3,
+        state: 'unknown',
+        phase: 'held',
+        approval_status: 'superseded',
+        execution_status: 'not_started',
+        review_state: null,
+        created_at_ms: NOW_MS - 28_000,
+        updated_at_ms: NOW_MS - 15_000,
+        summary: 'Held for brief amendment and superseded by successor.',
+      },
+      links: {
+        source_plan_id: 'plan_02',
+        source_plan_revision: 1,
+        source_approval_id: null,
+        source_work_brief_id: 'wb_02',
+        planning_grant_id: null,
+        planning_reservation_id: null,
+        supersedes_job_id: 'job_retired_awaiting_01',
+        superseded_by_job_id: 'job_current_plan_03',
+        parent_job_id: null,
+        follow_up_job_ids: [],
+        architect_advice_ids: [],
+        source_request_ids: [],
+      },
+      current_attention: null,
+    });
+
+    const currentActivePlan = makeWorkspaceJobHistoryRecord(id, {
+      job: {
+        source_id: id.source_id,
+        job_id: 'job_current_plan_03',
+        binding_id: id.binding_id,
+        chat_identity: id,
+        title: 'Current amended plan',
+        job_revision: 2,
+        state: 'needs_user',
+        phase: 'awaiting_approval',
+        approval_status: 'awaiting_approval',
+        execution_status: 'not_started',
+        review_state: null,
+        created_at_ms: NOW_MS - 10_000,
+        updated_at_ms: NOW_MS - 1_000,
+        summary: 'Current plan awaits operator approval.',
+      },
+      links: {
+        source_plan_id: 'plan_03',
+        source_plan_revision: 1,
+        source_approval_id: null,
+        source_work_brief_id: 'wb_03',
+        planning_grant_id: null,
+        planning_reservation_id: null,
+        supersedes_job_id: 'job_retired_held_02',
+        superseded_by_job_id: null,
+        parent_job_id: null,
+        follow_up_job_ids: [],
+        architect_advice_ids: [],
+        source_request_ids: [],
+      },
+      current_attention: {
+        kind: 'needs_approval',
+        reason: 'Plan awaits explicit approval in Codex.',
+        next_step: 'Review and approve plan_03 in Codex.',
+        blocking_hold_ids: [],
+        blocking_outbox_ids: [],
+        question_id: null,
+        updated_at_ms: NOW_MS - 1_000,
+      },
+    });
+
+    const genuineFailedJob = makeWorkspaceJobHistoryRecord(id, {
+      job: {
+        source_id: id.source_id,
+        job_id: 'job_genuine_failed_04',
+        binding_id: id.binding_id,
+        chat_identity: id,
+        title: 'Cancelled or failed job',
+        job_revision: 3,
+        state: 'failed',
+        phase: 'held',
+        approval_status: 'superseded',
+        execution_status: 'not_started',
+        review_state: null,
+        created_at_ms: NOW_MS - 45_000,
+        updated_at_ms: NOW_MS - 25_000,
+        summary: 'Genuine failure must never be masked as Superseded.',
+      },
+      current_attention: null,
+    });
+
+    const genuineUnknownRuntimeJob = makeWorkspaceJobHistoryRecord(id, {
+      job: {
+        source_id: id.source_id,
+        job_id: 'job_unknown_runtime_05',
+        binding_id: id.binding_id,
+        chat_identity: id,
+        title: 'Degraded runtime unknown job',
+        job_revision: 3,
+        state: 'unknown',
+        phase: 'held',
+        approval_status: 'superseded',
+        execution_status: 'unknown',
+        review_state: 'unresolved',
+        created_at_ms: NOW_MS - 40_000,
+        updated_at_ms: NOW_MS - 20_000,
+        summary: 'Degraded/unknown execution state must stay Status unknown.',
+      },
+      current_attention: null,
+    });
+
+    const ws = makeWorkspaceSnapshotFixture({
+      native_samples: [makeLiveNativeSample(id, { activity: 'idle' })],
+      job_histories: [
+        retiredAwaitingApproval,
+        retiredHeldAmendment,
+        currentActivePlan,
+        genuineFailedJob,
+        genuineUnknownRuntimeJob,
+      ],
+    });
+
+    const projected = projectWorkspaceSnapshot(ws, {
+      nowMs: NOW_MS,
+      selectedChatKey: formatWorkspaceChatIdentityKey(id),
+      selectedTab: 'jobs',
+    });
+    const sc = projected.selectedChat!;
+    assert.equal(sc.needsHumanCount, 1);
+    assert.equal(sc.blockers.length, 1);
+    assert.equal(sc.blockers[0]?.jobId, 'job_current_plan_03');
+    assert.equal(sc.jobSummary.totalJobCount, 5);
+    assert.equal(sc.jobSummary.failedJobCount, 1);
+    assert.equal(sc.jobSummary.needsAttentionJobCount, 1);
+    assert.equal(sc.jobSummary.activeJobCount, 1);
+
+    const view1 = sc.jobs.items.find((j) => j.jobId === 'job_retired_awaiting_01')!;
+    const view2 = sc.jobs.items.find((j) => j.jobId === 'job_retired_held_02')!;
+    const viewFailed = sc.jobs.items.find((j) => j.jobId === 'job_genuine_failed_04')!;
+    const viewUnknown = sc.jobs.items.find((j) => j.jobId === 'job_unknown_runtime_05')!;
+    assert.equal(view1.stateRaw, 'unknown');
+    assert.equal(view1.statusLabel, 'Superseded');
+    assert.equal(view1.tone, 'neutral');
+    assert.equal(view1.isVerifiedAccepted, false);
+    assert.equal(view1.phase, 'awaiting_approval');
+    assert.equal(view1.links.superseded_by_job_id, 'job_retired_held_02');
+
+    assert.equal(view2.stateRaw, 'unknown');
+    assert.equal(view2.statusLabel, 'Superseded');
+    assert.equal(view2.tone, 'neutral');
+    assert.equal(view2.isVerifiedAccepted, false);
+    assert.equal(view2.phase, 'held');
+    assert.equal(view2.links.supersedes_job_id, 'job_retired_awaiting_01');
+    assert.equal(view2.links.superseded_by_job_id, 'job_current_plan_03');
+
+    assert.equal(viewFailed.statusLabel, 'Failed');
+    assert.equal(viewFailed.tone, 'danger');
+    assert.equal(viewUnknown.statusLabel, 'Status unknown');
+    assert.equal(viewUnknown.tone, 'neutral');
+  });
 });

@@ -71,11 +71,12 @@ use crate::coworker_observation::CoworkerObservationExecutorSpec;
 use crate::coworker_workflow::{
     read_persisted_candidate_check_report, read_persisted_job_integration_report,
     CombinedCandidateIdentity, CombinedCandidateStatus, ControllerJobRuntimeState,
-    ControllerPolicyStore, CoworkerJobPhase, CoworkerJobRecord, CoworkerTaskRecord,
-    CoworkerTaskStage, CoworkerWorkflowStore, FrozenCheckExecutionStatus, FrozenCheckSubject,
-    FrozenCheckTargetKind, OutboxDispatchKind, OutboxDispatchRecord, OutboxDispatchStatus,
-    PendingControllerEffect, PendingControllerEffectKind, PendingControllerEffectStatus,
-    ReviewVerdictOutcome, TaskAttemptExecutionArtifacts, TaskAttemptRef, TaskCandidateRef,
+    ControllerPolicyStore, CoworkerBindingLedger, CoworkerJobPhase, CoworkerJobRecord,
+    CoworkerTaskRecord, CoworkerTaskStage, CoworkerWorkflowStore, FrozenCheckExecutionStatus,
+    FrozenCheckSubject, FrozenCheckTargetKind, OutboxDispatchKind, OutboxDispatchRecord,
+    OutboxDispatchStatus, PendingControllerEffect, PendingControllerEffectKind,
+    PendingControllerEffectStatus, PlanningReservationStatus, ReviewVerdictOutcome,
+    TaskAttemptExecutionArtifacts, TaskAttemptRef, TaskCandidateRef, WorkBriefKind,
     WorkflowHoldReason, WorkflowHoldRecord,
 };
 use crate::fs_safety::constant_time_str_eq;
@@ -328,32 +329,9 @@ pub fn read_scoped_workspace_job_histories(
     let verified_sessions_root =
         verify_sessions_root_readonly(stores.sessions_dir, &mut degraded, &mut diagnostics);
 
-    // Build follow-up and supersession maps strictly across jobs that match the verified 4-part scope.
-    let mut in_scope_job_ids = BTreeSet::new();
-    for job in &ledger.jobs {
-        if job_matches_basic_chat_scope(chat_identity, job) {
-            in_scope_job_ids.insert(job.job_id.as_str());
-        }
-    }
-
-    let mut follow_ups_by_target: BTreeMap<&str, Vec<String>> = BTreeMap::new();
-    let mut superseded_by_target: BTreeMap<&str, String> = BTreeMap::new();
-    for job in &ledger.jobs {
-        if !in_scope_job_ids.contains(job.job_id.as_str()) {
-            continue;
-        }
-        if let Some(ref target_id) = job.supersedes_job_id {
-            if in_scope_job_ids.contains(target_id.as_str()) {
-                follow_ups_by_target
-                    .entry(target_id.as_str())
-                    .or_default()
-                    .push(job.job_id.clone());
-                superseded_by_target.insert(target_id.as_str(), job.job_id.clone());
-            }
-        }
-    }
-
-    let mut projected_jobs = Vec::with_capacity(ledger.jobs.len());
+    // Pre-validate every job and its companion records against the verified 4-part scope before
+    // building lineage maps or minting store-backed obsolete-planning retirement evidence.
+    let mut admitted_jobs: Vec<PrevalidatedScopedJob<'_>> = Vec::with_capacity(ledger.jobs.len());
     let mut rejected_scope_count = 0usize;
 
     for job in &ledger.jobs {
@@ -401,19 +379,20 @@ pub fn read_scoped_workspace_job_histories(
             .and_then(|(pid, rev)| plan_revisions_by_key.get(&(pid.to_string(), rev)).cloned());
 
         let mut approval_record = None;
-        if let Some(ref linkage) = job.approval_linkage {
-            if let Some(ref records_map) = authority_records_by_id {
-                let Some(found) = records_map.get(&linkage.approval_id) else {
-                    rejected_scope_count += 1;
-                    diagnostics.push(WorkspaceHistoryDiagnostic::new(
-                        WorkspaceHistoryDiagnosticKind::ApprovalVerificationFailed,
-                        Some(&job.job_id),
-                        "Job approval_id was not found in the configured read-only authority store.",
-                    ));
-                    continue;
-                };
-                approval_record = Some(found.clone());
-            }
+        if let (Some(linkage), Some(records_map)) = (
+            job.approval_linkage.as_ref(),
+            authority_records_by_id.as_ref(),
+        ) {
+            let Some(found) = records_map.get(&linkage.approval_id) else {
+                rejected_scope_count += 1;
+                diagnostics.push(WorkspaceHistoryDiagnostic::new(
+                    WorkspaceHistoryDiagnosticKind::ApprovalVerificationFailed,
+                    Some(&job.job_id),
+                    "Job approval_id was not found in the configured read-only authority store.",
+                ));
+                continue;
+            };
+            approval_record = Some(found.clone());
         }
 
         if let (Some(sroot), Some(ref approval)) = (verified_sessions_root, &approval_record) {
@@ -426,15 +405,12 @@ pub fn read_scoped_workspace_job_histories(
             );
         }
 
-        let context = WorkspaceJobLineageContext {
-            superseded_by_job_id: superseded_by_target.get(job.job_id.as_str()).cloned(),
+        let prelim_context = WorkspaceJobLineageContext {
+            superseded_by_job_id: None,
             parent_job_id: None,
-            follow_up_job_ids: follow_ups_by_target
-                .get(job.job_id.as_str())
-                .cloned()
-                .unwrap_or_default(),
-            plan_revision,
-            approval_record,
+            follow_up_job_ids: Vec::new(),
+            plan_revision: plan_revision.clone(),
+            approval_record: approval_record.clone(),
             runtime_missing_or_degraded,
         };
 
@@ -442,12 +418,85 @@ pub fn read_scoped_workspace_job_histories(
             chat_identity,
             job,
             runtime_opt.as_ref(),
-            Some(&context),
+            Some(&prelim_context),
         ) {
             rejected_scope_count += 1;
             diagnostics.push(diag);
             continue;
         }
+        if job.validate().is_err() {
+            rejected_scope_count += 1;
+            diagnostics.push(WorkspaceHistoryDiagnostic::new(
+                WorkspaceHistoryDiagnosticKind::ScopeRejected,
+                Some(&job.job_id),
+                "Job record failed typed workflow contract validation.",
+            ));
+            continue;
+        }
+
+        admitted_jobs.push(PrevalidatedScopedJob {
+            job,
+            runtime_opt,
+            plan_revision,
+            approval_record,
+            runtime_missing_or_degraded,
+        });
+    }
+
+    let mut admitted_by_id: BTreeMap<&str, &PrevalidatedScopedJob<'_>> = BTreeMap::new();
+    for entry in &admitted_jobs {
+        admitted_by_id.insert(entry.job.job_id.as_str(), entry);
+    }
+
+    let mut follow_ups_by_target: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+    let mut superseded_by_target: BTreeMap<&str, String> = BTreeMap::new();
+    for entry in &admitted_jobs {
+        if let (
+            Some(ref sup_target_id),
+            WorkBriefKind::Amendment {
+                ref target_job_id,
+                target_job_revision,
+                ..
+            },
+        ) = (&entry.job.supersedes_job_id, &entry.job.work_brief.kind)
+        {
+            if sup_target_id != target_job_id || *target_job_revision == 0 {
+                continue;
+            }
+            if admitted_by_id
+                .get(sup_target_id.as_str())
+                .is_some_and(|target_entry| {
+                    target_entry.job.job_id != entry.job.job_id
+                        && *target_job_revision <= target_entry.job.job_revision
+                })
+            {
+                follow_ups_by_target
+                    .entry(sup_target_id.as_str())
+                    .or_default()
+                    .push(entry.job.job_id.clone());
+                superseded_by_target.insert(sup_target_id.as_str(), entry.job.job_id.clone());
+            }
+        }
+    }
+
+    let mut projected_jobs = Vec::with_capacity(admitted_jobs.len());
+
+    for entry in &admitted_jobs {
+        let job = entry.job;
+        let context = WorkspaceJobLineageContext {
+            superseded_by_job_id: superseded_by_target.get(job.job_id.as_str()).cloned(),
+            parent_job_id: None,
+            follow_up_job_ids: follow_ups_by_target
+                .get(job.job_id.as_str())
+                .cloned()
+                .unwrap_or_default(),
+            plan_revision: entry.plan_revision.clone(),
+            approval_record: entry.approval_record.clone(),
+            runtime_missing_or_degraded: entry.runtime_missing_or_degraded,
+        };
+
+        let verified_obsolete_planning =
+            verify_obsolete_planning_supersession_readonly(&ledger, entry, &admitted_jobs);
 
         let verified_acceptance = if job.phase == CoworkerJobPhase::Completed {
             let store_ctx = HistoricalStoreVerificationContext {
@@ -460,7 +509,7 @@ pub fn read_scoped_workspace_job_histories(
             match verify_historical_job_acceptance_readonly(
                 chat_identity,
                 job,
-                runtime_opt.as_ref(),
+                entry.runtime_opt.as_ref(),
                 &context,
                 &store_ctx,
             ) {
@@ -478,9 +527,10 @@ pub fn read_scoped_workspace_job_histories(
         match project_coworker_job_history_internal(
             chat_identity,
             job,
-            runtime_opt.as_ref(),
+            entry.runtime_opt.as_ref(),
             Some(&context),
             verified_acceptance.as_ref(),
+            verified_obsolete_planning.as_ref(),
         ) {
             Ok(history) => projected_jobs.push(history),
             Err(diag) => {
@@ -522,15 +572,27 @@ pub fn project_coworker_job_record(
 /// Validates `source_id`, `binding_id`, `thread_uuid`, `canonical_project_scope`, brief/planning
 /// base consistency, approval linkage, and runtime envelope identity before projecting. Without
 /// store-backed receipt and Closure ledger verification, `acceptance_proof` always remains
-/// [`WorkspaceAcceptanceProof::unknown`].
+/// [`WorkspaceAcceptanceProof::unknown`], and caller-supplied [`WorkspaceJobLineageContext`]
+/// never suppresses live planning attention.
 pub fn project_coworker_job_history(
     chat_identity: &WorkspaceChatIdentity,
     job: &CoworkerJobRecord,
     runtime: Option<&ControllerJobRuntimeState>,
     context: Option<&WorkspaceJobLineageContext>,
 ) -> Result<WorkspaceJobHistory, WorkspaceHistoryDiagnostic> {
-    project_coworker_job_history_internal(chat_identity, job, runtime, context, None)
+    project_coworker_job_history_internal(chat_identity, job, runtime, context, None, None)
 }
+
+struct PrevalidatedScopedJob<'a> {
+    job: &'a CoworkerJobRecord,
+    runtime_opt: Option<ControllerJobRuntimeState>,
+    plan_revision: Option<PlanRevision>,
+    approval_record: Option<ApprovalRecord>,
+    runtime_missing_or_degraded: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct VerifiedObsoletePlanningSupersession;
 
 #[derive(Debug, Clone)]
 struct VerifiedHistoricalTaskAcceptance {
@@ -565,6 +627,7 @@ fn project_coworker_job_history_internal(
     runtime: Option<&ControllerJobRuntimeState>,
     context: Option<&WorkspaceJobLineageContext>,
     verified_acceptance: Option<&VerifiedHistoricalJobAcceptance>,
+    verified_obsolete_planning: Option<&VerifiedObsoletePlanningSupersession>,
 ) -> Result<WorkspaceJobHistory, WorkspaceHistoryDiagnostic> {
     chat_identity.validate().map_err(|_| {
         WorkspaceHistoryDiagnostic::new(
@@ -608,7 +671,7 @@ fn project_coworker_job_history_internal(
     let current_attention = if verified_acceptance.is_some() {
         None
     } else {
-        derive_job_current_attention(job, runtime, &projected_tasks)
+        derive_job_current_attention(job, runtime, &projected_tasks, verified_obsolete_planning)
     };
     let links = project_record_links(job, context);
     let result = project_job_result(job, runtime, runtime_missing, verified_acceptance);
@@ -622,6 +685,7 @@ fn project_coworker_job_history_internal(
         &runs,
         current_attention.as_ref(),
         verified_acceptance,
+        verified_obsolete_planning,
     );
 
     let acceptance_proof = match verified_acceptance {
@@ -707,15 +771,149 @@ fn validate_chat_identity_and_canonical_repo_on_disk(
     Ok(())
 }
 
-fn job_matches_basic_chat_scope(
-    chat_identity: &WorkspaceChatIdentity,
+fn successor_amendment_hold_revision(
+    old_job: &CoworkerJobRecord,
+    succ_job: &CoworkerJobRecord,
+) -> Option<u64> {
+    if succ_job.job_id == old_job.job_id {
+        return None;
+    }
+    if succ_job.supersedes_job_id.as_deref() != Some(old_job.job_id.as_str()) {
+        return None;
+    }
+    match &succ_job.work_brief.kind {
+        WorkBriefKind::Amendment {
+            target_job_id,
+            target_job_revision,
+            ..
+        } if target_job_id == &old_job.job_id && *target_job_revision >= 1 => {
+            let expected_hold_rev = target_job_revision.checked_add(1)?;
+            (expected_hold_rev <= old_job.job_revision).then_some(expected_hold_rev)
+        }
+        _ => None,
+    }
+}
+
+fn verify_obsolete_planning_supersession_readonly(
+    ledger: &CoworkerBindingLedger,
+    old_entry: &PrevalidatedScopedJob<'_>,
+    admitted_jobs: &[PrevalidatedScopedJob<'_>],
+) -> Option<VerifiedObsoletePlanningSupersession> {
+    if !job_is_effect_free_obsolete_planning(ledger, old_entry) {
+        return None;
+    }
+
+    let old_job = old_entry.job;
+    let has_verified_successor = admitted_jobs
+        .iter()
+        .any(|succ_entry| successor_amendment_hold_revision(old_job, succ_entry.job).is_some());
+    if !has_verified_successor {
+        return None;
+    }
+
+    let all_active_holds_causally_verified =
+        old_job.holds.iter().filter(|h| h.active).all(|hold| {
+            hold.reason == WorkflowHoldReason::BriefAmendmentPending
+                && admitted_jobs.iter().any(|succ_entry| {
+                    let succ_job = succ_entry.job;
+                    successor_amendment_hold_revision(old_job, succ_job).is_some_and(
+                        |expected_hold_rev| {
+                            hold.created_at_job_revision == expected_hold_rev
+                                && hold
+                                    .request_key
+                                    .strip_prefix("amend_")
+                                    .is_some_and(|rk| rk == succ_job.create_request_key)
+                        },
+                    )
+                })
+        });
+
+    all_active_holds_causally_verified.then_some(VerifiedObsoletePlanningSupersession)
+}
+
+fn job_is_effect_free_obsolete_planning(
+    ledger: &CoworkerBindingLedger,
+    old_entry: &PrevalidatedScopedJob<'_>,
+) -> bool {
+    let job = old_entry.job;
+    if !matches!(
+        job.phase,
+        CoworkerJobPhase::AwaitingApproval | CoworkerJobPhase::Held
+    ) {
+        return false;
+    }
+    if job.approval_linkage.is_some()
+        || !job.tasks.is_empty()
+        || !job.outbox.is_empty()
+        || !job.combined_candidates.is_empty()
+    {
+        return false;
+    }
+    if old_entry.runtime_missing_or_degraded || old_entry.runtime_opt.is_some() {
+        return false;
+    }
+
+    let active_holds: Vec<&WorkflowHoldRecord> = job.holds.iter().filter(|h| h.active).collect();
+    if job.phase == CoworkerJobPhase::Held && active_holds.is_empty() {
+        return false;
+    }
+    if active_holds
+        .iter()
+        .any(|h| h.reason != WorkflowHoldReason::BriefAmendmentPending)
+    {
+        return false;
+    }
+
+    !job_has_ambiguous_planning_reservation(ledger, job)
+}
+
+fn job_has_ambiguous_planning_reservation(
+    ledger: &CoworkerBindingLedger,
     job: &CoworkerJobRecord,
 ) -> bool {
-    job.binding_id == chat_identity.binding_id
-        && job.thread_uuid == chat_identity.thread_uuid
-        && job.work_brief.binding_id == chat_identity.binding_id
-        && job.work_brief.thread_uuid == chat_identity.thread_uuid
-        && job.work_brief.project_base.repository_path == chat_identity.canonical_project_scope
+    for grant in &ledger.planning_grants {
+        for res in &grant.reservations {
+            if !matches!(
+                res.status,
+                PlanningReservationStatus::ReservedBeforeEffect
+                    | PlanningReservationStatus::EffectUnknown
+            ) {
+                continue;
+            }
+            let linked_via_planning_result = job.planning_result.as_ref().is_some_and(|pr| {
+                pr.grant_id == grant.grant_id
+                    && (pr.reservation_id == res.reservation_id
+                        || pr.request_key == res.request_key)
+            });
+            let linked_via_advice = ledger.architect_advice.iter().any(|adv| {
+                adv.grant_id == grant.grant_id
+                    && adv.reservation_id == res.reservation_id
+                    && adv.context_dependencies.work_brief_digest == job.work_brief_digest
+            });
+            if linked_via_planning_result || linked_via_advice {
+                return true;
+            }
+
+            if grant.binding_id != job.binding_id
+                || grant.thread_uuid != job.thread_uuid
+                || grant.project_base.repository_path != job.work_brief.project_base.repository_path
+            {
+                continue;
+            }
+            if let Some(ref call_base) = res.call_project_base {
+                if call_base != &job.work_brief.project_base {
+                    continue;
+                }
+            }
+
+            // Orchestrator and Architect context_digest values hash composite tuples whose dynamic
+            // call inputs (plan_id, expected_plan_revision, advice refs, or question summary) are
+            // not stored on an unfinalized reservation. Any same-scoped unresolved reservation not
+            // positively proven to target another scope/base conservatively blocks retirement.
+            return true;
+        }
+    }
+    false
 }
 
 fn validate_job_and_companion_scopes(
@@ -1908,11 +2106,8 @@ fn derive_job_current_attention(
     job: &CoworkerJobRecord,
     runtime: Option<&ControllerJobRuntimeState>,
     projected_tasks: &[WorkspaceTaskHistory],
+    verified_obsolete_planning: Option<&VerifiedObsoletePlanningSupersession>,
 ) -> Option<WorkspaceAttentionState> {
-    if job.phase == CoworkerJobPhase::Cancelled {
-        return None;
-    }
-
     let mut blocking_outbox_ids: Vec<String> = job
         .outbox
         .iter()
@@ -1931,9 +2126,32 @@ fn derive_job_current_attention(
     }
 
     let active_holds: Vec<&WorkflowHoldRecord> = job.holds.iter().filter(|h| h.active).collect();
-    let blocking_hold_ids: Vec<String> = active_holds.iter().map(|h| h.hold_id.clone()).collect();
+    let mut blocking_hold_ids: Vec<String> =
+        active_holds.iter().map(|h| h.hold_id.clone()).collect();
+
+    let mut has_task_unresolved_effect = false;
+    for task in projected_tasks {
+        if let Some(attn) = task
+            .current_attention
+            .as_ref()
+            .filter(|a| a.kind == WorkspaceAttentionKind::UnresolvedEffect)
+        {
+            has_task_unresolved_effect = true;
+            for hold_id in &attn.blocking_hold_ids {
+                if !blocking_hold_ids.contains(hold_id) {
+                    blocking_hold_ids.push(hold_id.clone());
+                }
+            }
+            for outbox_id in &attn.blocking_outbox_ids {
+                if !blocking_outbox_ids.contains(outbox_id) {
+                    blocking_outbox_ids.push(outbox_id.clone());
+                }
+            }
+        }
+    }
 
     if !blocking_outbox_ids.is_empty()
+        || has_task_unresolved_effect
         || active_holds
             .iter()
             .any(|h| h.reason == WorkflowHoldReason::UnknownEffectReconciliationRequired)
@@ -1950,11 +2168,24 @@ fn derive_job_current_attention(
         });
     }
 
-    if job.phase == CoworkerJobPhase::AwaitingApproval && job.approval_linkage.is_none() {
+    if job.phase == CoworkerJobPhase::Cancelled {
+        return None;
+    }
+
+    let suppressed_obsolete_amendment_hold = verified_obsolete_planning.is_some()
+        && !active_holds.is_empty()
+        && active_holds
+            .iter()
+            .all(|h| h.reason == WorkflowHoldReason::BriefAmendmentPending);
+
+    if (!active_holds.is_empty() || job.phase == CoworkerJobPhase::Held)
+        && !suppressed_obsolete_amendment_hold
+    {
+        let (kind, reason) = classify_holds_attention(&active_holds);
         return Some(WorkspaceAttentionState {
-            kind: WorkspaceAttentionKind::NeedsApproval,
-            reason: "Published workflow plan is waiting on explicit human approval.".to_string(),
-            next_step: Some("Review and approve the published plan scope.".to_string()),
+            kind,
+            reason,
+            next_step: None,
             blocking_hold_ids,
             blocking_outbox_ids: Vec::new(),
             question_id: None,
@@ -1962,12 +2193,14 @@ fn derive_job_current_attention(
         });
     }
 
-    if !active_holds.is_empty() || job.phase == CoworkerJobPhase::Held {
-        let (kind, reason) = classify_holds_attention(&active_holds);
+    if job.phase == CoworkerJobPhase::AwaitingApproval
+        && job.approval_linkage.is_none()
+        && verified_obsolete_planning.is_none()
+    {
         return Some(WorkspaceAttentionState {
-            kind,
-            reason,
-            next_step: None,
+            kind: WorkspaceAttentionKind::NeedsApproval,
+            reason: "Published workflow plan is waiting on explicit human approval.".to_string(),
+            next_step: Some("Review and approve the published plan scope.".to_string()),
             blocking_hold_ids,
             blocking_outbox_ids: Vec::new(),
             question_id: None,
@@ -2430,6 +2663,7 @@ fn project_job_summary(
     runs: &[WorkspaceRunRecord],
     current_attention: Option<&WorkspaceAttentionState>,
     verified_acceptance: Option<&VerifiedHistoricalJobAcceptance>,
+    verified_obsolete_planning: Option<&VerifiedObsoletePlanningSupersession>,
 ) -> WorkspaceJobSummary {
     let phase_str = job_phase_name(job.phase);
     let approval_status = if context.is_some_and(|c| c.superseded_by_job_id.is_some()) {
@@ -2449,21 +2683,66 @@ fn project_job_summary(
             t.current_attempt_no > 0 || !t.attempts.is_empty() || !t.candidates.is_empty()
         }) || !job.outbox.is_empty();
 
+    let has_unresolved_effect =
+        current_attention.is_some_and(|a| a.kind == WorkspaceAttentionKind::UnresolvedEffect);
+
     let (state, execution_status, review_state) = match job.phase {
         CoworkerJobPhase::Briefing | CoworkerJobPhase::Planning => {
-            (ObservationJobState::Planning, "not_started", None)
-        }
-        CoworkerJobPhase::AwaitingApproval => (ObservationJobState::NeedsUser, "not_started", None),
-        CoworkerJobPhase::Held => (
-            ObservationJobState::NeedsUser,
-            if any_task_started {
-                "stopped"
+            if has_unresolved_effect {
+                (
+                    ObservationJobState::Unknown,
+                    "unknown",
+                    Some("unresolved".to_string()),
+                )
             } else {
-                "not_started"
-            },
-            None,
-        ),
-        CoworkerJobPhase::Cancelled => (ObservationJobState::Failed, "stopped", None),
+                (ObservationJobState::Planning, "not_started", None)
+            }
+        }
+        CoworkerJobPhase::AwaitingApproval => {
+            if has_unresolved_effect {
+                (
+                    ObservationJobState::Unknown,
+                    "unknown",
+                    Some("unresolved".to_string()),
+                )
+            } else if verified_obsolete_planning.is_some() && current_attention.is_none() {
+                (ObservationJobState::Unknown, "not_started", None)
+            } else {
+                (ObservationJobState::NeedsUser, "not_started", None)
+            }
+        }
+        CoworkerJobPhase::Held => {
+            if has_unresolved_effect {
+                (
+                    ObservationJobState::Unknown,
+                    "unknown",
+                    Some("unresolved".to_string()),
+                )
+            } else if verified_obsolete_planning.is_some() && current_attention.is_none() {
+                (ObservationJobState::Unknown, "not_started", None)
+            } else {
+                (
+                    ObservationJobState::NeedsUser,
+                    if any_task_started {
+                        "stopped"
+                    } else {
+                        "not_started"
+                    },
+                    None,
+                )
+            }
+        }
+        CoworkerJobPhase::Cancelled => {
+            if has_unresolved_effect {
+                (
+                    ObservationJobState::Unknown,
+                    "unknown",
+                    Some("unresolved".to_string()),
+                )
+            } else {
+                (ObservationJobState::Failed, "stopped", None)
+            }
+        }
         CoworkerJobPhase::ClosureReview => (
             if runtime_missing {
                 ObservationJobState::Unknown

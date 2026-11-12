@@ -343,6 +343,44 @@ function formatJobStateMeta(state: ObservationJobState): { label: string; tone: 
   }
 }
 
+function isRetiredSupersededPlanningJobHistory(history: WorkspaceJobHistory): boolean {
+  const { job } = history;
+  if (job.state !== 'unknown' || history.acceptance_proof.status === 'verified_accepted') {
+    return false;
+  }
+  if (history.current_attention !== null && history.current_attention.kind !== 'none') {
+    return false;
+  }
+  if (
+    history.tasks.some(
+      (task) => task.current_attention !== null && task.current_attention.kind !== 'none',
+    )
+  ) {
+    return false;
+  }
+  if (job.review_state !== null && job.review_state.trim().length > 0) {
+    return false;
+  }
+  const approvalLower = job.approval_status.trim().toLowerCase();
+  const execLower = job.execution_status.trim().toLowerCase();
+  const phaseLower = job.phase?.trim().toLowerCase() ?? '';
+  return (
+    approvalLower === 'superseded' &&
+    execLower === 'not_started' &&
+    (phaseLower === 'awaiting_approval' || phaseLower === 'held')
+  );
+}
+
+function formatWorkspaceJobHistoryStateMeta(history: WorkspaceJobHistory): {
+  label: string;
+  tone: string;
+} {
+  if (isRetiredSupersededPlanningJobHistory(history)) {
+    return { label: 'Superseded', tone: 'neutral' };
+  }
+  return formatJobStateMeta(history.job.state);
+}
+
 function formatAcceptanceStatusMeta(status: WorkspaceAcceptanceStatus): {
   label: string;
   tone: string;
@@ -1792,7 +1830,7 @@ export function WorkspaceJobsPanel({
             const safeDomId = jobKey.replace(/[^A-Za-z0-9_-]/g, '_');
             const detailId = `tl-wp-job-detail-${safeDomId}`;
             const isExpanded = expandedJobKeys.has(jobKey);
-            const stateMeta = formatJobStateMeta(job.state);
+            const stateMeta = formatWorkspaceJobHistoryStateMeta(history);
             const acceptanceMeta = formatAcceptanceStatusMeta(history.acceptance_proof.status);
             const truncationNotes = summarizeJobTruncation(history.truncation);
             const linkItems = collectRecordLinkItems(history.links);

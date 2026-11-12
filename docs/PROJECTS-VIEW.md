@@ -74,6 +74,30 @@ alone, or spilling records across chats—and renders `WorkspaceChatPanels`
   multi-page history loading. Whenever messages, job histories, child calls,
   requests, or native samples are omitted by snapshot bounds—or when unscoped
   records are withheld—explicit notices keep the omission visible.
+- **Human-attention badge counting unit vs detail rows**: `collectChatBlockers`
+  retains every job-level, task-level, native-chat, and waiting-request blocker
+  row for inspection, while `countChatDistinctAttentionUnits` returns separate
+  scoped job and independent unit counts so per-chat `needsHumanCount` badges
+  compute the exact sum
+  `Math.max(visibleDistinctActionableJobCount, chatSummary.attention_count) + independentUnmatchedUnits`.
+  Here `visibleDistinctActionableJobCount` counts distinct actionable job IDs
+  scoped per chat (one job plus multiple task attention rows or multiple task
+  causes within that job counts as `1` job unit), `chatSummary.attention_count`
+  provides the backend lower bound when older job histories are omitted, and
+  `independentUnmatchedUnits` adds genuinely independent unmatched signals on top
+  of that job lower bound: live native `waiting_for_input` /
+  `waiting_for_approval`, standalone explicit `question_id` entries, standalone
+  `waiting_for_user` `request_id` entries, and unmatched unlinked fallback
+  blocker rows. Correlation uses explicit scoped IDs only and never merges
+  identical prose across jobs or chats or hides live native input merely because
+  a job exists. Store-retired obsolete planning jobs (`state === "unknown"`,
+  `approval_status === "superseded"`, `execution_status === "not_started"`,
+  `phase` in `"awaiting_approval" | "held"`, `review_state === null`, unverified
+  acceptance, and zero job or task `current_attention`) render neutral
+  `Superseded` in both `app-model.ts` and `WorkspaceJobsPanel`
+  (`workspace-panels.tsx`) without globally hiding `Failed` or unresolved
+  `Unknown` records, trusting `supersedes` links alone, or inflating
+  human-attention or failed-job counts.
 - **Independent Coworker state and model**: Live Coworker activity and verified
   configured model selection come from fresh native chat samples and remain
   separate from Worker runtime receipts. Stale or disconnected native samples

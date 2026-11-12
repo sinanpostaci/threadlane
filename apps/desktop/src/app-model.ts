@@ -2934,6 +2934,19 @@ function projectWorkspaceJobView(
   } else if (history.job.state === 'ready') {
     statusLabel = 'Ready';
     tone = 'neutral';
+  } else if (
+    isRetiredSupersededPlanningJobFields(
+      history.job.approval_status,
+      history.job.execution_status,
+      history.job.phase,
+      history.job.review_state,
+      history.job.state,
+      taskAttention !== null,
+      isVerifiedAccepted,
+    )
+  ) {
+    statusLabel = 'Superseded';
+    tone = 'neutral';
   } else if (history.job.state === 'failed') {
     statusLabel = 'Failed';
     tone = 'danger';
@@ -3327,6 +3340,41 @@ function computeChatWorkerSummary(
   };
 }
 
+function normalizeActionableCorrelationId(
+  rawId: string | null | undefined,
+): string | null {
+  const valid = validateCorrelationId(rawId);
+  if (valid === null || valid.toLowerCase() === 'unknown') {
+    return null;
+  }
+  return valid;
+}
+
+function isRetiredSupersededPlanningJobFields(
+  approvalStatus: string,
+  executionStatus: string,
+  phase: string | null,
+  reviewState: string | null,
+  stateRaw: ObservationJobState,
+  hasCurrentAttention: boolean,
+  isVerifiedAccepted: boolean,
+): boolean {
+  if (hasCurrentAttention || isVerifiedAccepted || stateRaw !== 'unknown') {
+    return false;
+  }
+  if (reviewState !== null && reviewState.trim().length > 0) {
+    return false;
+  }
+  const approvalLower = approvalStatus.trim().toLowerCase();
+  const execLower = executionStatus.trim().toLowerCase();
+  const phaseLower = phase?.trim().toLowerCase() ?? '';
+  return (
+    approvalLower === 'superseded' &&
+    execLower === 'not_started' &&
+    (phaseLower === 'awaiting_approval' || phaseLower === 'held')
+  );
+}
+
 function computeChatJobSummary(
   jobViews: readonly WorkspaceJobView[],
   summaryActiveJobCount: number,
@@ -3345,12 +3393,20 @@ function computeChatJobSummary(
         j.executionStatus.trim().toLowerCase() === 'completed'),
   ).length;
   const failedJobCount = jobViews.filter((j) => j.stateRaw === 'failed').length;
-  const needsAttentionJobCount = jobViews.filter(
-    (j) =>
-      j.currentAttention !== null ||
-      j.stateRaw === 'needs_user' ||
-      j.tasks.some((t) => t.currentAttention !== null),
-  ).length;
+  const needsAttentionJobCount = new Set(
+    jobViews
+      .map((j, idx) => ({ job: j, idx }))
+      .filter(
+        ({ job: j }) =>
+          j.currentAttention !== null ||
+          j.stateRaw === 'needs_user' ||
+          j.tasks.some((t) => t.currentAttention !== null),
+      )
+      .map(
+        ({ job: j, idx }) =>
+          normalizeActionableCorrelationId(j.jobId) ?? `unlinked\u0000${idx}`,
+      ),
+  ).size;
 
   let statusLabel: string;
   if (totalJobCount === 0 && activeJobCount === 0) {
@@ -3427,20 +3483,38 @@ function collectChatBlockers(
     });
   }
 
-  for (const job of jobViews) {
+  for (let jobIdx = 0; jobIdx < jobViews.length; jobIdx += 1) {
+    const job = jobViews[jobIdx]!;
+    const validJobId = normalizeActionableCorrelationId(job.jobId);
+    const jobKeyToken = validJobId ?? `unlinked_${jobIdx}`;
+    let unlinkedHasExplicitAttention = false;
+
     if (job.currentAttention !== null) {
-      jobsWithExplicitAttention.add(job.jobId);
+      if (validJobId !== null) {
+        jobsWithExplicitAttention.add(validJobId);
+      } else {
+        unlinkedHasExplicitAttention = true;
+      }
+      const explicitQuestionId = normalizeActionableCorrelationId(
+        job.currentAttention.questionId,
+      );
+      const blockerKey =
+        validJobId !== null
+          ? `${chatKey}\u0000blocker\u0000job\u0000${validJobId}`
+          : explicitQuestionId !== null
+            ? `${chatKey}\u0000blocker\u0000question\u0000${explicitQuestionId}\u0000${jobIdx}`
+            : `${chatKey}\u0000blocker\u0000job\u0000${jobKeyToken}`;
       blockers.push({
-        key: `${chatKey}\u0000blocker\u0000job\u0000${job.jobId}`,
+        key: blockerKey,
         origin: 'job_attention',
         kind: job.currentAttention.kind,
         kindLabel: job.currentAttention.kindLabel,
         reason: job.currentAttention.reason,
         nextStep: job.currentAttention.nextStep,
-        jobId: job.jobId,
+        jobId: validJobId,
         taskId: null,
         requestId: null,
-        questionId: job.currentAttention.questionId,
+        questionId: explicitQuestionId,
         blockingHoldIds: [...job.currentAttention.blockingHoldIds],
         blockingOutboxIds: [...job.currentAttention.blockingOutboxIds],
         updatedAtMs: job.currentAttention.updatedAtMs ?? job.updatedAtMs,
@@ -3451,20 +3525,36 @@ function collectChatBlockers(
       });
     }
 
-    for (const task of job.tasks) {
+    for (let taskIdx = 0; taskIdx < job.tasks.length; taskIdx += 1) {
+      const task = job.tasks[taskIdx]!;
       if (task.currentAttention !== null) {
-        jobsWithExplicitAttention.add(job.jobId);
+        if (validJobId !== null) {
+          jobsWithExplicitAttention.add(validJobId);
+        } else {
+          unlinkedHasExplicitAttention = true;
+        }
+        const explicitQuestionId = normalizeActionableCorrelationId(
+          task.currentAttention.questionId,
+        );
+        const taskKeyToken =
+          normalizeActionableCorrelationId(task.taskId) ?? `task_${taskIdx}`;
+        const taskBlockerKey =
+          validJobId !== null
+            ? `${chatKey}\u0000blocker\u0000task\u0000${validJobId}\u0000${taskKeyToken}`
+            : explicitQuestionId !== null
+              ? `${chatKey}\u0000blocker\u0000question\u0000${explicitQuestionId}\u0000${jobIdx}\u0000${taskIdx}`
+              : `${chatKey}\u0000blocker\u0000task\u0000${jobKeyToken}\u0000${taskKeyToken}`;
         blockers.push({
-          key: `${chatKey}\u0000blocker\u0000task\u0000${job.jobId}\u0000${task.taskId}`,
+          key: taskBlockerKey,
           origin: 'task_attention',
           kind: task.currentAttention.kind,
           kindLabel: task.currentAttention.kindLabel,
           reason: task.currentAttention.reason,
           nextStep: task.currentAttention.nextStep,
-          jobId: job.jobId,
-          taskId: task.taskId,
+          jobId: validJobId,
+          taskId: normalizeActionableCorrelationId(task.taskId),
           requestId: null,
-          questionId: task.currentAttention.questionId,
+          questionId: explicitQuestionId,
           blockingHoldIds: [...task.currentAttention.blockingHoldIds],
           blockingOutboxIds: [...task.currentAttention.blockingOutboxIds],
           updatedAtMs: task.currentAttention.updatedAtMs ?? job.updatedAtMs,
@@ -3476,16 +3566,22 @@ function collectChatBlockers(
       }
     }
 
-    if (job.stateRaw === 'needs_user' && !jobsWithExplicitAttention.has(job.jobId)) {
-      jobsWithExplicitAttention.add(job.jobId);
+    const coveredByExplicit =
+      validJobId !== null
+        ? jobsWithExplicitAttention.has(validJobId)
+        : unlinkedHasExplicitAttention;
+    if (job.stateRaw === 'needs_user' && !coveredByExplicit) {
+      if (validJobId !== null) {
+        jobsWithExplicitAttention.add(validJobId);
+      }
       blockers.push({
-        key: `${chatKey}\u0000blocker\u0000needs_user\u0000${job.jobId}`,
+        key: `${chatKey}\u0000blocker\u0000needs_user\u0000${jobKeyToken}`,
         origin: 'job_needs_user',
         kind: 'needs_user_input',
         kindLabel: 'Needs user input',
         reason: job.summary ?? `Job "${job.title}" is waiting for user input.`,
         nextStep: 'Review the blocked job and respond in Codex.',
-        jobId: job.jobId,
+        jobId: validJobId,
         taskId: null,
         requestId: null,
         questionId: null,
@@ -3497,23 +3593,27 @@ function collectChatBlockers(
     }
   }
 
-  for (const item of activityItems) {
+  for (let reqIdx = 0; reqIdx < activityItems.length; reqIdx += 1) {
+    const item = activityItems[reqIdx]!;
     if (item.stateRaw !== 'waiting_for_user') {
       continue;
     }
-    if (item.jobId !== null && jobsWithExplicitAttention.has(item.jobId)) {
+    const reqJobId = normalizeActionableCorrelationId(item.jobId);
+    if (reqJobId !== null && jobsWithExplicitAttention.has(reqJobId)) {
       continue;
     }
+    const validRequestId = normalizeActionableCorrelationId(item.requestId);
+    const reqKeyToken = validRequestId ?? `unlinked_req_${reqIdx}`;
     blockers.push({
-      key: `${chatKey}\u0000blocker\u0000req\u0000${item.requestId}`,
+      key: `${chatKey}\u0000blocker\u0000req\u0000${reqKeyToken}`,
       origin: 'request_waiting_for_user',
       kind: 'needs_user_input',
       kindLabel: 'Waiting for user',
       reason: item.summary ?? `Request "${item.title}" is waiting for user input.`,
       nextStep: 'Respond in Codex to continue.',
-      jobId: item.jobId,
+      jobId: reqJobId,
       taskId: null,
-      requestId: item.requestId,
+      requestId: validRequestId,
       questionId: null,
       blockingHoldIds: [],
       blockingOutboxIds: [],
@@ -3523,6 +3623,73 @@ function collectChatBlockers(
   }
 
   return blockers;
+}
+
+interface ChatAttentionUnitBreakdown {
+  distinctJobUnits: number;
+  independentUnits: number;
+}
+
+function countChatDistinctAttentionUnits(
+  blockers: readonly WorkspaceChatBlockerView[],
+): ChatAttentionUnitBreakdown {
+  const actionableJobIds = new Set<string>();
+  const jobLinkedQuestionIds = new Set<string>();
+  const jobLinkedRequestIds = new Set<string>();
+
+  for (const blocker of blockers) {
+    const validJobId = normalizeActionableCorrelationId(blocker.jobId);
+    if (validJobId !== null) {
+      actionableJobIds.add(validJobId);
+      const qId = normalizeActionableCorrelationId(blocker.questionId);
+      if (qId !== null) {
+        jobLinkedQuestionIds.add(qId);
+      }
+      const rId = normalizeActionableCorrelationId(blocker.requestId);
+      if (rId !== null) {
+        jobLinkedRequestIds.add(rId);
+      }
+    }
+  }
+
+  let hasUnmatchedNativeSignal = false;
+  const unmatchedQuestionIds = new Set<string>();
+  const unmatchedRequestIds = new Set<string>();
+  const unmatchedFallbackKeys = new Set<string>();
+
+  for (const blocker of blockers) {
+    if (normalizeActionableCorrelationId(blocker.jobId) !== null) {
+      continue;
+    }
+    if (blocker.origin === 'native_chat') {
+      hasUnmatchedNativeSignal = true;
+      continue;
+    }
+    const qId = normalizeActionableCorrelationId(blocker.questionId);
+    if (qId !== null) {
+      if (!jobLinkedQuestionIds.has(qId)) {
+        unmatchedQuestionIds.add(qId);
+      }
+      continue;
+    }
+    const rId = normalizeActionableCorrelationId(blocker.requestId);
+    if (rId !== null) {
+      if (!jobLinkedRequestIds.has(rId)) {
+        unmatchedRequestIds.add(rId);
+      }
+      continue;
+    }
+    unmatchedFallbackKeys.add(blocker.key);
+  }
+
+  return {
+    distinctJobUnits: actionableJobIds.size,
+    independentUnits:
+      (hasUnmatchedNativeSignal ? 1 : 0) +
+      unmatchedQuestionIds.size +
+      unmatchedRequestIds.size +
+      unmatchedFallbackKeys.size,
+  };
 }
 
 interface DiscoveredChatAccumulator {
@@ -4098,10 +4265,11 @@ export function projectWorkspaceSnapshot(
       activityItems,
       referenceNowMs,
     );
-    const needsHumanCount = Math.max(
-      blockers.length,
-      acc.chatSummary?.attention_count ?? 0,
-    );
+    const { distinctJobUnits, independentUnits } =
+      countChatDistinctAttentionUnits(blockers);
+    const backendJobAttentionCount = acc.chatSummary?.attention_count ?? 0;
+    const needsHumanCount =
+      Math.max(distinctJobUnits, backendJobAttentionCount) + independentUnits;
     const hasCurrentBlocker = needsHumanCount > 0;
     const needsHumanBadgeLabel = formatNeedsHumanBadge(needsHumanCount);
 

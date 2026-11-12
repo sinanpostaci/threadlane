@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use threadlane_authority::{AuthorityStore, OperatorApprovalRequest};
 use threadlane_core::observation::{
@@ -3775,4 +3776,1902 @@ async fn failed_candidate_checks_and_fenced_closure_artifacts_never_show_accepte
         fenced_read.jobs[0].acceptance_proof,
         WorkspaceAcceptanceProof::unknown()
     );
+}
+
+// ============================================================================
+// Obsolete planning supersession retirement & unresolved-effect preservation
+// ============================================================================
+
+fn sample_amendment_hold(
+    hold_id: &str,
+    request_key: &str,
+    created_at_job_revision: u64,
+    detail: &str,
+) -> WorkflowHoldRecord {
+    WorkflowHoldRecord {
+        hold_id: hold_id.to_string(),
+        request_key: request_key.to_string(),
+        reason: WorkflowHoldReason::BriefAmendmentPending,
+        detail: detail.to_string(),
+        directly_affected_task_ids: Vec::new(),
+        affected_write_paths: Vec::new(),
+        affected_interfaces: Vec::new(),
+        holds_entire_job: true,
+        active: true,
+        created_at_job_revision,
+        resolved_at_job_revision: None,
+        resolution_note: None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn production_orchestrator_context_digest(
+    binding_id: &str,
+    thread_uuid: &str,
+    grant_id: &str,
+    profile_id: &str,
+    registry_revision: u64,
+    policy_digest: &str,
+    job_id: &str,
+    work_brief_digest: &str,
+    project_base: &CanonicalProjectBaseRef,
+    plan_id: Option<&str>,
+    expected_plan_revision: u64,
+    selected_choice: &SelectedRoleChoice,
+) -> String {
+    let empty_advice: Vec<(&str, &str, &str)> = Vec::new();
+    let seed = (
+        "threadlane-native:coworker-orchestrator-context:v1",
+        binding_id,
+        thread_uuid,
+        grant_id,
+        profile_id,
+        registry_revision,
+        policy_digest,
+        job_id,
+        work_brief_digest,
+        project_base,
+        plan_id,
+        expected_plan_revision,
+        selected_choice,
+        &empty_advice,
+    );
+    let bytes = serde_json::to_vec(&seed).expect("serialize orchestrator context seed");
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    format!("{:x}", hasher.finalize())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sample_completed_orchestrator_reservation_and_result(
+    binding_id: &str,
+    thread_uuid: &str,
+    grant_id: &str,
+    job_id: &str,
+    suffix: &str,
+    work_brief_digest: &str,
+    project_base: &CanonicalProjectBaseRef,
+    planning_policy_digest: &str,
+    plan_id: &str,
+    run_id: &str,
+) -> (PlanningCallReservation, PlanningResultRef) {
+    let orchestrator_choice = sample_orchestrator_choice();
+    let reservation_id = format!("rsv_{suffix}");
+    let request_key = format!("req_plan_{suffix}");
+    let report_artifact_id = format!("pca_{suffix}");
+    let context_digest = production_orchestrator_context_digest(
+        binding_id,
+        thread_uuid,
+        grant_id,
+        "profile-default",
+        1,
+        planning_policy_digest,
+        job_id,
+        work_brief_digest,
+        project_base,
+        None,
+        0,
+        &orchestrator_choice,
+    );
+    let reservation = PlanningCallReservation {
+        reservation_id: reservation_id.clone(),
+        request_key: request_key.clone(),
+        role: WorkflowRole::Orchestrator,
+        difficulty: Some(Difficulty::Hard),
+        selected_choice: orchestrator_choice.clone(),
+        context_digest,
+        call_project_base: Some(project_base.clone()),
+        status: PlanningReservationStatus::Completed,
+        reserved_at_ms: 1_700_000_048_000,
+        updated_at_ms: 1_700_000_050_000,
+        run_id: Some(run_id.to_string()),
+        report_artifact_id: Some(report_artifact_id.clone()),
+        output_digest: Some(HEX64_C.to_string()),
+        diagnostic: None,
+    };
+    let result = PlanningResultRef {
+        grant_id: grant_id.to_string(),
+        reservation_id,
+        request_key,
+        run_id: run_id.to_string(),
+        report_artifact_id,
+        output_digest: HEX64_C.to_string(),
+        work_brief_digest: work_brief_digest.to_string(),
+        project_base: project_base.clone(),
+        profile_id: "profile-default".to_string(),
+        registry_revision: 1,
+        policy_digest: planning_policy_digest.to_string(),
+        selected_choice: orchestrator_choice,
+        plan_id: plan_id.to_string(),
+        plan_revision: 1,
+        plan_digest: HEX64_B.to_string(),
+        plan_status: PlanStatus::Published,
+        task_interfaces: BTreeMap::new(),
+        architect_advice_ids: Vec::new(),
+        resolved_open_questions: Vec::new(),
+        deferred_proposals: Vec::new(),
+        recorded_at_ms: 1_700_000_050_000,
+    };
+    (reservation, result)
+}
+
+#[test]
+fn retires_attention_for_store_verified_obsolete_planning_jobs_across_two_step_lineage_without_mutation(
+) {
+    let tmp = TempDir::new().expect("tempdir");
+    let plans_dir = make_private_dir(&tmp.path().join("plans"));
+    let repo_dir = make_private_dir(&tmp.path().join("repo-obsolete-lineage"));
+    let chat =
+        WorkspaceChatIdentity::new(SOURCE_A, BINDING_A, THREAD_A, &repo_dir.to_string_lossy())
+            .expect("valid chat identity");
+
+    let project_base = sample_project_base(&repo_dir);
+    let planning_policy = sample_planning_policy();
+    let planning_policy_digest = planning_policy.digest().expect("planning policy digest");
+    let grant_id = "grt_obsolete_lineage_0123456789abcd";
+
+    // Step 1: Held effect-free planning job carrying only a BriefAmendmentPending hold.
+    let (brief_1, brief_digest_1) = sample_work_brief(
+        "brf_obs_01",
+        BINDING_A,
+        THREAD_A,
+        project_base.clone(),
+        WorkBriefKind::NewJob,
+        "Initial held planning brief",
+    );
+    let job_1 = CoworkerJobRecord {
+        job_id: "job_obs_000000000000000000000001".to_string(),
+        job_revision: 2,
+        create_request_key: "req_obs_job_01".to_string(),
+        binding_id: BINDING_A.to_string(),
+        thread_uuid: THREAD_A.to_string(),
+        phase: CoworkerJobPhase::Held,
+        work_brief: brief_1,
+        work_brief_digest: brief_digest_1,
+        supersedes_job_id: None,
+        planning_result: None,
+        approval_linkage: None,
+        tasks: Vec::new(),
+        holds: vec![sample_amendment_hold(
+            "hld_obs_amend_01",
+            "amend_req_obs_job_02",
+            2,
+            "Refine initial scope before approval",
+        )],
+        outbox: Vec::new(),
+        combined_candidates: Vec::new(),
+    };
+
+    // Step 2: AwaitingApproval effect-free planning job amending job_1, subsequently amended by job_3.
+    let (brief_2, brief_digest_2) = sample_work_brief(
+        "brf_obs_02",
+        BINDING_A,
+        THREAD_A,
+        project_base.clone(),
+        WorkBriefKind::Amendment {
+            target_job_id: job_1.job_id.clone(),
+            target_job_revision: 1,
+            amendment_reason: "Refine initial scope before approval".to_string(),
+        },
+        "Intermediate superseded awaiting-approval plan",
+    );
+    let job_2_id = "job_obs_000000000000000000000002";
+    let (res_2, pr_2) = sample_completed_orchestrator_reservation_and_result(
+        BINDING_A,
+        THREAD_A,
+        grant_id,
+        job_2_id,
+        "obs_02",
+        &brief_digest_2,
+        &project_base,
+        &planning_policy_digest,
+        "plan_obs_02",
+        "run_00000000-0000-4000-8000-000000000202",
+    );
+    let job_2 = CoworkerJobRecord {
+        job_id: job_2_id.to_string(),
+        job_revision: 3,
+        create_request_key: "req_obs_job_02".to_string(),
+        binding_id: BINDING_A.to_string(),
+        thread_uuid: THREAD_A.to_string(),
+        phase: CoworkerJobPhase::AwaitingApproval,
+        work_brief: brief_2,
+        work_brief_digest: brief_digest_2,
+        supersedes_job_id: Some(job_1.job_id.clone()),
+        planning_result: Some(pr_2),
+        approval_linkage: None,
+        tasks: Vec::new(),
+        holds: vec![sample_amendment_hold(
+            "hld_obs_amend_02",
+            "amend_req_obs_job_03",
+            3,
+            "Supersede intermediate plan with final slice",
+        )],
+        outbox: Vec::new(),
+        combined_candidates: Vec::new(),
+    };
+
+    // Step 3: Active head amendment job awaiting human approval.
+    let (brief_3, brief_digest_3) = sample_work_brief(
+        "brf_obs_03",
+        BINDING_A,
+        THREAD_A,
+        project_base.clone(),
+        WorkBriefKind::Amendment {
+            target_job_id: job_2.job_id.clone(),
+            target_job_revision: 2,
+            amendment_reason: "Supersede intermediate plan with final slice".to_string(),
+        },
+        "Current head plan awaiting approval",
+    );
+    let job_3_id = "job_obs_000000000000000000000003";
+    let (res_3, pr_3) = sample_completed_orchestrator_reservation_and_result(
+        BINDING_A,
+        THREAD_A,
+        grant_id,
+        job_3_id,
+        "obs_03",
+        &brief_digest_3,
+        &project_base,
+        &planning_policy_digest,
+        "plan_obs_03",
+        "run_00000000-0000-4000-8000-000000000203",
+    );
+    let job_3 = CoworkerJobRecord {
+        job_id: job_3_id.to_string(),
+        job_revision: 2,
+        create_request_key: "req_obs_job_03".to_string(),
+        binding_id: BINDING_A.to_string(),
+        thread_uuid: THREAD_A.to_string(),
+        phase: CoworkerJobPhase::AwaitingApproval,
+        work_brief: brief_3,
+        work_brief_digest: brief_digest_3,
+        supersedes_job_id: Some(job_2.job_id.clone()),
+        planning_result: Some(pr_3),
+        approval_linkage: None,
+        tasks: Vec::new(),
+        holds: Vec::new(),
+        outbox: Vec::new(),
+        combined_candidates: Vec::new(),
+    };
+
+    // Unretired independent planning approval in the same ledger must keep NeedsApproval.
+    let (brief_4, brief_digest_4) = sample_work_brief(
+        "brf_obs_04",
+        BINDING_A,
+        THREAD_A,
+        project_base.clone(),
+        WorkBriefKind::NewJob,
+        "Older unretired independent plan without successor",
+    );
+    let job_4_id = "job_obs_000000000000000000000004";
+    let (res_4, pr_4) = sample_completed_orchestrator_reservation_and_result(
+        BINDING_A,
+        THREAD_A,
+        grant_id,
+        job_4_id,
+        "obs_04",
+        &brief_digest_4,
+        &project_base,
+        &planning_policy_digest,
+        "plan_obs_04",
+        "run_00000000-0000-4000-8000-000000000204",
+    );
+    let job_4 = CoworkerJobRecord {
+        job_id: job_4_id.to_string(),
+        job_revision: 2,
+        create_request_key: "req_obs_job_04".to_string(),
+        binding_id: BINDING_A.to_string(),
+        thread_uuid: THREAD_A.to_string(),
+        phase: CoworkerJobPhase::AwaitingApproval,
+        work_brief: brief_4,
+        work_brief_digest: brief_digest_4,
+        supersedes_job_id: None,
+        planning_result: Some(pr_4),
+        approval_linkage: None,
+        tasks: Vec::new(),
+        holds: Vec::new(),
+        outbox: Vec::new(),
+        combined_candidates: Vec::new(),
+    };
+
+    let planning_grant = PlanningAdviceGrant {
+        grant_id: grant_id.to_string(),
+        create_request_key: "req_grant_obs_lineage".to_string(),
+        binding_id: BINDING_A.to_string(),
+        thread_uuid: THREAD_A.to_string(),
+        project_base,
+        profile_id: "profile-default".to_string(),
+        registry_revision: 1,
+        policy: planning_policy,
+        policy_digest: planning_policy_digest,
+        capabilities: PlanningReadOnlyCapabilities::strict_read_only(),
+        budget: PlanningCallBudget {
+            max_total_calls: 8,
+            max_orchestrator_calls: 8,
+            max_architect_calls: 2,
+            max_timeout_ms_per_call: DEFAULT_TIMEOUT_MS,
+            max_output_bytes_per_call: DEFAULT_MAX_STDOUT_BYTES,
+        },
+        usage: PlanningGrantUsage {
+            reserved_total_calls: 3,
+            completed_calls: 3,
+            failed_calls: 0,
+            unknown_effect_calls: 0,
+            refused_before_effect_calls: 0,
+            reserved_orchestrator_calls: 3,
+            reserved_architect_calls: 0,
+        },
+        status: PlanningGrantStatus::Active,
+        created_at_ms: 1_700_000_040_000,
+        expires_at_ms: 1_700_003_640_000,
+        revoked_at_ms: None,
+        revoked_reason: None,
+        operator_attested: true,
+        native_per_call_identity_verified: false,
+        scoped_profile_dependency_proof: None,
+        reservations: vec![res_2, res_3, res_4],
+    };
+    planning_grant.validate().expect("valid planning grant");
+
+    let workflow_store = CoworkerWorkflowStore::new(&plans_dir).expect("workflow store");
+    let ledger = CoworkerBindingLedger {
+        schema_version: 1,
+        binding_id: BINDING_A.to_string(),
+        thread_uuid: Some(THREAD_A.to_string()),
+        ledger_revision: 4,
+        planning_grants: vec![planning_grant],
+        architect_advice: Vec::new(),
+        jobs: vec![job_1.clone(), job_2.clone(), job_3.clone(), job_4.clone()],
+        admission_markers: BTreeMap::new(),
+    };
+    ledger.validate(BINDING_A).expect("valid workflow ledger");
+    let ledger_path = workflow_store
+        .ledger_path_for_binding(BINDING_A)
+        .expect("workflow ledger path");
+    write_private_json(&ledger_path, &ledger);
+
+    let mut entries_before: Vec<_> = fs::read_dir(&plans_dir)
+        .expect("read plans_dir before")
+        .map(|e| e.expect("entry").file_name())
+        .collect();
+    entries_before.sort();
+    let ledger_bytes_before = fs::read(&ledger_path).expect("read ledger bytes before");
+
+    let stores = WorkspaceHistoryStores::new(&plans_dir);
+    let read = read_scoped_workspace_job_histories(&chat, &stores)
+        .expect("scoped read with obsolete planning lineage");
+
+    let mut entries_after: Vec<_> = fs::read_dir(&plans_dir)
+        .expect("read plans_dir after")
+        .map(|e| e.expect("entry").file_name())
+        .collect();
+    entries_after.sort();
+    let ledger_bytes_after = fs::read(&ledger_path).expect("read ledger bytes after");
+    assert_eq!(
+        entries_before, entries_after,
+        "read-only history projection must not create lockfiles or sidecars"
+    );
+    assert_eq!(
+        ledger_bytes_before, ledger_bytes_after,
+        "read-only history projection must not mutate stored ledgers"
+    );
+    assert!(!read.degraded);
+    assert_eq!(read.rejected_scope_count, 0);
+    assert_eq!(read.jobs.len(), 4);
+
+    let find_job = |id: &str| {
+        read.jobs
+            .iter()
+            .find(|j| j.job.job_id == id)
+            .expect("projected job exists")
+    };
+
+    let h1 = find_job(&job_1.job_id);
+    assert_eq!(h1.current_attention, None);
+    assert_eq!(h1.job.phase.as_deref(), Some("held"));
+    assert_eq!(h1.job.approval_status, "superseded");
+    assert_eq!(h1.job.execution_status, "not_started");
+    assert_eq!(h1.job.review_state, None);
+    assert_eq!(h1.job.state, ObservationJobState::Unknown);
+    assert_ne!(h1.job.state, ObservationJobState::Failed);
+    assert_ne!(h1.job.state, ObservationJobState::NeedsUser);
+    assert_ne!(h1.job.state, ObservationJobState::Completed);
+    assert_eq!(h1.acceptance_proof, WorkspaceAcceptanceProof::unknown());
+    assert_eq!(h1.result, None);
+    assert_eq!(
+        h1.links.superseded_by_job_id.as_deref(),
+        Some(job_2.job_id.as_str())
+    );
+    assert_eq!(h1.links.follow_up_job_ids, vec![job_2.job_id.clone()]);
+
+    let h2 = find_job(&job_2.job_id);
+    assert_eq!(h2.current_attention, None);
+    assert_eq!(h2.job.phase.as_deref(), Some("awaiting_approval"));
+    assert_eq!(h2.job.approval_status, "superseded");
+    assert_eq!(h2.job.execution_status, "not_started");
+    assert_eq!(h2.job.review_state, None);
+    assert_eq!(h2.job.state, ObservationJobState::Unknown);
+    assert_ne!(h2.job.state, ObservationJobState::Failed);
+    assert_ne!(h2.job.state, ObservationJobState::NeedsUser);
+    assert_ne!(h2.job.state, ObservationJobState::Completed);
+    assert_eq!(h2.acceptance_proof, WorkspaceAcceptanceProof::unknown());
+    assert_eq!(h2.result, None);
+    assert_eq!(
+        h2.links.supersedes_job_id.as_deref(),
+        Some(job_1.job_id.as_str())
+    );
+    assert_eq!(
+        h2.links.superseded_by_job_id.as_deref(),
+        Some(job_3.job_id.as_str())
+    );
+    assert_eq!(h2.links.source_plan_id.as_deref(), Some("plan_obs_02"));
+    assert_eq!(h2.runs.len(), 1);
+
+    let h3 = find_job(&job_3.job_id);
+    assert_eq!(
+        h3.current_attention.as_ref().map(|a| a.kind),
+        Some(WorkspaceAttentionKind::NeedsApproval)
+    );
+    assert_eq!(h3.job.state, ObservationJobState::NeedsUser);
+    assert_eq!(h3.job.approval_status, "pending_approval");
+
+    let h4 = find_job(&job_4.job_id);
+    assert_eq!(
+        h4.current_attention.as_ref().map(|a| a.kind),
+        Some(WorkspaceAttentionKind::NeedsApproval)
+    );
+    assert_eq!(h4.job.state, ObservationJobState::NeedsUser);
+
+    let persisted_ledger = workflow_store
+        .read_binding_ledger(BINDING_A)
+        .expect("re-read stored ledger");
+    assert_eq!(persisted_ledger.jobs[0].holds, job_1.holds);
+    assert_eq!(persisted_ledger.jobs[1].holds, job_2.holds);
+}
+
+#[test]
+fn forged_lineage_context_unrelated_jobs_and_scope_or_revision_mismatches_do_not_suppress_attention(
+) {
+    let tmp = TempDir::new().expect("tempdir");
+    let plans_dir = make_private_dir(&tmp.path().join("plans"));
+    let auth_dir = make_private_dir(&tmp.path().join("authority"));
+    let repo_a = make_private_dir(&tmp.path().join("repo-a"));
+    let repo_b = make_private_dir(&tmp.path().join("repo-b"));
+    let chat_a =
+        WorkspaceChatIdentity::new(SOURCE_A, BINDING_A, THREAD_A, &repo_a.to_string_lossy())
+            .expect("chat identity A");
+
+    let base_a = sample_project_base(&repo_a);
+    let base_b = sample_project_base(&repo_b);
+    let policy = ExecutionPolicy::deny_all("policy-test").expect("policy");
+    let policy_digest = policy.digest().expect("policy digest");
+
+    // 1. Forged caller-supplied public WorkspaceJobLineageContext on pure projection must NEVER suppress attention.
+    let (forged_brief_await, forged_digest_await) = sample_work_brief(
+        "brf_forged_await",
+        BINDING_A,
+        THREAD_A,
+        base_a.clone(),
+        WorkBriefKind::NewJob,
+        "Awaiting approval tested against forged lineage context",
+    );
+    let job_forged_await = CoworkerJobRecord {
+        job_id: "job_forged_await_01".to_string(),
+        job_revision: 1,
+        create_request_key: "req_forged_await_01".to_string(),
+        binding_id: BINDING_A.to_string(),
+        thread_uuid: THREAD_A.to_string(),
+        phase: CoworkerJobPhase::AwaitingApproval,
+        work_brief: forged_brief_await,
+        work_brief_digest: forged_digest_await,
+        supersedes_job_id: None,
+        planning_result: None,
+        approval_linkage: None,
+        tasks: Vec::new(),
+        holds: Vec::new(),
+        outbox: Vec::new(),
+        combined_candidates: Vec::new(),
+    };
+    let (forged_brief_held, forged_digest_held) = sample_work_brief(
+        "brf_forged_held",
+        BINDING_A,
+        THREAD_A,
+        base_a.clone(),
+        WorkBriefKind::NewJob,
+        "Held planning job tested against forged lineage context",
+    );
+    let job_forged_held = CoworkerJobRecord {
+        job_id: "job_forged_held_01".to_string(),
+        job_revision: 2,
+        create_request_key: "req_forged_held_01".to_string(),
+        binding_id: BINDING_A.to_string(),
+        thread_uuid: THREAD_A.to_string(),
+        phase: CoworkerJobPhase::Held,
+        work_brief: forged_brief_held,
+        work_brief_digest: forged_digest_held,
+        supersedes_job_id: None,
+        planning_result: None,
+        approval_linkage: None,
+        tasks: Vec::new(),
+        holds: vec![sample_amendment_hold(
+            "hld_forged_01",
+            "amend_forged_01",
+            2,
+            "Claimed amendment hold",
+        )],
+        outbox: Vec::new(),
+        combined_candidates: Vec::new(),
+    };
+    let forged_ctx = WorkspaceJobLineageContext {
+        superseded_by_job_id: Some("job_claimed_successor_99".to_string()),
+        follow_up_job_ids: vec!["job_claimed_successor_99".to_string()],
+        ..WorkspaceJobLineageContext::default()
+    };
+    let pure_await =
+        project_coworker_job_history(&chat_a, &job_forged_await, None, Some(&forged_ctx))
+            .expect("pure await projection");
+    assert_eq!(pure_await.job.approval_status, "superseded");
+    assert_eq!(pure_await.job.state, ObservationJobState::NeedsUser);
+    assert_eq!(
+        pure_await.current_attention.as_ref().map(|a| a.kind),
+        Some(WorkspaceAttentionKind::NeedsApproval)
+    );
+    let pure_held =
+        project_coworker_job_history(&chat_a, &job_forged_held, None, Some(&forged_ctx))
+            .expect("pure held projection");
+    assert_eq!(pure_held.job.state, ObservationJobState::NeedsUser);
+    assert_eq!(
+        pure_held.current_attention.as_ref().map(|a| a.kind),
+        Some(WorkspaceAttentionKind::OnHold)
+    );
+
+    // 2. Store-backed checks: unrelated NewJob, revision mismatch, cross-repo successor, and missing-approval successor.
+    let (b_unrel_old, d_unrel_old) = sample_work_brief(
+        "brf_unrel_old",
+        BINDING_A,
+        THREAD_A,
+        base_a.clone(),
+        WorkBriefKind::NewJob,
+        "Old planning job followed only by unrelated NewJob",
+    );
+    let job_unrel_old = CoworkerJobRecord {
+        job_id: "job_unrel_old_01".to_string(),
+        job_revision: 1,
+        create_request_key: "req_unrel_old_01".to_string(),
+        binding_id: BINDING_A.to_string(),
+        thread_uuid: THREAD_A.to_string(),
+        phase: CoworkerJobPhase::AwaitingApproval,
+        work_brief: b_unrel_old,
+        work_brief_digest: d_unrel_old,
+        supersedes_job_id: None,
+        planning_result: None,
+        approval_linkage: None,
+        tasks: Vec::new(),
+        holds: Vec::new(),
+        outbox: Vec::new(),
+        combined_candidates: Vec::new(),
+    };
+    let (b_unrel_new, d_unrel_new) = sample_work_brief(
+        "brf_unrel_new",
+        BINDING_A,
+        THREAD_A,
+        base_a.clone(),
+        WorkBriefKind::NewJob,
+        "Newer independent job in same scope",
+    );
+    let job_unrel_new = CoworkerJobRecord {
+        job_id: "job_unrel_new_02".to_string(),
+        job_revision: 1,
+        create_request_key: "req_unrel_new_02".to_string(),
+        binding_id: BINDING_A.to_string(),
+        thread_uuid: THREAD_A.to_string(),
+        phase: CoworkerJobPhase::Planning,
+        work_brief: b_unrel_new,
+        work_brief_digest: d_unrel_new,
+        supersedes_job_id: None,
+        planning_result: None,
+        approval_linkage: None,
+        tasks: Vec::new(),
+        holds: Vec::new(),
+        outbox: Vec::new(),
+        combined_candidates: Vec::new(),
+    };
+
+    // target_job_revision > old_job.job_revision mismatch
+    let (b_rev_old, d_rev_old) = sample_work_brief(
+        "brf_rev_old",
+        BINDING_A,
+        THREAD_A,
+        base_a.clone(),
+        WorkBriefKind::NewJob,
+        "Old planning job with revision 1",
+    );
+    let job_rev_old = CoworkerJobRecord {
+        job_id: "job_rev_old_01".to_string(),
+        job_revision: 1,
+        create_request_key: "req_rev_old_01".to_string(),
+        binding_id: BINDING_A.to_string(),
+        thread_uuid: THREAD_A.to_string(),
+        phase: CoworkerJobPhase::AwaitingApproval,
+        work_brief: b_rev_old,
+        work_brief_digest: d_rev_old,
+        supersedes_job_id: None,
+        planning_result: None,
+        approval_linkage: None,
+        tasks: Vec::new(),
+        holds: Vec::new(),
+        outbox: Vec::new(),
+        combined_candidates: Vec::new(),
+    };
+    let (b_rev_succ, d_rev_succ) = sample_work_brief(
+        "brf_rev_succ",
+        BINDING_A,
+        THREAD_A,
+        base_a.clone(),
+        WorkBriefKind::Amendment {
+            target_job_id: job_rev_old.job_id.clone(),
+            target_job_revision: 9,
+            amendment_reason: "Impossible future target revision".to_string(),
+        },
+        "Successor claiming future target_job_revision",
+    );
+    let job_rev_succ = CoworkerJobRecord {
+        job_id: "job_rev_succ_02".to_string(),
+        job_revision: 1,
+        create_request_key: "req_rev_succ_02".to_string(),
+        binding_id: BINDING_A.to_string(),
+        thread_uuid: THREAD_A.to_string(),
+        phase: CoworkerJobPhase::Planning,
+        work_brief: b_rev_succ,
+        work_brief_digest: d_rev_succ,
+        supersedes_job_id: Some(job_rev_old.job_id.clone()),
+        planning_result: None,
+        approval_linkage: None,
+        tasks: Vec::new(),
+        holds: Vec::new(),
+        outbox: Vec::new(),
+        combined_candidates: Vec::new(),
+    };
+
+    // Cross-repository successor (repo_b) targeting repo_a old job
+    let (b_repo_old, d_repo_old) = sample_work_brief(
+        "brf_repo_old",
+        BINDING_A,
+        THREAD_A,
+        base_a.clone(),
+        WorkBriefKind::NewJob,
+        "Held job in repo_a targeted by foreign-repo amendment",
+    );
+    let job_repo_old = CoworkerJobRecord {
+        job_id: "job_repo_old_01".to_string(),
+        job_revision: 2,
+        create_request_key: "req_repo_old_01".to_string(),
+        binding_id: BINDING_A.to_string(),
+        thread_uuid: THREAD_A.to_string(),
+        phase: CoworkerJobPhase::Held,
+        work_brief: b_repo_old,
+        work_brief_digest: d_repo_old,
+        supersedes_job_id: None,
+        planning_result: None,
+        approval_linkage: None,
+        tasks: Vec::new(),
+        holds: vec![sample_amendment_hold(
+            "hld_repo_old_01",
+            "amend_repo_old_01",
+            2,
+            "Pending amendment",
+        )],
+        outbox: Vec::new(),
+        combined_candidates: Vec::new(),
+    };
+    let (b_repo_succ, d_repo_succ) = sample_work_brief(
+        "brf_repo_succ",
+        BINDING_A,
+        THREAD_A,
+        base_b,
+        WorkBriefKind::Amendment {
+            target_job_id: job_repo_old.job_id.clone(),
+            target_job_revision: 1,
+            amendment_reason: "Mismatched canonical project scope".to_string(),
+        },
+        "Foreign repository successor",
+    );
+    let job_repo_succ = CoworkerJobRecord {
+        job_id: "job_repo_succ_02".to_string(),
+        job_revision: 1,
+        create_request_key: "req_repo_succ_02".to_string(),
+        binding_id: BINDING_A.to_string(),
+        thread_uuid: THREAD_A.to_string(),
+        phase: CoworkerJobPhase::Planning,
+        work_brief: b_repo_succ,
+        work_brief_digest: d_repo_succ,
+        supersedes_job_id: Some(job_repo_old.job_id.clone()),
+        planning_result: None,
+        approval_linkage: None,
+        tasks: Vec::new(),
+        holds: Vec::new(),
+        outbox: Vec::new(),
+        combined_candidates: Vec::new(),
+    };
+
+    // Successor with unverified/missing approval_id in configured AuthorityStore must be rejected before supersession.
+    let (b_auth_old, d_auth_old) = sample_work_brief(
+        "brf_auth_old",
+        BINDING_A,
+        THREAD_A,
+        base_a.clone(),
+        WorkBriefKind::NewJob,
+        "Old planning job targeted by successor with missing approval",
+    );
+    let job_auth_old = CoworkerJobRecord {
+        job_id: "job_auth_old_01".to_string(),
+        job_revision: 1,
+        create_request_key: "req_auth_old_01".to_string(),
+        binding_id: BINDING_A.to_string(),
+        thread_uuid: THREAD_A.to_string(),
+        phase: CoworkerJobPhase::AwaitingApproval,
+        work_brief: b_auth_old,
+        work_brief_digest: d_auth_old,
+        supersedes_job_id: None,
+        planning_result: None,
+        approval_linkage: None,
+        tasks: Vec::new(),
+        holds: Vec::new(),
+        outbox: Vec::new(),
+        combined_candidates: Vec::new(),
+    };
+    let (b_auth_succ, d_auth_succ) = sample_work_brief(
+        "brf_auth_succ",
+        BINDING_A,
+        THREAD_A,
+        base_a.clone(),
+        WorkBriefKind::Amendment {
+            target_job_id: job_auth_old.job_id.clone(),
+            target_job_revision: 1,
+            amendment_reason: "Successor claiming missing approval".to_string(),
+        },
+        "Successor with missing authority record",
+    );
+    let mut missing_linkage = sample_approval_linkage(
+        base_a,
+        &policy_digest,
+        vec!["task-missing-auth-01".to_string()],
+    );
+    missing_linkage.plan_id = "plan_missing_auth_02".to_string();
+    let job_auth_succ = CoworkerJobRecord {
+        job_id: "job_auth_succ_02".to_string(),
+        job_revision: 2,
+        create_request_key: "req_auth_succ_02".to_string(),
+        binding_id: BINDING_A.to_string(),
+        thread_uuid: THREAD_A.to_string(),
+        phase: CoworkerJobPhase::Executing,
+        work_brief: b_auth_succ,
+        work_brief_digest: d_auth_succ,
+        supersedes_job_id: Some(job_auth_old.job_id.clone()),
+        planning_result: None,
+        approval_linkage: Some(missing_linkage),
+        tasks: Vec::new(),
+        holds: Vec::new(),
+        outbox: Vec::new(),
+        combined_candidates: Vec::new(),
+    };
+
+    let workflow_store = CoworkerWorkflowStore::new(&plans_dir).expect("workflow store");
+    let ledger = CoworkerBindingLedger {
+        schema_version: 1,
+        binding_id: BINDING_A.to_string(),
+        thread_uuid: Some(THREAD_A.to_string()),
+        ledger_revision: 1,
+        planning_grants: Vec::new(),
+        architect_advice: Vec::new(),
+        jobs: vec![
+            job_unrel_old.clone(),
+            job_unrel_new,
+            job_rev_old.clone(),
+            job_rev_succ,
+            job_repo_old.clone(),
+            job_repo_succ,
+            job_auth_old.clone(),
+            job_auth_succ,
+        ],
+        admission_markers: BTreeMap::new(),
+    };
+    ledger.validate(BINDING_A).expect("valid ledger");
+    write_private_json(
+        &workflow_store
+            .ledger_path_for_binding(BINDING_A)
+            .expect("ledger path"),
+        &ledger,
+    );
+
+    let stores = WorkspaceHistoryStores::new(&plans_dir).with_authority_dir(&auth_dir);
+    let read = read_scoped_workspace_job_histories(&chat_a, &stores).expect("scoped read");
+    assert_eq!(read.rejected_scope_count, 2);
+
+    let find_job = |id: &str| {
+        read.jobs
+            .iter()
+            .find(|j| j.job.job_id == id)
+            .expect("projected job exists")
+    };
+
+    let h_unrel = find_job(&job_unrel_old.job_id);
+    assert_eq!(
+        h_unrel.current_attention.as_ref().map(|a| a.kind),
+        Some(WorkspaceAttentionKind::NeedsApproval)
+    );
+    assert_eq!(h_unrel.links.superseded_by_job_id, None);
+
+    let h_rev = find_job(&job_rev_old.job_id);
+    assert_eq!(
+        h_rev.current_attention.as_ref().map(|a| a.kind),
+        Some(WorkspaceAttentionKind::NeedsApproval)
+    );
+    assert_eq!(h_rev.links.superseded_by_job_id, None);
+
+    let h_repo = find_job(&job_repo_old.job_id);
+    assert_eq!(
+        h_repo.current_attention.as_ref().map(|a| a.kind),
+        Some(WorkspaceAttentionKind::OnHold)
+    );
+    assert_eq!(h_repo.links.superseded_by_job_id, None);
+
+    let h_auth = find_job(&job_auth_old.job_id);
+    assert_eq!(
+        h_auth.current_attention.as_ref().map(|a| a.kind),
+        Some(WorkspaceAttentionKind::NeedsApproval)
+    );
+    assert_eq!(h_auth.links.superseded_by_job_id, None);
+}
+
+#[test]
+fn non_amendment_holds_execution_linkage_runtime_degradation_and_ambiguous_reservations_preserve_attention(
+) {
+    let tmp = TempDir::new().expect("tempdir");
+    let plans_dir = make_private_dir(&tmp.path().join("plans"));
+    let repo_dir = make_private_dir(&tmp.path().join("repo-non-effect-free"));
+    let chat =
+        WorkspaceChatIdentity::new(SOURCE_A, BINDING_A, THREAD_A, &repo_dir.to_string_lossy())
+            .expect("chat identity");
+
+    let base = sample_project_base(&repo_dir);
+    let policy = ExecutionPolicy::deny_all("policy-test").expect("policy");
+    let policy_digest = policy.digest().expect("policy digest");
+    let planning_policy = sample_planning_policy();
+    let planning_policy_digest = planning_policy.digest().expect("planning policy digest");
+
+    // 1. Extra ConversationClarificationPending hold alongside BriefAmendmentPending -> retains NeedsUserInput.
+    let (b_clar_old, d_clar_old) = sample_work_brief(
+        "brf_clar_old",
+        BINDING_A,
+        THREAD_A,
+        base.clone(),
+        WorkBriefKind::NewJob,
+        "Held job with active user clarification hold",
+    );
+    let job_clar_old = CoworkerJobRecord {
+        job_id: "job_clar_old_01".to_string(),
+        job_revision: 3,
+        create_request_key: "req_clar_old_01".to_string(),
+        binding_id: BINDING_A.to_string(),
+        thread_uuid: THREAD_A.to_string(),
+        phase: CoworkerJobPhase::Held,
+        work_brief: b_clar_old,
+        work_brief_digest: d_clar_old,
+        supersedes_job_id: None,
+        planning_result: None,
+        approval_linkage: None,
+        tasks: Vec::new(),
+        holds: vec![
+            sample_amendment_hold("hld_clar_amend", "amend_clar_01", 2, "Amended"),
+            WorkflowHoldRecord {
+                hold_id: "hld_clar_user".to_string(),
+                request_key: "req_clar_hold".to_string(),
+                reason: WorkflowHoldReason::ConversationClarificationPending,
+                detail: "Confirm migration target before continuing".to_string(),
+                directly_affected_task_ids: Vec::new(),
+                affected_write_paths: Vec::new(),
+                affected_interfaces: Vec::new(),
+                holds_entire_job: true,
+                active: true,
+                created_at_job_revision: 3,
+                resolved_at_job_revision: None,
+                resolution_note: None,
+            },
+        ],
+        outbox: Vec::new(),
+        combined_candidates: Vec::new(),
+    };
+    let (b_clar_succ, d_clar_succ) = sample_work_brief(
+        "brf_clar_succ",
+        BINDING_A,
+        THREAD_A,
+        base.clone(),
+        WorkBriefKind::Amendment {
+            target_job_id: job_clar_old.job_id.clone(),
+            target_job_revision: 3,
+            amendment_reason: "Amended while clarification still active".to_string(),
+        },
+        "Successor to clarification-held job",
+    );
+    let job_clar_succ = CoworkerJobRecord {
+        job_id: "job_clar_succ_02".to_string(),
+        job_revision: 1,
+        create_request_key: "req_clar_succ_02".to_string(),
+        binding_id: BINDING_A.to_string(),
+        thread_uuid: THREAD_A.to_string(),
+        phase: CoworkerJobPhase::Planning,
+        work_brief: b_clar_succ,
+        work_brief_digest: d_clar_succ,
+        supersedes_job_id: Some(job_clar_old.job_id.clone()),
+        planning_result: None,
+        approval_linkage: None,
+        tasks: Vec::new(),
+        holds: Vec::new(),
+        outbox: Vec::new(),
+        combined_candidates: Vec::new(),
+    };
+
+    // 2. Held phase with zero active holds -> lacks BriefAmendmentPending proof, retains OnHold.
+    let (b_nohold_old, d_nohold_old) = sample_work_brief(
+        "brf_nohold_old",
+        BINDING_A,
+        THREAD_A,
+        base.clone(),
+        WorkBriefKind::NewJob,
+        "Held job without active BriefAmendmentPending hold",
+    );
+    let job_nohold_old = CoworkerJobRecord {
+        job_id: "job_nohold_old_01".to_string(),
+        job_revision: 1,
+        create_request_key: "req_nohold_old_01".to_string(),
+        binding_id: BINDING_A.to_string(),
+        thread_uuid: THREAD_A.to_string(),
+        phase: CoworkerJobPhase::Held,
+        work_brief: b_nohold_old,
+        work_brief_digest: d_nohold_old,
+        supersedes_job_id: None,
+        planning_result: None,
+        approval_linkage: None,
+        tasks: Vec::new(),
+        holds: Vec::new(),
+        outbox: Vec::new(),
+        combined_candidates: Vec::new(),
+    };
+    let (b_nohold_succ, d_nohold_succ) = sample_work_brief(
+        "brf_nohold_succ",
+        BINDING_A,
+        THREAD_A,
+        base.clone(),
+        WorkBriefKind::Amendment {
+            target_job_id: job_nohold_old.job_id.clone(),
+            target_job_revision: 1,
+            amendment_reason: "Amend held job without hold record".to_string(),
+        },
+        "Successor to zero-hold held job",
+    );
+    let job_nohold_succ = CoworkerJobRecord {
+        job_id: "job_nohold_succ_02".to_string(),
+        job_revision: 1,
+        create_request_key: "req_nohold_succ_02".to_string(),
+        binding_id: BINDING_A.to_string(),
+        thread_uuid: THREAD_A.to_string(),
+        phase: CoworkerJobPhase::Planning,
+        work_brief: b_nohold_succ,
+        work_brief_digest: d_nohold_succ,
+        supersedes_job_id: Some(job_nohold_old.job_id.clone()),
+        planning_result: None,
+        approval_linkage: None,
+        tasks: Vec::new(),
+        holds: Vec::new(),
+        outbox: Vec::new(),
+        combined_candidates: Vec::new(),
+    };
+
+    // 3. Approved job with task/attempt/controller runtime stop -> retains attention despite amendment successor.
+    let (b_exec_old, d_exec_old) = sample_work_brief(
+        "brf_exec_old",
+        BINDING_A,
+        THREAD_A,
+        base.clone(),
+        WorkBriefKind::NewJob,
+        "Approved job with controller stop fence",
+    );
+    let mut exec_linkage = sample_approval_linkage(
+        base.clone(),
+        &policy_digest,
+        vec!["task-exec-01".to_string()],
+    );
+    exec_linkage.plan_id = "plan_exec_old_01".to_string();
+    let job_exec_old = CoworkerJobRecord {
+        job_id: "job_exec_old_01".to_string(),
+        job_revision: 3,
+        create_request_key: "req_exec_old_01".to_string(),
+        binding_id: BINDING_A.to_string(),
+        thread_uuid: THREAD_A.to_string(),
+        phase: CoworkerJobPhase::Executing,
+        work_brief: b_exec_old,
+        work_brief_digest: d_exec_old,
+        supersedes_job_id: None,
+        planning_result: None,
+        approval_linkage: Some(exec_linkage),
+        tasks: vec![CoworkerTaskRecord {
+            task_id: "task-exec-01".to_string(),
+            task_digest: HEX64_D.to_string(),
+            role: WorkflowRole::Coder,
+            difficulty: Difficulty::Hard,
+            selected_choice: sample_coder_choice(),
+            depends_on: Vec::new(),
+            write_paths: vec!["src/lib.rs".to_string()],
+            owned_interfaces: Vec::new(),
+            consumed_interfaces: Vec::new(),
+            stage: CoworkerTaskStage::ReadyToDispatch,
+            stage_before_hold: None,
+            current_attempt_no: 0,
+            active_candidate_id: None,
+            accepted_candidate_id: None,
+            dependency_input_commit: None,
+            dependency_input_tree_sha: None,
+            accepted_predecessor_receipts: Vec::new(),
+            attempts: Vec::new(),
+            candidates: Vec::new(),
+            active_hold_ids: Vec::new(),
+            unresolved_outbox_id: None,
+        }],
+        holds: Vec::new(),
+        outbox: Vec::new(),
+        combined_candidates: Vec::new(),
+    };
+    let (b_exec_succ, d_exec_succ) = sample_work_brief(
+        "brf_exec_succ",
+        BINDING_A,
+        THREAD_A,
+        base.clone(),
+        WorkBriefKind::Amendment {
+            target_job_id: job_exec_old.job_id.clone(),
+            target_job_revision: 3,
+            amendment_reason: "Follow-up amendment after approval".to_string(),
+        },
+        "Successor to approved job",
+    );
+    let job_exec_succ = CoworkerJobRecord {
+        job_id: "job_exec_succ_02".to_string(),
+        job_revision: 1,
+        create_request_key: "req_exec_succ_02".to_string(),
+        binding_id: BINDING_A.to_string(),
+        thread_uuid: THREAD_A.to_string(),
+        phase: CoworkerJobPhase::Planning,
+        work_brief: b_exec_succ,
+        work_brief_digest: d_exec_succ,
+        supersedes_job_id: Some(job_exec_old.job_id.clone()),
+        planning_result: None,
+        approval_linkage: None,
+        tasks: Vec::new(),
+        holds: Vec::new(),
+        outbox: Vec::new(),
+        combined_candidates: Vec::new(),
+    };
+
+    // 4. Non-causal manual BriefAmendmentPending hold (request_key does not match amend_<succ>) -> retains OnHold.
+    let (b_uncausal_old, d_uncausal_old) = sample_work_brief(
+        "brf_uncausal_old",
+        BINDING_A,
+        THREAD_A,
+        base.clone(),
+        WorkBriefKind::NewJob,
+        "Held job with non-causal BriefAmendmentPending hold",
+    );
+    let job_uncausal_old = CoworkerJobRecord {
+        job_id: "job_uncausal_old_01".to_string(),
+        job_revision: 2,
+        create_request_key: "req_uncausal_old_01".to_string(),
+        binding_id: BINDING_A.to_string(),
+        thread_uuid: THREAD_A.to_string(),
+        phase: CoworkerJobPhase::Held,
+        work_brief: b_uncausal_old,
+        work_brief_digest: d_uncausal_old,
+        supersedes_job_id: None,
+        planning_result: None,
+        approval_linkage: None,
+        tasks: Vec::new(),
+        holds: vec![sample_amendment_hold(
+            "hld_uncausal_01",
+            "req_manual_hold_unrelated",
+            2,
+            "Manual hold unrelated to successor request_key",
+        )],
+        outbox: Vec::new(),
+        combined_candidates: Vec::new(),
+    };
+    let (b_uncausal_succ, d_uncausal_succ) = sample_work_brief(
+        "brf_uncausal_succ",
+        BINDING_A,
+        THREAD_A,
+        base.clone(),
+        WorkBriefKind::Amendment {
+            target_job_id: job_uncausal_old.job_id.clone(),
+            target_job_revision: 1,
+            amendment_reason: "Amendment alongside unrelated manual hold".to_string(),
+        },
+        "Successor to job with non-causal hold",
+    );
+    let job_uncausal_succ = CoworkerJobRecord {
+        job_id: "job_uncausal_succ_02".to_string(),
+        job_revision: 1,
+        create_request_key: "req_uncausal_succ_02".to_string(),
+        binding_id: BINDING_A.to_string(),
+        thread_uuid: THREAD_A.to_string(),
+        phase: CoworkerJobPhase::Planning,
+        work_brief: b_uncausal_succ,
+        work_brief_digest: d_uncausal_succ,
+        supersedes_job_id: Some(job_uncausal_old.job_id.clone()),
+        planning_result: None,
+        approval_linkage: None,
+        tasks: Vec::new(),
+        holds: Vec::new(),
+        outbox: Vec::new(),
+        combined_candidates: Vec::new(),
+    };
+
+    // 5. Clean superseded planning job in BINDING_A (with an unrelated-base reservation on the same grant
+    //    to prove base isolation, then used to verify degraded controller runtime refuses retirement).
+    let (b_clean_old, d_clean_old) = sample_work_brief(
+        "brf_clean_old",
+        BINDING_A,
+        THREAD_A,
+        base.clone(),
+        WorkBriefKind::NewJob,
+        "Clean superseded planning job",
+    );
+    let job_clean_old = CoworkerJobRecord {
+        job_id: "job_clean_old_01".to_string(),
+        job_revision: 2,
+        create_request_key: "req_clean_old_01".to_string(),
+        binding_id: BINDING_A.to_string(),
+        thread_uuid: THREAD_A.to_string(),
+        phase: CoworkerJobPhase::Held,
+        work_brief: b_clean_old,
+        work_brief_digest: d_clean_old.clone(),
+        supersedes_job_id: None,
+        planning_result: None,
+        approval_linkage: None,
+        tasks: Vec::new(),
+        holds: vec![sample_amendment_hold(
+            "hld_clean_01",
+            "amend_req_clean_succ_02",
+            2,
+            "Clean amendment",
+        )],
+        outbox: Vec::new(),
+        combined_candidates: Vec::new(),
+    };
+    let (b_clean_succ, d_clean_succ) = sample_work_brief(
+        "brf_clean_succ",
+        BINDING_A,
+        THREAD_A,
+        base.clone(),
+        WorkBriefKind::Amendment {
+            target_job_id: job_clean_old.job_id.clone(),
+            target_job_revision: 1,
+            amendment_reason: "Clean amendment".to_string(),
+        },
+        "Successor to clean planning job",
+    );
+    let job_clean_succ = CoworkerJobRecord {
+        job_id: "job_clean_succ_02".to_string(),
+        job_revision: 1,
+        create_request_key: "req_clean_succ_02".to_string(),
+        binding_id: BINDING_A.to_string(),
+        thread_uuid: THREAD_A.to_string(),
+        phase: CoworkerJobPhase::Planning,
+        work_brief: b_clean_succ,
+        work_brief_digest: d_clean_succ,
+        supersedes_job_id: Some(job_clean_old.job_id.clone()),
+        planning_result: None,
+        approval_linkage: None,
+        tasks: Vec::new(),
+        holds: Vec::new(),
+        outbox: Vec::new(),
+        combined_candidates: Vec::new(),
+    };
+
+    let unrelated_call_base = CanonicalProjectBaseRef {
+        repository_path: repo_dir.to_string_lossy().into_owned(),
+        base_commit: SHA40_HEAD_1.to_string(),
+        base_tree_sha: SHA40_TREE_1.to_string(),
+    };
+    let grant_other_base_id = "grt_other_base_0123456789abcdef";
+    let other_base_choice = sample_orchestrator_choice();
+    let other_base_digest = production_orchestrator_context_digest(
+        BINDING_A,
+        THREAD_A,
+        grant_other_base_id,
+        "profile-default",
+        1,
+        &planning_policy_digest,
+        "job_other_base_99",
+        &d_clean_old,
+        &unrelated_call_base,
+        None,
+        0,
+        &other_base_choice,
+    );
+    let grant_other_base = PlanningAdviceGrant {
+        grant_id: grant_other_base_id.to_string(),
+        create_request_key: "req_grant_other_base".to_string(),
+        binding_id: BINDING_A.to_string(),
+        thread_uuid: THREAD_A.to_string(),
+        project_base: base.clone(),
+        profile_id: "profile-default".to_string(),
+        registry_revision: 1,
+        policy: planning_policy.clone(),
+        policy_digest: planning_policy_digest.clone(),
+        capabilities: PlanningReadOnlyCapabilities::strict_read_only(),
+        budget: PlanningCallBudget {
+            max_total_calls: 4,
+            max_orchestrator_calls: 4,
+            max_architect_calls: 2,
+            max_timeout_ms_per_call: DEFAULT_TIMEOUT_MS,
+            max_output_bytes_per_call: DEFAULT_MAX_STDOUT_BYTES,
+        },
+        usage: PlanningGrantUsage {
+            reserved_total_calls: 1,
+            completed_calls: 0,
+            failed_calls: 0,
+            unknown_effect_calls: 0,
+            refused_before_effect_calls: 0,
+            reserved_orchestrator_calls: 1,
+            reserved_architect_calls: 0,
+        },
+        status: PlanningGrantStatus::Active,
+        created_at_ms: 1_700_000_040_000,
+        expires_at_ms: 1_700_003_640_000,
+        revoked_at_ms: None,
+        revoked_reason: None,
+        operator_attested: true,
+        native_per_call_identity_verified: false,
+        scoped_profile_dependency_proof: None,
+        reservations: vec![PlanningCallReservation {
+            reservation_id: "rsv_other_base_01".to_string(),
+            request_key: "req_rsv_other_base_01".to_string(),
+            role: WorkflowRole::Orchestrator,
+            difficulty: Some(Difficulty::Hard),
+            selected_choice: other_base_choice,
+            context_digest: other_base_digest,
+            call_project_base: Some(unrelated_call_base),
+            status: PlanningReservationStatus::ReservedBeforeEffect,
+            reserved_at_ms: 1_700_000_045_000,
+            updated_at_ms: 1_700_000_045_000,
+            run_id: None,
+            report_artifact_id: None,
+            output_digest: None,
+            diagnostic: None,
+        }],
+    };
+    grant_other_base
+        .validate()
+        .expect("valid grant with unrelated call_project_base reservation");
+
+    let workflow_store = CoworkerWorkflowStore::new(&plans_dir).expect("workflow store");
+    let ledger = CoworkerBindingLedger {
+        schema_version: 1,
+        binding_id: BINDING_A.to_string(),
+        thread_uuid: Some(THREAD_A.to_string()),
+        ledger_revision: 2,
+        planning_grants: vec![grant_other_base],
+        architect_advice: Vec::new(),
+        jobs: vec![
+            job_clar_old.clone(),
+            job_clar_succ,
+            job_nohold_old.clone(),
+            job_nohold_succ,
+            job_exec_old.clone(),
+            job_exec_succ,
+            job_uncausal_old.clone(),
+            job_uncausal_succ,
+            job_clean_old.clone(),
+            job_clean_succ,
+        ],
+        admission_markers: BTreeMap::new(),
+    };
+    ledger.validate(BINDING_A).expect("valid ledger");
+    write_private_json(
+        &workflow_store
+            .ledger_path_for_binding(BINDING_A)
+            .expect("ledger path"),
+        &ledger,
+    );
+
+    let mut exec_rt = sample_runtime_state(&job_exec_old, policy, &policy_digest);
+    exec_rt.stop_requested = true;
+    exec_rt.stop_or_block_reason = Some("Operator requested stop".to_string());
+    let mut rt_map = BTreeMap::new();
+    rt_map.insert(job_exec_old.job_id.clone(), exec_rt);
+    write_controller_ledger_file(&plans_dir, BINDING_A, rt_map);
+
+    // 6. Production-shaped composite-hash Orchestrator reservations (with no planning_result or
+    //    architect_advice) in BOTH ReservedBeforeEffect and EffectUnknown states, followed by real
+    //    causal amendment holds -> must conservatively retain OnHold attention without mutation.
+    for (binding_id, status_label, status, unknown_calls) in [
+        (
+            "bnd_hist_ambig_reserved",
+            "reserved_before_effect",
+            PlanningReservationStatus::ReservedBeforeEffect,
+            0u32,
+        ),
+        (
+            "bnd_hist_ambig_unknown",
+            "effect_unknown",
+            PlanningReservationStatus::EffectUnknown,
+            1u32,
+        ),
+    ] {
+        let ambig_chat =
+            WorkspaceChatIdentity::new(SOURCE_A, binding_id, THREAD_A, &repo_dir.to_string_lossy())
+                .expect("ambig chat identity");
+
+        let (b_ambig_old, d_ambig_old) = sample_work_brief(
+            &format!("brf_{status_label}_old"),
+            binding_id,
+            THREAD_A,
+            base.clone(),
+            WorkBriefKind::NewJob,
+            "Planning job interrupted before Orchestrator result and then amended",
+        );
+        let succ_req_key = format!("req_{status_label}_succ_02");
+        let job_ambig_old = CoworkerJobRecord {
+            job_id: format!("job_{status_label}_old_01"),
+            job_revision: 2,
+            create_request_key: format!("req_{status_label}_old_01"),
+            binding_id: binding_id.to_string(),
+            thread_uuid: THREAD_A.to_string(),
+            phase: CoworkerJobPhase::Held,
+            work_brief: b_ambig_old,
+            work_brief_digest: d_ambig_old.clone(),
+            supersedes_job_id: None,
+            planning_result: None,
+            approval_linkage: None,
+            tasks: Vec::new(),
+            holds: vec![sample_amendment_hold(
+                &format!("hld_{status_label}_01"),
+                &format!("amend_{succ_req_key}"),
+                2,
+                "Real causal amendment hold after interrupted Orchestrator call",
+            )],
+            outbox: Vec::new(),
+            combined_candidates: Vec::new(),
+        };
+        let (b_ambig_succ, d_ambig_succ) = sample_work_brief(
+            &format!("brf_{status_label}_succ"),
+            binding_id,
+            THREAD_A,
+            base.clone(),
+            WorkBriefKind::Amendment {
+                target_job_id: job_ambig_old.job_id.clone(),
+                target_job_revision: 1,
+                amendment_reason: "Real causal amendment hold after interrupted Orchestrator call"
+                    .to_string(),
+            },
+            "Amendment successor after interrupted Orchestrator reservation",
+        );
+        let job_ambig_succ = CoworkerJobRecord {
+            job_id: format!("job_{status_label}_succ_02"),
+            job_revision: 1,
+            create_request_key: succ_req_key,
+            binding_id: binding_id.to_string(),
+            thread_uuid: THREAD_A.to_string(),
+            phase: CoworkerJobPhase::Planning,
+            work_brief: b_ambig_succ,
+            work_brief_digest: d_ambig_succ,
+            supersedes_job_id: Some(job_ambig_old.job_id.clone()),
+            planning_result: None,
+            approval_linkage: None,
+            tasks: Vec::new(),
+            holds: Vec::new(),
+            outbox: Vec::new(),
+            combined_candidates: Vec::new(),
+        };
+
+        let grant_id = format!("grt_{status_label}_0123456789ab");
+        let choice = sample_orchestrator_choice();
+        let composite_digest = production_orchestrator_context_digest(
+            binding_id,
+            THREAD_A,
+            &grant_id,
+            "profile-default",
+            1,
+            &planning_policy_digest,
+            &job_ambig_old.job_id,
+            &d_ambig_old,
+            &base,
+            Some("plan_interrupted_draft"),
+            2,
+            &choice,
+        );
+        assert_ne!(
+            composite_digest, d_ambig_old,
+            "production Orchestrator context_digest must be a composite hash, never raw work_brief_digest"
+        );
+
+        let grant = PlanningAdviceGrant {
+            grant_id,
+            create_request_key: format!("req_grant_{status_label}"),
+            binding_id: binding_id.to_string(),
+            thread_uuid: THREAD_A.to_string(),
+            project_base: base.clone(),
+            profile_id: "profile-default".to_string(),
+            registry_revision: 1,
+            policy: planning_policy.clone(),
+            policy_digest: planning_policy_digest.clone(),
+            capabilities: PlanningReadOnlyCapabilities::strict_read_only(),
+            budget: PlanningCallBudget {
+                max_total_calls: 4,
+                max_orchestrator_calls: 4,
+                max_architect_calls: 2,
+                max_timeout_ms_per_call: DEFAULT_TIMEOUT_MS,
+                max_output_bytes_per_call: DEFAULT_MAX_STDOUT_BYTES,
+            },
+            usage: PlanningGrantUsage {
+                reserved_total_calls: 1,
+                completed_calls: 0,
+                failed_calls: 0,
+                unknown_effect_calls: unknown_calls,
+                refused_before_effect_calls: 0,
+                reserved_orchestrator_calls: 1,
+                reserved_architect_calls: 0,
+            },
+            status: PlanningGrantStatus::Active,
+            created_at_ms: 1_700_000_040_000,
+            expires_at_ms: 1_700_003_640_000,
+            revoked_at_ms: None,
+            revoked_reason: None,
+            operator_attested: true,
+            native_per_call_identity_verified: false,
+            scoped_profile_dependency_proof: None,
+            reservations: vec![PlanningCallReservation {
+                reservation_id: format!("rsv_{status_label}_01"),
+                request_key: format!("req_rsv_{status_label}_01"),
+                role: WorkflowRole::Orchestrator,
+                difficulty: Some(Difficulty::Hard),
+                selected_choice: choice,
+                context_digest: composite_digest,
+                call_project_base: Some(base.clone()),
+                status,
+                reserved_at_ms: 1_700_000_045_000,
+                updated_at_ms: 1_700_000_046_000,
+                run_id: None,
+                report_artifact_id: None,
+                output_digest: None,
+                diagnostic: Some("Interrupted orchestrator call".to_string()),
+            }],
+        };
+        grant
+            .validate()
+            .expect("valid grant with unresolved reservation");
+
+        let ambig_ledger = CoworkerBindingLedger {
+            schema_version: 1,
+            binding_id: binding_id.to_string(),
+            thread_uuid: Some(THREAD_A.to_string()),
+            ledger_revision: 2,
+            planning_grants: vec![grant],
+            architect_advice: Vec::new(),
+            jobs: vec![job_ambig_old.clone(), job_ambig_succ],
+            admission_markers: BTreeMap::new(),
+        };
+        ambig_ledger
+            .validate(binding_id)
+            .expect("valid ambiguous-reservation ledger");
+        let ambig_ledger_path = workflow_store
+            .ledger_path_for_binding(binding_id)
+            .expect("ambig ledger path");
+        write_private_json(&ambig_ledger_path, &ambig_ledger);
+        let bytes_before = fs::read(&ambig_ledger_path).expect("read ambig ledger before");
+
+        let stores = WorkspaceHistoryStores::new(&plans_dir);
+        let ambig_read = read_scoped_workspace_job_histories(&ambig_chat, &stores)
+            .expect("scoped read with unresolved planning reservation");
+        let bytes_after = fs::read(&ambig_ledger_path).expect("read ambig ledger after");
+        assert_eq!(
+            bytes_before, bytes_after,
+            "read-only history projection must not resolve or mutate unresolved reservations"
+        );
+
+        let h_ambig_old = ambig_read
+            .jobs
+            .iter()
+            .find(|j| j.job.job_id == job_ambig_old.job_id)
+            .expect("projected ambiguous old job");
+        assert_eq!(
+            h_ambig_old.current_attention.as_ref().map(|a| a.kind),
+            Some(WorkspaceAttentionKind::OnHold),
+            "unresolved {status_label} reservation with composite Orchestrator digest must block retirement"
+        );
+        assert_eq!(h_ambig_old.job.state, ObservationJobState::NeedsUser);
+        assert_eq!(h_ambig_old.job.phase.as_deref(), Some("held"));
+    }
+
+    let stores = WorkspaceHistoryStores::new(&plans_dir);
+    let read = read_scoped_workspace_job_histories(&chat, &stores).expect("healthy read");
+    assert!(!read.degraded);
+
+    fn find_in<'a>(
+        jobs: &'a [threadlane_core::observation::WorkspaceJobHistory],
+        id: &str,
+    ) -> &'a threadlane_core::observation::WorkspaceJobHistory {
+        jobs.iter()
+            .find(|j| j.job.job_id == id)
+            .expect("job exists")
+    }
+
+    assert_eq!(
+        find_in(&read.jobs, &job_clar_old.job_id)
+            .current_attention
+            .as_ref()
+            .map(|a| a.kind),
+        Some(WorkspaceAttentionKind::NeedsUserInput)
+    );
+    assert_eq!(
+        find_in(&read.jobs, &job_nohold_old.job_id)
+            .current_attention
+            .as_ref()
+            .map(|a| a.kind),
+        Some(WorkspaceAttentionKind::OnHold)
+    );
+    assert_eq!(
+        find_in(&read.jobs, &job_exec_old.job_id)
+            .current_attention
+            .as_ref()
+            .map(|a| a.kind),
+        Some(WorkspaceAttentionKind::BlockedFailure)
+    );
+    assert_eq!(
+        find_in(&read.jobs, &job_uncausal_old.job_id)
+            .current_attention
+            .as_ref()
+            .map(|a| a.kind),
+        Some(WorkspaceAttentionKind::OnHold)
+    );
+    let h_clean = find_in(&read.jobs, &job_clean_old.job_id);
+    assert_eq!(h_clean.current_attention, None);
+    assert_eq!(h_clean.job.state, ObservationJobState::Unknown);
+    assert_ne!(h_clean.job.state, ObservationJobState::Failed);
+    assert_eq!(h_clean.job.approval_status, "superseded");
+    assert_eq!(h_clean.job.execution_status, "not_started");
+
+    // Corrupt controller runtime ledger -> degraded store must refuse to treat job_clean_old as proven effect-free.
+    let policy_store = ControllerPolicyStore::new(&plans_dir).expect("policy store");
+    let ctl_ledger_path = policy_store
+        .ledger_path_for_binding(BINDING_A)
+        .expect("controller ledger path");
+    fs::write(&ctl_ledger_path, b"{not valid json").expect("corrupt controller ledger");
+    fs::set_permissions(&ctl_ledger_path, fs::Permissions::from_mode(0o600))
+        .expect("chmod 0600 corrupt controller ledger");
+
+    let degraded_read =
+        read_scoped_workspace_job_histories(&chat, &stores).expect("degraded controller read");
+    assert!(degraded_read.degraded);
+    let h_clean_degraded = find_in(&degraded_read.jobs, &job_clean_old.job_id);
+    assert_eq!(
+        h_clean_degraded.current_attention.as_ref().map(|a| a.kind),
+        Some(WorkspaceAttentionKind::OnHold),
+        "degraded controller runtime store must never prove effect-free retirement"
+    );
+    assert_eq!(h_clean_degraded.job.state, ObservationJobState::NeedsUser);
+    let persisted_clean = workflow_store
+        .read_binding_ledger(BINDING_A)
+        .expect("re-read clean workflow ledger");
+    assert_eq!(persisted_clean.jobs[8].holds, job_clean_old.holds);
+}
+
+#[test]
+fn preserves_unresolved_effect_attention_across_stop_supersession_and_completed_acceptance_candidates(
+) {
+    let tmp = TempDir::new().expect("tempdir");
+    let plans_dir = make_private_dir(&tmp.path().join("plans"));
+    let repo_dir = make_private_dir(&tmp.path().join("repo-unresolved"));
+    let chat =
+        WorkspaceChatIdentity::new(SOURCE_A, BINDING_A, THREAD_A, &repo_dir.to_string_lossy())
+            .expect("chat identity");
+
+    let base = sample_project_base(&repo_dir);
+    let policy = ExecutionPolicy::deny_all("policy-test").expect("policy");
+    let policy_digest = policy.digest().expect("policy digest");
+
+    let make_task =
+        |task_id: &str, stage: CoworkerTaskStage, unresolved_outbox_id: Option<&str>| {
+            CoworkerTaskRecord {
+                task_id: task_id.to_string(),
+                task_digest: HEX64_D.to_string(),
+                role: WorkflowRole::Coder,
+                difficulty: Difficulty::Hard,
+                selected_choice: sample_coder_choice(),
+                depends_on: Vec::new(),
+                write_paths: vec!["src/lib.rs".to_string()],
+                owned_interfaces: Vec::new(),
+                consumed_interfaces: Vec::new(),
+                stage,
+                stage_before_hold: None,
+                current_attempt_no: 1,
+                active_candidate_id: None,
+                accepted_candidate_id: None,
+                dependency_input_commit: None,
+                dependency_input_tree_sha: None,
+                accepted_predecessor_receipts: Vec::new(),
+                attempts: Vec::new(),
+                candidates: Vec::new(),
+                active_hold_ids: Vec::new(),
+                unresolved_outbox_id: unresolved_outbox_id.map(str::to_string),
+            }
+        };
+
+    // 1. Cancelled job with OutboxDispatchStatus::EffectUnknown must still require UnresolvedEffect reconciliation.
+    let (b_cancel, d_cancel) = sample_work_brief(
+        "brf_cancel_unknown",
+        BINDING_A,
+        THREAD_A,
+        base.clone(),
+        WorkBriefKind::NewJob,
+        "Cancelled job with unresolved outbox effect",
+    );
+    let mut link_cancel = sample_approval_linkage(
+        base.clone(),
+        &policy_digest,
+        vec!["task-cancel-u1".to_string()],
+    );
+    link_cancel.plan_id = "plan_cancel_u1".to_string();
+    let job_cancelled_unknown = CoworkerJobRecord {
+        job_id: "job_cancel_unknown_01".to_string(),
+        job_revision: 4,
+        create_request_key: "req_cancel_unknown_01".to_string(),
+        binding_id: BINDING_A.to_string(),
+        thread_uuid: THREAD_A.to_string(),
+        phase: CoworkerJobPhase::Cancelled,
+        work_brief: b_cancel,
+        work_brief_digest: d_cancel,
+        supersedes_job_id: None,
+        planning_result: None,
+        approval_linkage: Some(link_cancel),
+        tasks: vec![make_task(
+            "task-cancel-u1",
+            CoworkerTaskStage::EffectUnknown,
+            Some("outbox_cancel_u1"),
+        )],
+        holds: Vec::new(),
+        outbox: vec![OutboxDispatchRecord {
+            outbox_id: "outbox_cancel_u1".to_string(),
+            request_key: "req_outbox_cancel_u1".to_string(),
+            kind: OutboxDispatchKind::TaskAttemptDispatch,
+            task_id: "task-cancel-u1".to_string(),
+            attempt_no: 1,
+            role: WorkflowRole::Coder,
+            subject_digest: HEX64_D.to_string(),
+            status: OutboxDispatchStatus::EffectUnknown,
+            reserved_at_job_revision: 2,
+            updated_at_job_revision: 3,
+            run_id: None,
+            worker_id: None,
+            receipt_id: None,
+            diagnostic: Some("Interrupted dispatch before receipt".to_string()),
+        }],
+        combined_candidates: Vec::new(),
+    };
+
+    // 2. Superseded job with stop_requested AND PendingControllerEffectStatus::EffectUnknown must retain UnresolvedEffect.
+    let (b_sup_u, d_sup_u) = sample_work_brief(
+        "brf_sup_unknown",
+        BINDING_A,
+        THREAD_A,
+        base.clone(),
+        WorkBriefKind::NewJob,
+        "Superseded job with controller EffectUnknown",
+    );
+    let mut link_sup_u = sample_approval_linkage(
+        base.clone(),
+        &policy_digest,
+        vec!["task-sup-u1".to_string()],
+    );
+    link_sup_u.plan_id = "plan_sup_u1".to_string();
+    let job_sup_unknown = CoworkerJobRecord {
+        job_id: "job_sup_unknown_01".to_string(),
+        job_revision: 4,
+        create_request_key: "req_sup_unknown_01".to_string(),
+        binding_id: BINDING_A.to_string(),
+        thread_uuid: THREAD_A.to_string(),
+        phase: CoworkerJobPhase::Held,
+        work_brief: b_sup_u,
+        work_brief_digest: d_sup_u,
+        supersedes_job_id: None,
+        planning_result: None,
+        approval_linkage: Some(link_sup_u),
+        tasks: vec![make_task(
+            "task-sup-u1",
+            CoworkerTaskStage::EffectUnknown,
+            None,
+        )],
+        holds: vec![sample_amendment_hold(
+            "hld_sup_u1",
+            "amend_sup_u1",
+            4,
+            "Amended after interrupted effect",
+        )],
+        outbox: Vec::new(),
+        combined_candidates: Vec::new(),
+    };
+    let (b_sup_succ, d_sup_succ) = sample_work_brief(
+        "brf_sup_succ",
+        BINDING_A,
+        THREAD_A,
+        base.clone(),
+        WorkBriefKind::Amendment {
+            target_job_id: job_sup_unknown.job_id.clone(),
+            target_job_revision: 3,
+            amendment_reason: "Amended after interrupted effect".to_string(),
+        },
+        "Successor after interrupted effect",
+    );
+    let job_sup_succ = CoworkerJobRecord {
+        job_id: "job_sup_succ_02".to_string(),
+        job_revision: 1,
+        create_request_key: "req_sup_succ_02".to_string(),
+        binding_id: BINDING_A.to_string(),
+        thread_uuid: THREAD_A.to_string(),
+        phase: CoworkerJobPhase::Planning,
+        work_brief: b_sup_succ,
+        work_brief_digest: d_sup_succ,
+        supersedes_job_id: Some(job_sup_unknown.job_id.clone()),
+        planning_result: None,
+        approval_linkage: None,
+        tasks: Vec::new(),
+        holds: Vec::new(),
+        outbox: Vec::new(),
+        combined_candidates: Vec::new(),
+    };
+
+    // 3. Latest Completed acceptance job with PendingControllerEffectStatus::EffectUnknown must stay actionable UnresolvedEffect.
+    let (b_comp_u, d_comp_u) = sample_work_brief(
+        "brf_comp_unknown",
+        BINDING_A,
+        THREAD_A,
+        base.clone(),
+        WorkBriefKind::NewJob,
+        "Latest acceptance job with EffectUnknown",
+    );
+    let mut link_comp_u =
+        sample_approval_linkage(base, &policy_digest, vec!["task-comp-u1".to_string()]);
+    link_comp_u.plan_id = "plan_comp_u1".to_string();
+    let job_completed_unknown = CoworkerJobRecord {
+        job_id: "job_completed_unknown_03".to_string(),
+        job_revision: 5,
+        create_request_key: "req_comp_unknown_03".to_string(),
+        binding_id: BINDING_A.to_string(),
+        thread_uuid: THREAD_A.to_string(),
+        phase: CoworkerJobPhase::Completed,
+        work_brief: b_comp_u,
+        work_brief_digest: d_comp_u,
+        supersedes_job_id: None,
+        planning_result: None,
+        approval_linkage: Some(link_comp_u),
+        tasks: vec![make_task(
+            "task-comp-u1",
+            CoworkerTaskStage::Integrated,
+            None,
+        )],
+        holds: Vec::new(),
+        outbox: Vec::new(),
+        combined_candidates: Vec::new(),
+    };
+
+    let workflow_store = CoworkerWorkflowStore::new(&plans_dir).expect("workflow store");
+    let ledger = CoworkerBindingLedger {
+        schema_version: 1,
+        binding_id: BINDING_A.to_string(),
+        thread_uuid: Some(THREAD_A.to_string()),
+        ledger_revision: 3,
+        planning_grants: Vec::new(),
+        architect_advice: Vec::new(),
+        jobs: vec![
+            job_cancelled_unknown.clone(),
+            job_sup_unknown.clone(),
+            job_sup_succ,
+            job_completed_unknown.clone(),
+        ],
+        admission_markers: BTreeMap::new(),
+    };
+    ledger.validate(BINDING_A).expect("valid ledger");
+    write_private_json(
+        &workflow_store
+            .ledger_path_for_binding(BINDING_A)
+            .expect("ledger path"),
+        &ledger,
+    );
+
+    let rt_cancel = sample_runtime_state(&job_cancelled_unknown, policy.clone(), &policy_digest);
+    let mut rt_sup = sample_runtime_state(&job_sup_unknown, policy.clone(), &policy_digest);
+    rt_sup.stop_requested = true;
+    rt_sup.pending_effects.insert(
+        "eff_sup_unknown_01".to_string(),
+        PendingControllerEffect {
+            effect_id: "eff_sup_unknown_01".to_string(),
+            request_key: "req_eff_sup_u1".to_string(),
+            job_id: job_sup_unknown.job_id.clone(),
+            task_id: Some("task-sup-u1".to_string()),
+            attempt_no: Some(1),
+            kind: PendingControllerEffectKind::CoderDispatch,
+            status: PendingControllerEffectStatus::EffectUnknown,
+            subject_digest: HEX64_D.to_string(),
+            external_correlation_id: None,
+            created_at_ms: 1_700_000_200_000,
+            updated_at_ms: 1_700_000_205_000,
+            diagnostic: Some("Unknown dispatch effect after stop".to_string()),
+        },
+    );
+    let mut rt_comp = sample_runtime_state(&job_completed_unknown, policy, &policy_digest);
+    rt_comp.pending_effects.insert(
+        "eff_comp_unknown_01".to_string(),
+        PendingControllerEffect {
+            effect_id: "eff_comp_unknown_01".to_string(),
+            request_key: "req_eff_comp_u1".to_string(),
+            job_id: job_completed_unknown.job_id.clone(),
+            task_id: None,
+            attempt_no: None,
+            kind: PendingControllerEffectKind::ClosureInvocation,
+            status: PendingControllerEffectStatus::EffectUnknown,
+            subject_digest: HEX64_C.to_string(),
+            external_correlation_id: None,
+            created_at_ms: 1_700_000_210_000,
+            updated_at_ms: 1_700_000_215_000,
+            diagnostic: Some("Closure effect receipt uncertain".to_string()),
+        },
+    );
+
+    let mut rt_map = BTreeMap::new();
+    rt_map.insert(job_cancelled_unknown.job_id.clone(), rt_cancel);
+    rt_map.insert(job_sup_unknown.job_id.clone(), rt_sup);
+    rt_map.insert(job_completed_unknown.job_id.clone(), rt_comp);
+    write_controller_ledger_file(&plans_dir, BINDING_A, rt_map);
+
+    let stores = WorkspaceHistoryStores::new(&plans_dir);
+    let read = read_scoped_workspace_job_histories(&chat, &stores).expect("scoped read");
+    assert!(read.degraded);
+
+    for expected_id in [
+        &job_cancelled_unknown.job_id,
+        &job_sup_unknown.job_id,
+        &job_completed_unknown.job_id,
+    ] {
+        let hist = read
+            .jobs
+            .iter()
+            .find(|j| &j.job.job_id == expected_id)
+            .expect("projected job exists");
+        assert_eq!(
+            hist.current_attention.as_ref().map(|a| a.kind),
+            Some(WorkspaceAttentionKind::UnresolvedEffect),
+            "job {expected_id} must preserve UnresolvedEffect reconciliation attention"
+        );
+        assert_eq!(hist.job.state, ObservationJobState::Unknown);
+        assert_eq!(hist.acceptance_proof, WorkspaceAcceptanceProof::unknown());
+    }
 }
