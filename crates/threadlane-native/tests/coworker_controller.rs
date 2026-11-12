@@ -10181,7 +10181,9 @@ fn record_external_resolution(
     request: &threadlane_native::external_resolution::RecordExternalResolutionRequest,
 ) -> threadlane_native::external_resolution::ExternalResolutionReceipt {
     let service = external_resolution_service(fixture);
-    let preview = service.preview(request).expect("external resolution preview");
+    let preview = service
+        .preview(request)
+        .expect("external resolution preview");
     service
         .record(
             request,
@@ -10589,9 +10591,7 @@ async fn external_resolution_record_blocks_direct_dispatch_that_starts_after_the
         "guarded dispatch must wait while the winning record still holds its advancement guard"
     );
 
-    release_tx
-        .send(())
-        .expect("release the post-persist probe");
+    release_tx.send(()).expect("release the post-persist probe");
     let receipt = tokio::time::timeout(Duration::from_secs(5), record_handle)
         .await
         .expect("record should finish after probe release")
@@ -10866,7 +10866,9 @@ async fn external_resolution_full_job_blocks_execution_and_driver_but_preserves_
         preview_error.code(),
         NativeErrorCode::UnsupportedCapability.as_str()
     );
-    assert!(preview_error.message().contains(receipt.receipt_id.as_str()));
+    assert!(preview_error
+        .message()
+        .contains(receipt.receipt_id.as_str()));
 
     let start_error = gateway
         .start_execution(&threadlane_native::StartExecutionParams {
