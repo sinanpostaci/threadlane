@@ -2034,7 +2034,13 @@ test.describe('Workspace external resolution receipts', () => {
       narrowBlockedStaleReceipt.getByText('Partial · 1 task (stale)').first(),
     ).toBeVisible();
     await expect(
-      narrowBlockedStaleReceipt.locator('.tl-wp-state-desc').first(),
+      narrowBlockedStaleReceipt
+        .locator('.tl-wp-callout-title')
+        .getByText('Stale external receipt', { exact: true })
+        .first(),
+    ).toBeVisible();
+    await expect(
+      blockedJobCard.locator('button.tl-wp-job-row-btn .tl-wp-job-title').first(),
     ).toHaveText('Blocked With Historical Receipts');
     await expect(
       narrowBlockedStaleReceipt.getByText('job_ext_blocked_03').first(),
