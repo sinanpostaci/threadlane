@@ -293,24 +293,32 @@ fn pins_primary_and_auxiliary_models_and_provider_policies_under_inherit_and_tas
             OpenCodeRuleEffect::Deny
         );
 
-        // Authoritative CLI argv check: exact `--model`, no `--auto` or skip-permissions.
+        // Authoritative CLI argv check: both modes preserve the exact `--model`, `--session`,
+        // argument order, and trailing `--`; only the final prompt differs.
         let argv = spec
             .build_argv_for_workdir(&workdir)
             .expect("build_argv_for_workdir");
+        let expected_inherit_argv = vec![
+            "--standalone".to_string(),
+            "run".to_string(),
+            "--model".to_string(),
+            "opencode-go/deepseek-v4.1-flash#max".to_string(),
+            "--format".to_string(),
+            "json".to_string(),
+            "--session".to_string(),
+            "sess-oc-220".to_string(),
+            "--".to_string(),
+            "Verify model and policy pins".to_string(),
+        ];
         assert_eq!(
-            argv,
-            vec![
-                "--standalone",
-                "run",
-                "--model",
-                "opencode-go/deepseek-v4.1-flash#max",
-                "--format",
-                "json",
-                "--session",
-                "sess-oc-220",
-                "--",
-                "Verify model and policy pins",
-            ]
+            argv.len(),
+            expected_inherit_argv.len(),
+            "both modes must emit exactly one prompt argument after `--`"
+        );
+        assert_eq!(
+            &argv[..expected_inherit_argv.len() - 1],
+            &expected_inherit_argv[..expected_inherit_argv.len() - 1],
+            "both modes must preserve the exact CLI flags, model, session, and argument order"
         );
         assert!(!argv
             .iter()
@@ -318,6 +326,10 @@ fn pins_primary_and_auxiliary_models_and_provider_policies_under_inherit_and_tas
 
         match mode {
             WorkerFilePermissions::Inherit => {
+                assert_eq!(
+                    argv, expected_inherit_argv,
+                    "Inherit mode must keep the exact raw caller argv with no prologue"
+                );
                 assert!(
                     config.permissions.is_none(),
                     "Inherit mode must not inject file permission rules"
@@ -328,6 +340,36 @@ fn pins_primary_and_auxiliary_models_and_provider_policies_under_inherit_and_tas
                 );
             }
             WorkerFilePermissions::TaskFiles => {
+                let actual_prompt = argv
+                    .last()
+                    .expect("TaskFiles argv must contain the effective prompt");
+                let expected_original_prompt = expected_inherit_argv
+                    .last()
+                    .expect("expected argv includes the original prompt");
+                let original_prompt_suffix =
+                    format!("[THREADLANE_TASK_INSTRUCTION] {expected_original_prompt}");
+                let contract = actual_prompt.strip_suffix(&original_prompt_suffix).expect(
+                    "TaskFiles prompt must end with the exact original caller prompt verbatim",
+                );
+                assert!(
+                    contract.starts_with("[THREADLANE_OPENCODE_TASK_FILES_CONTRACT] "),
+                    "TaskFiles argv must prepend the OpenCode task_files contract"
+                );
+                let canonical_workdir =
+                    fs::canonicalize(&workdir).expect("canonicalize actual task workdir");
+                let canonical_workdir_str = canonical_workdir.to_str().expect("utf8 workdir");
+                assert!(
+                    contract.contains(&format!(
+                        "canonical task working directory (authoritative checkout root for every file operation): `{canonical_workdir_str}`"
+                    )),
+                    "TaskFiles contract must name the canonical actual task working directory"
+                );
+                assert!(
+                    contract.contains(
+                        "[`crates/threadlane-workers/` (directory subtree `crates/threadlane-workers` and `crates/threadlane-workers/**`), `docs/WORKERS.md` (exact file only; no descendant `/**`)]"
+                    ),
+                    "TaskFiles contract must declare the exact directory and file write scopes"
+                );
                 assert!(
                     config.permissions.is_some(),
                     "TaskFiles mode must populate V2 `permissions` rules"
