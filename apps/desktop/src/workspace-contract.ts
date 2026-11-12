@@ -244,12 +244,20 @@ export const WORKSPACE_EXTERNAL_RESOLUTION_SCOPES: readonly WorkspaceExternalRes
 export const WORKSPACE_EXTERNAL_RESOLUTION_APPLICABILITIES: readonly WorkspaceExternalResolutionApplicability[] =
   ['applicable', 'stale', 'unverified'] as const;
 
+/**
+ * Maximum covered-attention rows retained per external resolution (`65`): one explicit
+ * job-level row plus up to `MAX_WORKSPACE_TASKS_PER_JOB` task rows.
+ */
+export const MAX_WORKSPACE_COVERED_ATTENTION_PER_RESOLUTION =
+  MAX_WORKSPACE_TASKS_PER_JOB + 1;
+
 export interface WorkspaceExternalResolutionViewContract {
   readonly version: typeof WORKSPACE_EXTERNAL_RESOLUTION_VIEW_CONTRACT_VERSION;
   readonly max_external_resolutions_per_job: typeof MAX_WORKSPACE_EXTERNAL_RESOLUTIONS_PER_JOB;
   readonly max_task_ids_per_resolution: typeof MAX_WORKSPACE_TASKS_PER_JOB;
   readonly max_evidence_refs_per_resolution: typeof MAX_WORKSPACE_RECORD_LINKS_PER_LIST;
-  readonly max_covered_attention_per_resolution: typeof MAX_WORKSPACE_RECORD_LINKS_PER_LIST;
+  readonly max_covered_attention_per_resolution:
+    typeof MAX_WORKSPACE_COVERED_ATTENTION_PER_RESOLUTION;
   readonly max_summary_chars: typeof MAX_OBSERVATION_SUMMARY_CHARS;
   readonly max_id_bytes: typeof MAX_WORKSPACE_LABEL_BYTES;
   readonly requires_store_verified_applicability: true;
@@ -270,7 +278,7 @@ export const WORKSPACE_EXTERNAL_RESOLUTION_VIEW_CONTRACT: WorkspaceExternalResol
     max_external_resolutions_per_job: MAX_WORKSPACE_EXTERNAL_RESOLUTIONS_PER_JOB,
     max_task_ids_per_resolution: MAX_WORKSPACE_TASKS_PER_JOB,
     max_evidence_refs_per_resolution: MAX_WORKSPACE_RECORD_LINKS_PER_LIST,
-    max_covered_attention_per_resolution: MAX_WORKSPACE_RECORD_LINKS_PER_LIST,
+    max_covered_attention_per_resolution: MAX_WORKSPACE_COVERED_ATTENTION_PER_RESOLUTION,
     max_summary_chars: MAX_OBSERVATION_SUMMARY_CHARS,
     max_id_bytes: MAX_WORKSPACE_LABEL_BYTES,
     requires_store_verified_applicability: true,
@@ -1622,7 +1630,7 @@ function normalizeCoveredAttentionList(
     }
     normalized.push({ task_id: cleanTaskId, attention });
   }
-  return capTail(normalized, MAX_WORKSPACE_RECORD_LINKS_PER_LIST).items;
+  return capTail(normalized, MAX_WORKSPACE_COVERED_ATTENTION_PER_RESOLUTION).items;
 }
 
 /**

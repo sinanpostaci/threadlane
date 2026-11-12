@@ -3258,6 +3258,10 @@ pub const MAX_WORKSPACE_RECORD_LINKS_PER_LIST: usize = 64;
 /// Maximum store-verified external resolution receipts retained per job history (`64`).
 pub const MAX_WORKSPACE_EXTERNAL_RESOLUTIONS_PER_JOB: usize = 64;
 
+/// Maximum covered-attention rows retained per external resolution (`65`): one explicit
+/// job-level row plus up to [`MAX_WORKSPACE_TASKS_PER_JOB`] task rows.
+pub const MAX_WORKSPACE_COVERED_ATTENTION_PER_RESOLUTION: usize = MAX_WORKSPACE_TASKS_PER_JOB + 1;
+
 /// Initial native observation sampling interval in milliseconds (`2,000 ms` / `2 s`).
 pub const WORKSPACE_SAMPLING_INTERVAL_MS: u64 = 2_000;
 
@@ -5535,7 +5539,7 @@ impl WorkspaceExternalResolution {
             .collect();
         let (covered_attention, _) = cap_tail(
             covered_attention_all,
-            MAX_WORKSPACE_RECORD_LINKS_PER_LIST,
+            MAX_WORKSPACE_COVERED_ATTENTION_PER_RESOLUTION,
         );
 
         Some(Self {

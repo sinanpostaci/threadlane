@@ -1820,8 +1820,14 @@ fn external_resolution_history_is_backward_compatible_bounded_and_deduplicated()
     .normalized();
 
     assert_eq!(history.external_resolutions.len(), 2);
-    assert_eq!(history.external_resolutions[0].receipt_id, "rcpt_external_01");
-    assert_eq!(history.external_resolutions[0].summary, "Newer receipt wins.");
+    assert_eq!(
+        history.external_resolutions[0].receipt_id,
+        "rcpt_external_01"
+    );
+    assert_eq!(
+        history.external_resolutions[0].summary,
+        "Newer receipt wins."
+    );
     assert_eq!(
         history.external_resolutions[0].covered_attention.len(),
         1,
@@ -1832,12 +1838,12 @@ fn external_resolution_history_is_backward_compatible_bounded_and_deduplicated()
         WorkspaceExternalResolutionApplicability::Unverified
     );
     assert_eq!(
-        history.truncation.external_resolutions_omitted,
-        3,
+        history.truncation.external_resolutions_omitted, 3,
         "invalid outcome, invalid identity, and duplicate rows are counted"
     );
 
-    let many: Vec<WorkspaceExternalResolution> = (0..MAX_WORKSPACE_EXTERNAL_RESOLUTIONS_PER_JOB + 3)
+    let many: Vec<WorkspaceExternalResolution> = (0..MAX_WORKSPACE_EXTERNAL_RESOLUTIONS_PER_JOB
+        + 3)
         .map(|idx| WorkspaceExternalResolution {
             receipt_id: format!("rcpt_external_{idx:03}"),
             recorded_at_ms: Some(1_000 + idx as i64),
@@ -1861,7 +1867,10 @@ fn external_resolution_history_is_backward_compatible_bounded_and_deduplicated()
     assert_eq!(bounded.truncation.external_resolutions_omitted, 3);
 
     let json = serde_json::to_value(&bounded).expect("serialize external resolution history");
-    assert_eq!(json["external_resolutions"][0]["outcome"], "resolved_externally");
+    assert_eq!(
+        json["external_resolutions"][0]["outcome"],
+        "resolved_externally"
+    );
     assert_eq!(json["external_resolutions"][0]["scope"], "job");
     assert_eq!(
         json["external_resolutions"][0]["applicability"],
@@ -1874,4 +1883,183 @@ fn external_resolution_history_is_backward_compatible_bounded_and_deduplicated()
     let reparsed: WorkspaceJobHistory =
         serde_json::from_value(json).expect("reparse external resolution history");
     assert_eq!(reparsed, bounded);
+}
+
+#[test]
+fn external_resolution_covered_attention_preserves_job_row_and_maximum_task_rows() {
+    assert_eq!(MAX_WORKSPACE_TASKS_PER_JOB, 64);
+    assert_eq!(MAX_WORKSPACE_RECORD_LINKS_PER_LIST, 64);
+    assert_eq!(
+        MAX_WORKSPACE_COVERED_ATTENTION_PER_RESOLUTION,
+        MAX_WORKSPACE_TASKS_PER_JOB + 1
+    );
+
+    let attention = WorkspaceAttentionState {
+        kind: WorkspaceAttentionKind::NeedsApproval,
+        reason: "Covered by an external receipt.".to_string(),
+        next_step: None,
+        blocking_hold_ids: vec!["hold_covered_01".to_string()],
+        blocking_outbox_ids: Vec::new(),
+        question_id: None,
+        updated_at_ms: Some(1_000),
+    };
+    let task_ids: Vec<String> = (0..MAX_WORKSPACE_TASKS_PER_JOB)
+        .map(|idx| format!("task_covered_{idx:02}"))
+        .collect();
+    let covered_job = WorkspaceCoveredAttention {
+        task_id: None,
+        attention: attention.clone(),
+    };
+    let covered_tasks: Vec<WorkspaceCoveredAttention> = task_ids
+        .iter()
+        .map(|task_id| WorkspaceCoveredAttention {
+            task_id: Some(task_id.clone()),
+            attention: attention.clone(),
+        })
+        .collect();
+    let mut covered_attention = Vec::with_capacity(MAX_WORKSPACE_COVERED_ATTENTION_PER_RESOLUTION);
+    covered_attention.push(covered_job.clone());
+    covered_attention.extend(covered_tasks.iter().cloned());
+
+    let base_job = WorkspaceJobSummary {
+        source_id: "default".to_string(),
+        job_id: "job_covered_max_01".to_string(),
+        ..WorkspaceJobSummary::default()
+    };
+    let max_resolution = WorkspaceExternalResolution {
+        receipt_id: "rcpt_covered_max_01".to_string(),
+        outcome: WorkspaceExternalResolutionOutcome::ResolvedExternally,
+        scope: WorkspaceExternalResolutionScope::Job,
+        task_ids: task_ids.clone(),
+        applicability: WorkspaceExternalResolutionApplicability::Applicable,
+        summary: "Maximum covered attention.".to_string(),
+        evidence_refs: (0..MAX_WORKSPACE_RECORD_LINKS_PER_LIST + 5)
+            .map(|idx| format!("ev_covered_{idx:02}"))
+            .collect(),
+        recorded_at_ms: Some(1_000),
+        covered_attention,
+        ..WorkspaceExternalResolution::default()
+    };
+    let normalized = WorkspaceJobHistory {
+        job: base_job.clone(),
+        external_resolutions: vec![max_resolution.clone()],
+        ..WorkspaceJobHistory::default()
+    }
+    .normalized();
+    assert_eq!(normalized.external_resolutions.len(), 1);
+    assert_eq!(normalized.truncation.external_resolutions_omitted, 0);
+    let normalized_resolution = &normalized.external_resolutions[0];
+    assert_eq!(normalized_resolution.task_ids, task_ids);
+    assert_eq!(
+        normalized_resolution.evidence_refs.len(),
+        MAX_WORKSPACE_RECORD_LINKS_PER_LIST
+    );
+    assert_eq!(
+        normalized_resolution.covered_attention.len(),
+        MAX_WORKSPACE_COVERED_ATTENTION_PER_RESOLUTION
+    );
+    assert_eq!(normalized_resolution.covered_attention[0], covered_job);
+    let expected_task_ids: Vec<Option<&str>> = task_ids
+        .iter()
+        .map(|task_id| Some(task_id.as_str()))
+        .collect();
+    let retained_task_ids: Vec<Option<&str>> = normalized_resolution
+        .covered_attention
+        .iter()
+        .skip(1)
+        .map(|covered| covered.task_id.as_deref())
+        .collect();
+    assert_eq!(retained_task_ids, expected_task_ids);
+
+    let renormalized = WorkspaceJobHistory {
+        job: base_job.clone(),
+        external_resolutions: normalized.external_resolutions.clone(),
+        ..WorkspaceJobHistory::default()
+    }
+    .normalized();
+    assert_eq!(
+        renormalized.external_resolutions, normalized.external_resolutions,
+        "covered-attention normalization must remain idempotent"
+    );
+
+    // More valid job-level rows than the dedicated maximum force tail capping while
+    // preserving the canonical job row and all declared task rows.
+    let overflow_row_count = MAX_WORKSPACE_COVERED_ATTENTION_PER_RESOLUTION + 1;
+    let mut overflow_attention: Vec<WorkspaceCoveredAttention> = (0..overflow_row_count)
+        .map(|idx| WorkspaceCoveredAttention {
+            task_id: None,
+            attention: WorkspaceAttentionState {
+                reason: format!("Overflow job row {idx}."),
+                ..attention.clone()
+            },
+        })
+        .collect();
+    overflow_attention.push(covered_job.clone());
+    overflow_attention.extend(covered_tasks.iter().cloned());
+    overflow_attention.push(WorkspaceCoveredAttention {
+        task_id: Some("bad task id".to_string()),
+        attention: attention.clone(),
+    });
+    overflow_attention.push(WorkspaceCoveredAttention {
+        task_id: Some("task_not_declared".to_string()),
+        attention: attention.clone(),
+    });
+    let overflow_resolution = WorkspaceExternalResolution {
+        receipt_id: "rcpt_covered_overflow_01".to_string(),
+        covered_attention: overflow_attention,
+        evidence_refs: Vec::new(),
+        ..max_resolution.clone()
+    };
+    let overflow = WorkspaceJobHistory {
+        job: base_job,
+        external_resolutions: vec![overflow_resolution],
+        ..WorkspaceJobHistory::default()
+    }
+    .normalized();
+    let overflow_resolution = &overflow.external_resolutions[0];
+    assert_eq!(
+        overflow_resolution.covered_attention.len(),
+        MAX_WORKSPACE_COVERED_ATTENTION_PER_RESOLUTION
+    );
+    assert_eq!(overflow_resolution.covered_attention[0], covered_job);
+    let overflow_task_ids: Vec<Option<&str>> = overflow_resolution
+        .covered_attention
+        .iter()
+        .skip(1)
+        .map(|covered| covered.task_id.as_deref())
+        .collect();
+    assert_eq!(overflow_task_ids, expected_task_ids);
+    assert!(
+        overflow_resolution
+            .covered_attention
+            .iter()
+            .all(|covered| covered.task_id.as_deref() != Some("task_not_declared")),
+        "undeclared task rows must stay quarantined"
+    );
+
+    let oversized_links = WorkspaceRecordLinks {
+        follow_up_job_ids: (0..MAX_WORKSPACE_RECORD_LINKS_PER_LIST + 5)
+            .map(|idx| format!("followup_{idx:02}"))
+            .collect(),
+        architect_advice_ids: (0..MAX_WORKSPACE_RECORD_LINKS_PER_LIST + 5)
+            .map(|idx| format!("advice_{idx:02}"))
+            .collect(),
+        source_request_ids: (0..MAX_WORKSPACE_RECORD_LINKS_PER_LIST + 5)
+            .map(|idx| format!("request_{idx:02}"))
+            .collect(),
+        ..WorkspaceRecordLinks::default()
+    }
+    .normalized();
+    assert_eq!(
+        oversized_links.follow_up_job_ids.len(),
+        MAX_WORKSPACE_RECORD_LINKS_PER_LIST
+    );
+    assert_eq!(
+        oversized_links.architect_advice_ids.len(),
+        MAX_WORKSPACE_RECORD_LINKS_PER_LIST
+    );
+    assert_eq!(
+        oversized_links.source_request_ids.len(),
+        MAX_WORKSPACE_RECORD_LINKS_PER_LIST
+    );
 }

@@ -43,6 +43,7 @@ import {
   MAX_WORKSPACE_ATTEMPTS_PER_TASK,
   MAX_WORKSPACE_CANDIDATES_PER_TASK,
   MAX_WORKSPACE_COMBINED_CANDIDATES_PER_JOB,
+  MAX_WORKSPACE_COVERED_ATTENTION_PER_RESOLUTION,
   MAX_WORKSPACE_EXTERNAL_RESOLUTIONS_PER_JOB,
   MAX_WORKSPACE_JOBS_PER_BINDING,
   MAX_WORKSPACE_MESSAGES_WINDOW,
@@ -1450,6 +1451,131 @@ test('external resolution view contract is ledger-independent, backward-compatib
   };
   const upgraded = upgradeLegacyObservationSnapshot(legacyObservation);
   assert.deepEqual(upgraded.job_histories[0]?.external_resolutions, []);
+});
+
+test('external resolution covered attention retains the job row plus maximum task rows and stays bounded', () => {
+  assert.equal(MAX_WORKSPACE_TASKS_PER_JOB, 64);
+  assert.equal(MAX_WORKSPACE_RECORD_LINKS_PER_LIST, 64);
+  assert.equal(
+    MAX_WORKSPACE_COVERED_ATTENTION_PER_RESOLUTION,
+    MAX_WORKSPACE_TASKS_PER_JOB + 1,
+  );
+  assert.equal(
+    WORKSPACE_EXTERNAL_RESOLUTION_VIEW_CONTRACT.max_covered_attention_per_resolution,
+    MAX_WORKSPACE_COVERED_ATTENTION_PER_RESOLUTION,
+  );
+  assert.equal(
+    WORKSPACE_EXTERNAL_RESOLUTION_VIEW_CONTRACT.max_task_ids_per_resolution,
+    MAX_WORKSPACE_TASKS_PER_JOB,
+  );
+  assert.equal(
+    WORKSPACE_EXTERNAL_RESOLUTION_VIEW_CONTRACT.max_evidence_refs_per_resolution,
+    MAX_WORKSPACE_RECORD_LINKS_PER_LIST,
+  );
+
+  const attention = {
+    kind: 'needs_approval',
+    reason: 'Covered by an external receipt.',
+    next_step: null,
+    blocking_hold_ids: ['hold_covered_01'],
+    blocking_outbox_ids: [],
+    question_id: null,
+    updated_at_ms: 1_000,
+  };
+  const taskIds = Array.from({ length: MAX_WORKSPACE_TASKS_PER_JOB }, (_, idx) =>
+    `task_covered_${String(idx).padStart(2, '0')}`,
+  );
+  const maxCovered = [
+    { task_id: null, attention },
+    ...taskIds.map((taskId) => ({ task_id: taskId, attention })),
+  ];
+  const maxResolution = normalizeWorkspaceExternalResolution({
+    receipt_id: 'rcpt_covered_max_01',
+    outcome: 'resolved_externally',
+    scope: 'job',
+    task_ids: taskIds,
+    applicability: 'applicable',
+    summary: 'Maximum covered attention.',
+    evidence_refs: Array.from(
+      { length: MAX_WORKSPACE_RECORD_LINKS_PER_LIST + 5 },
+      (_, idx) => `ev_covered_${idx}`,
+    ),
+    covered_attention: maxCovered,
+  });
+  assert.ok(maxResolution);
+  assert.equal(maxResolution.task_ids.length, MAX_WORKSPACE_TASKS_PER_JOB);
+  assert.equal(maxResolution.evidence_refs.length, MAX_WORKSPACE_RECORD_LINKS_PER_LIST);
+  assert.equal(
+    maxResolution.covered_attention.length,
+    MAX_WORKSPACE_COVERED_ATTENTION_PER_RESOLUTION,
+  );
+  assert.equal(maxResolution.covered_attention[0]?.task_id, null);
+  assert.deepEqual(
+    maxResolution.covered_attention.slice(1).map((covered) => covered.task_id),
+    taskIds,
+  );
+  assert.deepEqual(normalizeWorkspaceExternalResolution(maxResolution), maxResolution);
+
+  const overflowing = normalizeWorkspaceExternalResolution({
+    ...maxResolution,
+    covered_attention: [
+      ...Array.from(
+        { length: MAX_WORKSPACE_COVERED_ATTENTION_PER_RESOLUTION + 1 },
+        (_, idx) => ({
+          task_id: null,
+          attention: { ...attention, reason: `Overflow job row ${idx}.` },
+        }),
+      ),
+      ...maxCovered,
+      { task_id: 'bad task id', attention },
+      { task_id: 'task_not_declared', attention },
+    ],
+  });
+  assert.ok(overflowing);
+  assert.equal(
+    overflowing.covered_attention.length,
+    MAX_WORKSPACE_COVERED_ATTENTION_PER_RESOLUTION,
+  );
+  assert.equal(overflowing.covered_attention[0]?.task_id, null);
+  assert.deepEqual(
+    overflowing.covered_attention.slice(1).map((covered) => covered.task_id),
+    taskIds,
+  );
+  assert.equal(
+    overflowing.covered_attention.some(
+      (covered) =>
+        covered.task_id === 'bad task id' || covered.task_id === 'task_not_declared',
+    ),
+    false,
+  );
+
+  const oversizedLinks = Array.from(
+    { length: MAX_WORKSPACE_RECORD_LINKS_PER_LIST + 5 },
+    (_, idx) => `link_${idx}`,
+  );
+  const history = normalizeWorkspaceJobHistory({
+    job: {
+      source_id: 'default',
+      job_id: 'job_covered_max_01',
+      binding_id: 'bnd_chat_alpha',
+      chat_identity: sampleIdentity(),
+      title: 'Covered attention maximum',
+    },
+    links: {
+      follow_up_job_ids: oversizedLinks,
+      architect_advice_ids: oversizedLinks,
+      source_request_ids: oversizedLinks,
+    },
+    external_resolutions: [maxResolution],
+  });
+  assert.equal(history.external_resolutions?.length, 1);
+  assert.equal(
+    history.external_resolutions?.[0]?.covered_attention.length,
+    MAX_WORKSPACE_COVERED_ATTENTION_PER_RESOLUTION,
+  );
+  assert.equal(history.links.follow_up_job_ids.length, MAX_WORKSPACE_RECORD_LINKS_PER_LIST);
+  assert.equal(history.links.architect_advice_ids.length, MAX_WORKSPACE_RECORD_LINKS_PER_LIST);
+  assert.equal(history.links.source_request_ids.length, MAX_WORKSPACE_RECORD_LINKS_PER_LIST);
 });
 
 test('Messages projection accepts only safe sources, rejects transcripts/synthetic turns, and preserves ordering and completeness', () => {
