@@ -1480,11 +1480,7 @@ impl CoworkerControllerService {
                 continue;
             }
             if self
-                .external_resolution_blocks_task_dispatch(
-                    &ledger,
-                    &current_adm.job,
-                    &task.task_id,
-                )
+                .external_resolution_blocks_task_dispatch(&ledger, &current_adm.job, &task.task_id)
                 .is_some()
             {
                 if !fenced_task_ids.contains(&task.task_id) {

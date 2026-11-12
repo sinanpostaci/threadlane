@@ -25,9 +25,7 @@ use crate::conversation_change::{
     acquire_conversation_advancement_guard, inspect_unresolved_blocking_changes,
     ConversationChangeError, ConversationChangeStore,
 };
-use crate::coworker_workflow::{
-    CoworkerBindingLedger, CoworkerJobRecord, CoworkerWorkflowStore,
-};
+use crate::coworker_workflow::{CoworkerBindingLedger, CoworkerJobRecord, CoworkerWorkflowStore};
 use crate::error::{NativeError, NativeErrorCode};
 use crate::external_resolution::{
     ExternalResolutionReceipt, ExternalResolutionScope, ExternalResolutionTarget,
@@ -184,11 +182,8 @@ fn block_from_receipt(
             .iter()
             .find(|job| &job.job_id == job_id)
             .map(|job| {
-                let mut ids: Vec<String> = job
-                    .tasks
-                    .iter()
-                    .map(|task| task.task_id.clone())
-                    .collect();
+                let mut ids: Vec<String> =
+                    job.tasks.iter().map(|task| task.task_id.clone()).collect();
                 ids.sort();
                 ids
             })
@@ -426,13 +421,9 @@ fn verify_no_external_resolution_dispatch_block(
     let ledger = store
         .read_binding_ledger(binding_id)
         .map_err(|err| map_native_error(&err))?;
-    if let Some(block) = external_resolution_blocks_task(
-        &ledger,
-        None,
-        Some(plan_id),
-        Some(approval_id),
-        task_id,
-    ) {
+    if let Some(block) =
+        external_resolution_blocks_task(&ledger, None, Some(plan_id), Some(approval_id), task_id)
+    {
         return Err(GuardedDispatchError::pre_effect(
             EXTERNAL_RESOLUTION_DISPATCH_BLOCKED,
             if block.full_job {
@@ -743,8 +734,8 @@ mod tests {
     ) -> ExternalResolutionReceipt {
         ExternalResolutionReceipt {
             schema_version: 1,
-            interface_version:
-                crate::external_resolution::EXTERNAL_RESOLUTION_INTERFACE_VERSION.to_string(),
+            interface_version: crate::external_resolution::EXTERNAL_RESOLUTION_INTERFACE_VERSION
+                .to_string(),
             receipt_id: format!("exr_{}", "0".repeat(32)),
             binding_id: "bnd_external_dispatch".to_string(),
             thread_uuid: "0196ed00-0000-7000-8000-0000000000a1".to_string(),

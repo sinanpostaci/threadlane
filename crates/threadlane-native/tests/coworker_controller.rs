@@ -10174,7 +10174,9 @@ fn record_external_resolution(
         Some(&fixture.sessions_dir),
     )
     .expect("open external resolution service");
-    let preview = service.preview(request).expect("external resolution preview");
+    let preview = service
+        .preview(request)
+        .expect("external resolution preview");
     service
         .record(
             request,

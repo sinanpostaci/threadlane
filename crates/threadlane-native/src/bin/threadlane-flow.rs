@@ -59,8 +59,8 @@ use threadlane_native::coworker_workflow::{
 };
 use threadlane_native::external_resolution::{
     ExternalResolutionConfirmation, ExternalResolutionInspection, ExternalResolutionPreview,
-    ExternalResolutionReceipt, ExternalResolutionService, RecordExternalResolutionRequest,
-    ReconcileExternalResolutionRequest,
+    ExternalResolutionReceipt, ExternalResolutionService, ReconcileExternalResolutionRequest,
+    RecordExternalResolutionRequest,
 };
 use threadlane_native::operator_cli::{
     emit_error, read_request, validate_dirs, verify_binding, write_result, OperatorCliError,
@@ -279,7 +279,11 @@ enum ExternalResolutionCommand {
         request: PathBuf,
 
         /// Exact canonical native thread UUID confirmed independently by the operator.
-        #[arg(long = "confirm-thread", visible_alias = "confirm-thread-uuid", value_name = "UUID")]
+        #[arg(
+            long = "confirm-thread",
+            visible_alias = "confirm-thread-uuid",
+            value_name = "UUID"
+        )]
         confirm_thread: Option<String>,
 
         /// Exact 64-character lowercase SHA-256 preview digest confirmed by the operator.
@@ -1516,12 +1520,14 @@ fn ensure_scope<T: FlowScoped>(
 }
 
 fn validate_project_root_override(path: &Path) -> Result<PathBuf, OperatorCliError> {
-    if !path.is_absolute() || path.components().any(|part| {
-        matches!(
-            part,
-            std::path::Component::CurDir | std::path::Component::ParentDir
-        )
-    }) {
+    if !path.is_absolute()
+        || path.components().any(|part| {
+            matches!(
+                part,
+                std::path::Component::CurDir | std::path::Component::ParentDir
+            )
+        })
+    {
         return Err(OperatorCliError::invalid_input(
             "`--project-root` must be a normalized absolute directory path.",
         ));
@@ -1572,8 +1578,8 @@ fn apply_external_resolution_record_confirmations(
     let raw_thread = confirm_thread.ok_or_else(|| {
         OperatorCliError::invalid_input("Missing required `--confirm-thread` argument.")
     })?;
-    let thread_uuid = validate_canonical_thread_uuid("confirm_thread", &raw_thread)
-        .map_err(|_| {
+    let thread_uuid =
+        validate_canonical_thread_uuid("confirm_thread", &raw_thread).map_err(|_| {
             OperatorCliError::invalid_input(
                 "`--confirm-thread` must be a canonical lowercase non-nil thread UUID.",
             )
@@ -1604,13 +1610,8 @@ fn open_external_resolution_service(
     authority_dir: &Path,
     sessions_dir: &Path,
 ) -> Result<ExternalResolutionService, OperatorCliError> {
-    ExternalResolutionService::new(
-        plans_dir,
-        authority_dir,
-        registry_dir,
-        Some(sessions_dir),
-    )
-    .map_err(|error| map_native_error(&error, false))
+    ExternalResolutionService::new(plans_dir, authority_dir, registry_dir, Some(sessions_dir))
+        .map_err(|error| map_native_error(&error, false))
 }
 
 fn ensure_external_resolution_request_scope(
@@ -1645,7 +1646,13 @@ fn ensure_external_resolution_preview_scope(
     thread: &str,
     project_root: Option<&Path>,
 ) -> Result<(), OperatorCliError> {
-    ensure_scope(preview, binding, thread, "scope_mismatch", STORED_SCOPE_MISMATCH)?;
+    ensure_scope(
+        preview,
+        binding,
+        thread,
+        "scope_mismatch",
+        STORED_SCOPE_MISMATCH,
+    )?;
     if let Some(expected_root) = project_root {
         if preview.project.canonical_repo_root.as_path() != expected_root {
             return Err(OperatorCliError::new(
@@ -3575,11 +3582,11 @@ mod tests {
             let globals = GlobalArgs::from_cli(&parsed).expect("extract globals");
             assert_eq!(globals.binding, BINDING);
             assert_eq!(globals.thread, THREAD);
-            assert_eq!(globals.project_root.as_deref(), Some(Path::new("/tmp/project")));
-            assert!(matches!(
-                parsed.command,
-                FlowCommand::ExternalResolution(_)
-            ));
+            assert_eq!(
+                globals.project_root.as_deref(),
+                Some(Path::new("/tmp/project"))
+            );
+            assert!(matches!(parsed.command, FlowCommand::ExternalResolution(_)));
         }
     }
 

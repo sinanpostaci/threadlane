@@ -3425,7 +3425,8 @@ async fn exported_operator_context_admits_planning_grant_and_scope_approval_with
 #[tokio::test]
 async fn external_resolution_flow_forwarding_skips_context_journal_in_inherited_observation_env() {
     let mut f = ContextFixture::start().await;
-    let context = f.write_private_context("external-resolution-context.json", &f.valid_context_json());
+    let context =
+        f.write_private_context("external-resolution-context.json", &f.valid_context_json());
     let marker = f.root.join("external-resolution-argv.marker");
     write_argv_recording_sibling(&f.pkg_bin_dir, "threadlane-flow", &marker);
     let inner = [

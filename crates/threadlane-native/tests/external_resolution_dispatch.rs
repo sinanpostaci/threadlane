@@ -109,15 +109,17 @@ fn task_scope_blocks_only_the_covered_task_and_full_job_closes_advancement() {
         ExternalResolutionScope::FullJob,
     )];
     for task_id in ["task-1", "task-2"] {
-        assert!(external_resolution_blocks_task(
-            &full,
-            Some("job_a"),
-            Some("plan_a"),
-            Some("apr_a"),
-            task_id
-        )
-        .expect("full-job receipt must block every task")
-        .full_job);
+        assert!(
+            external_resolution_blocks_task(
+                &full,
+                Some("job_a"),
+                Some("plan_a"),
+                Some("apr_a"),
+                task_id
+            )
+            .expect("full-job receipt must block every task")
+            .full_job
+        );
     }
     assert!(external_resolution_blocks_full_job(
         &full,

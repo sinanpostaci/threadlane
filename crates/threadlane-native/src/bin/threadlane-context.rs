@@ -1887,10 +1887,7 @@ mod tests {
         let flow_args = build_child_args(
             &validated,
             ChildFamily::Flow,
-            &[
-                "external-resolution".to_string(),
-                "inspect".to_string(),
-            ],
+            &["external-resolution".to_string(), "inspect".to_string()],
         );
         assert_eq!(
             flow_args,
