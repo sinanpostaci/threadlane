@@ -1796,8 +1796,15 @@ fn unknown_outbox_effect_and_in_flight_task_stage_block_record_until_reconciled(
     in_flight.expected_job_revision = Some(4);
     let err = service
         .preview(&in_flight)
-        .expect_err("in-flight task attempt must block preview");
-    assert_eq!(err.code(), NativeErrorCode::ValidationFailed.as_str());
+        .expect_err("in-flight task attempt with an unresolved pointer must block preview");
+    assert_eq!(
+        err.code(),
+        NativeErrorCode::AmbiguousWakeupPendingReconciliation.as_str()
+    );
+    assert!(
+        err.message().contains("unresolved outbox"),
+        "DispatchReserved with an unresolved pointer must hit the pointer guard: {err}"
+    );
     assert_eq!(
         service
             .inspect(BINDING, THREAD)
@@ -1806,6 +1813,77 @@ fn unknown_outbox_effect_and_in_flight_task_stage_block_record_until_reconciled(
             .len(),
         0
     );
+
+    // Clear only the unresolved pointer while keeping DispatchReserved. Both revisions advance,
+    // so refresh every request expectation before exercising the stage-specific guard.
+    fixture
+        .store
+        .transact_binding_ledger(BINDING, Some(4), |ledger| {
+            let job = ledger
+                .jobs
+                .iter_mut()
+                .find(|job| job.job_id == fixture.job.job_id)
+                .expect("fixture job");
+            job.job_revision = 5;
+            job.tasks[0].unresolved_outbox_id = None;
+            Ok(CoworkerLedgerMutationOutcome::Mutated(()))
+        })
+        .expect("write stage-only in-flight fixture");
+    let stage_ledger = fixture
+        .store
+        .read_binding_ledger(BINDING)
+        .expect("ledger after clearing the unresolved pointer");
+    assert_eq!(stage_ledger.ledger_revision, 5);
+    let stage_job = stage_ledger
+        .jobs
+        .iter()
+        .find(|job| job.job_id == fixture.job.job_id)
+        .expect("fixture job after clearing the unresolved pointer");
+    assert_eq!(stage_job.job_revision, 5);
+    assert_eq!(
+        stage_job.tasks[0].stage,
+        CoworkerTaskStage::DispatchReserved
+    );
+    assert!(stage_job.tasks[0].unresolved_outbox_id.is_none());
+
+    let mut stage_only = request.clone();
+    stage_only.expected_ledger_revision = Some(stage_ledger.ledger_revision);
+    stage_only.expected_job_revision = Some(stage_job.job_revision);
+    stage_only.expected_runtime_revision = None;
+    let err = service
+        .preview(&stage_only)
+        .expect_err("in-flight task stage without an unresolved pointer must block preview");
+    assert_eq!(err.code(), NativeErrorCode::ValidationFailed.as_str());
+    assert!(
+        err.message()
+            .contains("task attempt, review, or integration stage is in flight"),
+        "the refusal must come from the in-flight stage guard, not a stale revision: {err}"
+    );
+    assert_eq!(
+        service
+            .inspect(BINDING, THREAD)
+            .expect("inspect after stage-only refusal")
+            .receipts
+            .len(),
+        0
+    );
+    let after_stage_refusal = fixture
+        .store
+        .read_binding_ledger(BINDING)
+        .expect("ledger after stage-only refusal");
+    assert_eq!(after_stage_refusal.ledger_revision, 5);
+    assert!(after_stage_refusal.external_resolutions.is_empty());
+    let after_stage_job = after_stage_refusal
+        .jobs
+        .iter()
+        .find(|job| job.job_id == fixture.job.job_id)
+        .expect("fixture job after stage-only refusal");
+    assert_eq!(after_stage_job.job_revision, 5);
+    assert_eq!(
+        after_stage_job.tasks[0].stage,
+        CoworkerTaskStage::DispatchReserved
+    );
+    assert!(after_stage_job.tasks[0].unresolved_outbox_id.is_none());
 }
 
 #[test]
