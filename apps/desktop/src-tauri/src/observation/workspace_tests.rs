@@ -62,7 +62,7 @@ mod unix_workspace_tests {
         PlanStore, PlanTask, RegistrySnapshot, RoleAssignment, ToolAdapter, ToolDefinition,
         WorkflowProfile, WorkflowRole,
     };
-    use threadlane_workers::{WorkerFilePermissions, WorkerProvider};
+    use threadlane_workers::{resolve_model_target, WorkerFilePermissions, WorkerProvider};
 
     use crate::observation::{ObservationService, ObservationSourceConfig};
 
@@ -707,6 +707,13 @@ mod unix_workspace_tests {
         approved_task_ids: &[String],
         created_at_ms: i64,
     ) -> ApprovalRecord {
+        let fixture_model = "fake-legacy-model";
+        let fixture_target = resolve_model_target(
+            WorkerProvider::Antigravity,
+            fixture_model,
+            Some("high"),
+        )
+        .expect("resolve fake legacy Antigravity model target");
         let approved_set: BTreeSet<&str> = approved_task_ids.iter().map(String::as_str).collect();
         let approved_tasks: Vec<ApprovedTaskRecord> = published
             .tasks
@@ -722,12 +729,12 @@ mod unix_workspace_tests {
                 tool_id: "antigravity_cli".to_string(),
                 adapter: ToolAdapter::Antigravity,
                 provider: Some(WorkerProvider::Antigravity),
-                canonical_executable: Some(PathBuf::from("/bin/sh")),
+                canonical_executable: Some(PathBuf::from("/opt/threadlane-test/fake-antigravity")),
                 model_id: "model-flash".to_string(),
-                model_arg: "opencode-go/deepseek-v4.1-flash".to_string(),
-                base_model: "deepseek-v4.1-flash".to_string(),
-                effort: Some("max".to_string()),
-                cli_model_arg: Some("opencode-go/deepseek-v4.1-flash".to_string()),
+                model_arg: fixture_model.to_string(),
+                base_model: fixture_target.base_model.clone(),
+                effort: fixture_target.effort.clone(),
+                cli_model_arg: Some(fixture_target.cli_model_arg.clone()),
                 standalone: Some(false),
                 file_permissions: Some(WorkerFilePermissions::TaskFiles),
                 depends_on: task.depends_on.clone(),
@@ -829,6 +836,13 @@ mod unix_workspace_tests {
             approved_task_ids,
             approval_created_at_ms,
         );
+        for task in &approval.tasks {
+            assert!(
+                task.is_frozen_headless_worker(),
+                "legacy worker fixture task `{}` must carry complete frozen headless pins before persistence",
+                task.task_id
+            );
+        }
         write_legacy_approvals_ledger(stores, std::slice::from_ref(&approval));
         (published, approval)
     }
