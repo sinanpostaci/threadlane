@@ -1534,10 +1534,26 @@ exit 0
             frozen_oc.canonical_executable.as_ref(),
             Some(&fs::canonicalize(&fixture.fake_oc_exe).expect("canonical fake executable"))
         );
-        assert_eq!(
-            fs::read_to_string(&fixture.oc_prompt_file).expect("captured OpenCode instruction"),
-            frozen_oc.instruction
+        let captured_oc_prompt =
+            fs::read_to_string(&fixture.oc_prompt_file).expect("captured OpenCode instruction");
+        const OPENCODE_TASK_INSTRUCTION_DELIMITER: &str = "[THREADLANE_TASK_INSTRUCTION] ";
+        assert!(
+            captured_oc_prompt.starts_with(
+                "[THREADLANE_OPENCODE_TASK_FILES_CONTRACT] Session-local OpenCode task_files execution contract: "
+            ),
+            "captured OpenCode prompt must start with the TaskFiles execution contract prologue"
         );
+        assert_eq!(
+            captured_oc_prompt
+                .matches(OPENCODE_TASK_INSTRUCTION_DELIMITER)
+                .count(),
+            1,
+            "captured OpenCode prompt must contain exactly one task instruction delimiter"
+        );
+        let (_, retained_oc_instruction) = captured_oc_prompt
+            .split_once(OPENCODE_TASK_INSTRUCTION_DELIMITER)
+            .expect("captured OpenCode prompt must contain the task instruction delimiter");
+        assert_eq!(retained_oc_instruction, frozen_oc.instruction.as_str());
 
         host.shutdown().await.expect("shutdown host");
     }
