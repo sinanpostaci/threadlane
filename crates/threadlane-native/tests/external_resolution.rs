@@ -5,20 +5,28 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 
 use serde::Serialize;
 use serde_json::json;
 use tempfile::TempDir;
 use threadlane_authority::{ApprovalRecord, AuthorityStore, OperatorApprovalRequest};
+use threadlane_core::Core;
+use threadlane_host::{HostPhase, HostSessionManifest};
 use threadlane_native::coworker_workflow::{
     deterministic_prefixed_id, sha256_hex, CanonicalProjectBaseRef, ControllerPolicyStore,
-    CoworkerBindingLedger, CoworkerJobOwnershipKey, CoworkerJobOwnershipStore, CoworkerJobPhase,
-    CoworkerJobRecord, CoworkerLedgerMutationOutcome, CoworkerOwnershipAcquireOutcome,
-    CoworkerTaskRecord, CoworkerTaskStage, CoworkerWorkflowStore, CreatePlanningGrantRequest,
-    FinalizePlanningCallRequest, FrozenApprovalLinkage, OutboxDispatchKind, OutboxDispatchRecord,
-    OutboxDispatchStatus, PlanningCallBudget, PlanningReadOnlyCapabilities,
-    PlanningReservationStatus, ReservePlanningCallRequest, WorkBrief, WorkBriefKind,
+    ControllerRoleExecutionBudget, CoworkerBindingLedger,
+    CoworkerJobOwnershipKey, CoworkerJobOwnershipStore, CoworkerJobPhase, CoworkerJobRecord,
+    CoworkerLedgerMutationOutcome, CoworkerOwnershipAcquireOutcome, CoworkerTaskRecord,
+    CoworkerTaskStage, CoworkerWorkflowStore, CreatePlanningGrantRequest,
+    FinalizePlanningCallRequest, FreezeControllerExecutionEnvelopeRequest, FrozenApprovalLinkage,
+    FrozenCheckCommandSpec, FrozenCheckKind, FrozenControllerCapabilityEnvelope,
+    OutboxDispatchKind, OutboxDispatchRecord, OutboxDispatchStatus, PendingControllerEffect,
+    PendingControllerEffectKind, PendingControllerEffectStatus, PlanningCallBudget,
+    PlanningReadOnlyCapabilities, PlanningReservationStatus, ReservePlanningCallRequest, WorkBrief,
+    WorkBriefKind,
 };
 use threadlane_native::error::NativeErrorCode;
 use threadlane_native::external_resolution::{
@@ -31,11 +39,14 @@ use threadlane_native::external_resolution::{
     EXTERNAL_RESOLUTION_RECEIPT_DOMAIN, EXTERNAL_RESOLUTION_SCHEMA_VERSION,
     MAX_EXTERNAL_RESOLUTIONS_PER_BINDING,
 };
+use threadlane_native::fs_safety::acquire_cross_process_lock;
+use threadlane_native::planning_driver::planning_commands_dir;
 use threadlane_native::profile_flow::{ExecutionPolicy, PolicyAllowRule};
 use threadlane_native::{
     Difficulty, NativeError, RegistryStore, RoleExecutionRoute, SelectedRoleChoice, ToolAdapter,
     WorkflowProfile, WorkflowRole,
 };
+use threadlane_operations::IntegrationStrategy;
 use threadlane_workers::{
     resolve_exact_commit_sha, resolve_exact_tree_sha, run_sanitized_git, ExecutionBudgets,
     DEFAULT_GIT_COMMAND_TIMEOUT_MS,
@@ -130,6 +141,24 @@ fn planning_policy() -> ExecutionPolicy {
             efforts: vec!["high".to_string()],
             allow_no_effort: false,
             roles: vec![WorkflowRole::Orchestrator, WorkflowRole::Architect],
+        }],
+    }
+}
+
+fn controller_policy() -> ExecutionPolicy {
+    ExecutionPolicy {
+        schema_version: 1,
+        policy_id: "policy-external-controller".to_string(),
+        allow_rules: vec![PolicyAllowRule {
+            tool_id: "tool-agy".to_string(),
+            model_id: "model-argon".to_string(),
+            efforts: vec!["high".to_string()],
+            allow_no_effort: false,
+            roles: vec![
+                WorkflowRole::Coder,
+                WorkflowRole::Reviewer,
+                WorkflowRole::Closure,
+            ],
         }],
     }
 }
@@ -285,35 +314,52 @@ fn setup_fixture() -> ExternalFixture {
         base_commit: base_commit.clone(),
         base_tree_sha: base_tree_sha.clone(),
     };
-    let policy = ExecutionPolicy::deny_all("policy-external-resolution").expect("deny policy");
+    let policy = controller_policy();
+    let capability_envelope = FrozenControllerCapabilityEnvelope {
+        allowed_reviewer_choices: vec![headless_choice(Difficulty::Hard)],
+        allowed_closure_choices: vec![headless_choice(Difficulty::Hard)],
+        max_in_scope_correction_attempts: 1,
+        allowed_check_ids: vec!["cargo_test".to_string()],
+        local_git_integration_allowed: true,
+        allow_check_failure_corrections: false,
+    };
     let approval_linkage =
         FrozenApprovalLinkage::from_approval_and_policy(&approval, base_tree_sha, &policy)
-            .expect("bind approval linkage");
+            .expect("bind approval linkage")
+            .with_controller_envelope(capability_envelope, &policy)
+            .expect("bind controller capability envelope");
     let tasks: Vec<CoworkerTaskRecord> = plan
         .tasks
         .iter()
-        .map(|task| CoworkerTaskRecord {
-            task_id: task.id.clone(),
-            task_digest: sha256_hex(task.id.as_bytes()),
-            role: task.role,
-            difficulty: task.difficulty,
-            selected_choice: headless_choice(task.difficulty),
-            depends_on: task.depends_on.clone(),
-            write_paths: task.allowed_write_paths.clone(),
-            owned_interfaces: Vec::new(),
-            consumed_interfaces: Vec::new(),
-            stage: CoworkerTaskStage::ReadyToDispatch,
-            stage_before_hold: None,
-            current_attempt_no: 0,
-            active_candidate_id: None,
-            accepted_candidate_id: None,
-            dependency_input_commit: None,
-            dependency_input_tree_sha: None,
-            accepted_predecessor_receipts: Vec::new(),
-            attempts: Vec::new(),
-            candidates: Vec::new(),
-            active_hold_ids: Vec::new(),
-            unresolved_outbox_id: None,
+        .map(|task| {
+            let approved = approval
+                .tasks
+                .iter()
+                .find(|candidate| candidate.task_id == task.id)
+                .expect("approved task matching plan task");
+            CoworkerTaskRecord {
+                task_id: task.id.clone(),
+                task_digest: approved.task_digest.clone(),
+                role: task.role,
+                difficulty: task.difficulty,
+                selected_choice: headless_choice(task.difficulty),
+                depends_on: approved.depends_on.clone(),
+                write_paths: approved.allowed_write_paths.clone(),
+                owned_interfaces: Vec::new(),
+                consumed_interfaces: Vec::new(),
+                stage: CoworkerTaskStage::ReadyToDispatch,
+                stage_before_hold: None,
+                current_attempt_no: 0,
+                active_candidate_id: None,
+                accepted_candidate_id: None,
+                dependency_input_commit: None,
+                dependency_input_tree_sha: None,
+                accepted_predecessor_receipts: Vec::new(),
+                attempts: Vec::new(),
+                candidates: Vec::new(),
+                active_hold_ids: Vec::new(),
+                unresolved_outbox_id: None,
+            }
         })
         .collect();
     let work_brief = WorkBrief {
@@ -394,6 +440,278 @@ fn service(fixture: &ExternalFixture) -> ExternalResolutionService {
         Some(fixture.sessions.as_path()),
     )
     .expect("open external resolution service")
+}
+
+fn install_stopped_host_session(fixture: &ExternalFixture) -> (PathBuf, String) {
+    let session_dir = make_private_dir(&fixture.sessions.join(&fixture.approval.approval_id));
+    let runtime_state_dir = make_private_dir(&session_dir.join("runtime-state"));
+    let database_path = runtime_state_dir.join("state.db");
+    let mut core = Core::open(&database_path).expect("open disposable core runtime");
+    let binding = core
+        .create_binding(THREAD, "External resolution fixture runtime")
+        .expect("create runtime binding");
+    drop(core);
+
+    fs::write(session_dir.join("host.lock"), b"").expect("write empty host.lock");
+    fs::set_permissions(
+        session_dir.join("host.lock"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .expect("chmod host.lock");
+
+    let manifest = HostSessionManifest::from_approval_record(
+        &fixture.approval,
+        Some(binding.binding_id.clone()),
+        HostPhase::Stopped,
+        None,
+        None,
+        1_700_000_050_000,
+        1_700_000_060_000,
+    );
+    write_private_json(&session_dir.join("host-manifest.json"), &manifest);
+    (session_dir, binding.binding_id)
+}
+
+fn runtime_database_path(session_dir: &Path) -> PathBuf {
+    session_dir.join("runtime-state").join("state.db")
+}
+
+fn set_runtime_wakeup_status(session_dir: &Path, status: &str) {
+    let connection = rusqlite::Connection::open(runtime_database_path(session_dir))
+        .expect("open runtime database for fixture mutation");
+    connection
+        .execute(
+            "UPDATE wakeups SET status = ?1 WHERE binding_id IN (SELECT binding_id FROM bindings)",
+            rusqlite::params![status],
+        )
+        .expect("update fixture wakeup status");
+}
+
+fn insert_runtime_run_and_worker(
+    session_dir: &Path,
+    binding_id: &str,
+    run_status: &str,
+    worker_status: &str,
+) {
+    let connection = rusqlite::Connection::open(runtime_database_path(session_dir))
+        .expect("open runtime database for fixture insertion");
+    connection
+        .execute(
+            "INSERT INTO runs (
+                run_id, binding_id, revision, status, instruction, step_seq, step_delay_ms,
+                next_step_at_ms, active_question_id, started_at_ms, updated_at_ms,
+                completed_at_ms, cancelled_at_ms, cancel_reason
+             ) VALUES (
+                'run_external_runtime_01', ?1, 1, ?2, 'fixture run', 0, 0,
+                NULL, NULL, 1700000000000, 1700000000000, NULL, NULL, NULL
+             )",
+            rusqlite::params![binding_id, run_status],
+        )
+        .expect("insert fixture run");
+    connection
+        .execute(
+            "INSERT INTO workers (
+                worker_id, run_id, binding_id, revision, status, profile_id, profile_digest,
+                provider, requested_model, requested_effort, observed_model, observed_effort,
+                instruction, claim_id, attempt_count, execution_binding_json, worktree_json,
+                progress_json, outcome_json, created_at_ms, updated_at_ms, started_at_ms,
+                completed_at_ms, cancel_requested_at_ms, cancel_reason
+             ) VALUES (
+                'wrk_external_runtime_01', 'run_external_runtime_01', ?1, 1, ?2,
+                'profile-external', ?3, 'antigravity', 'gemini-4-argon-high', 'high',
+                NULL, NULL, 'fixture worker', NULL, 1, NULL, '{}', '{}', NULL,
+                1700000000000, 1700000000000, 1700000000000, NULL, NULL, NULL
+             )",
+            rusqlite::params![binding_id, worker_status, HEX64_A],
+        )
+        .expect("insert fixture worker");
+}
+
+fn update_runtime_run_and_worker_status(
+    session_dir: &Path,
+    run_status: &str,
+    worker_status: &str,
+) {
+    let connection = rusqlite::Connection::open(runtime_database_path(session_dir))
+        .expect("open runtime database for fixture status update");
+    connection
+        .execute("UPDATE runs SET status = ?1", rusqlite::params![run_status])
+        .expect("update fixture run status");
+    connection
+        .execute(
+            "UPDATE workers SET status = ?1",
+            rusqlite::params![worker_status],
+        )
+        .expect("update fixture worker status");
+}
+
+fn remove_runtime_run_and_worker(session_dir: &Path) {
+    let connection = rusqlite::Connection::open(runtime_database_path(session_dir))
+        .expect("open runtime database for fixture cleanup");
+    connection
+        .execute("DELETE FROM workers", [])
+        .expect("remove fixture worker");
+    connection
+        .execute("DELETE FROM runs", [])
+        .expect("remove fixture run");
+}
+
+fn controller_envelope_request(
+    fixture: &ExternalFixture,
+    operator_attested: bool,
+    confirm_approval_subject_digest: Option<String>,
+    confirm_envelope_digest: Option<String>,
+) -> FreezeControllerExecutionEnvelopeRequest {
+    let mut role_budgets = BTreeMap::new();
+    for role in [
+        WorkflowRole::Coder,
+        WorkflowRole::Reviewer,
+        WorkflowRole::Closure,
+    ] {
+        role_budgets.insert(
+            role,
+            ControllerRoleExecutionBudget::default_for_role(role, 1),
+        );
+    }
+
+    let mut check_commands = BTreeMap::new();
+    check_commands.insert(
+        "cargo_test".to_string(),
+        FrozenCheckCommandSpec {
+            check_id: "cargo_test".to_string(),
+            kind: FrozenCheckKind::Tests,
+            executable: fixture.root.join("bin/fake-agy"),
+            argv: vec!["test".to_string()],
+            repo_relative_cwd: ".".to_string(),
+            timeout_ms: 30_000,
+            max_stdout_bytes: 65_536,
+            max_stderr_bytes: 65_536,
+            required_for_task_review: true,
+            required_for_candidate_closure: true,
+        },
+    );
+
+    FreezeControllerExecutionEnvelopeRequest {
+        binding_id: BINDING.to_string(),
+        thread_uuid: THREAD.to_string(),
+        job_id: fixture.job.job_id.clone(),
+        expected_job_revision: fixture.job.job_revision,
+        policy: controller_policy(),
+        reviewer_choice: headless_choice(Difficulty::Hard),
+        closure_choice: headless_choice(Difficulty::Hard),
+        role_budgets,
+        max_in_scope_corrections_per_task: 0,
+        max_total_corrections_per_job: 0,
+        max_total_task_attempts_per_job: fixture.job.tasks.len() as u32,
+        check_commands,
+        allow_task_worktree_commits: true,
+        allow_run_integration_execution: false,
+        default_integration_strategy: IntegrationStrategy::FastForwardOnly,
+        independence_completeness_receipt: None,
+        shadow_jev_policy: None,
+        created_at_ms: 1_700_000_100_000,
+        operator_attested,
+        confirm_approval_subject_digest,
+        confirm_envelope_digest,
+    }
+}
+
+fn install_controller_runtime(fixture: &ExternalFixture) -> ControllerPolicyStore {
+    let policy_store =
+        ControllerPolicyStore::new(&fixture.plans).expect("open controller policy store");
+    let registry = Arc::new(RegistryStore::open(&fixture.registry_dir).expect("reopen registry"));
+    let plans = Arc::new(PlanStore::open(&fixture.plans).expect("reopen plans"));
+    let authority = AuthorityStore::open(
+        &fixture.authority_dir,
+        Arc::clone(&registry),
+        Arc::clone(&plans),
+    )
+    .expect("reopen authority");
+
+    let preview_request = controller_envelope_request(fixture, false, None, None);
+    let preview = policy_store
+        .preview_execution_envelope(&preview_request, &fixture.job, &authority)
+        .expect("preview controller envelope");
+    let recorded_request = controller_envelope_request(
+        fixture,
+        true,
+        Some(preview.approval_subject_digest.clone()),
+        Some(preview.envelope_digest.clone()),
+    );
+    policy_store
+        .record_execution_envelope(&recorded_request, &fixture.job, &authority)
+        .expect("record controller envelope");
+    policy_store
+}
+
+fn set_controller_effect(
+    store: &ControllerPolicyStore,
+    status: PendingControllerEffectStatus,
+) {
+    store
+        .mutate_job_runtime_for_operator(
+            BINDING,
+            "job_0123456789abcdef0123456789abcdef",
+            |state| {
+                let job_id = state.job_id.clone();
+                state.pending_effects.insert(
+                    "eff_0123456789abcdef0123456789abcdef".to_string(),
+                    PendingControllerEffect {
+                        effect_id: "eff_0123456789abcdef0123456789abcdef".to_string(),
+                        request_key: "req_external_runtime_effect".to_string(),
+                        job_id,
+                        task_id: Some("task-alpha".to_string()),
+                        attempt_no: Some(1),
+                        kind: PendingControllerEffectKind::CoderDispatch,
+                        status,
+                        subject_digest: HEX64_B.to_string(),
+                        external_correlation_id: None,
+                        created_at_ms: 1_700_000_100_000,
+                        updated_at_ms: 1_700_000_100_000,
+                        diagnostic: Some("fixture controller effect".to_string()),
+                    },
+                );
+                Ok(())
+            },
+        )
+        .expect("insert controller effect");
+}
+
+fn clear_controller_effects(store: &ControllerPolicyStore) {
+    store
+        .mutate_job_runtime_for_operator(
+            BINDING,
+            "job_0123456789abcdef0123456789abcdef",
+            |state| {
+                state.pending_effects.clear();
+                Ok(())
+            },
+        )
+        .expect("clear controller effects");
+}
+
+fn binding_tag(domain: &[u8], binding_id: &str) -> String {
+    let mut seed = Vec::new();
+    seed.extend_from_slice(domain);
+    seed.extend_from_slice(binding_id.as_bytes());
+    let digest = sha256_hex(&seed);
+    digest[..32].to_string()
+}
+
+fn planning_command_lock_name(binding_id: &str) -> String {
+    let mut seed = Vec::new();
+    seed.extend_from_slice(b"threadlane-native:planning-command-ledger:v1\0");
+    seed.extend_from_slice(&(binding_id.len() as u64).to_le_bytes());
+    seed.extend_from_slice(binding_id.as_bytes());
+    let digest = sha256_hex(&seed);
+    format!("planning-commands-{}.lock", &digest[..32])
+}
+
+fn conversation_change_lock_name(binding_id: &str) -> String {
+    format!(
+        "changes-{}.lock",
+        binding_tag(b"threadlane-native:conversation-changes:v1\0", binding_id)
+    )
 }
 
 fn job_request(
@@ -1857,4 +2175,608 @@ fn tampered_persisted_receipt_fails_closed_and_preserves_tampered_bytes() {
         ))
         .expect_err("preview on tampered ledger must fail closed");
     assert_eq!(err.code(), NativeErrorCode::ProtocolError.as_str());
+}
+
+#[test]
+fn frozen_approval_linkage_and_job_task_digest_drift_are_refused() {
+    let fixture = setup_fixture();
+    let service = service(&fixture);
+    let request = job_request(
+        &fixture,
+        "req_linkage_drift_01",
+        ExternalResolutionScope::FullJob,
+        None,
+        None,
+    );
+    let source_before =
+        fs::read(fixture.repo.join("src/lib.rs")).expect("read source before linkage drift");
+    let original_job = fixture.job.clone();
+    let mut drift_cases = Vec::new();
+
+    let mut plan_digest_job = original_job.clone();
+    plan_digest_job
+        .approval_linkage
+        .as_mut()
+        .expect("fixture approval linkage")
+        .plan_digest = HEX64_B.to_string();
+    drift_cases.push(plan_digest_job);
+
+    let mut profile_job = original_job.clone();
+    profile_job
+        .approval_linkage
+        .as_mut()
+        .expect("fixture approval linkage")
+        .profile_id = "profile-drifted".to_string();
+    drift_cases.push(profile_job);
+
+    let mut registry_job = original_job.clone();
+    registry_job
+        .approval_linkage
+        .as_mut()
+        .expect("fixture approval linkage")
+        .registry_revision = fixture.registry_revision + 1;
+    drift_cases.push(registry_job);
+
+    let mut approved_task_job = original_job.clone();
+    approved_task_job
+        .approval_linkage
+        .as_mut()
+        .expect("fixture approval linkage")
+        .approved_task_ids = vec!["task-alpha".to_string()];
+    drift_cases.push(approved_task_job);
+
+    let mut write_scope_job = original_job.clone();
+    write_scope_job
+        .approval_linkage
+        .as_mut()
+        .expect("fixture approval linkage")
+        .approved_write_paths = vec!["src/unapproved.rs".to_string()];
+    drift_cases.push(write_scope_job);
+
+    let mut task_digest_job = original_job.clone();
+    task_digest_job.tasks[0].task_digest = sha256_hex(b"drifted task digest");
+    drift_cases.push(task_digest_job);
+
+    let mut task_scope_job = original_job.clone();
+    task_scope_job.tasks[0].write_paths = vec!["src/unapproved.rs".to_string()];
+    drift_cases.push(task_scope_job);
+
+    let mut task_dependency_job = original_job.clone();
+    task_dependency_job.tasks[0].depends_on = vec!["task-beta".to_string()];
+    drift_cases.push(task_dependency_job);
+
+    for drifted_job in drift_cases {
+        fixture
+            .store
+            .transact_binding_ledger(BINDING, None, |ledger| {
+                ledger.jobs = vec![drifted_job.clone()];
+                Ok(CoworkerLedgerMutationOutcome::Mutated(()))
+            })
+            .expect("write drifted job fixture");
+        let err = service
+            .preview(&request)
+            .expect_err("immutable approval/task drift must be refused");
+        assert_eq!(err.code(), NativeErrorCode::ValidationFailed.as_str());
+        assert_eq!(
+            fixture
+                .store
+                .read_binding_ledger(BINDING)
+                .expect("ledger during drift attempts")
+                .external_resolutions
+                .len(),
+            0
+        );
+    }
+
+    fixture
+        .store
+        .transact_binding_ledger(BINDING, None, |ledger| {
+            ledger.jobs = vec![original_job];
+            Ok(CoworkerLedgerMutationOutcome::Mutated(()))
+        })
+        .expect("restore original job");
+    let preview = service
+        .preview(&request)
+        .expect("preview recovers with exact frozen approval and task digests");
+    assert_eq!(
+        preview.plan_digest.as_deref(),
+        Some(fixture.approval.plan_digest.as_str())
+    );
+
+    let receipt = service
+        .record(&request, &confirmation(&preview))
+        .expect("record with exact real frozen approval fields");
+    assert_eq!(receipt.request_key, request.request_key);
+    assert_eq!(
+        fs::read(fixture.repo.join("src/lib.rs")).expect("read source after linkage drift"),
+        source_before
+    );
+    assert!(!fixture.provider_marker.exists());
+}
+
+#[test]
+fn stopped_host_runtime_proof_rejects_active_unknown_and_nonquiescent_evidence() {
+    let fixture = setup_fixture();
+    let (session_dir, runtime_binding_id) = install_stopped_host_session(&fixture);
+    let service = service(&fixture);
+    let request = job_request(
+        &fixture,
+        "req_host_runtime_proof_01",
+        ExternalResolutionScope::FullJob,
+        None,
+        None,
+    );
+    let repo_source_before =
+        fs::read(fixture.repo.join("src/lib.rs")).expect("read source before proof");
+    let preview = service
+        .preview(&request)
+        .expect("stopped host with idle runtime and no active work must preview");
+    assert_eq!(
+        fixture
+            .store
+            .read_binding_ledger(BINDING)
+            .expect("ledger before host proof attempts")
+            .external_resolutions
+            .len(),
+        0
+    );
+
+    let runtime_state_dir = session_dir.join("runtime-state");
+    let supervisor_guard = acquire_cross_process_lock(
+        &runtime_state_dir,
+        "supervisor.lock",
+        "test_supervisor_lock",
+    )
+    .expect("hold supervisor.lock");
+    let err = service
+        .preview(&request)
+        .expect_err("held supervisor.lock must refuse stopped-runtime proof");
+    assert_eq!(
+        err.code(),
+        NativeErrorCode::AmbiguousWakeupPendingReconciliation.as_str()
+    );
+    drop(supervisor_guard);
+    fs::remove_file(runtime_state_dir.join("supervisor.lock"))
+        .expect("remove test supervisor.lock");
+
+    set_runtime_wakeup_status(&session_dir, "pending");
+    let err = service
+        .preview(&request)
+        .expect_err("Pending wakeup evidence must be refused");
+    assert_eq!(
+        err.code(),
+        NativeErrorCode::AmbiguousWakeupPendingReconciliation.as_str()
+    );
+    set_runtime_wakeup_status(&session_dir, "idle");
+
+    insert_runtime_run_and_worker(&session_dir, &runtime_binding_id, "running", "running");
+    let err = service
+        .preview(&request)
+        .expect_err("active run and worker must be refused");
+    assert_eq!(err.code(), NativeErrorCode::ValidationFailed.as_str());
+
+    update_runtime_run_and_worker_status(&session_dir, "completed", "unknown");
+    let err = service
+        .preview(&request)
+        .expect_err("Unknown worker must be refused");
+    assert_eq!(
+        err.code(),
+        NativeErrorCode::AmbiguousWakeupPendingReconciliation.as_str()
+    );
+
+    update_runtime_run_and_worker_status(&session_dir, "unknown", "completed");
+    let err = service
+        .preview(&request)
+        .expect_err("Unknown run must be refused");
+    assert_eq!(
+        err.code(),
+        NativeErrorCode::AmbiguousWakeupPendingReconciliation.as_str()
+    );
+
+    update_runtime_run_and_worker_status(&session_dir, "failed", "failed");
+    service
+        .preview(&request)
+        .expect("terminal Failed runtime records are quiescent worker/run evidence");
+
+    remove_runtime_run_and_worker(&session_dir);
+    set_runtime_wakeup_status(&session_dir, "submitted");
+    let err = service
+        .preview(&request)
+        .expect_err("Submitted outstanding wakeup delivery must be refused");
+    assert_eq!(
+        err.code(),
+        NativeErrorCode::AmbiguousWakeupPendingReconciliation.as_str()
+    );
+    set_runtime_wakeup_status(&session_dir, "idle");
+
+    let database_path = runtime_database_path(&session_dir);
+    let parked_database = database_path.with_extension("parked");
+    fs::rename(&database_path, &parked_database).expect("park runtime state.db");
+    let err = service
+        .preview(&request)
+        .expect_err("missing runtime state.db must not be treated as quiescent");
+    assert_eq!(
+        err.code(),
+        NativeErrorCode::AmbiguousWakeupPendingReconciliation.as_str()
+    );
+    fs::rename(&parked_database, &database_path).expect("restore runtime state.db");
+
+    let receipt = service
+        .record(&request, &confirmation(&preview))
+        .expect("record with proven stopped runtime quiescence");
+    assert_eq!(receipt.request_key, request.request_key);
+    assert_eq!(
+        fs::read(fixture.repo.join("src/lib.rs")).expect("read source after proof"),
+        repo_source_before
+    );
+    assert!(!fixture.provider_marker.exists());
+    assert_eq!(
+        fixture
+            .store
+            .read_binding_ledger(BINDING)
+            .expect("ledger after host proof record")
+            .external_resolutions
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn pending_and_unknown_controller_effects_block_record_until_reconciled() {
+    let fixture = setup_fixture();
+    let controller = install_controller_runtime(&fixture);
+    let service = service(&fixture);
+    let request = job_request(
+        &fixture,
+        "req_controller_effect_01",
+        ExternalResolutionScope::FullJob,
+        None,
+        None,
+    );
+
+    set_controller_effect(
+        &controller,
+        PendingControllerEffectStatus::ReservedBeforeEffect,
+    );
+    let err = service
+        .preview(&request)
+        .expect_err("reserved controller effect must block preview");
+    assert_eq!(err.code(), NativeErrorCode::ValidationFailed.as_str());
+
+    set_controller_effect(&controller, PendingControllerEffectStatus::EffectUnknown);
+    let err = service
+        .preview(&request)
+        .expect_err("Unknown controller effect must block preview");
+    assert_eq!(
+        err.code(),
+        NativeErrorCode::AmbiguousWakeupPendingReconciliation.as_str()
+    );
+
+    clear_controller_effects(&controller);
+    let preview = service
+        .preview(&request)
+        .expect("preview recovers after controller effect reconciliation");
+    let receipt = service
+        .record(&request, &confirmation(&preview))
+        .expect("record after controller effect reconciliation");
+    assert_eq!(receipt.request_key, request.request_key);
+    assert!(!fixture.provider_marker.exists());
+}
+
+#[test]
+fn record_reacquires_physical_owner_and_planning_command_guards() {
+    let fixture = setup_fixture();
+    let service = service(&fixture);
+    let request = job_request(
+        &fixture,
+        "req_guard_exclusion_01",
+        ExternalResolutionScope::FullJob,
+        None,
+        None,
+    );
+    let preview = service.preview(&request).expect("preview before held guards");
+    let ledger_bytes_before = fs::read(
+        fixture
+            .store
+            .ledger_path_for_binding(BINDING)
+            .expect("ledger path"),
+    )
+    .expect("ledger bytes before held guards");
+
+    let ownership_dir = fixture.plans.join("coworker-code-driver");
+    make_private_dir(&ownership_dir);
+    let ownership = CoworkerJobOwnershipStore::new(&ownership_dir).expect("ownership store");
+    let key = CoworkerJobOwnershipKey::new(BINDING, THREAD, fixture.job.job_id.clone())
+        .expect("ownership key");
+    let owner_guard = match ownership
+        .try_acquire_job(&key, 1_700_000_500_000)
+        .expect("acquire owner guard")
+    {
+        CoworkerOwnershipAcquireOutcome::Acquired(guard) => guard,
+        CoworkerOwnershipAcquireOutcome::Busy { .. } => panic!("fresh owner guard must acquire"),
+    };
+    let err = service
+        .record(&request, &confirmation(&preview))
+        .expect_err("record must reacquire and observe the physical owner guard");
+    assert_eq!(err.code(), NativeErrorCode::ValidationFailed.as_str());
+    assert!(err.message().contains("owned by a live"));
+    assert_eq!(
+        fs::read(
+            fixture
+                .store
+                .ledger_path_for_binding(BINDING)
+                .expect("ledger path")
+        )
+        .expect("ledger bytes after owner refusal"),
+        ledger_bytes_before
+    );
+    drop(owner_guard);
+
+    let commands_dir = planning_commands_dir(&fixture.plans);
+    make_private_dir(&commands_dir);
+    let planning_guard = acquire_cross_process_lock(
+        &commands_dir,
+        &planning_command_lock_name(BINDING),
+        "test_planning_command_guard",
+    )
+    .expect("hold planning command lock");
+    let record_service = service.clone();
+    let record_request = request.clone();
+    let record_confirmation = confirmation(&preview);
+    let (record_done_tx, record_done_rx) = mpsc::channel();
+    let record_thread = thread::spawn(move || {
+        let result = record_service.record(&record_request, &record_confirmation);
+        let _ = record_done_tx.send(result);
+    });
+    assert!(
+        record_done_rx
+            .recv_timeout(Duration::from_millis(250))
+            .is_err(),
+        "record must wait for the held planning command lock"
+    );
+    assert_eq!(
+        fixture
+            .store
+            .read_binding_ledger(BINDING)
+            .expect("ledger during held planning lock")
+            .external_resolutions
+            .len(),
+        0
+    );
+    drop(planning_guard);
+    let receipt = record_done_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("record completes after planning lock release")
+        .expect("record succeeds after planning lock release");
+    record_thread.join().expect("join record thread");
+    assert_eq!(receipt.request_key, request.request_key);
+    assert!(!fixture.provider_marker.exists());
+}
+
+#[test]
+fn record_waits_for_held_conversation_advancement_guard() {
+    let fixture = setup_fixture();
+    let service = service(&fixture);
+    let request = job_request(
+        &fixture,
+        "req_conversation_guard_01",
+        ExternalResolutionScope::FullJob,
+        None,
+        None,
+    );
+    let preview = service.preview(&request).expect("preview before held guard");
+    let namespace_dir = make_private_dir(&fixture.plans.join("conversation-changes"));
+    let conversation_guard = acquire_cross_process_lock(
+        &namespace_dir,
+        &conversation_change_lock_name(BINDING),
+        "test_conversation_advancement_guard",
+    )
+    .expect("hold conversation advancement lock");
+    let ledger_bytes_before = fs::read(
+        fixture
+            .store
+            .ledger_path_for_binding(BINDING)
+            .expect("ledger path"),
+    )
+    .expect("ledger bytes before held conversation guard");
+
+    let record_service = service.clone();
+    let record_request = request.clone();
+    let record_confirmation = confirmation(&preview);
+    let (record_done_tx, record_done_rx) = mpsc::channel();
+    let record_thread = thread::spawn(move || {
+        let result = record_service.record(&record_request, &record_confirmation);
+        let _ = record_done_tx.send(result);
+    });
+    assert!(
+        record_done_rx
+            .recv_timeout(Duration::from_millis(250))
+            .is_err(),
+        "record must wait for the held conversation advancement lock"
+    );
+    assert_eq!(
+        fs::read(
+            fixture
+                .store
+                .ledger_path_for_binding(BINDING)
+                .expect("ledger path")
+        )
+        .expect("ledger bytes during held conversation guard"),
+        ledger_bytes_before
+    );
+    drop(conversation_guard);
+    let receipt = record_done_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("record completes after conversation lock release")
+        .expect("record succeeds after conversation lock release");
+    record_thread.join().expect("join record thread");
+    assert_eq!(receipt.request_key, request.request_key);
+    assert!(!fixture.provider_marker.exists());
+}
+
+#[test]
+fn concurrent_plan_publication_and_record_linearize_under_plan_store_lock() {
+    let fixture = setup_fixture();
+    let (probe_tx, probe_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let probe_tx = Arc::new(Mutex::new(probe_tx));
+    let release_rx = Arc::new(Mutex::new(release_rx));
+    let service = service(&fixture).with_post_persist_probe(move |_| {
+        probe_tx
+            .lock()
+            .map_err(|_| invalid_probe_error())?
+            .send(())
+            .map_err(|_| {
+                NativeError::persistence_uncertain("plan race probe receiver disappeared")
+            })?;
+        release_rx
+            .lock()
+            .map_err(|_| invalid_probe_error())?
+            .recv()
+            .map_err(|_| NativeError::persistence_uncertain("plan race probe release disappeared"))?;
+        Ok(())
+    });
+    let request = job_request(
+        &fixture,
+        "req_plan_race_01",
+        ExternalResolutionScope::FullJob,
+        Some(1),
+        Some(1),
+    );
+    let preview = service.preview(&request).expect("preview before plan race");
+    let record_confirmation = confirmation(&preview);
+    let record_service = service.clone();
+    let record_request = request.clone();
+    let record_thread = thread::spawn(move || record_service.record(&record_request, &record_confirmation));
+    probe_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("record reaches post-persist probe with all guards held");
+
+    let (published_tx, published_rx) = mpsc::channel();
+    let (publisher_started_tx, publisher_started_rx) = mpsc::channel();
+    let plans_dir = fixture.plans.clone();
+    let plan_id = fixture.plan.plan_id.clone();
+    let plan_tasks = fixture.plan.tasks.clone();
+    let profile_revision = fixture.registry_revision;
+    let plan_revision = fixture.plan.revision;
+    let publisher_thread = thread::spawn(move || {
+        let _ = publisher_started_tx.send(());
+        let plans = PlanStore::open(&plans_dir).expect("publisher opens plan store");
+        let draft = plans
+            .change_at(
+                plan_revision,
+                PlanChange::SaveDraft {
+                    plan_id: plan_id.clone(),
+                    binding_id: BINDING.to_string(),
+                    profile_id: "profile-external".to_string(),
+                    profile_revision,
+                    summary: "Concurrent successor draft".to_string(),
+                    tasks: plan_tasks,
+                },
+                1_700_000_900_000,
+            )
+            .expect("concurrent publisher saves successor draft");
+        let published = plans
+            .change(
+                draft.revision,
+                PlanChange::Publish {
+                    plan_id: draft.plan_id.clone(),
+                    revision: draft.revision,
+                },
+            )
+            .expect("concurrent publisher publishes successor");
+        let _ = published_tx.send(published.revision);
+        published.revision
+    });
+    publisher_started_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("publisher thread starts while plans.lock is held");
+    assert!(
+        published_rx
+            .recv_timeout(Duration::from_millis(250))
+            .is_err(),
+        "publisher must not supersede the target while the receipt append holds plans.lock"
+    );
+
+    release_tx.send(()).expect("release record probe");
+    let receipt = record_thread
+        .join()
+        .expect("join record thread")
+        .expect("record linearizes before concurrent publication");
+    let published_revision = published_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("publisher completes after plans.lock release");
+    assert_eq!(published_revision, fixture.plan.revision + 1);
+    publisher_thread.join().expect("join publisher thread");
+    assert_eq!(receipt.request_key, request.request_key);
+
+    let inspection = service.inspect(BINDING, THREAD).expect("inspect after race");
+    assert_eq!(inspection.receipts.len(), 1);
+    let ExternalResolutionApplicability::Stale { reasons } =
+        &inspection.receipts[0].applicability
+    else {
+        panic!("published successor must make the preserved receipt stale");
+    };
+    assert!(reasons.contains(&ExternalResolutionStaleReason::BoundPlanChanged));
+    assert!(!fixture.provider_marker.exists());
+}
+
+#[test]
+fn record_refuses_confirmed_target_after_successor_publication() {
+    let fixture = setup_fixture();
+    let service = service(&fixture);
+    let request = job_request(
+        &fixture,
+        "req_plan_successor_refusal_01",
+        ExternalResolutionScope::FullJob,
+        Some(1),
+        Some(1),
+    );
+    let preview = service
+        .preview(&request)
+        .expect("preview before successor publication");
+
+    let plans = PlanStore::open(&fixture.plans).expect("open plans for successor");
+    let draft = plans
+        .change_at(
+            fixture.plan.revision,
+            PlanChange::SaveDraft {
+                plan_id: fixture.plan.plan_id.clone(),
+                binding_id: BINDING.to_string(),
+                profile_id: "profile-external".to_string(),
+                profile_revision: fixture.registry_revision,
+                summary: "Successor published after confirmation".to_string(),
+                tasks: fixture.plan.tasks.clone(),
+            },
+            1_700_000_900_000,
+        )
+        .expect("save successor draft");
+    plans
+        .change(
+            draft.revision,
+            PlanChange::Publish {
+                plan_id: draft.plan_id.clone(),
+                revision: draft.revision,
+            },
+        )
+        .expect("publish successor");
+
+    let err = service
+        .record(&request, &confirmation(&preview))
+        .expect_err("record must refuse a confirmed target superseded by publication");
+    assert_eq!(err.code(), NativeErrorCode::ValidationFailed.as_str());
+    assert_eq!(
+        fixture
+            .store
+            .read_binding_ledger(BINDING)
+            .expect("ledger after successor refusal")
+            .external_resolutions
+            .len(),
+        0
+    );
+    assert!(!fixture.provider_marker.exists());
+}
+
+fn invalid_probe_error() -> NativeError {
+    NativeError::persistence_uncertain("plan race probe lock poisoned")
 }

@@ -14,6 +14,12 @@
 //!   [`CoworkerWorkflowStore`] or a legacy published [`PlanRevision`] in [`PlanStore`] that is
 //!   uniquely linked to a single verified [`ApprovalRecord`] in [`AuthorityStore`]. Raw commit
 //!   SHAs, provider prose, and caller JSON self-attestations never prove target or authority scope.
+//! - **Read-only stopped-runtime proof**: An existing host session is accepted only after the
+//!   manifest is `Stopped` (or a fully proven `Failed` session is conservatively refused), no
+//!   supervisor readiness/PID or `supervisor.lock` holder remains, and `runtime-state/state.db`
+//!   is read without Core initialization to prove exact binding/wakeup scope plus terminal
+//!   worker/run and non-pending wake-up evidence. Notification configuration is never delivery
+//!   proof.
 //! - **Separate operator confirmation & deadlock-free lock order**: `record` requires an explicit
 //!   [`ExternalResolutionConfirmation`] (`trusted_local_attested == true`, matching canonical
 //!   `thread_uuid`, and constant-time matching domain-separated `preview_digest`) and holds:
@@ -22,7 +28,8 @@
 //!   3. Non-blocking [`HostLaunchIntentLock`] and [`HostSessionLock`] (when an approval is bound),
 //!   4. Per-binding [`PlanningCommandStore`] lock,
 //!   5. Per-binding [`ControllerPolicyStore`] lock (with the job runtime snapshot for job targets),
-//!   6. Per-binding [`CoworkerWorkflowStore`] transaction lock.
+//!   6. Independent [`PlanStore`] `plans.lock` held through the final target snapshot and append,
+//!   7. Per-binding [`CoworkerWorkflowStore`] transaction lock (innermost).
 //! - **Append-only single mutation**: Recording appends only the immutable
 //!   [`ExternalResolutionReceipt`]; it never mutates `job.phase`, `job.job_revision`, worker task
 //!   results, holds, approvals, controller envelopes, review/integration/Closure receipts, or host
@@ -45,12 +52,14 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use threadlane_authority::validation::validate_canonical_thread_uuid;
 use threadlane_authority::{ApprovalRecord, AuthorityStore};
+use threadlane_core::observation::{
+    read_core_state_readonly, ReadonlyCoreStateSnapshot, ObservationJournalError,
+};
 use threadlane_host::{
     read_host_launch_intent_optional, read_host_manifest_optional,
     read_session_task_ledger_recorded_history_readonly, verify_existing_private_dir,
-    verify_existing_session_dir, HostError, HostLaunchIntentLock, HostLaunchIntentStatus,
-    HostNotificationWakeupStatus, HostPhase, HostSessionLock, HOST_LOCK_FILENAME,
-    LAUNCH_INTENTS_SUBDIR,
+    verify_existing_session_dir, HostError, HostLaunchIntentLock, HostLaunchIntentStatus, HostPhase,
+    HostSessionLock, HOST_LOCK_FILENAME, LAUNCH_INTENTS_SUBDIR, RUNTIME_STATE_SUBDIR,
 };
 use threadlane_workers::{validate_exact_40_hex_sha, validate_sha256_hex_digest};
 use threadlane_workflow::{compile_plan_revision, PlanRevision, PlanStore, RegistryStore};
@@ -110,7 +119,10 @@ pub const EXTERNAL_RESOLUTION_ID_DOMAIN: &str = "threadlane-native:external-reso
 
 const MAX_WITNESS_ENTRIES: usize = 1024;
 
+const PLAN_STORE_LOCK_FILENAME: &str = "plans.lock";
+
 type WitnessMap = BTreeMap<(PathBuf, String), String>;
+type PostPersistProbe = Arc<dyn Fn(&Path) -> Result<(), NativeError> + Send + Sync>;
 
 /// Canonical project base identity proven from workflow or authority stores without spawning `git`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -278,7 +290,8 @@ impl ExternalResolutionEvidenceRef {
             Self::CommitSha { commit_sha } => {
                 validate_exact_40_hex_sha(commit_sha, "evidence_ref.commit_sha").map_err(|_| {
                     invalid("evidence_ref.commit_sha must be a 40-character lowercase hex SHA")
-                })
+                })?;
+                Ok(())
             }
             Self::ArtifactRef { reference } => validate_clean_bounded_text(
                 reference,
@@ -1033,7 +1046,7 @@ pub struct ExternalResolutionService {
     ownership_dir: PathBuf,
     commands_dir: PathBuf,
     witnesses: Arc<Mutex<WitnessMap>>,
-    post_persist_probe: Option<fn(&Path) -> Result<(), NativeError>>,
+    post_persist_probe: Option<PostPersistProbe>,
 }
 
 impl std::fmt::Debug for ExternalResolutionService {
@@ -1122,11 +1135,15 @@ impl ExternalResolutionService {
         Ok(self)
     }
 
-    /// Installs a deterministic post-persist durability probe for fault-injection tests.
+    /// Installs a deterministic post-persist durability probe for fault-injection and lock-order
+    /// tests. The probe runs while all recording guards, including `plans.lock`, remain held.
     #[doc(hidden)]
     #[must_use]
-    pub fn with_post_persist_probe(mut self, probe: fn(&Path) -> Result<(), NativeError>) -> Self {
-        self.post_persist_probe = Some(probe);
+    pub fn with_post_persist_probe<F>(mut self, probe: F) -> Self
+    where
+        F: Fn(&Path) -> Result<(), NativeError> + Send + Sync + 'static,
+    {
+        self.post_persist_probe = Some(Arc::new(probe));
         self
     }
 
@@ -1321,8 +1338,12 @@ impl ExternalResolutionService {
             .as_ref()
             .map(|(_, ctrl_rev, rt)| (*ctrl_rev, rt.clone()));
 
-        // 6. Per-binding CoworkerWorkflowStore atomic CAS transaction (innermost lock).
-        let probe = self.post_persist_probe;
+        // 6. PlanStore `plans.lock` held through the final snapshot and receipt append so an
+        // independent publisher cannot supersede the confirmed revision between read and write.
+        let _plan_store_guard = acquire_plan_store_lock(self.workflow.plans_dir())?;
+
+        // 7. Per-binding CoworkerWorkflowStore atomic CAS transaction (innermost lock).
+        let probe = self.post_persist_probe.clone();
         let (_, receipt) = self.workflow.transact_binding_ledger_with_post_persist_probe(
             &normalized.binding_id,
             Some(pre_guard_preview.source_ledger_revision),
@@ -1782,16 +1803,17 @@ impl ExternalResolutionService {
                             invalid("job.approval_linkage references an ApprovalRecord missing from AuthorityStore")
                         })?
                         .clone();
+                    linkage.verify_matches_approval(&approval)?;
                     if approval.binding_id != request.binding_id
                         || approval.thread_uuid != request.thread_uuid
-                        || approval.subject_digest != linkage.approval_subject_digest
                         || approval.repository_path != canonical_repo
                         || approval.base_commit != job.work_brief.project_base.base_commit
                     {
                         return Err(invalid(
-                            "bound ApprovalRecord does not match job scope, subject_digest, repository, or base_commit",
+                            "bound ApprovalRecord does not match job scope, repository, or base_commit",
                         ));
                     }
+                    verify_job_tasks_match_approval(job, &approval)?;
                     let plan_rev = plans
                         .iter()
                         .find(|p| {
@@ -2712,6 +2734,42 @@ fn verify_job_quiescent(job: &CoworkerJobRecord) -> Result<(), NativeError> {
     Ok(())
 }
 
+fn verify_job_tasks_match_approval(
+    job: &CoworkerJobRecord,
+    approval: &ApprovalRecord,
+) -> Result<(), NativeError> {
+    if job.tasks.len() != approval.tasks.len() {
+        return Err(invalid(
+            "CoworkerJobRecord tasks do not exactly match the frozen ApprovalRecord tasks",
+        ));
+    }
+    let mut seen_job_tasks = BTreeSet::new();
+    for task in &job.tasks {
+        if !seen_job_tasks.insert(task.task_id.as_str()) {
+            return Err(NativeError::new(
+                NativeErrorCode::ProtocolError,
+                "CoworkerJobRecord contains duplicate task identifiers",
+            ));
+        }
+        let approved = approval
+            .tasks
+            .iter()
+            .find(|candidate| candidate.task_id == task.task_id)
+            .ok_or_else(|| {
+                invalid("CoworkerJobRecord task is absent from the frozen ApprovalRecord")
+            })?;
+        if task.task_digest != approved.task_digest
+            || task.write_paths != approved.allowed_write_paths
+            || task.depends_on != approved.depends_on
+        {
+            return Err(invalid(
+                "CoworkerJobRecord task digest or immutable dependency/write scope drifted from the frozen ApprovalRecord",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn verify_host_launch_intent_state(
     sessions_dir: &Path,
     approval: &ApprovalRecord,
@@ -2755,16 +2813,55 @@ fn verify_stopped_host_session_contents(
             "existing host session manifest is not in Stopped or Failed phase",
         ));
     }
-    if matches!(
-        manifest.notifications.wakeup_status,
-        HostNotificationWakeupStatus::InFlight | HostNotificationWakeupStatus::Unknown
-    ) {
+    if manifest.gates.supervisor_authenticated_ready || manifest.pid.is_some() {
         return Err(NativeError::new(
             NativeErrorCode::AmbiguousWakeupPendingReconciliation,
-            "host notification wakeup status is InFlight or Unknown",
+            "stopped or failed host manifest still reports supervisor readiness or a live pid",
         ));
     }
+    if manifest.phase == HostPhase::Failed && manifest.session_binding_id.is_none() {
+        return Err(NativeError::new(
+            NativeErrorCode::UnsupportedCapability,
+            "failed host session has no runtime session binding, so quiescence cannot be proven",
+        ));
+    }
+
+    let runtime_state_candidate = session_dir.join(RUNTIME_STATE_SUBDIR);
+    let runtime_state_dir = match fs::symlink_metadata(&runtime_state_candidate) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
+                return Err(NativeError::new(
+                    NativeErrorCode::SecurityViolation,
+                    "host runtime-state path must be a non-symlink private directory",
+                ));
+            }
+            Some(verify_existing_private_dir(&runtime_state_candidate).map_err(map_host_error)?)
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => {
+            return Err(NativeError::new(
+                NativeErrorCode::IoError,
+                format!(
+                    "cannot inspect host runtime-state directory metadata: {}",
+                    sanitize_diagnostic_text(&err.to_string())
+                ),
+            ))
+        }
+    };
+
     if let Some(ref sb) = manifest.session_binding_id {
+        let runtime_state_dir = runtime_state_dir.ok_or_else(|| {
+            NativeError::new(
+                NativeErrorCode::AmbiguousWakeupPendingReconciliation,
+                "host manifest records a runtime session binding but runtime-state is missing",
+            )
+        })?;
+        verify_stopped_runtime_quiescence(
+            &runtime_state_dir,
+            approval,
+            sb,
+            &manifest.phase,
+        )?;
         if let Some((pending_intents, receipts)) =
             read_session_task_ledger_recorded_history_readonly(session_dir, approval, sb)
                 .map_err(map_host_error)?
@@ -2781,6 +2878,281 @@ fn verify_stopped_host_session_contents(
                 }
             }
         }
+    } else {
+        match fs::symlink_metadata(session_dir.join("task-receipts.json")) {
+            Ok(_) => {
+                return Err(NativeError::new(
+                    NativeErrorCode::AmbiguousWakeupPendingReconciliation,
+                    "host task ledger exists without a recorded session_binding_id",
+                ))
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(NativeError::new(
+                    NativeErrorCode::IoError,
+                    format!(
+                        "cannot inspect host task ledger metadata: {}",
+                        sanitize_diagnostic_text(&err.to_string())
+                    ),
+                ))
+            }
+        }
+        if let Some(ref runtime_state_dir) = runtime_state_dir {
+            if runtime_state_database_present(runtime_state_dir)? {
+                return Err(NativeError::new(
+                    NativeErrorCode::AmbiguousWakeupPendingReconciliation,
+                    "host runtime database exists without a recorded session_binding_id",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn runtime_state_database_present(runtime_state_dir: &Path) -> Result<bool, NativeError> {
+    for filename in ["state.db", "state.db-wal", "state.db-shm"] {
+        match fs::symlink_metadata(runtime_state_dir.join(filename)) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+                    return Err(NativeError::new(
+                        NativeErrorCode::SecurityViolation,
+                        "host runtime database artifacts must be non-symlink regular files",
+                    ));
+                }
+                return Ok(true);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(NativeError::new(
+                    NativeErrorCode::IoError,
+                    format!(
+                        "cannot inspect host runtime database metadata: {}",
+                        sanitize_diagnostic_text(&err.to_string())
+                    ),
+                ))
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn verify_stopped_runtime_quiescence(
+    runtime_state_dir: &Path,
+    approval: &ApprovalRecord,
+    session_binding_id: &str,
+    phase: &HostPhase,
+) -> Result<(), NativeError> {
+    let supervisor_lock_path = runtime_state_dir.join("supervisor.lock");
+    if probe_existing_lockfile_busy_readonly(&supervisor_lock_path)? {
+        return Err(NativeError::new(
+            NativeErrorCode::AmbiguousWakeupPendingReconciliation,
+            "host supervisor.lock is still held; stopped runtime quiescence is not proven",
+        ));
+    }
+
+    let database_path = runtime_state_dir.join("state.db");
+    match fs::symlink_metadata(&database_path) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+                return Err(NativeError::new(
+                    NativeErrorCode::SecurityViolation,
+                    "host runtime state.db must be a non-symlink regular file",
+                ));
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Err(NativeError::new(
+                NativeErrorCode::AmbiguousWakeupPendingReconciliation,
+                "host runtime session is recorded but state.db is missing",
+            ))
+        }
+        Err(err) => {
+            return Err(NativeError::new(
+                NativeErrorCode::IoError,
+                format!(
+                    "cannot inspect host runtime state.db metadata: {}",
+                    sanitize_diagnostic_text(&err.to_string())
+                ),
+            ))
+        }
+    }
+
+    let snapshot = read_core_state_readonly(&database_path).map_err(map_observation_read_error)?;
+    verify_runtime_snapshot_scope(&snapshot, session_binding_id, &approval.thread_uuid)?;
+    verify_runtime_snapshot_terminal(&snapshot, phase, &approval.approval_id)?;
+    Ok(())
+}
+
+fn verify_runtime_snapshot_scope(
+    snapshot: &ReadonlyCoreStateSnapshot,
+    session_binding_id: &str,
+    thread_uuid: &str,
+) -> Result<(), NativeError> {
+    let matching_bindings: Vec<_> = snapshot
+        .bindings
+        .iter()
+        .filter(|binding| binding.binding_id == session_binding_id)
+        .collect();
+    if snapshot.bindings.len() != 1
+        || matching_bindings.len() != 1
+        || matching_bindings[0].thread_uuid != thread_uuid
+    {
+        return Err(NativeError::new(
+            NativeErrorCode::SecurityViolation,
+            "read-only host runtime bindings do not uniquely match the recorded session binding and approval thread",
+        ));
+    }
+
+    if snapshot
+        .runs
+        .iter()
+        .any(|run| run.binding_id != session_binding_id)
+        || snapshot
+            .workers
+            .iter()
+            .any(|worker| worker.binding_id != session_binding_id)
+    {
+        return Err(NativeError::new(
+            NativeErrorCode::SecurityViolation,
+            "read-only host runtime contains foreign run or worker records",
+        ));
+    }
+
+    let wakeups: Vec<_> = snapshot
+        .wakeups
+        .iter()
+        .filter(|wakeup| wakeup.binding_id == session_binding_id)
+        .collect();
+    if snapshot.wakeups.len() != 1
+        || wakeups.len() != 1
+        || wakeups[0].thread_uuid != thread_uuid
+    {
+        return Err(NativeError::new(
+            NativeErrorCode::SecurityViolation,
+            "read-only host runtime wake-up evidence does not uniquely match the recorded session binding and approval thread",
+        ));
+    }
+    Ok(())
+}
+
+fn verify_runtime_snapshot_terminal(
+    snapshot: &ReadonlyCoreStateSnapshot,
+    phase: &HostPhase,
+    approval_id: &str,
+) -> Result<(), NativeError> {
+    let wakeup = snapshot
+        .wakeups
+        .first()
+        .ok_or_else(|| {
+            NativeError::new(
+                NativeErrorCode::AmbiguousWakeupPendingReconciliation,
+                "read-only host runtime has no wake-up record",
+            )
+        })?;
+    match wakeup.status.as_str() {
+        "idle" | "failed" | "succeeded" | "satisfied_by_ack" => {}
+        "pending" | "in_flight" | "submitted" => {
+            return Err(NativeError::new(
+                NativeErrorCode::AmbiguousWakeupPendingReconciliation,
+                format!(
+                    "host notification wake-up state `{}` is not proven quiescent",
+                    wakeup.status
+                ),
+            ))
+        }
+        "unknown" => {
+            return Err(NativeError::new(
+                NativeErrorCode::AmbiguousWakeupPendingReconciliation,
+                "host notification wake-up state is Unknown and requires reconciliation",
+            ))
+        }
+        other => {
+            return Err(NativeError::new(
+                NativeErrorCode::ProtocolError,
+                format!(
+                    "unrecognized host notification wake-up state `{}` in runtime state.db",
+                    sanitize_diagnostic_text(other)
+                ),
+            ))
+        }
+    }
+
+    let mut run_ids = BTreeSet::new();
+    for run in &snapshot.runs {
+        run_ids.insert(run.run_id.as_str());
+        match run.status.as_str() {
+            "completed" | "failed" | "cancelled" | "timed_out" => {}
+            "unknown" => {
+                return Err(NativeError::new(
+                    NativeErrorCode::AmbiguousWakeupPendingReconciliation,
+                    "host runtime contains a run with Unknown status",
+                ))
+            }
+            "queued" | "claimed" | "running" | "waiting_input" | "completing"
+            | "cancel_requested" => {
+                return Err(invalid(
+                    "host runtime contains a non-terminal run; stopped quiescence is not proven",
+                ))
+            }
+            other => {
+                return Err(NativeError::new(
+                    NativeErrorCode::ProtocolError,
+                    format!(
+                        "unrecognized run status `{}` in host runtime state.db",
+                        sanitize_diagnostic_text(other)
+                    ),
+                ))
+            }
+        }
+    }
+
+    let mut worker_run_ids = BTreeSet::new();
+    for worker in &snapshot.workers {
+        if !run_ids.contains(worker.run_id.as_str()) {
+            return Err(NativeError::new(
+                NativeErrorCode::ProtocolError,
+                "host runtime worker references a missing or foreign run",
+            ));
+        }
+        if !worker_run_ids.insert(worker.run_id.as_str()) {
+            return Err(NativeError::new(
+                NativeErrorCode::ProtocolError,
+                "host runtime contains duplicate worker evidence for a run",
+            ));
+        }
+        match worker.status.as_str() {
+            "completed" | "failed" | "cancelled" | "timed_out" => {}
+            "unknown" => {
+                return Err(NativeError::new(
+                    NativeErrorCode::AmbiguousWakeupPendingReconciliation,
+                    "host runtime contains a worker with Unknown status",
+                ))
+            }
+            "queued" | "claimed" | "running" | "cancel_requested" => {
+                return Err(invalid(
+                    "host runtime contains a non-terminal worker; stopped quiescence is not proven",
+                ))
+            }
+            other => {
+                return Err(NativeError::new(
+                    NativeErrorCode::ProtocolError,
+                    format!(
+                        "unrecognized worker status `{}` in host runtime state.db",
+                        sanitize_diagnostic_text(other)
+                    ),
+                ))
+            }
+        }
+    }
+
+    if *phase == HostPhase::Failed {
+        return Err(NativeError::new(
+            NativeErrorCode::UnsupportedCapability,
+            format!(
+                "failed host session {} cannot prove clean termination solely from recorded runtime status",
+                sanitize_diagnostic_text(approval_id)
+            ),
+        ));
     }
     Ok(())
 }
@@ -2806,6 +3178,31 @@ fn probe_existing_lockfile_busy_readonly(lock_path: &Path) -> Result<bool, Nativ
             "probed lockfile must be a non-symlink regular file",
         ));
     }
+    if meta.len() != 0 {
+        return Err(NativeError::new(
+            NativeErrorCode::SecurityViolation,
+            "probed lockfile must be an empty zero-byte file",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let mode = meta.permissions().mode() & 0o777;
+        if (mode & 0o177) != 0 {
+            return Err(NativeError::new(
+                NativeErrorCode::SecurityViolation,
+                "probed lockfile permissions are too permissive (expected 0600 or stricter)",
+            ));
+        }
+        if let Ok(self_meta) = fs::metadata("/proc/self") {
+            if meta.uid() != self_meta.uid() {
+                return Err(NativeError::new(
+                    NativeErrorCode::SecurityViolation,
+                    "probed lockfile owner does not match the current process owner",
+                ));
+            }
+        }
+    }
     let file = File::open(&clean).map_err(|err| {
         NativeError::new(
             NativeErrorCode::IoError,
@@ -2822,6 +3219,15 @@ fn probe_existing_lockfile_busy_readonly(lock_path: &Path) -> Result<bool, Nativ
         }
         Err(_) => Ok(true),
     }
+}
+
+fn acquire_plan_store_lock(plans_dir: &Path) -> Result<CrossProcessLockGuard, NativeError> {
+    let clean = validate_absolute_no_symlink_components(plans_dir, "plans_dir")?;
+    acquire_cross_process_lock(
+        &clean,
+        PLAN_STORE_LOCK_FILENAME,
+        "external_resolution_plan_store_lock",
+    )
 }
 
 fn acquire_conversation_advancement_lock_sync(
@@ -3011,6 +3417,25 @@ fn map_authority_read_error(err: threadlane_authority::AuthorityError) -> Native
             "AuthorityStore reported an I/O error",
         ),
         code => invalid(&format!("AuthorityStore validation failed ({code})")),
+    }
+}
+
+fn map_observation_read_error(err: ObservationJournalError) -> NativeError {
+    match err {
+        ObservationJournalError::SecurityViolation(_) => NativeError::new(
+            NativeErrorCode::SecurityViolation,
+            "host runtime state.db failed read-only security validation",
+        ),
+        ObservationJournalError::JournalTooLarge
+        | ObservationJournalError::RecordTooLarge
+        | ObservationJournalError::Json(_) => NativeError::new(
+            NativeErrorCode::ProtocolError,
+            "host runtime state.db could not be read as bounded read-only evidence",
+        ),
+        ObservationJournalError::Io(_) => NativeError::new(
+            NativeErrorCode::AmbiguousWakeupPendingReconciliation,
+            "host runtime state.db changed or became unreadable during read-only verification",
+        ),
     }
 }
 
