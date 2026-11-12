@@ -1358,12 +1358,18 @@ fn revalidate_launch_executable(
     Ok(())
 }
 
+/// Borrowed observer invoked after each failed spawn attempt.
+type SpawnErrorObserver<'a> = &'a mut (dyn FnMut(u32, &std::io::Error) + Send + 'a);
+
+/// Borrowed observer invoked once with the constructed argv before the first spawn attempt.
+type LaunchSetupObserver<'a> = &'a mut (dyn FnMut(&[String]) + Send + 'a);
+
 async fn launch_with_bounded_etxtbsy_retry<S>(
     mut spawn: S,
     canonical_executable: &Path,
     cancel_rx: &mut watch::Receiver<bool>,
     overall_deadline: tokio::time::Instant,
-    mut on_spawn_error: Option<&mut (dyn FnMut(u32, &std::io::Error) + Send)>,
+    mut on_spawn_error: Option<SpawnErrorObserver<'_>>,
 ) -> LaunchAttemptOutcome
 where
     S: FnMut() -> std::io::Result<Child>,
@@ -1526,7 +1532,7 @@ async fn run_supervised_process_group_for_test<F>(
     cancel_rx: &mut watch::Receiver<bool>,
     progress_tx: Option<mpsc::Sender<NormalizedWorkerEvent>>,
     health_observer: Option<ProviderHealthObserver>,
-    on_launch_setup: Option<&mut (dyn FnMut(&[String]) + Send)>,
+    on_launch_setup: Option<LaunchSetupObserver<'_>>,
     on_spawn_error: &mut (dyn FnMut(u32, &std::io::Error) + Send),
 ) -> Result<(WorkerExecutionReport, Option<AdvisoryResponseCollector>), WorkerError>
 where
@@ -1553,8 +1559,8 @@ async fn run_supervised_process_group_with_launch_observer<F>(
     cancel_rx: &mut watch::Receiver<bool>,
     progress_tx: Option<mpsc::Sender<NormalizedWorkerEvent>>,
     health_observer: Option<ProviderHealthObserver>,
-    on_launch_setup: Option<&mut (dyn FnMut(&[String]) + Send)>,
-    on_spawn_error: Option<&mut (dyn FnMut(u32, &std::io::Error) + Send)>,
+    on_launch_setup: Option<LaunchSetupObserver<'_>>,
+    on_spawn_error: Option<SpawnErrorObserver<'_>>,
 ) -> Result<(WorkerExecutionReport, Option<AdvisoryResponseCollector>), WorkerError>
 where
     F: FnOnce(&str) -> Result<Vec<String>, WorkerError>,
