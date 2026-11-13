@@ -8,23 +8,31 @@
 //! pre-effect reservation, unresolved durable dispatch intent refusal without redispatch, and
 //! checked acceptance rejection with physical tamper refusal, stable rejected-result rereads,
 //! completion refusal, durable rejection replay, and a newer authorized attempt.
+//! The recovery cases drop an actual serialized `rmcp`/Tokio duplex start reply after the
+//! durable external effect and then reconnect through a new enrolled server. They also reopen
+//! the existing authority store to reconcile a result without consuming a native notice, and
+//! exercise negative result/completion attempts without state or host effects. The fixture still
+//! does not prove native MCP callback or notice delivery.
 //! Provider invocation counting uses the existing fake-provider ledger. These local fake-provider
 //! tests do not prove native callback delivery or production provider behavior.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use rmcp::ServiceExt;
 use serde_json::{json, Value};
 use threadlane_core::{
-    BacklogItem, BacklogStatus, WorkerBacklogAcceptanceRejectionReceipt, WorkerBacklogExecution,
-    WorkerBacklogOutcome,
+    BacklogHistoryAction, BacklogHistoryPage, BacklogItem, BacklogStatus,
+    WorkerBacklogAcceptanceRejectionReceipt, WorkerBacklogExecution, WorkerBacklogOutcome,
 };
 use threadlane_host::{
     record_task_dispatch_intent, ApprovedHost, ApprovedHostConfig, ApprovedHostHandle,
     TaskDispatchIntent, TaskExecutionStatus, TaskStateSnapshot,
 };
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use super::*;
 
@@ -80,6 +88,23 @@ fn live_mcp(fixture: &ApprovedMcpFixture) -> PairedMcpServer {
         .with_host_stores(Arc::clone(&fixture.authority), &fixture.sessions_dir)
 }
 
+async fn read_approved_task(
+    mcp: &PairedMcpServer,
+    approval_id: &str,
+    task_id: &str,
+) -> TaskStateSnapshot {
+    let response = mcp
+        .invoke_tool_json(
+            "approved_task",
+            json!({ "approval_id": approval_id, "task_id": task_id }),
+            None,
+        )
+        .await
+        .expect("read approved task");
+    serde_json::from_value(response.structured_content.unwrap()["data"].clone())
+        .expect("decode task snapshot")
+}
+
 async fn wait_for_terminal_task(
     mcp: &PairedMcpServer,
     approval_id: &str,
@@ -87,17 +112,7 @@ async fn wait_for_terminal_task(
 ) -> TaskStateSnapshot {
     let deadline = Instant::now() + Duration::from_secs(8);
     loop {
-        let response = mcp
-            .invoke_tool_json(
-                "approved_task",
-                json!({ "approval_id": approval_id, "task_id": task_id }),
-                None,
-            )
-            .await
-            .expect("read approved task");
-        let snapshot: TaskStateSnapshot =
-            serde_json::from_value(response.structured_content.unwrap()["data"].clone())
-                .expect("decode task snapshot");
+        let snapshot = read_approved_task(mcp, approval_id, task_id).await;
         if matches!(
             snapshot.status,
             TaskExecutionStatus::ReadyForReview
@@ -112,6 +127,143 @@ async fn wait_for_terminal_task(
             "test Worker did not reach a terminal status in time"
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+async fn get_history(mcp: &PairedMcpServer, item_id: &str) -> BacklogHistoryPage {
+    let response = mcp
+        .invoke_tool_json(
+            "backlog_history",
+            json!({ "item_id": item_id, "limit": 50 }),
+            None,
+        )
+        .await
+        .expect("read backlog history");
+    serde_json::from_value(response.structured_content.unwrap()["data"].clone())
+        .expect("decode backlog history page")
+}
+
+fn reopened_mcp(fixture: &ApprovedMcpFixture) -> PairedMcpServer {
+    let authority = Arc::new(
+        threadlane_authority::AuthorityStore::open(
+            &fixture.authority_dir,
+            Arc::clone(&fixture.registry),
+            Arc::clone(&fixture.plans),
+        )
+        .expect("reopen existing authority store"),
+    );
+    PairedMcpServer::new(&fixture.state_dir, fixture.pairing_store.clone())
+        .expect("create reopened MCP server")
+        .with_host_stores(authority, &fixture.sessions_dir)
+}
+
+async fn wait_for_invocation_count(path: &Path, expected: u32) {
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        if read_invocation_count(path) >= expected {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "test fake provider did not reach the expected invocation count in time"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+async fn wait_for_item_execution(mcp: &PairedMcpServer, item_id: &str) -> BacklogItem {
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        let item = get_item(mcp, item_id).await;
+        if item.current_execution_ref.is_some() {
+            return item;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "test Worker reservation did not become durable in time"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+async fn wait_for_item_revision_above(
+    mcp: &PairedMcpServer,
+    item_id: &str,
+    revision: u64,
+) -> BacklogItem {
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        let item = get_item(mcp, item_id).await;
+        if item.revision > revision {
+            return item;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "test Worker execution receipt did not become durable in time"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+async fn assert_worker_state_unchanged(
+    mcp: &PairedMcpServer,
+    item_id: &str,
+    expected_item: &BacklogItem,
+    expected_history: &BacklogHistoryPage,
+) {
+    let item = get_item(mcp, item_id).await;
+    assert_eq!(
+        item, *expected_item,
+        "a refused Worker operation must not mutate the backlog item"
+    );
+    let history = get_history(mcp, item_id).await;
+    assert_eq!(
+        history, *expected_history,
+        "a refused Worker operation must not append history or change the current reference"
+    );
+}
+
+async fn write_json_rpc_line<W>(writer: &mut W, message: &Value)
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let line = serde_json::to_string(message).expect("serialize JSON-RPC request");
+    writer
+        .write_all(line.as_bytes())
+        .await
+        .expect("write serialized JSON-RPC request");
+    writer
+        .write_all(b"\n")
+        .await
+        .expect("terminate serialized JSON-RPC request");
+    writer.flush().await.expect("flush serialized JSON-RPC");
+}
+
+async fn read_json_rpc_response<R>(reader: &mut BufReader<R>, expected_id: u64) -> Value
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "timed out waiting for serialized JSON-RPC response id {expected_id}"
+        );
+        let mut line = String::new();
+        let bytes = tokio::time::timeout(remaining, reader.read_line(&mut line))
+            .await
+            .expect("serialized JSON-RPC response read timed out")
+            .expect("read serialized JSON-RPC response");
+        assert!(
+            bytes != 0,
+            "paired MCP transport closed before JSON-RPC response id {expected_id}"
+        );
+        if let Ok(response) = serde_json::from_str::<Value>(&line) {
+            if response.get("id").and_then(Value::as_u64) == Some(expected_id) {
+                return response;
+            }
+        }
     }
 }
 
@@ -396,9 +548,10 @@ async fn guarded_worker_backlog_start_result_complete_duplicate_stopped_and_repl
     assert_eq!(get_item(&mcp, &item_id).await.status, BacklogStatus::Doing);
     assert_eq!(read_invocation_count(&fixture.agy_count_file), 1);
 
-    // Exact duplicate reuses the same reservation and invocation. This is also the lost
-    // start-response path: the durable current execution is reconciled, not the original
-    // reservation serialization returned by core replay.
+    // Exact duplicate reuses the same reservation and invocation in-process. This is not a
+    // transport-loss proof; the serialized reply-loss path is covered separately by the actual
+    // rmcp/Tokio duplex test below. Here the durable current execution is reconciled, not the
+    // original reservation serialization returned by core replay.
     let duplicate = mcp
         .invoke_tool_json("backlog_worker_start", start_params.clone(), None)
         .await
@@ -1553,6 +1706,743 @@ async fn guarded_worker_backlog_pre_effect_refusal_preserves_exact_reservation()
             .expect("resumed execution");
     assert_eq!(resumed.execution_ref, execution_ref);
     assert!(resumed.dispatch_receipt.is_some());
+    assert_eq!(read_invocation_count(&fixture.agy_count_file), 1);
+
+    host.shutdown().await.expect("stop fixture host");
+}
+
+#[tokio::test]
+async fn guarded_worker_backlog_lost_serialized_transport_start_reply_reconnects_without_redispatch(
+) {
+    let fixture = setup_approved_mcp_fixture().await;
+    let (plan_revision, plan_digest) = create_published_plan(
+        &fixture,
+        "plan-worker-backlog-lost-reply",
+        &fixture.binding_a,
+        default_plan_tasks("Guarded Worker backlog lost start reply"),
+    );
+    let approval = approve_published_plan(
+        &fixture,
+        "plan-worker-backlog-lost-reply",
+        plan_revision,
+        &plan_digest,
+        &fixture.binding_a,
+        THREAD_UUID_A,
+        vec!["task-root-agy".to_string()],
+        1_700_002_500_000,
+    );
+    let host = start_fixture_host(&fixture, &approval.approval_id).await;
+    let mcp = live_mcp(&fixture);
+    enroll_server(&fixture, &mcp, &fixture.binding_a, THREAD_UUID_A).await;
+    let (item_id, revision) =
+        create_worker_item(&mcp, "create-lost-reply", "Lost start reply Worker item").await;
+    let start_params = json!({
+        "item_id": item_id,
+        "expected_revision": revision,
+        "command_key": "start-lost-reply",
+        "approval_id": approval.approval_id,
+        "task_id": "task-root-agy"
+    });
+    let original_epoch = mcp.epoch_id().to_string();
+
+    // Run the start request over the actual paired MCP server transport. The client side is an
+    // in-memory Tokio duplex split into rmcp reader/writer halves, so the request and response are
+    // really serialized JSON-RPC rather than an in-process tool-call result.
+    let transport_server = mcp.clone();
+    let (server_endpoint, client_endpoint) = tokio::io::duplex(64 * 1024);
+    let (server_read, server_write) = tokio::io::split(server_endpoint);
+    let server_task = tokio::spawn(async move {
+        match transport_server.serve((server_read, server_write)).await {
+            Ok(running) => {
+                let _ = running.waiting().await;
+            }
+            Err(err) => panic!("initialize paired MCP test transport: {err}"),
+        }
+    });
+    let (client_read, mut client_write) = tokio::io::split(client_endpoint);
+    let mut client_reader = BufReader::new(client_read);
+
+    write_json_rpc_line(
+        &mut client_write,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2026-07-28",
+                "capabilities": {},
+                "clientInfo": {"name": "threadlane-backlog-test", "version": "0.1.0"}
+            }
+        }),
+    )
+    .await;
+    let initialized = read_json_rpc_response(&mut client_reader, 1).await;
+    assert_eq!(initialized["result"]["protocolVersion"], "2025-11-25");
+    write_json_rpc_line(
+        &mut client_write,
+        &json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+    )
+    .await;
+
+    write_json_rpc_line(
+        &mut client_write,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "backlog_worker_start",
+                "arguments": start_params.clone()
+            }
+        }),
+    )
+    .await;
+
+    // Remove the only client reader before waiting for the effect. The server can still consume
+    // the already-sent request through the open write half, but the serialized start response can
+    // never be read by this connection.
+    drop(client_reader);
+
+    // Wait for the real provider effect and the durable dispatch receipt without a readable reply.
+    wait_for_invocation_count(&fixture.agy_count_file, 1).await;
+    let reserved = wait_for_item_execution(&mcp, &item_id).await;
+    assert_eq!(reserved.status, BacklogStatus::Doing);
+    let original_execution_ref = reserved
+        .current_execution_ref
+        .clone()
+        .expect("original Worker execution reference");
+    // The original create revision is known before dispatch: reservation is `revision + 1` and
+    // receipt attachment is `revision + 2`. Wait for that actual attach revision instead of the
+    // revision of the item read above, which may already be the attached revision and cannot
+    // advance again before the outcome is reconciled.
+    let attached = wait_for_item_revision_above(&mcp, &item_id, revision + 1).await;
+    assert_eq!(
+        attached.current_execution_ref.as_deref(),
+        Some(original_execution_ref.as_str())
+    );
+    let attached_history = get_history(&mcp, &item_id).await;
+    assert_eq!(
+        attached_history
+            .entries
+            .iter()
+            .filter(|entry| entry.action == BacklogHistoryAction::WorkerReserved)
+            .count(),
+        1
+    );
+    assert_eq!(
+        attached_history
+            .entries
+            .iter()
+            .filter(|entry| entry.action == BacklogHistoryAction::WorkerExecutionAttached)
+            .count(),
+        1
+    );
+    assert_eq!(
+        attached_history
+            .entries
+            .iter()
+            .filter(|entry| entry.action == BacklogHistoryAction::WorkerOutcomeRecorded)
+            .count(),
+        0
+    );
+    assert_eq!(read_invocation_count(&fixture.agy_count_file), 1);
+
+    // Close the remaining actual transport half without ever reading response id 2. This is a
+    // lost serialized start reply after the effect, not a helper result the caller merely ignored.
+    drop(client_write);
+    server_task.abort();
+    let _ = server_task.await;
+    drop(mcp);
+
+    // Reconnect through a new PairedMcpServer epoch and re-enroll the same verified chat scope.
+    let reconnected = live_mcp(&fixture);
+    assert_ne!(reconnected.epoch_id(), original_epoch.as_str());
+    enroll_server(&fixture, &reconnected, &fixture.binding_a, THREAD_UUID_A).await;
+    let item_before_replay = get_item(&reconnected, &item_id).await;
+    assert_eq!(item_before_replay.revision, attached.revision);
+    assert_eq!(
+        item_before_replay.current_execution_ref.as_deref(),
+        Some(original_execution_ref.as_str())
+    );
+
+    let terminal =
+        wait_for_terminal_task(&reconnected, &approval.approval_id, "task-root-agy").await;
+    assert_eq!(terminal.status, TaskExecutionStatus::ReadyForReview);
+
+    // The exact original item/approval/task/command-key replay reconciles the durable execution
+    // and receipt without another dispatch or another durable revision.
+    let replayed_start = reconnected
+        .invoke_tool_json("backlog_worker_start", start_params.clone(), None)
+        .await
+        .expect("replay the original start after transport reply loss");
+    let replayed_execution: WorkerBacklogExecution = serde_json::from_value(
+        replayed_start
+            .structured_content
+            .expect("replayed start data")["data"]["execution"]
+            .clone(),
+    )
+    .expect("decode replayed start execution");
+    assert_eq!(
+        replayed_execution.execution_ref, original_execution_ref,
+        "reconnect must preserve the original execution reference"
+    );
+    let replayed_receipt = replayed_execution
+        .dispatch_receipt
+        .as_ref()
+        .expect("reconnect must reuse the original durable dispatch receipt");
+    assert_eq!(
+        terminal.run_id.as_deref(),
+        Some(replayed_receipt.run_id.as_str())
+    );
+    assert_eq!(
+        terminal.worker_id.as_deref(),
+        Some(replayed_receipt.worker_id.as_str())
+    );
+    assert!(replayed_execution.outcome.is_none());
+    let item_after_replay = get_item(&reconnected, &item_id).await;
+    assert_eq!(item_after_replay.status, BacklogStatus::Doing);
+    assert_eq!(item_after_replay.revision, item_before_replay.revision);
+    assert_eq!(
+        item_after_replay.current_execution_ref.as_deref(),
+        Some(original_execution_ref.as_str())
+    );
+    assert_eq!(read_invocation_count(&fixture.agy_count_file), 1);
+
+    let result = reconnected
+        .invoke_tool_json(
+            "backlog_worker_result",
+            json!({
+                "item_id": item_id,
+                "execution_ref": original_execution_ref
+            }),
+            None,
+        )
+        .await
+        .expect("reconcile the original Worker result after reconnect");
+    let result_data = result.structured_content.expect("result data")["data"].clone();
+    let executed: WorkerBacklogExecution =
+        serde_json::from_value(result_data["execution"].clone()).expect("decode result execution");
+    let outcome = executed.outcome.as_ref().expect("successful outcome");
+    assert_eq!(outcome.outcome, WorkerBacklogOutcome::Success);
+    let result_digest = outcome
+        .result_digest
+        .clone()
+        .expect("successful result digest");
+    let delivery = result_data["delivery"]
+        .as_object()
+        .expect("path-free delivery inspection");
+    let delivery_digest = delivery["delivery_digest"]
+        .as_str()
+        .expect("delivery digest")
+        .to_string();
+    let item_after_result = get_item(&reconnected, &item_id).await;
+    assert_eq!(item_after_result.status, BacklogStatus::Doing);
+    assert_eq!(item_after_result.revision, item_before_replay.revision + 1);
+    assert_eq!(
+        item_after_result.current_execution_ref.as_deref(),
+        Some(original_execution_ref.as_str())
+    );
+
+    let completed = reconnected
+        .invoke_tool_json(
+            "backlog_worker_complete",
+            json!({
+                "item_id": item_id,
+                "execution_ref": original_execution_ref,
+                "command_key": "complete-after-lost-reply",
+                "expected_revision": item_after_result.revision,
+                "expected_result_digest": result_digest,
+                "expected_delivery_digest": delivery_digest,
+                "acceptance_note": "Accepted the original recovered Worker delivery.",
+                "acceptance_evidence": "Reconciled the original execution, receipt, result, and delivery digests."
+            }),
+            None,
+        )
+        .await
+        .expect("complete the original Worker execution after reconnect");
+    let completed_data = completed.structured_content.expect("completion data")["data"].clone();
+    assert_eq!(completed_data["completion"]["item"]["status"], "done");
+    assert_eq!(
+        completed_data["completion"]["execution"]["execution_ref"],
+        original_execution_ref
+    );
+    let item_after_complete = get_item(&reconnected, &item_id).await;
+    assert_eq!(item_after_complete.status, BacklogStatus::Done);
+    assert_eq!(item_after_complete.revision, item_after_result.revision + 1);
+    assert_eq!(
+        item_after_complete.current_execution_ref.as_deref(),
+        Some(original_execution_ref.as_str())
+    );
+    assert_eq!(read_invocation_count(&fixture.agy_count_file), 1);
+
+    let final_history = get_history(&reconnected, &item_id).await;
+    assert_eq!(
+        final_history
+            .entries
+            .iter()
+            .filter(|entry| entry.action == BacklogHistoryAction::WorkerReserved)
+            .count(),
+        1
+    );
+    assert_eq!(
+        final_history
+            .entries
+            .iter()
+            .filter(|entry| entry.action == BacklogHistoryAction::WorkerExecutionAttached)
+            .count(),
+        1
+    );
+    assert_eq!(
+        final_history
+            .entries
+            .iter()
+            .filter(|entry| entry.action == BacklogHistoryAction::WorkerOutcomeRecorded)
+            .count(),
+        1
+    );
+    assert_eq!(
+        final_history
+            .entries
+            .iter()
+            .filter(|entry| entry.action == BacklogHistoryAction::Completed)
+            .count(),
+        1
+    );
+
+    host.shutdown().await.expect("stop fixture host");
+}
+
+#[tokio::test]
+async fn guarded_worker_backlog_missed_notice_recovery_reopens_authority_and_completes() {
+    let fixture = setup_approved_mcp_fixture().await;
+    let (plan_revision, plan_digest) = create_published_plan(
+        &fixture,
+        "plan-worker-backlog-missed-notice",
+        &fixture.binding_a,
+        default_plan_tasks("Guarded Worker backlog missed notice"),
+    );
+    let approval = approve_published_plan(
+        &fixture,
+        "plan-worker-backlog-missed-notice",
+        plan_revision,
+        &plan_digest,
+        &fixture.binding_a,
+        THREAD_UUID_A,
+        vec!["task-root-agy".to_string()],
+        1_700_002_600_000,
+    );
+    let host = start_fixture_host(&fixture, &approval.approval_id).await;
+    let mcp = live_mcp(&fixture);
+    enroll_server(&fixture, &mcp, &fixture.binding_a, THREAD_UUID_A).await;
+    let (item_id, revision) =
+        create_worker_item(&mcp, "create-missed-notice", "Missed notice Worker item").await;
+
+    let start = mcp
+        .invoke_tool_json(
+            "backlog_worker_start",
+            json!({
+                "item_id": item_id,
+                "expected_revision": revision,
+                "command_key": "start-missed-notice",
+                "approval_id": approval.approval_id,
+                "task_id": "task-root-agy"
+            }),
+            None,
+        )
+        .await
+        .expect("start Worker without native notice delivery");
+    let execution: WorkerBacklogExecution =
+        serde_json::from_value(start.structured_content.unwrap()["data"]["execution"].clone())
+            .expect("decode missed-notice execution");
+
+    let terminal = wait_for_terminal_task(&mcp, &approval.approval_id, "task-root-agy").await;
+    assert_eq!(terminal.status, TaskExecutionStatus::ReadyForReview);
+    // Native notices stay disabled on this fixture, and no approved event batch is pulled or
+    // acknowledged. The terminal result is still durable before the host is stopped.
+    assert_eq!(
+        event_batch_row_count(&fixture.state_dir, &fixture.binding_a),
+        0,
+        "missed-notice recovery must not depend on consuming a native event batch"
+    );
+
+    host.shutdown().await.expect("stop fixture host");
+    drop(mcp);
+
+    // Replace the paired server with a fresh epoch over a real reopened authority store.
+    let reopened = reopened_mcp(&fixture);
+    enroll_server(&fixture, &reopened, &fixture.binding_a, THREAD_UUID_A).await;
+    let item_before_result = get_item(&reopened, &item_id).await;
+    assert_eq!(item_before_result.status, BacklogStatus::Doing);
+    assert_eq!(
+        item_before_result.current_execution_ref.as_deref(),
+        Some(execution.execution_ref.as_str())
+    );
+    let history_before_result = get_history(&reopened, &item_id).await;
+
+    let result = reopened
+        .invoke_tool_json(
+            "backlog_worker_result",
+            json!({
+                "item_id": item_id,
+                "execution_ref": execution.execution_ref
+            }),
+            None,
+        )
+        .await
+        .expect("reconcile persisted terminal result after the notice was missed");
+    let result_data = result.structured_content.expect("result data")["data"].clone();
+    let executed: WorkerBacklogExecution =
+        serde_json::from_value(result_data["execution"].clone()).expect("decode result execution");
+    let outcome = executed.outcome.as_ref().expect("successful outcome");
+    assert_eq!(outcome.outcome, WorkerBacklogOutcome::Success);
+    let result_digest = outcome
+        .result_digest
+        .clone()
+        .expect("successful result digest");
+    let delivery = result_data["delivery"]
+        .as_object()
+        .expect("path-free delivery inspection");
+    let delivery_digest = delivery["delivery_digest"]
+        .as_str()
+        .expect("delivery digest")
+        .to_string();
+    let item_after_result = get_item(&reopened, &item_id).await;
+    assert_eq!(item_after_result.status, BacklogStatus::Doing);
+    assert_eq!(
+        item_after_result.current_execution_ref.as_deref(),
+        Some(execution.execution_ref.as_str())
+    );
+    assert_eq!(item_after_result.revision, item_before_result.revision + 1);
+    let history_after_result = get_history(&reopened, &item_id).await;
+    assert_eq!(
+        history_after_result.entries.len(),
+        history_before_result.entries.len() + 1,
+        "result reconciliation must append exactly one outcome history entry"
+    );
+    assert_eq!(
+        history_after_result
+            .entries
+            .iter()
+            .filter(|entry| entry.action == BacklogHistoryAction::WorkerReserved)
+            .count(),
+        1
+    );
+    assert_eq!(
+        history_after_result
+            .entries
+            .iter()
+            .filter(|entry| entry.action == BacklogHistoryAction::WorkerExecutionAttached)
+            .count(),
+        1
+    );
+    assert_eq!(
+        history_after_result
+            .entries
+            .iter()
+            .filter(|entry| entry.action == BacklogHistoryAction::WorkerOutcomeRecorded)
+            .count(),
+        1
+    );
+
+    let completed = reopened
+        .invoke_tool_json(
+            "backlog_worker_complete",
+            json!({
+                "item_id": item_id,
+                "execution_ref": execution.execution_ref,
+                "command_key": "complete-missed-notice",
+                "expected_revision": item_after_result.revision,
+                "expected_result_digest": result_digest,
+                "expected_delivery_digest": delivery_digest,
+                "acceptance_note": "Accepted the recovered terminal Worker delivery.",
+                "acceptance_evidence": "Reopened durable authority, result, and delivery evidence."
+            }),
+            None,
+        )
+        .await
+        .expect("complete recovered Worker delivery");
+    let completed_data = completed.structured_content.expect("completion data")["data"].clone();
+    assert_eq!(completed_data["completion"]["item"]["status"], "done");
+    let item_after_complete = get_item(&reopened, &item_id).await;
+    assert_eq!(item_after_complete.status, BacklogStatus::Done);
+    assert_eq!(item_after_complete.revision, item_after_result.revision + 1);
+    assert_eq!(
+        item_after_complete.current_execution_ref.as_deref(),
+        Some(execution.execution_ref.as_str())
+    );
+    assert_eq!(read_invocation_count(&fixture.agy_count_file), 1);
+
+    let history_after_complete = get_history(&reopened, &item_id).await;
+    assert_eq!(
+        history_after_complete
+            .entries
+            .iter()
+            .filter(|entry| entry.action == BacklogHistoryAction::WorkerReserved)
+            .count(),
+        1
+    );
+    assert_eq!(
+        history_after_complete
+            .entries
+            .iter()
+            .filter(|entry| entry.action == BacklogHistoryAction::WorkerExecutionAttached)
+            .count(),
+        1
+    );
+    assert_eq!(
+        history_after_complete
+            .entries
+            .iter()
+            .filter(|entry| entry.action == BacklogHistoryAction::WorkerOutcomeRecorded)
+            .count(),
+        1
+    );
+    assert_eq!(
+        history_after_complete
+            .entries
+            .iter()
+            .filter(|entry| entry.action == BacklogHistoryAction::Completed)
+            .count(),
+        1
+    );
+
+    // A durable result reread after completion stays immutable and never dispatches again.
+    let reread = reopened
+        .invoke_tool_json(
+            "backlog_worker_result",
+            json!({
+                "item_id": item_id,
+                "execution_ref": execution.execution_ref
+            }),
+            None,
+        )
+        .await
+        .expect("reread completed Worker result");
+    let reread_execution: WorkerBacklogExecution =
+        serde_json::from_value(reread.structured_content.unwrap()["data"]["execution"].clone())
+            .expect("decode reread execution");
+    assert_eq!(
+        reread_execution
+            .outcome
+            .as_ref()
+            .map(|outcome| outcome.outcome),
+        Some(WorkerBacklogOutcome::Success)
+    );
+    assert!(reread_execution.completion.is_some());
+    assert_eq!(
+        get_item(&reopened, &item_id).await.revision,
+        item_after_complete.revision
+    );
+    assert_eq!(read_invocation_count(&fixture.agy_count_file), 1);
+    assert_eq!(
+        event_batch_row_count(&fixture.state_dir, &fixture.binding_a),
+        0,
+        "recovery must still not require pulling or acknowledging a native event batch"
+    );
+}
+
+#[tokio::test]
+async fn guarded_worker_backlog_negative_result_and_complete_matrix_preserves_state() {
+    let fixture = setup_approved_mcp_fixture().await;
+    let (plan_revision, plan_digest) = create_published_plan(
+        &fixture,
+        "plan-worker-backlog-negative-matrix",
+        &fixture.binding_a,
+        default_plan_tasks("Guarded Worker backlog negative matrix"),
+    );
+    let approval = approve_published_plan(
+        &fixture,
+        "plan-worker-backlog-negative-matrix",
+        plan_revision,
+        &plan_digest,
+        &fixture.binding_a,
+        THREAD_UUID_A,
+        vec!["task-root-agy".to_string()],
+        1_700_002_700_000,
+    );
+    let host = start_fixture_host(&fixture, &approval.approval_id).await;
+    let mcp = live_mcp(&fixture);
+    enroll_server(&fixture, &mcp, &fixture.binding_a, THREAD_UUID_A).await;
+    let other_mcp = live_mcp(&fixture);
+    enroll_server(&fixture, &other_mcp, &fixture.binding_b, THREAD_UUID_B).await;
+    let (item_id, revision) = create_worker_item(
+        &mcp,
+        "create-negative-matrix",
+        "Negative matrix Worker item",
+    )
+    .await;
+
+    let start = mcp
+        .invoke_tool_json(
+            "backlog_worker_start",
+            json!({
+                "item_id": item_id,
+                "expected_revision": revision,
+                "command_key": "start-negative-matrix",
+                "approval_id": approval.approval_id,
+                "task_id": "task-root-agy"
+            }),
+            None,
+        )
+        .await
+        .expect("start Worker for negative matrix");
+    let execution: WorkerBacklogExecution =
+        serde_json::from_value(start.structured_content.unwrap()["data"]["execution"].clone())
+            .expect("decode negative-matrix execution");
+
+    let terminal = wait_for_terminal_task(&mcp, &approval.approval_id, "task-root-agy").await;
+    assert_eq!(terminal.status, TaskExecutionStatus::ReadyForReview);
+    let result = mcp
+        .invoke_tool_json(
+            "backlog_worker_result",
+            json!({
+                "item_id": item_id,
+                "execution_ref": execution.execution_ref
+            }),
+            None,
+        )
+        .await
+        .expect("record successful result before negative matrix");
+    let result_data = result.structured_content.expect("result data")["data"].clone();
+    let executed: WorkerBacklogExecution =
+        serde_json::from_value(result_data["execution"].clone()).expect("decode result execution");
+    let outcome = executed.outcome.as_ref().expect("successful outcome");
+    assert_eq!(outcome.outcome, WorkerBacklogOutcome::Success);
+    let result_digest = outcome
+        .result_digest
+        .clone()
+        .expect("successful result digest");
+    let delivery = result_data["delivery"]
+        .as_object()
+        .expect("path-free delivery inspection");
+    let delivery_digest = delivery["delivery_digest"]
+        .as_str()
+        .expect("delivery digest")
+        .to_string();
+
+    let item_before = get_item(&mcp, &item_id).await;
+    let history_before = get_history(&mcp, &item_id).await;
+    let host_before = read_approved_task(&mcp, &approval.approval_id, "task-root-agy").await;
+    assert_eq!(host_before.status, TaskExecutionStatus::ReadyForReview);
+
+    let complete_params = json!({
+        "item_id": item_id,
+        "execution_ref": execution.execution_ref,
+        "command_key": "complete-negative-matrix",
+        "expected_revision": item_before.revision,
+        "expected_result_digest": result_digest,
+        "expected_delivery_digest": delivery_digest,
+        "acceptance_note": "Negative matrix must not complete.",
+        "acceptance_evidence": "Each refused request must leave durable state unchanged."
+    });
+
+    let foreign_result = json!({
+        "item_id": item_id,
+        "execution_ref": execution.execution_ref
+    });
+    let mut wrong_ref_result = foreign_result.clone();
+    wrong_ref_result["execution_ref"] = json!("wbe_missing_negative_result");
+    let mut wrong_ref_complete = complete_params.clone();
+    wrong_ref_complete["execution_ref"] = json!("wbe_missing_negative_complete");
+    let mut stale_complete = complete_params.clone();
+    stale_complete["expected_revision"] = json!(item_before.revision + 1);
+    let mut changed_result = complete_params.clone();
+    changed_result["expected_result_digest"] = json!("f".repeat(64));
+    let mut changed_delivery = complete_params.clone();
+    changed_delivery["expected_delivery_digest"] = json!("f".repeat(64));
+    let ordinary_worker_success_shortcut = json!({
+        "command_key": "ordinary-complete-negative-matrix",
+        "item_id": item_id,
+        "expected_revision": item_before.revision,
+        "note": "Ordinary Coworker success shortcut.",
+        "evidence": "Worker completion must remain guarded."
+    });
+
+    for (label, server, tool, params, expected_code) in [
+        (
+            "foreign enrolled chat result",
+            &other_mcp,
+            "backlog_worker_result",
+            foreign_result,
+            "validation_failed",
+        ),
+        (
+            "foreign enrolled chat complete",
+            &other_mcp,
+            "backlog_worker_complete",
+            complete_params.clone(),
+            "validation_failed",
+        ),
+        (
+            "wrong result execution reference",
+            &mcp,
+            "backlog_worker_result",
+            wrong_ref_result,
+            "validation_failed",
+        ),
+        (
+            "wrong complete execution reference",
+            &mcp,
+            "backlog_worker_complete",
+            wrong_ref_complete,
+            "validation_failed",
+        ),
+        (
+            "stale complete revision",
+            &mcp,
+            "backlog_worker_complete",
+            stale_complete,
+            "stale_revision",
+        ),
+        (
+            "changed result digest",
+            &mcp,
+            "backlog_worker_complete",
+            changed_result,
+            "result_digest_mismatch",
+        ),
+        (
+            "changed delivery digest",
+            &mcp,
+            "backlog_worker_complete",
+            changed_delivery,
+            "delivery_digest_mismatch",
+        ),
+        (
+            "ordinary Worker success shortcut",
+            &mcp,
+            "backlog_complete",
+            ordinary_worker_success_shortcut,
+            "validation_failed",
+        ),
+    ] {
+        let err = server
+            .invoke_tool_json(tool, params, None)
+            .await
+            .expect_err("negative matrix operation must be refused");
+        assert_eq!(
+            err.structured_content
+                .expect("negative matrix error payload")["error"]["code"],
+            expected_code,
+            "{label} returned the wrong refusal"
+        );
+        assert_worker_state_unchanged(&mcp, &item_id, &item_before, &history_before).await;
+        assert_eq!(
+            read_invocation_count(&fixture.agy_count_file),
+            1,
+            "{label} must not invoke the fake provider again"
+        );
+    }
+
+    let host_after = read_approved_task(&mcp, &approval.approval_id, "task-root-agy").await;
+    assert_eq!(host_after.status, host_before.status);
+    assert_eq!(host_after.run_id, host_before.run_id);
+    assert_eq!(host_after.worker_id, host_before.worker_id);
+    assert_eq!(
+        host_after.worker.as_ref().map(|worker| worker.revision),
+        host_before.worker.as_ref().map(|worker| worker.revision),
+        "refused result/completion requests must not mutate the host worker"
+    );
     assert_eq!(read_invocation_count(&fixture.agy_count_file), 1);
 
     host.shutdown().await.expect("stop fixture host");

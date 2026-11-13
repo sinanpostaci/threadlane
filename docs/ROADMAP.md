@@ -24,14 +24,20 @@ in [First personal MVP acceptance](MVP-READINESS.md). Older checkpoint, pilot,
 and multi-role sections below describe their original evidence only; they are
 not new evidence for the 2026-11-13 contract.
 
-The combined checkout now contains a source-level foundation for this contract:
-additive core backlog storage, paired MCP backlog tools, and the guarded Worker
-reservation/result/completion facade. This is not full-product delivery. The
-desktop conversation stream and backlog drawer, liveness and `NeedsYou`
-derivation, live provider/native-callback acceptance, final Nix packaging,
-integrated formatting/Clippy/test validation, and the package-closing review
-remain pending. Only the parent records integrated test evidence; source presence
-is not acceptance.
+The combined checkout now contains the core backlog, paired MCP tools, guarded
+Worker result/acceptance/rejection, and the desktop chat stream with a backlog
+drawer. Fresh native activity and verified Worker presence drive live indicators;
+backlog state does not manufacture human attention. The read-only presence route
+avoids store initialization and write-lock waits, with bounded desktop acquisition.
+Parent validation includes 130 core tests, 63 host regressions, 188 desktop tests
+(one pre-existing manual test excluded), 36 frontend test files, type checking,
+frontend build, and focused Clippy checks. Wide/narrow production-component
+rendering through test-only IPC also verified the light/dark drawer correction.
+
+This is not full-product delivery. Expanded native recovery tests passed, while
+the complete browser gate, real fresh-chat projection, same-final-artifact parallel execution,
+Nix packages, isolated NixOS application acceptance, and the package-closing
+review remain open. See the current contract for qualification boundaries.
 
 The user stays in the native Codex conversation, including frequent Steer and
 questions. Codex interprets intent and plans. Threadlane owns validated execution,

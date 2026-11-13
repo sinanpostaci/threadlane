@@ -6,7 +6,7 @@ full product is not delivered.**
 
 This is the current product contract. It supersedes conflicting historical
 multi-role requirements while retaining their original evidence. The combined
-checkout passed 161 native library tests, focused core and real HTTP operator
+checkout passed 164 native library tests, focused core and real HTTP operator
 tests, formatting, and Clippy for the guarded delivery path. Two isolated real
 one-Worker checks passed: an idle native callback and a callback handled inside
 an already active native turn. In both, the actual Coworker read the result,
@@ -14,8 +14,10 @@ independently inspected delivery, recorded durable `Done`, and acknowledged the
 actual event batch without environment repair. Those proofs use a frozen earlier
 bundle, not the final UI/rejection candidate.
 
-Desktop integration, final same-artifact parallel acceptance, Nix packaging,
-isolated NixOS application acceptance, and the package-closing review remain open.
+The desktop stream, drawer, scoped backlog projection, and bounded read-only
+Worker presence are integrated. Final browser/native recovery gates, real
+fresh-chat projection, same-artifact parallel acceptance, Nix packaging, isolated
+NixOS application acceptance, and the package-closing review remain open.
 Source presence and these narrow proofs do not establish full MVP delivery.
 
 ## Human-approved direction
@@ -282,39 +284,59 @@ independently checked physical delivery, blocks the item, and leaves the
 successful technical outcome immutable. It reuses the existing runner and
 authority rather than creating a second execution model.
 
-The combined guarded facade passed seven focused tests and all 161 native
+The combined guarded facade passed ten focused tests and all 164 native
 library regressions; Clippy passed. Tests cover exact rejection and receipt
 replay, changed or missing physical delivery, stale revisions, acceptance
-refusal after rejection, and preservation of a newer authorized attempt.
+refusal after rejection, and preservation of a newer authorized attempt. The
+expanded fake-provider tests also discard an actual serialized MCP start reply,
+reconnect through a new enrolled server, and verify the same receipt with one
+provider invocation. Missed-notice recovery reads the retained result after a
+clean host stop and authority reopen, checks delivery, and records Done. Negative
+result/completion requests leave item, history, and host state unchanged. These
+fixtures do not themselves prove live native callback delivery.
 
-### MCP, stream/drawer, liveness, and live acceptance (partial delivery)
+### Desktop stream and read-only liveness (integrated, final acceptance open)
 
-The paired backlog and guarded Worker tools exist. Two isolated live one-Worker
-proofs passed on an earlier frozen bundle: idle and busy-turn callbacks, physical
-Coworker delivery inspection, durable `Done`, and real event ACK. The desktop
-stream/drawer, liveness, `NeedsYou`, independent parallel work on the final
-artifact, and installed-package acceptance remain open.
+Ordinary Projects chats render one bottom-growing durable event stream and a
+read-only Todo/Doing/Done/Blocked drawer. Current scope uses the complete source,
+binding, thread, and canonical-project identity. The reader anchor survives event
+head trimming and reflow; Working expires using original sample timestamps.
+Backlog failures and awaiting checks do not create a human request.
 
-## What this source-level foundation does not deliver
+Desktop host presence uses the static read-only authority/session route without
+initializing stores or acquiring write locks. Acquisition retains at most 64
+candidates before scheduling, runs at most eight calls concurrently, uses per-call
+and overall deadlines, cancels pending work, and retains completed results.
 
-- No desktop conversation-stream or backlog-drawer implementation.
-- No verified liveness projection or `NeedsYou` derivation from actual open
-  human requests.
-- No broad verified live provider execution, independent parallel behavior,
-  native callback delivery beyond the two narrow parent proofs, or
-  installed-package acceptance.
-- No final Nix packaging, cross-platform support, or release qualification.
-- No full MVP claim, no package-closing review, and no test evidence recorded by
-  this document.
-- No schema-version bump, broad migration, or recovery-behavior change. The new
-  tables are created idempotently by the existing sole-owner `Core` on open, so
-  older bindings, runs, workers, events, approvals, and historical state remain
-  compatible.
+At the integrated UI checkpoint, parent-run checks passed 130 core tests, 63 host
+regressions, 188 desktop tests, and 36 frontend test files. One pre-existing manual
+Codex navigation test was excluded. Type checking, frontend build, and focused
+Clippy checks passed. Production React components rendered through test-only
+Tauri IPC at wide and narrow sizes without page errors or document overflow.
+Drawer title contrast was measured above 13:1 in both light and dark themes after
+the portal-local token correction. These checks do not prove real native IPC in
+a NixOS guest or qualify every browser interaction.
+
+### Live acceptance and remaining qualification
+
+Two earlier frozen-bundle one-Worker proofs passed: idle and busy-turn callbacks,
+physical Coworker delivery inspection, durable `Done`, and real event ACK. They
+do not qualify the final UI/rejection bundle. Expanded native recovery tests passed;
+the final browser suite is still being integrated and validated. Actual paired
+fresh-chat projection, independent parallel execution on the final artifact,
+Nix packaging, isolated NixOS application acceptance, and the one package-closing
+review remain required.
+
+No full MVP delivery, installed-package, or unsupported-platform claim is made.
+The additive tables still use the existing sole-owner Core initialization without
+a broad schema migration; older stored bindings and historical state remain
+compatible. Historical pilots retain only their original scope.
 
 ## Open acceptance gates
 
 Source presence alone satisfies none of these gates. The parent records
-integrated test evidence; the boxes remain open.
+integrated test evidence; completed source work is distinct from the remaining
+combined-artifact and live acceptance gates.
 
 - [ ] Parent-run `cargo fmt` check, focused core/MCP/facade tests, and Clippy
       pass against the combined checkout and its own target directory.
@@ -322,8 +344,8 @@ integrated test evidence; the boxes remain open.
       exact-success rejection, immutable success preservation, preserved
       rejection on reread, fresh-authority retry, and unknown-outcome recovery
       pass focused tests.
-- [ ] Desktop bottom-growing stream and backlog drawer are implemented and
-      reviewed.
+- [x] Desktop bottom-growing stream and backlog drawer are implemented and
+      reviewed; final combined browser/application acceptance remains separate.
 - [ ] `NeedsYou` derives only from real open human requests, not from `Blocked`
       or awaiting-review states.
 - [ ] Host result persistence before notice, later `backlog_worker_result`
