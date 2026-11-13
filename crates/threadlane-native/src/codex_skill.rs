@@ -1897,10 +1897,10 @@ mod tests {
         let openai_yaml_path = skill_dir.join("agents").join("openai.yaml");
         let marker_path = skill_dir.join(MARKER_FILE_NAME);
 
-        assert_eq!(
-            fs::read_to_string(&skill_md_path).expect("read SKILL.md"),
-            BUNDLED_SKILL_MD
-        );
+        let installed_skill_md = fs::read_to_string(&skill_md_path).expect("read SKILL.md");
+        assert_eq!(installed_skill_md, BUNDLED_SKILL_MD);
+        assert!(installed_skill_md.contains("backlog_worker_reject"));
+        assert!(installed_skill_md.contains("one of complete or reject"));
         assert_eq!(
             fs::read_to_string(&openai_yaml_path).expect("read openai.yaml"),
             BUNDLED_OPENAI_YAML

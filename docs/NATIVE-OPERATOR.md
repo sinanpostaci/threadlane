@@ -23,10 +23,11 @@ connection, session resume, context uncertainty, or before external effects when
 rules or state are uncertain, refetch `operating_guide` (or run `threadlane guide`
 on the trusted-local CLI route) and then refresh live scoped state and revisions
 (`status`, bounded `backlog_list` / `backlog_get` / `backlog_history`, and only
-actual recorded execution references for guarded `backlog_worker_result`
-reconciliation). Read `list_approvals`, `approved_session`, and `approved_task`
-when their actual IDs are known. Legacy jobs additionally use `coworker_status`,
-`list_plans`, and `get_plan`. Do not invent identifiers or use a polling loop.
+actual recorded execution references when invoking guarded
+`backlog_worker_result` or `backlog_worker_reject`). Read `list_approvals`,
+`approved_session`, and `approved_task` when their actual IDs are known. Legacy
+jobs additionally use `coworker_status`, `list_plans`, and `get_plan`. Do not
+invent identifiers or use a polling loop.
 
 ## Setup and planning
 

@@ -91,15 +91,27 @@ approval/task identity:
   to the retained receipt and original event. If mapping or evidence is missing,
   report the precise reason; never invent IDs, claim success, create `NeedsYou`,
   or relaunch.
-- Independently inspect actual physical delivery and the item-specific acceptance
-  condition. Then call `backlog_worker_complete` with the exact current
+- Independently verify that the recorded outcome is exact technical success and
+  inspect actual physical delivery and the item-specific acceptance condition.
+  The sequence is result reconciliation, then physical acceptance, then exactly
+  one of complete or reject. ACK only the real returned `batch_id`; ACK is
+  independent and is not acceptance or completion.
+- After a positive check, call `backlog_worker_complete` with the exact current
   `expected_revision`, `execution_ref`, previously inspected matching result and
-  delivery digests, a bounded acceptance note, and evidence. A callback, pull,
-  read, or ACK is not acceptance; ACK only the actual returned `batch_id`, and
-  ACK is not completion.
+  delivery digests, a bounded acceptance note, and evidence.
+- If exact technical success and physical delivery are confirmed but acceptance
+  fails, call `backlog_worker_reject(command_key, item_id, expected_revision, execution_ref, expected_result_digest, expected_delivery_digest, rejection_reason, rejection_evidence)`.
+  It separately records failed Coworker acceptance and blocks the item with a
+  bounded reason while preserving the immutable successful outcome. It creates
+  no human question/`NeedsYou` and dispatches nothing. Missing or mismatched
+  evidence cannot justify rejection or completion.
+- A rejected attempt cannot complete, and a result reread preserves the
+  rejection. An exact replay of the original rejection request returns its
+  receipt even if a later attempt exists. A new attempt needs fresh authorized
+  approval/task identity and the current revision; never replay old authority.
 - On a stopped host, use only supported read result/history; do not ACK history
   or restart to force a result. Busy- and idle-turn handling is intended, but
-  live native-chat delivery is not claimed as qualified.
+  broad live native-chat delivery is not claimed as qualified.
 - Failed or Unknown outcomes cannot become `Done`. `Done` replay returns the
   immutable original completion, not a new acceptance. Never fabricate run IDs
   or import raw outcomes.

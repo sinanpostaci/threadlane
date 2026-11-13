@@ -127,12 +127,13 @@ Version: `2026-11-13.v1`
   transport failure. Never replay an effectful or `outcome_unknown` command
   without reconciling durable receipts first.
 
-## Guarded Worker reservation, result, and completion
+## Guarded Worker reservation, result, completion, and rejection
 
 - The paired, enrolled MCP facade exposes the guarded Worker contract:
   - `backlog_worker_start(command_key, item_id, expected_revision, approval_id, task_id)`
   - `backlog_worker_result(item_id, execution_ref)`
   - `backlog_worker_complete(command_key, item_id, expected_revision, execution_ref, expected_result_digest, expected_delivery_digest, acceptance_note, acceptance_evidence)`
+  - `backlog_worker_reject(command_key, item_id, expected_revision, execution_ref, expected_result_digest, expected_delivery_digest, rejection_reason, rejection_evidence)`
 - `backlog_worker_start` requires real operator enrollment and the exact frozen
   approval/task identity. It records the reservation before any external effect
   and returns the software-generated `execution_ref`. Do not fabricate a
@@ -147,18 +148,39 @@ Version: `2026-11-13.v1`
   backlog item, and history; never blind replay the effect or mint a new command
   key to bypass the uncertainty.
 - A successful result leaves the item in `Doing`. Read the exact MCP result,
-  independently verify actual physical delivery and the acceptance condition, and
-  inspect the matching result and delivery digests. Only then call
-  `backlog_worker_complete` with the item's current `expected_revision`, the exact
-  `execution_ref`, the previously inspected matching `expected_result_digest` and
-  `expected_delivery_digest`, a bounded acceptance note, and bounded acceptance
-  evidence. A callback, pull, read, or ACK is not acceptance; ACK alone leaves
-  the item in `Doing`.
+  independently verify that the recorded outcome is exact technical success,
+  verify actual physical delivery and the item-specific acceptance condition, and
+  inspect the matching result and delivery digests. The sequence is result
+  reconciliation, then independent physical acceptance, then exactly one of
+  complete or reject. ACK of the real returned batch is independent of that
+  decision and is never acceptance.
+- Only after a positive check, call `backlog_worker_complete` with the item's
+  current `expected_revision`, the exact `execution_ref`, the previously inspected
+  matching `expected_result_digest` and `expected_delivery_digest`, a bounded
+  acceptance note, and bounded acceptance evidence.
+- If exact technical success and physical delivery are confirmed but the delivery
+  fails Coworker acceptance, call `backlog_worker_reject` with the item's current
+  `expected_revision`, the exact `execution_ref`, the previously inspected matching
+  `expected_result_digest` and `expected_delivery_digest`, a bounded rejection
+  reason, and bounded rejection evidence. This separately records the failed
+  Coworker acceptance and moves the item to `Blocked` with that reason. It
+  preserves the immutable technical `Success`; it does not claim execution
+  failure or `Done`, create a human question or `NeedsYou`, or automatically
+  dispatch another attempt.
+- Missing or mismatched result or delivery evidence permits neither completion nor
+  rejection. Report the exact uncertainty and keep the attempt unreconciled; do
+  not invent failure, rejection, or success.
+- A rejected attempt cannot complete or record another outcome, and a
+  `backlog_worker_result` reread preserves the rejection. An exact replay of the
+  original rejection request returns its original receipt even if a later attempt
+  exists. A new attempt requires fresh authorized approval/task identity and the
+  item's current revision; never replay old authority.
 - Failed and Unknown outcomes cannot become `Done`. An Unknown outcome stays
   unknown until reconciled through the original execution; it is not success and
-  cannot reserve a replacement. After a known failure, a new attempt requires a
-  fresh approval/task identity and the item's current revision. There is no raw
-  outcome import path and no manual Worker success shortcut.
+  cannot reserve a replacement. After a known failure or a recorded acceptance
+  rejection, a new attempt requires a fresh approval/task identity and the item's
+  current revision. There is no raw outcome import path and no manual Worker
+  success shortcut.
 - `Done` replay returns the immutable original completion receipt; it does not
   create a new acceptance or rewrite the recorded evidence. Keep submitted,
   read/pull delivery, handled, stopped, and accepted distinct. Do not imply
@@ -489,31 +511,36 @@ An ordinary approved-task callback carries only `approval_id` and directs you to
    `current_execution_ref`. Do not invent an `item_id` or `execution_ref`.
 3. Call `backlog_worker_result(item_id, current_execution_ref)` for that actual
    reference. The host persists a terminal result before its result notice;
-   progress notices can arrive earlier. This call performs the later backlog reconciliation. Match
-   the returned
+   progress notices can arrive earlier. This call performs the later backlog
+   reconciliation. Match the returned
    `execution.authority.approval_id` to the callback's `approval_id` and match
    `execution.authority.task_id` and the dispatch `run_id`/`worker_id` to the
    retained start receipt and original event evidence before acceptance. If the
    mapping or evidence is missing, report the precise reason; do not mark
    success, create `NeedsYou`, or relaunch the Worker.
-4. Only for a verified terminal success, independently inspect the actual
+4. Only for a verified exact terminal success, independently inspect the actual
    physical delivery and item-specific acceptance condition. A status change,
    callback, pull, or ACK is not acceptance. If work is still running, process
    and ACK the current batch, then await another notice or a later scoped resume;
-   do not poll or attempt completion without terminal evidence.
-5. Only after that check, call `backlog_worker_complete` with the exact current
-   `expected_revision`, `execution_ref`, the previously inspected matching
-   `expected_result_digest` and `expected_delivery_digest`, a bounded acceptance
-   note, and bounded acceptance evidence.
+   do not poll or attempt completion or rejection without terminal evidence.
+5. Only after that check, choose exactly one of complete or reject. Call
+   `backlog_worker_complete` with the exact current `expected_revision`,
+   `execution_ref`, the previously inspected matching `expected_result_digest`
+   and `expected_delivery_digest`, a bounded acceptance note, and bounded
+   acceptance evidence. If exact technical success and physical delivery are
+   confirmed but Coworker acceptance fails, call `backlog_worker_reject` with the
+   same exact revision, execution ref, and matching digests plus a bounded
+   rejection reason and evidence. Missing or mismatched evidence permits neither
+   call.
 6. ACK only the actual returned `batch_id` through `approved_ack_events`, per the
-   response schema. ACK is not completion or human acceptance; an ACK alone
-   leaves the item in `Doing`.
+   response schema. ACK is independent of completion or rejection and is not
+   human acceptance; an ACK alone leaves the item in `Doing`.
 7. On a stopped host, read original task evidence with `approved_task` or
    `approved_activity`, then use `backlog_worker_result` for guarded backlog
    reconciliation. No legacy job or `execution_status` call is required. Do not
-   ACK history, restart a host solely to force a callback, or invent a result. This procedure is intended for
-   busy or idle turns, but source and fixtures do not establish live native-chat
-   delivery qualification in either state.
+   ACK history, restart a host solely to force a callback, or invent a result.
+   This procedure is intended for busy or idle turns, but source and fixtures do
+   not establish live native-chat delivery qualification in either state.
 
 ### Optional legacy execution callbacks
 

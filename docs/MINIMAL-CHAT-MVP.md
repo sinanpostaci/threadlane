@@ -1,19 +1,22 @@
 # Minimal chat-centered Threadlane MVP
 
-**Status: human-approved product scope, 2026-11-13. Source-level core, runtime,
-and guarded-facade work is available in the combined checkout; the full product
-is unverified and not delivered.**
+**Status: human-approved product scope, 2026-11-13. Core, operator transport,
+and guarded Worker acceptance/rejection have focused parent validation. The
+full product is not delivered.**
 
-This document is the current product contract. It supersedes conflicting
-multi-role workflow requirements in older planning documents while preserving
-their historical pilot and acceptance evidence as historical. The independent
-combined checkout now contains the additive core backlog, paired MCP backlog
-tools, and the guarded Worker execution facade. That is source-level
-implementation only. The desktop conversation stream and backlog drawer,
-liveness and `NeedsYou` derivation, live provider/native-callback acceptance,
-final Nix packaging, integrated formatting/Clippy/test validation, and the
-package-closing review remain pending. Only the parent records integrated test
-evidence.
+This is the current product contract. It supersedes conflicting historical
+multi-role requirements while retaining their original evidence. The combined
+checkout passed 161 native library tests, focused core and real HTTP operator
+tests, formatting, and Clippy for the guarded delivery path. Two isolated real
+one-Worker checks passed: an idle native callback and a callback handled inside
+an already active native turn. In both, the actual Coworker read the result,
+independently inspected delivery, recorded durable `Done`, and acknowledged the
+actual event batch without environment repair. Those proofs use a frozen earlier
+bundle, not the final UI/rejection candidate.
+
+Desktop integration, final same-artifact parallel acceptance, Nix packaging,
+isolated NixOS application acceptance, and the package-closing review remain open.
+Source presence and these narrow proofs do not establish full MVP delivery.
 
 ## Human-approved direction
 
@@ -77,7 +80,9 @@ success booleans.
 - Worker items may be created and edited while `Todo`, and blocked with a
   reason. They cannot be started or completed through the ordinary Coworker
   commands and cannot be converted to Coworker. The guarded Worker facade below
-  reserves, reconciles, and completes them.
+  reserves, reconciles, completes, or rejects them. An acceptance rejection moves
+  the item to `Blocked` while preserving its immutable successful technical
+  outcome.
 - Ordinary edits are revision-checked. In `Doing`, only the title may be
   clarified; both the acceptance condition and delivery description are frozen.
   Ordinary edits of `Blocked` or `Done` items are rejected. Final completion
@@ -101,8 +106,9 @@ Invariant-enforced behavior:
 - allowed status transitions and terminal `Done`;
 - immutable item kind and no public status/kind bypass in ordinary edits;
 - Worker manual `Doing`/`Done` rejection;
-- guarded Worker reservation, dispatch receipt, result reconciliation, and
-  completion receipt on the trusted paired route;
+- guarded Worker reservation, dispatch receipt, result reconciliation,
+  completion receipt, and separate acceptance rejection with immutable success
+  preservation on the trusted paired route;
 - bounded text, limits, cursors, and pagination;
 - atomic item, history, and deduplication writes;
 - preserved legacy binding, run, worker, event, and recovery behavior.
@@ -127,6 +133,9 @@ The paired, enrolled MCP facade exposes the stable guarded Worker contract:
 - `backlog_worker_start(command_key, item_id, expected_revision, approval_id, task_id)`
 - `backlog_worker_result(item_id, execution_ref)`
 - `backlog_worker_complete(command_key, item_id, expected_revision, execution_ref, expected_result_digest, expected_delivery_digest, acceptance_note, acceptance_evidence)`
+- `backlog_worker_reject(command_key, item_id, expected_revision, execution_ref, expected_result_digest, expected_delivery_digest, rejection_reason, rejection_evidence)`
+
+This contract's paired facade totals 52 tools; the scoped surface remains 24.
 
 `backlog_worker_start` requires real enrollment and the exact frozen
 approval/task identity. It records the reservation before any external effect and
@@ -144,35 +153,57 @@ receipt, backlog item, and history; never blind replay the effect or mint a new
 command key to bypass the uncertainty.
 
 A successful result leaves the Worker item in `Doing`. The Coworker reads the
-exact MCP result, independently verifies actual physical delivery and the
-item-specific acceptance condition, and inspects the matching result and delivery
-digests. Only then may `backlog_worker_complete` record `Done` with the item's
-current `expected_revision`, the exact `execution_ref`, the previously inspected
-matching `expected_result_digest` and `expected_delivery_digest`, a bounded
-acceptance note, and bounded acceptance evidence. A callback, pull, read, or ACK
-is not acceptance, and ACK alone leaves the item in `Doing`.
+exact MCP result, independently verifies that the recorded outcome is exact
+technical success, verifies actual physical delivery and the item-specific
+acceptance condition, and inspects the matching result and delivery digests. The
+sequence is result reconciliation, then independent physical acceptance, then
+exactly one of complete or reject. ACK of the real returned event batch is
+independent of that decision and is never acceptance.
+
+Only after a positive check may `backlog_worker_complete` record `Done` with the
+item's current `expected_revision`, the exact `execution_ref`, the previously
+inspected matching `expected_result_digest` and `expected_delivery_digest`, a
+bounded acceptance note, and bounded acceptance evidence.
+
+If exact technical success and physical delivery are independently confirmed but
+the delivery fails Coworker acceptance, `backlog_worker_reject` separately
+records the failed Coworker acceptance with a bounded reason and evidence and
+moves the item to `Blocked`. It preserves the immutable technical `Success`; it
+does not record execution failure or `Done`, create a human question or
+`NeedsYou`, or automatically dispatch another attempt. Missing or mismatched
+result or delivery evidence permits neither completion nor rejection: report the
+exact uncertainty and keep the attempt unreconciled rather than inventing either
+outcome.
 
 An ordinary approved-task callback identifies only `approval_id` (no job, item,
 or execution ref); after `approved_pull_events`, recover the actual
 item/`current_execution_ref`, reconcile that exact execution, match authority and
-dispatch identity before acceptance, verify physical delivery, complete at the
-current revision with matching digests, and ACK only the actual returned batch.
-ACK is not completion. Missing mapping or evidence is reported precisely, never
-filled with invented IDs, a success claim, `NeedsYou`, or a relaunch. A stopped
-host permits supported read result/history, not history ACK or a forced restart.
-Busy/idle callback handling is intended but not live-qualified.
+dispatch identity before acceptance, verify physical delivery, then complete or
+reject at the current revision with matching digests, and ACK only the actual
+returned batch. ACK is not completion or rejection. Missing mapping or evidence is
+reported precisely, never filled with invented IDs, a success claim, `NeedsYou`,
+or a relaunch. A stopped host permits supported read result/history, not history
+ACK or a forced restart. Busy/idle callback handling is intended but not
+live-qualified.
+
+A rejected attempt cannot complete or record another outcome. A
+`backlog_worker_result` reread preserves the stored rejection. An exact replay of
+the original rejection request returns the original rejection receipt even if a
+later attempt now exists. A new attempt after rejection requires fresh authorized
+approval/task identity and the item's current revision; old authority must never
+be replayed.
 
 Failed and Unknown outcomes cannot become `Done`. An Unknown outcome remains
 unknown until reconciled through the original execution; it is not success and
-cannot reserve a replacement. After a known failure, a new attempt requires a
-fresh approval/task identity and the item's current revision. Raw outcome import
-and manual Worker success shortcuts are not part of this contract. A `Done`
-replay returns the immutable original completion receipt rather than creating a
-new acceptance.
+cannot reserve a replacement. After a known failure or a recorded acceptance
+rejection, a new attempt requires a fresh approval/task identity and the item's
+current revision. Raw outcome import and manual Worker success shortcuts are not
+part of this contract. A `Done` replay returns the immutable original completion
+receipt rather than creating a new acceptance.
 
-These are source-level contracts in the combined checkout. Live provider,
-native-callback, UI, and installed-package acceptance are not established by the
-source alone.
+These are source-level contracts in the combined checkout. Broad live provider,
+parallel native-callback, UI, and installed-package acceptance are not
+established by source or the two narrow parent proofs alone.
 
 ## Roles and approvals
 
@@ -214,13 +245,14 @@ framework. The guarded Worker facade is an additive trusted-paired boundary over
 the same state. A big-bang rewrite is not required.
 
 Optional advice, planning, or role-flow surfaces may remain available where they
-already exist, but they are not mandatory steps in the new contract. Historical
-multi-role jobs and pilots remain valid historical evidence; they do not create a
-new mandatory stage.
+already exist, but they are not mandatory steps in the new contract. The optional
+legacy sections of the shared MCP guide are opt-in only and are not required for
+ordinary backlog work. Historical multi-role jobs and pilots remain valid
+historical evidence; they do not create a new mandatory stage.
 
 ## Implementation status
 
-### Core backlog storage and current contract (source available)
+### Core backlog storage and guarded linkage (validated)
 
 Present in `threadlane-core` in the combined checkout:
 
@@ -229,37 +261,47 @@ Present in `threadlane-core` in the combined checkout:
 - `create_backlog_item`, `get_backlog_item`, `list_backlog_items`,
   `edit_backlog_item`, `block_backlog_item`, `start_backlog_item`,
   `complete_backlog_item`, and `list_backlog_history`;
+- guarded Worker reservation, dispatch receipt attachment, terminal-result
+  reconciliation, separate acceptance completion or rejection, immutable
+  `Done` replay, preserved rejection on reread, and fresh-authority retry rules;
 - bounded text, keyset pagination, stable history order, revision checks,
   payload-conflict detection, and rejection-without-side-effects behavior.
 
-This is source-level storage and workflow state. Parent validation remains open.
+Core backlog storage and the trusted-local operator routes have focused
+validation. Integrated parent-run validation of the combined checkout remains
+open.
 
-### Worker reservation and guarded completion (source available, unverified)
+### Worker reservation and guarded acceptance (focused validation passed)
 
 The combined checkout contains the guarded Worker linkage and paired facade:
 reservation against an exact frozen approval/task identity, dispatch receipt
 attachment, mutating terminal-result reconciliation, separate Coworker
-acceptance completion, immutable `Done` replay, and explicit Failed/Unknown
-handling. It reuses the existing runner and authority rather than creating a
-second execution model.
+acceptance completion or rejection, immutable `Done` replay, and explicit
+Failed/Unknown handling. A rejection requires exact technical success plus
+independently checked physical delivery, blocks the item, and leaves the
+successful technical outcome immutable. It reuses the existing runner and
+authority rather than creating a second execution model.
 
-It has not been accepted as live execution. Real provider behavior, native
-callback delivery, process-loss recovery, and installed-package behavior remain
-unverified.
+The combined guarded facade passed seven focused tests and all 161 native
+library regressions; Clippy passed. Tests cover exact rejection and receipt
+replay, changed or missing physical delivery, stale revisions, acceptance
+refusal after rejection, and preservation of a newer authorized attempt.
 
-### MCP, stream/drawer, liveness, and live acceptance (partial source)
+### MCP, stream/drawer, liveness, and live acceptance (partial delivery)
 
-The paired MCP backlog tools and guarded Worker facade exist at source level.
-The desktop bottom-growing stream and backlog drawer, runtime liveness
-projection, `NeedsYou` derivation, and end-to-end live acceptance remain open.
-No UI or live-product claim is made here.
+The paired backlog and guarded Worker tools exist. Two isolated live one-Worker
+proofs passed on an earlier frozen bundle: idle and busy-turn callbacks, physical
+Coworker delivery inspection, durable `Done`, and real event ACK. The desktop
+stream/drawer, liveness, `NeedsYou`, independent parallel work on the final
+artifact, and installed-package acceptance remain open.
 
 ## What this source-level foundation does not deliver
 
 - No desktop conversation-stream or backlog-drawer implementation.
 - No verified liveness projection or `NeedsYou` derivation from actual open
   human requests.
-- No verified live provider execution, native callback delivery, or
+- No broad verified live provider execution, independent parallel behavior,
+  native callback delivery beyond the two narrow parent proofs, or
   installed-package acceptance.
 - No final Nix packaging, cross-platform support, or release qualification.
 - No full MVP claim, no package-closing review, and no test evidence recorded by
@@ -277,7 +319,9 @@ integrated test evidence; the boxes remain open.
 - [ ] Parent-run `cargo fmt` check, focused core/MCP/facade tests, and Clippy
       pass against the combined checkout and its own target directory.
 - [ ] Guarded reservation, mutating result reconciliation, verified completion,
-      and unknown-outcome recovery pass focused tests.
+      exact-success rejection, immutable success preservation, preserved
+      rejection on reread, fresh-authority retry, and unknown-outcome recovery
+      pass focused tests.
 - [ ] Desktop bottom-growing stream and backlog drawer are implemented and
       reviewed.
 - [ ] `NeedsYou` derives only from real open human requests, not from `Blocked`
@@ -288,7 +332,8 @@ integrated test evidence; the boxes remain open.
       mandatory multi-role job/closure stage.
 - [ ] A live authorized Coworker/Worker acceptance conversation passes on the
       supported Linux/NixOS host, including approved-task callbacks in busy and
-      idle turns.
+      idle turns. The two earlier-bundle proofs do not close final combined-artifact
+      acceptance.
 - [ ] The authorized package-closing review is completed after integrated
       validation.
 
