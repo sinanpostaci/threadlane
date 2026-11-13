@@ -11,6 +11,7 @@ use threadlane_native::coworker_notice::{
     coworker_notice_dir, CoworkerNoticeConfig, CoworkerNoticeStore, NoticeDeliveryStatus,
 };
 use threadlane_native::coworker_workflow::{
+    read_persisted_derived_task_execution_report, read_persisted_task_review_report,
     CoworkerJobLockState, CoworkerJobOwnershipKey, OutboxDispatchStatus,
 };
 use threadlane_native::planning_driver::planning_artifacts_dir;
@@ -191,6 +192,39 @@ fn spawn_single_coworker_notice_ws_server(
 
 #[allow(clippy::too_many_arguments)]
 async fn create_planned_approved_and_frozen_pipeline_job_for_scope(
+    fixture: &PipelineTestFixture,
+    binding_id: &str,
+    thread_uuid: &str,
+    brief_id: &str,
+    plan_id: &str,
+    tasks: Vec<PlanTask>,
+    task_interfaces: BTreeMap<String, TaskInterfaceOwnershipSpec>,
+    approved_write_paths: Vec<String>,
+    max_parallel: usize,
+    approval_budgets: ExecutionBudgets,
+    coder_budget: ControllerRoleExecutionBudget,
+    correction_cap: u32,
+) -> (CoworkerJobRecord, String) {
+    create_planned_approved_and_frozen_pipeline_job_for_scope_with_reviewer(
+        fixture,
+        binding_id,
+        thread_uuid,
+        brief_id,
+        plan_id,
+        tasks,
+        task_interfaces,
+        approved_write_paths,
+        max_parallel,
+        approval_budgets,
+        coder_budget,
+        correction_cap,
+        headless_argon_choice(Difficulty::Hard),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn create_planned_approved_and_frozen_pipeline_job_for_scope_with_reviewer(
     fixture: &PipelineTestFixture,
     binding_id: &str,
     thread_uuid: &str,
@@ -530,8 +564,9 @@ fn headless_codex_reviewer_choice(difficulty: Difficulty) -> SelectedRoleChoice 
     }
 }
 
-/// Keeps the Go/Antigravity Coder while pinning a fake read-only Codex advisory Reviewer backed
-/// by the same deterministic Node provider fixture. This is the real mixed provider combination.
+/// Pins a fake read-only Codex advisory Reviewer backed by the same deterministic Node provider
+/// fixture while leaving the profile Coder choice unchanged. This is the real mixed provider
+/// combination when the Coder is the OpenCode v2 Go/max fixture.
 fn configure_codex_reviewer(fixture: &PipelineTestFixture) {
     let snapshot = fixture.registry.snapshot().unwrap();
     fixture
@@ -584,6 +619,75 @@ fn configure_codex_reviewer(fixture: &PipelineTestFixture) {
         .unwrap();
 }
 
+/// The exact frozen OpenCode v2 Go/max Coder choice used by the mixed-provider pipeline.
+fn headless_opencode_go_choice(difficulty: Difficulty) -> SelectedRoleChoice {
+    SelectedRoleChoice {
+        tool_id: "tool-opencode".to_string(),
+        adapter: ToolAdapter::OpencodeV2,
+        route: RoleExecutionRoute::HeadlessWorker,
+        model_id: "model-deepseek".to_string(),
+        model_arg: "opencode-go/deepseek-v4.1-flash".to_string(),
+        effort: Some("max".to_string()),
+        matched_difficulty: Some(difficulty),
+    }
+}
+
+/// Registers the exact frozen OpenCode v2 Go/max Coder choice while leaving the profile Reviewer
+/// untouched. The fake Node role provider interprets `api --standalone session.create`,
+/// `session export --standalone --sanitize`, and `--standalone run ... --format json`, emitting
+/// provider-observed telemetry and owned-session metadata for the same Coder calls.
+fn configure_go_coder(fixture: &PipelineTestFixture) {
+    let snapshot = fixture.registry.snapshot().unwrap();
+    fixture
+        .registry
+        .apply(
+            snapshot.revision,
+            RegistryChange::UpsertTool {
+                tool: ToolDefinition {
+                    id: "tool-opencode".to_string(),
+                    label: "Offline OpenCode Go Coder".to_string(),
+                    adapter: ToolAdapter::OpencodeV2,
+                    executable_path: Some(fixture.fake_agy_exe.clone()),
+                    enabled: true,
+                },
+            },
+        )
+        .unwrap();
+    fixture
+        .registry
+        .apply(
+            snapshot.revision + 1,
+            RegistryChange::UpsertModels {
+                models: vec![ModelDefinition {
+                    id: "model-deepseek".to_string(),
+                    tool_id: "tool-opencode".to_string(),
+                    label: "DeepSeek Flash fixture".to_string(),
+                    model_arg: "opencode-go/deepseek-v4.1-flash".to_string(),
+                    efforts: vec!["max".to_string()],
+                    allow_no_effort: false,
+                }],
+            },
+        )
+        .unwrap();
+    let mut profile = snapshot.profiles[0].clone();
+    for assignment in &mut profile.assignments {
+        if assignment.role == WorkflowRole::Coder {
+            assignment.difficulty = Some(Difficulty::Hard);
+            assignment.choice = ModelChoice {
+                model_id: "model-deepseek".to_string(),
+                effort: Some("max".to_string()),
+            };
+        }
+    }
+    fixture
+        .registry
+        .apply(
+            snapshot.revision + 2,
+            RegistryChange::UpsertProfile { profile },
+        )
+        .unwrap();
+}
+
 fn pipeline_execution_policy(fixture: &PipelineTestFixture) -> ExecutionPolicy {
     let mut policy = execution_policy();
     if fixture
@@ -597,6 +701,22 @@ fn pipeline_execution_policy(fixture: &PipelineTestFixture) -> ExecutionPolicy {
         policy.allow_rules.push(PolicyAllowRule {
             tool_id: "tool-codex".to_string(),
             model_id: "model-luna".to_string(),
+            efforts: vec!["max".to_string()],
+            allow_no_effort: false,
+            roles: vec![WorkflowRole::Coder],
+        });
+    }
+    if fixture
+        .registry
+        .snapshot()
+        .unwrap()
+        .tools
+        .iter()
+        .any(|t| t.id == "tool-opencode")
+    {
+        policy.allow_rules.push(PolicyAllowRule {
+            tool_id: "tool-opencode".to_string(),
+            model_id: "model-deepseek".to_string(),
             efforts: vec!["max".to_string()],
             allow_no_effort: false,
             roles: vec![WorkflowRole::Coder],
@@ -664,26 +784,31 @@ fn install_tracked_primary_cache_ignore_and_artifact(fixture: &mut PipelineTestF
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cli_code_driver_full_automatic_pipeline_runs_parallel_roots_reviewer_correction_dependent_and_single_closure_to_completed(
 ) {
-    assert_full_pipeline(false, false).await;
+    assert_full_pipeline(false, false, false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn codex_luna_full_frozen_pipeline_parallel_roots_correction_dependent_and_single_closure() {
-    assert_full_pipeline(true, false).await;
+    assert_full_pipeline(true, false, false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn go_coder_codex_sol_reviewer_full_frozen_pipeline_parallel_roots_correction_dependent_and_single_closure(
 ) {
-    assert_full_pipeline(false, true).await;
+    assert_full_pipeline(false, true, true).await;
 }
 
 #[allow(clippy::too_many_lines)]
-async fn assert_full_pipeline(codex_coder: bool, codex_reviewer: bool) {
+async fn assert_full_pipeline(codex_coder: bool, codex_reviewer: bool, go_coder: bool) {
+    assert!(
+        !codex_coder || !go_coder,
+        "the legacy Codex Coder and OpenCode Go Coder fixtures are mutually exclusive"
+    );
     Box::pin(async {
         let mut fixture = setup_fixture();
         let primary_cache_file = install_tracked_primary_cache_ignore_and_artifact(&mut fixture);
         if codex_coder { configure_codex_coder(&fixture); }
+        if go_coder { configure_go_coder(&fixture); }
         if codex_reviewer { configure_codex_reviewer(&fixture); }
         let reviewer_choice = if codex_reviewer {
             headless_codex_reviewer_choice(Difficulty::Hard)
@@ -762,7 +887,7 @@ async fn assert_full_pipeline(codex_coder: bool, codex_reviewer: bool) {
             },
         );
 
-        let (job, approval_id) = create_planned_approved_and_frozen_pipeline_job_for_scope(
+        let (job, approval_id) = create_planned_approved_and_frozen_pipeline_job_for_scope_with_reviewer(
             &fixture,
             &binding_id,
             &thread_uuid,
@@ -1304,6 +1429,111 @@ async fn assert_full_pipeline(codex_coder: bool, codex_reviewer: bool) {
             }
         }
 
+        if go_coder {
+            let approval = fixture.authority.get_for_operator(&approval_id).unwrap();
+            assert!(approval.tasks.iter().all(|t| t.is_frozen_headless_worker()
+                && t.provider == Some(threadlane_workers::WorkerProvider::OpenCodeV2)
+                && t.adapter == ToolAdapter::OpencodeV2
+                && t.model_arg == "opencode-go/deepseek-v4.1-flash"
+                && t.effort.as_deref() == Some("max")));
+            let runtime = fixture
+                .policy_store
+                .get_job_runtime_readonly(&binding_id, &job.job_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(runtime.attempt_artifacts.len(), 4);
+            for artifact in runtime.attempt_artifacts.values() {
+                assert_eq!(artifact.observed_provider, "opencode_v2");
+                assert_eq!(
+                    artifact.observed_model.as_deref(),
+                    Some("opencode-go/deepseek-v4.1-flash")
+                );
+                assert_eq!(artifact.observed_effort.as_deref(), Some("max"));
+                assert!(artifact.codex_launch_report.is_none());
+                let task = approval
+                    .tasks
+                    .iter()
+                    .find(|t| t.task_id == artifact.task_id)
+                    .unwrap();
+                let choice = runtime
+                    .envelope
+                    .task_coder_choices
+                    .get(&artifact.task_id)
+                    .unwrap();
+                assert_eq!(choice.adapter, ToolAdapter::OpencodeV2);
+                assert_eq!(choice.model_arg, "opencode-go/deepseek-v4.1-flash");
+                assert_eq!(choice.effort.as_deref(), Some("max"));
+                assert!(artifact.has_matching_coder_evidence(task, choice));
+                let subject = artifact.review_subject.as_ref().expect("reviewed task subject");
+                assert_eq!(subject.policy.requested_provider.as_deref(), Some("opencode_v2"));
+                assert_eq!(
+                    subject.policy.observed_model.as_deref(),
+                    Some("opencode-go/deepseek-v4.1-flash")
+                );
+                assert_eq!(subject.policy.observed_effort.as_deref(), Some("max"));
+                subject.verify_integrity().unwrap();
+            }
+            assert_eq!(runtime.derived_attempts.len(), 1);
+            let receipt = &runtime.derived_attempts[0];
+            assert_eq!(receipt.task_id, "task-root-a");
+            assert_eq!(receipt.attempt_no, 2);
+            let frozen_choice = runtime
+                .envelope
+                .task_coder_choices
+                .get(&receipt.task_id)
+                .expect("frozen derived Coder choice");
+            assert_eq!(&receipt.coder_choice, frozen_choice);
+            let derived_effect = runtime
+                .pending_effects
+                .values()
+                .find(|effect| {
+                    effect.kind == PendingControllerEffectKind::CoderDispatch
+                        && effect.task_id.as_deref() == Some("task-root-a")
+                        && effect.attempt_no == Some(2)
+                })
+                .expect("derived CoderDispatch effect for task-root-a attempt 2");
+            assert_eq!(
+                derived_effect.status,
+                PendingControllerEffectStatus::EffectConfirmed
+            );
+            let report = read_persisted_derived_task_execution_report(
+                &fixture.plans_dir,
+                &derived_effect.effect_id,
+            )
+            .expect("read persisted derived Go execution report")
+            .expect("persisted derived Go execution report exists");
+            assert_eq!(report.attempt_no, 2);
+            assert_eq!(report.coder_choice, receipt.coder_choice);
+            assert_eq!(report.observed_provider, "opencode_v2");
+            assert_eq!(
+                report.observed_model.as_deref(),
+                Some("opencode-go/deepseek-v4.1-flash")
+            );
+            assert_eq!(report.observed_effort.as_deref(), Some("max"));
+            let worker_report = &report.execution_report.worker_report;
+            assert_eq!(
+                worker_report.provider,
+                threadlane_workers::WorkerProvider::OpenCodeV2
+            );
+            assert_eq!(
+                worker_report.requested_model.base_model,
+                "opencode-go/deepseek-v4.1-flash"
+            );
+            assert_eq!(worker_report.requested_model.effort.as_deref(), Some("max"));
+            assert_eq!(worker_report.requested_session_id, None);
+            let metadata = worker_report
+                .validated_opencode_metadata()
+                .expect("validated owned OpenCode metadata for derived attempt");
+            assert_eq!(metadata.observed_model, "opencode-go/deepseek-v4.1-flash");
+            assert_eq!(metadata.observed_effort.as_deref(), Some("max"));
+            assert_eq!(metadata.assistant_message_count, 1);
+            assert_eq!(
+                worker_report.allocated_session_id.as_deref(),
+                Some(metadata.session_id.as_str())
+            );
+            assert!(worker_report.opencode_metadata_error.is_none());
+        }
+
         if codex_reviewer {
             let runtime = fixture.policy_store.get_job_runtime_readonly(&binding_id, &job.job_id).unwrap().unwrap();
             let mut review_effect_count = 0;
@@ -1422,7 +1652,7 @@ async fn cli_code_driver_cancel_during_owned_in_flight_reviewer_drains_fences_pr
             allowed_write_paths: vec!["src/a.rs".to_string()],
         }];
 
-        let (job, approval_id) = create_planned_approved_and_frozen_pipeline_job_for_scope(
+        let (job, approval_id) = create_planned_approved_and_frozen_pipeline_job_for_scope_with_reviewer(
             &fixture,
             &binding_id,
             &thread_uuid,
@@ -1633,7 +1863,7 @@ async fn cli_code_driver_settled_check_and_correction_blocks_send_one_attention_
             let binding_id = binding.binding_id;
             let thread_uuid = binding.thread_uuid;
             let correction = case.starts_with("correction");
-            let (job, approval_id) = create_planned_approved_and_frozen_pipeline_job_for_scope(
+            let (job, approval_id) = create_planned_approved_and_frozen_pipeline_job_for_scope_with_reviewer(
                 &fixture, &binding_id, &thread_uuid, "brf_notice_block", "plan-notice-block",
                 vec![PlanTask {
                     id: "task-notice-a".into(), title: "Attention fixture task".into(),
@@ -1763,7 +1993,7 @@ async fn cli_code_driver_full_pipeline_live_held_coders_report_running_not_unkno
         let binding_id = binding.binding_id;
         let thread_uuid = binding.thread_uuid;
 
-        let (job, approval_id) = create_planned_approved_and_frozen_pipeline_job_for_scope(
+        let (job, approval_id) = create_planned_approved_and_frozen_pipeline_job_for_scope_with_reviewer(
             &fixture,
             &binding_id,
             &thread_uuid,
@@ -2329,7 +2559,7 @@ async fn stopped_host_cached_running_is_unknown_without_mutating_historical_stat
             role: WorkflowRole::Coder, difficulty: Difficulty::Hard, depends_on,
             allowed_write_paths: vec![path.into()],
         }).collect();
-        let (job, approval_id) = create_planned_approved_and_frozen_pipeline_job_for_scope(
+        let (job, approval_id) = create_planned_approved_and_frozen_pipeline_job_for_scope_with_reviewer(
             &fixture, &binding.binding_id, &thread, "brf_inactive_projection", "plan-inactive-projection",
             tasks, BTreeMap::new(), vec!["src/a.rs".into(), "src/b.rs".into(), "src/c.rs".into()],
             2, ExecutionBudgets::default(), ControllerRoleExecutionBudget::default_for_role(WorkflowRole::Coder, 4), 1,

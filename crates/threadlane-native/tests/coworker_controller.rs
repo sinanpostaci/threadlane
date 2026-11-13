@@ -611,6 +611,84 @@ printf '%s\n' '{"type":"step_finish","sessionID":"sess-oc-initial","model":"open
         .expect("pin fake OpenCode Coder");
 }
 
+/// Configures the exact frozen OpenCode v2 Go/max Coder fixture used by correction tests. The fake
+/// Node role provider honors the same initial/derived prompt contract as the AGY coder while
+/// emitting OpenCode-owned session metadata and observed model/variant telemetry.
+fn configure_opencode_correction_coder(fixture: &ControllerTestFixture) -> SelectedRoleChoice {
+    let root_dir = fixture.agy_count_file.parent().expect("fixture root dir");
+    let role_script_path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/support/fake-coworker-roles.mjs");
+    assert!(
+        role_script_path.is_file(),
+        "fake-coworker-roles.mjs must exist at {}",
+        role_script_path.display()
+    );
+    let wrapper_path = fixture
+        .fake_agy_exe
+        .with_file_name("fake-opencode-go-coder");
+    write_executable_script(
+        &wrapper_path,
+        &format!(
+            "#!/bin/sh\nset -eu\nexec node \"{}\" \"{}\" \"$@\"\n",
+            role_script_path.display(),
+            root_dir.display()
+        ),
+    );
+
+    let snapshot = fixture.registry.snapshot().expect("registry snapshot");
+    fixture
+        .registry
+        .apply(
+            snapshot.revision,
+            RegistryChange::UpsertTool {
+                tool: ToolDefinition {
+                    id: "tool-opencode".to_string(),
+                    label: "Offline OpenCode Go Coder".to_string(),
+                    adapter: ToolAdapter::OpencodeV2,
+                    executable_path: Some(wrapper_path),
+                    enabled: true,
+                },
+            },
+        )
+        .expect("configure fake OpenCode Go Coder tool");
+    fixture
+        .registry
+        .apply(
+            snapshot.revision + 1,
+            RegistryChange::UpsertModels {
+                models: vec![ModelDefinition {
+                    id: "model-deepseek".to_string(),
+                    tool_id: "tool-opencode".to_string(),
+                    label: "DeepSeek Flash fixture".to_string(),
+                    model_arg: "opencode-go/deepseek-v4.1-flash".to_string(),
+                    efforts: vec!["max".to_string()],
+                    allow_no_effort: false,
+                }],
+            },
+        )
+        .expect("configure fake OpenCode Go Coder model");
+    let mut profile = snapshot.profiles[0].clone();
+    let coder = profile
+        .assignments
+        .iter_mut()
+        .find(|assignment| assignment.role == WorkflowRole::Coder)
+        .expect("Coder assignment");
+    coder.difficulty = Some(Difficulty::Hard);
+    coder.choice = ModelChoice {
+        model_id: "model-deepseek".to_string(),
+        effort: Some("max".to_string()),
+    };
+    fixture
+        .registry
+        .apply(
+            snapshot.revision + 2,
+            RegistryChange::UpsertProfile { profile },
+        )
+        .expect("pin fake OpenCode Go Coder");
+
+    headless_opencode_go_choice(Difficulty::Hard)
+}
+
 /// Registers a fake read-only Codex advisory Reviewer backed by the deterministic Node provider
 /// fixture and returns the exact frozen Reviewer choice plus its private counter/override state
 /// directory. The fixture emits no runtime model/effort telemetry, matching real `codex exec`.
@@ -752,6 +830,18 @@ fn headless_codex_reviewer_choice(difficulty: Difficulty) -> SelectedRoleChoice 
         model_id: "model-codex-sol".to_string(),
         model_arg: "gpt-6.1-sol".to_string(),
         effort: Some("high".to_string()),
+        matched_difficulty: Some(difficulty),
+    }
+}
+
+fn headless_opencode_go_choice(difficulty: Difficulty) -> SelectedRoleChoice {
+    SelectedRoleChoice {
+        tool_id: "tool-opencode".to_string(),
+        adapter: ToolAdapter::OpencodeV2,
+        route: RoleExecutionRoute::HeadlessWorker,
+        model_id: "model-deepseek".to_string(),
+        model_arg: "opencode-go/deepseek-v4.1-flash".to_string(),
+        effort: Some("max".to_string()),
         matched_difficulty: Some(difficulty),
     }
 }

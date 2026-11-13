@@ -1,6 +1,9 @@
 #!/usr/bin/env node
 // Deterministic fake provider interpreter for Threadlane Coworker pipeline behavioral tests.
 // Handles Orchestrator, Reviewer, and Closure in `--mode plan`, and Coder in execution mode.
+// Also implements OpenCode v2 owned session metadata (`api --standalone session.create`,
+// `api --standalone session.get`, `session export --standalone --sanitize`) and NDJSON
+// `step_start`/`step_finish` framing for `--standalone run`.
 // Binds Reviewer responses to the exact 9-field ExpectedTaskReviewIdentity block in the prompt
 // and Closure responses to the exact FinalCandidateSubject digest and tree SHA in the prompt.
 
@@ -50,6 +53,40 @@ for (let i = 0; i < args.length; i += 1) {
   }
 }
 
+const opencodeCreate =
+  args[0] === "api" &&
+  args[1] === "--standalone" &&
+  args[2] === "session.create" &&
+  args[3] === "--data" &&
+  typeof args[4] === "string";
+const opencodeGet =
+  args[0] === "api" &&
+  args[1] === "--standalone" &&
+  args[2] === "session.get" &&
+  args[3] === "--param" &&
+  typeof args[4] === "string" &&
+  args[4].startsWith("sessionID=");
+const opencodeExport =
+  args[0] === "session" &&
+  args[1] === "export" &&
+  args[2] === "--standalone" &&
+  args[3] === "--sanitize" &&
+  typeof args[4] === "string";
+const opencodeRun = args[0] === "--standalone" && args[1] === "run";
+
+if (opencodeCreate) {
+  handleOpenCodeSessionCreate(args[4]);
+  process.exit(0);
+}
+if (opencodeGet) {
+  handleOpenCodeSessionGet(args[4].slice("sessionID=".length));
+  process.exit(0);
+}
+if (opencodeExport) {
+  handleOpenCodeSessionExport(args[4]);
+  process.exit(0);
+}
+
 // Test opt-in only: the same forged logger-shaped text must remain unverified metadata.
 if (diagnosticPath && fs.existsSync(path.join(stateDir, "emit_provider_health_hint.gate"))) {
   fs.writeFileSync(diagnosticPath,
@@ -86,6 +123,205 @@ function withStateLock(fn) {
       // Ignore cleanup race.
     }
   }
+}
+
+function openCodeCanonicalWorkdir() {
+  return fs.realpathSync(process.cwd());
+}
+
+function openCodeShortHash(value) {
+  let hash = 2166136261;
+  for (const byte of Buffer.from(value, "utf8")) {
+    hash ^= byte;
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(16).padStart(8, "0");
+}
+
+function openCodeSessionFilePath() {
+  return path.join(
+    stateDir,
+    `opencode_session_${openCodeShortHash(openCodeCanonicalWorkdir())}.json`,
+  );
+}
+
+function readOpenCodeSessionState() {
+  const statePath = openCodeSessionFilePath();
+  if (!fs.existsSync(statePath)) {
+    return null;
+  }
+  return JSON.parse(fs.readFileSync(statePath, "utf8"));
+}
+
+function writeOpenCodeSessionState(state) {
+  fs.writeFileSync(openCodeSessionFilePath(), JSON.stringify(state), {
+    mode: 0o600,
+  });
+}
+
+function failOpenCodeFixture(message) {
+  process.stderr.write(`${message}\n`);
+  process.exit(2);
+}
+
+function handleOpenCodeSessionCreate(rawPayload) {
+  const workdir = openCodeCanonicalWorkdir();
+  let payload;
+  try {
+    payload = JSON.parse(rawPayload);
+  } catch (_) {
+    failOpenCodeFixture("invalid OpenCode session.create payload");
+  }
+  if (
+    payload.agent !== "build" ||
+    payload.model?.providerID !== "opencode-go" ||
+    payload.model?.id !== "deepseek-v4.1-flash" ||
+    payload.model?.variant !== "max" ||
+    payload.location?.directory !== workdir
+  ) {
+    failOpenCodeFixture("unexpected OpenCode session.create target");
+  }
+  const previous = readOpenCodeSessionState();
+  const seq = (previous?.seq ?? 0) + 1;
+  const createdMs = Date.now();
+  const state = {
+    seq,
+    id: `ses_go_${seq}_${openCodeShortHash(workdir)}`,
+    directory: workdir,
+    created_ms: createdMs,
+    run_started_ms: null,
+    run_completed_ms: null,
+  };
+  writeOpenCodeSessionState(state);
+  process.stdout.write(
+    `${JSON.stringify({
+      data: {
+        id: state.id,
+        location: { directory: workdir },
+        time: { created: createdMs },
+      },
+    })}\n`,
+  );
+}
+
+function requireOpenCodeSessionState() {
+  const state = readOpenCodeSessionState();
+  if (!state || typeof state.id !== "string") {
+    failOpenCodeFixture("missing OpenCode owned session state");
+  }
+  if (state.directory !== openCodeCanonicalWorkdir()) {
+    failOpenCodeFixture("OpenCode owned session directory mismatch");
+  }
+  return state;
+}
+
+function handleOpenCodeSessionGet(requestedSessionId) {
+  const state = requireOpenCodeSessionState();
+  if (requestedSessionId !== state.id) {
+    failOpenCodeFixture("OpenCode session.get requested a foreign session");
+  }
+  if (!Number.isInteger(state.run_completed_ms)) {
+    failOpenCodeFixture("OpenCode session.get before a completed run");
+  }
+  process.stdout.write(
+    `${JSON.stringify({
+      data: {
+        id: state.id,
+        outcome: "succeeded",
+        location: { directory: state.directory },
+        time: { created: state.created_ms, idle: state.run_completed_ms },
+      },
+    })}\n`,
+  );
+}
+
+function handleOpenCodeSessionExport(requestedSessionId) {
+  const state = requireOpenCodeSessionState();
+  if (requestedSessionId !== state.id) {
+    failOpenCodeFixture("OpenCode session export requested a foreign session");
+  }
+  if (!Number.isInteger(state.run_completed_ms)) {
+    failOpenCodeFixture("OpenCode session export before a completed run");
+  }
+  process.stdout.write(
+    `${JSON.stringify({
+      info: {
+        id: state.id,
+        outcome: "succeeded",
+        location: { directory: state.directory },
+        time: { created: state.created_ms, idle: state.run_completed_ms },
+      },
+      messages: [
+        {
+          id: "msg_go_coder",
+          type: "assistant",
+          sessionID: state.id,
+          finish: "stop",
+          time: {
+            created: state.run_started_ms,
+            completed: state.run_completed_ms,
+          },
+          model: {
+            providerID: "opencode-go",
+            id: "deepseek-v4.1-flash",
+            variant: "max",
+          },
+        },
+      ],
+    })}\n`,
+  );
+}
+
+function beginOpenCodeRun() {
+  const state = requireOpenCodeSessionState();
+  const sessionIndex = args.indexOf("--session");
+  if (sessionIndex === -1 || args[sessionIndex + 1] !== state.id) {
+    failOpenCodeFixture("OpenCode run did not use the owned session");
+  }
+  const formatIndex = args.indexOf("--format");
+  if (formatIndex === -1 || args[formatIndex + 1] !== "json") {
+    failOpenCodeFixture("OpenCode run did not request JSON framing");
+  }
+  if (model !== "opencode-go/deepseek-v4.1-flash#max") {
+    failOpenCodeFixture("OpenCode run requested an unexpected model target");
+  }
+  if (!Number.isInteger(state.created_ms)) {
+    failOpenCodeFixture("OpenCode run has no session creation timestamp");
+  }
+  const startedMs = Date.now();
+  if (startedMs < state.created_ms) {
+    failOpenCodeFixture("OpenCode run started before its session was created");
+  }
+  state.run_started_ms = startedMs;
+  state.run_completed_ms = null;
+  writeOpenCodeSessionState(state);
+  process.stdout.write(
+    `${JSON.stringify({
+      type: "step_start",
+      sessionID: state.id,
+      model: "opencode-go/deepseek-v4.1-flash",
+      variant: "max",
+    })}\n`,
+  );
+  return state;
+}
+
+function finishOpenCodeRun(state) {
+  const completedMs = Date.now();
+  if (completedMs < state.run_started_ms) {
+    failOpenCodeFixture("OpenCode run completion predates its start");
+  }
+  state.run_completed_ms = completedMs;
+  writeOpenCodeSessionState(state);
+  process.stdout.write(
+    `${JSON.stringify({
+      type: "step_finish",
+      sessionID: state.id,
+      model: "opencode-go/deepseek-v4.1-flash",
+      variant: "max",
+      reason: "stop",
+    })}\n`,
+  );
 }
 
 function incrementCounterUnlocked(filename) {
@@ -426,20 +662,25 @@ if (codexTask) prompt = args.at(-1);
 
 const coderSeq = withStateLock(() => incrementCounterUnlocked("agy_coder_count.txt"));
 const coderSessionId = `sess-agy-coder-${coderSeq}`;
+let opencodeSession = null;
 
-const initEvent = {
-  type: "init",
-  session_id: coderSessionId,
-  model,
-};
-if (effort) {
-  initEvent.effort = effort;
-}
-if (codexTask) {
-  process.stdout.write(`${JSON.stringify({type: "thread.started", thread_id: coderSessionId})}\n`);
-  process.stdout.write(`${JSON.stringify({type: "turn.started"})}\n`);
+if (opencodeRun) {
+  opencodeSession = beginOpenCodeRun();
 } else {
-  process.stdout.write(`${JSON.stringify(initEvent)}\n`);
+  const initEvent = {
+    type: "init",
+    session_id: coderSessionId,
+    model,
+  };
+  if (effort) {
+    initEvent.effort = effort;
+  }
+  if (codexTask) {
+    process.stdout.write(`${JSON.stringify({type: "thread.started", thread_id: coderSessionId})}\n`);
+    process.stdout.write(`${JSON.stringify({type: "turn.started"})}\n`);
+  } else {
+    process.stdout.write(`${JSON.stringify(initEvent)}\n`);
+  }
 }
 
 const worktreeDir = process.cwd();
@@ -497,13 +738,17 @@ if (prompt.includes("THREADLANE IN-SCOPE CORRECTION DIRECTIVE")) {
   fs.writeFileSync(path.join(srcDir, "c.rs"), "pub fn c() -> u32 { 300 }\n", "utf8");
 }
 
-const resultEvent = {
-  type: "result",
-  subtype: "success",
-  session_id: coderSessionId,
-  model,
-};
-if (effort) {
-  resultEvent.effort = effort;
+if (opencodeRun) {
+  finishOpenCodeRun(opencodeSession);
+} else {
+  const resultEvent = {
+    type: "result",
+    subtype: "success",
+    session_id: coderSessionId,
+    model,
+  };
+  if (effort) {
+    resultEvent.effort = effort;
+  }
+  process.stdout.write(`${JSON.stringify(codexTask ? {type: "turn.completed", usage: {input_tokens: 10, output_tokens: 5}} : resultEvent)}\n`);
 }
-process.stdout.write(`${JSON.stringify(codexTask ? {type: "turn.completed", usage: {input_tokens: 10, output_tokens: 5}} : resultEvent)}\n`);

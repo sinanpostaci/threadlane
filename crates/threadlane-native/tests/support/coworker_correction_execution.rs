@@ -48,6 +48,27 @@ fn replace_argv_arg(argv: &mut [String], from: &str, to: &str) {
     argv[index] = to.to_string();
 }
 
+fn load_initial_worker_execution_report(
+    fixture: &ControllerTestFixture,
+    approval_id: &str,
+    worker_id: &str,
+) -> threadlane_workers::TaskExecutionReport {
+    let report_path = fixture
+        .sessions_dir
+        .join(approval_id)
+        .join("runtime-state/worker_reports")
+        .join(format!("art_{worker_id}.json"));
+    let bytes = fs::read(&report_path).expect("read initial worker report artifact");
+    let report: threadlane_workers::TaskExecutionReport =
+        serde_json::from_slice(&bytes).expect("parse initial worker report artifact");
+    assert_eq!(
+        report.worker_report.allocated_session_id.is_some(),
+        report.worker_report.opencode_metadata.is_some(),
+        "initial report metadata and allocated session must agree"
+    );
+    report
+}
+
 async fn assert_codex_reviewer_report_rejected(
     service: &CoworkerTaskCorrectionService,
     session: &threadlane_native::coworker_workflow::OwnedCoworkerControllerSession,
@@ -401,6 +422,12 @@ async fn prepare_task_for_derived_correction_with_reviewer_and_budgets(
         .expect("require DerivedTaskAttemptReceipt")
         .clone();
 
+    let expected_coder_choice = runtime_before_corr
+        .envelope
+        .task_coder_choices
+        .get(task_id)
+        .expect("frozen Coder choice for task")
+        .clone();
     let expected_req_key = compute_derived_coder_request_key(
         &job.job_id,
         task_id,
@@ -409,7 +436,7 @@ async fn prepare_task_for_derived_correction_with_reviewer_and_budgets(
         &review_1.verdict.verdict_id,
         &review_subject_1.subject_digest,
         &runtime_before_corr.envelope.envelope_digest,
-        &headless_argon_choice(Difficulty::Hard),
+        &expected_coder_choice,
     );
     let expected_eff_id =
         compute_derived_coder_effect_id(&job.job_id, task_id, 2, &expected_req_key);
@@ -1131,6 +1158,7 @@ async fn task_correction_executes_derived_coder_attempt_reopens_idempotently_ver
 async fn task_correction_accepts_pinned_codex_reviewer_without_runtime_telemetry_and_completes_derived_go_attempt(
 ) {
     let fixture = setup_fixture();
+    let coder_choice = configure_opencode_correction_coder(&fixture);
     let (reviewer_choice, reviewer_state_dir) = configure_codex_reviewer(&fixture);
     write_codex_reviewer_override(
         &reviewer_state_dir,
@@ -1146,12 +1174,15 @@ async fn task_correction_accepts_pinned_codex_reviewer_without_runtime_telemetry
     let task_id = "task-corr-codex-rev";
     let PreparedCorrectionFixtureTask {
         job,
+        approval_id,
+        approved_task_before,
         host_handle,
         session,
         step_ts,
         verify_1,
         review_subject_1,
         review_1,
+        art_1_before,
         task_manifest,
         prep_outcome,
         receipt,
@@ -1168,6 +1199,64 @@ async fn task_correction_accepts_pinned_codex_reviewer_without_runtime_telemetry
         reviewer_choice.clone(),
     ))
     .await;
+
+    // The approval must freeze the OpenCode v2 Go/max Coder, not the profile's default AGY Coder.
+    assert!(approved_task_before.is_frozen_headless_worker());
+    assert_eq!(
+        approved_task_before.provider,
+        Some(WorkerProvider::OpenCodeV2)
+    );
+    assert_eq!(approved_task_before.adapter, ToolAdapter::OpencodeV2);
+    assert_eq!(approved_task_before.model_id, coder_choice.model_id);
+    assert_eq!(approved_task_before.model_arg, coder_choice.model_arg);
+    assert_eq!(
+        approved_task_before.effort.as_deref(),
+        coder_choice.effort.as_deref()
+    );
+
+    // Real initial Go Coder telemetry and the software-owned session metadata must be persisted,
+    // not inferred from the test name or from the requested model.
+    assert_eq!(art_1_before.observed_provider, "opencode_v2");
+    assert_eq!(
+        art_1_before.observed_model.as_deref(),
+        Some(coder_choice.model_arg.as_str())
+    );
+    assert_eq!(art_1_before.observed_effort.as_deref(), Some("max"));
+    let initial_report =
+        load_initial_worker_execution_report(&fixture, &approval_id, &art_1_before.worker_id);
+    assert_eq!(
+        initial_report.worker_report.provider,
+        WorkerProvider::OpenCodeV2
+    );
+    assert_eq!(
+        initial_report.worker_report.requested_model.base_model,
+        coder_choice.model_arg
+    );
+    assert_eq!(
+        initial_report
+            .worker_report
+            .requested_model
+            .effort
+            .as_deref(),
+        Some("max")
+    );
+    assert_eq!(initial_report.worker_report.requested_session_id, None);
+    let initial_metadata = initial_report
+        .worker_report
+        .validated_opencode_metadata()
+        .expect("validated owned OpenCode metadata for initial attempt");
+    assert_eq!(initial_metadata.observed_model, coder_choice.model_arg);
+    assert_eq!(initial_metadata.observed_effort.as_deref(), Some("max"));
+    assert_eq!(initial_metadata.assistant_message_count, 1);
+    assert_eq!(
+        initial_report.worker_report.allocated_session_id.as_deref(),
+        Some(initial_metadata.session_id.as_str())
+    );
+    assert!(initial_metadata.session_id.starts_with("ses_go_"));
+    assert!(initial_report
+        .worker_report
+        .opencode_metadata_error
+        .is_none());
 
     // A Codex Reviewer report has no runtime model/effort telemetry; preparation must accept the
     // verified pinned launch configuration instead of demanding fabricated observations.
@@ -1252,6 +1341,47 @@ async fn task_correction_accepts_pinned_codex_reviewer_without_runtime_telemetry
         1,
         "preparing/executing a correction must not call the Reviewer"
     );
+
+    // The derived attempt must use the same frozen OpenCode v2 Go/max choice, with a fresh
+    // software-owned session and genuine observed Go telemetry from the real fake CLI invocations.
+    let derived_report = exec_outcome
+        .report
+        .as_ref()
+        .expect("persisted derived Go execution artifact");
+    assert_eq!(derived_report.coder_choice, coder_choice);
+    assert_eq!(derived_report.observed_provider, "opencode_v2");
+    assert_eq!(
+        derived_report.observed_model.as_deref(),
+        Some(coder_choice.model_arg.as_str())
+    );
+    assert_eq!(derived_report.observed_effort.as_deref(), Some("max"));
+    let derived_worker_report = &derived_report.execution_report.worker_report;
+    assert_eq!(derived_worker_report.provider, WorkerProvider::OpenCodeV2);
+    assert_eq!(
+        derived_worker_report.requested_model.base_model,
+        coder_choice.model_arg
+    );
+    assert_eq!(
+        derived_worker_report.requested_model.effort.as_deref(),
+        Some("max")
+    );
+    assert_eq!(derived_worker_report.requested_session_id, None);
+    let derived_metadata = derived_worker_report
+        .validated_opencode_metadata()
+        .expect("validated owned OpenCode metadata for derived attempt");
+    assert_eq!(derived_metadata.observed_model, coder_choice.model_arg);
+    assert_eq!(derived_metadata.observed_effort.as_deref(), Some("max"));
+    assert_eq!(derived_metadata.assistant_message_count, 1);
+    assert_eq!(
+        derived_worker_report.allocated_session_id.as_deref(),
+        Some(derived_metadata.session_id.as_str())
+    );
+    assert!(derived_metadata.session_id.starts_with("ses_go_"));
+    assert_ne!(
+        derived_metadata.session_id, initial_metadata.session_id,
+        "each attempt must allocate its own software-owned OpenCode session"
+    );
+    assert!(derived_worker_report.opencode_metadata_error.is_none());
 
     let repeat_exec = Box::pin(correction_exec_service.execute_task_correction(
         session.guard(),
@@ -1402,6 +1532,7 @@ async fn task_correction_accepts_pinned_codex_reviewer_without_runtime_telemetry
         .expect("final runtime exists");
     assert_eq!(runtime_final.total_task_attempts_reserved, 2);
     assert_eq!(runtime_final.total_corrections_reserved, 1);
+    assert_eq!(runtime_final.derived_attempts.len(), 1);
     assert_eq!(runtime_final.derived_attempts, vec![receipt]);
     assert_eq!(read_invocation_count(&fixture.agy_count_file), 2);
     assert_eq!(
