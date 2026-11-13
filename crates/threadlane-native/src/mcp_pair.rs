@@ -15,7 +15,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use threadlane::descriptor::validate_lazy_state_dir;
 use threadlane::mcp::{
-    AckEventsParams, AnswerParams, CancelParams, CancelWorkerParams, GetRunParams, GetWorkerParams,
+    AckEventsParams, AnswerParams, BacklogBlockParams, BacklogCompleteParams, BacklogCreateParams,
+    BacklogEditParams, BacklogGetParams, BacklogHistoryParams, BacklogListParams,
+    BacklogStartParams, CancelParams, CancelWorkerParams, GetRunParams, GetWorkerParams,
     ListActivityParams, ListRunQuestionsParams, ListRunRevisionsParams, ListRunsParams,
     PullEventsParams, StartDemoParams, StartWorkerParams, StatusParams, SteerParams,
 };
@@ -1805,7 +1807,15 @@ impl PairedMcpServer {
             | "cancel"
             | "start_worker"
             | "get_worker"
-            | "cancel_worker" => self.prepare_delegated_tool_json_future(tool_name, arguments),
+            | "cancel_worker"
+            | "backlog_create"
+            | "backlog_get"
+            | "backlog_list"
+            | "backlog_edit"
+            | "backlog_block"
+            | "backlog_start"
+            | "backlog_complete"
+            | "backlog_history" => self.prepare_delegated_tool_json_future(tool_name, arguments),
             "catalog"
             | "list_plans"
             | "get_plan"
@@ -1910,6 +1920,38 @@ impl PairedMcpServer {
             "cancel_worker" => {
                 let params = self.parse_enrolled_tool_params(tool_name, arguments)?;
                 Ok(self.cancel_worker_boxed(params))
+            }
+            "backlog_create" => {
+                let params = self.parse_enrolled_tool_params(tool_name, arguments)?;
+                Ok(self.backlog_create_boxed(params))
+            }
+            "backlog_get" => {
+                let params = self.parse_enrolled_tool_params(tool_name, arguments)?;
+                Ok(self.backlog_get_boxed(params))
+            }
+            "backlog_list" => {
+                let params = self.parse_enrolled_tool_params(tool_name, arguments)?;
+                Ok(self.backlog_list_boxed(params))
+            }
+            "backlog_edit" => {
+                let params = self.parse_enrolled_tool_params(tool_name, arguments)?;
+                Ok(self.backlog_edit_boxed(params))
+            }
+            "backlog_block" => {
+                let params = self.parse_enrolled_tool_params(tool_name, arguments)?;
+                Ok(self.backlog_block_boxed(params))
+            }
+            "backlog_start" => {
+                let params = self.parse_enrolled_tool_params(tool_name, arguments)?;
+                Ok(self.backlog_start_boxed(params))
+            }
+            "backlog_complete" => {
+                let params = self.parse_enrolled_tool_params(tool_name, arguments)?;
+                Ok(self.backlog_complete_boxed(params))
+            }
+            "backlog_history" => {
+                let params = self.parse_enrolled_tool_params(tool_name, arguments)?;
+                Ok(self.backlog_history_boxed(params))
             }
             _ => Err(Self::format_pairing_error(
                 tool_name,
@@ -3534,6 +3576,86 @@ impl PairedMcpServer {
         })
     }
 
+    fn backlog_create_boxed(
+        &self,
+        params: BacklogCreateParams,
+    ) -> BoxedTaskLocalFuture<'_, Result<CallToolResult, CallToolResult>> {
+        Box::pin(async move {
+            let delegate = self.enrolled_delegate("backlog_create").await?;
+            delegate.backlog_create(Parameters(params)).await
+        })
+    }
+
+    fn backlog_get_boxed(
+        &self,
+        params: BacklogGetParams,
+    ) -> BoxedTaskLocalFuture<'_, Result<CallToolResult, CallToolResult>> {
+        Box::pin(async move {
+            let delegate = self.enrolled_delegate("backlog_get").await?;
+            delegate.backlog_get(Parameters(params)).await
+        })
+    }
+
+    fn backlog_list_boxed(
+        &self,
+        params: BacklogListParams,
+    ) -> BoxedTaskLocalFuture<'_, Result<CallToolResult, CallToolResult>> {
+        Box::pin(async move {
+            let delegate = self.enrolled_delegate("backlog_list").await?;
+            delegate.backlog_list(Parameters(params)).await
+        })
+    }
+
+    fn backlog_edit_boxed(
+        &self,
+        params: BacklogEditParams,
+    ) -> BoxedTaskLocalFuture<'_, Result<CallToolResult, CallToolResult>> {
+        Box::pin(async move {
+            let delegate = self.enrolled_delegate("backlog_edit").await?;
+            delegate.backlog_edit(Parameters(params)).await
+        })
+    }
+
+    fn backlog_block_boxed(
+        &self,
+        params: BacklogBlockParams,
+    ) -> BoxedTaskLocalFuture<'_, Result<CallToolResult, CallToolResult>> {
+        Box::pin(async move {
+            let delegate = self.enrolled_delegate("backlog_block").await?;
+            delegate.backlog_block(Parameters(params)).await
+        })
+    }
+
+    fn backlog_start_boxed(
+        &self,
+        params: BacklogStartParams,
+    ) -> BoxedTaskLocalFuture<'_, Result<CallToolResult, CallToolResult>> {
+        Box::pin(async move {
+            let delegate = self.enrolled_delegate("backlog_start").await?;
+            delegate.backlog_start(Parameters(params)).await
+        })
+    }
+
+    fn backlog_complete_boxed(
+        &self,
+        params: BacklogCompleteParams,
+    ) -> BoxedTaskLocalFuture<'_, Result<CallToolResult, CallToolResult>> {
+        Box::pin(async move {
+            let delegate = self.enrolled_delegate("backlog_complete").await?;
+            delegate.backlog_complete(Parameters(params)).await
+        })
+    }
+
+    fn backlog_history_boxed(
+        &self,
+        params: BacklogHistoryParams,
+    ) -> BoxedTaskLocalFuture<'_, Result<CallToolResult, CallToolResult>> {
+        Box::pin(async move {
+            let delegate = self.enrolled_delegate("backlog_history").await?;
+            delegate.backlog_history(Parameters(params)).await
+        })
+    }
+
     fn catalog_boxed(
         &self,
         params: CatalogParams,
@@ -4387,6 +4509,158 @@ impl PairedMcpServer {
         Parameters(params): Parameters<CancelWorkerParams>,
     ) -> Result<CallToolResult, CallToolResult> {
         self.cancel_worker_boxed(params).await
+    }
+
+    /// Creates an ordinary per-chat backlog item in the enrolled chat binding (requires verified operator enrollment).
+    #[tool(
+        name = "backlog_create",
+        description = "Create an ordinary per-chat backlog item with title, acceptance condition, delivery description, and kind (worker or coworker) in the enrolled chat binding. Backlog storage only: grants no execution approval, provider authority, or worker dispatch.",
+        annotations(
+            title = "Create Ordinary Backlog Item",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    pub async fn backlog_create(
+        &self,
+        Parameters(params): Parameters<BacklogCreateParams>,
+    ) -> Result<CallToolResult, CallToolResult> {
+        self.backlog_create_boxed(params).await
+    }
+
+    /// Reads one ordinary per-chat backlog item owned by the enrolled chat binding (requires verified operator enrollment).
+    #[tool(
+        name = "backlog_get",
+        description = "Read one ordinary per-chat backlog item owned by the enrolled chat binding. Read-only: never changes revision, status, authority, or execution state.",
+        annotations(
+            title = "Get Ordinary Backlog Item",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    pub async fn backlog_get(
+        &self,
+        Parameters(params): Parameters<BacklogGetParams>,
+    ) -> Result<CallToolResult, CallToolResult> {
+        self.backlog_get_boxed(params).await
+    }
+
+    /// Lists a bounded page of ordinary per-chat backlog items owned by the enrolled chat binding (requires verified operator enrollment).
+    #[tool(
+        name = "backlog_list",
+        description = "List a bounded cursor-paginated page of ordinary per-chat backlog items owned exclusively by the enrolled chat binding. Read-only: never changes revision, status, authority, or execution state.",
+        annotations(
+            title = "List Ordinary Backlog Items",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    pub async fn backlog_list(
+        &self,
+        Parameters(params): Parameters<BacklogListParams>,
+    ) -> Result<CallToolResult, CallToolResult> {
+        self.backlog_list_boxed(params).await
+    }
+
+    /// Edits an ordinary per-chat backlog item at an expected revision in the enrolled chat binding (requires verified operator enrollment).
+    #[tool(
+        name = "backlog_edit",
+        description = "Edit the title, acceptance condition, or delivery description of an ordinary per-chat backlog item at expected_revision in the enrolled chat binding. Backlog storage only: grants no execution approval, provider authority, or worker dispatch.",
+        annotations(
+            title = "Edit Ordinary Backlog Item",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    pub async fn backlog_edit(
+        &self,
+        Parameters(params): Parameters<BacklogEditParams>,
+    ) -> Result<CallToolResult, CallToolResult> {
+        self.backlog_edit_boxed(params).await
+    }
+
+    /// Records a revision-checked blocked reason for an ordinary per-chat backlog item in the enrolled chat binding (requires verified operator enrollment).
+    #[tool(
+        name = "backlog_block",
+        description = "Record a revision-checked reason that an ordinary per-chat backlog item is blocked at expected_revision in the enrolled chat binding. Backlog storage only: grants no execution approval, provider authority, or worker dispatch.",
+        annotations(
+            title = "Block Ordinary Backlog Item",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    pub async fn backlog_block(
+        &self,
+        Parameters(params): Parameters<BacklogBlockParams>,
+    ) -> Result<CallToolResult, CallToolResult> {
+        self.backlog_block_boxed(params).await
+    }
+
+    /// Records Coworker start attestation for an ordinary per-chat backlog item in the enrolled chat binding (requires verified operator enrollment).
+    #[tool(
+        name = "backlog_start",
+        description = "Attest that an ordinary per-chat Coworker backlog item has started at expected_revision in the enrolled chat binding. ONLY a Coworker attestation: rejects Worker-backed items, and Worker execution needs the separate approved path. Grants no execution approval, provider authority, success flag, or worker dispatch.",
+        annotations(
+            title = "Attest Coworker Backlog Start",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    pub async fn backlog_start(
+        &self,
+        Parameters(params): Parameters<BacklogStartParams>,
+    ) -> Result<CallToolResult, CallToolResult> {
+        self.backlog_start_boxed(params).await
+    }
+
+    /// Records Coworker completion attestation for an ordinary per-chat backlog item in the enrolled chat binding (requires verified operator enrollment).
+    #[tool(
+        name = "backlog_complete",
+        description = "Attest completion of an ordinary per-chat Coworker backlog item at expected_revision with a note and evidence in the enrolled chat binding. ONLY a Coworker attestation: rejects Worker-backed items, and Worker execution needs the separate approved path. Grants no execution approval, provider authority, success flag, or worker dispatch.",
+        annotations(
+            title = "Attest Coworker Backlog Completion",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    pub async fn backlog_complete(
+        &self,
+        Parameters(params): Parameters<BacklogCompleteParams>,
+    ) -> Result<CallToolResult, CallToolResult> {
+        self.backlog_complete_boxed(params).await
+    }
+
+    /// Lists a bounded page of ordinary per-chat backlog history for one item owned by the enrolled chat binding (requires verified operator enrollment).
+    #[tool(
+        name = "backlog_history",
+        description = "List a bounded cursor-paginated page of ordinary per-chat backlog history for one item owned exclusively by the enrolled chat binding. Read-only: never changes revision, status, authority, or execution state.",
+        annotations(
+            title = "List Ordinary Backlog History",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    pub async fn backlog_history(
+        &self,
+        Parameters(params): Parameters<BacklogHistoryParams>,
+    ) -> Result<CallToolResult, CallToolResult> {
+        self.backlog_history_boxed(params).await
     }
 
     /// Lists a bounded page of configured workflow profiles from the operator registry (requires verified operator enrollment).
@@ -5477,5 +5751,716 @@ mod observation_correlation_tests {
             assert_eq!(actor_b2.model, None);
             assert_eq!(actor_b2.effort, None);
         }
+    }
+}
+
+#[cfg(test)]
+mod backlog_paired_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    const THREAD_A: &str = "0196ed00-0000-7000-8000-00000000030a";
+    const THREAD_B: &str = "0196ed00-0000-7000-8000-00000000030b";
+    const BACKLOG_TOOL_NAMES: [&str; 8] = [
+        "backlog_create",
+        "backlog_get",
+        "backlog_list",
+        "backlog_edit",
+        "backlog_block",
+        "backlog_start",
+        "backlog_complete",
+        "backlog_history",
+    ];
+
+    fn structured_data(result: Result<CallToolResult, CallToolResult>) -> Value {
+        let result = result.expect("backlog tool must succeed");
+        assert_ne!(
+            result.is_error,
+            Some(true),
+            "backlog tool returned is_error"
+        );
+        let payload = result
+            .structured_content
+            .expect("backlog tool must return structured content");
+        assert_eq!(payload["untrusted_data"], Value::Bool(true));
+        payload["data"].clone()
+    }
+
+    fn error_code(error: CallToolResult) -> String {
+        let payload = error
+            .structured_content
+            .expect("backlog error must be structured");
+        payload["error"]["code"]
+            .as_str()
+            .expect("backlog error code")
+            .to_string()
+    }
+
+    // The shared contract guarantees serialization but not Rust field names, so read the
+    // software-generated identifiers from the structured payload instead of assuming fields.
+    fn find_value<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
+        match value {
+            Value::Object(map) => map
+                .get(key)
+                .or_else(|| map.values().find_map(|child| find_value(child, key))),
+            Value::Array(items) => items.iter().find_map(|child| find_value(child, key)),
+            _ => None,
+        }
+    }
+
+    fn item_id(item: &Value) -> String {
+        ["item_id", "backlog_item_id", "id"]
+            .iter()
+            .find_map(|key| item.get(*key).and_then(Value::as_str))
+            .or_else(|| find_value(item, "item_id").and_then(Value::as_str))
+            .expect("backlog item must expose item_id")
+            .to_string()
+    }
+
+    fn item_revision(item: &Value) -> u64 {
+        [
+            "revision",
+            "item_revision",
+            "backlog_revision",
+            "current_revision",
+        ]
+        .iter()
+        .find_map(|key| item.get(*key).and_then(Value::as_u64))
+        .or_else(|| find_value(item, "revision").and_then(Value::as_u64))
+        .expect("backlog item must expose revision")
+    }
+
+    fn create_params(command_key: &str, kind: &str, title: &str) -> BacklogCreateParams {
+        // Deserialize the public native-facing params so the kind enum is not constructed manually.
+        serde_json::from_value(json!({
+            "command_key": command_key,
+            "title": title,
+            "acceptance_condition": format!("{title} acceptance condition"),
+            "delivery_description": format!("{title} delivery description"),
+            "kind": kind,
+        }))
+        .expect("backlog create params must match the agreed schema")
+    }
+
+    fn enroll(
+        store: &PairingStore,
+        token: &str,
+        server: &PairedMcpServer,
+        binding_id: &str,
+        thread_id: &str,
+    ) {
+        store
+            .enroll(
+                token,
+                crate::OperatorEnrollRequest {
+                    connection_nonce: server.connection_nonce().to_string(),
+                    epoch_id: server.epoch_id().to_string(),
+                    binding_id: binding_id.to_string(),
+                    thread_id: thread_id.to_string(),
+                    project_id: Some("proj_backlog".to_string()),
+                },
+            )
+            .expect("trusted fixture enrollment");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn backlog_tools_are_registered_with_strict_schemas_and_reject_unbound_meta() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state_dir = tmp.path().join("runtime");
+        let pairing_store = PairingStore::open(tmp.path().join("pairing")).expect("pairing store");
+        let unbound = PairedMcpServer::new(&state_dir, pairing_store).expect("unbound server");
+
+        let tools = unbound.list_tools();
+        assert_eq!(tools.len(), 48, "PairedMcpServer must expose 48 tools");
+
+        let cases: [(&str, bool, &[&str], &[&str]); 8] = [
+            (
+                "backlog_create",
+                false,
+                &[
+                    "acceptance_condition",
+                    "command_key",
+                    "delivery_description",
+                    "kind",
+                    "title",
+                ],
+                &[
+                    "acceptance_condition",
+                    "command_key",
+                    "delivery_description",
+                    "kind",
+                    "title",
+                ],
+            ),
+            ("backlog_get", true, &["item_id"], &["item_id"]),
+            ("backlog_list", true, &["cursor", "limit"], &[]),
+            (
+                "backlog_edit",
+                false,
+                &[
+                    "acceptance_condition",
+                    "command_key",
+                    "delivery_description",
+                    "expected_revision",
+                    "item_id",
+                    "title",
+                ],
+                &["command_key", "expected_revision", "item_id"],
+            ),
+            (
+                "backlog_block",
+                false,
+                &["command_key", "expected_revision", "item_id", "reason"],
+                &["command_key", "expected_revision", "item_id", "reason"],
+            ),
+            (
+                "backlog_start",
+                false,
+                &["command_key", "expected_revision", "item_id"],
+                &["command_key", "expected_revision", "item_id"],
+            ),
+            (
+                "backlog_complete",
+                false,
+                &[
+                    "command_key",
+                    "evidence",
+                    "expected_revision",
+                    "item_id",
+                    "note",
+                ],
+                &[
+                    "command_key",
+                    "evidence",
+                    "expected_revision",
+                    "item_id",
+                    "note",
+                ],
+            ),
+            (
+                "backlog_history",
+                true,
+                &["cursor", "item_id", "limit"],
+                &["item_id"],
+            ),
+        ];
+
+        for (tool_name, read_only, expected_props, expected_required) in cases {
+            let tool = tools
+                .iter()
+                .find(|tool| tool.name == tool_name)
+                .unwrap_or_else(|| panic!("missing backlog tool `{tool_name}`"));
+            let annotations = tool
+                .annotations
+                .as_ref()
+                .unwrap_or_else(|| panic!("missing `{tool_name}` annotations"));
+            assert_eq!(annotations.read_only_hint, Some(read_only));
+            assert_eq!(annotations.destructive_hint, Some(false));
+            assert_eq!(annotations.idempotent_hint, Some(true));
+            assert_eq!(annotations.open_world_hint, Some(false));
+
+            let schema =
+                serde_json::to_value(&tool.input_schema).expect("serialize backlog input schema");
+            assert_eq!(
+                schema["additionalProperties"],
+                Value::Bool(false),
+                "`{tool_name}` must enforce deny_unknown_fields"
+            );
+            let props = schema["properties"]
+                .as_object()
+                .unwrap_or_else(|| panic!("`{tool_name}` schema must have properties"));
+            let mut actual_props: Vec<&str> = props.keys().map(String::as_str).collect();
+            actual_props.sort_unstable();
+            let mut sorted_expected_props = expected_props.to_vec();
+            sorted_expected_props.sort_unstable();
+            assert_eq!(
+                actual_props, sorted_expected_props,
+                "`{tool_name}` exposed unexpected parameters"
+            );
+
+            let mut actual_required: Vec<&str> = schema
+                .get("required")
+                .and_then(Value::as_array)
+                .map(|required| required.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default();
+            actual_required.sort_unstable();
+            let mut sorted_expected_required = expected_required.to_vec();
+            sorted_expected_required.sort_unstable();
+            assert_eq!(
+                actual_required, sorted_expected_required,
+                "`{tool_name}` required fields do not match the agreed contract"
+            );
+
+            for forbidden in [
+                "binding_id",
+                "thread_id",
+                "thread_uuid",
+                "session_id",
+                "connection_nonce",
+                "epoch_id",
+                "now_ms",
+                "at_ms",
+                "timestamp",
+                "created_at_ms",
+                "updated_at_ms",
+                "time_ms",
+                "status",
+                "state",
+                "authority",
+                "approved",
+                "operator_approved",
+                "success",
+                "result",
+            ] {
+                assert!(
+                    !props.contains_key(forbidden),
+                    "`{tool_name}` must not expose caller-supplied `{forbidden}`"
+                );
+            }
+        }
+
+        let create_schema = serde_json::to_string(
+            &tools
+                .iter()
+                .find(|tool| tool.name == "backlog_create")
+                .expect("backlog_create tool")
+                .input_schema,
+        )
+        .expect("serialize backlog_create schema");
+        assert!(create_schema.contains("\"worker\""));
+        assert!(create_schema.contains("\"coworker\""));
+
+        for tool_name in ["backlog_start", "backlog_complete"] {
+            let description = tools
+                .iter()
+                .find(|tool| tool.name == tool_name)
+                .and_then(|tool| tool.description.as_deref())
+                .unwrap_or_else(|| panic!("missing `{tool_name}` description"));
+            assert!(
+                description.contains("ONLY a Coworker attestation"),
+                "`{tool_name}` must label the ordinary attestation boundary"
+            );
+            assert!(
+                description.contains("Worker-backed items"),
+                "`{tool_name}` must state that Worker-backed items are rejected"
+            );
+            assert!(
+                description.contains("separate approved path"),
+                "`{tool_name}` must point Worker execution to the approved path"
+            );
+        }
+
+        let forged_meta = Some(json!({
+            "threadId": THREAD_A,
+            "binding_id": "bnd_forged_backlog",
+            "thread_uuid": THREAD_A,
+        }));
+        let unbound_err = unbound
+            .invoke_tool_json("backlog_list", json!({}), forged_meta)
+            .await
+            .expect_err("unbound backlog_list must ignore and reject forged metadata");
+        assert_eq!(error_code(unbound_err), "unbound_connection");
+
+        let handler_err = unbound
+            .backlog_list(Parameters(BacklogListParams {
+                cursor: None,
+                limit: None,
+            }))
+            .await
+            .expect_err("unbound public backlog_list handler must fail");
+        assert_eq!(error_code(handler_err), "unbound_connection");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn backlog_paired_tools_enforce_scope_revisions_dedup_and_coworker_attestation() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state_dir = tmp.path().join("runtime");
+        let supervisor = threadlane::Supervisor::start(threadlane::SupervisorConfig {
+            state_dir: state_dir.clone(),
+            tick_interval: Duration::from_millis(50),
+            codex: None,
+            workers: None,
+        })
+        .await
+        .expect("start supervisor");
+        let sup_client =
+            threadlane::SupervisorClient::from_state_dir(&state_dir).expect("supervisor client");
+        let binding_a = sup_client
+            .create_binding(THREAD_A, "Backlog Chat A")
+            .await
+            .expect("create binding A");
+        let binding_b = sup_client
+            .create_binding(THREAD_B, "Backlog Chat B")
+            .await
+            .expect("create binding B");
+
+        let pairing_store = PairingStore::open(tmp.path().join("pairing")).expect("pairing store");
+        let token = pairing_store.operator_token().expect("operator token");
+        let mut mcp_a = PairedMcpServer::new(&state_dir, pairing_store.clone()).expect("mcp A");
+        let mcp_b = PairedMcpServer::new(&state_dir, pairing_store.clone()).expect("mcp B");
+        enroll(
+            &pairing_store,
+            &token,
+            &mcp_a,
+            &binding_a.binding_id,
+            THREAD_A,
+        );
+        enroll(
+            &pairing_store,
+            &token,
+            &mcp_b,
+            &binding_b.binding_id,
+            THREAD_B,
+        );
+
+        let item_a = structured_data(
+            mcp_a
+                .invoke_tool_json(
+                    "backlog_create",
+                    json!({
+                        "command_key": "backlog-create-a",
+                        "title": "Chat A ordinary item",
+                        "acceptance_condition": "Chat A acceptance condition",
+                        "delivery_description": "Chat A delivery description",
+                        "kind": "coworker"
+                    }),
+                    None,
+                )
+                .await,
+        );
+        let item_a_id = item_id(&item_a);
+
+        let item_b = structured_data(
+            mcp_b
+                .backlog_create(Parameters(create_params(
+                    "backlog-create-b",
+                    "coworker",
+                    "Chat B ordinary item",
+                )))
+                .await,
+        );
+        let item_b_id = item_id(&item_b);
+
+        let page_a = structured_data(
+            mcp_a
+                .invoke_tool_json("backlog_list", json!({"limit": 10}), None)
+                .await,
+        );
+        let page_a_json = page_a.to_string();
+        assert!(page_a_json.contains(&item_a_id));
+        assert!(!page_a_json.contains(&item_b_id));
+
+        let page_b = structured_data(
+            mcp_b
+                .backlog_list(Parameters(BacklogListParams {
+                    cursor: None,
+                    limit: Some(10),
+                }))
+                .await,
+        );
+        let page_b_json = page_b.to_string();
+        assert!(page_b_json.contains(&item_b_id));
+        assert!(!page_b_json.contains(&item_a_id));
+
+        let read_a = structured_data(
+            mcp_a
+                .backlog_get(Parameters(BacklogGetParams {
+                    item_id: item_a_id.clone(),
+                }))
+                .await,
+        );
+        assert_eq!(read_a, item_a);
+        let cross_binding_err = mcp_b
+            .invoke_tool_json("backlog_get", json!({"item_id": item_a_id}), None)
+            .await
+            .expect_err("another chat must not read Chat A's backlog item");
+        let _ = error_code(cross_binding_err);
+
+        let forged_scope_item = structured_data(
+            mcp_a
+                .invoke_tool_json(
+                    "backlog_create",
+                    json!({
+                        "command_key": "backlog-create-forged-meta",
+                        "title": "Forged meta ordinary item",
+                        "acceptance_condition": "Forged meta acceptance condition",
+                        "delivery_description": "Forged meta delivery description",
+                        "kind": "coworker"
+                    }),
+                    Some(json!({
+                        "threadId": THREAD_B,
+                        "binding_id": binding_b.binding_id,
+                        "thread_uuid": THREAD_B
+                    })),
+                )
+                .await,
+        );
+        let forged_scope_item_id = item_id(&forged_scope_item);
+        assert!(
+            !structured_data(
+                mcp_b
+                    .invoke_tool_json("backlog_list", json!({"limit": 10}), None)
+                    .await
+            )
+            .to_string()
+            .contains(&forged_scope_item_id),
+            "caller metadata must not move an item into another chat"
+        );
+
+        for tool_name in BACKLOG_TOOL_NAMES {
+            let rebind_err = mcp_a
+                .invoke_tool_json(tool_name, json!({"binding_id": binding_b.binding_id}), None)
+                .await
+                .expect_err("caller-supplied binding_id must be rejected");
+            assert_eq!(error_code(rebind_err), "rebind_rejected", "{tool_name}");
+
+            let unknown_err = mcp_a
+                .invoke_tool_json(tool_name, json!({"unknown_field": true}), None)
+                .await
+                .expect_err("unknown backlog field must be rejected");
+            assert_eq!(error_code(unknown_err), "validation_failed", "{tool_name}");
+        }
+
+        for (tool_name, key, value) in [
+            (
+                "backlog_create",
+                "authority",
+                json!({"operator_approved": true}),
+            ),
+            ("backlog_get", "result", json!({"success": true})),
+            ("backlog_list", "status", json!("completed")),
+            ("backlog_complete", "success", json!(true)),
+        ] {
+            let mut args = serde_json::Map::new();
+            args.insert(key.to_string(), value);
+            let injected_err = mcp_a
+                .invoke_tool_json(tool_name, Value::Object(args), None)
+                .await
+                .expect_err("injected authority/status/result field must be rejected");
+            assert_eq!(
+                error_code(injected_err),
+                "validation_failed",
+                "{tool_name} `{key}`"
+            );
+        }
+
+        let original_revision = item_revision(&item_a);
+        let edited_a = structured_data(
+            mcp_a
+                .backlog_edit(Parameters(BacklogEditParams {
+                    command_key: "backlog-edit-a".to_string(),
+                    item_id: item_a_id.clone(),
+                    expected_revision: original_revision,
+                    title: Some("Chat A ordinary item edited".to_string()),
+                    acceptance_condition: None,
+                    delivery_description: None,
+                }))
+                .await,
+        );
+        let edited_revision = item_revision(&edited_a);
+        assert!(edited_revision > original_revision);
+
+        let stale_err = mcp_a
+            .invoke_tool_json(
+                "backlog_edit",
+                json!({
+                    "command_key": "backlog-edit-a-stale",
+                    "item_id": item_a_id,
+                    "expected_revision": original_revision,
+                    "title": "Stale edit"
+                }),
+                None,
+            )
+            .await
+            .expect_err("stale backlog revision must be rejected");
+        let _ = error_code(stale_err);
+
+        let conflicting_key_err = mcp_a
+            .invoke_tool_json(
+                "backlog_edit",
+                json!({
+                    "command_key": "backlog-edit-a",
+                    "item_id": item_a_id,
+                    "expected_revision": edited_revision,
+                    "title": "Conflicting edit for the same command key"
+                }),
+                None,
+            )
+            .await
+            .expect_err("conflicting backlog command key must be rejected");
+        let _ = error_code(conflicting_key_err);
+
+        let conflicting_create_err = mcp_a
+            .invoke_tool_json(
+                "backlog_create",
+                json!({
+                    "command_key": "backlog-create-a",
+                    "title": "Different item for the same create key",
+                    "acceptance_condition": "Different acceptance condition",
+                    "delivery_description": "Different delivery description",
+                    "kind": "coworker"
+                }),
+                None,
+            )
+            .await
+            .expect_err("conflicting backlog create key must be rejected");
+        let _ = error_code(conflicting_create_err);
+
+        let worker_item = structured_data(
+            mcp_a
+                .invoke_tool_json(
+                    "backlog_create",
+                    json!({
+                        "command_key": "backlog-create-worker",
+                        "title": "Worker-backed ordinary item",
+                        "acceptance_condition": "Worker-backed acceptance condition",
+                        "delivery_description": "Worker-backed delivery description",
+                        "kind": "worker"
+                    }),
+                    None,
+                )
+                .await,
+        );
+        let worker_item_id = item_id(&worker_item);
+        let worker_revision = item_revision(&worker_item);
+        let worker_start_err = mcp_a
+            .invoke_tool_json(
+                "backlog_start",
+                json!({
+                    "command_key": "backlog-start-worker",
+                    "item_id": worker_item_id,
+                    "expected_revision": worker_revision
+                }),
+                None,
+            )
+            .await
+            .expect_err("Worker-backed item must reject Coworker start attestation");
+        let _ = error_code(worker_start_err);
+        let worker_complete_err = mcp_a
+            .invoke_tool_json(
+                "backlog_complete",
+                json!({
+                    "command_key": "backlog-complete-worker",
+                    "item_id": worker_item_id,
+                    "expected_revision": worker_revision,
+                    "note": "Worker completion attestation must not be accepted",
+                    "evidence": "fixture evidence"
+                }),
+                None,
+            )
+            .await
+            .expect_err("Worker-backed item must reject Coworker completion attestation");
+        let _ = error_code(worker_complete_err);
+        let worker_after = structured_data(
+            mcp_a
+                .backlog_get(Parameters(BacklogGetParams {
+                    item_id: worker_item_id,
+                }))
+                .await,
+        );
+        assert_eq!(
+            worker_after, worker_item,
+            "rejected Worker attestations must not mutate the item"
+        );
+
+        let started_a = structured_data(
+            mcp_a
+                .backlog_start(Parameters(BacklogStartParams {
+                    command_key: "backlog-start-a".to_string(),
+                    item_id: item_a_id.clone(),
+                    expected_revision: edited_revision,
+                }))
+                .await,
+        );
+        let started_revision = item_revision(&started_a);
+        assert_ne!(started_a, edited_a);
+
+        let completed_a = structured_data(
+            mcp_a
+                .backlog_complete(Parameters(BacklogCompleteParams {
+                    command_key: "backlog-complete-a".to_string(),
+                    item_id: item_a_id.clone(),
+                    expected_revision: started_revision,
+                    note: "Coworker completed the ordinary backlog item".to_string(),
+                    evidence: "fixture evidence".to_string(),
+                }))
+                .await,
+        );
+        assert_ne!(completed_a, started_a);
+
+        let read_completed = structured_data(
+            mcp_a
+                .backlog_get(Parameters(BacklogGetParams {
+                    item_id: item_a_id.clone(),
+                }))
+                .await,
+        );
+        assert_eq!(
+            read_completed, completed_a,
+            "Coworker completion must persist for a later read"
+        );
+        let history = structured_data(
+            mcp_a
+                .backlog_history(Parameters(BacklogHistoryParams {
+                    item_id: item_a_id.clone(),
+                    cursor: None,
+                    limit: Some(10),
+                }))
+                .await,
+        );
+        assert!(
+            !history.is_null(),
+            "backlog history must return a structured page"
+        );
+
+        mcp_a
+            .automatic_pairing
+            .require_call_identity
+            .store(true, Ordering::Release);
+        let missing_thread_err = mcp_a
+            .invoke_tool_json("backlog_list", json!({}), None)
+            .await
+            .expect_err("missing required thread identity must fail");
+        assert_eq!(error_code(missing_thread_err), "shared_connection_rejected");
+        let wrong_thread_err = CALL_THREAD_HINT
+            .scope(
+                Some(THREAD_B.to_string()),
+                mcp_a.invoke_tool_json("backlog_list", json!({}), None),
+            )
+            .await
+            .expect_err("wrong thread identity must fail");
+        assert_eq!(error_code(wrong_thread_err), "shared_connection_rejected");
+        let right_thread_page = CALL_THREAD_HINT
+            .scope(
+                Some(THREAD_A.to_string()),
+                mcp_a.invoke_tool_json("backlog_list", json!({}), None),
+            )
+            .await
+            .expect("matching thread identity must succeed")
+            .structured_content
+            .expect("matching thread page");
+        assert_eq!(right_thread_page["binding_id"], binding_a.binding_id);
+        mcp_a
+            .automatic_pairing
+            .require_call_identity
+            .store(false, Ordering::Release);
+
+        mcp_a.restart_epoch().expect("restart epoch");
+        let expired_epoch_err = mcp_a
+            .invoke_tool_json("backlog_list", json!({}), None)
+            .await
+            .expect_err("stale enrollment epoch must not authorize backlog tools");
+        let _ = error_code(expired_epoch_err);
+
+        let bindings = sup_client.list_bindings().await.expect("list bindings");
+        assert_eq!(
+            bindings.len(),
+            2,
+            "backlog tools must not create or rebind chats"
+        );
+
+        supervisor.shutdown().await;
     }
 }

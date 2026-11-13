@@ -100,7 +100,9 @@ pub struct StartApprovedTaskParams {
 /// Parameters for the `approved_task` MCP tool.
 ///
 /// Reads the current execution status of an approved task within `approval_id` for the enrolled
-/// `(control_binding_id, native_thread_uuid)`. Completed workers report `ready_for_review` (`accepted: false`).
+/// `(control_binding_id, native_thread_uuid)`. Completed workers report `ready_for_review`
+/// (`accepted: false`), including results read from a cleanly stopped host. Result reads never
+/// start a host or provider, dispatch work, mark tasks done, or accept a worker.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ApprovedTaskParams {
@@ -1193,6 +1195,9 @@ pub(crate) async fn execute_start_approved_task(
 }
 
 /// Executes the `approved_task` tool after enrollment verification.
+///
+/// Uses the host's live-or-stopped result reader so a completed result remains readable after a
+/// clean host stop without starting a host or provider or granting any new execution authority.
 pub(crate) async fn execute_approved_task(
     authority: Arc<AuthorityStore>,
     sessions_dir: PathBuf,
@@ -1212,7 +1217,7 @@ pub(crate) async fn execute_approved_task(
     .await?;
 
     let snapshot = client
-        .get_task(&params.approval_id, &params.task_id)
+        .get_task_live_or_stopped(&params.approval_id, &params.task_id)
         .await
         .map_err(|err| {
             let (code, message) = map_host_error_to_mcp(&err);

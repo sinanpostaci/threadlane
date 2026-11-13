@@ -1118,7 +1118,8 @@ async fn approved_mcp_tools_registered_in_router_with_strict_schemas_and_store_c
 
     // 3. Verify all 8 approved-task tools are registered in the actual `rmcp` tool router with strict schemas.
     let tools = configured_mcp.list_tools();
-    assert_eq!(tools.len(), 40);
+    // Parent combined router: 40 base tools + 8 backlog tools.
+    assert_eq!(tools.len(), 48);
 
     for (
         tool_name,
@@ -3539,7 +3540,8 @@ async fn codex_first_auto_start_cli_and_policy_prerequisites_and_default_off_inv
     assert!(enabled_server.has_host_launcher_policy());
     assert_eq!(enabled_server.host_launcher_policy(), Some(&sibling_policy));
     let enabled_tools = enabled_server.list_tools();
-    assert_eq!(enabled_tools.len(), 40);
+    // Parent combined router: 40 base tools + 8 backlog tools.
+    assert_eq!(enabled_tools.len(), 48);
     for planning_tool in [
         "prepare_work",
         "consult_architect",
@@ -5564,7 +5566,7 @@ async fn approved_activity_reads_stopped_host_history_without_restart_or_mutatio
         &digest,
         binding_a,
         THREAD_UUID_A,
-        vec!["task-root-agy".to_string()],
+        vec!["task-root-agy".to_string(), "task-root-oc".to_string()],
         1_700_000_000_100,
     );
     let mcp = PairedMcpServer::new(&fixture.state_dir, fixture.pairing_store.clone())
@@ -5612,6 +5614,36 @@ async fn approved_activity_reads_stopped_host_history_without_restart_or_mutatio
     }
     assert!(completed, "task-root-agy should reach ReadyForReview");
 
+    // Read the completed result through the MCP `approved_task` handler before stopping the host.
+    let live_result = mcp
+        .invoke_tool_json(
+            "approved_task",
+            json!({"approval_id": approval.approval_id, "task_id": "task-root-agy"}),
+            None,
+        )
+        .await
+        .expect("MCP reads completed result before host stop");
+    let live_envelope = live_result
+        .structured_content
+        .expect("live result envelope");
+    let live_snapshot: TaskStateSnapshot = serde_json::from_value(live_envelope["data"].clone())
+        .expect("deserialize live result snapshot");
+    assert_eq!(live_snapshot.status, TaskExecutionStatus::ReadyForReview);
+    assert!(!live_snapshot.accepted);
+    assert_eq!(live_snapshot.binding_id.as_str(), binding_a.as_str());
+    assert_eq!(live_snapshot.thread_uuid, THREAD_UUID_A);
+    let live_session_binding_id = live_snapshot.session_binding_id.clone();
+    let live_run_id = live_snapshot.run_id.clone().expect("live result run_id");
+    let live_worker_id = live_snapshot
+        .worker_id
+        .clone()
+        .expect("live result worker_id");
+    let live_outcome = live_snapshot
+        .worker
+        .as_ref()
+        .and_then(|worker| worker.outcome.clone())
+        .expect("live completed worker outcome");
+
     let cached_ready_summary = client
         .session_summary(&approval.approval_id)
         .expect("inspect ready summary before shutdown");
@@ -5656,6 +5688,77 @@ async fn approved_activity_reads_stopped_host_history_without_restart_or_mutatio
     let pre_snap =
         threadlane_core::observation::read_core_state_readonly(&db_path).expect("pre db snap");
     let agy_before = read_invocation_count(&fixture.agy_count_file);
+
+    // A stopped host cannot authenticate live readiness, but the same handler must return the exact
+    // checkpointed completed run and result without restarting the host or provider.
+    let stopped_result = mcp
+        .invoke_tool_json(
+            "approved_task",
+            json!({"approval_id": approval.approval_id, "task_id": "task-root-agy"}),
+            None,
+        )
+        .await
+        .expect("MCP reads completed result after host stop");
+    let stopped_envelope = stopped_result
+        .structured_content
+        .expect("stopped result envelope");
+    let stopped_snapshot: TaskStateSnapshot =
+        serde_json::from_value(stopped_envelope["data"].clone())
+            .expect("deserialize stopped result snapshot");
+    assert_eq!(stopped_snapshot.status, TaskExecutionStatus::ReadyForReview);
+    assert!(!stopped_snapshot.accepted);
+    assert_eq!(stopped_snapshot.binding_id.as_str(), binding_a.as_str());
+    assert_eq!(stopped_snapshot.thread_uuid, THREAD_UUID_A);
+    assert_eq!(stopped_snapshot.session_binding_id, live_session_binding_id);
+    assert_eq!(stopped_snapshot.run_id, Some(live_run_id));
+    assert_eq!(stopped_snapshot.worker_id, Some(live_worker_id));
+    let stopped_outcome = stopped_snapshot
+        .worker
+        .as_ref()
+        .and_then(|worker| worker.outcome.clone());
+    assert_eq!(stopped_outcome, Some(live_outcome));
+
+    // A never-dispatched approved task remains unstarted after the stopped result read.
+    let unstarted_result = mcp
+        .invoke_tool_json(
+            "approved_task",
+            json!({"approval_id": approval.approval_id, "task_id": "task-root-oc"}),
+            None,
+        )
+        .await
+        .expect("MCP reads unstarted task after host stop");
+    let unstarted_envelope = unstarted_result
+        .structured_content
+        .expect("unstarted envelope");
+    let unstarted_snapshot: TaskStateSnapshot =
+        serde_json::from_value(unstarted_envelope["data"].clone())
+            .expect("deserialize unstarted result snapshot");
+    assert!(matches!(
+        unstarted_snapshot.status,
+        TaskExecutionStatus::NotStarted | TaskExecutionStatus::Unknown
+    ));
+    assert!(!unstarted_snapshot.accepted);
+    assert!(unstarted_snapshot.run_id.is_none());
+    assert!(unstarted_snapshot.worker_id.is_none());
+
+    // Enrollment and binding scope checks still apply on the stopped result path.
+    let mcp_b = PairedMcpServer::new(&fixture.state_dir, fixture.pairing_store.clone())
+        .expect("create mcp B")
+        .with_workflow_stores(Arc::clone(&fixture.registry), Arc::clone(&fixture.plans))
+        .with_host_stores(Arc::clone(&fixture.authority), &fixture.sessions_dir);
+    enroll_server(&fixture, &mcp_b, &fixture.binding_b, THREAD_UUID_B).await;
+    let cross_binding_err = mcp_b
+        .invoke_tool_json(
+            "approved_task",
+            json!({"approval_id": approval.approval_id, "task_id": "task-root-agy"}),
+            None,
+        )
+        .await
+        .expect_err("Chat B must not read Chat A's stopped result");
+    assert_eq!(
+        cross_binding_err.structured_content.unwrap()["error"]["code"],
+        "scope_mismatch"
+    );
 
     // 1. Stopped global and task-filtered history succeed with pagination and kind filtering.
     let page1 = client
@@ -5756,11 +5859,24 @@ async fn approved_activity_reads_stopped_host_history_without_restart_or_mutatio
         "{session_error:?}"
     );
 
-    // 3. Verify zero process spawns and zero DB/cursor/wakeup mutations.
+    // 3. Verify zero process spawns, zero DB/cursor/wakeup mutations, and no host restart.
     assert_eq!(read_invocation_count(&fixture.agy_count_file), agy_before);
+    assert_eq!(read_invocation_count(&fixture.oc_count_file), 0);
+    assert!(!fixture.oc_prompt_file.exists());
     let post_snap =
         threadlane_core::observation::read_core_state_readonly(&db_path).expect("post db snap");
     assert_eq!(pre_snap, post_snap);
+    let final_manifest = threadlane_host::read_host_manifest_optional(&session_dir, &record)
+        .expect("read final manifest")
+        .expect("manifest still exists");
+    assert_eq!(final_manifest.phase, HostPhase::Stopped);
+    assert!(!threadlane_host::is_host_lock_held(&session_dir).expect("check host.lock after reads"));
+    assert!(
+        read_host_launch_intent_optional(&fixture.sessions_dir, &record)
+            .expect("read launch intent after stopped result reads")
+            .is_none(),
+        "stopped result reads must not create a host launch intent"
+    );
 }
 
 #[tokio::test]
