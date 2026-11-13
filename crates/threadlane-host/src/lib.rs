@@ -38,6 +38,8 @@
 pub mod cli;
 /// Authoritative caller-scoped client (`ApprovedHostClient`) for task dispatch, inspection, and cancellation.
 pub mod client;
+/// Read-only physical delivery inspection for an already verified completed worker task.
+pub mod delivery;
 /// Structured domain, security, scope, and runtime error types (`HostError`).
 pub mod error;
 /// Per-approval host lifecycle (`ApprovedHost`, `ApprovedHostConfig`, `ApprovedHostHandle`).
@@ -53,6 +55,10 @@ pub use cli::{
     ServeArgs,
 };
 pub use client::ApprovedHostClient;
+pub use delivery::{
+    inspect_delivery_for_verified_task, recheck_delivery_for_verified_task, DeliveryInspection,
+    DeliveryKind, MAX_DELIVERY_CHANGED_PATHS, MAX_DELIVERY_CONTENT_BYTES,
+};
 pub use error::HostError;
 pub use host::{ApprovedHost, ApprovedHostConfig, ApprovedHostHandle, DEFAULT_HOST_TICK_INTERVAL};
 pub use lifecycle::{
