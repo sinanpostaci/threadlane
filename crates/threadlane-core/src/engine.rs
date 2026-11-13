@@ -1378,8 +1378,9 @@ impl Core {
     }
 
     fn init_schema_and_recover(tx: &Transaction<'_>) -> Result<(), CoreError> {
-        // Backlog tables are additive: they are created idempotently on every
-        // open without altering existing tables, schema version, or recovery.
+        // Backlog and Worker-execution linkage tables are additive: they are
+        // created idempotently on every open without altering existing tables,
+        // schema version, or recovery.
         tx.execute_batch(
             "CREATE TABLE IF NOT EXISTS schema_meta (
                 id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -1520,6 +1521,39 @@ impl Core {
                 created_at_ms INTEGER NOT NULL,
                 PRIMARY KEY (binding_id, command_key)
             );
+
+            CREATE TABLE IF NOT EXISTS backlog_worker_executions (
+                execution_ref TEXT PRIMARY KEY,
+                binding_id TEXT NOT NULL REFERENCES bindings(binding_id),
+                item_id TEXT NOT NULL REFERENCES backlog_items(item_id),
+                approval_id TEXT NOT NULL,
+                subject_digest TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                task_digest TEXT NOT NULL,
+                acceptance_condition_digest TEXT NOT NULL,
+                delivery_description_digest TEXT NOT NULL,
+                reservation_revision INTEGER NOT NULL,
+                reserved_at_ms INTEGER NOT NULL,
+                session_binding_id TEXT,
+                run_id TEXT,
+                worker_id TEXT,
+                profile_id TEXT,
+                execution_binding_digest TEXT,
+                attached_at_ms INTEGER,
+                outcome TEXT,
+                outcome_note TEXT,
+                outcome_result_digest TEXT,
+                outcome_recorded_at_ms INTEGER,
+                completion_result_digest TEXT,
+                completion_delivery_digest TEXT,
+                completion_note TEXT,
+                completion_evidence TEXT,
+                completed_at_ms INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_backlog_worker_executions_binding_item_order
+                ON backlog_worker_executions(binding_id, item_id);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_backlog_worker_executions_approval_task
+                ON backlog_worker_executions(approval_id, task_id);
 
             CREATE TABLE IF NOT EXISTS wakeups (
                 binding_id TEXT PRIMARY KEY REFERENCES bindings(binding_id),

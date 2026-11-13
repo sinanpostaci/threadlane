@@ -5,10 +5,11 @@
 //! bounded change history; it never fabricates a `Run` or `Job`. Actual Coworker
 //! and Worker liveness stays outside this module.
 //!
-//! This foundation slice implements creation, reads, bounded listing, ordinary
-//! edits, blocking, and Coworker-only start/completion attestation. Worker
-//! items can be created, edited while `Todo`, and blocked, but guarded Worker
-//! reservation and verified terminal completion belong to the next slice.
+//! This module implements creation, reads, bounded listing, ordinary edits,
+//! blocking, and Coworker-only start/completion attestation. Guarded Worker
+//! reservation, dispatch-receipt attachment, recorded outcomes, and separate
+//! completion live in [`crate::backlog_worker`] behind explicitly named
+//! operator-attested methods for the trusted local caller.
 //!
 //! Schema initialization is additive and transactional through
 //! [`crate::Core::open`]. The existing schema version remains unchanged because
@@ -48,7 +49,7 @@ pub const MAX_BACKLOG_COMPLETION_NOTE_LEN: usize = 2_048;
 /// Maximum byte length for a Coworker completion evidence attestation.
 pub const MAX_BACKLOG_COMPLETION_EVIDENCE_LEN: usize = 2_048;
 
-/// Maximum byte length for a future Worker execution reference.
+/// Maximum byte length for a Worker execution reference stored on an item.
 pub const MAX_BACKLOG_EXECUTION_REF_LEN: usize = 512;
 
 const BACKLOG_CURSOR_VERSION: &str = "tlb1";
@@ -67,8 +68,10 @@ const COMPLETE_OPERATION: &str = "backlog_complete";
 pub enum BacklogItemKind {
     /// Work intended for the guarded Worker reservation/completion path.
     ///
-    /// In this foundation slice Worker items can be created, edited while
-    /// `Todo`, and blocked only. They cannot be started or completed manually.
+    /// Worker items can be created, edited while `Todo`, and blocked while
+    /// `Todo`. They cannot be started or completed through the ordinary manual
+    /// APIs. [`crate::backlog_worker`] provides the separate operator-attested
+    /// reservation, receipt, outcome, and completion boundary.
     Worker,
     /// Work the native Codex Coworker performs in the human conversation.
     ///
@@ -101,7 +104,7 @@ impl BacklogItemKind {
 pub enum BacklogStatus {
     /// Not started.
     Todo,
-    /// Coworker is actively working, or a future Worker reservation holds it.
+    /// Coworker is actively working, or a Worker execution reservation holds it.
     Doing,
     /// Accepted delivery was durably recorded.
     Done,
@@ -144,6 +147,14 @@ pub enum BacklogHistoryAction {
     Blocked,
     /// The item moved to `Done` with completion evidence.
     Completed,
+    /// A Worker execution reservation froze the current authority and conditions.
+    ///
+    /// This is a reservation, not proof that an external process is running.
+    WorkerReserved,
+    /// The exact dispatch receipt for the current Worker execution was attached.
+    WorkerExecutionAttached,
+    /// An operator-verified Worker outcome was recorded for the current execution.
+    WorkerOutcomeRecorded,
 }
 
 impl BacklogHistoryAction {
@@ -154,6 +165,9 @@ impl BacklogHistoryAction {
             Self::Started => "started",
             Self::Blocked => "blocked",
             Self::Completed => "completed",
+            Self::WorkerReserved => "worker_reserved",
+            Self::WorkerExecutionAttached => "worker_execution_attached",
+            Self::WorkerOutcomeRecorded => "worker_outcome_recorded",
         }
     }
 
@@ -164,6 +178,9 @@ impl BacklogHistoryAction {
             "started" => Some(Self::Started),
             "blocked" => Some(Self::Blocked),
             "completed" => Some(Self::Completed),
+            "worker_reserved" => Some(Self::WorkerReserved),
+            "worker_execution_attached" => Some(Self::WorkerExecutionAttached),
+            "worker_outcome_recorded" => Some(Self::WorkerOutcomeRecorded),
             _ => None,
         }
     }
@@ -179,7 +196,7 @@ pub struct NewBacklogItem {
     pub acceptance_condition: String,
     /// Bounded description of the intended delivery.
     pub delivery_description: String,
-    /// Coworker-attested or future Worker-backed work.
+    /// Coworker-attested or Worker-backed work.
     pub kind: BacklogItemKind,
 }
 
@@ -214,16 +231,17 @@ pub struct BacklogItem {
     pub acceptance_condition: String,
     /// Bounded description of the intended delivery.
     pub delivery_description: String,
-    /// Coworker-attested or future Worker-backed work.
+    /// Coworker-attested or Worker-backed work.
     pub kind: BacklogItemKind,
     /// Current committed backlog state.
     pub status: BacklogStatus,
     /// Bounded reason when `status == BacklogStatus::Blocked`.
     pub blocked_reason: Option<String>,
-    /// Reserved for a future Worker reservation.
+    /// Current Worker execution reservation, when one holds this item.
     ///
-    /// Remains `None` throughout this foundation slice. Coworker completion
-    /// never attaches a Worker invocation here.
+    /// Coworker completion never attaches a Worker invocation here. Previous
+    /// Worker attempts remain in the execution ledger and backlog history after
+    /// a later reservation replaces this current reference.
     pub current_execution_ref: Option<String>,
     /// Bounded Coworker attestation note recorded on completion.
     pub completion_note: Option<String>,
@@ -433,9 +451,10 @@ impl Core {
     ///
     /// Editing is allowed in `Todo`. In `Doing`, only the title may be clarified;
     /// the acceptance condition and delivery description are immutable. `Blocked`
-    /// and `Done` items reject ordinary edits. Worker items are only editable
-    /// while `Todo`. This method cannot change kind, status, completion, or
-    /// execution references.
+    /// and `Done` items reject ordinary edits. A reserved Worker item may have
+    /// its title clarified while `Doing`, but its acceptance condition and
+    /// delivery description stay frozen for every later status. This method
+    /// cannot change kind, status, completion, or execution references.
     pub fn edit_backlog_item(
         &mut self,
         binding_id: &str,
@@ -532,10 +551,12 @@ impl Core {
                 return Err(invalid_backlog_transition(&backlog_item, "edit"));
             }
         }
-        if backlog_item.kind == BacklogItemKind::Worker
-            && backlog_item.status != BacklogStatus::Todo
-        {
-            return Err(worker_manual_transition(&backlog_item, "edited"));
+        if backlog_item.kind == BacklogItemKind::Worker {
+            match backlog_item.status {
+                BacklogStatus::Todo => {}
+                BacklogStatus::Doing if backlog_item.current_execution_ref.is_some() => {}
+                _ => return Err(worker_manual_transition(&backlog_item, "edited")),
+            }
         }
         if let Some(title) = clean_title {
             backlog_item.title = title;
@@ -567,8 +588,10 @@ impl Core {
 
     /// Blocks a `Todo` or `Doing` item with a bounded reason.
     ///
-    /// Worker items may be blocked while `Todo`; they cannot enter `Doing` in
-    /// this slice, so Worker blocking never implies a running process.
+    /// Worker items may be blocked manually while `Todo`. A reserved Worker item
+    /// cannot be blocked through this ordinary API; recorded `Failure` or
+    /// `Unknown` outcomes block it through
+    /// [`crate::backlog_worker`] while preserving its execution evidence.
     pub fn block_backlog_item(
         &mut self,
         binding_id: &str,
@@ -648,9 +671,10 @@ impl Core {
 
     /// Starts a Coworker item from `Todo` or `Blocked` with a revision check.
     ///
-    /// Worker items are rejected: guarded Worker reservation is not part of this
-    /// foundation slice. Starting clears a prior blocked reason and never
-    /// attaches a Worker execution reference.
+    /// Worker items are rejected; only the separate operator-attested
+    /// [`crate::backlog_worker`] reservation can move a Worker item to `Doing`.
+    /// Starting clears a prior blocked reason and never attaches a Worker
+    /// execution reference.
     pub fn start_backlog_item(
         &mut self,
         binding_id: &str,
@@ -723,10 +747,11 @@ impl Core {
     /// Completes a Coworker item from `Doing` with bounded delivery note and
     /// evidence.
     ///
-    /// This is an explicit attestation that the Coworker checked the acceptance
-    /// condition and delivered the described result. It is not proof that a real
-    /// Worker ran, does not accept a caller-provided success flag, and never
-    /// attaches a Worker invocation. Completion is rejected from `Todo`,
+    /// This is an explicit Coworker attestation that the acceptance condition
+    /// was checked and the described result was delivered. It is not proof that
+    /// a real Worker ran, does not accept a caller-provided success flag, and
+    /// never attaches a Worker invocation. Worker items must use
+    /// [`crate::backlog_worker`] instead. Completion is rejected from `Todo`,
     /// `Blocked`, or `Done`, and completed evidence is immutable.
     #[allow(clippy::too_many_arguments)]
     pub fn complete_backlog_item(
@@ -846,7 +871,7 @@ impl Core {
     }
 }
 
-fn validate_backlog_item_id(raw: &str) -> Result<String, CoreError> {
+pub(crate) fn validate_backlog_item_id(raw: &str) -> Result<String, CoreError> {
     let clean = validate_identifier("item_id", raw)?;
     if clean.contains(':') {
         return Err(CoreError::Validation {
@@ -857,7 +882,7 @@ fn validate_backlog_item_id(raw: &str) -> Result<String, CoreError> {
     Ok(clean)
 }
 
-fn validate_expected_revision(expected_revision: u64) -> Result<(), CoreError> {
+pub(crate) fn validate_expected_revision(expected_revision: u64) -> Result<(), CoreError> {
     if expected_revision == 0 {
         return Err(CoreError::Validation {
             field: "expected_revision",
@@ -867,7 +892,7 @@ fn validate_expected_revision(expected_revision: u64) -> Result<(), CoreError> {
     Ok(())
 }
 
-fn next_backlog_revision(item: &BacklogItem) -> Result<u64, CoreError> {
+pub(crate) fn next_backlog_revision(item: &BacklogItem) -> Result<u64, CoreError> {
     item.revision.checked_add(1).ok_or_else(|| {
         CoreError::CorruptState(format!(
             "backlog item `{}` revision overflowed u64",
@@ -883,7 +908,7 @@ fn backlog_item_not_found(binding_id: &str, item_id: &str) -> CoreError {
     }
 }
 
-fn invalid_backlog_transition(item: &BacklogItem, action: &'static str) -> CoreError {
+pub(crate) fn invalid_backlog_transition(item: &BacklogItem, action: &'static str) -> CoreError {
     CoreError::Validation {
         field: "status",
         reason: format!(
@@ -898,13 +923,16 @@ fn worker_manual_transition(item: &BacklogItem, action: &'static str) -> CoreErr
     CoreError::Validation {
         field: "kind",
         reason: format!(
-            "Worker backlog item `{}` cannot be `{action}` manually; guarded Worker reservation and verified terminal completion are not implemented in this foundation slice",
+            "Worker backlog item `{}` cannot be `{action}` through the ordinary backlog API; use the operator-attested Worker execution path",
             item.item_id
         ),
     }
 }
 
-fn validate_backlog_item(item: &BacklogItem, expected_binding_id: &str) -> Result<(), CoreError> {
+pub(crate) fn validate_backlog_item(
+    item: &BacklogItem,
+    expected_binding_id: &str,
+) -> Result<(), CoreError> {
     if item.binding_id != expected_binding_id {
         return Err(CoreError::CorruptState(format!(
             "backlog item `{}` belongs to binding `{}` instead of requested binding `{expected_binding_id}`",
@@ -997,7 +1025,7 @@ fn validate_backlog_item(item: &BacklogItem, expected_binding_id: &str) -> Resul
     Ok(())
 }
 
-fn load_backlog_item_conn(
+pub(crate) fn load_backlog_item_conn(
     conn: &Connection,
     binding_id: &str,
     item_id: &str,
@@ -1108,7 +1136,7 @@ fn insert_backlog_item_tx(tx: &Transaction<'_>, item: &BacklogItem) -> Result<()
     Ok(())
 }
 
-fn update_backlog_item_tx(
+pub(crate) fn update_backlog_item_tx(
     tx: &Transaction<'_>,
     item: &BacklogItem,
     expected_revision: u64,
@@ -1155,7 +1183,7 @@ fn update_backlog_item_tx(
     Ok(())
 }
 
-fn record_backlog_history_tx(
+pub(crate) fn record_backlog_history_tx(
     tx: &Transaction<'_>,
     item: &BacklogItem,
     action: BacklogHistoryAction,
@@ -1179,14 +1207,11 @@ fn record_backlog_history_tx(
     Ok(())
 }
 
-fn check_backlog_dedup(
+pub(crate) fn check_backlog_dedup_raw(
     tx: &Transaction<'_>,
     binding_id: &str,
     command_key: &str,
-    operation: &str,
-    payload_hash: &str,
-    expected_item_id: Option<&str>,
-) -> Result<Option<BacklogItem>, CoreError> {
+) -> Result<Option<(String, String, String)>, CoreError> {
     let existing: Option<(String, String, String)> = tx
         .query_row(
             "SELECT operation, payload_hash, response_json
@@ -1196,8 +1221,20 @@ fn check_backlog_dedup(
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()?;
+    Ok(existing)
+}
 
-    let Some((stored_operation, stored_hash, response_json)) = existing else {
+fn check_backlog_dedup(
+    tx: &Transaction<'_>,
+    binding_id: &str,
+    command_key: &str,
+    operation: &str,
+    payload_hash: &str,
+    expected_item_id: Option<&str>,
+) -> Result<Option<BacklogItem>, CoreError> {
+    let Some((stored_operation, stored_hash, response_json)) =
+        check_backlog_dedup_raw(tx, binding_id, command_key)?
+    else {
         return Ok(None);
     };
     if stored_operation != operation || stored_hash != payload_hash {
@@ -1226,16 +1263,15 @@ fn check_backlog_dedup(
     Ok(Some(item))
 }
 
-fn record_backlog_dedup(
+pub(crate) fn record_backlog_dedup_raw(
     tx: &Transaction<'_>,
     binding_id: &str,
     command_key: &str,
     operation: &str,
     payload_hash: &str,
-    item: &BacklogItem,
+    response_json: &str,
     now_ms: i64,
 ) -> Result<(), CoreError> {
-    let response_json = serialize_backlog_item(item)?;
     tx.execute(
         "INSERT INTO backlog_command_dedup (
             binding_id, command_key, operation, payload_hash, response_json, created_at_ms
@@ -1250,6 +1286,27 @@ fn record_backlog_dedup(
         ],
     )?;
     Ok(())
+}
+
+fn record_backlog_dedup(
+    tx: &Transaction<'_>,
+    binding_id: &str,
+    command_key: &str,
+    operation: &str,
+    payload_hash: &str,
+    item: &BacklogItem,
+    now_ms: i64,
+) -> Result<(), CoreError> {
+    let response_json = serialize_backlog_item(item)?;
+    record_backlog_dedup_raw(
+        tx,
+        binding_id,
+        command_key,
+        operation,
+        payload_hash,
+        &response_json,
+        now_ms,
+    )
 }
 
 fn serialize_backlog_item(item: &BacklogItem) -> Result<String, CoreError> {
@@ -1652,7 +1709,7 @@ fn parse_backlog_history_cursor(
     Ok((after, high_water_mark))
 }
 
-fn validate_backlog_cursor_text(raw: &str) -> Result<(), CoreError> {
+pub(crate) fn validate_backlog_cursor_text(raw: &str) -> Result<(), CoreError> {
     if raw.is_empty() {
         return Err(CoreError::Validation {
             field: "cursor",
@@ -1675,7 +1732,7 @@ fn validate_backlog_cursor_text(raw: &str) -> Result<(), CoreError> {
     Ok(())
 }
 
-fn parse_backlog_cursor_position(label: &str, raw: &str) -> Result<u64, CoreError> {
+pub(crate) fn parse_backlog_cursor_position(label: &str, raw: &str) -> Result<u64, CoreError> {
     if raw.is_empty() || !raw.bytes().all(|byte| byte.is_ascii_digit()) || raw.starts_with('0') {
         return Err(CoreError::Validation {
             field: "cursor",

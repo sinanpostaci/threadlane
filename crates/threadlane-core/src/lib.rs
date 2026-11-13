@@ -6,11 +6,16 @@
 //! This crate owns the SQLite persistence layer, deterministic demo run state machine,
 //! per-binding isolation, revision-checked answer/steer/cancel mutations, idempotent
 //! command deduplication, ordered event batches with high-water-mark acknowledgements,
-//! persistent wake-up notice coalescing and recovery, and the durable per-chat
-//! Todo/Doing/Done/Blocked backlog used by the minimal chat-centered MVP.
+//! persistent wake-up notice coalescing and recovery, the durable per-chat
+//! Todo/Doing/Done/Blocked backlog used by the minimal chat-centered MVP, and
+//! trusted-local operator-attested Worker execution linkage for backlog items.
 
 /// Durable per-chat backlog storage and revision-checked item mutations.
 pub mod backlog;
+/// Trusted-local operator-attested Worker execution linkage for backlog items.
+///
+/// These methods are core integration helpers, not public scoped MCP tools.
+pub mod backlog_worker;
 mod engine;
 /// Domain and storage error types.
 pub mod error;
@@ -31,6 +36,12 @@ pub use backlog::{
     MAX_BACKLOG_BLOCKED_REASON_LEN, MAX_BACKLOG_COMPLETION_EVIDENCE_LEN,
     MAX_BACKLOG_COMPLETION_NOTE_LEN, MAX_BACKLOG_DELIVERY_LEN, MAX_BACKLOG_EXECUTION_REF_LEN,
     MAX_BACKLOG_TITLE_LEN,
+};
+pub use backlog_worker::{
+    WorkerBacklogAttemptIdentity, WorkerBacklogAttemptPage, WorkerBacklogAuthority,
+    WorkerBacklogCompletion, WorkerBacklogCompletionReceipt, WorkerBacklogCompletionRecord,
+    WorkerBacklogDispatchReceipt, WorkerBacklogExecution, WorkerBacklogOutcome,
+    WorkerBacklogOutcomeReport, WorkerBacklogRecordedOutcome, MAX_WORKER_BACKLOG_OUTCOME_NOTE_LEN,
 };
 pub use engine::Core;
 pub use error::{AckErrorReason, CoreError};
