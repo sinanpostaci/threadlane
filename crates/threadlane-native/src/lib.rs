@@ -1069,9 +1069,9 @@ fi
         let mcp_a = PairedMcpServer::new(&state_dir, pairing_store.clone()).expect("create mcp A");
         let mcp_b = PairedMcpServer::new(&state_dir, pairing_store.clone()).expect("create mcp B");
 
-        // Two connection tools, sixteen runtime tools, eight ordinary backlog tools, three guarded Worker backlog tools, five workflow tools, eight approved-task tools, five Coworker planning tools, and four Coworker execution tools.
+        // Two connection tools, sixteen runtime tools, eight ordinary backlog tools, four guarded Worker backlog tools, five workflow tools, eight approved-task tools, five Coworker planning tools, and four Coworker execution tools.
         let tools = mcp_a.list_tools();
-        assert_eq!(tools.len(), 51, "PairedMcpServer must expose 51 tools");
+        assert_eq!(tools.len(), 52, "PairedMcpServer must expose 52 tools");
         let list_activity_tool = tools
             .iter()
             .find(|tool| tool.name == "list_activity")
@@ -1406,7 +1406,7 @@ fi
         let mcp = PairedMcpServer::new(&state_dir, pairing_store).expect("create mcp");
 
         let tools = mcp.list_tools();
-        assert_eq!(tools.len(), 51);
+        assert_eq!(tools.len(), 52);
 
         for (tool_name, expected_read_only, expected_props) in [
             ("catalog", true, &["cursor", "limit"][..]),

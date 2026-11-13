@@ -53,8 +53,9 @@ use crate::auto_pair::{
 };
 use crate::backlog_worker::{
     WorkerBacklogCompleteOutcome, WorkerBacklogCompleteParams, WorkerBacklogError,
-    WorkerBacklogResultOutcome, WorkerBacklogResultParams, WorkerBacklogService,
-    WorkerBacklogStartParams, WORKER_BACKLOG_COMPLETE_TOOL, WORKER_BACKLOG_RESULT_TOOL,
+    WorkerBacklogRejectOutcome, WorkerBacklogRejectParams, WorkerBacklogResultOutcome,
+    WorkerBacklogResultParams, WorkerBacklogService, WorkerBacklogStartParams,
+    WORKER_BACKLOG_COMPLETE_TOOL, WORKER_BACKLOG_REJECT_TOOL, WORKER_BACKLOG_RESULT_TOOL,
     WORKER_BACKLOG_START_TOOL,
 };
 use crate::error::{NativeError, NativeErrorCode};
@@ -1839,7 +1840,8 @@ impl PairedMcpServer {
             }
             WORKER_BACKLOG_START_TOOL
             | WORKER_BACKLOG_RESULT_TOOL
-            | WORKER_BACKLOG_COMPLETE_TOOL => {
+            | WORKER_BACKLOG_COMPLETE_TOOL
+            | WORKER_BACKLOG_REJECT_TOOL => {
                 self.prepare_backlog_worker_tool_json_future(tool_name, arguments)
             }
             "coworker_status"
@@ -2081,6 +2083,11 @@ impl PairedMcpServer {
                 let params: WorkerBacklogCompleteParams =
                     Self::parse_tool_params(tool_name, arguments)?;
                 Ok(self.backlog_worker_complete_boxed(params))
+            }
+            WORKER_BACKLOG_REJECT_TOOL => {
+                let params: WorkerBacklogRejectParams =
+                    Self::parse_tool_params(tool_name, arguments)?;
+                Ok(self.backlog_worker_reject_boxed(params))
             }
             _ => Err(Self::format_pairing_error(
                 tool_name,
@@ -4037,6 +4044,68 @@ impl PairedMcpServer {
         })
     }
 
+    fn backlog_worker_reject_boxed(
+        &self,
+        params: WorkerBacklogRejectParams,
+    ) -> BoxedTaskLocalFuture<'_, Result<CallToolResult, CallToolResult>> {
+        Box::pin(async move {
+            let enrollment = self.verify_enrolled_binding_for_tool(WORKER_BACKLOG_REJECT_TOOL)?;
+            let Some(stores) = self.host_stores.clone() else {
+                return Err(Self::format_scoped_error(
+                    &enrollment.binding_id,
+                    WORKER_BACKLOG_REJECT_TOOL,
+                    "host_not_configured",
+                    HOST_NOT_CONFIGURED_MESSAGE,
+                ));
+            };
+            let service = self.backlog_worker_service(&stores).map_err(|error| {
+                Self::format_scoped_error(
+                    &enrollment.binding_id,
+                    WORKER_BACKLOG_REJECT_TOOL,
+                    error.code(),
+                    error.message(),
+                )
+            })?;
+            let final_recheck = self.backlog_worker_final_recheck(
+                WORKER_BACKLOG_REJECT_TOOL,
+                enrollment.binding_id.clone(),
+                enrollment.thread_id.clone(),
+            );
+            let req_id = self
+                .begin_paired_observation(
+                    &enrollment.binding_id,
+                    &enrollment.thread_id,
+                    WORKER_BACKLOG_REJECT_TOOL,
+                    None,
+                    None,
+                )
+                .await;
+            let result: Result<WorkerBacklogRejectOutcome, WorkerBacklogError> = service
+                .reject(
+                    &enrollment.binding_id,
+                    &enrollment.thread_id,
+                    params,
+                    final_recheck,
+                )
+                .await;
+            let res = match result {
+                Ok(outcome) => Self::format_planning_gateway_result(
+                    &enrollment.binding_id,
+                    WORKER_BACKLOG_REJECT_TOOL,
+                    outcome,
+                ),
+                Err(error) => Err(Self::format_scoped_error(
+                    &enrollment.binding_id,
+                    WORKER_BACKLOG_REJECT_TOOL,
+                    error.code(),
+                    error.message(),
+                )),
+            };
+            self.finish_paired_observation(req_id, &res).await;
+            res
+        })
+    }
+
     fn catalog_boxed(
         &self,
         params: CatalogParams,
@@ -5099,6 +5168,25 @@ impl PairedMcpServer {
         Parameters(params): Parameters<WorkerBacklogCompleteParams>,
     ) -> Result<CallToolResult, CallToolResult> {
         self.backlog_worker_complete_boxed(params).await
+    }
+
+    /// Records a checked failed-acceptance rejection of an exact successful Worker delivery (requires verified operator enrollment).
+    #[tool(
+        name = "backlog_worker_reject",
+        description = "Reject Coworker acceptance of one exact stored successful Worker execution after independently checking the actual physical delivery. Requires the exact current revision, execution_ref, result digest, and delivery digest returned by the result tool, plus a bounded reason and evidence. A first rejection rechecks the real terminal success and delivery bytes, then durably blocks the item without rewriting the successful outcome as a provider failure or recording Done. Exact durable replay returns the original rejection receipt without reading the old checkout, even after a newer authorized attempt; changed keys, payloads, references, or revisions are refused. Creates no new role, host, dispatch, retry, or human request.",
+        annotations(
+            title = "Reject Guarded Worker Delivery",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    pub async fn backlog_worker_reject(
+        &self,
+        Parameters(params): Parameters<WorkerBacklogRejectParams>,
+    ) -> Result<CallToolResult, CallToolResult> {
+        self.backlog_worker_reject_boxed(params).await
     }
 
     /// Lists a bounded page of configured workflow profiles from the operator registry (requires verified operator enrollment).
@@ -6310,7 +6398,7 @@ mod backlog_paired_tests {
         let unbound = PairedMcpServer::new(&state_dir, pairing_store).expect("unbound server");
 
         let tools = unbound.list_tools();
-        assert_eq!(tools.len(), 51, "PairedMcpServer must expose 51 tools");
+        assert_eq!(tools.len(), 52, "PairedMcpServer must expose 52 tools");
 
         let cases: [(&str, bool, &[&str], &[&str]); 8] = [
             (

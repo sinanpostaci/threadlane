@@ -3,9 +3,10 @@
 //! This module is the typed boundary between the paired MCP server and the existing
 //! trusted-local supervisor transport. It reserves a Worker backlog item before any
 //! host/provider effect, reconciles the original approved task and invocation, reads
-//! genuine live or stopped host snapshots, records only verified terminal outcomes, and
-//! commits separate Coworker acceptance completion. It never creates a job, controller,
-//! reviewer, closure stage, or automatic acceptance decision.
+//! genuine live or stopped host snapshots, records only verified terminal outcomes,
+//! commits separate Coworker acceptance completion, and records a failed-acceptance
+//! rejection only after rechecking the same physically verified delivery. It never
+//! creates a job, controller, reviewer, closure stage, or automatic acceptance decision.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -20,9 +21,11 @@ use threadlane::protocol::{ScopedRequest, ScopedResponse};
 use threadlane::{ErrorCode as RuntimeErrorCode, SupervisorClient};
 use threadlane_authority::{ApprovalRecord, ApprovedTaskRecord, AuthorityError, AuthorityStore};
 use threadlane_core::{
-    BacklogItem, BacklogItemKind, BacklogStatus, WorkerAcceptanceState, WorkerBacklogAuthority,
-    WorkerBacklogCompletion, WorkerBacklogCompletionReceipt, WorkerBacklogDispatchReceipt,
-    WorkerBacklogExecution, WorkerBacklogOutcome, WorkerBacklogOutcomeReport, WorkerStatus,
+    BacklogItem, BacklogItemKind, BacklogStatus, WorkerAcceptanceState,
+    WorkerBacklogAcceptanceRejection, WorkerBacklogAcceptanceRejectionReceipt,
+    WorkerBacklogAuthority, WorkerBacklogCompletion, WorkerBacklogCompletionReceipt,
+    WorkerBacklogDispatchReceipt, WorkerBacklogExecution, WorkerBacklogOutcome,
+    WorkerBacklogOutcomeReport, WorkerStatus,
 };
 use threadlane_host::{
     ApprovedHostClient, DeliveryInspection, HostError, TaskExecutionStatus, TaskStateSnapshot,
@@ -36,6 +39,7 @@ use crate::host_launcher::{
 const START_TOOL: &str = "backlog_worker_start";
 const RESULT_TOOL: &str = "backlog_worker_result";
 const COMPLETE_TOOL: &str = "backlog_worker_complete";
+const REJECT_TOOL: &str = "backlog_worker_reject";
 const FAILURE_RESULT_DIGEST_SCHEMA: &str = "threadlane-worker-backlog-failure-result-v1";
 const DERIVED_COMMAND_DOMAIN: &str = "threadlane-worker-backlog-command-v1";
 
@@ -90,6 +94,33 @@ pub struct WorkerBacklogCompleteParams {
     pub acceptance_evidence: String,
 }
 
+/// Strict MCP parameters for rejecting a technically successful delivery.
+///
+/// The caller must already have read the exact stored success and physical
+/// delivery, and independently decided that the delivered result does not meet
+/// the item's acceptance condition. The request carries no outcome override and
+/// cannot claim a provider failure or completion.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerBacklogRejectParams {
+    /// Caller-supplied idempotency key scoped to the enrolled chat binding.
+    pub command_key: String,
+    /// Software-generated backlog item identifier.
+    pub item_id: String,
+    /// Expected current backlog item revision.
+    pub expected_revision: u64,
+    /// Exact stored successful Worker execution reference.
+    pub execution_ref: String,
+    /// Exact successful result digest previously returned by the result tool.
+    pub expected_result_digest: String,
+    /// Exact physical delivery digest previously returned by the result tool.
+    pub expected_delivery_digest: String,
+    /// Bounded Coworker reason the delivered result failed acceptance.
+    pub rejection_reason: String,
+    /// Bounded Coworker evidence checked during failed acceptance.
+    pub rejection_evidence: String,
+}
+
 /// Compact successful start/reservation response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerBacklogStartOutcome {
@@ -119,6 +150,16 @@ pub struct WorkerBacklogCompleteOutcome {
     /// Durable core completion receipt.
     pub completion: WorkerBacklogCompletionReceipt,
     /// Path-free delivery inspection observed for a first completion; absent on durable replay.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivery: Option<DeliveryInspection>,
+}
+
+/// Separate failed-acceptance rejection response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerBacklogRejectOutcome {
+    /// Durable core rejection receipt preserving the original successful outcome.
+    pub rejection: WorkerBacklogAcceptanceRejectionReceipt,
+    /// Path-free delivery inspection observed for a first rejection; absent on durable replay.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delivery: Option<DeliveryInspection>,
 }
@@ -791,6 +832,176 @@ impl WorkerBacklogService {
         })
     }
 
+    /// Rejects Coworker acceptance of a technically successful Worker delivery.
+    ///
+    /// A first rejection re-reads the exact current item/execution, the stored successful
+    /// terminal result, and the genuine physical delivery, then requires the caller's exact
+    /// expected digests before committing a separate durable rejection. The original
+    /// successful outcome is never rewritten as a failure and the item never becomes `Done`.
+    /// A missing or changed checkout is a refusal, never a rejection by absence. An exact
+    /// durable replay returns the original rejection receipt without reading a mutable
+    /// checkout, even after a newer authorized attempt exists. Changed command keys,
+    /// payloads, execution references, or revisions are refused rather than reinterpreted.
+    pub(crate) async fn reject<F>(
+        &self,
+        binding_id: &str,
+        thread_uuid: &str,
+        params: WorkerBacklogRejectParams,
+        final_recheck: F,
+    ) -> Result<WorkerBacklogRejectOutcome, WorkerBacklogError>
+    where
+        F: FnOnce() -> Result<(), WorkerBacklogError> + Send,
+    {
+        let mut final_recheck = Some(final_recheck);
+        let item = self.load_item(binding_id, &params.item_id).await?;
+        let execution = self
+            .get_execution(
+                binding_id,
+                thread_uuid,
+                &params.item_id,
+                &params.execution_ref,
+            )
+            .await?;
+        validate_execution_identity(&execution, binding_id, &params.item_id)?;
+        let (record, task) = self
+            .load_execution_authority(binding_id, thread_uuid, &execution)
+            .await?;
+
+        // Durable replay is resolved before current-item or physical-checkout checks: the
+        // original rejection remains the immutable receipt even after a newer attempt exists.
+        if let Some(stored) = execution.acceptance_rejection.as_ref() {
+            if stored.result_digest != params.expected_result_digest
+                || stored.delivery_digest != params.expected_delivery_digest
+                || stored.reason != params.rejection_reason
+                || stored.evidence != params.rejection_evidence
+            {
+                return Err(WorkerBacklogError::new(
+                    "rejection_conflict",
+                    "The backlog item already has a different durable acceptance rejection.",
+                ));
+            }
+            final_recheck
+                .take()
+                .expect("rejection recheck closure must be available")()?;
+            let rejection = self
+                .reject_core(binding_id, &record.thread_uuid, &params)
+                .await
+                .map_err(|error| match error.code {
+                    "worker_backlog_unavailable" | "supervisor_unavailable" => error,
+                    _ => WorkerBacklogError::new(
+                        "rejection_conflict",
+                        "The durable acceptance rejection cannot be replayed with this command key, payload, execution reference, or revision.",
+                    ),
+                })?;
+            validate_rejection_receipt(
+                &rejection,
+                binding_id,
+                &params.item_id,
+                &params.execution_ref,
+                &params.expected_result_digest,
+                &params.expected_delivery_digest,
+                &params.rejection_reason,
+                &params.rejection_evidence,
+            )?;
+            return Ok(WorkerBacklogRejectOutcome {
+                rejection,
+                delivery: None,
+            });
+        }
+
+        if item.current_execution_ref.as_deref() != Some(execution.execution_ref.as_str()) {
+            return Err(WorkerBacklogError::new(
+                "execution_not_current",
+                "The stored Worker execution is not the current execution for this backlog item.",
+            ));
+        }
+        if execution.completion.is_some() {
+            return Err(WorkerBacklogError::new(
+                "invalid_state",
+                "A completed Worker execution cannot be rejected.",
+            ));
+        }
+        let outcome = execution.outcome.as_ref().ok_or_else(|| {
+            WorkerBacklogError::new(
+                "outcome_required",
+                "Worker acceptance rejection requires a stored successful outcome.",
+            )
+        })?;
+        if outcome.outcome != WorkerBacklogOutcome::Success {
+            return Err(WorkerBacklogError::new(
+                "outcome_required",
+                "Worker acceptance rejection requires a stored successful outcome.",
+            ));
+        }
+        if item.status != BacklogStatus::Doing {
+            return Err(WorkerBacklogError::new(
+                "invalid_state",
+                "Worker acceptance rejection requires the backlog item to still be in Doing.",
+            ));
+        }
+        let stored_result_digest = outcome.result_digest.as_deref().ok_or_else(|| {
+            WorkerBacklogError::new(
+                "corrupt_worker_state",
+                "A successful Worker outcome is missing its stored result digest.",
+            )
+        })?;
+        if stored_result_digest != params.expected_result_digest {
+            return Err(WorkerBacklogError::new(
+                "result_digest_mismatch",
+                "The expected result digest does not match the stored successful outcome.",
+            ));
+        }
+
+        let client = self.host_client(binding_id, &record.thread_uuid)?;
+        let inspection = client
+            .inspect_task_delivery(&record.approval_id, &task.task_id)
+            .await
+            .map_err(|error| WorkerBacklogError::from_host_error(&error))?;
+        let snapshot = client
+            .get_task_live_or_stopped(&record.approval_id, &task.task_id)
+            .await
+            .map_err(|error| WorkerBacklogError::from_host_error(&error))?;
+        verify_snapshot_identity(&snapshot, &record, &task)?;
+        verify_delivery_identity(&inspection, &record, &task, &execution, &snapshot)?;
+        if inspection.result_digest != params.expected_result_digest {
+            return Err(WorkerBacklogError::new(
+                "result_digest_mismatch",
+                "The actual Worker result digest changed since the stored successful outcome.",
+            ));
+        }
+        if inspection.delivery_digest != params.expected_delivery_digest {
+            return Err(WorkerBacklogError::new(
+                "delivery_digest_mismatch",
+                "The actual delivery bytes no longer match the expected delivery digest.",
+            ));
+        }
+        client
+            .recheck_task_delivery(&record.approval_id, &task.task_id, &inspection)
+            .await
+            .map_err(|error| WorkerBacklogError::from_host_error(&error))?;
+        final_recheck
+            .take()
+            .expect("rejection recheck closure must be available")()?;
+
+        let rejection = self
+            .reject_core(binding_id, &record.thread_uuid, &params)
+            .await?;
+        validate_rejection_receipt(
+            &rejection,
+            binding_id,
+            &params.item_id,
+            &params.execution_ref,
+            &params.expected_result_digest,
+            &params.expected_delivery_digest,
+            &params.rejection_reason,
+            &params.rejection_evidence,
+        )?;
+        Ok(WorkerBacklogRejectOutcome {
+            rejection,
+            delivery: Some(inspection),
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn reconcile_start<T, B, V, R>(
         &self,
@@ -1392,6 +1603,35 @@ impl WorkerBacklogService {
         }
     }
 
+    async fn reject_core(
+        &self,
+        binding_id: &str,
+        thread_uuid: &str,
+        params: &WorkerBacklogRejectParams,
+    ) -> Result<WorkerBacklogAcceptanceRejectionReceipt, WorkerBacklogError> {
+        let request = OperatorWorkerBacklogRequest::RejectAcceptance {
+            binding_id: binding_id.to_string(),
+            thread_uuid: thread_uuid.to_string(),
+            command_key: params.command_key.clone(),
+            item_id: params.item_id.clone(),
+            expected_revision: params.expected_revision,
+            rejection: WorkerBacklogAcceptanceRejection {
+                execution_ref: params.execution_ref.clone(),
+                result_digest: params.expected_result_digest.clone(),
+                delivery_digest: params.expected_delivery_digest.clone(),
+                reason: params.rejection_reason.clone(),
+                evidence: params.rejection_evidence.clone(),
+            },
+        };
+        match self.call(request, None).await? {
+            OperatorWorkerBacklogResponse::AcceptanceRejection { rejection } => Ok(rejection),
+            _ => Err(WorkerBacklogError::new(
+                "corrupt_worker_state",
+                "The control supervisor returned an unexpected acceptance rejection response.",
+            )),
+        }
+    }
+
     async fn get_execution(
         &self,
         binding_id: &str,
@@ -1822,6 +2062,59 @@ fn verify_delivery_identity(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn validate_rejection_receipt(
+    receipt: &WorkerBacklogAcceptanceRejectionReceipt,
+    binding_id: &str,
+    item_id: &str,
+    execution_ref: &str,
+    result_digest: &str,
+    delivery_digest: &str,
+    reason: &str,
+    evidence: &str,
+) -> Result<(), WorkerBacklogError> {
+    validate_execution_identity(&receipt.execution, binding_id, item_id)?;
+    if receipt.item.binding_id != binding_id
+        || receipt.item.item_id != item_id
+        || receipt.item.status != BacklogStatus::Blocked
+        || receipt.item.current_execution_ref.as_deref() != Some(execution_ref)
+        || receipt.execution.execution_ref != execution_ref
+        || receipt.execution.completion.is_some()
+        || receipt
+            .execution
+            .outcome
+            .as_ref()
+            .map(|outcome| outcome.outcome)
+            != Some(WorkerBacklogOutcome::Success)
+    {
+        return Err(WorkerBacklogError::new(
+            "corrupt_worker_state",
+            "The durable Worker acceptance rejection receipt did not preserve the expected execution state.",
+        ));
+    }
+    let stored = receipt
+        .execution
+        .acceptance_rejection
+        .as_ref()
+        .ok_or_else(|| {
+            WorkerBacklogError::new(
+                "corrupt_worker_state",
+                "The durable Worker acceptance rejection receipt has no rejection record.",
+            )
+        })?;
+    if stored.result_digest != result_digest
+        || stored.delivery_digest != delivery_digest
+        || stored.reason != reason
+        || stored.evidence != evidence
+    {
+        return Err(WorkerBacklogError::new(
+            "corrupt_worker_state",
+            "The durable Worker acceptance rejection receipt did not match the requested rejection.",
+        ));
+    }
+    Ok(())
+}
+
 fn failure_result_digest(
     record: &ApprovalRecord,
     task: &ApprovedTaskRecord,
@@ -2073,6 +2366,8 @@ pub(crate) const WORKER_BACKLOG_START_TOOL: &str = START_TOOL;
 pub(crate) const WORKER_BACKLOG_RESULT_TOOL: &str = RESULT_TOOL;
 /// Stable completion tool name.
 pub(crate) const WORKER_BACKLOG_COMPLETE_TOOL: &str = COMPLETE_TOOL;
+/// Stable failed-acceptance rejection tool name.
+pub(crate) const WORKER_BACKLOG_REJECT_TOOL: &str = REJECT_TOOL;
 
 #[cfg(test)]
 mod tests {

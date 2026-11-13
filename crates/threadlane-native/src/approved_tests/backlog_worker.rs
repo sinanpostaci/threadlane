@@ -5,7 +5,9 @@
 //! after a recorded outcome and after durable completion with the old checkout removed,
 //! stale/cross-binding/unapproved/wrong-thread rejection, stopped-host result reads, changed
 //! same-length delivery refusal, durable completion replay after checkout removal, recoverable
-//! pre-effect reservation, and unresolved durable dispatch intent refusal without redispatch.
+//! pre-effect reservation, unresolved durable dispatch intent refusal without redispatch, and
+//! checked acceptance rejection with physical tamper refusal, stable rejected-result rereads,
+//! completion refusal, durable rejection replay, and a newer authorized attempt.
 //! Provider invocation counting uses the existing fake-provider ledger. These local fake-provider
 //! tests do not prove native callback delivery or production provider behavior.
 
@@ -15,7 +17,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
-use threadlane_core::{BacklogItem, BacklogStatus, WorkerBacklogExecution, WorkerBacklogOutcome};
+use threadlane_core::{
+    BacklogItem, BacklogStatus, WorkerBacklogAcceptanceRejectionReceipt, WorkerBacklogExecution,
+    WorkerBacklogOutcome,
+};
 use threadlane_host::{
     record_task_dispatch_intent, ApprovedHost, ApprovedHostConfig, ApprovedHostHandle,
     TaskDispatchIntent, TaskExecutionStatus, TaskStateSnapshot,
@@ -157,6 +162,9 @@ fn assert_worker_backlog_schema(tool: &rmcp::model::Tool, expected: &[&str]) {
         "allowed_write_paths",
         "profile_id",
         "success",
+        "outcome",
+        "raw_outcome",
+        "provider_failure",
         "worker_snapshot",
         "authority",
         "provider",
@@ -202,6 +210,20 @@ async fn guarded_worker_backlog_tools_are_registered_with_strict_bounded_inputs(
                 "expected_delivery_digest",
                 "acceptance_note",
                 "acceptance_evidence",
+            ][..],
+            false,
+        ),
+        (
+            "backlog_worker_reject",
+            &[
+                "command_key",
+                "item_id",
+                "expected_revision",
+                "execution_ref",
+                "expected_result_digest",
+                "expected_delivery_digest",
+                "rejection_reason",
+                "rejection_evidence",
             ][..],
             false,
         ),
@@ -762,6 +784,623 @@ async fn guarded_worker_backlog_failure_is_recorded_and_never_completed() {
     );
 
     host.shutdown().await.expect("stop fixture host");
+}
+
+#[tokio::test]
+async fn guarded_worker_backlog_rejection_rechecks_delivery_and_replays_durably() {
+    let fixture = setup_approved_mcp_fixture().await;
+    let (plan_revision, plan_digest) = create_published_plan(
+        &fixture,
+        "plan-worker-backlog-rejection",
+        &fixture.binding_a,
+        default_plan_tasks("Guarded Worker backlog rejection"),
+    );
+    let approval = approve_published_plan(
+        &fixture,
+        "plan-worker-backlog-rejection",
+        plan_revision,
+        &plan_digest,
+        &fixture.binding_a,
+        THREAD_UUID_A,
+        vec!["task-root-agy".to_string()],
+        1_700_002_300_000,
+    );
+    let host = start_fixture_host(&fixture, &approval.approval_id).await;
+    let mcp = live_mcp(&fixture);
+    enroll_server(&fixture, &mcp, &fixture.binding_a, THREAD_UUID_A).await;
+    let (item_id, revision) =
+        create_worker_item(&mcp, "create-rejection", "Rejected Worker item").await;
+
+    let start_params = json!({
+        "item_id": item_id,
+        "expected_revision": revision,
+        "command_key": "start-rejection",
+        "approval_id": approval.approval_id,
+        "task_id": "task-root-agy"
+    });
+    let start = mcp
+        .invoke_tool_json("backlog_worker_start", start_params.clone(), None)
+        .await
+        .expect("start Worker for rejection");
+    let execution: WorkerBacklogExecution =
+        serde_json::from_value(start.structured_content.unwrap()["data"]["execution"].clone())
+            .expect("decode rejection execution");
+
+    let terminal = wait_for_terminal_task(&mcp, &approval.approval_id, "task-root-agy").await;
+    assert_eq!(terminal.status, TaskExecutionStatus::ReadyForReview);
+
+    // Rejection must work from the same durable stopped-host evidence as completion.
+    host.shutdown().await.expect("stop fixture host");
+    let result = mcp
+        .invoke_tool_json(
+            "backlog_worker_result",
+            json!({
+                "item_id": item_id,
+                "execution_ref": execution.execution_ref
+            }),
+            None,
+        )
+        .await
+        .expect("read stopped host Worker result");
+    let result_data = result.structured_content.expect("result data")["data"].clone();
+    let executed: WorkerBacklogExecution =
+        serde_json::from_value(result_data["execution"].clone()).expect("decode result execution");
+    let outcome = executed.outcome.as_ref().expect("successful outcome");
+    assert_eq!(outcome.outcome, WorkerBacklogOutcome::Success);
+    let result_digest = outcome
+        .result_digest
+        .clone()
+        .expect("successful result digest");
+    let delivery = result_data["delivery"]
+        .as_object()
+        .expect("path-free delivery inspection");
+    let delivery_digest = delivery["delivery_digest"]
+        .as_str()
+        .expect("delivery digest")
+        .to_string();
+    let worktree_id = delivery["worktree_id"]
+        .as_str()
+        .expect("worktree identity")
+        .to_string();
+    let item_after_result = get_item(&mcp, &item_id).await;
+    assert_eq!(item_after_result.status, BacklogStatus::Doing);
+    assert_eq!(read_invocation_count(&fixture.agy_count_file), 1);
+
+    let reject_params = json!({
+        "command_key": "reject-checked-acceptance",
+        "item_id": item_id,
+        "expected_revision": item_after_result.revision,
+        "execution_ref": execution.execution_ref,
+        "expected_result_digest": result_digest.clone(),
+        "expected_delivery_digest": delivery_digest.clone(),
+        "rejection_reason": "The delivered patch does not satisfy the acceptance condition.",
+        "rejection_evidence": "Compared the exact result and physical delivery digests against the checked delivery."
+    });
+
+    // A mismatched expected result digest is refused before any rejection is recorded.
+    let mut wrong_result = reject_params.clone();
+    wrong_result["expected_result_digest"] = json!("f".repeat(64));
+    let wrong_result_err = mcp
+        .invoke_tool_json("backlog_worker_reject", wrong_result, None)
+        .await
+        .expect_err("mismatched result digest must refuse rejection");
+    assert_eq!(
+        wrong_result_err.structured_content.unwrap()["error"]["code"],
+        "result_digest_mismatch"
+    );
+    let unchanged = get_item(&mcp, &item_id).await;
+    assert_eq!(unchanged.status, BacklogStatus::Doing);
+    assert_eq!(unchanged.revision, item_after_result.revision);
+
+    // A mismatched expected delivery digest is refused.
+    let mut wrong_delivery = reject_params.clone();
+    wrong_delivery["expected_delivery_digest"] = json!("f".repeat(64));
+    let wrong_delivery_err = mcp
+        .invoke_tool_json("backlog_worker_reject", wrong_delivery, None)
+        .await
+        .expect_err("mismatched delivery digest must refuse rejection");
+    assert_eq!(
+        wrong_delivery_err.structured_content.unwrap()["error"]["code"],
+        "delivery_digest_mismatch"
+    );
+
+    // A stale item revision is refused by the durable core revision check.
+    let mut stale_revision = reject_params.clone();
+    stale_revision["expected_revision"] = json!(item_after_result.revision + 1);
+    let stale_err = mcp
+        .invoke_tool_json("backlog_worker_reject", stale_revision, None)
+        .await
+        .expect_err("stale rejection revision must fail");
+    assert_eq!(
+        stale_err.structured_content.unwrap()["error"]["code"],
+        "stale_revision"
+    );
+    assert_eq!(
+        get_item(&mcp, &item_id).await.revision,
+        item_after_result.revision
+    );
+
+    // Actual physical bytes, not just a stored digest, gate the first rejection.
+    let work_area_root = fixture
+        .sessions_dir
+        .join(&approval.approval_id)
+        .join(WORK_AREA_SUBDIR);
+    let checkout = threadlane_workers::load_and_verify_manifest(&work_area_root, &worktree_id)
+        .expect("load verified task worktree manifest")
+        .checkout_path;
+    // An absent physical checkout is a refusal, never permission to invent a rejection.
+    let parked_checkout = checkout.with_extension("parked");
+    fs::rename(&checkout, &parked_checkout).expect("park the physical checkout");
+    let missing_checkout_err = mcp
+        .invoke_tool_json("backlog_worker_reject", reject_params.clone(), None)
+        .await
+        .expect_err("absent physical checkout must refuse rejection");
+    assert!(
+        missing_checkout_err.structured_content.is_some(),
+        "missing checkout must return a structured refusal"
+    );
+    let after_missing_checkout = get_item(&mcp, &item_id).await;
+    assert_eq!(after_missing_checkout.status, BacklogStatus::Doing);
+    assert_eq!(after_missing_checkout.revision, item_after_result.revision);
+    fs::rename(&parked_checkout, &checkout).expect("restore the physical checkout");
+
+    let delivered_file = checkout.join("src/lib.rs");
+    let original_bytes = fs::read(&delivered_file).expect("read delivered file");
+    let mut changed_bytes = original_bytes.clone();
+    changed_bytes[0] = if changed_bytes[0] == b'/' { b'#' } else { b'/' };
+    assert_eq!(changed_bytes.len(), original_bytes.len());
+    fs::write(&delivered_file, &changed_bytes).expect("write same-length changed delivery");
+    let tampered_err = mcp
+        .invoke_tool_json("backlog_worker_reject", reject_params.clone(), None)
+        .await
+        .expect_err("same-length delivery tamper must refuse rejection");
+    assert_eq!(
+        tampered_err.structured_content.unwrap()["error"]["code"],
+        "delivery_digest_mismatch"
+    );
+    let after_tamper = get_item(&mcp, &item_id).await;
+    assert_eq!(after_tamper.status, BacklogStatus::Doing);
+    assert_eq!(after_tamper.revision, item_after_result.revision);
+    fs::write(&delivered_file, &original_bytes).expect("restore exact delivered bytes");
+
+    // The checked rejection blocks the item without rewriting the successful result.
+    let rejected = mcp
+        .invoke_tool_json("backlog_worker_reject", reject_params.clone(), None)
+        .await
+        .expect("reject checked Worker delivery");
+    let rejected_data = rejected.structured_content.expect("rejection data")["data"].clone();
+    let rejection: WorkerBacklogAcceptanceRejectionReceipt =
+        serde_json::from_value(rejected_data["rejection"].clone())
+            .expect("decode rejection receipt");
+    assert_eq!(rejection.item.status, BacklogStatus::Blocked);
+    assert_eq!(
+        rejection.item.current_execution_ref.as_deref(),
+        Some(execution.execution_ref.as_str())
+    );
+    assert!(rejection.item.completed_at_ms.is_none());
+    assert!(rejection.item.completion_note.is_none());
+    assert!(rejection.item.completion_evidence.is_none());
+    assert_eq!(
+        rejection
+            .execution
+            .outcome
+            .as_ref()
+            .expect("original success preserved")
+            .outcome,
+        WorkerBacklogOutcome::Success
+    );
+    assert_eq!(
+        rejection
+            .execution
+            .outcome
+            .as_ref()
+            .expect("original outcome note preserved")
+            .note,
+        outcome.note
+    );
+    assert_eq!(
+        rejection
+            .execution
+            .outcome
+            .as_ref()
+            .and_then(|outcome| outcome.result_digest.as_deref()),
+        Some(result_digest.as_str())
+    );
+    assert!(rejection.execution.completion.is_none());
+    let stored_rejection = rejection
+        .execution
+        .acceptance_rejection
+        .as_ref()
+        .expect("stored acceptance rejection");
+    assert_eq!(stored_rejection.result_digest, result_digest);
+    assert_eq!(stored_rejection.delivery_digest, delivery_digest);
+    assert_eq!(
+        stored_rejection.reason,
+        reject_params["rejection_reason"]
+            .as_str()
+            .expect("rejection reason")
+    );
+    assert_eq!(
+        stored_rejection.evidence,
+        reject_params["rejection_evidence"]
+            .as_str()
+            .expect("rejection evidence")
+    );
+    let rejected_at_ms = stored_rejection.rejected_at_ms;
+    let rejected_revision = rejection.item.revision;
+    assert_eq!(rejected_revision, item_after_result.revision + 1);
+    assert!(rejected_data.get("delivery").is_some());
+    let blocked = get_item(&mcp, &item_id).await;
+    assert_eq!(blocked.status, BacklogStatus::Blocked);
+    assert_eq!(blocked.revision, rejected_revision);
+    assert!(blocked
+        .blocked_reason
+        .as_deref()
+        .is_some_and(|reason| reason.contains("worker acceptance rejected")
+            && reason.contains(
+                reject_params["rejection_reason"]
+                    .as_str()
+                    .expect("rejection reason")
+            )));
+    assert_eq!(read_invocation_count(&fixture.agy_count_file), 1);
+
+    // The original start command still replays the same rejected execution without dispatch.
+    let start_replay = mcp
+        .invoke_tool_json("backlog_worker_start", start_params.clone(), None)
+        .await
+        .expect("exact start replay after rejection");
+    let start_replay_execution: WorkerBacklogExecution = serde_json::from_value(
+        start_replay.structured_content.expect("start replay data")["data"]["execution"].clone(),
+    )
+    .expect("decode start replay execution");
+    assert_eq!(
+        start_replay_execution.execution_ref,
+        execution.execution_ref
+    );
+    assert_eq!(
+        start_replay_execution
+            .acceptance_rejection
+            .as_ref()
+            .expect("start replay retains rejection")
+            .rejected_at_ms,
+        rejected_at_ms
+    );
+    assert_eq!(read_invocation_count(&fixture.agy_count_file), 1);
+
+    // A rejected result reread stays blocked with its rejection and never re-records success.
+    let reread = mcp
+        .invoke_tool_json(
+            "backlog_worker_result",
+            json!({
+                "item_id": item_id,
+                "execution_ref": execution.execution_ref
+            }),
+            None,
+        )
+        .await
+        .expect("re-read rejected Worker result");
+    let reread_execution: WorkerBacklogExecution =
+        serde_json::from_value(reread.structured_content.unwrap()["data"]["execution"].clone())
+            .expect("decode re-read rejected execution");
+    assert_eq!(
+        reread_execution
+            .outcome
+            .as_ref()
+            .map(|outcome| outcome.outcome),
+        Some(WorkerBacklogOutcome::Success)
+    );
+    assert_eq!(
+        reread_execution
+            .acceptance_rejection
+            .as_ref()
+            .expect("rejection retained on result reread")
+            .rejected_at_ms,
+        rejected_at_ms
+    );
+    assert_eq!(
+        get_item(&mcp, &item_id).await.revision,
+        rejected_revision,
+        "rejected result reread must not append another backlog revision"
+    );
+
+    // A rejected attempt cannot be completed.
+    let completion_err = mcp
+        .invoke_tool_json(
+            "backlog_worker_complete",
+            json!({
+                "item_id": item_id,
+                "execution_ref": execution.execution_ref,
+                "command_key": "complete-rejected-attempt",
+                "expected_revision": rejected_revision,
+                "expected_result_digest": result_digest.clone(),
+                "expected_delivery_digest": delivery_digest.clone(),
+                "acceptance_note": "Rejected delivery must remain rejected.",
+                "acceptance_evidence": "The checked acceptance rejection is durable."
+            }),
+            None,
+        )
+        .await
+        .expect_err("rejected Worker cannot complete");
+    assert_eq!(
+        completion_err.structured_content.unwrap()["error"]["code"],
+        "invalid_state"
+    );
+    assert_eq!(
+        get_item(&mcp, &item_id).await.status,
+        BacklogStatus::Blocked
+    );
+
+    // Exact durable replay returns the original receipt without a new revision.
+    let replayed = mcp
+        .invoke_tool_json("backlog_worker_reject", reject_params.clone(), None)
+        .await
+        .expect("exact rejection replay");
+    let replayed_receipt: WorkerBacklogAcceptanceRejectionReceipt = serde_json::from_value(
+        replayed.structured_content.expect("replay data")["data"]["rejection"].clone(),
+    )
+    .expect("decode replayed rejection");
+    assert_eq!(
+        replayed_receipt
+            .execution
+            .acceptance_rejection
+            .as_ref()
+            .expect("replayed rejection record")
+            .rejected_at_ms,
+        rejected_at_ms
+    );
+    assert_eq!(replayed_receipt.item.revision, rejected_revision);
+    assert_eq!(
+        get_item(&mcp, &item_id).await.revision,
+        rejected_revision,
+        "exact rejection replay must not append another revision"
+    );
+
+    // Changed payload, key, revision, and reference are refusals, not reinterpretations.
+    let mut changed_reason = reject_params.clone();
+    changed_reason["rejection_reason"] = json!("A different failed-acceptance reason.");
+    let changed_reason_err = mcp
+        .invoke_tool_json("backlog_worker_reject", changed_reason, None)
+        .await
+        .expect_err("changed rejection reason must conflict");
+    assert_eq!(
+        changed_reason_err.structured_content.unwrap()["error"]["code"],
+        "rejection_conflict"
+    );
+    let mut changed_key = reject_params.clone();
+    changed_key["command_key"] = json!("reject-changed-key");
+    let changed_key_err = mcp
+        .invoke_tool_json("backlog_worker_reject", changed_key, None)
+        .await
+        .expect_err("changed rejection key must conflict");
+    assert_eq!(
+        changed_key_err.structured_content.unwrap()["error"]["code"],
+        "rejection_conflict"
+    );
+    let mut changed_revision = reject_params.clone();
+    changed_revision["expected_revision"] = json!(rejected_revision);
+    let changed_revision_err = mcp
+        .invoke_tool_json("backlog_worker_reject", changed_revision, None)
+        .await
+        .expect_err("changed rejection revision must conflict");
+    assert_eq!(
+        changed_revision_err.structured_content.unwrap()["error"]["code"],
+        "rejection_conflict"
+    );
+    let mut changed_ref = reject_params.clone();
+    changed_ref["execution_ref"] = json!("wbe_missing_rejection");
+    let changed_ref_err = mcp
+        .invoke_tool_json("backlog_worker_reject", changed_ref, None)
+        .await
+        .expect_err("changed rejection execution reference must be refused");
+    assert_eq!(
+        changed_ref_err.structured_content.unwrap()["error"]["code"],
+        "validation_failed"
+    );
+    assert_eq!(
+        get_item(&mcp, &item_id).await.status,
+        BacklogStatus::Blocked
+    );
+
+    // The old mutable checkout is not part of durable rejection replay.
+    fs::remove_dir_all(&checkout).expect("remove rejected task checkout");
+    let replay_without_checkout = mcp
+        .invoke_tool_json("backlog_worker_reject", reject_params.clone(), None)
+        .await
+        .expect("durable rejection replay without the old checkout");
+    let replay_without_checkout: WorkerBacklogAcceptanceRejectionReceipt = serde_json::from_value(
+        replay_without_checkout
+            .structured_content
+            .expect("replay-without-checkout data")["data"]["rejection"]
+            .clone(),
+    )
+    .expect("decode replay-without-checkout rejection");
+    assert_eq!(
+        replay_without_checkout
+            .execution
+            .acceptance_rejection
+            .as_ref()
+            .expect("replay-without-checkout rejection record")
+            .rejected_at_ms,
+        rejected_at_ms
+    );
+
+    // A new attempt must use a fresh authorized approval/task tuple; the old tuple is refused.
+    let old_authority_retry = mcp
+        .invoke_tool_json(
+            "backlog_worker_start",
+            json!({
+                "item_id": item_id,
+                "expected_revision": rejected_revision,
+                "command_key": "start-rejected-old-authority",
+                "approval_id": approval.approval_id,
+                "task_id": "task-root-agy"
+            }),
+            None,
+        )
+        .await
+        .expect_err("rejected attempt authority must not be reused");
+    assert_eq!(
+        old_authority_retry.structured_content.unwrap()["error"]["code"],
+        "validation_failed"
+    );
+    assert_eq!(
+        get_item(&mcp, &item_id).await.status,
+        BacklogStatus::Blocked
+    );
+
+    let (fresh_plan_revision, fresh_plan_digest) = create_published_plan(
+        &fixture,
+        "plan-worker-backlog-rejection-retry",
+        &fixture.binding_a,
+        default_plan_tasks("Fresh authorized retry after rejection"),
+    );
+    let fresh_approval = approve_published_plan(
+        &fixture,
+        "plan-worker-backlog-rejection-retry",
+        fresh_plan_revision,
+        &fresh_plan_digest,
+        &fixture.binding_a,
+        THREAD_UUID_A,
+        vec!["task-root-agy".to_string()],
+        1_700_002_400_000,
+    );
+    let fresh_host = start_fixture_host(&fixture, &fresh_approval.approval_id).await;
+    let fresh_start = mcp
+        .invoke_tool_json(
+            "backlog_worker_start",
+            json!({
+                "item_id": item_id,
+                "expected_revision": rejected_revision,
+                "command_key": "start-fresh-after-rejection",
+                "approval_id": fresh_approval.approval_id,
+                "task_id": "task-root-agy"
+            }),
+            None,
+        )
+        .await
+        .expect("fresh authorized attempt after rejection");
+    let fresh_execution: WorkerBacklogExecution = serde_json::from_value(
+        fresh_start.structured_content.expect("fresh start data")["data"]["execution"].clone(),
+    )
+    .expect("decode fresh execution");
+    assert_ne!(fresh_execution.execution_ref, execution.execution_ref);
+    let item_after_fresh_start = get_item(&mcp, &item_id).await;
+    assert_eq!(item_after_fresh_start.status, BacklogStatus::Doing);
+    assert!(item_after_fresh_start.blocked_reason.is_none());
+    assert_eq!(
+        item_after_fresh_start.current_execution_ref.as_deref(),
+        Some(fresh_execution.execution_ref.as_str())
+    );
+    assert_eq!(read_invocation_count(&fixture.agy_count_file), 2);
+
+    // The original rejection still replays even though a newer attempt is now current.
+    let replay_with_newer_attempt = mcp
+        .invoke_tool_json("backlog_worker_reject", reject_params.clone(), None)
+        .await
+        .expect("durable rejection replay with a newer attempt");
+    let replay_with_newer_attempt: WorkerBacklogAcceptanceRejectionReceipt =
+        serde_json::from_value(
+            replay_with_newer_attempt
+                .structured_content
+                .expect("newer-attempt replay data")["data"]["rejection"]
+                .clone(),
+        )
+        .expect("decode newer-attempt replay rejection");
+    assert_eq!(
+        replay_with_newer_attempt
+            .execution
+            .acceptance_rejection
+            .as_ref()
+            .expect("newer-attempt replay rejection record")
+            .rejected_at_ms,
+        rejected_at_ms
+    );
+    assert_eq!(
+        replay_with_newer_attempt.item.status,
+        BacklogStatus::Blocked
+    );
+    assert_eq!(
+        replay_with_newer_attempt
+            .item
+            .current_execution_ref
+            .as_deref(),
+        Some(execution.execution_ref.as_str())
+    );
+    let after_old_replay = get_item(&mcp, &item_id).await;
+    assert_eq!(after_old_replay.status, BacklogStatus::Doing);
+    assert_eq!(
+        after_old_replay.current_execution_ref.as_deref(),
+        Some(fresh_execution.execution_ref.as_str())
+    );
+    assert_eq!(
+        after_old_replay.revision, item_after_fresh_start.revision,
+        "old rejection replay must not touch the newer attempt state"
+    );
+
+    // The rejected attempt remains stable and cannot be completed after a newer attempt exists.
+    let old_result = mcp
+        .invoke_tool_json(
+            "backlog_worker_result",
+            json!({
+                "item_id": item_id,
+                "execution_ref": execution.execution_ref
+            }),
+            None,
+        )
+        .await
+        .expect("read rejected execution after a newer attempt");
+    let old_result: WorkerBacklogExecution = serde_json::from_value(
+        old_result.structured_content.expect("old result data")["data"]["execution"].clone(),
+    )
+    .expect("decode old rejected execution");
+    assert_eq!(
+        old_result
+            .acceptance_rejection
+            .as_ref()
+            .expect("old rejection after newer attempt")
+            .rejected_at_ms,
+        rejected_at_ms
+    );
+    assert_eq!(
+        old_result.outcome.as_ref().map(|outcome| outcome.outcome),
+        Some(WorkerBacklogOutcome::Success)
+    );
+    let after_old_result = get_item(&mcp, &item_id).await;
+    assert_eq!(after_old_result.status, BacklogStatus::Doing);
+    assert_eq!(
+        after_old_result.current_execution_ref.as_deref(),
+        Some(fresh_execution.execution_ref.as_str())
+    );
+    assert_eq!(after_old_result.revision, item_after_fresh_start.revision);
+    let completion_after_newer = mcp
+        .invoke_tool_json(
+            "backlog_worker_complete",
+            json!({
+                "item_id": item_id,
+                "execution_ref": execution.execution_ref,
+                "command_key": "complete-old-after-newer",
+                "expected_revision": after_old_result.revision,
+                "expected_result_digest": result_digest,
+                "expected_delivery_digest": delivery_digest,
+                "acceptance_note": "An old rejected attempt cannot complete.",
+                "acceptance_evidence": "A newer attempt is current."
+            }),
+            None,
+        )
+        .await
+        .expect_err("old rejected attempt cannot complete after a newer attempt");
+    assert_eq!(
+        completion_after_newer.structured_content.unwrap()["error"]["code"],
+        "execution_not_current"
+    );
+
+    let fresh_terminal =
+        wait_for_terminal_task(&mcp, &fresh_approval.approval_id, "task-root-agy").await;
+    assert_eq!(fresh_terminal.status, TaskExecutionStatus::ReadyForReview);
+    fresh_host
+        .shutdown()
+        .await
+        .expect("stop fresh fixture host");
 }
 
 #[tokio::test]
