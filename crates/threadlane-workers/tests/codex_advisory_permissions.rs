@@ -870,7 +870,7 @@ fn codex_advisory_exact_frontier_still_traverses_and_rejects_hazards_under_denie
         .expect_err("deep entry under denied root must fail closed");
     assert!(err.to_string().contains("relative component depth 63"));
     fs::remove_dir_all(workdir.join(".git")).expect("remove deep .git fixture");
-    fs::create_dir(&workdir.join(".git")).expect("recreate empty .git directory");
+    fs::create_dir(workdir.join(".git")).expect("recreate empty .git directory");
 
     // 3. Project Codex config marker under denied `.aws` is still rejected.
     fs::create_dir_all(workdir.join(".aws/.codex")).expect("create project marker under .aws");
