@@ -1,15 +1,17 @@
+use std::ffi::OsString;
 use std::ops::Deref;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use threadlane_native::codex_setup::{
-    resolve_codex_home, resolve_default_runtime_state_dir, resolve_native_mcp_executable,
-    run_codex_mcp_setup, CodexSetupMode, CodexSetupReport, CodexSetupRequest,
-    CODEX_CONFIG_FILENAME,
+    resolve_codex_home, resolve_default_runtime_state_dir, resolve_default_runtime_state_dir_with,
+    resolve_native_mcp_executable, run_codex_mcp_setup, CodexSetupMode, CodexSetupReport,
+    CodexSetupRequest, CODEX_CONFIG_FILENAME,
 };
 use threadlane_native::codex_skill::{
     resolve_codex_skills_dir, run_codex_skill_setup, CodexSkillSetupReport, CodexSkillSetupRequest,
 };
+use threadlane_native::NativeError;
 
 use crate::AppError;
 
@@ -45,6 +47,37 @@ pub(crate) const DESKTOP_PAIRING_SUBDIR: &str = "pairing";
 
 /// Subdirectory under `app_data_dir` used for the private Codex setup management lock and receipt.
 pub(crate) const DESKTOP_CODEX_SETUP_SUBDIR: &str = "codex-setup";
+
+/// Resolves the runtime `state_dir` shared by managed Codex MCP setup and read-only workspace
+/// observation for a desktop launch.
+///
+/// An explicit `--state-dir` always takes precedence. A demo-only launch (no explicit runtime
+/// state directory, but a demo directory) returns `None` so observation is not silently attached
+/// to the user's production runtime. Otherwise the same native default resolution as managed MCP
+/// setup applies, without creating or starting a supervisor.
+pub(crate) fn resolve_desktop_runtime_state_dir(
+    supplied_state_dir: Option<&Path>,
+    demo_state_dir: Option<&Path>,
+) -> Result<Option<PathBuf>, NativeError> {
+    resolve_desktop_runtime_state_dir_with(supplied_state_dir, demo_state_dir, |key| {
+        std::env::var_os(key)
+    })
+}
+
+/// Resolves the desktop runtime `state_dir` with an explicit environment lookup.
+pub(crate) fn resolve_desktop_runtime_state_dir_with<F>(
+    supplied_state_dir: Option<&Path>,
+    demo_state_dir: Option<&Path>,
+    get_env: F,
+) -> Result<Option<PathBuf>, NativeError>
+where
+    F: FnMut(&str) -> Option<OsString>,
+{
+    if supplied_state_dir.is_none() && demo_state_dir.is_some() {
+        return Ok(None);
+    }
+    resolve_default_runtime_state_dir_with(supplied_state_dir, get_env).map(Some)
+}
 
 /// Configuration for the desktop startup Codex MCP registration service.
 #[derive(Debug, Clone)]
@@ -343,15 +376,22 @@ pub(crate) fn execute_desktop_codex_mcp_setup(
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsString;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
 
     use tempfile::TempDir;
-    use threadlane_native::codex_setup::{CodexSetupState, DEFAULT_NATIVE_MCP_EXECUTABLE_NAME};
+    use threadlane_native::codex_setup::{
+        CodexSetupState, DEFAULT_NATIVE_MCP_EXECUTABLE_NAME, THREADLANE_CLI_XDG_STATE_HOME_ENV,
+    };
     use threadlane_native::codex_skill::{CodexSkillSetupState, THREADLANE_SKILL_VERSION};
 
     use super::*;
+
+    fn env_for_home(home: &Path, key: &str) -> Option<OsString> {
+        (key == "HOME").then(|| OsString::from(home.as_os_str()))
+    }
 
     fn build_isolated_config(root: &Path, name: &str) -> CodexSetupServiceConfig {
         let scoped = root.join(name);
@@ -598,6 +638,158 @@ mod tests {
         assert_eq!(
             fs::read_to_string(&extra_note).unwrap(),
             "preserve user note\n"
+        );
+    }
+
+    #[test]
+    fn desktop_runtime_resolution_matches_managed_setup_and_explicit_override_wins() {
+        let tmp = TempDir::new().expect("tempdir");
+        let root = tmp.path();
+        let home = root.join("home");
+        fs::create_dir_all(&home).expect("create home");
+
+        let resolved =
+            resolve_desktop_runtime_state_dir_with(None, None, |key| env_for_home(&home, key))
+                .expect("resolve default runtime")
+                .expect("default runtime present");
+        let expected_default = home
+            .join(".local")
+            .join("state")
+            .join("threadlane")
+            .join("runtime");
+        assert_eq!(resolved, expected_default);
+        assert!(
+            !resolved.exists(),
+            "runtime resolution must not create the runtime directory"
+        );
+
+        let app_data = root.join("app-data");
+        let bin_dir = root.join("bin");
+        fs::create_dir_all(&bin_dir).expect("create bin dir");
+        let mcp_exe = bin_dir.join(DEFAULT_NATIVE_MCP_EXECUTABLE_NAME);
+        fs::write(&mcp_exe, b"#!/bin/sh\nexit 0\n").expect("write fake MCP");
+        fs::set_permissions(&mcp_exe, fs::Permissions::from_mode(0o755)).expect("chmod fake MCP");
+
+        let mut config = CodexSetupServiceConfig::from_desktop_dirs(
+            Some(resolved.clone()),
+            root.join("registry"),
+            app_data.join("plans"),
+            app_data.join("authority"),
+            app_data.join("sessions"),
+            &app_data,
+        );
+        config.codex_home_override = Some(root.join("codex-home"));
+        config.mcp_executable_override = Some(mcp_exe);
+        config.skills_dir_override = Some(root.join("skills"));
+
+        let report = execute_desktop_codex_mcp_setup(&config, CodexSetupMode::Apply);
+        assert_eq!(report.state, CodexSetupState::Registered);
+        let applied = fs::read_to_string(root.join("codex-home").join(CODEX_CONFIG_FILENAME))
+            .expect("read applied Codex config");
+        let resolved_text = resolved.to_str().expect("UTF-8 runtime path");
+        assert!(
+            applied.contains(resolved_text),
+            "managed MCP setup must use the same resolved runtime path as observation"
+        );
+
+        let explicit = root.join("explicit-runtime");
+        let demo = root.join("demo-runtime");
+        let resolved_explicit =
+            resolve_desktop_runtime_state_dir_with(Some(&explicit), Some(&demo), |key| {
+                env_for_home(&home, key)
+            })
+            .expect("resolve explicit runtime")
+            .expect("explicit runtime present");
+        assert_eq!(resolved_explicit, explicit);
+
+        assert!(resolve_desktop_runtime_state_dir_with(
+            Some(Path::new("relative-runtime")),
+            None,
+            |key| env_for_home(&home, key),
+        )
+        .is_err());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            let linked_home = root.join("linked-home");
+            symlink(&home, &linked_home).expect("create symlinked home");
+            assert!(resolve_desktop_runtime_state_dir_with(
+                Some(&linked_home.join("runtime")),
+                None,
+                |key| env_for_home(&home, key),
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn desktop_runtime_resolution_preserves_cli_xdg_marker_and_home_defaults() {
+        let tmp = TempDir::new().expect("tempdir");
+        let home = tmp.path().join("home");
+        let isolated_xdg = tmp.path().join("isolated-xdg");
+        let original_xdg = tmp.path().join("original-xdg");
+
+        let without_marker = resolve_desktop_runtime_state_dir_with(None, None, |key| match key {
+            "HOME" => Some(OsString::from(home.as_os_str())),
+            "XDG_STATE_HOME" => Some(OsString::from(isolated_xdg.as_os_str())),
+            _ => None,
+        })
+        .expect("resolve XDG runtime")
+        .expect("XDG runtime present");
+        assert_eq!(
+            without_marker,
+            isolated_xdg.join("threadlane").join("runtime")
+        );
+
+        let empty_marker = resolve_desktop_runtime_state_dir_with(None, None, |key| match key {
+            "HOME" => Some(OsString::from(home.as_os_str())),
+            "XDG_STATE_HOME" => Some(OsString::from(isolated_xdg.as_os_str())),
+            THREADLANE_CLI_XDG_STATE_HOME_ENV => Some(OsString::new()),
+            _ => None,
+        })
+        .expect("resolve HOME runtime")
+        .expect("HOME runtime present");
+        assert_eq!(
+            empty_marker,
+            home.join(".local")
+                .join("state")
+                .join("threadlane")
+                .join("runtime")
+        );
+
+        let original_marker = resolve_desktop_runtime_state_dir_with(None, None, |key| match key {
+            "HOME" => Some(OsString::from(home.as_os_str())),
+            "XDG_STATE_HOME" => Some(OsString::from(isolated_xdg.as_os_str())),
+            THREADLANE_CLI_XDG_STATE_HOME_ENV => Some(OsString::from(original_xdg.as_os_str())),
+            _ => None,
+        })
+        .expect("resolve original CLI runtime")
+        .expect("original CLI runtime present");
+        assert_eq!(
+            original_marker,
+            original_xdg.join("threadlane").join("runtime")
+        );
+    }
+
+    #[test]
+    fn demo_only_launch_does_not_attach_to_default_production_runtime() {
+        let tmp = TempDir::new().expect("tempdir");
+        let home = tmp.path().join("home");
+        let demo = tmp.path().join("demo-runtime");
+
+        assert_eq!(
+            resolve_desktop_runtime_state_dir_with(None, Some(&demo), |key| {
+                env_for_home(&home, key)
+            })
+            .expect("resolve demo-only launch"),
+            None
+        );
+        assert_eq!(
+            resolve_desktop_runtime_state_dir_with(None, Some(&demo), |_| None)
+                .expect("demo-only resolution must not require HOME"),
+            None
         );
     }
 }

@@ -13,7 +13,10 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use clap::Parser;
-use codex_setup::{CodexSetupService, CodexSetupServiceConfig, DesktopCodexSetupReport};
+use codex_setup::{
+    resolve_desktop_runtime_state_dir, CodexSetupService, CodexSetupServiceConfig,
+    DesktopCodexSetupReport,
+};
 use host_control::HostControlHub;
 use observation::{ObservationService, ObservationSourceConfig};
 use serde::{Deserialize, Serialize};
@@ -1408,6 +1411,12 @@ fn main() -> ExitCode {
     let cli = DesktopCli::parse();
     let initial_runtime_state_dir = cli.state_dir.clone();
     let initial_demo_state_dir = cli.demo_state_dir.clone();
+    let resolved_runtime_state_dir = resolve_desktop_runtime_state_dir(
+        initial_runtime_state_dir.as_deref(),
+        initial_demo_state_dir.as_deref(),
+    )
+    .ok()
+    .flatten();
     let bridge = match DesktopBridge::new(cli.state_dir, cli.demo_state_dir) {
         Ok(bridge) => bridge,
         Err(err) => {
@@ -1475,8 +1484,12 @@ fn main() -> ExitCode {
                 sessions_dir,
                 cli_host_executable,
             )?;
+            // On explicit-path resolution failure, let setup validate and report the raw path itself.
+            let setup_state_dir = resolved_runtime_state_dir
+                .clone()
+                .or_else(|| initial_runtime_state_dir.clone());
             let codex_setup = CodexSetupService::new(CodexSetupServiceConfig::from_desktop_dirs(
-                initial_runtime_state_dir.clone(),
+                setup_state_dir,
                 control.registry.config_dir().to_path_buf(),
                 control.plans.dir().to_path_buf(),
                 control.authority.dir().to_path_buf(),
@@ -1487,7 +1500,7 @@ fn main() -> ExitCode {
                 codex_setup.spawn_startup_apply();
             }
             let observation = ObservationService::new(ObservationSourceConfig {
-                runtime_state_dir: initial_runtime_state_dir,
+                runtime_state_dir: resolved_runtime_state_dir,
                 registry_dir: control.registry.config_dir().to_path_buf(),
                 plans_dir: control.plans.dir().to_path_buf(),
                 authority_dir: control.authority.dir().to_path_buf(),

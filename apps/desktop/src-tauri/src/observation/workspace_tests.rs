@@ -305,6 +305,38 @@ mod unix_workspace_tests {
         }
     }
 
+    fn write_verified_chat_sample(
+        stores: &TestStores,
+        source_id: &str,
+        binding_id: &str,
+        thread_uuid: &str,
+        project: &Path,
+        producer_epoch: &str,
+    ) -> WorkspaceChatIdentity {
+        let identity =
+            WorkspaceChatIdentity::new(source_id, binding_id, thread_uuid, &path_text(project))
+                .expect("valid chat identity");
+        let now_ms = current_observation_time_ms();
+        write_workspace_native_sample_sidecar(
+            &stores.state,
+            &make_native_sample(
+                identity.clone(),
+                producer_epoch,
+                SampleTiming {
+                    sequence: 1,
+                    observed_at_ms: now_ms - 250,
+                    last_success_at_ms: now_ms - 250,
+                },
+                WorkspaceAvailabilityState::Available,
+                WorkspaceActivityState::Idle,
+                WorkspaceConfiguredSelection::verified(Some("gpt-6-astra"), Some("high")),
+                None,
+            ),
+        )
+        .expect("write verified chat sample");
+        identity
+    }
+
     fn sample_choice() -> SelectedRoleChoice {
         SelectedRoleChoice {
             matched_difficulty: Some(Difficulty::Medium),
@@ -1683,6 +1715,85 @@ mod unix_workspace_tests {
             chat_fallback.configured_selection.evidence,
             WorkspaceSelectionEvidence::Unavailable
         );
+    }
+
+    #[test]
+    fn workspace_snapshot_reads_verified_fresh_chat_from_resolved_default_runtime_without_plans_or_approvals(
+    ) {
+        let tree = TestTree::new("fresh-chat-default-runtime");
+        let mut stores = TestStores::new(&tree, "stores");
+        stores.state = tree.dir("home/.local/state/threadlane/runtime");
+        let app_data = tree.dir("app-data");
+        let project = tree.dir("repo-fresh");
+
+        let home = tree.join("home");
+        let resolved_runtime =
+            crate::codex_setup::resolve_desktop_runtime_state_dir_with(None, None, |key| {
+                (key == "HOME").then(|| std::ffi::OsString::from(home.as_os_str()))
+            })
+            .expect("resolve default runtime")
+            .expect("default runtime present");
+        assert_eq!(
+            resolved_runtime, stores.state,
+            "normal startup must observe the same resolved default runtime"
+        );
+
+        let chat_identity = WorkspaceChatIdentity::new(
+            &stores.canonical_source_id(),
+            "bnd_fresh_chat",
+            "0196ed00-0000-7000-8000-000000000401",
+            &path_text(&project),
+        )
+        .expect("valid fresh chat identity");
+        let now_ms = current_observation_time_ms();
+        write_workspace_native_sample_sidecar(
+            &resolved_runtime,
+            &make_native_sample(
+                chat_identity.clone(),
+                "epoch_fresh_chat",
+                SampleTiming {
+                    sequence: 1,
+                    observed_at_ms: now_ms - 250,
+                    last_success_at_ms: now_ms - 250,
+                },
+                WorkspaceAvailabilityState::Available,
+                WorkspaceActivityState::Idle,
+                WorkspaceConfiguredSelection::verified(Some("gpt-6-astra"), Some("high")),
+                None,
+            ),
+        )
+        .expect("write fresh chat sample");
+
+        let service = ObservationService::new(ObservationSourceConfig {
+            runtime_state_dir: Some(resolved_runtime.clone()),
+            registry_dir: stores.registry.clone(),
+            plans_dir: stores.plans.clone(),
+            authority_dir: stores.authority.clone(),
+            sessions_dir: stores.sessions.clone(),
+            app_data_dir: app_data,
+        });
+        let snap = service
+            .workspace_snapshot(None)
+            .expect("workspace_snapshot");
+
+        assert!(snap.observation.jobs.is_empty());
+        assert!(snap.observation.requests.is_empty());
+        assert!(snap.job_histories.is_empty());
+        assert_eq!(snap.chats.len(), 1);
+        let chat = &snap.chats[0];
+        assert_eq!(chat.identity, chat_identity);
+        assert_eq!(chat.availability, WorkspaceAvailabilityState::Available);
+        assert_eq!(chat.activity, WorkspaceActivityState::Idle);
+        assert_eq!(chat.active_job_count, 0);
+        assert_eq!(chat.attention_count, 0);
+        assert_eq!(
+            chat.configured_selection.evidence,
+            WorkspaceSelectionEvidence::VerifiedConfiguration
+        );
+        assert!(!resolved_runtime.join("supervisor.json").exists());
+        assert!(!resolved_runtime.join("state.db").exists());
+        assert!(!stores.plans.join("plans.lock").exists());
+        assert!(!stores.authority.join("authority.lock").exists());
     }
 
     #[test]
@@ -3968,6 +4079,552 @@ mod unix_workspace_tests {
                 .count(),
             0,
             "partial task coverage must not create a duplicate human question"
+        );
+    }
+
+    #[test]
+    fn workspace_snapshot_verified_chat_attaches_published_unapproved_plan_as_needs_approval() {
+        let tree = TestTree::new("pending-approval-plan");
+        let stores = TestStores::new(&tree, "stores");
+        let app_data = tree.dir("app-data");
+        let project = tree.dir("repo-pending-approval");
+        let source_id = stores.canonical_source_id();
+        let binding_id = "bnd_ws_pending_approval_01";
+        let thread_uuid = "0196ed00-0000-7000-8000-000000000901";
+        let plan = publish_legacy_plan_revision(
+            &stores,
+            binding_id,
+            "plan_ws_pending_approval_01",
+            0,
+            "Published legacy plan awaiting approval",
+            vec![legacy_plan_task(
+                "task-pending-approval",
+                "Pending approval task",
+            )],
+        );
+        let chat_identity = write_verified_chat_sample(
+            &stores,
+            &source_id,
+            binding_id,
+            thread_uuid,
+            &project,
+            "epoch_pending_approval",
+        );
+        assert!(
+            !stores.authority.join(APPROVALS_FILE_NAME).exists(),
+            "the pending fixture must not carry execution authority"
+        );
+
+        let before_read = snapshot_tree_fingerprints(tree.path());
+        let service = ObservationService::new(stores.config(&app_data));
+        let snap = service
+            .workspace_snapshot(None)
+            .expect("workspace_snapshot with pending legacy approval");
+        let after_read = snapshot_tree_fingerprints(tree.path());
+        assert_eq!(
+            before_read, after_read,
+            "pending-approval projection must remain strictly read-only"
+        );
+
+        assert_eq!(snap.chats.len(), 1);
+        let chat = &snap.chats[0];
+        assert_eq!(chat.identity, chat_identity);
+        assert_eq!(chat.active_job_count, 1);
+        assert_eq!(chat.attention_count, 1);
+
+        let history = snap
+            .job_histories
+            .iter()
+            .find(|history| history.job.job_id == plan.plan_id)
+            .expect("published unapproved legacy plan history");
+        assert_eq!(history.job.chat_identity.as_ref(), Some(&chat_identity));
+        assert_eq!(history.job.binding_id.as_deref(), Some(binding_id));
+        assert_eq!(history.job.state, ObservationJobState::Planning);
+        assert_eq!(history.job.approval_status, "unapproved");
+        assert_eq!(history.job.execution_status, "not_started");
+        assert_eq!(
+            history.acceptance_proof.status,
+            WorkspaceAcceptanceStatus::Unknown
+        );
+        assert!(history.acceptance_proof.accepted_candidate_id.is_none());
+        assert!(history.acceptance_proof.combined_candidate_id.is_none());
+        assert!(history.acceptance_proof.closure_verdict_id.is_none());
+
+        let attention = history
+            .current_attention
+            .as_ref()
+            .expect("verified pending approval must be visible");
+        assert_eq!(attention.kind, WorkspaceAttentionKind::NeedsApproval);
+        assert_eq!(
+            attention.reason,
+            "The latest recorded published plan referenced by this job has no approval linked to the job."
+        );
+        assert_eq!(
+            attention.next_step.as_deref(),
+            Some(
+                "Inspect the current plan and approval evidence before deciding whether approval or a revised plan is needed."
+            )
+        );
+        assert!(attention.blocking_hold_ids.is_empty());
+        assert!(attention.blocking_outbox_ids.is_empty());
+        assert_eq!(attention.question_id, None);
+
+        assert_eq!(history.tasks.len(), 1);
+        let task = &history.tasks[0];
+        assert_eq!(task.task_id, "task-pending-approval");
+        assert_eq!(task.status, "not_approved");
+        assert!(
+            task.current_attention.is_none(),
+            "one pending approval must remain a job-level row, not a task alert"
+        );
+        assert_eq!(
+            task.acceptance_proof.status,
+            WorkspaceAcceptanceStatus::Unknown
+        );
+
+        let raw_job = snap
+            .observation
+            .jobs
+            .iter()
+            .find(|job| job.id == plan.plan_id)
+            .expect("raw published unapproved legacy job");
+        assert_eq!(raw_job.state, ObservationJobState::Planning);
+        assert_eq!(raw_job.approval_status, "unapproved");
+        assert_eq!(raw_job.execution_status, "not_started");
+        assert_eq!(raw_job.active_call_count, 0);
+        assert_eq!(raw_job.binding_id.as_deref(), Some(binding_id));
+        assert!(
+            raw_job.thread_uuid.is_none() && raw_job.project_path.is_none(),
+            "the fixture must exercise the legacy binding-only plan projection"
+        );
+
+        let plan_message = snap
+            .messages
+            .items
+            .iter()
+            .find(|message| {
+                message.source_kind == WorkspaceMessageSourceKind::PlanSummary
+                    && message.scope.job_id.as_deref() == Some(plan.plan_id.as_str())
+            })
+            .expect("safe plan summary message");
+        assert_eq!(
+            plan_message.summary,
+            "Published legacy plan awaiting approval"
+        );
+        assert_eq!(
+            plan_message.scope.chat_identity.as_ref(),
+            Some(&chat_identity)
+        );
+        assert_eq!(plan_message.scope.binding_id.as_deref(), Some(binding_id));
+        assert_eq!(plan_message.scope.thread_uuid.as_deref(), Some(thread_uuid));
+        assert_eq!(
+            plan_message.scope.canonical_project_scope.as_deref(),
+            Some(chat_identity.canonical_project_scope.as_str())
+        );
+
+        let attention_messages: Vec<_> = snap
+            .messages
+            .items
+            .iter()
+            .filter(|message| {
+                message.source_kind == WorkspaceMessageSourceKind::AttentionSummary
+                    && message.scope.job_id.as_deref() == Some(plan.plan_id.as_str())
+            })
+            .collect();
+        assert_eq!(
+            attention_messages.len(),
+            1,
+            "one pending approval must produce exactly one scoped attention summary"
+        );
+        let approval_message = attention_messages[0];
+        assert_eq!(
+            approval_message.source_record_id,
+            format!("attn_{}", plan.plan_id)
+        );
+        assert_eq!(approval_message.summary, attention.reason);
+        assert_eq!(
+            approval_message.scope.chat_identity.as_ref(),
+            Some(&chat_identity)
+        );
+        assert_eq!(
+            approval_message.scope.binding_id.as_deref(),
+            Some(binding_id)
+        );
+        assert_eq!(
+            approval_message.scope.thread_uuid.as_deref(),
+            Some(thread_uuid)
+        );
+        assert_eq!(
+            approval_message.scope.canonical_project_scope.as_deref(),
+            Some(chat_identity.canonical_project_scope.as_str())
+        );
+        assert!(
+            snap.messages.items.iter().all(|message| !message
+                .summary
+                .contains("Do not leak this legacy instruction")),
+            "task instructions must never enter safe Messages"
+        );
+    }
+
+    #[test]
+    fn workspace_snapshot_verified_chat_keeps_unapproved_draft_nonactionable() {
+        let tree = TestTree::new("pending-approval-draft");
+        let stores = TestStores::new(&tree, "stores");
+        let app_data = tree.dir("app-data");
+        let project = tree.dir("repo-pending-draft");
+        let source_id = stores.canonical_source_id();
+        let binding_id = "bnd_ws_pending_draft_01";
+        let thread_uuid = "0196ed00-0000-7000-8000-000000000902";
+        let plan_id = "plan_ws_pending_draft_01";
+
+        let plan_store = PlanStore::open(&stores.plans).expect("open pending draft PlanStore");
+        plan_store
+            .change_at(
+                0,
+                PlanChange::SaveDraft {
+                    plan_id: plan_id.to_string(),
+                    binding_id: binding_id.to_string(),
+                    profile_id: "profile-main".to_string(),
+                    profile_revision: 1,
+                    summary: "Draft legacy plan stays informational".to_string(),
+                    tasks: vec![legacy_plan_task("task-pending-draft", "Pending draft task")],
+                },
+                1_700_000_902_000,
+            )
+            .expect("save pending legacy draft");
+        drop(plan_store);
+
+        let chat_identity = write_verified_chat_sample(
+            &stores,
+            &source_id,
+            binding_id,
+            thread_uuid,
+            &project,
+            "epoch_pending_draft",
+        );
+        let service = ObservationService::new(stores.config(&app_data));
+        let snap = service
+            .workspace_snapshot(None)
+            .expect("workspace_snapshot with pending legacy draft");
+
+        assert_eq!(snap.chats.len(), 1);
+        let chat = &snap.chats[0];
+        assert_eq!(chat.identity, chat_identity);
+        assert_eq!(chat.active_job_count, 0);
+        assert_eq!(chat.attention_count, 0);
+
+        let history = snap
+            .job_histories
+            .iter()
+            .find(|history| history.job.job_id == plan_id)
+            .expect("legacy draft history");
+        assert_eq!(history.job.state, ObservationJobState::Planning);
+        assert_eq!(history.job.approval_status, "draft");
+        assert_eq!(history.job.execution_status, "not_started");
+        assert!(
+            history.job.chat_identity.is_none(),
+            "a draft must not gain the published-plan chat fallback"
+        );
+        assert!(
+            history.current_attention.is_none(),
+            "a draft must not fabricate a live pending-approval state"
+        );
+        assert_eq!(history.tasks.len(), 1);
+        assert_eq!(history.tasks[0].status, "not_approved");
+        assert!(history.tasks[0].current_attention.is_none());
+        assert_eq!(
+            history.acceptance_proof.status,
+            WorkspaceAcceptanceStatus::Unknown
+        );
+
+        let plan_message = snap
+            .messages
+            .items
+            .iter()
+            .find(|message| {
+                message.source_kind == WorkspaceMessageSourceKind::PlanSummary
+                    && message.scope.job_id.as_deref() == Some(plan_id)
+            })
+            .expect("draft plan summary message");
+        assert!(plan_message.scope.chat_identity.is_none());
+        assert!(
+            snap.messages.items.iter().all(|message| {
+                message.source_kind != WorkspaceMessageSourceKind::AttentionSummary
+                    || message.scope.job_id.as_deref() != Some(plan_id)
+            }),
+            "drafts must not emit pending-approval attention messages"
+        );
+    }
+
+    #[test]
+    fn workspace_snapshot_ambiguous_or_wrong_binding_published_plans_stay_nonactionable() {
+        let tree = TestTree::new("pending-approval-ambiguity");
+        let stores = TestStores::new(&tree, "stores");
+        let app_data = tree.dir("app-data");
+        let source_id = stores.canonical_source_id();
+        let project_a = tree.dir("repo-ambiguous-alpha");
+        let project_b = tree.dir("repo-ambiguous-beta");
+        let project_other = tree.dir("repo-wrong-binding");
+        let ambiguous_binding = "bnd_ws_ambiguous_01";
+        let wrong_plan_binding = "bnd_ws_wrong_plan_01";
+        let ambiguous_plan = publish_legacy_plan_revision(
+            &stores,
+            ambiguous_binding,
+            "plan_ws_ambiguous_01",
+            0,
+            "Ambiguous published plan",
+            vec![legacy_plan_task(
+                "task-ambiguous-plan",
+                "Ambiguous pending task",
+            )],
+        );
+        let wrong_binding_plan = publish_legacy_plan_revision(
+            &stores,
+            wrong_plan_binding,
+            "plan_ws_wrong_binding_01",
+            0,
+            "Wrong binding published plan",
+            vec![legacy_plan_task(
+                "task-wrong-binding-plan",
+                "Wrong binding pending task",
+            )],
+        );
+
+        let ambiguous_chat_a = write_verified_chat_sample(
+            &stores,
+            &source_id,
+            ambiguous_binding,
+            "0196ed00-0000-7000-8000-000000000903",
+            &project_a,
+            "epoch_ambiguous_alpha",
+        );
+        let ambiguous_chat_b = write_verified_chat_sample(
+            &stores,
+            &source_id,
+            ambiguous_binding,
+            "0196ed00-0000-7000-8000-000000000904",
+            &project_b,
+            "epoch_ambiguous_beta",
+        );
+        let other_binding_chat = write_verified_chat_sample(
+            &stores,
+            &source_id,
+            "bnd_ws_other_01",
+            "0196ed00-0000-7000-8000-000000000905",
+            &project_other,
+            "epoch_other_binding",
+        );
+        write_verified_chat_sample(
+            &stores,
+            "src_ffffffffffffffffffffffffffffffff",
+            wrong_plan_binding,
+            "0196ed00-0000-7000-8000-000000000906",
+            &project_other,
+            "epoch_foreign_source",
+        );
+
+        let service = ObservationService::new(stores.config(&app_data));
+        let snap = service
+            .workspace_snapshot(None)
+            .expect("workspace_snapshot with ambiguous and wrong-scope plans");
+
+        assert_eq!(snap.chats.len(), 3);
+        for identity in [ambiguous_chat_a, ambiguous_chat_b, other_binding_chat] {
+            let chat = snap
+                .chats
+                .iter()
+                .find(|chat| chat.identity == identity)
+                .expect("verified non-actionable chat");
+            assert_eq!(chat.active_job_count, 0);
+            assert_eq!(chat.attention_count, 0);
+        }
+
+        for plan in [&ambiguous_plan, &wrong_binding_plan] {
+            let history = snap
+                .job_histories
+                .iter()
+                .find(|history| history.job.job_id == plan.plan_id)
+                .expect("unjoined published plan history");
+            assert_eq!(history.job.state, ObservationJobState::Planning);
+            assert_eq!(history.job.approval_status, "unapproved");
+            assert_eq!(history.job.execution_status, "not_started");
+            assert!(
+                history.job.chat_identity.is_none(),
+                "ambiguous or wrong-scope candidates must never be joined"
+            );
+            assert!(
+                history.current_attention.is_none(),
+                "unverified identity scope must not fabricate pending approval"
+            );
+            assert!(history
+                .tasks
+                .iter()
+                .all(|task| task.status == "not_approved" && task.current_attention.is_none()));
+            assert_eq!(
+                history.acceptance_proof.status,
+                WorkspaceAcceptanceStatus::Unknown
+            );
+
+            let plan_message = snap
+                .messages
+                .items
+                .iter()
+                .find(|message| {
+                    message.source_kind == WorkspaceMessageSourceKind::PlanSummary
+                        && message.scope.job_id.as_deref() == Some(plan.plan_id.as_str())
+                })
+                .expect("unjoined plan summary message");
+            assert!(plan_message.scope.chat_identity.is_none());
+            assert!(
+                snap.messages.items.iter().all(|message| {
+                    message.source_kind != WorkspaceMessageSourceKind::AttentionSummary
+                        || message.scope.job_id.as_deref() != Some(plan.plan_id.as_str())
+                }),
+                "unverified or ambiguous scope must not emit pending-approval attention"
+            );
+        }
+
+        assert!(snap
+            .native_samples
+            .iter()
+            .all(|sample| sample.chat_identity.source_id == source_id));
+        assert!(snap.messages.items.iter().all(|message| {
+            message.summary
+                != "The latest recorded published plan referenced by this job has no approval linked to the job."
+        }));
+    }
+
+    #[test]
+    fn workspace_snapshot_matching_approval_removes_pending_approval_attention() {
+        let tree = TestTree::new("pending-approval-cleared");
+        let stores = TestStores::new(&tree, "stores");
+        let app_data = tree.dir("app-data");
+        let project = tree.dir("repo-pending-cleared");
+        let source_id = stores.canonical_source_id();
+        let binding_id = "bnd_ws_pending_cleared_01";
+        let thread_uuid = "0196ed00-0000-7000-8000-000000000907";
+        let task_id = "task-pending-cleared";
+        let plan = publish_legacy_plan_revision(
+            &stores,
+            binding_id,
+            "plan_ws_pending_cleared_01",
+            0,
+            "Published legacy plan before approval",
+            vec![legacy_plan_task(task_id, "Pending cleared task")],
+        );
+        let chat_identity = write_verified_chat_sample(
+            &stores,
+            &source_id,
+            binding_id,
+            thread_uuid,
+            &project,
+            "epoch_pending_cleared",
+        );
+        let service = ObservationService::new(stores.config(&app_data));
+
+        let before = service
+            .workspace_snapshot(None)
+            .expect("workspace_snapshot before matching approval");
+        let before_history = before
+            .job_histories
+            .iter()
+            .find(|history| history.job.job_id == plan.plan_id)
+            .expect("pending approval history before approval");
+        assert_eq!(
+            before_history
+                .current_attention
+                .as_ref()
+                .map(|attention| attention.kind),
+            Some(WorkspaceAttentionKind::NeedsApproval)
+        );
+        assert!(before.messages.items.iter().any(|message| {
+            message.source_kind == WorkspaceMessageSourceKind::AttentionSummary
+                && message.scope.job_id.as_deref() == Some(plan.plan_id.as_str())
+                && message.summary
+                    == "The latest recorded published plan referenced by this job has no approval linked to the job."
+        }));
+
+        let approval = make_legacy_worker_approval(
+            &plan,
+            binding_id,
+            thread_uuid,
+            &project,
+            &[task_id.to_string()],
+            1_700_000_907_000,
+        );
+        write_legacy_approvals_ledger(&stores, std::slice::from_ref(&approval));
+
+        let after = service
+            .workspace_snapshot(None)
+            .expect("workspace_snapshot after matching approval");
+        let after_history = after
+            .job_histories
+            .iter()
+            .find(|history| history.job.job_id == plan.plan_id)
+            .expect("approved legacy plan history");
+        assert_eq!(after_history.job.approval_status, "approved");
+        assert_eq!(
+            after_history.job.chat_identity.as_ref(),
+            Some(&chat_identity)
+        );
+        assert_eq!(after_history.job.execution_status, "not_started");
+        assert_ne!(after_history.job.state, ObservationJobState::Completed);
+        assert!(
+            after_history.current_attention.is_none(),
+            "persisted approval evidence must retire the pending-approval attention"
+        );
+        assert!(after_history
+            .tasks
+            .iter()
+            .all(|task| task.current_attention.is_none()));
+        assert_eq!(
+            after_history.acceptance_proof.status,
+            WorkspaceAcceptanceStatus::Unknown,
+            "approval alone must never claim Worker completion acceptance"
+        );
+        assert!(after_history
+            .acceptance_proof
+            .accepted_candidate_id
+            .is_none());
+        assert!(after_history
+            .acceptance_proof
+            .combined_candidate_id
+            .is_none());
+        assert!(after_history.acceptance_proof.closure_verdict_id.is_none());
+
+        assert_eq!(after.chats.len(), 1);
+        assert_eq!(after.chats[0].identity, chat_identity);
+        assert_eq!(after.chats[0].active_job_count, 1);
+        assert_eq!(after.chats[0].attention_count, 0);
+        assert!(after.messages.items.iter().all(|message| {
+            !(message.source_kind == WorkspaceMessageSourceKind::AttentionSummary
+                && message.scope.job_id.as_deref() == Some(plan.plan_id.as_str())
+                && message.summary
+                    == "The latest recorded published plan referenced by this job has no approval linked to the job.")
+        }));
+        assert!(after
+            .messages
+            .items
+            .iter()
+            .all(|message| message.source_record_id != format!("attn_{}", plan.plan_id)));
+        let plan_message = after
+            .messages
+            .items
+            .iter()
+            .find(|message| {
+                message.source_kind == WorkspaceMessageSourceKind::PlanSummary
+                    && message.scope.job_id.as_deref() == Some(plan.plan_id.as_str())
+            })
+            .expect("approved plan summary message");
+        assert_eq!(
+            plan_message.scope.chat_identity.as_ref(),
+            Some(&chat_identity)
+        );
+        assert!(
+            after.messages.items.iter().all(|message| !message
+                .summary
+                .contains("Do not leak this legacy instruction")),
+            "approval must not introduce raw task instructions"
         );
     }
 }

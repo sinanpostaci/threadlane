@@ -57,6 +57,11 @@ const WARN_NATIVE_SAMPLE_REGRESSED: &str =
 const WARN_COWORKER_SCOPE_REJECTED: &str =
     "Rejected coworker job record whose scope did not match its binding ledger or project root.";
 
+const VERIFIED_PENDING_PLAN_ATTENTION_REASON: &str =
+    "The latest recorded published plan referenced by this job has no approval linked to the job.";
+const PENDING_PLAN_ATTENTION_NEXT_STEP: &str =
+    "Inspect the current plan and approval evidence before deciding whether approval or a revised plan is needed.";
+
 /// Bounded in-memory native sample reconciliation cache attached to [`ObservationService`].
 ///
 /// Preserves monotonic `(producer_epoch, backend_process_instance, sequence)` ordering across
@@ -513,13 +518,26 @@ fn project_single_source_workspace(
             continue;
         }
 
+        let mut pending_approval_verified = false;
         let verified_chat = match (
             legacy_job.binding_id.as_deref(),
             legacy_job.thread_uuid.as_deref(),
             legacy_job.project_path.as_deref(),
         ) {
             (Some(b), Some(t), Some(p)) => verified_chat_identity_for_spec(spec, b, t, p),
-            _ => None,
+            _ => {
+                // Published legacy plans without an approval omit `thread_uuid` and
+                // `project_path`. Attach only the unique independently verified full chat
+                // identity owned by the frozen plan revision's control binding.
+                let fallback = resolve_legacy_pending_approval_chat(
+                    spec,
+                    legacy_job,
+                    &candidate_chats,
+                    &plan_revisions_by_key,
+                );
+                pending_approval_verified = fallback.is_some();
+                fallback
+            }
         };
 
         let legacy_task_ids: Vec<String> = legacy_job
@@ -569,10 +587,11 @@ fn project_single_source_workspace(
             }
             _ => None,
         };
-        let mut legacy_history = build_legacy_fallback_job_history(
+        let mut legacy_history = build_legacy_fallback_job_history_with_pending_approval(
             legacy_job,
             verified_chat,
             verified_external_resolutions.as_ref(),
+            pending_approval_verified,
         );
         attach_correlated_request_ids(&mut legacy_history, projected_requests);
 
@@ -936,6 +955,49 @@ fn verified_chat_identity_for_spec(
     is_verified_project_scope_for_spec(spec, &identity.canonical_project_scope).then_some(identity)
 }
 
+/// Resolves the narrow legacy published-plan case that has no chat tuple of its own.
+///
+/// The candidate pool already contains only full four-part identities from verified native
+/// samples, trusted hints, verified ledgers, or fully scoped projected jobs. This helper never
+/// synthesizes a tuple from titles, job/plan IDs, or partial metadata. Ambiguity across two
+/// independently verified chats for the same control binding fails closed.
+fn resolve_legacy_pending_approval_chat(
+    spec: &SourceSpec,
+    legacy_job: &ObservationJob,
+    candidate_chats: &BTreeMap<String, WorkspaceChatIdentity>,
+    plan_revisions_by_key: &BTreeMap<(String, u64), PlanRevision>,
+) -> Option<WorkspaceChatIdentity> {
+    if legacy_job.state != ObservationJobState::Planning
+        || legacy_job.approval_status != "unapproved"
+        || legacy_job.execution_status != "not_started"
+        || legacy_job.thread_uuid.is_some()
+        || legacy_job.project_path.is_some()
+        || legacy_job
+            .tasks
+            .iter()
+            .any(|task| task.status != "not_approved")
+    {
+        return None;
+    }
+
+    let binding_id = legacy_job.binding_id.as_deref()?;
+    let plan_id = legacy_job.plan_id.as_deref()?;
+    let plan_revision_number = legacy_job.plan_revision?;
+    let plan_revision = plan_revisions_by_key.get(&(plan_id.to_string(), plan_revision_number))?;
+    if plan_revision.binding_id != binding_id || !plan_revision.status.is_active_published() {
+        return None;
+    }
+
+    let mut matches = candidate_chats.values().filter(|identity| {
+        identity.source_id == spec.source.id && identity.binding_id == binding_id
+    });
+    let identity = matches.next()?.clone();
+    if matches.next().is_some() {
+        return None;
+    }
+    Some(identity)
+}
+
 fn is_verified_project_scope_for_spec(spec: &SourceSpec, raw_path: &str) -> bool {
     if raw_path.is_empty()
         || raw_path.len() > MAX_WORKER_PATH_BYTES
@@ -1080,10 +1142,25 @@ fn derive_project_label(canonical_project_scope: &str) -> String {
     sanitize_observation_label(raw, FALLBACK_VERIFIED_PROJECT_LABEL)
 }
 
+#[cfg(test)]
 fn build_legacy_fallback_job_history(
     job: &ObservationJob,
     verified_chat: Option<WorkspaceChatIdentity>,
     verified_external_resolutions: Option<&VerifiedLegacyPlanExternalResolutions>,
+) -> WorkspaceJobHistory {
+    build_legacy_fallback_job_history_with_pending_approval(
+        job,
+        verified_chat,
+        verified_external_resolutions,
+        false,
+    )
+}
+
+fn build_legacy_fallback_job_history_with_pending_approval(
+    job: &ObservationJob,
+    verified_chat: Option<WorkspaceChatIdentity>,
+    verified_external_resolutions: Option<&VerifiedLegacyPlanExternalResolutions>,
+    pending_approval_verified: bool,
 ) -> WorkspaceJobHistory {
     let tasks: Vec<WorkspaceTaskHistory> = job
         .tasks
@@ -1105,6 +1182,8 @@ fn build_legacy_fallback_job_history(
     // specific human action, avoiding a duplicate generic request.
     let current_attention = if job.state == ObservationJobState::NeedsUser && has_task_attention {
         None
+    } else if pending_approval_verified && job.state == ObservationJobState::Planning {
+        Some(legacy_pending_approval_attention(job.updated_at_ms))
     } else {
         legacy_job_attention(job.state, job.updated_at_ms)
     };
@@ -1238,6 +1317,22 @@ fn legacy_job_attention(
         question_id: None,
         updated_at_ms,
     })
+}
+
+/// Projects the narrowly verified published legacy plan that has not been approved or started.
+///
+/// The wording is software-owned metadata. It does not claim that a human read a message, grant
+/// execution authority, or infer a more specific request from plan titles or task instructions.
+fn legacy_pending_approval_attention(updated_at_ms: Option<i64>) -> WorkspaceAttentionState {
+    WorkspaceAttentionState {
+        kind: WorkspaceAttentionKind::NeedsApproval,
+        reason: VERIFIED_PENDING_PLAN_ATTENTION_REASON.to_string(),
+        next_step: Some(PENDING_PLAN_ATTENTION_NEXT_STEP.to_string()),
+        blocking_hold_ids: Vec::new(),
+        blocking_outbox_ids: Vec::new(),
+        question_id: None,
+        updated_at_ms,
+    }
 }
 
 fn legacy_attention_is_coverable(attention: &WorkspaceAttentionState) -> bool {
@@ -1654,11 +1749,21 @@ fn collect_legacy_job_message_candidates(
     out: &mut Vec<WorkspaceMessageCandidateInput>,
 ) {
     let chat_id = legacy_history.job.chat_identity.clone();
+    let has_verified_chat = chat_id.is_some();
 
     let scope = WorkspaceMessageScope {
-        source_id: legacy_job.source_id.clone(),
-        binding_id: legacy_job.binding_id.clone(),
-        thread_uuid: legacy_job.thread_uuid.clone(),
+        source_id: chat_id
+            .as_ref()
+            .map(|c| c.source_id.clone())
+            .unwrap_or_else(|| legacy_job.source_id.clone()),
+        binding_id: chat_id
+            .as_ref()
+            .map(|c| c.binding_id.clone())
+            .or_else(|| legacy_job.binding_id.clone()),
+        thread_uuid: chat_id
+            .as_ref()
+            .map(|c| c.thread_uuid.clone())
+            .or_else(|| legacy_job.thread_uuid.clone()),
         canonical_project_scope: chat_id.as_ref().map(|c| c.canonical_project_scope.clone()),
         chat_identity: chat_id,
         job_id: Some(legacy_job.id.clone()),
@@ -1711,6 +1816,31 @@ fn collect_legacy_job_message_candidates(
                     .to_string(),
             ),
         });
+    }
+
+    // Only the narrowly verified published/unapproved legacy plan emits a pending-approval
+    // attention row. Other legacy attention kinds keep their existing message boundaries.
+    if has_verified_chat {
+        if let Some(attention) = legacy_history.current_attention.as_ref() {
+            if attention.kind == WorkspaceAttentionKind::NeedsApproval
+                && !attention.reason.trim().is_empty()
+            {
+                out.push(WorkspaceMessageCandidateInput {
+                    source_kind: "attention_summary".to_string(),
+                    source_record_id: format!("attn_{}", legacy_job.id),
+                    source_order: WorkspaceMessageSourceOrder {
+                        recorded_at_ms: legacy_job.updated_at_ms,
+                        source_seq: legacy_job.plan_revision.unwrap_or(0),
+                        sub_index: 1,
+                    },
+                    scope: scope.clone(),
+                    actor_role: Some("coworker".to_string()),
+                    raw_summary: attention.reason.clone(),
+                    upstream_truncated: false,
+                    incomplete_reason: None,
+                });
+            }
+        }
     }
 }
 
