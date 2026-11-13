@@ -223,7 +223,9 @@ async function waitForFiniteAnimations(scope: Locator): Promise<void> {
           animation.finished.catch(() => undefined)
         )
       ),
-      new Promise<void>((resolve) => setTimeout(() => resolve(), 2_000)),
+      new Promise<void>((resolve) => {
+        setTimeout(() => resolve(), 2_000);
+      }),
     ]);
     await new Promise<void>((resolve) =>
       requestAnimationFrame(() => requestAnimationFrame(() => resolve()))
@@ -237,10 +239,10 @@ async function expectOpaqueDrawerContrast(label: Locator): Promise<void> {
     canvas.width = 1;
     canvas.height = 1;
     const context = canvas.getContext('2d');
+    if (!context) {
+      throw new Error('Expected a 2D canvas context for color parsing.');
+    }
     const parse = (value: string): number[] => {
-      if (!context) {
-        return [0, 0, 0, 0];
-      }
       context.clearRect(0, 0, 1, 1);
       context.fillStyle = 'rgba(0, 0, 0, 0)';
       context.fillStyle = value;
@@ -292,16 +294,22 @@ async function expectOpaqueDrawerContrast(label: Locator): Promise<void> {
     const text = composite(parse(getComputedStyle(labelEl).color), background);
     const textLuminance = luminance(text);
     const backgroundLuminance = luminance(background);
+    const dot = dialog.querySelector('.tl-chat-item .tl-status-dot');
+    const dotBackground = dot
+      ? parse(getComputedStyle(dot).backgroundColor)
+      : [0, 0, 0, 0];
     return {
       backgroundAlpha: dialogBackground[3],
       contrast:
         (Math.max(textLuminance, backgroundLuminance) + 0.05) /
         (Math.min(textLuminance, backgroundLuminance) + 0.05),
+      dotAlpha: dotBackground[3],
     };
   });
 
   expect(metrics.backgroundAlpha).toBeGreaterThanOrEqual(0.99);
   expect(metrics.contrast).toBeGreaterThanOrEqual(4.5);
+  expect(metrics.dotAlpha).toBeGreaterThanOrEqual(0.99);
 }
 
 test.describe('wide sidebar chat titles', () => {
@@ -478,6 +486,8 @@ test.describe('narrow drawer chat titles', () => {
     await expectReadableTitle(drawer, ALPHA_TITLE);
   });
 
+  // The Radix portal sits outside .tl-app-shell, so the local gray bridge must
+  // keep the drawer surface opaque and readable in both themes.
   test('keeps the navigation drawer opaque and titles readable in light and dark themes', async ({
     page,
   }) => {
@@ -519,10 +529,10 @@ test.describe('narrow drawer chat titles', () => {
         name: /navigation|projects|workspace/i,
       });
       await expect(drawer).toBeVisible();
-      await waitForFiniteAnimations(drawer);
-
       const alphaLabel = await expectReadableTitle(drawer, ALPHA_TITLE);
       const betaLabel = await expectReadableTitle(drawer, BETA_TITLE);
+      await waitForFiniteAnimations(drawer);
+
       await expectOpaqueDrawerContrast(alphaLabel);
       await expectOpaqueDrawerContrast(betaLabel);
       await expectNoHorizontalOverflow(page, drawer);

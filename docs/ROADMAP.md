@@ -24,20 +24,14 @@ in [First personal MVP acceptance](MVP-READINESS.md). Older checkpoint, pilot,
 and multi-role sections below describe their original evidence only; they are
 not new evidence for the 2026-11-13 contract.
 
-The combined checkout now contains the core backlog, paired MCP tools, guarded
-Worker result/acceptance/rejection, and the desktop chat stream with a backlog
-drawer. Fresh native activity and verified Worker presence drive live indicators;
-backlog state does not manufacture human attention. The read-only presence route
-avoids store initialization and write-lock waits, with bounded desktop acquisition.
-Parent validation includes 130 core tests, 63 host regressions, 188 desktop tests
-(one pre-existing manual test excluded), 36 frontend test files, type checking,
-frontend build, and focused Clippy checks. Wide/narrow production-component
-rendering through test-only IPC also verified the light/dark drawer correction.
-
-This is not full-product delivery. Expanded native recovery tests passed, while
-the complete browser gate, real fresh-chat projection, same-final-artifact parallel execution,
-Nix packages, isolated NixOS application acceptance, and the package-closing
-review remain open. See the current contract for qualification boundaries.
+The minimal chat-centered MVP passed its qualified Linux/NixOS acceptance
+on 2026-11-13. The [dated acceptance report](MINIMAL-CHAT-MVP-ACCEPTANCE-2026-11-13.md)
+records combined source gates, the actual native Coworker/Worker idle and busy
+flows, real independent parallel operation, bounded read-only liveness,
+wide/narrow browser checks, final packages, independent NixOS application/tray
+checks, and the package-closing review with targeted rechecks. Native guest UI
+fixtures, mocked browser IPC and real-provider evidence are distinguished.
+Publication does not activate a host upgrade or qualify untested platforms.
 
 The user stays in the native Codex conversation, including frequent Steer and
 questions. Codex interprets intent and plans. Threadlane owns validated execution,

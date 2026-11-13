@@ -8,16 +8,22 @@ trusted scope approval remain explicit setup boundaries; ordinary work should
 not require switching to the panel for each task. See
 [session lifecycle and its current limits](docs/SESSION-LIFECYCLE.md).
 
-> **Status:** Early development with AI assistance, reviewed before checkpointing. The Linux desktop includes editable tools, model/effort catalogs, workflow profiles, durable plan drafts, appearance settings, and read-only activity history. CLI and Linux desktop Nix source builds pass. One trusted local operator CLI conversation also received a real busy-turn callback and completed a six-event pull/ACK, cancellation of a real OpenCode process, and explicit stop/restart without replay; see [the 2026-10-31 pilot](docs/NATIVE-CLI-PILOT-2026-10-31.md). Immutable operator approvals, detached local hosts, frozen-task MCP dispatch and default-off approved-session notifications have local fixture coverage. Production multi-chat onboarding, live API entitlement, interactive provider steering, and other platforms remain separate acceptance gates. See the [M4 baseline and its validation limits](docs/M4-CHECKPOINT.md), [approved-session notification extension](docs/APPROVED-NOTIFICATIONS.md), [configuration](docs/CONFIGURATION.md), and [desktop usage](docs/DESKTOP.md).
+> **Current product:** the minimal chat-centered MVP passed its qualified
+> Linux/NixOS acceptance on 2026-11-13. Native Codex remains the Coworker;
+> Threadlane shows one chat event stream, a small Todo/Doing/Done/Blocked backlog,
+> and real fresh activity. Ordinary work has no mandatory Jobs, Orchestrator,
+> Reviewer or Closure stage. Read the [current contract](docs/MINIMAL-CHAT-MVP.md)
+> and [dated acceptance report](docs/MINIMAL-CHAT-MVP-ACCEPTANCE-2026-11-13.md) for
+> exact artifact/model/platform boundaries. Source publication does not activate
+> a host system upgrade.
 
-The current first personal Linux release scope and outstanding acceptance gates are
-tracked in [MVP readiness](docs/MVP-READINESS.md). Older milestone reports below
-retain their original evidence; they do not replace qualification of the current
-installed planning, execution, review and completion chain.
+The milestone sections below preserve earlier implementation history and optional
+capabilities. Their historical limitations and multi-role workflows do not
+replace the current minimal product contract or impose mandatory roles on it.
 
 ---
 
-## Working Now and Remaining Milestones
+## Earlier milestones and optional capabilities
 
 ### Conversation Runtime and Bounded History (Milestones 1 and 2A)
 - **`threadlane-core` (`crates/threadlane-core`)**: Transactional SQLite state engine (`SCHEMA_VERSION = 4`, with transactional v1/v2/v3 upgrades) with validated non-nil Codex thread UUID bindings, deterministic simulated demo runs, revision-checked `answer` / `steer` / `cancel` transitions, per-binding compact idempotent command replay, bounded keyset-paginated run/revision/question history, bounded event batches, high-water-mark event acknowledgements, and persistent wake-up notice coalescing and crash/reopen recovery.

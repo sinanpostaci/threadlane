@@ -1,24 +1,14 @@
 # Minimal chat-centered Threadlane MVP
 
-**Status: human-approved product scope, 2026-11-13. Core, operator transport,
-and guarded Worker acceptance/rejection have focused parent validation. The
-full product is not delivered.**
+**Status: accepted for the qualified Linux/NixOS environment, 2026-11-13.**
 
 This is the current product contract. It supersedes conflicting historical
 multi-role requirements while retaining their original evidence. The combined
-checkout passed 164 native library tests, focused core and real HTTP operator
-tests, formatting, and Clippy for the guarded delivery path. Two isolated real
-one-Worker checks passed: an idle native callback and a callback handled inside
-an already active native turn. In both, the actual Coworker read the result,
-independently inspected delivery, recorded durable `Done`, and acknowledged the
-actual event batch without environment repair. Those proofs use a frozen earlier
-bundle, not the final UI/rejection candidate.
-
-The desktop stream, drawer, scoped backlog projection, and bounded read-only
-Worker presence are integrated. Final browser/native recovery gates, real
-fresh-chat projection, same-artifact parallel acceptance, Nix packaging, isolated
-NixOS application acceptance, and the package-closing review remain open.
-Source presence and these narrow proofs do not establish full MVP delivery.
+runtime, minimal desktop, live native Coworker/Worker flow, parallel isolation,
+recovery, package and independent NixOS application gates passed. The
+[acceptance report](MINIMAL-CHAT-MVP-ACCEPTANCE-2026-11-13.md) identifies the exact
+runtime checkpoint, artifact paths, checks, corrected defects and qualification
+limits. Publication of this source does not activate a host upgrade.
 
 ## Human-approved direction
 
@@ -185,8 +175,8 @@ reject at the current revision with matching digests, and ACK only the actual
 returned batch. ACK is not completion or rejection. Missing mapping or evidence is
 reported precisely, never filled with invented IDs, a success claim, `NeedsYou`,
 or a relaunch. A stopped host permits supported read result/history, not history
-ACK or a forced restart. Busy/idle callback handling is intended but not
-live-qualified.
+ACK or a forced restart. Busy and idle native callback handling passed the
+qualified live cases; see the acceptance report for artifact and model boundaries.
 
 A rejected attempt cannot complete or record another outcome. A
 `backlog_worker_result` reread preserves the stored rejection. An exact replay of
@@ -203,9 +193,10 @@ current revision. Raw outcome import and manual Worker success shortcuts are not
 part of this contract. A `Done` replay returns the immutable original completion
 receipt rather than creating a new acceptance.
 
-These are source-level contracts in the combined checkout. Broad live provider,
-parallel native-callback, UI, and installed-package acceptance are not
-established by source or the two narrow parent proofs alone.
+These contracts passed the combined source checks and the specific live
+provider/native-callback, browser and packaged NixOS UI gates recorded in the
+acceptance report. They do not establish every-provider, every-platform, or
+installed-host upgrade acceptance.
 
 ## Roles and approvals
 
@@ -269,11 +260,10 @@ Present in `threadlane-core` in the combined checkout:
 - bounded text, keyset pagination, stable history order, revision checks,
   payload-conflict detection, and rejection-without-side-effects behavior.
 
-Core backlog storage and the trusted-local operator routes have focused
-validation. Integrated parent-run validation of the combined checkout remains
-open.
+Core backlog storage and the trusted-local operator routes passed focused and
+combined parent-run validation; see the acceptance report.
 
-### Worker reservation and guarded acceptance (focused validation passed)
+### Worker reservation and guarded acceptance (validated)
 
 The combined checkout contains the guarded Worker linkage and paired facade:
 reservation against an exact frozen approval/task identity, dispatch receipt
@@ -284,7 +274,7 @@ independently checked physical delivery, blocks the item, and leaves the
 successful technical outcome immutable. It reuses the existing runner and
 authority rather than creating a second execution model.
 
-The combined guarded facade passed ten focused tests and all 164 native
+The combined guarded facade passed eleven focused tests and all 166 native
 library regressions; Clippy passed. Tests cover exact rejection and receipt
 replay, changed or missing physical delivery, stale revisions, acceptance
 refusal after rejection, and preservation of a newer authorized attempt. The
@@ -295,7 +285,7 @@ clean host stop and authority reopen, checks delivery, and records Done. Negativ
 result/completion requests leave item, history, and host state unchanged. These
 fixtures do not themselves prove live native callback delivery.
 
-### Desktop stream and read-only liveness (integrated, final acceptance open)
+### Desktop stream and read-only liveness (validated)
 
 Ordinary Projects chats render one bottom-growing durable event stream and a
 read-only Todo/Doing/Done/Blocked drawer. Current scope uses the complete source,
@@ -308,57 +298,59 @@ initializing stores or acquiring write locks. Acquisition retains at most 64
 candidates before scheduling, runs at most eight calls concurrently, uses per-call
 and overall deadlines, cancels pending work, and retains completed results.
 
-At the integrated UI checkpoint, parent-run checks passed 130 core tests, 63 host
-regressions, 188 desktop tests, and 36 frontend test files. One pre-existing manual
-Codex navigation test was excluded. Type checking, frontend build, and focused
-Clippy checks passed. Production React components rendered through test-only
-Tauri IPC at wide and narrow sizes without page errors or document overflow.
-Drawer title contrast was measured above 13:1 in both light and dark themes after
-the portal-local token correction. These checks do not prove real native IPC in
-a NixOS guest or qualify every browser interaction.
+Parent-run combined validation passed formatting, focused behavior and
+all-target Clippy, 1,325 Rust workspace tests, the desktop suite, 36 frontend test
+files, type checking and production build. The complete 36-check browser gate
+passed using production components with explicitly mocked test IPC. The final
+packaged app separately passed real Tauri IPC and Wayland/tray acceptance inside
+an independent NixOS guest. Drawer opacity and text contrast were measured,
+and actual final screenshots inspected. See the acceptance report for precise
+counts and test boundaries.
 
-### Live acceptance and remaining qualification
+### Live acceptance and qualification limits
 
-Two earlier frozen-bundle one-Worker proofs passed: idle and busy-turn callbacks,
-physical Coworker delivery inspection, durable `Done`, and real event ACK. They
-do not qualify the final UI/rejection bundle. Expanded native recovery tests passed;
-the final browser suite is still being integrated and validated. Actual paired
-fresh-chat projection, independent parallel execution on the final artifact,
-Nix packaging, isolated NixOS application acceptance, and the one package-closing
-review remain required.
+The qualified real native route projected new paired chats before work, returned
+Worker results to idle and already-active Codex turns, captured actual physical
+Worker presence, and required the native Coworker to inspect physical delivery,
+record durable Done and ACK the actual batch. Two independent real Workers on
+one runtime artifact overlapped and completed in separate chats and worktrees.
+The same final packaged desktop showed a new actual native chat before work,
+then actual Worker Working and checked Done with cleared live/attention indicators.
+Lost replies/notices, stopped-host recovery, duplicates, stale revisions and
+cross-chat rejection passed the focused fixture matrix. Fixture recovery and
+native guest UI evidence remain distinct from real-provider evidence.
 
-No full MVP delivery, installed-package, or unsupported-platform claim is made.
-The additive tables still use the existing sole-owner Core initialization without
-a broad schema migration; older stored bindings and historical state remain
-compatible. Historical pilots retain only their original scope.
+The final CLI/MCP/host/session binaries are byte-identical to the live-qualified
+runtime; the final desktop package includes the separately qualified UI fixes.
+Astra performed one package-closing review and targeted correction rechecks.
+No host activation, Codex restart, second backend, global configuration change,
+or non-Linux qualification is claimed. Historical pilots retain their original
+scope. The additive backlog tables retain the existing sole-owner Core and
+binding/run compatibility; the report does not claim a broad migration acceptance.
 
-## Open acceptance gates
+## Acceptance gates (qualified Linux/NixOS scope)
 
-Source presence alone satisfies none of these gates. The parent records
-integrated test evidence; completed source work is distinct from the remaining
-combined-artifact and live acceptance gates.
+Each completed gate below is supported by the dated acceptance report. Source
+presence alone was not treated as acceptance.
 
-- [ ] Parent-run `cargo fmt` check, focused core/MCP/facade tests, and Clippy
-      pass against the combined checkout and its own target directory.
-- [ ] Guarded reservation, mutating result reconciliation, verified completion,
-      exact-success rejection, immutable success preservation, preserved
-      rejection on reread, fresh-authority retry, and unknown-outcome recovery
-      pass focused tests.
-- [x] Desktop bottom-growing stream and backlog drawer are implemented and
-      reviewed; final combined browser/application acceptance remains separate.
-- [ ] `NeedsYou` derives only from real open human requests, not from `Blocked`
-      or awaiting-review states.
-- [ ] Host result persistence before notice, later `backlog_worker_result`
-      reconciliation, and notice-loss recovery are verified.
-- [ ] Independent tasks run in parallel without a global one-Worker cap or
-      mandatory multi-role job/closure stage.
-- [ ] A live authorized Coworker/Worker acceptance conversation passes on the
-      supported Linux/NixOS host, including approved-task callbacks in busy and
-      idle turns. The two earlier-bundle proofs do not close final combined-artifact
-      acceptance.
-- [ ] The authorized package-closing review is completed after integrated
-      validation.
+- [x] Parent-run formatting, focused core/MCP/facade tests, combined workspace
+      tests and Clippy pass with checkout-local build directories.
+- [x] Guarded reservation, exact-success rejection, immutable Done/success,
+      fresh-authority retry rules and unknown-outcome recovery pass.
+- [x] One bottom-growing desktop stream and a small backlog drawer replace the
+      normal Jobs/Messages/Activity surface; wide/narrow behavior is qualified.
+- [x] Actual fresh activity drives Working; only a real open human request
+      drives Needs you. Historical failure, Blocked and awaiting-check do not.
+- [x] Results persist before notices; lost reply/notice and stopped-host result
+      recovery preserve the original invocation without blind redispatch.
+- [x] Independent real Workers run in parallel without a mandatory multi-role
+      job/controller/closure stage.
+- [x] Actual native Coworker idle/busy callback, physical delivery checking,
+      durable Done, real event ACK and fresh-before-work projection pass.
+- [x] Final Nix packages, real wide/narrow native app and Linux Wayland tray
+      acceptance pass without host activation.
+- [x] One authorized Astra High package-closing review and targeted fix rechecks
+      are complete.
 
-Historical pilot and multi-role acceptance reports remain evidence only for
-their exact prior scope. They are not evidence that this new contract or its
-open gates have been delivered.
+These gates qualify the dated Linux/NixOS MVP, not every provider, untested
+platform, compositor, installed-host upgrade or unlimited outage duration.

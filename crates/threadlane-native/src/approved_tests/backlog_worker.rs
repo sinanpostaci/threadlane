@@ -8,11 +8,13 @@
 //! pre-effect reservation, unresolved durable dispatch intent refusal without redispatch, and
 //! checked acceptance rejection with physical tamper refusal, stable rejected-result rereads,
 //! completion refusal, durable rejection replay, and a newer authorized attempt.
-//! The recovery cases drop an actual serialized `rmcp`/Tokio duplex start reply after the
-//! durable external effect and then reconnect through a new enrolled server. They also reopen
-//! the existing authority store to reconcile a result without consuming a native notice, and
-//! exercise negative result/completion attempts without state or host effects. The fixture still
-//! does not prove native MCP callback or notice delivery.
+//! The recovery cases drop actual serialized `rmcp`/Tokio duplex start, result, and Done replies
+//! after their durable effects and then reconnect through fresh enrolled server epochs. They also
+//! cover an interrupted state after real host admission/spawn but before the backlog dispatch
+//! receipt was attached, and reopen the existing authority store to reconcile a result without
+//! consuming a native notice. Negative result/completion attempts are exercised without state or
+//! host effects. The fixture still does not prove native MCP callback or notice delivery, and a
+//! controlled transport/state interruption is not a physical process kill or power-loss test.
 //! Provider invocation counting uses the existing fake-provider ledger. These local fake-provider
 //! tests do not prove native callback delivery or production provider behavior.
 
@@ -24,13 +26,15 @@ use std::time::{Duration, Instant};
 
 use rmcp::ServiceExt;
 use serde_json::{json, Value};
+use threadlane::DATABASE_FILENAME;
 use threadlane_core::{
-    BacklogHistoryAction, BacklogHistoryPage, BacklogItem, BacklogStatus,
-    WorkerBacklogAcceptanceRejectionReceipt, WorkerBacklogExecution, WorkerBacklogOutcome,
+    BacklogHistoryAction, BacklogHistoryPage, BacklogItem, BacklogStatus, Core,
+    WorkerBacklogAcceptanceRejectionReceipt, WorkerBacklogAuthority, WorkerBacklogExecution,
+    WorkerBacklogOutcome,
 };
 use threadlane_host::{
-    record_task_dispatch_intent, ApprovedHost, ApprovedHostConfig, ApprovedHostHandle,
-    TaskDispatchIntent, TaskExecutionStatus, TaskStateSnapshot,
+    record_task_dispatch_intent, ApprovedHost, ApprovedHostClient, ApprovedHostConfig,
+    ApprovedHostHandle, TaskDispatchIntent, TaskExecutionStatus, TaskStateSnapshot,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -265,6 +269,112 @@ where
             }
         }
     }
+}
+
+struct TestTransportTask(Option<tokio::task::JoinHandle<()>>);
+
+impl TestTransportTask {
+    fn new(task: tokio::task::JoinHandle<()>) -> Self {
+        Self(Some(task))
+    }
+
+    async fn close(&mut self) {
+        if let Some(task) = self.0.take() {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+}
+
+impl Drop for TestTransportTask {
+    fn drop(&mut self) {
+        if let Some(task) = self.0.take() {
+            task.abort();
+        }
+    }
+}
+
+/// Performs one real serialized `rmcp`/Tokio duplex tool call, verifies that the server produced a
+/// successful reply, and then deliberately discards that reply from the caller's application
+/// logic. The transport is closed and its serving task is reaped before this helper returns.
+async fn discard_serialized_tool_reply(mcp: &PairedMcpServer, tool: &str, arguments: Value) {
+    let transport_server = mcp.clone();
+    let (server_endpoint, client_endpoint) = tokio::io::duplex(64 * 1024);
+    let (server_read, server_write) = tokio::io::split(server_endpoint);
+    let mut server_task = TestTransportTask::new(tokio::spawn(async move {
+        match transport_server.serve((server_read, server_write)).await {
+            Ok(running) => {
+                let _ = running.waiting().await;
+            }
+            Err(err) => panic!("initialize paired MCP test transport: {err}"),
+        }
+    }));
+    let (client_read, mut client_write) = tokio::io::split(client_endpoint);
+    let mut client_reader = BufReader::new(client_read);
+
+    write_json_rpc_line(
+        &mut client_write,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2026-07-28",
+                "capabilities": {},
+                "clientInfo": {"name": "threadlane-backlog-test", "version": "0.1.0"}
+            }
+        }),
+    )
+    .await;
+    let initialized = read_json_rpc_response(&mut client_reader, 1).await;
+    assert_eq!(initialized["result"]["protocolVersion"], "2025-11-25");
+    write_json_rpc_line(
+        &mut client_write,
+        &json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+    )
+    .await;
+
+    write_json_rpc_line(
+        &mut client_write,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": tool,
+                "arguments": arguments
+            }
+        }),
+    )
+    .await;
+    let response = read_json_rpc_response(&mut client_reader, 2).await;
+    assert!(
+        response.get("error").is_none(),
+        "serialized `{tool}` call returned a JSON-RPC error: {response}"
+    );
+    let result = response
+        .get("result")
+        .and_then(Value::as_object)
+        .unwrap_or_else(|| {
+            panic!("serialized `{tool}` call returned no result object: {response}")
+        });
+    assert_ne!(
+        result.get("isError").and_then(Value::as_bool),
+        Some(true),
+        "serialized `{tool}` call returned a tool error instead of a successful reply"
+    );
+    assert!(
+        result.get("structuredContent").is_some(),
+        "serialized `{tool}` call returned no structured reply"
+    );
+
+    // The reply was received and verified as serialized bytes, then intentionally discarded. No
+    // field from it is used as an application outcome; durable reconciliation must come from the
+    // reopened authority store below.
+    drop(response);
+    drop(client_reader);
+    drop(client_write);
+    server_task.close().await;
 }
 
 fn write_failing_agy(fixture: &ApprovedMcpFixture) {
@@ -2443,6 +2553,614 @@ async fn guarded_worker_backlog_negative_result_and_complete_matrix_preserves_st
         host_before.worker.as_ref().map(|worker| worker.revision),
         "refused result/completion requests must not mutate the host worker"
     );
+    assert_eq!(read_invocation_count(&fixture.agy_count_file), 1);
+
+    host.shutdown().await.expect("stop fixture host");
+}
+
+#[tokio::test]
+async fn guarded_worker_backlog_lost_serialized_result_and_done_replies_reconcile_on_reopen() {
+    let fixture = setup_approved_mcp_fixture().await;
+    let (plan_revision, plan_digest) = create_published_plan(
+        &fixture,
+        "plan-worker-backlog-wire-result-done",
+        &fixture.binding_a,
+        default_plan_tasks("Guarded Worker backlog lost result and done replies"),
+    );
+    let approval = approve_published_plan(
+        &fixture,
+        "plan-worker-backlog-wire-result-done",
+        plan_revision,
+        &plan_digest,
+        &fixture.binding_a,
+        THREAD_UUID_A,
+        vec!["task-root-agy".to_string()],
+        1_700_002_800_000,
+    );
+    let host = start_fixture_host(&fixture, &approval.approval_id).await;
+    let mcp = live_mcp(&fixture);
+    enroll_server(&fixture, &mcp, &fixture.binding_a, THREAD_UUID_A).await;
+    let (item_id, revision) = create_worker_item(
+        &mcp,
+        "create-wire-result-done",
+        "Lost result and done reply Worker item",
+    )
+    .await;
+
+    let start_params = json!({
+        "item_id": item_id,
+        "expected_revision": revision,
+        "command_key": "start-wire-result-done",
+        "approval_id": approval.approval_id.clone(),
+        "task_id": "task-root-agy"
+    });
+    let start = mcp
+        .invoke_tool_json("backlog_worker_start", start_params, None)
+        .await
+        .expect("start Worker before result and done reply loss");
+    let execution: WorkerBacklogExecution = serde_json::from_value(
+        start.structured_content.expect("start data")["data"]["execution"].clone(),
+    )
+    .expect("decode started execution");
+    let execution_ref = execution.execution_ref.clone();
+    let dispatch_receipt = execution.dispatch_receipt.clone();
+    assert!(dispatch_receipt.is_some());
+
+    let terminal = wait_for_terminal_task(&mcp, &approval.approval_id, "task-root-agy").await;
+    assert_eq!(terminal.status, TaskExecutionStatus::ReadyForReview);
+    assert_eq!(read_invocation_count(&fixture.agy_count_file), 1);
+
+    // Reconcile the later result and completion from stopped-host evidence, as the existing
+    // durable Worker paths do. The transport loss below is the only injected interruption.
+    host.shutdown().await.expect("stop fixture host");
+
+    let item_before_result = get_item(&mcp, &item_id).await;
+    let history_before_result = get_history(&mcp, &item_id).await;
+    let result_params = json!({
+        "item_id": item_id,
+        "execution_ref": execution_ref.clone()
+    });
+    let original_epoch = mcp.epoch_id().to_string();
+
+    // Send the real result request over a serialized rmcp transport. The server records the
+    // outcome and returns a genuine serialized reply; this application reads and discards it,
+    // then closes the transport without ever using the reply as the reconciliation result.
+    discard_serialized_tool_reply(&mcp, "backlog_worker_result", result_params.clone()).await;
+
+    let item_after_result =
+        wait_for_item_revision_above(&mcp, &item_id, item_before_result.revision).await;
+    assert_eq!(item_after_result.status, BacklogStatus::Doing);
+    assert_eq!(item_after_result.revision, item_before_result.revision + 1);
+    assert_eq!(
+        item_after_result.current_execution_ref.as_deref(),
+        Some(execution_ref.as_str())
+    );
+    let history_after_result = get_history(&mcp, &item_id).await;
+    assert_eq!(
+        history_after_result.entries.len(),
+        history_before_result.entries.len() + 1,
+        "result reconciliation must append exactly one outcome history entry"
+    );
+    assert_eq!(
+        history_after_result
+            .entries
+            .iter()
+            .filter(|entry| entry.action == BacklogHistoryAction::WorkerReserved)
+            .count(),
+        1
+    );
+    assert_eq!(
+        history_after_result
+            .entries
+            .iter()
+            .filter(|entry| entry.action == BacklogHistoryAction::WorkerExecutionAttached)
+            .count(),
+        1
+    );
+    assert_eq!(
+        history_after_result
+            .entries
+            .iter()
+            .filter(|entry| entry.action == BacklogHistoryAction::WorkerOutcomeRecorded)
+            .count(),
+        1
+    );
+    assert_eq!(
+        history_after_result
+            .entries
+            .iter()
+            .filter(|entry| entry.action == BacklogHistoryAction::Completed)
+            .count(),
+        0
+    );
+    assert_eq!(read_invocation_count(&fixture.agy_count_file), 1);
+
+    // Drop the original application server and reconnect through a fresh epoch over a genuinely
+    // reopened authority store. The durable result must already be present from the discarded
+    // serialized reply.
+    drop(mcp);
+    let reopened = reopened_mcp(&fixture);
+    assert_ne!(reopened.epoch_id(), original_epoch.as_str());
+    enroll_server(&fixture, &reopened, &fixture.binding_a, THREAD_UUID_A).await;
+    assert_eq!(get_item(&reopened, &item_id).await, item_after_result);
+    assert_eq!(
+        get_history(&reopened, &item_id).await,
+        history_after_result,
+        "the persisted result history must survive the server epoch change unchanged"
+    );
+
+    let result = reopened
+        .invoke_tool_json("backlog_worker_result", result_params.clone(), None)
+        .await
+        .expect("read the original recovered Worker result");
+    let result_data = result.structured_content.expect("result data")["data"].clone();
+    let executed: WorkerBacklogExecution =
+        serde_json::from_value(result_data["execution"].clone()).expect("decode result execution");
+    assert_eq!(executed.execution_ref, execution_ref);
+    assert_eq!(executed.dispatch_receipt, dispatch_receipt);
+    assert!(executed.completion.is_none());
+    let outcome = executed.outcome.as_ref().expect("successful outcome");
+    assert_eq!(outcome.outcome, WorkerBacklogOutcome::Success);
+    let result_digest = outcome
+        .result_digest
+        .clone()
+        .expect("successful result digest");
+    let delivery = result_data["delivery"]
+        .as_object()
+        .expect("path-free delivery inspection");
+    let delivery_digest = delivery["delivery_digest"]
+        .as_str()
+        .expect("delivery digest")
+        .to_string();
+    let worktree_id = delivery["worktree_id"]
+        .as_str()
+        .expect("worktree identity")
+        .to_string();
+    assert_eq!(
+        get_item(&reopened, &item_id).await,
+        item_after_result,
+        "reading the recovered result must not mutate the durable item"
+    );
+    assert_eq!(get_history(&reopened, &item_id).await, history_after_result);
+
+    // A real physical delivery check still gates completion after the reply loss.
+    let work_area_root = fixture
+        .sessions_dir
+        .join(&approval.approval_id)
+        .join(WORK_AREA_SUBDIR);
+    let checkout = threadlane_workers::load_and_verify_manifest(&work_area_root, &worktree_id)
+        .expect("load verified task worktree manifest")
+        .checkout_path;
+    let delivered_file = checkout.join("src/lib.rs");
+    let original_bytes = fs::read(&delivered_file).expect("read delivered file");
+    let mut changed_bytes = original_bytes.clone();
+    changed_bytes[0] = if changed_bytes[0] == b'/' { b'#' } else { b'/' };
+    assert_eq!(changed_bytes.len(), original_bytes.len());
+    fs::write(&delivered_file, &changed_bytes).expect("write same-length changed delivery");
+
+    let item_before_complete = get_item(&reopened, &item_id).await;
+    let history_before_complete = get_history(&reopened, &item_id).await;
+    let complete_params = json!({
+        "item_id": item_id,
+        "execution_ref": execution_ref.clone(),
+        "command_key": "complete-wire-result-done",
+        "expected_revision": item_before_complete.revision,
+        "expected_result_digest": result_digest,
+        "expected_delivery_digest": delivery_digest,
+        "acceptance_note": "Accepted the recovered exact Worker delivery.",
+        "acceptance_evidence": "Reconciled the original execution, receipt, result, and physical delivery."
+    });
+    let changed_bytes_err = reopened
+        .invoke_tool_json("backlog_worker_complete", complete_params.clone(), None)
+        .await
+        .expect_err("changed same-length delivery must still refuse Done after reply loss");
+    assert_eq!(
+        changed_bytes_err.structured_content.unwrap()["error"]["code"],
+        "delivery_digest_mismatch"
+    );
+    assert_eq!(get_item(&reopened, &item_id).await, item_before_complete);
+    assert_eq!(
+        get_history(&reopened, &item_id).await,
+        history_before_complete
+    );
+
+    fs::write(&delivered_file, &original_bytes).expect("restore exact delivered bytes");
+
+    // The same deliberate reply-loss pattern is applied to the mutating Done commit. The server
+    // records the completion and serializes the receipt, but this application discards it.
+    discard_serialized_tool_reply(
+        &reopened,
+        "backlog_worker_complete",
+        complete_params.clone(),
+    )
+    .await;
+
+    let item_after_complete =
+        wait_for_item_revision_above(&reopened, &item_id, item_before_complete.revision).await;
+    assert_eq!(item_after_complete.status, BacklogStatus::Done);
+    assert_eq!(
+        item_after_complete.revision,
+        item_before_complete.revision + 1
+    );
+    assert_eq!(
+        item_after_complete.current_execution_ref.as_deref(),
+        Some(execution_ref.as_str())
+    );
+    let completed_at_ms = item_after_complete
+        .completed_at_ms
+        .expect("durable completion timestamp");
+    assert_eq!(
+        item_after_complete.completion_note.as_deref(),
+        Some("Accepted the recovered exact Worker delivery.")
+    );
+    let history_after_complete = get_history(&reopened, &item_id).await;
+    assert_eq!(
+        history_after_complete.entries.len(),
+        history_before_complete.entries.len() + 1,
+        "completion must append exactly one Done history entry"
+    );
+    assert_eq!(
+        history_after_complete
+            .entries
+            .iter()
+            .filter(|entry| entry.action == BacklogHistoryAction::WorkerReserved)
+            .count(),
+        1
+    );
+    assert_eq!(
+        history_after_complete
+            .entries
+            .iter()
+            .filter(|entry| entry.action == BacklogHistoryAction::WorkerExecutionAttached)
+            .count(),
+        1
+    );
+    assert_eq!(
+        history_after_complete
+            .entries
+            .iter()
+            .filter(|entry| entry.action == BacklogHistoryAction::WorkerOutcomeRecorded)
+            .count(),
+        1
+    );
+    assert_eq!(
+        history_after_complete
+            .entries
+            .iter()
+            .filter(|entry| entry.action == BacklogHistoryAction::Completed)
+            .count(),
+        1
+    );
+    assert_eq!(read_invocation_count(&fixture.agy_count_file), 1);
+
+    // Read back the exact immutable completion that the discarded reply carried.
+    let completed_result = reopened
+        .invoke_tool_json("backlog_worker_result", result_params.clone(), None)
+        .await
+        .expect("read the discarded Done reply from durable state");
+    let completed_data = completed_result
+        .structured_content
+        .expect("completed result data")["data"]
+        .clone();
+    let completed_execution: WorkerBacklogExecution =
+        serde_json::from_value(completed_data["execution"].clone())
+            .expect("decode completed execution");
+    assert_eq!(completed_execution.execution_ref, execution_ref);
+    assert_eq!(completed_execution.dispatch_receipt, dispatch_receipt);
+    let completion = completed_execution
+        .completion
+        .as_ref()
+        .expect("durable completion receipt");
+    assert_eq!(completion.result_digest, result_digest);
+    assert_eq!(completion.delivery_digest, delivery_digest);
+    assert_eq!(completion.completed_at_ms, completed_at_ms);
+    assert_eq!(
+        completion.acceptance_note,
+        "Accepted the recovered exact Worker delivery."
+    );
+    assert_eq!(
+        completion.acceptance_evidence,
+        "Reconciled the original execution, receipt, result, and physical delivery."
+    );
+    assert_eq!(get_item(&reopened, &item_id).await, item_after_complete);
+    assert_eq!(
+        get_history(&reopened, &item_id).await,
+        history_after_complete
+    );
+    assert_eq!(read_invocation_count(&fixture.agy_count_file), 1);
+
+    let reopened_epoch = reopened.epoch_id().to_string();
+    drop(reopened);
+
+    // A second fresh epoch proves terminal Done is durable without the live server or checkout.
+    let done_reopened = reopened_mcp(&fixture);
+    assert_ne!(done_reopened.epoch_id(), reopened_epoch.as_str());
+    enroll_server(&fixture, &done_reopened, &fixture.binding_a, THREAD_UUID_A).await;
+    assert_eq!(
+        get_item(&done_reopened, &item_id).await,
+        item_after_complete
+    );
+    assert_eq!(
+        get_history(&done_reopened, &item_id).await,
+        history_after_complete
+    );
+
+    fs::remove_dir_all(&checkout).expect("remove completed task checkout before Done replay");
+
+    // The exact original completion command and expected revision replay the same immutable
+    // receipt after the checkout is gone, without another provider invocation, revision, or
+    // history entry.
+    let replayed = done_reopened
+        .invoke_tool_json("backlog_worker_complete", complete_params, None)
+        .await
+        .expect("exact durable Done replay after reply loss and checkout removal");
+    let replayed_data = replayed.structured_content.expect("replay data")["data"].clone();
+    assert_eq!(
+        replayed_data["completion"]["item"]["status"],
+        Value::String("done".to_string())
+    );
+    assert_eq!(
+        replayed_data["completion"]["item"]["revision"],
+        item_after_complete.revision
+    );
+    let replayed_execution: WorkerBacklogExecution =
+        serde_json::from_value(replayed_data["completion"]["execution"].clone())
+            .expect("decode replayed completion execution");
+    assert_eq!(replayed_execution.execution_ref, execution_ref);
+    assert_eq!(replayed_execution.dispatch_receipt, dispatch_receipt);
+    let replayed_completion = replayed_execution
+        .completion
+        .as_ref()
+        .expect("replayed completion receipt");
+    assert_eq!(replayed_completion.result_digest, result_digest);
+    assert_eq!(replayed_completion.delivery_digest, delivery_digest);
+    assert_eq!(replayed_completion.completed_at_ms, completed_at_ms);
+    assert_eq!(
+        get_item(&done_reopened, &item_id).await,
+        item_after_complete
+    );
+    assert_eq!(
+        get_history(&done_reopened, &item_id).await,
+        history_after_complete,
+        "exact Done replay must not append another revision or history entry"
+    );
+    assert_eq!(read_invocation_count(&fixture.agy_count_file), 1);
+}
+
+#[tokio::test]
+async fn guarded_worker_backlog_spawn_before_receipt_resumes_exact_original_invocation() {
+    let fixture = setup_approved_mcp_fixture().await;
+    let (plan_revision, plan_digest) = create_published_plan(
+        &fixture,
+        "plan-worker-backlog-unattached-receipt",
+        &fixture.binding_a,
+        default_plan_tasks("Guarded Worker backlog unattached receipt"),
+    );
+    let approval = approve_published_plan(
+        &fixture,
+        "plan-worker-backlog-unattached-receipt",
+        plan_revision,
+        &plan_digest,
+        &fixture.binding_a,
+        THREAD_UUID_A,
+        vec!["task-root-agy".to_string()],
+        1_700_003_000_000,
+    );
+    let host = start_fixture_host(&fixture, &approval.approval_id).await;
+    let mcp = live_mcp(&fixture);
+    enroll_server(&fixture, &mcp, &fixture.binding_a, THREAD_UUID_A).await;
+    let (item_id, revision) = create_worker_item(
+        &mcp,
+        "create-unattached-receipt",
+        "Unattached receipt Worker item",
+    )
+    .await;
+
+    let frozen_approval = host.approval();
+    let frozen_task = frozen_approval
+        .tasks
+        .iter()
+        .find(|task| task.task_id == "task-root-agy")
+        .expect("frozen approved task-root-agy");
+    let dispatch = host
+        .materialized_plan()
+        .task_dispatch
+        .iter()
+        .find(|dispatch| dispatch.task_id == "task-root-agy")
+        .expect("frozen dispatch for task-root-agy")
+        .clone();
+    let authority = WorkerBacklogAuthority {
+        approval_id: frozen_approval.approval_id.clone(),
+        subject_digest: frozen_approval.subject_digest.clone(),
+        task_id: frozen_task.task_id.clone(),
+        task_digest: frozen_task.task_digest.clone(),
+    };
+    let start_params = json!({
+        "item_id": item_id,
+        "expected_revision": revision,
+        "command_key": "start-unattached-receipt",
+        "approval_id": approval.approval_id.clone(),
+        "task_id": "task-root-agy"
+    });
+
+    // Persist the durable reservation with the same command key and frozen authority that the
+    // facade start will replay. This is a controlled interruption, not a physical process kill.
+    let mut core =
+        Core::open(fixture.state_dir.join(DATABASE_FILENAME)).expect("open control core");
+    let reservation = core
+        .reserve_worker_backlog_execution_operator_attested(
+            &fixture.binding_a,
+            "start-unattached-receipt",
+            &item_id,
+            revision,
+            authority,
+            1_700_003_000_100,
+        )
+        .expect("persist original Worker reservation");
+    assert_eq!(
+        reservation.authority.approval_id,
+        frozen_approval.approval_id
+    );
+    assert_eq!(
+        reservation.authority.subject_digest,
+        frozen_approval.subject_digest
+    );
+    assert_eq!(reservation.authority.task_id, frozen_task.task_id);
+    assert_eq!(reservation.authority.task_digest, frozen_task.task_digest);
+    assert!(reservation.dispatch_receipt.is_none());
+    assert!(reservation.outcome.is_none());
+    let item_reserved = get_item(&mcp, &item_id).await;
+    assert_eq!(item_reserved.status, BacklogStatus::Doing);
+    assert_eq!(item_reserved.revision, revision + 1);
+    assert_eq!(
+        item_reserved.current_execution_ref.as_deref(),
+        Some(reservation.execution_ref.as_str())
+    );
+    let history_reserved = get_history(&mcp, &item_id).await;
+    assert_eq!(
+        history_reserved
+            .entries
+            .iter()
+            .filter(|entry| entry.action == BacklogHistoryAction::WorkerReserved)
+            .count(),
+        1
+    );
+    assert_eq!(
+        history_reserved
+            .entries
+            .iter()
+            .filter(|entry| entry.action == BacklogHistoryAction::WorkerExecutionAttached)
+            .count(),
+        0
+    );
+    assert_eq!(
+        read_invocation_count(&fixture.agy_count_file),
+        0,
+        "a reservation alone must not invoke the fake provider"
+    );
+
+    // Deliberately dispatch the approved task through the real host client without the facade's
+    // post-dispatch receipt attachment. The durable backlog reservation has no receipt and no
+    // outcome while the provider effect is genuinely complete. This models an interruption after
+    // admission/spawn but before the backlog dispatch receipt became durable.
+    let client = ApprovedHostClient::new(
+        Arc::clone(&fixture.authority),
+        &fixture.sessions_dir,
+        &fixture.binding_a,
+        THREAD_UUID_A,
+    )
+    .expect("open approved host client");
+    let dispatched = client
+        .dispatch_task(&approval.approval_id, "task-root-agy")
+        .await
+        .expect("dispatch approved task outside the backlog receipt attachment");
+    assert!(dispatched.run_id.is_some());
+    assert!(dispatched.worker_id.is_some());
+    wait_for_invocation_count(&fixture.agy_count_file, 1).await;
+    let terminal = wait_for_terminal_task(&mcp, &approval.approval_id, "task-root-agy").await;
+    assert_eq!(terminal.status, TaskExecutionStatus::ReadyForReview);
+
+    let before_resume = core
+        .get_worker_backlog_execution_operator_attested(
+            &fixture.binding_a,
+            &item_id,
+            &reservation.execution_ref,
+        )
+        .expect("read interrupted Worker execution");
+    assert!(
+        before_resume.dispatch_receipt.is_none(),
+        "the injected interruption must leave the backlog receipt unattached"
+    );
+    assert!(before_resume.outcome.is_none());
+    assert_eq!(get_item(&mcp, &item_id).await, item_reserved);
+    assert_eq!(get_history(&mcp, &item_id).await, history_reserved);
+    assert_eq!(read_invocation_count(&fixture.agy_count_file), 1);
+
+    // The exact original start command replays the same reservation, observes the genuine sealed
+    // host invocation, and attaches that exact receipt without dispatching again.
+    let resumed = mcp
+        .invoke_tool_json("backlog_worker_start", start_params.clone(), None)
+        .await
+        .expect("resume the interrupted original Worker invocation");
+    let resumed_execution: WorkerBacklogExecution = serde_json::from_value(
+        resumed.structured_content.expect("resumed start data")["data"]["execution"].clone(),
+    )
+    .expect("decode resumed execution");
+    assert_eq!(resumed_execution.execution_ref, reservation.execution_ref);
+    assert!(resumed_execution.outcome.is_none());
+    let receipt = resumed_execution
+        .dispatch_receipt
+        .as_ref()
+        .expect("resume must attach the genuine dispatch receipt");
+    assert_eq!(receipt.session_binding_id, host.session_binding_id());
+    assert_eq!(receipt.profile_id, dispatch.profile_id);
+    assert_eq!(
+        Some(receipt.run_id.as_str()),
+        terminal.run_id.as_deref(),
+        "the attached receipt must preserve the original host run identity"
+    );
+    assert_eq!(
+        Some(receipt.worker_id.as_str()),
+        terminal.worker_id.as_deref(),
+        "the attached receipt must preserve the original host worker identity"
+    );
+    let item_after_resume = get_item(&mcp, &item_id).await;
+    assert_eq!(item_after_resume.status, BacklogStatus::Doing);
+    assert_eq!(item_after_resume.revision, item_reserved.revision + 1);
+    assert_eq!(
+        item_after_resume.current_execution_ref.as_deref(),
+        Some(reservation.execution_ref.as_str())
+    );
+    let history_after_resume = get_history(&mcp, &item_id).await;
+    assert_eq!(
+        history_after_resume.entries.len(),
+        history_reserved.entries.len() + 1
+    );
+    assert_eq!(
+        history_after_resume
+            .entries
+            .iter()
+            .filter(|entry| entry.action == BacklogHistoryAction::WorkerReserved)
+            .count(),
+        1
+    );
+    assert_eq!(
+        history_after_resume
+            .entries
+            .iter()
+            .filter(|entry| entry.action == BacklogHistoryAction::WorkerExecutionAttached)
+            .count(),
+        1
+    );
+    assert_eq!(
+        history_after_resume
+            .entries
+            .iter()
+            .filter(|entry| entry.action == BacklogHistoryAction::WorkerOutcomeRecorded)
+            .count(),
+        0
+    );
+    assert_eq!(
+        read_invocation_count(&fixture.agy_count_file),
+        1,
+        "resume after spawn before receipt must not dispatch a second provider invocation"
+    );
+
+    let duplicate = mcp
+        .invoke_tool_json("backlog_worker_start", start_params, None)
+        .await
+        .expect("exact duplicate start after receipt resume");
+    let duplicate_execution: WorkerBacklogExecution = serde_json::from_value(
+        duplicate.structured_content.expect("duplicate start data")["data"]["execution"].clone(),
+    )
+    .expect("decode duplicate execution");
+    assert_eq!(duplicate_execution.execution_ref, reservation.execution_ref);
+    assert_eq!(
+        duplicate_execution.dispatch_receipt,
+        resumed_execution.dispatch_receipt
+    );
+    assert_eq!(get_item(&mcp, &item_id).await, item_after_resume);
+    assert_eq!(get_history(&mcp, &item_id).await, history_after_resume);
     assert_eq!(read_invocation_count(&fixture.agy_count_file), 1);
 
     host.shutdown().await.expect("stop fixture host");
