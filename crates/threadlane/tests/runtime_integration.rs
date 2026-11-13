@@ -617,7 +617,7 @@ async fn test_stdio_mcp_initialize_list_and_scoped_tool_calls() {
     )
     .await;
 
-    // 2. tools/list: verify exact 11 scoped tools, annotations, and no binding_id/thread_uuid/now_ms params.
+    // 2. tools/list: verify exact 24 scoped tools, annotations, and no binding_id/thread_uuid/now_ms params.
     send_json_rpc(
         &mut stdin,
         &json!({
@@ -653,6 +653,14 @@ async fn test_stdio_mcp_initialize_list_and_scoped_tool_calls() {
         "start_worker",
         "get_worker",
         "cancel_worker",
+        "backlog_create",
+        "backlog_get",
+        "backlog_list",
+        "backlog_edit",
+        "backlog_block",
+        "backlog_start",
+        "backlog_complete",
+        "backlog_history",
     ]
     .into_iter()
     .collect();
@@ -1835,7 +1843,7 @@ async fn test_stdio_mcp_offline_discovery_online_recovery_restart_and_descriptor
         let missing_list = read_json_rpc_response(&mut missing_reader, 2).await;
         assert_eq!(
             missing_list["result"]["tools"].as_array().map(Vec::len),
-            Some(16)
+            Some(24)
         );
         assert!(
             !missing_state_dir.exists(),
@@ -1930,8 +1938,8 @@ async fn test_stdio_mcp_offline_discovery_online_recovery_restart_and_descriptor
         .expect("tools array");
     assert_eq!(
         tools.len(),
-        16,
-        "MCP tool count includes the operating guide"
+        24,
+        "standalone MCP tool count includes the operating guide and eight ordinary backlog tools"
     );
 
     // 5. Calling `status` while supervisor is offline returns a structured transport_error tool result.

@@ -13,8 +13,9 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::de::DeserializeOwned;
 use threadlane_core::{
-    estimate_wire_response_bytes, Command, Core, CoreError, WakeupStatus, WorkerClaim,
-    WorkerStatus, MAX_COMPACT_RESPONSE_BYTES, MAX_STATUS_RECENT_RUNS,
+    estimate_wire_response_bytes, BacklogItemEdit, Command, Core, CoreError, NewBacklogItem,
+    WakeupStatus, WorkerClaim, WorkerStatus, DEFAULT_PAGE_LIMIT, MAX_COMPACT_RESPONSE_BYTES,
+    MAX_STATUS_RECENT_RUNS,
 };
 use threadlane_workers::NormalizedWorkerEvent;
 use tokio::net::TcpListener;
@@ -924,6 +925,7 @@ async fn handle_scoped_command(
         }
         if !state.stopping.load(Ordering::SeqCst)
             && !matches!(req, ScopedRequest::ListActivity { .. })
+            && !req.is_backlog()
         {
             let report = access
                 .core_mut()
@@ -968,6 +970,139 @@ async fn handle_scoped_command(
                     ));
                 }
                 status_resp
+            }
+            ScopedRequest::BacklogCreate {
+                command_key,
+                title,
+                acceptance_condition,
+                delivery_description,
+                kind,
+            } => {
+                let item = access
+                    .core_mut()
+                    .create_backlog_item(
+                        &binding_id,
+                        &command_key,
+                        NewBacklogItem {
+                            title,
+                            acceptance_condition,
+                            delivery_description,
+                            kind,
+                        },
+                        now,
+                    )
+                    .map_err(|err| map_core_error(&state, "backlog_create failed", err))?;
+                ScopedResponse::BacklogItem(item)
+            }
+            ScopedRequest::BacklogGet { item_id } => {
+                let item = access
+                    .core_mut()
+                    .get_backlog_item(&binding_id, &item_id)
+                    .map_err(|err| map_core_error(&state, "backlog_get failed", err))?;
+                ScopedResponse::BacklogItem(item)
+            }
+            ScopedRequest::BacklogList { cursor, limit } => {
+                let page = access
+                    .core_mut()
+                    .list_backlog_items(
+                        &binding_id,
+                        cursor.as_deref(),
+                        limit.unwrap_or(DEFAULT_PAGE_LIMIT),
+                    )
+                    .map_err(|err| map_core_error(&state, "backlog_list failed", err))?;
+                ScopedResponse::BacklogItemPage(page)
+            }
+            ScopedRequest::BacklogEdit {
+                command_key,
+                item_id,
+                expected_revision,
+                title,
+                acceptance_condition,
+                delivery_description,
+            } => {
+                let item = access
+                    .core_mut()
+                    .edit_backlog_item(
+                        &binding_id,
+                        &command_key,
+                        &item_id,
+                        expected_revision,
+                        BacklogItemEdit {
+                            title,
+                            acceptance_condition,
+                            delivery_description,
+                        },
+                        now,
+                    )
+                    .map_err(|err| map_core_error(&state, "backlog_edit failed", err))?;
+                ScopedResponse::BacklogItem(item)
+            }
+            ScopedRequest::BacklogBlock {
+                command_key,
+                item_id,
+                expected_revision,
+                reason,
+            } => {
+                let item = access
+                    .core_mut()
+                    .block_backlog_item(
+                        &binding_id,
+                        &command_key,
+                        &item_id,
+                        expected_revision,
+                        &reason,
+                        now,
+                    )
+                    .map_err(|err| map_core_error(&state, "backlog_block failed", err))?;
+                ScopedResponse::BacklogItem(item)
+            }
+            ScopedRequest::BacklogStart {
+                command_key,
+                item_id,
+                expected_revision,
+            } => {
+                let item = access
+                    .core_mut()
+                    .start_backlog_item(&binding_id, &command_key, &item_id, expected_revision, now)
+                    .map_err(|err| map_core_error(&state, "backlog_start failed", err))?;
+                ScopedResponse::BacklogItem(item)
+            }
+            ScopedRequest::BacklogComplete {
+                command_key,
+                item_id,
+                expected_revision,
+                note,
+                evidence,
+            } => {
+                let item = access
+                    .core_mut()
+                    .complete_backlog_item(
+                        &binding_id,
+                        &command_key,
+                        &item_id,
+                        expected_revision,
+                        &note,
+                        &evidence,
+                        now,
+                    )
+                    .map_err(|err| map_core_error(&state, "backlog_complete failed", err))?;
+                ScopedResponse::BacklogItem(item)
+            }
+            ScopedRequest::BacklogHistory {
+                item_id,
+                cursor,
+                limit,
+            } => {
+                let page = access
+                    .core_mut()
+                    .list_backlog_history(
+                        &binding_id,
+                        &item_id,
+                        cursor.as_deref(),
+                        limit.unwrap_or(DEFAULT_PAGE_LIMIT),
+                    )
+                    .map_err(|err| map_core_error(&state, "backlog_history failed", err))?;
+                ScopedResponse::BacklogHistory(page)
             }
             ScopedRequest::StartWorker {
                 command_key,

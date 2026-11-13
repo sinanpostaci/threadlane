@@ -257,7 +257,11 @@ async fn test_list_activity_sdk_http_cli_mcp_pagination_filters_live_advance_and
     let tools = list_resp["result"]["tools"]
         .as_array()
         .expect("tools array");
-    assert_eq!(tools.len(), 16);
+    assert_eq!(
+        tools.len(),
+        24,
+        "standalone MCP tool count includes the operating guide and eight ordinary backlog tools"
+    );
     let activity_tool = tools
         .iter()
         .find(|t| t["name"] == json!("list_activity"))

@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 use threadlane_core::{
-    AckResult, Binding, Command, CommandOutput, EventBatch, QuestionHistoryPage,
-    RevisionHistoryPage, Run, RunListPage, WakeupNotice, DEFAULT_EVENT_BATCH_SIZE,
-    DEFAULT_PAGE_LIMIT,
+    AckResult, BacklogHistoryPage, BacklogItem, BacklogItemKind, BacklogItemPage, Binding, Command,
+    CommandOutput, EventBatch, QuestionHistoryPage, RevisionHistoryPage, Run, RunListPage,
+    WakeupNotice, DEFAULT_EVENT_BATCH_SIZE, DEFAULT_PAGE_LIMIT,
 };
 pub use threadlane_core::{
     ActivityPage, EnsureBindingOutcome, Event, EventKind, EventPayload, GetOrCreateBindingOutcome,
@@ -167,6 +167,99 @@ pub enum ScopedRequest {
         #[serde(default)]
         kind: Option<EventKind>,
     },
+    /// Create an ordinary per-chat backlog item without starting execution.
+    BacklogCreate {
+        /// Caller-supplied idempotency key scoped to the binding.
+        command_key: String,
+        /// Short backlog item title.
+        title: String,
+        /// Acceptance condition for the item.
+        acceptance_condition: String,
+        /// Intended delivery description for the item.
+        delivery_description: String,
+        /// Backlog item classification.
+        kind: BacklogItemKind,
+    },
+    /// Fetch one ordinary backlog item within the binding.
+    BacklogGet {
+        /// Software-generated backlog item identifier.
+        item_id: String,
+    },
+    /// List a bounded page of ordinary backlog items within the binding.
+    BacklogList {
+        /// Optional opaque keyset cursor returned by a previous `BacklogList` page.
+        #[serde(default)]
+        cursor: Option<String>,
+        /// Optional page size limit (`1..=MAX_PAGE_LIMIT`, defaults to `DEFAULT_PAGE_LIMIT`).
+        #[serde(default)]
+        limit: Option<usize>,
+    },
+    /// Apply a revision-checked edit to an ordinary backlog item.
+    BacklogEdit {
+        /// Caller-supplied idempotency key scoped to the binding.
+        command_key: String,
+        /// Target backlog item identifier.
+        item_id: String,
+        /// Expected current revision of the backlog item.
+        expected_revision: u64,
+        /// Optional replacement title.
+        #[serde(default)]
+        title: Option<String>,
+        /// Optional replacement acceptance condition.
+        #[serde(default)]
+        acceptance_condition: Option<String>,
+        /// Optional replacement delivery description.
+        #[serde(default)]
+        delivery_description: Option<String>,
+    },
+    /// Block an ordinary backlog item at `expected_revision`.
+    BacklogBlock {
+        /// Caller-supplied idempotency key scoped to the binding.
+        command_key: String,
+        /// Target backlog item identifier.
+        item_id: String,
+        /// Expected current revision of the backlog item.
+        expected_revision: u64,
+        /// Why the item is blocked.
+        reason: String,
+    },
+    /// Attest Coworker start of a Coworker backlog item at `expected_revision`.
+    ///
+    /// Worker items are rejected; this is not execution admission or approval authority.
+    BacklogStart {
+        /// Caller-supplied idempotency key scoped to the binding.
+        command_key: String,
+        /// Target backlog item identifier.
+        item_id: String,
+        /// Expected current revision of the backlog item.
+        expected_revision: u64,
+    },
+    /// Attest Coworker completion of a Coworker backlog item with note and evidence.
+    ///
+    /// Worker items are rejected; this is not execution completion or acceptance authority.
+    BacklogComplete {
+        /// Caller-supplied idempotency key scoped to the binding.
+        command_key: String,
+        /// Target backlog item identifier.
+        item_id: String,
+        /// Expected current revision of the backlog item.
+        expected_revision: u64,
+        /// Coworker completion note.
+        note: String,
+        /// Coworker completion evidence reference or summary.
+        evidence: String,
+    },
+    /// List a bounded page of ordinary backlog item history within the binding.
+    BacklogHistory {
+        /// Target backlog item identifier.
+        item_id: String,
+        /// Optional opaque keyset cursor returned by a previous `BacklogHistory` page.
+        #[serde(default)]
+        cursor: Option<String>,
+        /// Optional page size limit (`1..=MAX_PAGE_LIMIT`, defaults to `DEFAULT_PAGE_LIMIT`).
+        #[serde(default)]
+        limit: Option<usize>,
+    },
     /// Start a deterministic demo run (`Start -> Running`).
     StartDemo {
         /// Caller-supplied idempotency key scoped to the binding.
@@ -272,11 +365,21 @@ pub enum ScopedRequest {
 impl ScopedRequest {
     /// Converts this [`ScopedRequest`] into a [`threadlane_core::Command`] using supervisor-injected `now_ms`.
     ///
-    /// Returns `None` for [`ScopedRequest::Status`] and [`ScopedRequest::StartWorker`], which require
-    /// supervisor-level aggregation or startup profile resolution prior to core execution.
+    /// Returns `None` for [`ScopedRequest::Status`], [`ScopedRequest::StartWorker`], and all
+    /// ordinary backlog operations, which require supervisor-level handling rather than a
+    /// [`threadlane_core::Command`] variant.
     pub fn into_core_command(self, now_ms: i64) -> Option<Command> {
         match self {
-            Self::Status | Self::StartWorker { .. } => None,
+            Self::Status
+            | Self::StartWorker { .. }
+            | Self::BacklogCreate { .. }
+            | Self::BacklogGet { .. }
+            | Self::BacklogList { .. }
+            | Self::BacklogEdit { .. }
+            | Self::BacklogBlock { .. }
+            | Self::BacklogStart { .. }
+            | Self::BacklogComplete { .. }
+            | Self::BacklogHistory { .. } => None,
             Self::GetRun { run_id } => Some(Command::GetRun { run_id }),
             Self::ListRuns { cursor, limit } => Some(Command::ListRuns {
                 cursor,
@@ -412,7 +515,24 @@ impl ScopedRequest {
         )
     }
 
-    /// Returns `true` if executing this request mutates persistent binding, run, worker, or cursor state.
+    /// Returns `true` for ordinary backlog requests, which never advance demo ticks or schedule
+    /// workers, runs, events, wake-ups, or approvals.
+    pub const fn is_backlog(&self) -> bool {
+        matches!(
+            self,
+            Self::BacklogCreate { .. }
+                | Self::BacklogGet { .. }
+                | Self::BacklogList { .. }
+                | Self::BacklogEdit { .. }
+                | Self::BacklogBlock { .. }
+                | Self::BacklogStart { .. }
+                | Self::BacklogComplete { .. }
+                | Self::BacklogHistory { .. }
+        )
+    }
+
+    /// Returns `true` if executing this request mutates persistent binding, run, worker, cursor,
+    /// or backlog state.
     pub const fn is_mutating(&self) -> bool {
         matches!(
             self,
@@ -425,6 +545,11 @@ impl ScopedRequest {
                 | Self::Cancel { .. }
                 | Self::StartWorker { .. }
                 | Self::CancelWorker { .. }
+                | Self::BacklogCreate { .. }
+                | Self::BacklogEdit { .. }
+                | Self::BacklogBlock { .. }
+                | Self::BacklogStart { .. }
+                | Self::BacklogComplete { .. }
         )
     }
 }
@@ -594,6 +719,12 @@ pub enum ScopedResponse {
     /// Bounded keyset-paginated read-only activity event page (`ListActivity`).
     #[serde(alias = "activity_page", alias = "activity_history")]
     Activity(ActivityPage),
+    /// One ordinary backlog item snapshot (backlog create/get/edit/block/start/complete).
+    BacklogItem(BacklogItem),
+    /// Bounded keyset-paginated ordinary backlog item page (`BacklogList`).
+    BacklogItemPage(BacklogItemPage),
+    /// Bounded keyset-paginated ordinary backlog item history page (`BacklogHistory`).
+    BacklogHistory(BacklogHistoryPage),
     /// Ordered event delivery batch (`PullEvents`).
     EventBatch(EventBatch),
     /// Event batch acknowledgement result (`AckEvents`).
@@ -675,6 +806,30 @@ impl ScopedResponse {
     /// Extracts the inner [`ActivityPage`] if this is `ScopedResponse::Activity`.
     pub fn into_activity_page(self) -> Option<ActivityPage> {
         self.into_activity()
+    }
+
+    /// Extracts the inner [`BacklogItem`] if this is `ScopedResponse::BacklogItem`.
+    pub fn into_backlog_item(self) -> Option<BacklogItem> {
+        match self {
+            Self::BacklogItem(item) => Some(item),
+            _ => None,
+        }
+    }
+
+    /// Extracts the inner [`BacklogItemPage`] if this is `ScopedResponse::BacklogItemPage`.
+    pub fn into_backlog_item_page(self) -> Option<BacklogItemPage> {
+        match self {
+            Self::BacklogItemPage(page) => Some(page),
+            _ => None,
+        }
+    }
+
+    /// Extracts the inner [`BacklogHistoryPage`] if this is `ScopedResponse::BacklogHistory`.
+    pub fn into_backlog_history(self) -> Option<BacklogHistoryPage> {
+        match self {
+            Self::BacklogHistory(page) => Some(page),
+            _ => None,
+        }
     }
 
     /// Extracts the inner [`EventBatch`] if this is `ScopedResponse::EventBatch`.

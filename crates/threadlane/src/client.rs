@@ -6,8 +6,9 @@ use reqwest::Method;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use threadlane_core::{
-    AckResult, ActivityPage, Binding, CoreError, EventBatch, EventKind, QuestionHistoryPage,
-    RevisionHistoryPage, Run, RunListPage, WakeupNotice, WorkerSnapshot, MAX_ID_LEN,
+    AckResult, ActivityPage, BacklogHistoryPage, BacklogItem, BacklogItemKind, BacklogItemPage,
+    Binding, CoreError, EventBatch, EventKind, QuestionHistoryPage, RevisionHistoryPage, Run,
+    RunListPage, WakeupNotice, WorkerSnapshot, MAX_ID_LEN,
 };
 
 use crate::descriptor::{read_and_validate_descriptor, validate_lazy_state_dir, RuntimeDescriptor};
@@ -444,6 +445,158 @@ impl ScopedClient {
             .await?;
         resp.into_activity().ok_or_else(|| {
             Error::Transport("unexpected response kind for list_activity".to_string())
+        })
+    }
+
+    /// Creates an ordinary backlog item within the fixed binding without starting execution.
+    pub async fn create_backlog_item(
+        &self,
+        command_key: String,
+        title: String,
+        acceptance_condition: String,
+        delivery_description: String,
+        kind: BacklogItemKind,
+    ) -> Result<BacklogItem, Error> {
+        let resp = self
+            .execute(&ScopedRequest::BacklogCreate {
+                command_key,
+                title,
+                acceptance_condition,
+                delivery_description,
+                kind,
+            })
+            .await?;
+        resp.into_backlog_item().ok_or_else(|| {
+            Error::Transport("unexpected response kind for create_backlog_item".to_string())
+        })
+    }
+
+    /// Fetches one ordinary backlog item within the fixed binding.
+    pub async fn get_backlog_item(&self, item_id: String) -> Result<BacklogItem, Error> {
+        let resp = self.execute(&ScopedRequest::BacklogGet { item_id }).await?;
+        resp.into_backlog_item().ok_or_else(|| {
+            Error::Transport("unexpected response kind for get_backlog_item".to_string())
+        })
+    }
+
+    /// Lists a bounded keyset-paginated page of ordinary backlog items within the fixed binding.
+    pub async fn list_backlog_items(
+        &self,
+        cursor: Option<String>,
+        limit: Option<usize>,
+    ) -> Result<BacklogItemPage, Error> {
+        let resp = self
+            .execute(&ScopedRequest::BacklogList { cursor, limit })
+            .await?;
+        resp.into_backlog_item_page().ok_or_else(|| {
+            Error::Transport("unexpected response kind for list_backlog_items".to_string())
+        })
+    }
+
+    /// Applies a revision-checked edit to an ordinary backlog item within the fixed binding.
+    pub async fn edit_backlog_item(
+        &self,
+        command_key: String,
+        item_id: String,
+        expected_revision: u64,
+        title: Option<String>,
+        acceptance_condition: Option<String>,
+        delivery_description: Option<String>,
+    ) -> Result<BacklogItem, Error> {
+        let resp = self
+            .execute(&ScopedRequest::BacklogEdit {
+                command_key,
+                item_id,
+                expected_revision,
+                title,
+                acceptance_condition,
+                delivery_description,
+            })
+            .await?;
+        resp.into_backlog_item().ok_or_else(|| {
+            Error::Transport("unexpected response kind for edit_backlog_item".to_string())
+        })
+    }
+
+    /// Blocks an ordinary backlog item at `expected_revision` within the fixed binding.
+    pub async fn block_backlog_item(
+        &self,
+        command_key: String,
+        item_id: String,
+        expected_revision: u64,
+        reason: String,
+    ) -> Result<BacklogItem, Error> {
+        let resp = self
+            .execute(&ScopedRequest::BacklogBlock {
+                command_key,
+                item_id,
+                expected_revision,
+                reason,
+            })
+            .await?;
+        resp.into_backlog_item().ok_or_else(|| {
+            Error::Transport("unexpected response kind for block_backlog_item".to_string())
+        })
+    }
+
+    /// Attests Coworker start of a Coworker backlog item within the fixed binding.
+    pub async fn start_backlog_item(
+        &self,
+        command_key: String,
+        item_id: String,
+        expected_revision: u64,
+    ) -> Result<BacklogItem, Error> {
+        let resp = self
+            .execute(&ScopedRequest::BacklogStart {
+                command_key,
+                item_id,
+                expected_revision,
+            })
+            .await?;
+        resp.into_backlog_item().ok_or_else(|| {
+            Error::Transport("unexpected response kind for start_backlog_item".to_string())
+        })
+    }
+
+    /// Attests Coworker completion of a Coworker backlog item within the fixed binding.
+    pub async fn complete_backlog_item(
+        &self,
+        command_key: String,
+        item_id: String,
+        expected_revision: u64,
+        note: String,
+        evidence: String,
+    ) -> Result<BacklogItem, Error> {
+        let resp = self
+            .execute(&ScopedRequest::BacklogComplete {
+                command_key,
+                item_id,
+                expected_revision,
+                note,
+                evidence,
+            })
+            .await?;
+        resp.into_backlog_item().ok_or_else(|| {
+            Error::Transport("unexpected response kind for complete_backlog_item".to_string())
+        })
+    }
+
+    /// Lists a bounded keyset-paginated history page for an ordinary backlog item within the fixed binding.
+    pub async fn list_backlog_history(
+        &self,
+        item_id: String,
+        cursor: Option<String>,
+        limit: Option<usize>,
+    ) -> Result<BacklogHistoryPage, Error> {
+        let resp = self
+            .execute(&ScopedRequest::BacklogHistory {
+                item_id,
+                cursor,
+                limit,
+            })
+            .await?;
+        resp.into_backlog_history().ok_or_else(|| {
+            Error::Transport("unexpected response kind for list_backlog_history".to_string())
         })
     }
 
