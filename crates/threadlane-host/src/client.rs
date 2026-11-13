@@ -38,9 +38,10 @@ use crate::error::HostError;
 use crate::lifecycle::project_task_lifecycle;
 use crate::storage::{
     build_validated_task_profile, derive_ack_command_key, derive_cancel_command_key,
-    is_host_lock_held, now_epoch_ms, read_host_manifest_optional, read_task_ledger_entry,
-    record_task_dispatch_intent, record_task_receipt, validate_approval_id,
-    validate_canonical_thread_uuid, validate_hex_digest, validate_host_instance_id,
+    ensure_no_symlink_components, is_host_lock_held, now_epoch_ms, read_host_manifest_optional,
+    read_session_task_ledger_readonly, read_task_ledger_entry, record_task_dispatch_intent,
+    record_task_receipt, validate_approval_id, validate_canonical_thread_uuid,
+    validate_existing_sessions_root, validate_hex_digest, validate_host_instance_id,
     validate_identifier, validate_sessions_root, verify_all_transitive_predecessors_in_approval,
     verify_existing_private_dir, verify_existing_session_dir,
 };
@@ -62,6 +63,16 @@ struct VerifiedSession {
     work_area_dir: PathBuf,
     live_binding: Binding,
     scoped_client: ScopedClient,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadySessionAccess {
+    /// Existing active operations preserve their blocking `host.lock` ownership probe and
+    /// `HostNotReady` errors.
+    Active,
+    /// Presence reads use only noncreating probes and map normal non-live conditions to
+    /// `Ok(None)` instead of `HostNotReady`.
+    ReadonlyPresence,
 }
 
 /// Authoritative caller-scoped client for dispatching approved root worker tasks, inspecting task
@@ -1621,24 +1632,89 @@ impl ApprovedHostClient {
     /// Returns the runtime's actual, bounded worker-process presence for `task_id` in
     /// `approval_id` when an active authenticated host session currently owns that exact run.
     ///
-    /// - Strictly read-only: never starts, restarts, dispatches, retries, cancels, or records
-    ///   receipts.
-    /// - Resolves the frozen approval, exact task, caller `control_binding_id`, and native thread
-    ///   before inspecting session state, including for unstarted and stopped sessions.
-    /// - Returns `Ok(None)` for an unstarted task, a non-`Ready` session, a non-sealed receipt, or
-    ///   any observation that is not live, fresh, and bound to the current manifest instance,
-    ///   sealed receipt, worker claim, and attempt. Corrupt or foreign observation identities are
-    ///   explicit errors.
-    /// - The returned snapshot is only the runtime DTO. It carries no path, provider prose, raw
-    ///   error, or credential. A live observation is not a claim that the physical child process
-    ///   remains alive after this call returns.
+    /// Delegates to [`Self::get_task_presence_readonly_at`] with this client's authority directory
+    /// and authoritative caller scope so there is only one presence implementation.
     pub async fn get_task_presence(
         &self,
         approval_id: &str,
         task_id: &str,
     ) -> Result<Option<WorkerPresenceSnapshot>, HostError> {
+        Self::get_task_presence_readonly_at(
+            self.authority.dir(),
+            &self.sessions_dir,
+            &self.control_binding_id,
+            &self.native_thread_uuid,
+            approval_id,
+            task_id,
+        )
+        .await
+    }
+
+    /// Returns the runtime's actual, bounded worker-process presence for `task_id` in
+    /// `approval_id` without constructing registry/plan stores or mutating any store or session.
+    ///
+    /// - Strictly read-only: never starts, restarts, dispatches, retries, cancels, or records
+    ///   receipts. It never creates or chmods the authority/sessions roots, session directories,
+    ///   `host.lock`, `task-receipts.lock`, or any other file.
+    /// - Reads and integrity-checks the frozen [`ApprovalRecord`] directly from `authority_dir`
+    ///   without acquiring `authority.lock`, then verifies the explicit caller
+    ///   `control_binding_id`, native thread, and approval identity before any session access.
+    /// - Returns `Ok(None)` for an unstarted task, a missing session directory, a non-`Ready`
+    ///   session, a missing/non-live `host.lock`, a non-sealed receipt, or any observation that is
+    ///   not live, fresh, and bound to the current manifest instance, sealed receipt, worker
+    ///   claim, and attempt. Corrupt or foreign observation identities are explicit errors.
+    /// - External `authority.lock`/`task-receipts.lock` holders do not block this read because it
+    ///   never acquires those locks.
+    /// - The returned snapshot is only the runtime DTO. It carries no path, provider prose, raw
+    ///   error, or credential. A live observation is not a claim that the physical child process
+    ///   remains alive after this call returns.
+    pub async fn get_task_presence_readonly_at(
+        authority_dir: &Path,
+        sessions_dir: &Path,
+        control_binding_id: &str,
+        native_thread_uuid: &str,
+        approval_id: &str,
+        task_id: &str,
+    ) -> Result<Option<WorkerPresenceSnapshot>, HostError> {
+        validate_identifier("control_binding_id", control_binding_id)?;
+        validate_canonical_thread_uuid("native_thread_uuid", native_thread_uuid)?;
         validate_identifier("task_id", task_id)?;
-        let record = self.resolve_authorized_approval(approval_id)?;
+        validate_approval_id(approval_id)?;
+
+        let record = AuthorityStore::get_for_operator_readonly_at(authority_dir, approval_id)?;
+
+        // Authoritative caller scope checks BEFORE accessing any session path.
+        if record.binding_id != control_binding_id {
+            return Err(HostError::ScopeMismatch {
+                field: "control_binding_id".to_string(),
+                expected: control_binding_id.to_string(),
+                actual: record.binding_id,
+                reason: format!(
+                    "approval `{}` does not belong to caller control_binding_id `{}`",
+                    record.approval_id, control_binding_id
+                ),
+            });
+        }
+        if record.thread_uuid != native_thread_uuid {
+            return Err(HostError::ScopeMismatch {
+                field: "thread_uuid".to_string(),
+                expected: native_thread_uuid.to_string(),
+                actual: record.thread_uuid,
+                reason: format!(
+                    "approval `{}` does not belong to caller native thread_uuid `{}`",
+                    record.approval_id, native_thread_uuid
+                ),
+            });
+        }
+
+        let sessions_dir = validate_existing_sessions_root(
+            sessions_dir,
+            &[
+                ("authority_dir", authority_dir),
+                ("repository_path", record.repository_path.as_path()),
+            ],
+        )?;
+
         let task = record
             .tasks
             .iter()
@@ -1655,7 +1731,7 @@ impl ApprovedHostClient {
             });
         }
 
-        let session_candidate = self.sessions_dir.join(&record.approval_id);
+        let session_candidate = sessions_dir.join(&record.approval_id);
         match std::fs::symlink_metadata(&session_candidate) {
             Ok(_) => {}
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -1666,7 +1742,7 @@ impl ApprovedHostClient {
                 });
             }
         }
-        let session_dir = verify_existing_session_dir(&self.sessions_dir, &record.approval_id)?;
+        let session_dir = verify_existing_session_dir(&sessions_dir, &record.approval_id)?;
         let Some(initial_manifest) = read_host_manifest_optional(&session_dir, &record)? else {
             return Ok(None);
         };
@@ -1675,8 +1751,21 @@ impl ApprovedHostClient {
         {
             return Ok(None);
         }
+        let Some(expected_instance_id) = initial_manifest.instance_id.clone() else {
+            return Ok(None);
+        };
 
-        let session = self.verify_active_ready_session(approval_id).await?;
+        let Some(session) = Self::verify_ready_session_for_record(
+            &record,
+            &sessions_dir,
+            native_thread_uuid,
+            Some(&expected_instance_id),
+            ReadySessionAccess::ReadonlyPresence,
+        )
+        .await?
+        else {
+            return Ok(None);
+        };
         let task = session
             .record
             .tasks
@@ -1694,9 +1783,10 @@ impl ApprovedHostClient {
             });
         }
 
-        let Some(instance_id) = session.manifest.instance_id.clone() else {
+        if session.manifest.instance_id.as_deref() != Some(expected_instance_id.as_str()) {
             return Ok(None);
-        };
+        }
+        let instance_id = expected_instance_id;
         let session_binding_id = session.manifest.session_binding_id.clone().ok_or_else(|| {
             HostError::CorruptManifest {
                 path: session.session_dir.display().to_string(),
@@ -1704,13 +1794,13 @@ impl ApprovedHostClient {
             }
         })?;
 
-        let (_, receipt) = read_task_ledger_entry(
+        let Some(receipt) = read_exact_task_receipt_readonly(
             &session.session_dir,
             &session.record,
-            &session.live_binding.binding_id,
+            &session_binding_id,
             task_id,
-        )?;
-        let Some(receipt) = receipt else {
+        )?
+        else {
             return Ok(None);
         };
         if receipt.task_id != task.task_id
@@ -1805,7 +1895,9 @@ impl ApprovedHostClient {
             return Ok(None);
         }
 
-        // Final checks are synchronous and use only freshly read state after the last await.
+        // Final checks are synchronous and use only freshly read, noncreating state after the
+        // last await: the exact manifest instance/session binding, the noncreating host.lock
+        // ownership probe, and the same exact sealed task receipt.
         let final_manifest = read_host_manifest_optional(&session.session_dir, &session.record)?;
         let Some(final_manifest) = final_manifest else {
             return Ok(None);
@@ -1814,11 +1906,11 @@ impl ApprovedHostClient {
             || !final_manifest.gates.supervisor_authenticated_ready
             || final_manifest.instance_id.as_deref() != Some(instance_id.as_str())
             || final_manifest.session_binding_id.as_deref() != Some(session_binding_id.as_str())
-            || !is_host_lock_held(&session.session_dir)?
+            || !is_host_lock_held_readonly(&session.session_dir)?
         {
             return Ok(None);
         }
-        let (_, final_receipt) = read_task_ledger_entry(
+        let final_receipt = read_exact_task_receipt_readonly(
             &session.session_dir,
             &session.record,
             &session_binding_id,
@@ -3380,17 +3472,71 @@ impl ApprovedHostClient {
         approval_id: &str,
     ) -> Result<VerifiedSession, HostError> {
         let record = self.resolve_authorized_approval(approval_id)?;
-        let session_dir = verify_existing_session_dir(&self.sessions_dir, &record.approval_id)?;
+        Self::verify_ready_session_for_record(
+            &record,
+            &self.sessions_dir,
+            &self.native_thread_uuid,
+            None,
+            ReadySessionAccess::Active,
+        )
+        .await?
+        .ok_or_else(|| HostError::HostNotReady {
+            approval_id: record.approval_id.clone(),
+            phase: None,
+            reason: "host session is not ready".to_string(),
+        })
+    }
 
-        let manifest = read_host_manifest_optional(&session_dir, &record)?.ok_or_else(|| {
-            HostError::HostNotReady {
-                approval_id: record.approval_id.clone(),
-                phase: None,
-                reason: "host-manifest.json does not exist".to_string(),
+    /// Shared Ready-session verification for active operations and strictly read-only presence.
+    ///
+    /// The caller must already have authorized `record` for `native_thread_uuid`. Active access
+    /// preserves the existing blocking `host.lock` probe and `HostNotReady` errors. Read-only
+    /// presence uses only noncreating probes and maps normal non-live conditions to `Ok(None)`.
+    async fn verify_ready_session_for_record(
+        record: &ApprovalRecord,
+        sessions_dir: &Path,
+        native_thread_uuid: &str,
+        expected_instance_id: Option<&str>,
+        access: ReadySessionAccess,
+    ) -> Result<Option<VerifiedSession>, HostError> {
+        if record.thread_uuid != native_thread_uuid {
+            return Err(HostError::ScopeMismatch {
+                field: "thread_uuid".to_string(),
+                expected: native_thread_uuid.to_string(),
+                actual: record.thread_uuid.clone(),
+                reason: format!(
+                    "approval `{}` does not belong to caller native thread_uuid `{}`",
+                    record.approval_id, native_thread_uuid
+                ),
+            });
+        }
+
+        let session_dir = match verify_existing_session_dir(sessions_dir, &record.approval_id) {
+            Ok(session_dir) => session_dir,
+            Err(HostError::HostNotReady { .. })
+                if access == ReadySessionAccess::ReadonlyPresence =>
+            {
+                return Ok(None);
             }
-        })?;
+            Err(err) => return Err(err),
+        };
+
+        let manifest = match read_host_manifest_optional(&session_dir, record)? {
+            Some(manifest) => manifest,
+            None if access == ReadySessionAccess::ReadonlyPresence => return Ok(None),
+            None => {
+                return Err(HostError::HostNotReady {
+                    approval_id: record.approval_id.clone(),
+                    phase: None,
+                    reason: "host-manifest.json does not exist".to_string(),
+                });
+            }
+        };
 
         if manifest.phase != HostPhase::Ready || !manifest.gates.supervisor_authenticated_ready {
+            if access == ReadySessionAccess::ReadonlyPresence {
+                return Ok(None);
+            }
             return Err(HostError::HostNotReady {
                 approval_id: record.approval_id.clone(),
                 phase: Some(manifest.phase),
@@ -3401,7 +3547,27 @@ impl ApprovedHostClient {
             });
         }
 
-        if !is_host_lock_held(&session_dir)? {
+        if expected_instance_id
+            .is_some_and(|expected| manifest.instance_id.as_deref() != Some(expected))
+        {
+            if access == ReadySessionAccess::ReadonlyPresence {
+                return Ok(None);
+            }
+            return Err(HostError::CorruptManifest {
+                path: session_dir.display().to_string(),
+                reason: "ready manifest instance_id changed during session verification"
+                    .to_string(),
+            });
+        }
+
+        let lock_held = match access {
+            ReadySessionAccess::Active => is_host_lock_held(&session_dir)?,
+            ReadySessionAccess::ReadonlyPresence => is_host_lock_held_readonly(&session_dir)?,
+        };
+        if !lock_held {
+            if access == ReadySessionAccess::ReadonlyPresence {
+                return Ok(None);
+            }
             return Err(HostError::HostNotReady {
                 approval_id: record.approval_id.clone(),
                 phase: Some(manifest.phase),
@@ -3455,10 +3621,10 @@ impl ApprovedHostClient {
                 reason: "live supervisor session_binding_id mismatch".to_string(),
             });
         }
-        if live_binding.thread_uuid != self.native_thread_uuid {
+        if live_binding.thread_uuid != native_thread_uuid {
             return Err(HostError::ScopeMismatch {
                 field: "thread_uuid".to_string(),
-                expected: self.native_thread_uuid.clone(),
+                expected: native_thread_uuid.to_string(),
                 actual: live_binding.thread_uuid,
                 reason: "live supervisor thread_uuid mismatch".to_string(),
             });
@@ -3466,14 +3632,14 @@ impl ApprovedHostClient {
 
         let scoped_client = ScopedClient::from_state_dir(&runtime_state_dir, &session_binding_id)?;
 
-        Ok(VerifiedSession {
-            record,
+        Ok(Some(VerifiedSession {
+            record: record.clone(),
             manifest,
             session_dir,
             work_area_dir,
             live_binding,
             scoped_client,
-        })
+        }))
     }
 }
 
@@ -3670,6 +3836,53 @@ fn open_existing_lock_file_readonly(
         let _ = pre_meta;
     }
     Ok(file)
+}
+
+fn is_host_lock_held_readonly(session_dir: &Path) -> Result<bool, HostError> {
+    use fs2::FileExt;
+
+    let lock_path = session_dir.join(HOST_LOCK_FILENAME);
+    let checked = ensure_no_symlink_components(&lock_path)?;
+    let pre_meta = match std::fs::symlink_metadata(&checked) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => {
+            return Err(HostError::Io {
+                operation: "symlink_metadata(host.lock)".to_string(),
+                reason: err.to_string(),
+            });
+        }
+    };
+    verify_existing_lock_file_metadata(&checked, &pre_meta)?;
+
+    let file = open_existing_lock_file_readonly(&checked, &pre_meta)?;
+    match file.try_lock_exclusive() {
+        Ok(()) => {
+            let _ = file.unlock();
+            Ok(false)
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => Ok(true),
+        Err(err) => Err(HostError::Io {
+            operation: "try_lock_exclusive(host.lock)".to_string(),
+            reason: err.to_string(),
+        }),
+    }
+}
+
+fn read_exact_task_receipt_readonly(
+    session_dir: &Path,
+    record: &ApprovalRecord,
+    session_binding_id: &str,
+    task_id: &str,
+) -> Result<Option<TaskRunReceipt>, HostError> {
+    let Some((_intents, receipts)) =
+        read_session_task_ledger_readonly(session_dir, record, session_binding_id)?
+    else {
+        return Ok(None);
+    };
+    Ok(receipts
+        .into_iter()
+        .find(|receipt| receipt.task_id == task_id))
 }
 
 fn verify_live_task_presence(

@@ -2020,3 +2020,577 @@ async fn actual_worker_presence_is_scoped_fresh_and_never_survives_clean_stop() 
         "stopped presence and result reads must not launch the provider"
     );
 }
+
+#[derive(Debug, PartialEq, Eq)]
+struct ReadonlyPresenceFileSnapshot {
+    path: PathBuf,
+    bytes: Option<Vec<u8>>,
+    mode: Option<u32>,
+}
+
+fn snapshot_readonly_presence_file(path: &Path) -> ReadonlyPresenceFileSnapshot {
+    let mode = match fs::symlink_metadata(path) {
+        Ok(meta) => Some(meta.permissions().mode() & 0o777),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => panic!("stat presence fixture `{}`: {err}", path.display()),
+    };
+    ReadonlyPresenceFileSnapshot {
+        path: path.to_path_buf(),
+        bytes: read_optional_bytes(path),
+        mode,
+    }
+}
+
+fn capture_readonly_presence_files(
+    fixture: &HostProcessFixture,
+) -> Vec<ReadonlyPresenceFileSnapshot> {
+    let session_dir = fixture.session_dir();
+    [
+        fixture.authority.approvals_path().to_path_buf(),
+        fixture.authority.lock_path().to_path_buf(),
+        session_dir.join("host.lock"),
+        session_dir.join("host-manifest.json"),
+        session_dir.join(TASK_RECEIPTS_FILENAME),
+        session_dir.join("task-receipts.lock"),
+    ]
+    .into_iter()
+    .map(|path| snapshot_readonly_presence_file(&path))
+    .collect()
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ReadonlyPresenceDirSnapshot {
+    path: PathBuf,
+    mode: Option<u32>,
+}
+
+fn snapshot_readonly_presence_dir(path: &Path) -> ReadonlyPresenceDirSnapshot {
+    let mode = match fs::symlink_metadata(path) {
+        Ok(meta) => Some(meta.permissions().mode() & 0o777),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => panic!("stat presence directory `{}`: {err}", path.display()),
+    };
+    ReadonlyPresenceDirSnapshot {
+        path: path.to_path_buf(),
+        mode,
+    }
+}
+
+fn capture_readonly_presence_dirs(
+    fixture: &HostProcessFixture,
+) -> Vec<ReadonlyPresenceDirSnapshot> {
+    [
+        fixture.authority.dir().to_path_buf(),
+        fixture.sessions_dir.clone(),
+        fixture.session_dir(),
+    ]
+    .into_iter()
+    .map(|path| snapshot_readonly_presence_dir(&path))
+    .collect()
+}
+
+async fn readonly_presence_at_fixture(
+    fixture: &HostProcessFixture,
+    sessions_dir: &Path,
+    control_binding_id: &str,
+    native_thread_uuid: &str,
+    task_id: &str,
+) -> Result<Option<WorkerPresenceSnapshot>, HostError> {
+    ApprovedHostClient::get_task_presence_readonly_at(
+        &fixture.authority_dir,
+        sessions_dir,
+        control_binding_id,
+        native_thread_uuid,
+        &fixture.approval_id,
+        task_id,
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn readonly_presence_static_api_is_noncreating_and_handles_live_stopped_and_tamper() {
+    let fixture = setup_host_presence_fixture();
+    fixture.assert_no_provider_invocation();
+
+    // A missing sessions root is unavailable, but the read-only route must not initialize it.
+    assert!(!fixture.sessions_dir.exists());
+    let missing_root = readonly_presence_at_fixture(
+        &fixture,
+        &fixture.sessions_dir,
+        CONTROL_BINDING_ID,
+        THREAD_UUID,
+        PRESENCE_TASK_ID,
+    )
+    .await;
+    assert!(
+        missing_root.is_err(),
+        "missing sessions root must be unavailable, got {missing_root:?}"
+    );
+    assert!(
+        !fixture.sessions_dir.exists(),
+        "read-only presence must never create a missing sessions root"
+    );
+
+    fs::create_dir(&fixture.sessions_dir).expect("create existing private sessions root");
+    fs::set_permissions(&fixture.sessions_dir, fs::Permissions::from_mode(0o700))
+        .expect("chmod existing sessions root 0700");
+
+    // A missing authority store is unavailable and must not be initialized either.
+    let missing_authority_dir = fixture._tmp.path().join("missing-authority-store");
+    let missing_authority = ApprovedHostClient::get_task_presence_readonly_at(
+        &missing_authority_dir,
+        &fixture.sessions_dir,
+        CONTROL_BINDING_ID,
+        THREAD_UUID,
+        &fixture.approval_id,
+        PRESENCE_TASK_ID,
+    )
+    .await;
+    assert!(
+        missing_authority.is_err(),
+        "missing authority store must be unavailable, got {missing_authority:?}"
+    );
+    assert!(
+        !missing_authority_dir.exists(),
+        "read-only presence must never create a missing authority store"
+    );
+
+    // A missing authority lock must not be created by the read-only authority path.
+    let authority_lock_backup = fixture._tmp.path().join("missing-authority.lock");
+    fs::rename(fixture.authority.lock_path(), &authority_lock_backup)
+        .expect("move authority.lock outside the authority store");
+    assert_no_live_presence(
+        readonly_presence_at_fixture(
+            &fixture,
+            &fixture.sessions_dir,
+            CONTROL_BINDING_ID,
+            THREAD_UUID,
+            PRESENCE_TASK_ID,
+        )
+        .await,
+        "missing authority.lock and session directory",
+    );
+    assert!(
+        !fixture.authority.lock_path().exists(),
+        "read-only presence must not create a missing authority.lock"
+    );
+    fs::rename(&authority_lock_backup, fixture.authority.lock_path())
+        .expect("restore authority.lock");
+
+    // A tampered authority ledger fails closed and is preserved byte-for-byte.
+    let approvals_path = fixture.authority.approvals_path().to_path_buf();
+    let original_approvals = fs::read(&approvals_path).expect("read authority ledger fixture");
+    let tampered_approvals = b"{ not valid authority ledger json\n";
+    fs::write(&approvals_path, tampered_approvals).expect("write tampered authority ledger");
+    fs::set_permissions(&approvals_path, fs::Permissions::from_mode(0o600))
+        .expect("keep tampered authority ledger private");
+    let tampered_authority = readonly_presence_at_fixture(
+        &fixture,
+        &fixture.sessions_dir,
+        CONTROL_BINDING_ID,
+        THREAD_UUID,
+        PRESENCE_TASK_ID,
+    )
+    .await;
+    assert!(
+        tampered_authority.is_err(),
+        "tampered authority ledger must fail closed, got {tampered_authority:?}"
+    );
+    assert_eq!(
+        fs::read(&approvals_path)
+            .expect("reread tampered authority ledger")
+            .as_slice(),
+        tampered_approvals.as_slice(),
+        "read-only presence must not rewrite a tampered authority ledger"
+    );
+    fs::write(&approvals_path, &original_approvals).expect("restore authority ledger fixture");
+    fs::set_permissions(&approvals_path, fs::Permissions::from_mode(0o600))
+        .expect("restore authority ledger permissions");
+
+    // A missing session directory is simply not live and must not be created.
+    assert_no_live_presence(
+        readonly_presence_at_fixture(
+            &fixture,
+            &fixture.sessions_dir,
+            CONTROL_BINDING_ID,
+            THREAD_UUID,
+            PRESENCE_TASK_ID,
+        )
+        .await,
+        "missing session directory",
+    );
+    assert!(
+        !fixture.session_dir().exists(),
+        "read-only presence must never create a missing session directory"
+    );
+
+    // Explicit caller scope is checked before any missing sessions root would be touched.
+    let unscoped_sessions = fixture._tmp.path().join("unscoped-sessions-must-not-exist");
+    match ApprovedHostClient::get_task_presence_readonly_at(
+        &fixture.authority_dir,
+        &unscoped_sessions,
+        "bnd_wrong_presence_scope",
+        THREAD_UUID,
+        &fixture.approval_id,
+        PRESENCE_TASK_ID,
+    )
+    .await
+    {
+        Err(HostError::ScopeMismatch { field, .. }) => {
+            assert_eq!(field, "control_binding_id");
+        }
+        other => panic!("expected foreign-binding presence refusal, got {other:?}"),
+    }
+    let other_thread_uuid = "660e8400-e29b-41d4-a716-446655440001";
+    match ApprovedHostClient::get_task_presence_readonly_at(
+        &fixture.authority_dir,
+        &unscoped_sessions,
+        CONTROL_BINDING_ID,
+        other_thread_uuid,
+        &fixture.approval_id,
+        PRESENCE_TASK_ID,
+    )
+    .await
+    {
+        Err(HostError::ScopeMismatch { field, .. }) => {
+            assert_eq!(field, "thread_uuid");
+        }
+        other => panic!("expected foreign-thread presence refusal, got {other:?}"),
+    }
+    assert!(
+        !unscoped_sessions.exists(),
+        "scope refusal must happen before touching a missing sessions root"
+    );
+
+    let client = ApprovedHostClient::open(
+        &fixture.registry_dir,
+        &fixture.plans_dir,
+        &fixture.authority_dir,
+        &fixture.sessions_dir,
+        CONTROL_BINDING_ID,
+        THREAD_UUID,
+    )
+    .expect("open authoritative approved host client");
+    let release = PresenceReleaseGuard::new(fixture.presence_release.clone());
+
+    let mut host = spawn_host_process(&fixture, "readonly-presence", None);
+    let status =
+        wait_for_authenticated_ready(&client, &fixture.approval_id, &mut host, |_| true).await;
+    assert_live_ready(&fixture, &client, &mut host, &status);
+
+    let unstarted_files = capture_readonly_presence_files(&fixture);
+    let unstarted_dirs = capture_readonly_presence_dirs(&fixture);
+    assert_no_live_presence(
+        readonly_presence_at_fixture(
+            &fixture,
+            &fixture.sessions_dir,
+            CONTROL_BINDING_ID,
+            THREAD_UUID,
+            PRESENCE_TASK_ID,
+        )
+        .await,
+        "unstarted static presence",
+    );
+    assert_eq!(
+        capture_readonly_presence_files(&fixture),
+        unstarted_files,
+        "unstarted read-only presence must preserve file bytes and permissions"
+    );
+    assert_eq!(
+        capture_readonly_presence_dirs(&fixture),
+        unstarted_dirs,
+        "unstarted read-only presence must preserve directory permissions"
+    );
+    fixture.assert_no_provider_invocation();
+
+    client
+        .dispatch_task(&fixture.approval_id, PRESENCE_TASK_ID)
+        .await
+        .expect("dispatch marker-gated presence task");
+    wait_for_presence_child_started(&fixture, &mut host).await;
+    let live =
+        wait_for_live_presence(&client, &fixture.approval_id, PRESENCE_TASK_ID, &mut host).await;
+    let invocations_after_dispatch = fixture.provider_invocation_count();
+    assert!(
+        invocations_after_dispatch >= 1,
+        "the marker-gated fake worker must have invoked its provider"
+    );
+    let static_live = readonly_presence_at_fixture(
+        &fixture,
+        &fixture.sessions_dir,
+        CONTROL_BINDING_ID,
+        THREAD_UUID,
+        PRESENCE_TASK_ID,
+    )
+    .await
+    .expect("read live presence through static read-only API")
+    .expect("static read-only API exposes the live worker");
+    assert_eq!(static_live.run_id, live.run_id);
+    assert_eq!(static_live.worker_id, live.worker_id);
+    assert_eq!(static_live.claim_id, live.claim_id);
+    assert_eq!(static_live.attempt_count, live.attempt_count);
+    assert_eq!(static_live.owner, live.owner);
+
+    let live_files = capture_readonly_presence_files(&fixture);
+    let live_dirs = capture_readonly_presence_dirs(&fixture);
+
+    // Externally held store/receipt locks must not block or perturb the read-only route.
+    let authority_lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(fixture.authority.lock_path())
+        .expect("open authority.lock for external holder");
+    authority_lock
+        .try_lock_exclusive()
+        .expect("hold authority.lock externally");
+    let receipts_lock_path = fixture.session_dir().join("task-receipts.lock");
+    let receipts_lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&receipts_lock_path)
+        .expect("open task-receipts.lock for external holder");
+    receipts_lock
+        .try_lock_exclusive()
+        .expect("hold task-receipts.lock externally");
+    let externally_locked = tokio::time::timeout(
+        Duration::from_secs(5),
+        readonly_presence_at_fixture(
+            &fixture,
+            &fixture.sessions_dir,
+            CONTROL_BINDING_ID,
+            THREAD_UUID,
+            PRESENCE_TASK_ID,
+        ),
+    )
+    .await
+    .expect("read-only presence must not block on externally held store or receipt locks")
+    .expect("read-only presence under external locks")
+    .expect("live presence remains available under external locks");
+    assert_eq!(externally_locked.run_id, live.run_id);
+    assert_eq!(externally_locked.worker_id, live.worker_id);
+    assert_eq!(externally_locked.claim_id, live.claim_id);
+    receipts_lock
+        .unlock()
+        .expect("release external task-receipts.lock");
+    authority_lock
+        .unlock()
+        .expect("release external authority.lock");
+
+    // A missing host.lock means non-live and must never be recreated by the presence read.
+    let host_lock_path = fixture.session_dir().join("host.lock");
+    let missing_host_lock_backup =
+        stopped_read_backup_path(&fixture, "presence-live-host.lock.missing");
+    fs::rename(&host_lock_path, &missing_host_lock_backup).expect("move live host.lock");
+    assert_no_live_presence(
+        readonly_presence_at_fixture(
+            &fixture,
+            &fixture.sessions_dir,
+            CONTROL_BINDING_ID,
+            THREAD_UUID,
+            PRESENCE_TASK_ID,
+        )
+        .await,
+        "missing host.lock presence",
+    );
+    assert!(
+        !host_lock_path.exists(),
+        "read-only presence must not recreate a missing host.lock"
+    );
+    fs::rename(&missing_host_lock_backup, &host_lock_path).expect("restore live host.lock");
+    let restored = readonly_presence_at_fixture(
+        &fixture,
+        &fixture.sessions_dir,
+        CONTROL_BINDING_ID,
+        THREAD_UUID,
+        PRESENCE_TASK_ID,
+    )
+    .await
+    .expect("read restored live presence")
+    .expect("restored host.lock makes live presence available again");
+    assert_eq!(restored.run_id, live.run_id);
+
+    // A tampered sealed receipt must never be adopted as a live observation.
+    let receipts_path = fixture.session_dir().join(TASK_RECEIPTS_FILENAME);
+    let original_receipts = fs::read(&receipts_path).expect("read live receipts fixture");
+    let mut ledger: serde_json::Value =
+        serde_json::from_slice(&original_receipts).expect("parse live receipts fixture");
+    let receipt_entry = ledger["receipts"]
+        .as_array_mut()
+        .expect("live receipts array")
+        .iter_mut()
+        .find(|entry| {
+            entry.get("task_id").and_then(|value| value.as_str()) == Some(PRESENCE_TASK_ID)
+        })
+        .expect("presence task receipt entry");
+    let actual_worker_id = receipt_entry["worker_id"]
+        .as_str()
+        .expect("receipt worker_id")
+        .to_string();
+    let tampered_worker_id = if actual_worker_id == "wrk_00000000000000000000000000000001" {
+        "wrk_ffffffffffffffffffffffffffffffff"
+    } else {
+        "wrk_00000000000000000000000000000001"
+    };
+    receipt_entry["worker_id"] = serde_json::Value::String(tampered_worker_id.to_string());
+    fs::write(
+        &receipts_path,
+        serde_json::to_vec_pretty(&ledger).expect("serialize tampered presence receipts"),
+    )
+    .expect("write tampered presence receipts fixture");
+    fs::set_permissions(&receipts_path, fs::Permissions::from_mode(0o600))
+        .expect("keep tampered presence receipts private");
+    assert_not_live_presence(
+        readonly_presence_at_fixture(
+            &fixture,
+            &fixture.sessions_dir,
+            CONTROL_BINDING_ID,
+            THREAD_UUID,
+            PRESENCE_TASK_ID,
+        )
+        .await,
+        "tampered static receipt presence",
+    );
+    fs::write(&receipts_path, &original_receipts).expect("restore live receipts fixture");
+    fs::set_permissions(&receipts_path, fs::Permissions::from_mode(0o600))
+        .expect("restore live receipts permissions");
+
+    // A stale/foreign manifest instance must not be adopted by the exact-instance check.
+    let manifest_path = fixture.session_dir().join("host-manifest.json");
+    let original_manifest = fs::read(&manifest_path).expect("read live manifest fixture");
+    let mut manifest_json: serde_json::Value =
+        serde_json::from_slice(&original_manifest).expect("parse live manifest fixture");
+    let actual_instance_id = manifest_json["instance_id"]
+        .as_str()
+        .expect("live manifest instance_id")
+        .to_string();
+    let stale_instance_id = if actual_instance_id == "hst_00000000000000000000000000000001" {
+        "hst_00000000000000000000000000000002"
+    } else {
+        "hst_00000000000000000000000000000001"
+    };
+    manifest_json["instance_id"] = serde_json::Value::String(stale_instance_id.to_string());
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest_json).expect("serialize stale live manifest"),
+    )
+    .expect("write stale live manifest fixture");
+    fs::set_permissions(&manifest_path, fs::Permissions::from_mode(0o600))
+        .expect("keep stale live manifest private");
+    assert_not_live_presence(
+        readonly_presence_at_fixture(
+            &fixture,
+            &fixture.sessions_dir,
+            CONTROL_BINDING_ID,
+            THREAD_UUID,
+            PRESENCE_TASK_ID,
+        )
+        .await,
+        "stale instance static presence",
+    );
+    fs::write(&manifest_path, &original_manifest).expect("restore live manifest fixture");
+    fs::set_permissions(&manifest_path, fs::Permissions::from_mode(0o600))
+        .expect("restore live manifest permissions");
+
+    let restored_after_tamper = readonly_presence_at_fixture(
+        &fixture,
+        &fixture.sessions_dir,
+        CONTROL_BINDING_ID,
+        THREAD_UUID,
+        PRESENCE_TASK_ID,
+    )
+    .await
+    .expect("read presence after restoring live fixtures")
+    .expect("restored fixtures expose live presence");
+    assert_eq!(restored_after_tamper.run_id, live.run_id);
+    assert_eq!(
+        capture_readonly_presence_files(&fixture),
+        live_files,
+        "read-only live presence probes must not change manifest, receipt, authority, or lock bytes/permissions"
+    );
+    assert_eq!(
+        capture_readonly_presence_dirs(&fixture),
+        live_dirs,
+        "read-only live presence probes must not change authority, sessions, or session directory permissions"
+    );
+    assert_eq!(
+        fixture.provider_invocation_count(),
+        invocations_after_dispatch,
+        "read-only live presence probes must not launch the provider"
+    );
+
+    release.release();
+    let live_result =
+        wait_for_task_ready(&client, &fixture.approval_id, PRESENCE_TASK_ID, &mut host).await;
+    assert_eq!(live_result.status, TaskExecutionStatus::ReadyForReview);
+    let invocations_after_success = fixture.provider_invocation_count();
+    assert_no_live_presence(
+        readonly_presence_at_fixture(
+            &fixture,
+            &fixture.sessions_dir,
+            CONTROL_BINDING_ID,
+            THREAD_UUID,
+            PRESENCE_TASK_ID,
+        )
+        .await,
+        "completed static presence",
+    );
+    assert_eq!(
+        fixture.provider_invocation_count(),
+        invocations_after_success,
+        "completed static presence must not launch the provider"
+    );
+
+    let idle = wait_for_host_idle(&client, &fixture.approval_id, &mut host).await;
+    let instance_id = idle.instance_id.clone();
+    let session_binding_id = idle.session_binding_id.clone();
+    let stopped = client
+        .stop_idle_session(&fixture.approval_id, &instance_id)
+        .await
+        .expect("authenticated idle stop after static presence reads");
+    let exit = host.wait_for_exit(EXIT_TIMEOUT).await;
+    assert_eq!(
+        exit.code(),
+        Some(0),
+        "host process must exit naturally after static presence reads"
+    );
+    assert_durable_stopped(&fixture, &instance_id, &session_binding_id, &stopped);
+
+    let stopped_fingerprint = capture_stopped_read_fingerprint(&fixture);
+    let stopped_files = capture_readonly_presence_files(&fixture);
+    let stopped_dirs = capture_readonly_presence_dirs(&fixture);
+    assert_no_live_presence(
+        readonly_presence_at_fixture(
+            &fixture,
+            &fixture.sessions_dir,
+            CONTROL_BINDING_ID,
+            THREAD_UUID,
+            PRESENCE_TASK_ID,
+        )
+        .await,
+        "stopped static presence",
+    );
+    assert_eq!(
+        capture_stopped_read_fingerprint(&fixture),
+        stopped_fingerprint,
+        "stopped static presence must not change manifest, receipts, DB, or sidecars"
+    );
+    assert_eq!(
+        capture_readonly_presence_files(&fixture),
+        stopped_files,
+        "stopped static presence must not change authority, manifest, receipt, or lock bytes/permissions"
+    );
+    assert_eq!(
+        capture_readonly_presence_dirs(&fixture),
+        stopped_dirs,
+        "stopped static presence must not change authority, sessions, or session directory permissions"
+    );
+    assert!(
+        !is_host_lock_held(&fixture.session_dir()).expect("probe stopped host.lock"),
+        "static presence must not revive the stopped host"
+    );
+    assert_eq!(
+        fixture.provider_invocation_count(),
+        invocations_after_success,
+        "stopped static presence must not launch the provider"
+    );
+}

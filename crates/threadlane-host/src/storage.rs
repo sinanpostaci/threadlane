@@ -468,19 +468,42 @@ pub fn paths_overlap(a: &Path, b: &Path) -> bool {
 /// - Ensures `sessions_dir` is a private `0700` directory without symlink components.
 /// - Rejects any path overlap with `other_dirs` (registry, plans, authority, or repository roots).
 /// - Rejects any foreign or non-private entry directly inside `sessions_dir`.
+///
+/// Startup and legacy client construction may create a missing private root. Strictly read-only
+/// callers must use [`validate_existing_sessions_root`] instead.
 pub fn validate_sessions_root(
     sessions_dir: &Path,
     other_dirs: &[(&str, &Path)],
 ) -> Result<PathBuf, HostError> {
     let canonical_sessions = ensure_private_dir(sessions_dir)?;
+    validate_sessions_root_contents(&canonical_sessions, other_dirs)?;
+    Ok(canonical_sessions)
+}
 
+/// Validates an already existing operator-selected `sessions_dir` root without creating it,
+/// changing its permissions, or acquiring/creating any lock file.
+///
+/// Shares the exact overlap and entry checks used by [`validate_sessions_root`].
+pub fn validate_existing_sessions_root(
+    sessions_dir: &Path,
+    other_dirs: &[(&str, &Path)],
+) -> Result<PathBuf, HostError> {
+    let canonical_sessions = verify_existing_private_dir(sessions_dir)?;
+    validate_sessions_root_contents(&canonical_sessions, other_dirs)?;
+    Ok(canonical_sessions)
+}
+
+fn validate_sessions_root_contents(
+    canonical_sessions: &Path,
+    other_dirs: &[(&str, &Path)],
+) -> Result<(), HostError> {
     for (label, other) in other_dirs {
         let other_resolved = if other.exists() {
             fs::canonicalize(other).unwrap_or_else(|_| other.to_path_buf())
         } else {
             ensure_no_symlink_components(other).unwrap_or_else(|_| other.to_path_buf())
         };
-        if paths_overlap(&canonical_sessions, &other_resolved) {
+        if paths_overlap(canonical_sessions, &other_resolved) {
             return Err(HostError::SecurityViolation {
                 path: canonical_sessions.display().to_string(),
                 reason: format!(
@@ -491,7 +514,7 @@ pub fn validate_sessions_root(
         }
     }
 
-    let entries = fs::read_dir(&canonical_sessions).map_err(|err| HostError::Io {
+    let entries = fs::read_dir(canonical_sessions).map_err(|err| HostError::Io {
         operation: "read_dir(sessions_dir)".to_string(),
         reason: err.to_string(),
     })?;
@@ -567,7 +590,7 @@ pub fn validate_sessions_root(
         }
     }
 
-    Ok(canonical_sessions)
+    Ok(())
 }
 
 /// Validates and prepares `<sessions_root>/<approval_id>` for host startup.
