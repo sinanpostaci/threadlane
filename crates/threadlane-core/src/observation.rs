@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -6,6 +6,7 @@ use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use fs2::FileExt;
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
@@ -2195,6 +2196,38 @@ pub struct ReadonlyWakeupRecord {
     pub resolved_at_ms: Option<i64>,
 }
 
+/// One immutable backlog history row read read-only from `state.db`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadonlyBacklogHistoryRecord {
+    /// Owning binding/chat identifier.
+    pub binding_id: String,
+    /// Actual durable item identifier.
+    pub item_id: String,
+    /// Resulting item revision recorded by this history row.
+    pub revision: u64,
+    /// Actual durable history action token (`created`, `worker_outcome_recorded`, ...).
+    pub action: String,
+    /// Full item snapshot committed with this history row.
+    pub item: crate::backlog::BacklogItem,
+    /// Timestamp (ms) when the history row was committed.
+    pub recorded_at_ms: i64,
+    /// Actual SQLite history rowid used as the stable within-chat sequence.
+    pub sequence: u64,
+}
+
+/// Bounded per-binding backlog row totals used for truthful omission accounting.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReadonlyBacklogBindingCounts {
+    /// Owning binding/chat identifier.
+    pub binding_id: String,
+    /// Total durable backlog items for the binding before the read-only bound.
+    pub item_count: usize,
+    /// Total durable history rows for the binding before the read-only bound.
+    pub history_count: usize,
+    /// Total current nonterminal Worker execution references before the read-only bound.
+    pub current_worker_execution_count: usize,
+}
+
 /// Complete read-only structural snapshot of `state.db`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReadonlyCoreStateSnapshot {
@@ -2210,6 +2243,19 @@ pub struct ReadonlyCoreStateSnapshot {
     pub event_batches: Vec<ReadonlyEventBatchRecord>,
     /// Wake-up state per binding.
     pub wakeups: Vec<ReadonlyWakeupRecord>,
+    /// Whether all additive backlog tables were present for this read.
+    ///
+    /// A legacy database without the additive backlog tables stays safely empty and reports
+    /// `false`; it never infers backlog work from runs, workers, events, or jobs.
+    pub backlog_available: bool,
+    /// Bounded backlog item snapshots across bindings.
+    pub backlog_items: Vec<crate::backlog::BacklogItem>,
+    /// Bounded durable backlog history rows across bindings.
+    pub backlog_history: Vec<ReadonlyBacklogHistoryRecord>,
+    /// Bounded Worker execution rows for the retained current and historical item references.
+    pub backlog_worker_executions: Vec<crate::backlog_worker::WorkerBacklogExecution>,
+    /// Per-binding backlog totals used for omission accounting.
+    pub backlog_binding_counts: Vec<ReadonlyBacklogBindingCounts>,
 }
 
 fn validate_readonly_sqlite_file(
@@ -2648,6 +2694,522 @@ where
     verify_sqlite_sidecar_absent(&shm_path, "state.db-shm sidecar")?;
 
     Ok(out)
+}
+
+fn sqlite_readonly_core_error(context: &str, err: crate::CoreError) -> ObservationJournalError {
+    ObservationJournalError::Io(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!("sqlite read-only {context}: {err}"),
+    ))
+}
+
+fn readonly_table_exists(
+    tx: &rusqlite::Transaction<'_>,
+    table: &str,
+) -> Result<bool, ObservationJournalError> {
+    let count: i64 = tx
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [table],
+            |row| row.get(0),
+        )
+        .map_err(|err| sqlite_readonly_error("sqlite_master table lookup failed", err))?;
+    Ok(count > 0)
+}
+
+#[allow(clippy::type_complexity)]
+type ReadonlyWorkerExecutionRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    i64,
+    i64,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+);
+
+/// Reads one Worker execution row without mutating the database.
+///
+/// Malformed or partially written optional evidence is skipped instead of turning an otherwise
+/// readable observation snapshot into an error. A missing optional rejection table is treated as
+/// "no rejection recorded".
+fn read_readonly_worker_execution(
+    tx: &rusqlite::Transaction<'_>,
+    binding_id: &str,
+    item_id: &str,
+    execution_ref: &str,
+    rejection_table_exists: bool,
+) -> Result<Option<crate::backlog_worker::WorkerBacklogExecution>, ObservationJournalError> {
+    let row: Option<ReadonlyWorkerExecutionRow> = tx
+        .query_row(
+            "SELECT execution_ref, binding_id, item_id, approval_id,
+                    subject_digest, task_id, task_digest,
+                    acceptance_condition_digest, delivery_description_digest,
+                    reservation_revision, reserved_at_ms, session_binding_id,
+                    run_id, worker_id, profile_id, execution_binding_digest,
+                    attached_at_ms, outcome, outcome_note, outcome_result_digest,
+                    outcome_recorded_at_ms, completion_result_digest,
+                    completion_delivery_digest, completion_note,
+                    completion_evidence, completed_at_ms
+             FROM backlog_worker_executions
+             WHERE binding_id = ?1 AND item_id = ?2 AND execution_ref = ?3",
+            rusqlite::params![binding_id, item_id, execution_ref],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                    row.get(11)?,
+                    row.get(12)?,
+                    row.get(13)?,
+                    row.get(14)?,
+                    row.get(15)?,
+                    row.get(16)?,
+                    row.get(17)?,
+                    row.get(18)?,
+                    row.get(19)?,
+                    row.get(20)?,
+                    row.get(21)?,
+                    row.get(22)?,
+                    row.get(23)?,
+                    row.get(24)?,
+                    row.get(25)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|err| sqlite_readonly_error("query Worker backlog execution failed", err))?;
+
+    let Some((
+        stored_execution_ref,
+        stored_binding_id,
+        stored_item_id,
+        approval_id,
+        subject_digest,
+        task_id,
+        task_digest,
+        acceptance_condition_digest,
+        delivery_description_digest,
+        reservation_revision,
+        reserved_at_ms,
+        session_binding_id,
+        run_id,
+        worker_id,
+        profile_id,
+        execution_binding_digest,
+        attached_at_ms,
+        outcome_raw,
+        outcome_note,
+        outcome_result_digest,
+        outcome_recorded_at_ms,
+        completion_result_digest,
+        completion_delivery_digest,
+        completion_note,
+        completion_evidence,
+        completed_at_ms,
+    )) = row
+    else {
+        return Ok(None);
+    };
+    if stored_execution_ref != execution_ref
+        || stored_binding_id != binding_id
+        || stored_item_id != item_id
+    {
+        return Ok(None);
+    }
+
+    let dispatch_receipt = match (session_binding_id, run_id, worker_id, profile_id) {
+        (None, None, None, None) => {
+            if execution_binding_digest.is_some() || attached_at_ms.is_some() {
+                return Ok(None);
+            }
+            None
+        }
+        (Some(session_binding_id), Some(run_id), Some(worker_id), Some(profile_id)) => {
+            Some(crate::backlog_worker::WorkerBacklogDispatchReceipt {
+                session_binding_id,
+                run_id,
+                worker_id,
+                profile_id,
+                execution_binding_digest,
+            })
+        }
+        _ => return Ok(None),
+    };
+
+    let outcome = match outcome_raw {
+        None => {
+            if outcome_note.is_some()
+                || outcome_result_digest.is_some()
+                || outcome_recorded_at_ms.is_some()
+            {
+                return Ok(None);
+            }
+            None
+        }
+        Some(raw_outcome) => {
+            let Some(outcome) = crate::backlog_worker::WorkerBacklogOutcome::from_str(&raw_outcome)
+            else {
+                return Ok(None);
+            };
+            let (Some(note), Some(recorded_at_ms)) = (outcome_note, outcome_recorded_at_ms) else {
+                return Ok(None);
+            };
+            let result_digest = if outcome == crate::backlog_worker::WorkerBacklogOutcome::Unknown {
+                if outcome_result_digest.is_some() {
+                    return Ok(None);
+                }
+                None
+            } else {
+                let Some(result_digest) = outcome_result_digest else {
+                    return Ok(None);
+                };
+                Some(result_digest)
+            };
+            Some(crate::backlog_worker::WorkerBacklogRecordedOutcome {
+                outcome,
+                note,
+                result_digest,
+                recorded_at_ms,
+            })
+        }
+    };
+
+    let completion = match (
+        completion_result_digest,
+        completion_delivery_digest,
+        completion_note,
+        completion_evidence,
+        completed_at_ms,
+    ) {
+        (None, None, None, None, None) => None,
+        (
+            Some(result_digest),
+            Some(delivery_digest),
+            Some(acceptance_note),
+            Some(acceptance_evidence),
+            Some(completed_at_ms),
+        ) => Some(crate::backlog_worker::WorkerBacklogCompletionRecord {
+            result_digest,
+            delivery_digest,
+            acceptance_note,
+            acceptance_evidence,
+            completed_at_ms,
+        }),
+        _ => return Ok(None),
+    };
+
+    let acceptance_rejection = if rejection_table_exists {
+        let rejection: Option<(String, String, String, String, i64, String, String)> = tx
+            .query_row(
+                "SELECT result_digest, delivery_digest, reason, evidence, rejected_at_ms,
+                        binding_id, item_id
+                 FROM backlog_worker_acceptance_rejections
+                 WHERE execution_ref = ?1",
+                [execution_ref],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|err| {
+                sqlite_readonly_error("query Worker acceptance rejection failed", err)
+            })?;
+        match rejection {
+            None => None,
+            Some((
+                result_digest,
+                delivery_digest,
+                reason,
+                evidence,
+                rejected_at_ms,
+                stored_rejection_binding_id,
+                stored_rejection_item_id,
+            )) if stored_rejection_binding_id == binding_id
+                && stored_rejection_item_id == item_id =>
+            {
+                Some(
+                    crate::backlog_worker::WorkerBacklogAcceptanceRejectionRecord {
+                        result_digest,
+                        delivery_digest,
+                        reason,
+                        evidence,
+                        rejected_at_ms,
+                    },
+                )
+            }
+            Some(_) => return Ok(None),
+        }
+    } else {
+        None
+    };
+
+    Ok(Some(crate::backlog_worker::WorkerBacklogExecution {
+        execution_ref: stored_execution_ref,
+        binding_id: stored_binding_id,
+        item_id: stored_item_id,
+        authority: crate::backlog_worker::WorkerBacklogAuthority {
+            approval_id,
+            subject_digest,
+            task_id,
+            task_digest,
+        },
+        acceptance_condition_digest,
+        delivery_description_digest,
+        reservation_revision: convert_u64_column(
+            "backlog_worker_executions",
+            "reservation_revision",
+            reservation_revision,
+        )?,
+        reserved_at_ms,
+        dispatch_receipt,
+        attached_at_ms,
+        outcome,
+        completion,
+        acceptance_rejection,
+    }))
+}
+
+/// Reads the additive backlog projection in bounded, read-only form.
+///
+/// The basic backlog tables are additive and may legitimately be absent from a legacy database.
+/// Missing basic tables leave the whole backlog projection empty and unavailable; a missing
+/// optional acceptance-rejection table is treated as "no rejection recorded" so older additive
+/// execution tables remain readable.
+fn read_readonly_backlog_tables(
+    tx: &rusqlite::Transaction<'_>,
+    snap: &mut ReadonlyCoreStateSnapshot,
+) -> Result<(), ObservationJournalError> {
+    for table in [
+        "backlog_items",
+        "backlog_history",
+        "backlog_worker_executions",
+    ] {
+        if !readonly_table_exists(tx, table)? {
+            snap.backlog_available = false;
+            snap.backlog_items.clear();
+            snap.backlog_history.clear();
+            snap.backlog_worker_executions.clear();
+            snap.backlog_binding_counts.clear();
+            return Ok(());
+        }
+    }
+    snap.backlog_available = true;
+    let rejection_table_exists = readonly_table_exists(tx, "backlog_worker_acceptance_rejections")?;
+
+    let binding_ids: Vec<String> = snap
+        .bindings
+        .iter()
+        .map(|binding| binding.binding_id.clone())
+        .collect();
+    let item_limit = i64::try_from(MAX_WORKSPACE_CHAT_WORK_ITEMS_PER_CHAT).unwrap_or(i64::MAX);
+    let history_limit = i64::try_from(MAX_WORKSPACE_CHAT_WORK_EVENTS_PER_CHAT).unwrap_or(i64::MAX);
+
+    for binding_id in binding_ids {
+        let item_count_raw: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM backlog_items WHERE binding_id = ?1",
+                [&binding_id],
+                |row| row.get(0),
+            )
+            .map_err(|err| sqlite_readonly_error("count backlog items failed", err))?;
+        let history_count_raw: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM backlog_history WHERE binding_id = ?1",
+                [&binding_id],
+                |row| row.get(0),
+            )
+            .map_err(|err| sqlite_readonly_error("count backlog history failed", err))?;
+        let current_worker_execution_count_raw: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM backlog_items
+                 WHERE binding_id = ?1
+                   AND kind = 'worker'
+                   AND status IN ('doing', 'blocked')
+                   AND current_execution_ref IS NOT NULL",
+                [&binding_id],
+                |row| row.get(0),
+            )
+            .map_err(|err| {
+                sqlite_readonly_error("count current Worker backlog executions failed", err)
+            })?;
+        snap.backlog_binding_counts
+            .push(ReadonlyBacklogBindingCounts {
+                binding_id: binding_id.clone(),
+                item_count: convert_usize_column("backlog_items", "count", item_count_raw)?,
+                history_count: convert_usize_column("backlog_history", "count", history_count_raw)?,
+                current_worker_execution_count: convert_usize_column(
+                    "backlog_items",
+                    "current_worker_execution_count",
+                    current_worker_execution_count_raw,
+                )?,
+            });
+
+        let item_ids: Vec<String> = {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT item_id FROM backlog_items
+                     WHERE binding_id = ?1
+                     ORDER BY rowid DESC
+                     LIMIT ?2",
+                )
+                .map_err(|err| sqlite_readonly_error("prepare backlog items failed", err))?;
+            let mut rows = stmt
+                .query(rusqlite::params![&binding_id, item_limit])
+                .map_err(|err| sqlite_readonly_error("query backlog items failed", err))?;
+            let mut item_ids = Vec::new();
+            while let Some(row) = rows
+                .next()
+                .map_err(|err| sqlite_readonly_error("step backlog items failed", err))?
+            {
+                item_ids
+                    .push(row.get::<_, String>(0).map_err(|err| {
+                        sqlite_readonly_error("read backlog item_id failed", err)
+                    })?);
+            }
+            item_ids.reverse();
+            item_ids
+        };
+
+        let mut execution_keys: BTreeSet<(String, String)> = BTreeSet::new();
+        for item_id in item_ids {
+            let item = crate::backlog::load_backlog_item_conn(tx, &binding_id, &item_id)
+                .map_err(|err| sqlite_readonly_core_error("load backlog item failed", err))?;
+            if item.kind == crate::backlog::BacklogItemKind::Worker
+                && matches!(
+                    item.status,
+                    crate::backlog::BacklogStatus::Doing | crate::backlog::BacklogStatus::Blocked
+                )
+            {
+                if let Some(execution_ref) = item.current_execution_ref.clone() {
+                    execution_keys.insert((item.item_id.clone(), execution_ref));
+                }
+            }
+            snap.backlog_items.push(item);
+        }
+
+        let history_rows: Vec<(i64, i64, String, String, i64)> = {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT rowid, revision, action, item_json, recorded_at_ms
+                     FROM backlog_history
+                     WHERE binding_id = ?1
+                     ORDER BY rowid DESC
+                     LIMIT ?2",
+                )
+                .map_err(|err| sqlite_readonly_error("prepare backlog history failed", err))?;
+            let mut rows = stmt
+                .query(rusqlite::params![&binding_id, history_limit])
+                .map_err(|err| sqlite_readonly_error("query backlog history failed", err))?;
+            let mut history_rows = Vec::new();
+            while let Some(row) = rows
+                .next()
+                .map_err(|err| sqlite_readonly_error("step backlog history failed", err))?
+            {
+                history_rows.push((
+                    row.get(0)
+                        .map_err(|err| sqlite_readonly_error("read backlog rowid failed", err))?,
+                    row.get(1).map_err(|err| {
+                        sqlite_readonly_error("read backlog revision failed", err)
+                    })?,
+                    row.get(2)
+                        .map_err(|err| sqlite_readonly_error("read backlog action failed", err))?,
+                    row.get(3).map_err(|err| {
+                        sqlite_readonly_error("read backlog item_json failed", err)
+                    })?,
+                    row.get(4).map_err(|err| {
+                        sqlite_readonly_error("read backlog recorded_at_ms failed", err)
+                    })?,
+                ));
+            }
+            history_rows.reverse();
+            history_rows
+        };
+
+        for (rowid, revision_raw, action, item_json, recorded_at_ms) in history_rows {
+            let sequence = convert_u64_column("backlog_history", "rowid", rowid)?;
+            let revision = convert_u64_column("backlog_history", "revision", revision_raw)?;
+            let item: crate::backlog::BacklogItem = serde_json::from_str(&item_json)?;
+            crate::backlog::validate_backlog_item(&item, &binding_id).map_err(|err| {
+                sqlite_readonly_core_error("validate backlog history failed", err)
+            })?;
+            if item.revision != revision {
+                return Err(ObservationJournalError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "backlog history revision {revision} does not match snapshot revision {}",
+                        item.revision
+                    ),
+                )));
+            }
+            if item.kind == crate::backlog::BacklogItemKind::Worker {
+                if let Some(execution_ref) = item.current_execution_ref.clone() {
+                    execution_keys.insert((item.item_id.clone(), execution_ref));
+                }
+            }
+            snap.backlog_history.push(ReadonlyBacklogHistoryRecord {
+                binding_id: binding_id.clone(),
+                item_id: item.item_id.clone(),
+                revision,
+                action,
+                item,
+                recorded_at_ms,
+                sequence,
+            });
+        }
+
+        for (item_id, execution_ref) in execution_keys
+            .into_iter()
+            .take(MAX_READONLY_BACKLOG_EXECUTIONS_PER_BINDING)
+        {
+            if let Some(execution) = read_readonly_worker_execution(
+                tx,
+                &binding_id,
+                &item_id,
+                &execution_ref,
+                rejection_table_exists,
+            )? {
+                snap.backlog_worker_executions.push(execution);
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Reads `state.db` at `database_path` using `SQLITE_OPEN_READ_ONLY` without creating directories,
@@ -3144,6 +3706,8 @@ pub fn read_core_state_readonly(
         }
     }
 
+    read_readonly_backlog_tables(&tx, &mut snap)?;
+
     drop(tx);
     drop(conn);
 
@@ -3224,6 +3788,33 @@ pub const MAX_WORKSPACE_NATIVE_SAMPLES_PER_SOURCE: usize = 128;
 
 /// Maximum number of safe items retained in a [`WorkspaceMessagesWindow`] (`1,000`).
 pub const MAX_WORKSPACE_MESSAGES_WINDOW: usize = 1_000;
+
+/// Maximum backlog items retained per canonical chat in [`WorkspaceChatWork`] (`200`).
+pub const MAX_WORKSPACE_CHAT_WORK_ITEMS_PER_CHAT: usize = 200;
+
+/// Maximum backlog history events retained per canonical chat in [`WorkspaceChatWork`] (`500`).
+pub const MAX_WORKSPACE_CHAT_WORK_EVENTS_PER_CHAT: usize = 500;
+
+/// Maximum Worker presence rows retained per canonical chat in [`WorkspaceChatWork`] (`32`).
+pub const MAX_WORKSPACE_CHAT_WORK_PRESENCE_PER_CHAT: usize = 32;
+
+/// Maximum backlog items retained across all chats in [`WorkspaceSnapshot::chat_work`] (`1,000`).
+pub const MAX_WORKSPACE_CHAT_WORK_ITEMS_TOTAL: usize = 1_000;
+
+/// Maximum backlog history events retained across all chats in [`WorkspaceSnapshot::chat_work`]
+/// (`2,000`).
+pub const MAX_WORKSPACE_CHAT_WORK_EVENTS_TOTAL: usize = 2_000;
+
+/// Maximum Worker presence rows retained across all chats in [`WorkspaceSnapshot::chat_work`]
+/// (`64`).
+pub const MAX_WORKSPACE_CHAT_WORK_PRESENCE_TOTAL: usize = 64;
+
+/// Maximum Worker executions retained per binding while reading backlog evidence (`500`).
+pub const MAX_READONLY_BACKLOG_EXECUTIONS_PER_BINDING: usize = 500;
+
+/// Maximum age (`5,000 ms`) accepted for a fresh Worker presence sample, matching the runtime
+/// presence DTO.
+pub const MAX_WORKSPACE_BACKLOG_PRESENCE_SAMPLE_AGE_MS: u64 = 5_000;
 
 /// Maximum structured job history records projected per `(source_id, binding_id)` (`64`),
 /// matching the durable coworker ledger capacity.
@@ -6436,6 +7027,392 @@ pub struct WorkspaceSnapshotBounds {
     pub jobs_capped: bool,
 }
 
+/// Availability of the durable backlog projection for one canonical chat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[derive(Default)]
+pub enum WorkspaceChatWorkAvailability {
+    /// The additive backlog tables were readable for this chat's binding.
+    Available,
+    /// The source, binding, or additive backlog tables were unavailable; no work is inferred.
+    #[default]
+    Unavailable,
+}
+
+/// Availability of one actual host-adapter Worker presence observation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[derive(Default)]
+pub enum WorkspaceBacklogPresenceAvailability {
+    /// A current host sample proves a live worker process.
+    Live,
+    /// The worker execution is terminal and no live process is claimed.
+    NonLive,
+    /// Presence was not observed or could not be refreshed; never a human request.
+    #[default]
+    Unavailable,
+}
+
+/// Freshness of one actual host-adapter Worker presence sample.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[derive(Default)]
+pub enum WorkspaceBacklogPresenceFreshness {
+    /// The sample is within its bounded age.
+    Fresh,
+    /// A running sample is older than its bounded age.
+    Stale,
+    /// No running sample applies.
+    #[default]
+    NotApplicable,
+}
+
+/// One backlog history event projected from an actual durable history row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceBacklogEvent {
+    /// Stable event identity derived from the actual durable `item_id` and `revision`.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub event_id: String,
+    /// Actual SQLite history rowid, ascending within one canonical chat identity.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub sequence: u64,
+    /// Actual durable backlog item identifier.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub item_id: String,
+    /// Item revision produced by this history row.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub revision: u64,
+    /// Actual durable history action token.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub action: String,
+    /// Timestamp (ms) when the history row was committed.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub recorded_at_ms: i64,
+    /// Item title at this history revision, retaining the authored language.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub title: String,
+    /// Committed backlog status at this history revision.
+    pub status: crate::backlog::BacklogStatus,
+    /// Current execution reference at this history revision, when one existed.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub execution_ref: Option<String>,
+    /// Operator-recorded outcome only for an actual matching `worker_outcome_recorded` row.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub outcome: Option<crate::backlog_worker::WorkerBacklogOutcome>,
+    /// Bounded action note from the actual matching evidence, when one exists.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub note: Option<String>,
+}
+
+/// One actual host-adapter Worker presence observation correlated to a backlog execution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceBacklogWorkerPresence {
+    /// Backlog item whose current execution is observed.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub item_id: String,
+    /// Exact guarded Worker execution reference.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub execution_ref: String,
+    /// Frozen approval identifier from the execution ledger.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub approval_id: String,
+    /// Frozen approved task identifier from the execution ledger.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub task_id: String,
+    /// Exact dispatched run identifier.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub run_id: String,
+    /// Exact dispatched worker identifier.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub worker_id: String,
+    /// Current or most recent dispatcher claim identifier.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub claim_id: Option<String>,
+    /// Host instance that produced the presence sample.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub host_instance_id: Option<String>,
+    /// Runner-owned process invocation identifier.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub invocation_id: Option<String>,
+    /// Monotonic software sequence within the process invocation.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub sequence: Option<u64>,
+    /// Actual host-adapter availability classification.
+    pub availability: WorkspaceBacklogPresenceAvailability,
+    /// Actual host-adapter freshness classification.
+    pub freshness: WorkspaceBacklogPresenceFreshness,
+    /// True only for a fresh live presence sample that is also unexpired.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub live: bool,
+    /// Original supervisor sample timestamp; never refreshed by projection.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub sampled_at_ms: Option<i64>,
+    /// Original measured sample age; never reset by projection.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub sample_age_ms: Option<u64>,
+    /// Bounded maximum sample age applied by the host adapter.
+    #[serde(default = "default_workspace_backlog_presence_max_sample_age_ms")]
+    pub max_sample_age_ms: u64,
+    /// Original host-computed expiry timestamp; never extended by projection.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub expires_at_ms: Option<i64>,
+}
+
+fn default_workspace_backlog_presence_max_sample_age_ms() -> u64 {
+    MAX_WORKSPACE_BACKLOG_PRESENCE_SAMPLE_AGE_MS
+}
+
+/// Per-chat truthful omission accounting for [`WorkspaceChatWork`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct WorkspaceChatWorkBounds {
+    /// Backlog items omitted by validity, per-chat, or all-chat bounds.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub items_omitted: usize,
+    /// Backlog history events omitted by validity, per-chat, or all-chat bounds.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub events_omitted: usize,
+    /// Worker presence rows omitted by validity, per-chat, or all-chat bounds.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub presence_omitted: usize,
+}
+
+/// Bounded read-only backlog work for one canonical chat identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct WorkspaceChatWork {
+    /// Exact canonical chat identity owning every item, event, and presence row.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub identity: WorkspaceChatIdentity,
+    /// Whether the durable backlog projection was actually readable.
+    pub availability: WorkspaceChatWorkAvailability,
+    /// Bounded backlog item snapshots in stable creation order.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub items: Vec<crate::backlog::BacklogItem>,
+    /// Bounded durable backlog history events in ascending sequence order.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub events: Vec<WorkspaceBacklogEvent>,
+    /// Actual host-adapter Worker presence rows correlated to current executions.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub worker_presence: Vec<WorkspaceBacklogWorkerPresence>,
+    /// Truthful per-chat omission accounting.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub bounds: WorkspaceChatWorkBounds,
+}
+
+/// One current nonterminal Worker execution eligible for an actual host presence refresh.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceChatWorkPresenceCandidate {
+    /// Backlog item owning the current execution.
+    pub item_id: String,
+    /// Exact guarded Worker execution reference.
+    pub execution_ref: String,
+    /// Frozen approval identifier.
+    pub approval_id: String,
+    /// Frozen approved task identifier.
+    pub task_id: String,
+    /// Exact dispatched session binding identifier.
+    pub session_binding_id: String,
+    /// Exact dispatched run identifier.
+    pub run_id: String,
+    /// Exact dispatched worker identifier.
+    pub worker_id: String,
+}
+
+/// Bounded presence-refresh candidate page with truthful omission accounting.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WorkspaceChatWorkPresenceCandidates {
+    /// Candidates to refresh, in deterministic order.
+    pub candidates: Vec<WorkspaceChatWorkPresenceCandidate>,
+    /// Candidates omitted by the per-chat presence bound.
+    pub omitted: usize,
+}
+
+impl WorkspaceChatWork {
+    /// Normalizes this chat work projection to exact identity, stable order, unique source
+    /// records, and the per-chat item/event/presence bounds.
+    pub fn normalized(&self) -> Self {
+        let identity = self.identity.clone();
+        if identity.canonical_key().is_none() {
+            return Self::default();
+        }
+
+        let mut bounds = self.bounds.clone();
+        let mut items_by_id: BTreeMap<String, crate::backlog::BacklogItem> = BTreeMap::new();
+        for item in &self.items {
+            if item.binding_id != identity.binding_id
+                || item.item_id.trim().is_empty()
+                || item.revision == 0
+            {
+                bounds.items_omitted = bounds.items_omitted.saturating_add(1);
+                continue;
+            }
+            match items_by_id.get(&item.item_id) {
+                Some(existing) if existing.revision >= item.revision => {
+                    bounds.items_omitted = bounds.items_omitted.saturating_add(1);
+                }
+                Some(_) => {
+                    bounds.items_omitted = bounds.items_omitted.saturating_add(1);
+                    items_by_id.insert(item.item_id.clone(), item.clone());
+                }
+                None => {
+                    items_by_id.insert(item.item_id.clone(), item.clone());
+                }
+            }
+        }
+        let mut items: Vec<crate::backlog::BacklogItem> = items_by_id.into_values().collect();
+        items.sort_by(|left, right| {
+            left.created_at_ms
+                .cmp(&right.created_at_ms)
+                .then_with(|| left.item_id.cmp(&right.item_id))
+        });
+        if items.len() > MAX_WORKSPACE_CHAT_WORK_ITEMS_PER_CHAT {
+            let overflow = items.len() - MAX_WORKSPACE_CHAT_WORK_ITEMS_PER_CHAT;
+            items = items.split_off(overflow);
+            bounds.items_omitted = bounds.items_omitted.saturating_add(overflow);
+        }
+
+        let mut events_by_id: BTreeMap<String, WorkspaceBacklogEvent> = BTreeMap::new();
+        for event in &self.events {
+            if event.event_id.trim().is_empty()
+                || event.action.trim().is_empty()
+                || event.revision == 0
+                || event.event_id != format!("{}:{}", event.item_id, event.revision)
+            {
+                bounds.events_omitted = bounds.events_omitted.saturating_add(1);
+                continue;
+            }
+            match events_by_id.get(&event.event_id) {
+                Some(existing) => {
+                    let replace = event.sequence < existing.sequence
+                        || (event.sequence == existing.sequence
+                            && event.recorded_at_ms > existing.recorded_at_ms);
+                    if replace {
+                        bounds.events_omitted = bounds.events_omitted.saturating_add(1);
+                        events_by_id.insert(event.event_id.clone(), event.clone());
+                    } else {
+                        bounds.events_omitted = bounds.events_omitted.saturating_add(1);
+                    }
+                }
+                None => {
+                    events_by_id.insert(event.event_id.clone(), event.clone());
+                }
+            }
+        }
+        let mut events: Vec<WorkspaceBacklogEvent> = events_by_id.into_values().collect();
+        events.sort_by(|left, right| {
+            left.sequence
+                .cmp(&right.sequence)
+                .then_with(|| left.event_id.cmp(&right.event_id))
+        });
+        if events.len() > MAX_WORKSPACE_CHAT_WORK_EVENTS_PER_CHAT {
+            let overflow = events.len() - MAX_WORKSPACE_CHAT_WORK_EVENTS_PER_CHAT;
+            events = events.split_off(overflow);
+            bounds.events_omitted = bounds.events_omitted.saturating_add(overflow);
+        }
+
+        let mut presence_by_key: BTreeMap<(String, String), WorkspaceBacklogWorkerPresence> =
+            BTreeMap::new();
+        for presence in &self.worker_presence {
+            let Some(owner_item) = items.iter().find(|item| item.item_id == presence.item_id)
+            else {
+                bounds.presence_omitted = bounds.presence_omitted.saturating_add(1);
+                continue;
+            };
+            if presence.item_id.trim().is_empty()
+                || presence.execution_ref.trim().is_empty()
+                || owner_item.kind != crate::backlog::BacklogItemKind::Worker
+                || !matches!(
+                    owner_item.status,
+                    crate::backlog::BacklogStatus::Doing | crate::backlog::BacklogStatus::Blocked
+                )
+                || owner_item.current_execution_ref.as_deref()
+                    != Some(presence.execution_ref.as_str())
+            {
+                bounds.presence_omitted = bounds.presence_omitted.saturating_add(1);
+                continue;
+            }
+            let mut presence = presence.clone();
+            if presence.availability != WorkspaceBacklogPresenceAvailability::Live
+                || presence.freshness != WorkspaceBacklogPresenceFreshness::Fresh
+            {
+                presence.live = false;
+            }
+            let key = (presence.item_id.clone(), presence.execution_ref.clone());
+            match presence_by_key.get(&key) {
+                Some(existing) => {
+                    if presence_sort_key(&presence) < presence_sort_key(existing) {
+                        bounds.presence_omitted = bounds.presence_omitted.saturating_add(1);
+                        presence_by_key.insert(key, presence);
+                    } else {
+                        bounds.presence_omitted = bounds.presence_omitted.saturating_add(1);
+                    }
+                }
+                None => {
+                    presence_by_key.insert(key, presence);
+                }
+            }
+        }
+        let mut worker_presence: Vec<WorkspaceBacklogWorkerPresence> =
+            presence_by_key.into_values().collect();
+        worker_presence.sort_by(|left, right| {
+            presence_sort_key(left)
+                .cmp(&presence_sort_key(right))
+                .then_with(|| left.item_id.cmp(&right.item_id))
+                .then_with(|| left.execution_ref.cmp(&right.execution_ref))
+        });
+        if worker_presence.len() > MAX_WORKSPACE_CHAT_WORK_PRESENCE_PER_CHAT {
+            let overflow = worker_presence.len() - MAX_WORKSPACE_CHAT_WORK_PRESENCE_PER_CHAT;
+            let keep = worker_presence.len() - overflow;
+            worker_presence.truncate(keep);
+            bounds.presence_omitted = bounds.presence_omitted.saturating_add(overflow);
+        }
+
+        Self {
+            identity,
+            availability: self.availability,
+            items,
+            events,
+            worker_presence,
+            bounds,
+        }
+    }
+
+    fn merge_from(&mut self, other: &Self) {
+        if other.availability == WorkspaceChatWorkAvailability::Available {
+            self.availability = WorkspaceChatWorkAvailability::Available;
+        }
+        self.items.extend(other.items.iter().cloned());
+        self.events.extend(other.events.iter().cloned());
+        self.worker_presence
+            .extend(other.worker_presence.iter().cloned());
+        self.bounds.items_omitted = self
+            .bounds
+            .items_omitted
+            .saturating_add(other.bounds.items_omitted);
+        self.bounds.events_omitted = self
+            .bounds
+            .events_omitted
+            .saturating_add(other.bounds.events_omitted);
+        self.bounds.presence_omitted = self
+            .bounds
+            .presence_omitted
+            .saturating_add(other.bounds.presence_omitted);
+    }
+}
+
+fn presence_sort_key(
+    presence: &WorkspaceBacklogWorkerPresence,
+) -> (
+    std::cmp::Reverse<bool>,
+    std::cmp::Reverse<i64>,
+    std::cmp::Reverse<u64>,
+) {
+    (
+        std::cmp::Reverse(presence.live),
+        std::cmp::Reverse(presence.sampled_at_ms.unwrap_or(i64::MIN)),
+        std::cmp::Reverse(presence.sequence.unwrap_or(0)),
+    )
+}
+
 /// Separate read-only workspace observation envelope that embeds [`ObservationSnapshot`] without
 /// altering [`ObservationSnapshot`] or [`ObservationActor`] wire shapes or struct literals.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -6466,6 +7443,10 @@ pub struct WorkspaceSnapshot {
     /// Safe `Messages` window (`<= 1,000` items; never requires transcripts or synthetic user messages).
     #[serde(default, deserialize_with = "deserialize_null_default")]
     pub messages: WorkspaceMessagesWindow,
+    /// Bounded read-only backlog work per canonical chat (`<= 1,000` items, `<= 2,000` events,
+    /// `<= 64` presence rows across all chats).
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub chat_work: Vec<WorkspaceChatWork>,
     /// Explicit truncation and bound accounting across all projected windows.
     #[serde(default, deserialize_with = "deserialize_null_default")]
     pub bounds: WorkspaceSnapshotBounds,
@@ -6483,6 +7464,7 @@ impl WorkspaceSnapshot {
             native_samples: Vec::new(),
             job_histories: Vec::new(),
             messages: WorkspaceMessagesWindow::default(),
+            chat_work: Vec::new(),
             bounds: WorkspaceSnapshotBounds::default(),
         }
         .normalized()
@@ -6618,6 +7600,7 @@ impl WorkspaceSnapshot {
             native_samples: Vec::new(),
             job_histories: histories,
             messages: WorkspaceMessagesWindow::default(),
+            chat_work: Vec::new(),
             bounds: WorkspaceSnapshotBounds::default(),
         }
         .normalized()
@@ -6699,6 +7682,96 @@ impl WorkspaceSnapshot {
             bound_workspace_job_histories(self.job_histories.clone());
         let messages = self.messages.normalized();
 
+        let mut chat_work_by_key: BTreeMap<String, WorkspaceChatWork> = BTreeMap::new();
+        for work in &self.chat_work {
+            let normalized = work.normalized();
+            let Some(chat_key) = normalized.identity.canonical_key() else {
+                continue;
+            };
+            match chat_work_by_key.get_mut(&chat_key) {
+                Some(existing) => existing.merge_from(&normalized),
+                None => {
+                    chat_work_by_key.insert(chat_key, normalized);
+                }
+            }
+        }
+        let mut chat_work: Vec<WorkspaceChatWork> = chat_work_by_key
+            .into_values()
+            .map(|work| work.normalized())
+            .collect();
+        chat_work.sort_by(|left, right| {
+            left.identity
+                .canonical_key()
+                .cmp(&right.identity.canonical_key())
+        });
+
+        let mut total_items: usize = chat_work.iter().map(|work| work.items.len()).sum();
+        let mut total_events: usize = chat_work.iter().map(|work| work.events.len()).sum();
+        let mut total_presence: usize = chat_work
+            .iter()
+            .map(|work| work.worker_presence.len())
+            .sum();
+        if total_items > MAX_WORKSPACE_CHAT_WORK_ITEMS_TOTAL {
+            for work in chat_work.iter_mut().rev() {
+                if total_items <= MAX_WORKSPACE_CHAT_WORK_ITEMS_TOTAL {
+                    break;
+                }
+                let overflow = total_items - MAX_WORKSPACE_CHAT_WORK_ITEMS_TOTAL;
+                let remove = overflow.min(work.items.len());
+                if remove > 0 {
+                    work.items = work.items.split_off(remove);
+                    work.bounds.items_omitted = work.bounds.items_omitted.saturating_add(remove);
+                    total_items -= remove;
+                    let remaining_item_ids: BTreeSet<String> =
+                        work.items.iter().map(|item| item.item_id.clone()).collect();
+                    let presence_before = work.worker_presence.len();
+                    work.worker_presence
+                        .retain(|presence| remaining_item_ids.contains(&presence.item_id));
+                    let removed_presence =
+                        presence_before.saturating_sub(work.worker_presence.len());
+                    if removed_presence > 0 {
+                        work.bounds.presence_omitted = work
+                            .bounds
+                            .presence_omitted
+                            .saturating_add(removed_presence);
+                        total_presence = total_presence.saturating_sub(removed_presence);
+                    }
+                }
+            }
+        }
+
+        if total_events > MAX_WORKSPACE_CHAT_WORK_EVENTS_TOTAL {
+            for work in chat_work.iter_mut().rev() {
+                if total_events <= MAX_WORKSPACE_CHAT_WORK_EVENTS_TOTAL {
+                    break;
+                }
+                let overflow = total_events - MAX_WORKSPACE_CHAT_WORK_EVENTS_TOTAL;
+                let remove = overflow.min(work.events.len());
+                if remove > 0 {
+                    work.events = work.events.split_off(remove);
+                    work.bounds.events_omitted = work.bounds.events_omitted.saturating_add(remove);
+                    total_events -= remove;
+                }
+            }
+        }
+
+        if total_presence > MAX_WORKSPACE_CHAT_WORK_PRESENCE_TOTAL {
+            for work in chat_work.iter_mut().rev() {
+                if total_presence <= MAX_WORKSPACE_CHAT_WORK_PRESENCE_TOTAL {
+                    break;
+                }
+                let overflow = total_presence - MAX_WORKSPACE_CHAT_WORK_PRESENCE_TOTAL;
+                let remove = overflow.min(work.worker_presence.len());
+                if remove > 0 {
+                    let keep = work.worker_presence.len() - remove;
+                    work.worker_presence.truncate(keep);
+                    work.bounds.presence_omitted =
+                        work.bounds.presence_omitted.saturating_add(remove);
+                    total_presence -= remove;
+                }
+            }
+        }
+
         let bounds = WorkspaceSnapshotBounds {
             native_samples_omitted: self
                 .bounds
@@ -6722,6 +7795,7 @@ impl WorkspaceSnapshot {
             native_samples,
             job_histories,
             messages,
+            chat_work,
             bounds,
         }
     }
@@ -6734,6 +7808,201 @@ impl WorkspaceSnapshot {
         next.generated_at_ms = next_generated_at_ms;
         next.observation.generated_at_ms = next_generated_at_ms;
         next.normalized()
+    }
+}
+
+/// Projects one bounded read-only [`WorkspaceChatWork`] from verified core snapshots.
+///
+/// The identity is matched strictly by `source_id`-owned caller scope plus exact
+/// `binding_id`/`thread_uuid`. Backlog tables without a matching verified chat identity never
+/// create a chat, and unavailable tables never infer work from jobs, runs, or `Doing` names.
+pub fn project_workspace_chat_work(
+    identity: &WorkspaceChatIdentity,
+    core_states: &[ReadonlyCoreStateSnapshot],
+) -> WorkspaceChatWork {
+    let mut work = WorkspaceChatWork {
+        identity: identity.clone(),
+        availability: WorkspaceChatWorkAvailability::Unavailable,
+        ..WorkspaceChatWork::default()
+    };
+    if identity.canonical_key().is_none() {
+        return WorkspaceChatWork::default();
+    }
+
+    let matching_states: Vec<&ReadonlyCoreStateSnapshot> = core_states
+        .iter()
+        .filter(|state| {
+            state.bindings.iter().any(|binding| {
+                binding.binding_id == identity.binding_id
+                    && binding.thread_uuid == identity.thread_uuid
+            })
+        })
+        .collect();
+
+    let mut executions_by_key: BTreeMap<
+        (String, String),
+        &crate::backlog_worker::WorkerBacklogExecution,
+    > = BTreeMap::new();
+    for state in &matching_states {
+        if state.backlog_available {
+            work.availability = WorkspaceChatWorkAvailability::Available;
+        }
+        let retained_before = work.items.len();
+        for item in &state.backlog_items {
+            if item.binding_id == identity.binding_id {
+                work.items.push(item.clone());
+            }
+        }
+        let retained_items = work.items.len().saturating_sub(retained_before);
+        if let Some(counts) = state
+            .backlog_binding_counts
+            .iter()
+            .find(|counts| counts.binding_id == identity.binding_id)
+        {
+            work.bounds.items_omitted = work
+                .bounds
+                .items_omitted
+                .saturating_add(counts.item_count.saturating_sub(retained_items));
+        }
+        for execution in &state.backlog_worker_executions {
+            if execution.binding_id == identity.binding_id {
+                executions_by_key.insert(
+                    (execution.item_id.clone(), execution.execution_ref.clone()),
+                    execution,
+                );
+            }
+        }
+    }
+
+    for state in &matching_states {
+        let retained_before = work.events.len();
+        for history in &state.backlog_history {
+            if history.binding_id != identity.binding_id {
+                continue;
+            }
+            let execution = history
+                .item
+                .current_execution_ref
+                .as_ref()
+                .and_then(|execution_ref| {
+                    executions_by_key.get(&(history.item_id.clone(), execution_ref.clone()))
+                });
+            let (outcome, note) = match history.action.as_str() {
+                "worker_outcome_recorded" => match execution.and_then(|exec| exec.outcome.as_ref())
+                {
+                    Some(recorded) if recorded.recorded_at_ms == history.recorded_at_ms => {
+                        (Some(recorded.outcome), Some(recorded.note.clone()))
+                    }
+                    _ => (None, None),
+                },
+                "completed" => (None, history.item.completion_note.clone()),
+                "blocked" => (None, history.item.blocked_reason.clone()),
+                _ => (None, None),
+            };
+            work.events.push(WorkspaceBacklogEvent {
+                event_id: format!("{}:{}", history.item_id, history.revision),
+                sequence: history.sequence,
+                item_id: history.item.item_id.clone(),
+                revision: history.revision,
+                action: history.action.clone(),
+                recorded_at_ms: history.recorded_at_ms,
+                title: history.item.title.clone(),
+                status: history.item.status,
+                execution_ref: history.item.current_execution_ref.clone(),
+                outcome,
+                note,
+            });
+        }
+        let retained_events = work.events.len().saturating_sub(retained_before);
+        if let Some(counts) = state
+            .backlog_binding_counts
+            .iter()
+            .find(|counts| counts.binding_id == identity.binding_id)
+        {
+            work.bounds.events_omitted = work
+                .bounds
+                .events_omitted
+                .saturating_add(counts.history_count.saturating_sub(retained_events));
+        }
+    }
+
+    let mut normalized = work.normalized();
+    let presence_candidates =
+        workspace_chat_work_presence_candidates(identity, core_states, &normalized.items);
+    normalized.bounds.presence_omitted = presence_candidates.omitted;
+    normalized
+}
+
+/// Returns the bounded set of current nonterminal Worker executions that may be refreshed through
+/// an actual host-adapter presence call.
+///
+/// A candidate requires an exact current execution reference, an attached dispatch receipt, and
+/// no completion. A missing execution row or receipt produces no candidate and never a synthetic
+/// presence row.
+pub fn workspace_chat_work_presence_candidates(
+    identity: &WorkspaceChatIdentity,
+    core_states: &[ReadonlyCoreStateSnapshot],
+    items: &[crate::backlog::BacklogItem],
+) -> WorkspaceChatWorkPresenceCandidates {
+    let item_ids: BTreeSet<&str> = items.iter().map(|item| item.item_id.as_str()).collect();
+    let mut candidates_by_key: BTreeMap<(String, String), WorkspaceChatWorkPresenceCandidate> =
+        BTreeMap::new();
+    for item in items {
+        if item.binding_id != identity.binding_id
+            || !item_ids.contains(item.item_id.as_str())
+            || item.kind != crate::backlog::BacklogItemKind::Worker
+            || !matches!(
+                item.status,
+                crate::backlog::BacklogStatus::Doing | crate::backlog::BacklogStatus::Blocked
+            )
+        {
+            continue;
+        }
+        let Some(execution_ref) = item.current_execution_ref.as_ref() else {
+            continue;
+        };
+        for state in core_states {
+            if !state.bindings.iter().any(|binding| {
+                binding.binding_id == identity.binding_id
+                    && binding.thread_uuid == identity.thread_uuid
+            }) {
+                continue;
+            }
+            let Some(execution) = state.backlog_worker_executions.iter().find(|execution| {
+                execution.binding_id == identity.binding_id
+                    && execution.item_id == item.item_id
+                    && &execution.execution_ref == execution_ref
+            }) else {
+                continue;
+            };
+            if execution.completion.is_some() {
+                continue;
+            }
+            let Some(receipt) = execution.dispatch_receipt.as_ref() else {
+                continue;
+            };
+            candidates_by_key.insert(
+                (item.item_id.clone(), execution_ref.clone()),
+                WorkspaceChatWorkPresenceCandidate {
+                    item_id: item.item_id.clone(),
+                    execution_ref: execution_ref.clone(),
+                    approval_id: execution.authority.approval_id.clone(),
+                    task_id: execution.authority.task_id.clone(),
+                    session_binding_id: receipt.session_binding_id.clone(),
+                    run_id: receipt.run_id.clone(),
+                    worker_id: receipt.worker_id.clone(),
+                },
+            );
+        }
+    }
+    let total = candidates_by_key.len();
+    let candidates: Vec<WorkspaceChatWorkPresenceCandidate> = candidates_by_key
+        .into_values()
+        .take(MAX_WORKSPACE_CHAT_WORK_PRESENCE_PER_CHAT)
+        .collect();
+    WorkspaceChatWorkPresenceCandidates {
+        omitted: total.saturating_sub(candidates.len()),
+        candidates,
     }
 }
 
@@ -6924,6 +8193,380 @@ mod tests {
             delivery: Vec::new(),
             summary: Some("Safe structural summary".to_string()),
         }
+    }
+
+    #[test]
+    fn read_core_state_readonly_projects_backlog_history_and_worker_execution_evidence() {
+        let dir = ScopedPrivateDir::new("core-backlog-projection");
+        let db_path = dir.path.join("state.db");
+        let thread_a = "0196ed00-0000-7000-8000-0000000000a1";
+        let thread_b = "0196ed00-0000-7000-8000-0000000000b1";
+        let result_digest = "d".repeat(64);
+        let delivery_digest = "e".repeat(64);
+
+        let mut core = crate::Core::open(&db_path).expect("open Core");
+        let binding_a = core
+            .create_binding(thread_a, "Alpha Chat")
+            .expect("binding a");
+        let binding_b = core
+            .create_binding(thread_b, "Beta Chat")
+            .expect("binding b");
+        let worker_item = core
+            .create_backlog_item(
+                &binding_a.binding_id,
+                "create-worker-item",
+                crate::backlog::NewBacklogItem {
+                    title: "Implement the chat stream".to_string(),
+                    acceptance_condition: "The stream shows committed backlog evidence".to_string(),
+                    delivery_description: "Deliver the minimal stream projection".to_string(),
+                    kind: crate::backlog::BacklogItemKind::Worker,
+                },
+                1_000,
+            )
+            .expect("create Worker item");
+        let reserved = core
+            .reserve_worker_backlog_execution_operator_attested(
+                &binding_a.binding_id,
+                "reserve-worker-item",
+                &worker_item.item_id,
+                1,
+                crate::backlog_worker::WorkerBacklogAuthority {
+                    approval_id: "apr_projection".to_string(),
+                    subject_digest: "a".repeat(64),
+                    task_id: "tsk_projection".to_string(),
+                    task_digest: "b".repeat(64),
+                },
+                1_010,
+            )
+            .expect("reserve Worker execution");
+        core.attach_worker_backlog_dispatch_receipt_operator_attested(
+            &binding_a.binding_id,
+            "attach-worker-item",
+            &worker_item.item_id,
+            &reserved.execution_ref,
+            2,
+            crate::backlog_worker::WorkerBacklogDispatchReceipt {
+                session_binding_id: "sbx_projection".to_string(),
+                run_id: "run_projection".to_string(),
+                worker_id: "wrk_projection".to_string(),
+                profile_id: "profile_projection".to_string(),
+                execution_binding_digest: Some("c".repeat(64)),
+            },
+            1_020,
+        )
+        .expect("attach dispatch receipt");
+        core.record_worker_backlog_outcome_operator_attested(
+            &binding_a.binding_id,
+            "outcome-worker-item",
+            &worker_item.item_id,
+            &reserved.execution_ref,
+            3,
+            crate::backlog_worker::WorkerBacklogOutcomeReport {
+                outcome: crate::backlog_worker::WorkerBacklogOutcome::Success,
+                note: "Verified technical success".to_string(),
+                result_digest: Some(result_digest.clone()),
+            },
+            1_030,
+        )
+        .expect("record successful outcome");
+        core.complete_worker_backlog_item_operator_attested(
+            &binding_a.binding_id,
+            "complete-worker-item",
+            &worker_item.item_id,
+            4,
+            crate::backlog_worker::WorkerBacklogCompletion {
+                execution_ref: reserved.execution_ref.clone(),
+                result_digest,
+                acceptance_note: "Accepted after checking delivery".to_string(),
+                acceptance_evidence: "Checked the actual delivered artifact".to_string(),
+                delivery_digest,
+            },
+            1_040,
+        )
+        .expect("complete Worker item");
+        core.create_backlog_item(
+            &binding_b.binding_id,
+            "create-coworker-item",
+            crate::backlog::NewBacklogItem {
+                title: "Explain the result".to_string(),
+                acceptance_condition: "The result is explained".to_string(),
+                delivery_description: "Explain the delivered result".to_string(),
+                kind: crate::backlog::BacklogItemKind::Coworker,
+            },
+            1_050,
+        )
+        .expect("create Coworker item");
+        drop(core);
+
+        let snapshot = read_core_state_readonly(&db_path).expect("read live backlog projection");
+        assert!(snapshot.backlog_available);
+        assert_eq!(snapshot.backlog_items.len(), 2);
+        assert_eq!(snapshot.backlog_history.len(), 6);
+        assert_eq!(snapshot.backlog_worker_executions.len(), 1);
+        assert!(snapshot.backlog_worker_executions[0]
+            .outcome
+            .as_ref()
+            .is_some_and(|outcome| {
+                outcome.outcome == crate::backlog_worker::WorkerBacklogOutcome::Success
+            }));
+        assert!(snapshot.backlog_worker_executions[0].completion.is_some());
+        assert!(snapshot.backlog_worker_executions[0]
+            .acceptance_rejection
+            .is_none());
+
+        let identity_a = WorkspaceChatIdentity::new(
+            "default",
+            &binding_a.binding_id,
+            thread_a,
+            "/home/dev/repos/alpha",
+        )
+        .expect("identity a");
+        let work_a = project_workspace_chat_work(&identity_a, std::slice::from_ref(&snapshot));
+        assert_eq!(
+            work_a.availability,
+            WorkspaceChatWorkAvailability::Available
+        );
+        assert_eq!(work_a.items.len(), 1);
+        assert_eq!(work_a.items[0].status, crate::backlog::BacklogStatus::Done);
+        assert_eq!(work_a.items[0].item_id, worker_item.item_id);
+        assert_eq!(work_a.events.len(), 5);
+        let sequences: Vec<u64> = work_a.events.iter().map(|event| event.sequence).collect();
+        let mut sorted_sequences = sequences.clone();
+        sorted_sequences.sort_unstable();
+        assert_eq!(sequences, sorted_sequences);
+        let mut event_ids = BTreeSet::new();
+        for event in &work_a.events {
+            assert!(
+                event_ids.insert(event.event_id.clone()),
+                "event ids must be unique within a chat"
+            );
+            assert_eq!(
+                event.event_id,
+                format!("{}:{}", event.item_id, event.revision)
+            );
+        }
+        let outcome_event = work_a
+            .events
+            .iter()
+            .find(|event| event.action == "worker_outcome_recorded")
+            .expect("outcome event");
+        assert_eq!(
+            outcome_event.outcome,
+            Some(crate::backlog_worker::WorkerBacklogOutcome::Success)
+        );
+        assert_eq!(
+            outcome_event.note.as_deref(),
+            Some("Verified technical success")
+        );
+        let completed_event = work_a
+            .events
+            .iter()
+            .find(|event| event.action == "completed")
+            .expect("completed event");
+        assert_eq!(
+            completed_event.note.as_deref(),
+            Some("Accepted after checking delivery")
+        );
+
+        let mut duplicated = work_a.clone();
+        duplicated.events.push(work_a.events[0].clone());
+        let normalized = duplicated.normalized();
+        assert_eq!(normalized.events.len(), work_a.events.len());
+        assert!(normalized.bounds.events_omitted >= 1);
+
+        let identity_b = WorkspaceChatIdentity::new(
+            "default",
+            &binding_b.binding_id,
+            thread_b,
+            "/home/dev/repos/beta",
+        )
+        .expect("identity b");
+        let work_b = project_workspace_chat_work(&identity_b, &[snapshot]);
+        assert_eq!(work_b.items.len(), 1);
+        assert_eq!(work_b.items[0].binding_id, binding_b.binding_id);
+        assert!(work_b
+            .events
+            .iter()
+            .all(|event| event.item_id != worker_item.item_id));
+    }
+
+    #[test]
+    fn read_core_state_readonly_legacy_without_backlog_tables_is_safe_and_unavailable() {
+        let dir = ScopedPrivateDir::new("core-legacy-no-backlog");
+        let db_path = dir.path.join("state.db");
+        let valid_uuid = "0196ed00-0000-7000-8000-0000000000c1";
+        {
+            let mut core = crate::Core::open(&db_path).expect("open Core");
+            core.create_binding(valid_uuid, "Legacy Chat")
+                .expect("create binding");
+        }
+        {
+            let conn = rusqlite::Connection::open(&db_path).expect("open raw sqlite");
+            conn.execute_batch(
+                "PRAGMA foreign_keys = OFF;
+                 DROP TABLE backlog_worker_acceptance_rejections;
+                 DROP TABLE backlog_worker_executions;
+                 DROP TABLE backlog_history;
+                 DROP TABLE backlog_command_dedup;
+                 DROP TABLE backlog_items;",
+            )
+            .expect("drop additive backlog tables");
+        }
+
+        let snapshot =
+            read_core_state_readonly(&db_path).expect("legacy database remains readable");
+        assert_eq!(snapshot.bindings.len(), 1);
+        assert!(!snapshot.backlog_available);
+        assert!(snapshot.backlog_items.is_empty());
+        assert!(snapshot.backlog_history.is_empty());
+        assert!(snapshot.backlog_worker_executions.is_empty());
+        assert!(snapshot.backlog_binding_counts.is_empty());
+
+        let identity = WorkspaceChatIdentity::new(
+            "default",
+            "bnd_legacy_chat",
+            valid_uuid,
+            "/home/dev/repos/legacy",
+        )
+        .expect("legacy identity");
+        let work = project_workspace_chat_work(&identity, &[snapshot]);
+        assert_eq!(
+            work.availability,
+            WorkspaceChatWorkAvailability::Unavailable,
+            "legacy missing tables never infer backlog work"
+        );
+        assert!(work.items.is_empty());
+        assert!(work.events.is_empty());
+    }
+
+    #[test]
+    fn read_core_state_readonly_preserves_optional_worker_acceptance_rejection() {
+        let dir = ScopedPrivateDir::new("core-backlog-rejection");
+        let db_path = dir.path.join("state.db");
+        let thread = "0196ed00-0000-7000-8000-0000000000d1";
+        let result_digest = "1".repeat(64);
+        let delivery_digest = "2".repeat(64);
+
+        let mut core = crate::Core::open(&db_path).expect("open Core");
+        let binding = core
+            .create_binding(thread, "Rejected Chat")
+            .expect("binding");
+        let item = core
+            .create_backlog_item(
+                &binding.binding_id,
+                "create-rejected-item",
+                crate::backlog::NewBacklogItem {
+                    title: "Rejected delivery".to_string(),
+                    acceptance_condition: "The delivery is accepted".to_string(),
+                    delivery_description: "Deliver the rejected artifact".to_string(),
+                    kind: crate::backlog::BacklogItemKind::Worker,
+                },
+                2_000,
+            )
+            .expect("create Worker item");
+        let reserved = core
+            .reserve_worker_backlog_execution_operator_attested(
+                &binding.binding_id,
+                "reserve-rejected-item",
+                &item.item_id,
+                1,
+                crate::backlog_worker::WorkerBacklogAuthority {
+                    approval_id: "apr_rejected".to_string(),
+                    subject_digest: "a".repeat(64),
+                    task_id: "tsk_rejected".to_string(),
+                    task_digest: "b".repeat(64),
+                },
+                2_010,
+            )
+            .expect("reserve Worker execution");
+        core.attach_worker_backlog_dispatch_receipt_operator_attested(
+            &binding.binding_id,
+            "attach-rejected-item",
+            &item.item_id,
+            &reserved.execution_ref,
+            2,
+            crate::backlog_worker::WorkerBacklogDispatchReceipt {
+                session_binding_id: "sbx_rejected".to_string(),
+                run_id: "run_rejected".to_string(),
+                worker_id: "wrk_rejected".to_string(),
+                profile_id: "profile_rejected".to_string(),
+                execution_binding_digest: Some("c".repeat(64)),
+            },
+            2_020,
+        )
+        .expect("attach receipt");
+        core.record_worker_backlog_outcome_operator_attested(
+            &binding.binding_id,
+            "outcome-rejected-item",
+            &item.item_id,
+            &reserved.execution_ref,
+            3,
+            crate::backlog_worker::WorkerBacklogOutcomeReport {
+                outcome: crate::backlog_worker::WorkerBacklogOutcome::Success,
+                note: "Technical execution succeeded".to_string(),
+                result_digest: Some(result_digest.clone()),
+            },
+            2_030,
+        )
+        .expect("record success");
+        core.reject_worker_backlog_acceptance_operator_attested(
+            &binding.binding_id,
+            "reject-acceptance",
+            &item.item_id,
+            4,
+            crate::backlog_worker::WorkerBacklogAcceptanceRejection {
+                execution_ref: reserved.execution_ref.clone(),
+                result_digest,
+                delivery_digest,
+                reason: "The delivery did not meet acceptance".to_string(),
+                evidence: "Checked the actual artifact against acceptance".to_string(),
+            },
+            2_040,
+        )
+        .expect("reject acceptance");
+        drop(core);
+
+        let snapshot = read_core_state_readonly(&db_path).expect("read rejection projection");
+        let execution = snapshot
+            .backlog_worker_executions
+            .iter()
+            .find(|execution| execution.execution_ref == reserved.execution_ref)
+            .expect("execution row");
+        let rejection = execution
+            .acceptance_rejection
+            .as_ref()
+            .expect("optional rejection record");
+        assert_eq!(rejection.reason, "The delivery did not meet acceptance");
+        assert!(execution.completion.is_none());
+
+        let identity = WorkspaceChatIdentity::new(
+            "default",
+            &binding.binding_id,
+            thread,
+            "/home/dev/repos/rejected",
+        )
+        .expect("identity");
+        let work = project_workspace_chat_work(&identity, &[snapshot]);
+        assert_eq!(work.items[0].status, crate::backlog::BacklogStatus::Blocked);
+        let outcome_event = work
+            .events
+            .iter()
+            .find(|event| event.action == "worker_outcome_recorded")
+            .expect("outcome event");
+        assert_eq!(
+            outcome_event.outcome,
+            Some(crate::backlog_worker::WorkerBacklogOutcome::Success),
+            "the immutable technical outcome is not rewritten by acceptance rejection"
+        );
+        let blocked_event = work
+            .events
+            .iter()
+            .find(|event| event.action == "blocked")
+            .expect("blocked event");
+        assert_eq!(
+            blocked_event.note.as_deref(),
+            Some("worker acceptance rejected: The delivery did not meet acceptance")
+        );
     }
 
     #[test]

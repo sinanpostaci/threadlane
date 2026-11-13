@@ -195,6 +195,13 @@ export const MAX_WORKSPACE_RUNS_PER_JOB = 256 as const;
 export const MAX_WORKSPACE_OUTBOX_PER_JOB = 256 as const;
 export const MAX_WORKSPACE_COMBINED_CANDIDATES_PER_JOB = 32 as const;
 export const MAX_WORKSPACE_RECORD_LINKS_PER_LIST = 64 as const;
+export const MAX_WORKSPACE_CHAT_WORK_ITEMS_PER_CHAT = 200 as const;
+export const MAX_WORKSPACE_CHAT_WORK_EVENTS_PER_CHAT = 500 as const;
+export const MAX_WORKSPACE_CHAT_WORK_PRESENCE_PER_CHAT = 32 as const;
+export const MAX_WORKSPACE_CHAT_WORK_ITEMS_TOTAL = 1_000 as const;
+export const MAX_WORKSPACE_CHAT_WORK_EVENTS_TOTAL = 2_000 as const;
+export const MAX_WORKSPACE_CHAT_WORK_PRESENCE_TOTAL = 64 as const;
+export const MAX_WORKSPACE_BACKLOG_PRESENCE_SAMPLE_AGE_MS = 5_000 as const;
 export const MAX_WORKSPACE_EXTERNAL_RESOLUTIONS_PER_JOB =
   MAX_WORKSPACE_RECORD_LINKS_PER_LIST;
 export const WORKSPACE_EXTERNAL_RESOLUTION_VIEW_CONTRACT_VERSION =
@@ -598,6 +605,84 @@ export interface WorkspaceSnapshotBounds {
   jobs_capped: boolean;
 }
 
+export type WorkspaceBacklogStatus = 'todo' | 'doing' | 'done' | 'blocked';
+
+export type WorkspaceBacklogItemKind = 'worker' | 'coworker';
+
+/** Exact serialized core `BacklogItem`; no invented status or derived workflow fields. */
+export interface BacklogItem {
+  item_id: string;
+  binding_id: string;
+  revision: number;
+  title: string;
+  acceptance_condition: string;
+  delivery_description: string;
+  kind: WorkspaceBacklogItemKind;
+  status: WorkspaceBacklogStatus;
+  blocked_reason: string | null;
+  current_execution_ref: string | null;
+  completion_note: string | null;
+  completion_evidence: string | null;
+  completed_at_ms: number | null;
+  created_at_ms: number;
+  updated_at_ms: number;
+}
+
+export type WorkspaceBacklogOutcome = 'success' | 'failure' | 'unknown';
+
+export interface WorkspaceBacklogEvent {
+  event_id: string;
+  sequence: number;
+  item_id: string;
+  revision: number;
+  action: string;
+  recorded_at_ms: number;
+  title: string;
+  status: WorkspaceBacklogStatus;
+  execution_ref: string | null;
+  outcome: WorkspaceBacklogOutcome | null;
+  note: string | null;
+}
+
+export type WorkspaceBacklogPresenceAvailability = 'live' | 'non_live' | 'unavailable';
+
+export type WorkspaceBacklogPresenceFreshness = 'fresh' | 'stale' | 'not_applicable';
+
+export interface WorkspaceBacklogWorkerPresence {
+  item_id: string;
+  execution_ref: string;
+  approval_id: string;
+  task_id: string;
+  run_id: string;
+  worker_id: string;
+  claim_id: string | null;
+  host_instance_id: string | null;
+  invocation_id: string | null;
+  sequence: number | null;
+  availability: WorkspaceBacklogPresenceAvailability;
+  freshness: WorkspaceBacklogPresenceFreshness;
+  live: boolean;
+  sampled_at_ms: number | null;
+  sample_age_ms: number | null;
+  max_sample_age_ms: number;
+  expires_at_ms: number | null;
+}
+
+export interface WorkspaceChatWorkBounds {
+  items_omitted: number;
+  events_omitted: number;
+  presence_omitted: number;
+}
+
+export interface WorkspaceChatWork {
+  identity: WorkspaceChatIdentity;
+  availability: 'available' | 'unavailable';
+  items: BacklogItem[];
+  events: WorkspaceBacklogEvent[];
+  worker_presence: WorkspaceBacklogWorkerPresence[];
+  bounds: WorkspaceChatWorkBounds;
+}
+
 export interface WorkspaceSnapshot {
   schema_version: 1;
   generated_at_ms: number;
@@ -607,5 +692,6 @@ export interface WorkspaceSnapshot {
   native_samples: WorkspaceNativeSample[];
   job_histories: WorkspaceJobHistory[];
   messages: WorkspaceMessagesWindow;
+  chat_work: WorkspaceChatWork[];
   bounds: WorkspaceSnapshotBounds;
 }

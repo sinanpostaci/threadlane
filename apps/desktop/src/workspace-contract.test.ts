@@ -42,6 +42,8 @@ import {
   MAX_OBSERVATION_SUMMARY_CHARS,
   MAX_WORKSPACE_ATTEMPTS_PER_TASK,
   MAX_WORKSPACE_CANDIDATES_PER_TASK,
+  MAX_WORKSPACE_CHAT_WORK_ITEMS_PER_CHAT,
+  MAX_WORKSPACE_CHAT_WORK_PRESENCE_PER_CHAT,
   MAX_WORKSPACE_COMBINED_CANDIDATES_PER_JOB,
   MAX_WORKSPACE_COVERED_ATTENTION_PER_RESOLUTION,
   MAX_WORKSPACE_EXTERNAL_RESOLUTIONS_PER_JOB,
@@ -71,6 +73,7 @@ import {
   evaluateWorkspaceNativeSampleAt,
   formatWorkspaceChatIdentityKey,
   normalizeWorkspaceChatSummary,
+  normalizeWorkspaceChatWork,
   normalizeWorkspaceExternalResolution,
   normalizeWorkspaceExternalResolutions,
   normalizeWorkspaceJobHistory,
@@ -469,6 +472,186 @@ test('golden WorkspaceSnapshot JSON fixture matches Rust wire and semantic contr
   const reserialized = JSON.stringify(snap);
   const reparsed = parseWorkspaceSnapshot(reserialized);
   assert.deepEqual(reparsed, snap);
+});
+
+test('chat_work defaults empty, rejects malformed scope/status, dedupes by source event id, and preserves actual timestamps', () => {
+  const legacy = normalizeWorkspaceSnapshot({});
+  assert.deepEqual(legacy.chat_work, []);
+
+  const identity = sampleIdentity();
+  const itemId = 'blg_chat_work_item';
+  const doneItem = {
+    item_id: itemId,
+    binding_id: identity.binding_id,
+    revision: 5,
+    title: 'Teslim edilen iş',
+    acceptance_condition: 'The delivered result is checked.',
+    delivery_description: 'Deliver the checked result.',
+    kind: 'worker',
+    status: 'done',
+    blocked_reason: null,
+    current_execution_ref: 'wbe_chat_work_execution',
+    completion_note: 'Checked and accepted',
+    completion_evidence: 'Inspected the delivered artifact',
+    completed_at_ms: 1_700_000_000_900,
+    created_at_ms: 1_700_000_000_100,
+    updated_at_ms: 1_700_000_000_900,
+  };
+  const failedEvent = {
+    event_id: `${itemId}:4`,
+    sequence: 2,
+    item_id: itemId,
+    revision: 4,
+    action: 'worker_outcome_recorded',
+    recorded_at_ms: 1_700_000_000_800,
+    title: 'Kontrol edilen sonuç',
+    status: 'doing',
+    execution_ref: 'wbe_chat_work_execution',
+    outcome: 'success',
+    note: 'Verified technical success',
+  };
+  const doingItemId = 'blg_chat_work_running';
+  const doingItem = {
+    ...doneItem,
+    item_id: doingItemId,
+    revision: 2,
+    status: 'doing',
+    current_execution_ref: 'wbe_chat_work_running',
+    completion_note: null,
+    completion_evidence: null,
+    completed_at_ms: null,
+    created_at_ms: 1_700_000_000_200,
+    updated_at_ms: 1_700_000_000_850,
+  };
+  const completedEvent = {
+    event_id: `${itemId}:5`,
+    sequence: 10,
+    item_id: itemId,
+    revision: 5,
+    action: 'completed',
+    recorded_at_ms: 1_700_000_000_900,
+    title: 'Teslim edilen iş',
+    status: 'done',
+    execution_ref: 'wbe_chat_work_execution',
+    outcome: null,
+    note: 'Checked and accepted',
+  };
+  const presence = {
+    item_id: doingItemId,
+    execution_ref: 'wbe_chat_work_running',
+    approval_id: 'apr_chat_work',
+    task_id: 'tsk_chat_work',
+    run_id: 'run_chat_work',
+    worker_id: 'wrk_chat_work',
+    claim_id: 'wcl_chat_work',
+    host_instance_id: 'hst_chat_work',
+    invocation_id: '0196ed00-0000-7000-8000-0000000005b1',
+    sequence: 7,
+    availability: 'live',
+    freshness: 'stale',
+    live: true,
+    sampled_at_ms: 1_700_000_000_850,
+    sample_age_ms: 5_250,
+    max_sample_age_ms: 5_000,
+    expires_at_ms: 1_700_000_000_900,
+  };
+
+  const snapshot = normalizeWorkspaceSnapshot({
+    schema_version: 1,
+    generated_at_ms: 1_700_000_001_000,
+    chat_work: [
+      {
+        identity,
+        availability: 'available',
+        items: [
+          doneItem,
+          doingItem,
+          { ...doneItem, item_id: 'blg_bad_status', status: 'mystery' },
+          { ...doneItem, item_id: 'blg_bad_title', title: 'x'.repeat(257) },
+        ],
+        events: [failedEvent, failedEvent, completedEvent],
+        worker_presence: [presence],
+        bounds: { items_omitted: 0, events_omitted: 0, presence_omitted: 0 },
+      },
+      {
+        identity: { ...identity, canonical_project_scope: 'relative/project' },
+        availability: 'available',
+        items: [doneItem],
+        events: [],
+        worker_presence: [],
+        bounds: { items_omitted: 0, events_omitted: 0, presence_omitted: 0 },
+      },
+    ],
+  });
+
+  assert.equal(snapshot.chat_work.length, 1);
+  const work = snapshot.chat_work[0]!;
+  assert.deepEqual(work.identity, identity);
+  assert.equal(work.availability, 'available');
+  assert.equal(work.items.length, 2);
+  assert.equal(work.items.find((item) => item.item_id === itemId)?.status, 'done');
+  assert.equal(
+    work.items.find((item) => item.item_id === doingItemId)?.status,
+    'doing',
+  );
+  assert.equal(work.bounds.items_omitted, 2);
+  assert.deepEqual(
+    work.events.map((event) => event.sequence),
+    [2, 10],
+  );
+  assert.equal(work.events[0]!.outcome, 'success');
+  assert.equal(work.events[1]!.outcome, null);
+  assert.ok(work.bounds.events_omitted >= 1);
+  assert.equal(work.worker_presence.length, 1);
+  assert.equal(work.worker_presence[0]!.live, false);
+  assert.equal(work.worker_presence[0]!.freshness, 'stale');
+  assert.equal(work.worker_presence[0]!.sampled_at_ms, 1_700_000_000_850);
+  assert.equal(work.worker_presence[0]!.expires_at_ms, 1_700_000_000_900);
+
+  const presenceItems = Array.from(
+    { length: MAX_WORKSPACE_CHAT_WORK_PRESENCE_PER_CHAT + 3 },
+    (_, index) => ({
+      ...doingItem,
+      item_id: `blg_chat_work_running_${index}`,
+      current_execution_ref: `wbe_chat_work_running_${index}`,
+      created_at_ms: 1_700_000_001_000 + index,
+    }),
+  );
+  const tooManyPresence = normalizeWorkspaceChatWork({
+    identity,
+    availability: 'available',
+    items: presenceItems,
+    events: [],
+    worker_presence: presenceItems.map((presenceItem, index) => ({
+      ...presence,
+      item_id: presenceItem.item_id,
+      execution_ref: presenceItem.current_execution_ref,
+      sequence: index + 1,
+    })),
+    bounds: { items_omitted: 0, events_omitted: 0, presence_omitted: 0 },
+  });
+  assert.ok(tooManyPresence);
+  assert.equal(
+    tooManyPresence.worker_presence.length,
+    MAX_WORKSPACE_CHAT_WORK_PRESENCE_PER_CHAT,
+  );
+  assert.equal(tooManyPresence.bounds.presence_omitted, 3);
+
+  const tooManyItems = normalizeWorkspaceChatWork({
+    identity,
+    availability: 'available',
+    items: Array.from({ length: MAX_WORKSPACE_CHAT_WORK_ITEMS_PER_CHAT + 2 }, (_, index) => ({
+      ...doneItem,
+      item_id: `blg_chat_work_${index}`,
+      created_at_ms: 1_700_000_000_100 + index,
+    })),
+    events: [],
+    worker_presence: [],
+    bounds: { items_omitted: 0, events_omitted: 0, presence_omitted: 0 },
+  });
+  assert.ok(tooManyItems);
+  assert.equal(tooManyItems.items.length, MAX_WORKSPACE_CHAT_WORK_ITEMS_PER_CHAT);
+  assert.equal(tooManyItems.bounds.items_omitted, 2);
 });
 
 test('legacy ObservationSnapshot and ObservationActor remain backward-compatible and sparse payloads degrade safely', () => {

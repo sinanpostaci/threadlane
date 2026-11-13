@@ -7,6 +7,13 @@ import {
   MAX_WORKSPACE_ATTEMPTS_PER_TASK,
   MAX_WORKSPACE_CANDIDATES_PER_TASK,
   MAX_WORKSPACE_CANONICAL_PATH_BYTES,
+  MAX_WORKSPACE_CHAT_WORK_EVENTS_PER_CHAT,
+  MAX_WORKSPACE_CHAT_WORK_EVENTS_TOTAL,
+  MAX_WORKSPACE_CHAT_WORK_ITEMS_PER_CHAT,
+  MAX_WORKSPACE_CHAT_WORK_ITEMS_TOTAL,
+  MAX_WORKSPACE_CHAT_WORK_PRESENCE_PER_CHAT,
+  MAX_WORKSPACE_CHAT_WORK_PRESENCE_TOTAL,
+  MAX_WORKSPACE_BACKLOG_PRESENCE_SAMPLE_AGE_MS,
   MAX_WORKSPACE_COMBINED_CANDIDATES_PER_JOB,
   MAX_WORKSPACE_EXTERNAL_RESOLUTIONS_PER_JOB,
   MAX_WORKSPACE_JOBS_PER_BINDING,
@@ -27,6 +34,7 @@ import {
 } from './observation/types.ts';
 
 import type {
+  BacklogItem,
   ObservationDeliveryStage,
   ObservationExecutor,
   ObservationJob,
@@ -42,9 +50,18 @@ import type {
   WorkspaceAttentionKind,
   WorkspaceAttentionState,
   WorkspaceAvailabilityState,
+  WorkspaceBacklogEvent,
+  WorkspaceBacklogItemKind,
+  WorkspaceBacklogOutcome,
+  WorkspaceBacklogPresenceAvailability,
+  WorkspaceBacklogPresenceFreshness,
+  WorkspaceBacklogStatus,
+  WorkspaceBacklogWorkerPresence,
   WorkspaceCapabilityState,
   WorkspaceChatIdentity,
   WorkspaceChatSummary,
+  WorkspaceChatWork,
+  WorkspaceChatWorkBounds,
   WorkspaceCombinedCandidate,
   WorkspaceConfiguredSelection,
   WorkspaceConnectionState,
@@ -90,6 +107,13 @@ export {
   MAX_WORKSPACE_ATTEMPTS_PER_TASK,
   MAX_WORKSPACE_CANDIDATES_PER_TASK,
   MAX_WORKSPACE_CANONICAL_PATH_BYTES,
+  MAX_WORKSPACE_CHAT_WORK_EVENTS_PER_CHAT,
+  MAX_WORKSPACE_CHAT_WORK_EVENTS_TOTAL,
+  MAX_WORKSPACE_CHAT_WORK_ITEMS_PER_CHAT,
+  MAX_WORKSPACE_CHAT_WORK_ITEMS_TOTAL,
+  MAX_WORKSPACE_CHAT_WORK_PRESENCE_PER_CHAT,
+  MAX_WORKSPACE_CHAT_WORK_PRESENCE_TOTAL,
+  MAX_WORKSPACE_BACKLOG_PRESENCE_SAMPLE_AGE_MS,
   MAX_WORKSPACE_COMBINED_CANDIDATES_PER_JOB,
   MAX_WORKSPACE_EXTERNAL_RESOLUTIONS_PER_JOB,
   MAX_WORKSPACE_JOBS_PER_BINDING,
@@ -110,6 +134,7 @@ export {
 };
 
 export type {
+  BacklogItem,
   ObservationProcessInstance,
   WorkspaceAcceptanceProof,
   WorkspaceAcceptanceStatus,
@@ -117,9 +142,18 @@ export type {
   WorkspaceAttentionKind,
   WorkspaceAttentionState,
   WorkspaceAvailabilityState,
+  WorkspaceBacklogEvent,
+  WorkspaceBacklogItemKind,
+  WorkspaceBacklogOutcome,
+  WorkspaceBacklogPresenceAvailability,
+  WorkspaceBacklogPresenceFreshness,
+  WorkspaceBacklogStatus,
+  WorkspaceBacklogWorkerPresence,
   WorkspaceCapabilityState,
   WorkspaceChatIdentity,
   WorkspaceChatSummary,
+  WorkspaceChatWork,
+  WorkspaceChatWorkBounds,
   WorkspaceCombinedCandidate,
   WorkspaceConfiguredSelection,
   WorkspaceConnectionState,
@@ -2571,6 +2605,7 @@ export function upgradeLegacyObservationSnapshot(observation: ObservationSnapsho
       requires_transcript: false,
       allows_synthetic_user_messages: false,
     },
+    chat_work: [],
     bounds: {
       native_samples_omitted: 0,
       job_histories_omitted: 0,
@@ -2579,6 +2614,585 @@ export function upgradeLegacyObservationSnapshot(observation: ObservationSnapsho
       jobs_capped: false,
     },
   });
+}
+
+const WORKSPACE_BACKLOG_STATUSES: readonly WorkspaceBacklogStatus[] = [
+  'todo',
+  'doing',
+  'done',
+  'blocked',
+] as const;
+const WORKSPACE_BACKLOG_ITEM_KINDS: readonly WorkspaceBacklogItemKind[] = [
+  'worker',
+  'coworker',
+] as const;
+const WORKSPACE_BACKLOG_OUTCOMES: readonly WorkspaceBacklogOutcome[] = [
+  'success',
+  'failure',
+  'unknown',
+] as const;
+const WORKSPACE_BACKLOG_PRESENCE_AVAILABILITIES: readonly WorkspaceBacklogPresenceAvailability[] = [
+  'live',
+  'non_live',
+  'unavailable',
+] as const;
+const WORKSPACE_BACKLOG_PRESENCE_FRESHNESSES: readonly WorkspaceBacklogPresenceFreshness[] = [
+  'fresh',
+  'stale',
+  'not_applicable',
+] as const;
+
+function parseBacklogStatus(raw: unknown): WorkspaceBacklogStatus | null {
+  return typeof raw === 'string' && (WORKSPACE_BACKLOG_STATUSES as readonly string[]).includes(raw)
+    ? (raw as WorkspaceBacklogStatus)
+    : null;
+}
+
+function parseBacklogItemKind(raw: unknown): WorkspaceBacklogItemKind | null {
+  return typeof raw === 'string' && (WORKSPACE_BACKLOG_ITEM_KINDS as readonly string[]).includes(raw)
+    ? (raw as WorkspaceBacklogItemKind)
+    : null;
+}
+
+function parseBacklogOutcome(raw: unknown): WorkspaceBacklogOutcome | null {
+  return typeof raw === 'string' && (WORKSPACE_BACKLOG_OUTCOMES as readonly string[]).includes(raw)
+    ? (raw as WorkspaceBacklogOutcome)
+    : null;
+}
+
+function parseBacklogPresenceAvailability(
+  raw: unknown,
+): WorkspaceBacklogPresenceAvailability {
+  return typeof raw === 'string' &&
+    (WORKSPACE_BACKLOG_PRESENCE_AVAILABILITIES as readonly string[]).includes(raw)
+    ? (raw as WorkspaceBacklogPresenceAvailability)
+    : 'unavailable';
+}
+
+function parseBacklogPresenceFreshness(raw: unknown): WorkspaceBacklogPresenceFreshness {
+  return typeof raw === 'string' &&
+    (WORKSPACE_BACKLOG_PRESENCE_FRESHNESSES as readonly string[]).includes(raw)
+    ? (raw as WorkspaceBacklogPresenceFreshness)
+    : 'not_applicable';
+}
+
+function cleanBacklogToken(raw: unknown, maxBytes: number): string | null {
+  if (typeof raw !== 'string') {
+    return null;
+  }
+  if (
+    raw.length === 0 ||
+    raw.trim() !== raw ||
+    utf8ByteLength(raw) > maxBytes ||
+    !/^[A-Za-z0-9_.:-]+$/.test(raw) ||
+    containsSensitiveMarker(raw.toLowerCase())
+  ) {
+    return null;
+  }
+  return raw;
+}
+
+function cleanBacklogText(raw: unknown, maxBytes: number, allowEmpty = false): string | null {
+  if (typeof raw !== 'string') {
+    return null;
+  }
+  if (utf8ByteLength(raw) > maxBytes || raw.includes('\0')) {
+    return null;
+  }
+  if (!allowEmpty && raw.trim().length === 0) {
+    return null;
+  }
+  return raw;
+}
+
+function cleanOptionalBacklogToken(raw: unknown, maxBytes: number): string | null | undefined {
+  if (raw === null || raw === undefined) {
+    return null;
+  }
+  const clean = cleanBacklogToken(raw, maxBytes);
+  return clean === null ? undefined : clean;
+}
+
+function cleanOptionalBacklogText(raw: unknown, maxBytes: number): string | null | undefined {
+  if (raw === null || raw === undefined) {
+    return null;
+  }
+  const clean = cleanBacklogText(raw, maxBytes);
+  return clean === null ? undefined : clean;
+}
+
+function normalizeBacklogItem(raw: unknown, bindingId: string): BacklogItem | null {
+  if (!isRecord(raw)) {
+    return null;
+  }
+  const itemId = cleanBacklogToken(raw.item_id, MAX_WORKSPACE_LABEL_BYTES);
+  const itemBinding = cleanBacklogToken(raw.binding_id, MAX_WORKSPACE_LABEL_BYTES);
+  const revision = cleanPositiveIntOrNull(raw.revision);
+  const kind = parseBacklogItemKind(raw.kind);
+  const status = parseBacklogStatus(raw.status);
+  const title = cleanBacklogText(raw.title, 256);
+  const acceptanceCondition = cleanBacklogText(raw.acceptance_condition, 2_048);
+  const deliveryDescription = cleanBacklogText(raw.delivery_description, 2_048);
+  if (
+    itemId === null ||
+    itemBinding === null ||
+    itemBinding !== bindingId ||
+    revision === null ||
+    kind === null ||
+    status === null ||
+    title === null ||
+    acceptanceCondition === null ||
+    deliveryDescription === null
+  ) {
+    return null;
+  }
+
+  const blockedReason = cleanOptionalBacklogText(raw.blocked_reason, 1_024);
+  const currentExecutionRef = cleanOptionalBacklogToken(raw.current_execution_ref, 512);
+  const completionNote = cleanOptionalBacklogText(raw.completion_note, 2_048);
+  const completionEvidence = cleanOptionalBacklogText(raw.completion_evidence, 2_048);
+  const completedAtMs = cleanPositiveIntOrNull(raw.completed_at_ms);
+  const createdAtMs = cleanPositiveIntOrNull(raw.created_at_ms);
+  const updatedAtMs = cleanPositiveIntOrNull(raw.updated_at_ms);
+  if (
+    blockedReason === undefined ||
+    currentExecutionRef === undefined ||
+    completionNote === undefined ||
+    completionEvidence === undefined ||
+    createdAtMs === null ||
+    updatedAtMs === null
+  ) {
+    return null;
+  }
+  if (status === 'blocked') {
+    if (blockedReason === null) {
+      return null;
+    }
+  } else if (blockedReason !== null) {
+    return null;
+  }
+  if (status === 'done') {
+    if (completionNote === null || completionEvidence === null || completedAtMs === null) {
+      return null;
+    }
+  } else if (
+    completionNote !== null ||
+    completionEvidence !== null ||
+    completedAtMs !== null
+  ) {
+    return null;
+  }
+
+  return {
+    item_id: itemId,
+    binding_id: itemBinding,
+    revision,
+    title,
+    acceptance_condition: acceptanceCondition,
+    delivery_description: deliveryDescription,
+    kind,
+    status,
+    blocked_reason: blockedReason,
+    current_execution_ref: currentExecutionRef,
+    completion_note: completionNote,
+    completion_evidence: completionEvidence,
+    completed_at_ms: completedAtMs,
+    created_at_ms: createdAtMs,
+    updated_at_ms: updatedAtMs,
+  };
+}
+
+function normalizeBacklogEvent(raw: unknown): WorkspaceBacklogEvent | null {
+  if (!isRecord(raw)) {
+    return null;
+  }
+  const eventId = cleanBacklogToken(raw.event_id, 512);
+  const sequence = cleanPositiveIntOrNull(raw.sequence);
+  const itemId = cleanBacklogToken(raw.item_id, MAX_WORKSPACE_LABEL_BYTES);
+  const revision = cleanPositiveIntOrNull(raw.revision);
+  const action = cleanBacklogToken(raw.action, 64);
+  const recordedAtMs = cleanPositiveIntOrNull(raw.recorded_at_ms);
+  const title = cleanBacklogText(raw.title, 256);
+  const status = parseBacklogStatus(raw.status);
+  const executionRef = cleanOptionalBacklogToken(raw.execution_ref, 512);
+  const note = cleanOptionalBacklogText(raw.note, 2_048);
+  let outcome: WorkspaceBacklogOutcome | null = null;
+  if (raw.outcome !== null && raw.outcome !== undefined) {
+    outcome = parseBacklogOutcome(raw.outcome);
+    if (outcome === null) {
+      return null;
+    }
+  }
+  if (
+    eventId === null ||
+    sequence === null ||
+    itemId === null ||
+    revision === null ||
+    action === null ||
+    recordedAtMs === null ||
+    title === null ||
+    status === null ||
+    executionRef === undefined ||
+    note === undefined
+  ) {
+    return null;
+  }
+  return {
+    event_id: eventId,
+    sequence,
+    item_id: itemId,
+    revision,
+    action,
+    recorded_at_ms: recordedAtMs,
+    title,
+    status,
+    execution_ref: executionRef,
+    outcome,
+    note,
+  };
+}
+
+function normalizeBacklogPresence(raw: unknown): WorkspaceBacklogWorkerPresence | null {
+  if (!isRecord(raw)) {
+    return null;
+  }
+  const itemId = cleanBacklogToken(raw.item_id, MAX_WORKSPACE_LABEL_BYTES);
+  const executionRef = cleanBacklogToken(raw.execution_ref, 512);
+  const approvalId = cleanBacklogToken(raw.approval_id, MAX_WORKSPACE_LABEL_BYTES);
+  const taskId = cleanBacklogToken(raw.task_id, MAX_WORKSPACE_LABEL_BYTES);
+  const runId = cleanBacklogToken(raw.run_id, MAX_WORKSPACE_LABEL_BYTES);
+  const workerId = cleanBacklogToken(raw.worker_id, MAX_WORKSPACE_LABEL_BYTES);
+  const claimId = cleanOptionalBacklogToken(raw.claim_id, MAX_WORKSPACE_LABEL_BYTES);
+  const hostInstanceId = cleanOptionalBacklogToken(raw.host_instance_id, MAX_WORKSPACE_LABEL_BYTES);
+  const invocationId = cleanOptionalBacklogToken(raw.invocation_id, MAX_WORKSPACE_LABEL_BYTES);
+  const sequence = cleanNonNegativeIntOrNull(raw.sequence);
+  const availability = parseBacklogPresenceAvailability(raw.availability);
+  const freshness = parseBacklogPresenceFreshness(raw.freshness);
+  const sampledAtMs = cleanPositiveIntOrNull(raw.sampled_at_ms);
+  const sampleAgeMs = cleanNonNegativeIntOrNull(raw.sample_age_ms);
+  const maxSampleAgeMs =
+    cleanNonNegativeIntOrNull(raw.max_sample_age_ms) ??
+    MAX_WORKSPACE_BACKLOG_PRESENCE_SAMPLE_AGE_MS;
+  const expiresAtMs = cleanPositiveIntOrNull(raw.expires_at_ms);
+  if (
+    itemId === null ||
+    executionRef === null ||
+    approvalId === null ||
+    taskId === null ||
+    runId === null ||
+    workerId === null ||
+    claimId === undefined ||
+    hostInstanceId === undefined ||
+    invocationId === undefined
+  ) {
+    return null;
+  }
+  return {
+    item_id: itemId,
+    execution_ref: executionRef,
+    approval_id: approvalId,
+    task_id: taskId,
+    run_id: runId,
+    worker_id: workerId,
+    claim_id: claimId,
+    host_instance_id: hostInstanceId,
+    invocation_id: invocationId,
+    sequence,
+    availability,
+    freshness,
+    live:
+      raw.live === true && availability === 'live' && freshness === 'fresh',
+    sampled_at_ms: sampledAtMs,
+    sample_age_ms: sampleAgeMs,
+    max_sample_age_ms: maxSampleAgeMs,
+    expires_at_ms: expiresAtMs,
+  };
+}
+
+function normalizeWorkspaceChatWorkEntry(raw: unknown): WorkspaceChatWork | null {
+  if (!isRecord(raw)) {
+    return null;
+  }
+  let identity: WorkspaceChatIdentity;
+  try {
+    identity = validateWorkspaceChatIdentity(raw.identity);
+  } catch {
+    return null;
+  }
+  const availability = raw.availability === 'available' ? 'available' : 'unavailable';
+  const rawBounds = isRecord(raw.bounds) ? raw.bounds : {};
+  const bounds: WorkspaceChatWorkBounds = {
+    items_omitted: cleanNonNegativeInt(rawBounds.items_omitted, 0),
+    events_omitted: cleanNonNegativeInt(rawBounds.events_omitted, 0),
+    presence_omitted: cleanNonNegativeInt(rawBounds.presence_omitted, 0),
+  };
+
+  let itemsOmitted = 0;
+  const itemsById = new Map<string, BacklogItem>();
+  if (Array.isArray(raw.items)) {
+    for (const entry of raw.items) {
+      const item = normalizeBacklogItem(entry, identity.binding_id);
+      if (item === null) {
+        itemsOmitted += 1;
+        continue;
+      }
+      const existing = itemsById.get(item.item_id);
+      if (existing === undefined || item.revision > existing.revision) {
+        if (existing !== undefined) {
+          itemsOmitted += 1;
+        }
+        itemsById.set(item.item_id, item);
+      } else {
+        itemsOmitted += 1;
+      }
+    }
+  }
+  let items = Array.from(itemsById.values()).sort(
+    (left, right) =>
+      left.created_at_ms - right.created_at_ms ||
+      compareStringsUtf8(left.item_id, right.item_id),
+  );
+  if (items.length > MAX_WORKSPACE_CHAT_WORK_ITEMS_PER_CHAT) {
+    const overflow = items.length - MAX_WORKSPACE_CHAT_WORK_ITEMS_PER_CHAT;
+    items = items.slice(overflow);
+    itemsOmitted += overflow;
+  }
+  const itemById = new Map(items.map((item) => [item.item_id, item] as const));
+
+  let eventsOmitted = 0;
+  const eventsById = new Map<string, WorkspaceBacklogEvent>();
+  if (Array.isArray(raw.events)) {
+    for (const entry of raw.events) {
+      const event = normalizeBacklogEvent(entry);
+      if (event === null || event.event_id !== `${event.item_id}:${event.revision}`) {
+        eventsOmitted += 1;
+        continue;
+      }
+      const existing = eventsById.get(event.event_id);
+      if (
+        existing === undefined ||
+        event.sequence < existing.sequence ||
+        (event.sequence === existing.sequence && event.recorded_at_ms > existing.recorded_at_ms)
+      ) {
+        if (existing !== undefined) {
+          eventsOmitted += 1;
+        }
+        eventsById.set(event.event_id, event);
+      } else {
+        eventsOmitted += 1;
+      }
+    }
+  }
+  let events = Array.from(eventsById.values()).sort(
+    (left, right) =>
+      left.sequence - right.sequence || compareStringsUtf8(left.event_id, right.event_id),
+  );
+  if (events.length > MAX_WORKSPACE_CHAT_WORK_EVENTS_PER_CHAT) {
+    const overflow = events.length - MAX_WORKSPACE_CHAT_WORK_EVENTS_PER_CHAT;
+    events = events.slice(overflow);
+    eventsOmitted += overflow;
+  }
+
+  let presenceOmitted = 0;
+  const presenceByKey = new Map<string, WorkspaceBacklogWorkerPresence>();
+  if (Array.isArray(raw.worker_presence)) {
+    for (const entry of raw.worker_presence) {
+      const presence = normalizeBacklogPresence(entry);
+      const ownerItem = presence === null ? undefined : itemById.get(presence.item_id);
+      if (
+        presence === null ||
+        ownerItem === undefined ||
+        ownerItem.kind !== 'worker' ||
+        (ownerItem.status !== 'doing' && ownerItem.status !== 'blocked') ||
+        ownerItem.current_execution_ref !== presence.execution_ref
+      ) {
+        presenceOmitted += 1;
+        continue;
+      }
+      const key = `${presence.item_id}\u0000${presence.execution_ref}`;
+      const existing = presenceByKey.get(key);
+      if (existing === undefined || compareBacklogPresence(presence, existing) < 0) {
+        if (existing !== undefined) {
+          presenceOmitted += 1;
+        }
+        presenceByKey.set(key, presence);
+      } else {
+        presenceOmitted += 1;
+      }
+    }
+  }
+  let workerPresence = Array.from(presenceByKey.values()).sort(compareBacklogPresence);
+  if (workerPresence.length > MAX_WORKSPACE_CHAT_WORK_PRESENCE_PER_CHAT) {
+    const overflow = workerPresence.length - MAX_WORKSPACE_CHAT_WORK_PRESENCE_PER_CHAT;
+    workerPresence = workerPresence.slice(0, MAX_WORKSPACE_CHAT_WORK_PRESENCE_PER_CHAT);
+    presenceOmitted += overflow;
+  }
+
+  return {
+    identity,
+    availability,
+    items,
+    events,
+    worker_presence: workerPresence,
+    bounds: {
+      items_omitted: bounds.items_omitted + itemsOmitted,
+      events_omitted: bounds.events_omitted + eventsOmitted,
+      presence_omitted: bounds.presence_omitted + presenceOmitted,
+    },
+  };
+}
+
+function compareBacklogPresence(
+  left: WorkspaceBacklogWorkerPresence,
+  right: WorkspaceBacklogWorkerPresence,
+): number {
+  if (left.live !== right.live) {
+    return left.live ? -1 : 1;
+  }
+  const leftSampled = left.sampled_at_ms ?? Number.MIN_SAFE_INTEGER;
+  const rightSampled = right.sampled_at_ms ?? Number.MIN_SAFE_INTEGER;
+  if (leftSampled !== rightSampled) {
+    return rightSampled - leftSampled;
+  }
+  const leftSequence = left.sequence ?? 0;
+  const rightSequence = right.sequence ?? 0;
+  if (leftSequence !== rightSequence) {
+    return rightSequence - leftSequence;
+  }
+  return (
+    compareStringsUtf8(left.item_id, right.item_id) ||
+    compareStringsUtf8(left.execution_ref, right.execution_ref)
+  );
+}
+
+function normalizeWorkspaceChatWorkList(raw: unknown): WorkspaceChatWork[] {
+  const merged = new Map<
+    string,
+    {
+      identity: WorkspaceChatIdentity;
+      availability: 'available' | 'unavailable';
+      items: BacklogItem[];
+      events: WorkspaceBacklogEvent[];
+      worker_presence: WorkspaceBacklogWorkerPresence[];
+      bounds: WorkspaceChatWorkBounds;
+    }
+  >();
+  if (Array.isArray(raw)) {
+    for (const entry of raw) {
+      const work = normalizeWorkspaceChatWorkEntry(entry);
+      if (work === null) {
+        continue;
+      }
+      const key = formatWorkspaceChatIdentityKey(work.identity);
+      if (key === null) {
+        continue;
+      }
+      const existing = merged.get(key);
+      if (existing === undefined) {
+        merged.set(key, {
+          identity: work.identity,
+          availability: work.availability,
+          items: work.items.slice(),
+          events: work.events.slice(),
+          worker_presence: work.worker_presence.slice(),
+          bounds: { ...work.bounds },
+        });
+      } else {
+        if (work.availability === 'available') {
+          existing.availability = 'available';
+        }
+        existing.items.push(...work.items);
+        existing.events.push(...work.events);
+        existing.worker_presence.push(...work.worker_presence);
+        existing.bounds.items_omitted += work.bounds.items_omitted;
+        existing.bounds.events_omitted += work.bounds.events_omitted;
+        existing.bounds.presence_omitted += work.bounds.presence_omitted;
+      }
+    }
+  }
+
+  const sortedKeys = Array.from(merged.keys()).sort(compareStringsUtf8);
+  let chatWork: WorkspaceChatWork[] = [];
+  for (const key of sortedKeys) {
+    const entry = merged.get(key);
+    if (!entry) {
+      continue;
+    }
+    const normalized = normalizeWorkspaceChatWork(entry);
+    if (normalized !== null) {
+      chatWork.push(normalized);
+    }
+  }
+
+  let totalItems = chatWork.reduce((sum, work) => sum + work.items.length, 0);
+  let totalEvents = chatWork.reduce((sum, work) => sum + work.events.length, 0);
+  let totalPresence = chatWork.reduce((sum, work) => sum + work.worker_presence.length, 0);
+  if (totalItems > MAX_WORKSPACE_CHAT_WORK_ITEMS_TOTAL) {
+    for (let index = chatWork.length - 1; index >= 0; index -= 1) {
+      if (totalItems <= MAX_WORKSPACE_CHAT_WORK_ITEMS_TOTAL) {
+        break;
+      }
+      const work = chatWork[index]!;
+      const overflow = totalItems - MAX_WORKSPACE_CHAT_WORK_ITEMS_TOTAL;
+      const remove = Math.min(overflow, work.items.length);
+      if (remove > 0) {
+        work.items = work.items.slice(remove);
+        work.bounds.items_omitted += remove;
+        totalItems -= remove;
+        const remainingItemIds = new Set(work.items.map((item) => item.item_id));
+        const presenceBefore = work.worker_presence.length;
+        work.worker_presence = work.worker_presence.filter((presence) =>
+          remainingItemIds.has(presence.item_id),
+        );
+        const removedPresence = presenceBefore - work.worker_presence.length;
+        if (removedPresence > 0) {
+          work.bounds.presence_omitted += removedPresence;
+          totalPresence -= removedPresence;
+        }
+      }
+    }
+  }
+
+  if (totalEvents > MAX_WORKSPACE_CHAT_WORK_EVENTS_TOTAL) {
+    for (let index = chatWork.length - 1; index >= 0; index -= 1) {
+      if (totalEvents <= MAX_WORKSPACE_CHAT_WORK_EVENTS_TOTAL) {
+        break;
+      }
+      const work = chatWork[index]!;
+      const overflow = totalEvents - MAX_WORKSPACE_CHAT_WORK_EVENTS_TOTAL;
+      const remove = Math.min(overflow, work.events.length);
+      if (remove > 0) {
+        work.events = work.events.slice(remove);
+        work.bounds.events_omitted += remove;
+        totalEvents -= remove;
+      }
+    }
+  }
+
+  if (totalPresence > MAX_WORKSPACE_CHAT_WORK_PRESENCE_TOTAL) {
+    for (let index = chatWork.length - 1; index >= 0; index -= 1) {
+      if (totalPresence <= MAX_WORKSPACE_CHAT_WORK_PRESENCE_TOTAL) {
+        break;
+      }
+      const work = chatWork[index]!;
+      const overflow = totalPresence - MAX_WORKSPACE_CHAT_WORK_PRESENCE_TOTAL;
+      const remove = Math.min(overflow, work.worker_presence.length);
+      if (remove > 0) {
+        work.worker_presence = work.worker_presence.slice(
+          0,
+          work.worker_presence.length - remove,
+        );
+        work.bounds.presence_omitted += remove;
+        totalPresence -= remove;
+      }
+    }
+  }
+
+  return chatWork;
+}
+
+export function normalizeWorkspaceChatWork(raw: unknown): WorkspaceChatWork | null {
+  return normalizeWorkspaceChatWorkEntry(raw);
 }
 
 export function normalizeWorkspaceSnapshot(raw: unknown): WorkspaceSnapshot {
@@ -2674,6 +3288,7 @@ export function normalizeWorkspaceSnapshot(raw: unknown): WorkspaceSnapshot {
     : [];
   const boundedHistories = boundWorkspaceJobHistories(rawHistories);
   const messages = normalizeWorkspaceMessagesWindow(obj.messages);
+  const chatWork = normalizeWorkspaceChatWorkList(obj.chat_work);
   const rawBounds = isRecord(obj.bounds) ? obj.bounds : {};
 
   return {
@@ -2685,6 +3300,7 @@ export function normalizeWorkspaceSnapshot(raw: unknown): WorkspaceSnapshot {
     native_samples: boundedSamples.samples,
     job_histories: boundedHistories.histories,
     messages,
+    chat_work: chatWork,
     bounds: {
       native_samples_omitted:
         cleanNonNegativeInt(rawBounds.native_samples_omitted, 0) +
