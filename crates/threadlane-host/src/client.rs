@@ -28,6 +28,9 @@ use threadlane_workers::{
     DependencyPredecessorInput, WorktreeKind, DEFAULT_GIT_COMMAND_TIMEOUT_MS,
 };
 
+use crate::delivery::{
+    inspect_delivery_for_verified_task, recheck_delivery_for_verified_task, DeliveryInspection,
+};
 use crate::error::HostError;
 use crate::lifecycle::project_task_lifecycle;
 use crate::storage::{
@@ -1610,6 +1613,89 @@ impl ApprovedHostClient {
                 })
             }
         }
+    }
+
+    /// Inspects the physical delivery of the exact terminal result for `task_id` in
+    /// `approval_id`.
+    ///
+    /// The caller supplies only existing identifiers. This method first resolves the persisted
+    /// approval and verifies this client's authoritative `control_binding_id` and
+    /// `native_thread_uuid`, then obtains the exact terminal [`TaskStateSnapshot`] through
+    /// [`Self::get_task_live_or_stopped`] so the existing live/stopped readiness, session,
+    /// receipt, worker, and inactive-job checks remain authoritative. It resolves the private
+    /// canonical session and work area internally through the existing storage helpers and calls
+    /// [`inspect_delivery_for_verified_task`] with that genuine record, snapshot, and work area.
+    ///
+    /// The returned path-free [`DeliveryInspection`] contains the actual terminal `result_digest`
+    /// and the current artifact `delivery_digest`. It never records `Done`, accepts the task,
+    /// mutates the checkout, restarts the host, or invokes a provider.
+    ///
+    /// Physical inspection runs on `spawn_blocking` because the bounded Git and file reads must
+    /// not occupy the Tokio executor. It is a stable read, not atomic future immutability: a
+    /// malicious same-UID process can change files during or after inspection. Use
+    /// [`Self::recheck_task_delivery`] immediately before relying on the receipt.
+    pub async fn inspect_task_delivery(
+        &self,
+        approval_id: &str,
+        task_id: &str,
+    ) -> Result<DeliveryInspection, HostError> {
+        let (record, snapshot, work_area_root) = self
+            .resolve_task_delivery_inputs(approval_id, task_id)
+            .await?;
+
+        tokio::task::spawn_blocking(move || {
+            inspect_delivery_for_verified_task(&record, &snapshot, &work_area_root)
+        })
+        .await
+        .map_err(|err| HostError::Io {
+            operation: "spawn_blocking(inspect_task_delivery)".to_string(),
+            reason: err.to_string(),
+        })?
+    }
+
+    /// Rechecks a prior [`DeliveryInspection`] against the current exact terminal result and
+    /// physical checkout.
+    ///
+    /// This method repeats the full caller-scope resolution and fetches a fresh terminal snapshot
+    /// through the same guarded live/stopped route before recomputing the inspection. A supplied
+    /// digest or receipt is never trusted on its own; any change in the terminal result or current
+    /// artifact delivery is a typed [`HostError::SecurityViolation`] refusal. It never accepts,
+    /// records `Done`, mutates the checkout, restarts the host, or invokes a provider.
+    ///
+    /// Recheck narrows the stable-read window but inherits its same-UID/TOCTOU limit; it does not
+    /// promise atomic future immutability.
+    pub async fn recheck_task_delivery(
+        &self,
+        approval_id: &str,
+        task_id: &str,
+        expected: &DeliveryInspection,
+    ) -> Result<(), HostError> {
+        let (record, snapshot, work_area_root) = self
+            .resolve_task_delivery_inputs(approval_id, task_id)
+            .await?;
+        let expected = expected.clone();
+
+        tokio::task::spawn_blocking(move || {
+            recheck_delivery_for_verified_task(&record, &snapshot, &work_area_root, &expected)
+        })
+        .await
+        .map_err(|err| HostError::Io {
+            operation: "spawn_blocking(recheck_task_delivery)".to_string(),
+            reason: err.to_string(),
+        })?
+    }
+
+    async fn resolve_task_delivery_inputs(
+        &self,
+        approval_id: &str,
+        task_id: &str,
+    ) -> Result<(ApprovalRecord, TaskStateSnapshot, PathBuf), HostError> {
+        validate_identifier("task_id", task_id)?;
+        let record = self.resolve_authorized_approval(approval_id)?;
+        let snapshot = self.get_task_live_or_stopped(approval_id, task_id).await?;
+        let session_dir = verify_existing_session_dir(&self.sessions_dir, &record.approval_id)?;
+        let work_area_root = verify_existing_private_dir(&session_dir.join(WORK_AREA_SUBDIR))?;
+        Ok((record, snapshot, work_area_root))
     }
 
     /// Requests revision-checked cancellation of an in-flight worker task using the sealed

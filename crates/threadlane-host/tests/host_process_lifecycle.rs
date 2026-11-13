@@ -24,9 +24,9 @@ use tempfile::TempDir;
 use threadlane_authority::{ApprovalRecord, AuthorityStore, OperatorApprovalRequest};
 use threadlane_host::{
     is_host_lock_held, read_host_manifest_optional, read_task_dispatch_intent, read_task_receipt,
-    ApprovedHostClient, HostControlRuntimeState, HostControlStatusResponse, HostError, HostPhase,
-    HostSessionSummary, TaskExecutionStatus, TaskStateSnapshot, RUNTIME_STATE_SUBDIR,
-    TASK_RECEIPTS_FILENAME, WORK_AREA_SUBDIR,
+    ApprovedHostClient, DeliveryInspection, DeliveryKind, HostControlRuntimeState,
+    HostControlStatusResponse, HostError, HostPhase, HostSessionSummary, TaskExecutionStatus,
+    TaskStateSnapshot, RUNTIME_STATE_SUBDIR, TASK_RECEIPTS_FILENAME, WORK_AREA_SUBDIR,
 };
 use threadlane_plans::{
     compile_plan_revision, Difficulty, ModelChoice, ModelDefinition, PlanChange, PlanStore,
@@ -43,6 +43,7 @@ const THREAD_UUID: &str = "550e8400-e29b-41d4-a716-446655440000";
 const CONTROL_BINDING_ID: &str = "bnd_process_lifecycle";
 const PLAN_ID: &str = "plan-host-process-lifecycle";
 const TASK_ID: &str = "task-process-agy";
+const FAILED_TASK_ID: &str = "task-process-failed";
 const START_TIMEOUT: Duration = Duration::from_secs(30);
 const EXIT_TIMEOUT: Duration = Duration::from_secs(10);
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -179,21 +180,30 @@ fn init_disposable_git_repo(repo_dir: &Path) -> String {
 fn write_fake_provider_script(script_path: &Path) {
     // Every invocation is recorded so lifecycle reads can prove that no provider was launched.
     // A deliberately dispatched worker completes with matching model/effort telemetry and one
-    // bounded in-scope edit; no host startup, stop, restart, or history read invokes it.
+    // bounded in-scope edit; a prompt tagged with FAILED_DELIVERY_TASK fails instead. No host
+    // startup, stop, restart, or result/delivery read invokes it.
     let script = r#"#!/bin/sh
 set -eu
 marker="${0%/*}/unexpected-agy-invocations.txt"
 printf 'fake AGY invocation\n' >> "$marker"
 MODEL=""
 EFFORT=""
+PROMPT=""
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --model) MODEL="$2"; shift 2 ;;
         --effort) EFFORT="$2"; shift 2 ;;
+        --print) PROMPT="$2"; shift 2 ;;
         *) shift 1 ;;
     esac
 done
 printf '{"type":"init","session_id":"sess-lifecycle-1","model":"%s","effort":"%s"}\n' "$MODEL" "$EFFORT"
+case "$PROMPT" in
+    *FAILED_DELIVERY_TASK*)
+        printf '{"type":"error","error":{"code":"fixture_failure","message":"fake AGY failed task"}}\n'
+        exit 17
+        ;;
+esac
 if [ -d "src" ]; then
     printf "// completed by fake AGY\npub fn alpha() -> u32 { 42 }\n" > "src/lib.rs"
 fi
@@ -224,6 +234,16 @@ fn private_log_file(path: &Path) -> File {
 }
 
 fn setup_host_process_fixture() -> HostProcessFixture {
+    setup_host_process_fixture_with_optional_failed_task(false)
+}
+
+fn setup_host_process_fixture_with_failed_task() -> HostProcessFixture {
+    setup_host_process_fixture_with_optional_failed_task(true)
+}
+
+fn setup_host_process_fixture_with_optional_failed_task(
+    include_failed_task: bool,
+) -> HostProcessFixture {
     let tmp = TempDir::new().expect("create private fixture tempdir");
     let root = fs::canonicalize(tmp.path()).expect("canonicalize fixture tempdir");
     fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
@@ -304,6 +324,27 @@ fn setup_host_process_fixture() -> HostProcessFixture {
     assert_eq!(registry_snapshot.revision, 3);
 
     let plans = Arc::new(PlanStore::open(&plans_dir).expect("open plan store"));
+    let mut plan_tasks = vec![PlanTask {
+        id: TASK_ID.to_string(),
+        title: "Single fake AGY task".to_string(),
+        instruction: "Edit src/lib.rs only when explicitly dispatched.".to_string(),
+        role: WorkflowRole::Coder,
+        difficulty: Difficulty::Hard,
+        depends_on: Vec::new(),
+        allowed_write_paths: vec!["src/lib.rs".to_string()],
+    }];
+    if include_failed_task {
+        plan_tasks.push(PlanTask {
+            id: FAILED_TASK_ID.to_string(),
+            title: "Failed fake AGY task".to_string(),
+            instruction: "FAILED_DELIVERY_TASK: stop unsuccessfully without editing files."
+                .to_string(),
+            role: WorkflowRole::Coder,
+            difficulty: Difficulty::Hard,
+            depends_on: Vec::new(),
+            allowed_write_paths: vec!["src/lib.rs".to_string()],
+        });
+    }
     let draft = plans
         .change_at(
             0,
@@ -313,15 +354,7 @@ fn setup_host_process_fixture() -> HostProcessFixture {
                 profile_id: "profile-process".to_string(),
                 profile_revision: registry_snapshot.revision,
                 summary: "Process lifecycle plan".to_string(),
-                tasks: vec![PlanTask {
-                    id: TASK_ID.to_string(),
-                    title: "Single fake AGY task".to_string(),
-                    instruction: "Edit src/lib.rs only when explicitly dispatched.".to_string(),
-                    role: WorkflowRole::Coder,
-                    difficulty: Difficulty::Hard,
-                    depends_on: Vec::new(),
-                    allowed_write_paths: vec!["src/lib.rs".to_string()],
-                }],
+                tasks: plan_tasks,
             },
             1_700_000_000_000,
         )
@@ -340,6 +373,10 @@ fn setup_host_process_fixture() -> HostProcessFixture {
 
     let authority = AuthorityStore::open(&authority_dir, Arc::clone(&registry), Arc::clone(&plans))
         .expect("open authority store");
+    let mut approved_task_ids = vec![TASK_ID.to_string()];
+    if include_failed_task {
+        approved_task_ids.push(FAILED_TASK_ID.to_string());
+    }
     let approval = authority
         .approve_at(
             OperatorApprovalRequest {
@@ -351,7 +388,7 @@ fn setup_host_process_fixture() -> HostProcessFixture {
                 expected_plan_digest: compiled.plan_digest,
                 repository_path: repo_dir,
                 base_commit,
-                approved_task_ids: vec![TASK_ID.to_string()],
+                approved_task_ids,
                 approved_write_paths: vec!["src/lib.rs".to_string()],
                 max_parallel: 1,
                 budgets: ExecutionBudgets::default(),
@@ -360,7 +397,8 @@ fn setup_host_process_fixture() -> HostProcessFixture {
         )
         .expect("persist operator approval");
     assert_eq!(approval.plan_id.as_str(), PLAN_ID);
-    assert_eq!(approval.worker_profile_count, 1);
+    let expected_worker_profiles = if include_failed_task { 2 } else { 1 };
+    assert_eq!(approval.worker_profile_count, expected_worker_profiles);
     assert_eq!(approval.native_route_count, 0);
 
     HostProcessFixture {
@@ -766,11 +804,12 @@ async fn wait_for_host_idle(
     }
 }
 
-async fn wait_for_task_ready(
+async fn wait_for_task_status(
     client: &ApprovedHostClient,
     approval_id: &str,
     task_id: &str,
     child: &mut HostChild,
+    expected: TaskExecutionStatus,
 ) -> TaskStateSnapshot {
     let deadline = tokio::time::Instant::now() + START_TIMEOUT;
     loop {
@@ -779,16 +818,32 @@ async fn wait_for_task_ready(
             .get_task_live_or_stopped(approval_id, task_id)
             .await
             .expect("read live task result");
-        if snapshot.status == TaskExecutionStatus::ReadyForReview {
+        if snapshot.status == expected {
             return snapshot;
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "task `{task_id}` did not become ReadyForReview: {:?}",
+            "task `{task_id}` did not become {expected:?}: {:?}",
             snapshot.status
         );
         tokio::time::sleep(POLL_INTERVAL).await;
     }
+}
+
+async fn wait_for_task_ready(
+    client: &ApprovedHostClient,
+    approval_id: &str,
+    task_id: &str,
+    child: &mut HostChild,
+) -> TaskStateSnapshot {
+    wait_for_task_status(
+        client,
+        approval_id,
+        task_id,
+        child,
+        TaskExecutionStatus::ReadyForReview,
+    )
+    .await
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -842,6 +897,19 @@ fn assert_scope_error(result: Result<TaskStateSnapshot, HostError>, expected_fie
             assert_eq!(field, expected_field, "unexpected scope mismatch field");
         }
         other => panic!("expected ScopeMismatch on `{expected_field}`, got {other:?}"),
+    }
+}
+
+fn assert_delivery_refused(result: Result<DeliveryInspection, HostError>, expected_code: &str) {
+    match result {
+        Err(err) => assert_eq!(
+            err.code(),
+            expected_code,
+            "unexpected delivery inspection refusal: {err:?}"
+        ),
+        Ok(inspection) => {
+            panic!("expected `{expected_code}` delivery refusal, got {inspection:?}");
+        }
     }
 }
 
@@ -1226,5 +1294,254 @@ async fn completed_task_result_is_readable_live_and_after_real_cli_idle_stop_wit
         fixture.provider_invocation_count(),
         completed_provider_invocations,
         "rejection probes and final stopped read must not launch the provider"
+    );
+}
+
+#[tokio::test]
+async fn approved_host_delivery_inspection_reads_live_and_stopped_results_without_mutation() {
+    let fixture = setup_host_process_fixture_with_failed_task();
+    fixture.assert_no_provider_invocation();
+
+    let client = ApprovedHostClient::open(
+        &fixture.registry_dir,
+        &fixture.plans_dir,
+        &fixture.authority_dir,
+        &fixture.sessions_dir,
+        CONTROL_BINDING_ID,
+        THREAD_UUID,
+    )
+    .expect("open authoritative approved host client");
+
+    let mut host = spawn_host_process(&fixture, "delivery", None);
+    let status =
+        wait_for_authenticated_ready(&client, &fixture.approval_id, &mut host, |_| true).await;
+    assert_live_ready(&fixture, &client, &mut host, &status);
+
+    // No receipt means no delivery, even though the approved task and work area exist.
+    assert_delivery_refused(
+        client
+            .inspect_task_delivery(&fixture.approval_id, TASK_ID)
+            .await,
+        "validation",
+    );
+    fixture.assert_no_provider_invocation();
+
+    client
+        .dispatch_task(&fixture.approval_id, TASK_ID)
+        .await
+        .expect("dispatch approved root task");
+    let live_result = wait_for_task_ready(&client, &fixture.approval_id, TASK_ID, &mut host).await;
+    wait_for_host_idle(&client, &fixture.approval_id, &mut host).await;
+    let live_delivery = client
+        .inspect_task_delivery(&fixture.approval_id, TASK_ID)
+        .await
+        .expect("inspect the live successful delivery");
+    assert_eq!(live_delivery.approval_id, fixture.approval_id);
+    assert_eq!(live_delivery.binding_id, CONTROL_BINDING_ID);
+    assert_eq!(live_delivery.thread_uuid, THREAD_UUID);
+    assert_eq!(live_delivery.task_id, TASK_ID);
+    assert_eq!(
+        live_delivery.run_id,
+        live_result.run_id.clone().expect("live result run id")
+    );
+    assert_eq!(
+        live_delivery.worker_id,
+        live_result
+            .worker_id
+            .clone()
+            .expect("live result worker id")
+    );
+    assert_eq!(live_delivery.delivery_kind, DeliveryKind::Patch);
+    assert!(live_delivery.changed_paths_count >= 1);
+    assert_eq!(live_delivery.result_digest.len(), 64);
+    assert_eq!(live_delivery.delivery_digest.len(), 64);
+    assert_eq!(
+        client
+            .inspect_task_delivery(&fixture.approval_id, TASK_ID)
+            .await
+            .expect("repeat live delivery inspection"),
+        live_delivery,
+        "a stable live delivery read must preserve result and artifact identity"
+    );
+    client
+        .recheck_task_delivery(&fixture.approval_id, TASK_ID, &live_delivery)
+        .await
+        .expect("recheck stable live delivery");
+    host.assert_running();
+    let provider_invocations_after_success = fixture.provider_invocation_count();
+    assert!(provider_invocations_after_success >= 1);
+    assert_eq!(
+        fixture.provider_invocation_count(),
+        provider_invocations_after_success,
+        "live delivery inspection must not launch the provider"
+    );
+
+    // A failed worker terminal result is refused before any physical delivery claim.
+    client
+        .dispatch_task(&fixture.approval_id, FAILED_TASK_ID)
+        .await
+        .expect("dispatch approved failing task");
+    let failed_result = wait_for_task_status(
+        &client,
+        &fixture.approval_id,
+        FAILED_TASK_ID,
+        &mut host,
+        TaskExecutionStatus::Failed,
+    )
+    .await;
+    assert_eq!(failed_result.status, TaskExecutionStatus::Failed);
+    assert!(!failed_result.accepted);
+    assert_delivery_refused(
+        client
+            .inspect_task_delivery(&fixture.approval_id, FAILED_TASK_ID)
+            .await,
+        "validation",
+    );
+    let provider_invocations_after_failure = fixture.provider_invocation_count();
+    assert!(provider_invocations_after_failure > provider_invocations_after_success);
+    assert_eq!(
+        fixture.provider_invocation_count(),
+        provider_invocations_after_failure,
+        "failed delivery refusal must not launch the provider"
+    );
+
+    // An unknown task in the authorized approval remains an explicit refusal.
+    assert_delivery_refused(
+        client
+            .inspect_task_delivery(&fixture.approval_id, "task-not-approved")
+            .await,
+        "unknown_task",
+    );
+
+    // Foreign caller bindings cannot inspect this approval's delivery.
+    let wrong_binding = ApprovedHostClient::open(
+        &fixture.registry_dir,
+        &fixture.plans_dir,
+        &fixture.authority_dir,
+        &fixture.sessions_dir,
+        "bnd_wrong_delivery_scope",
+        THREAD_UUID,
+    )
+    .expect("open wrong-binding client");
+    match wrong_binding
+        .inspect_task_delivery(&fixture.approval_id, TASK_ID)
+        .await
+    {
+        Err(HostError::ScopeMismatch { field, .. }) => {
+            assert_eq!(field, "control_binding_id");
+        }
+        other => panic!("expected foreign-binding scope refusal, got {other:?}"),
+    }
+
+    let idle_status = wait_for_host_idle(&client, &fixture.approval_id, &mut host).await;
+    assert_eq!(
+        idle_status.instance_id, status.instance_id,
+        "delivery inspection and refusal probes must not restart the host"
+    );
+    let instance_id = idle_status.instance_id.clone();
+    let session_binding_id = idle_status.session_binding_id.clone();
+    let stopped = client
+        .stop_idle_session(&fixture.approval_id, &instance_id)
+        .await
+        .expect("authenticated idle stop after delivery inspections");
+    let exit = host.wait_for_exit(EXIT_TIMEOUT).await;
+    assert_eq!(
+        exit.code(),
+        Some(0),
+        "host process must exit naturally after delivery inspections"
+    );
+    assert_durable_stopped(&fixture, &instance_id, &session_binding_id, &stopped);
+    assert_eq!(
+        fixture.provider_invocation_count(),
+        provider_invocations_after_failure,
+        "idle stop must not launch the provider again"
+    );
+
+    let fingerprint_before = capture_stopped_read_fingerprint(&fixture);
+    let stopped_delivery = client
+        .inspect_task_delivery(&fixture.approval_id, TASK_ID)
+        .await
+        .expect("inspect the clean stopped delivery");
+    assert_eq!(
+        stopped_delivery, live_delivery,
+        "clean stopped inspection must preserve the live result and artifact identity"
+    );
+    client
+        .recheck_task_delivery(&fixture.approval_id, TASK_ID, &stopped_delivery)
+        .await
+        .expect("recheck clean stopped delivery");
+    let fingerprint_after = capture_stopped_read_fingerprint(&fixture);
+    assert_eq!(
+        fingerprint_before, fingerprint_after,
+        "stopped delivery inspection and recheck must not change manifest, receipts, DB, or sidecars"
+    );
+    assert!(
+        fingerprint_after.wal.is_none() && fingerprint_after.shm.is_none(),
+        "clean stopped delivery reads must not gain WAL/SHM sidecars"
+    );
+    assert!(
+        !is_host_lock_held(&fixture.session_dir()).expect("probe stopped host.lock"),
+        "delivery reads must not restart the host or reacquire host.lock"
+    );
+    assert_eq!(
+        fixture.provider_invocation_count(),
+        provider_invocations_after_failure,
+        "stopped delivery inspection must not launch the provider"
+    );
+
+    // A missing sealed receipt remains NotStarted and cannot borrow a delivery.
+    let receipts_path = fixture.session_dir().join(TASK_RECEIPTS_FILENAME);
+    let missing_receipts_path =
+        stopped_read_backup_path(&fixture, "delivery-task-receipts.json.missing");
+    fs::rename(&receipts_path, &missing_receipts_path).expect("move receipts ledger");
+    assert_delivery_refused(
+        client
+            .inspect_task_delivery(&fixture.approval_id, TASK_ID)
+            .await,
+        "validation",
+    );
+    fs::rename(&missing_receipts_path, &receipts_path).expect("restore receipts ledger");
+    client
+        .recheck_task_delivery(&fixture.approval_id, TASK_ID, &stopped_delivery)
+        .await
+        .expect("restored stopped delivery still rechecks");
+
+    // Recheck must recompute the current artifact rather than trust the prior receipt.
+    let task_checkout = fixture
+        .session_dir()
+        .join(WORK_AREA_SUBDIR)
+        .join(CHECKOUTS_SUBDIR)
+        .join("tasks")
+        .join(&stopped_delivery.worktree_id);
+    fs::write(
+        task_checkout.join("src/lib.rs"),
+        "pub fn alpha() -> u32 { 99 }\n",
+    )
+    .expect("change the inspected task checkout");
+    let mismatch = client
+        .recheck_task_delivery(&fixture.approval_id, TASK_ID, &stopped_delivery)
+        .await
+        .expect_err("changed artifact must refuse delivery recheck");
+    assert_eq!(mismatch.code(), "security_violation");
+    let changed_delivery = client
+        .inspect_task_delivery(&fixture.approval_id, TASK_ID)
+        .await
+        .expect("changed checkout remains inspectable as a different delivery");
+    assert_ne!(
+        changed_delivery.delivery_digest,
+        stopped_delivery.delivery_digest
+    );
+    assert_eq!(
+        changed_delivery.result_digest, stopped_delivery.result_digest,
+        "artifact mutation must not rewrite the terminal result identity"
+    );
+    assert_eq!(
+        fixture.provider_invocation_count(),
+        provider_invocations_after_failure,
+        "artifact mismatch probes must not launch the provider"
+    );
+    assert!(
+        !is_host_lock_held(&fixture.session_dir()).expect("probe stopped host.lock"),
+        "artifact mismatch probes must not restart the host"
     );
 }
