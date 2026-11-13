@@ -203,6 +203,7 @@ async fn create_planned_approved_and_frozen_pipeline_job_for_scope(
     approval_budgets: ExecutionBudgets,
     coder_budget: ControllerRoleExecutionBudget,
     correction_cap: u32,
+    reviewer_choice: SelectedRoleChoice,
 ) -> (CoworkerJobRecord, String) {
     Box::pin(async move {
         let pb = project_base(fixture);
@@ -386,7 +387,7 @@ async fn create_planned_approved_and_frozen_pipeline_job_for_scope(
             .expect("approve plan");
 
         let cap_env = FrozenControllerCapabilityEnvelope {
-            allowed_reviewer_choices: vec![headless_argon_choice(Difficulty::Hard)],
+            allowed_reviewer_choices: vec![reviewer_choice.clone()],
             allowed_closure_choices: vec![headless_argon_choice(Difficulty::Extreme)],
             max_in_scope_correction_attempts: correction_cap,
             allowed_check_ids: vec!["cargo_test".to_string()],
@@ -431,7 +432,7 @@ async fn create_planned_approved_and_frozen_pipeline_job_for_scope(
             job_id: bound_job.job_id.clone(),
             expected_job_revision: bound_job.job_revision,
             policy: pipeline_execution_policy(fixture),
-            reviewer_choice: headless_argon_choice(Difficulty::Hard),
+            reviewer_choice,
             closure_choice: headless_argon_choice(Difficulty::Extreme),
             role_budgets,
             max_in_scope_corrections_per_task: correction_cap,
@@ -517,6 +518,72 @@ fn configure_codex_coder(fixture: &PipelineTestFixture) {
         .unwrap();
 }
 
+fn headless_codex_reviewer_choice(difficulty: Difficulty) -> SelectedRoleChoice {
+    SelectedRoleChoice {
+        tool_id: "tool-codex".to_string(),
+        adapter: ToolAdapter::CodexCli,
+        route: RoleExecutionRoute::HeadlessWorker,
+        model_id: "model-codex-sol".to_string(),
+        model_arg: "gpt-6.1-sol".to_string(),
+        effort: Some("high".to_string()),
+        matched_difficulty: Some(difficulty),
+    }
+}
+
+/// Keeps the Go/Antigravity Coder while pinning a fake read-only Codex advisory Reviewer backed
+/// by the same deterministic Node provider fixture. This is the real mixed provider combination.
+fn configure_codex_reviewer(fixture: &PipelineTestFixture) {
+    let snapshot = fixture.registry.snapshot().unwrap();
+    fixture
+        .registry
+        .apply(
+            snapshot.revision,
+            RegistryChange::UpsertTool {
+                tool: ToolDefinition {
+                    id: "tool-codex".to_string(),
+                    label: "Offline Codex Reviewer".to_string(),
+                    adapter: ToolAdapter::CodexCli,
+                    executable_path: Some(fixture.fake_agy_exe.clone()),
+                    enabled: true,
+                },
+            },
+        )
+        .unwrap();
+    fixture
+        .registry
+        .apply(
+            snapshot.revision + 1,
+            RegistryChange::UpsertModels {
+                models: vec![ModelDefinition {
+                    id: "model-codex-sol".to_string(),
+                    tool_id: "tool-codex".to_string(),
+                    label: "Codex Sol fixture".to_string(),
+                    model_arg: "gpt-6.1-sol".to_string(),
+                    efforts: vec!["high".to_string()],
+                    allow_no_effort: false,
+                }],
+            },
+        )
+        .unwrap();
+    let mut profile = snapshot.profiles[0].clone();
+    for assignment in &mut profile.assignments {
+        if assignment.role == WorkflowRole::Reviewer {
+            assignment.difficulty = Some(Difficulty::Hard);
+            assignment.choice = ModelChoice {
+                model_id: "model-codex-sol".to_string(),
+                effort: Some("high".to_string()),
+            };
+        }
+    }
+    fixture
+        .registry
+        .apply(
+            snapshot.revision + 2,
+            RegistryChange::UpsertProfile { profile },
+        )
+        .unwrap();
+}
+
 fn pipeline_execution_policy(fixture: &PipelineTestFixture) -> ExecutionPolicy {
     let mut policy = execution_policy();
     if fixture
@@ -533,6 +600,27 @@ fn pipeline_execution_policy(fixture: &PipelineTestFixture) -> ExecutionPolicy {
             efforts: vec!["max".to_string()],
             allow_no_effort: false,
             roles: vec![WorkflowRole::Coder],
+        });
+    }
+    if fixture
+        .registry
+        .snapshot()
+        .unwrap()
+        .profiles
+        .iter()
+        .any(|profile| {
+            profile.assignments.iter().any(|assignment| {
+                assignment.role == WorkflowRole::Reviewer
+                    && assignment.choice.model_id == "model-codex-sol"
+            })
+        })
+    {
+        policy.allow_rules.push(PolicyAllowRule {
+            tool_id: "tool-codex".to_string(),
+            model_id: "model-codex-sol".to_string(),
+            efforts: vec!["high".to_string()],
+            allow_no_effort: false,
+            roles: vec![WorkflowRole::Reviewer],
         });
     }
     policy
@@ -576,20 +664,32 @@ fn install_tracked_primary_cache_ignore_and_artifact(fixture: &mut PipelineTestF
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cli_code_driver_full_automatic_pipeline_runs_parallel_roots_reviewer_correction_dependent_and_single_closure_to_completed(
 ) {
-    assert_full_pipeline(false).await;
+    assert_full_pipeline(false, false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn codex_luna_full_frozen_pipeline_parallel_roots_correction_dependent_and_single_closure() {
-    assert_full_pipeline(true).await;
+    assert_full_pipeline(true, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn go_coder_codex_sol_reviewer_full_frozen_pipeline_parallel_roots_correction_dependent_and_single_closure(
+) {
+    assert_full_pipeline(false, true).await;
 }
 
 #[allow(clippy::too_many_lines)]
-async fn assert_full_pipeline(codex: bool) {
+async fn assert_full_pipeline(codex_coder: bool, codex_reviewer: bool) {
     Box::pin(async {
         let mut fixture = setup_fixture();
         let primary_cache_file = install_tracked_primary_cache_ignore_and_artifact(&mut fixture);
-        if codex { configure_codex_coder(&fixture); }
+        if codex_coder { configure_codex_coder(&fixture); }
+        if codex_reviewer { configure_codex_reviewer(&fixture); }
+        let reviewer_choice = if codex_reviewer {
+            headless_codex_reviewer_choice(Difficulty::Hard)
+        } else {
+            headless_argon_choice(Difficulty::Hard)
+        };
         let state_dir = fixture.root.join("runtime");
         fs::create_dir_all(&state_dir).expect("create runtime state_dir");
         fs::set_permissions(&state_dir, fs::Permissions::from_mode(0o700))
@@ -679,6 +779,7 @@ async fn assert_full_pipeline(codex: bool) {
             ExecutionBudgets::default(),
             ControllerRoleExecutionBudget::default_for_role(WorkflowRole::Coder, 5),
             1,
+            reviewer_choice.clone(),
         )
         .await;
 
@@ -1146,7 +1247,7 @@ async fn assert_full_pipeline(codex: bool) {
         );
         assert_eq!(notice_effect_count.load(Ordering::SeqCst), 1);
 
-        if codex {
+        if codex_coder {
             let approval = fixture.authority.get_for_operator(&approval_id).unwrap();
             assert!(approval.tasks.iter().all(|t| t.is_frozen_headless_worker() && t.provider == Some(threadlane_workers::WorkerProvider::CodexCli)));
             let runtime = fixture.policy_store.get_job_runtime_readonly(&binding_id, &job.job_id).unwrap().unwrap();
@@ -1201,6 +1302,28 @@ async fn assert_full_pipeline(codex: bool) {
                 let mut wrong = artifact.clone(); wrong.codex_launch_report.as_mut().unwrap().constructed_argv[17] = report.constructed_argv[17].replace("src/a.rs", "src/");
                 if wrong.codex_launch_report != artifact.codex_launch_report { assert!(!wrong.has_matching_coder_evidence(task, choice)); }
             }
+        }
+
+        if codex_reviewer {
+            let runtime = fixture.policy_store.get_job_runtime_readonly(&binding_id, &job.job_id).unwrap().unwrap();
+            let mut review_effect_count = 0;
+            for effect in runtime.pending_effects.values() {
+                if effect.kind == PendingControllerEffectKind::ReviewerInvocation
+                    && effect.status == PendingControllerEffectStatus::EffectConfirmed
+                {
+                    review_effect_count += 1;
+                    let report = read_persisted_task_review_report(&fixture.plans_dir, &effect.effect_id)
+                        .expect("read persisted Codex Reviewer report")
+                        .expect("persisted Codex Reviewer report exists");
+                    assert_eq!(report.provider, threadlane_workers::WorkerProvider::CodexCli);
+                    assert_eq!(report.requested_model.base_model, "gpt-6.1-sol");
+                    assert_eq!(report.requested_model.effort.as_deref(), Some("high"));
+                    assert_eq!(report.observed_model, None);
+                    assert_eq!(report.observed_effort, None);
+                    assert!(report.execution().has_pinned_codex_read_only_launch_config());
+                }
+            }
+            assert_eq!(review_effect_count, 4, "one persisted report per Reviewer call");
         }
 
         // Reconstruct only the dependent task's fenced, pre-verification boundary from its
@@ -1312,6 +1435,7 @@ async fn cli_code_driver_cancel_during_owned_in_flight_reviewer_drains_fences_pr
             ExecutionBudgets::default(),
             ControllerRoleExecutionBudget::default_for_role(WorkflowRole::Coder, 4),
             1,
+            headless_argon_choice(Difficulty::Hard),
         )
         .await;
 
@@ -1518,6 +1642,7 @@ async fn cli_code_driver_settled_check_and_correction_blocks_send_one_attention_
                 }], BTreeMap::new(), vec!["src/a.rs".into()], 1, ExecutionBudgets::default(),
                 ControllerRoleExecutionBudget::default_for_role(WorkflowRole::Coder, if case == "correction_budget" { 1 } else { 4 }),
                 if case == "correction_no_authority" { 0 } else { 1 },
+                headless_argon_choice(Difficulty::Hard),
             ).await;
             if correction {
                 fs::write(fixture.root.join("reviewer_override_task-notice-a.json"), json!({
@@ -1670,6 +1795,7 @@ async fn cli_code_driver_full_pipeline_live_held_coders_report_running_not_unkno
             ExecutionBudgets::default(),
             ControllerRoleExecutionBudget::default_for_role(WorkflowRole::Coder, 4),
             1,
+            headless_argon_choice(Difficulty::Hard),
         )
         .await;
 
@@ -2207,6 +2333,7 @@ async fn stopped_host_cached_running_is_unknown_without_mutating_historical_stat
             &fixture, &binding.binding_id, &thread, "brf_inactive_projection", "plan-inactive-projection",
             tasks, BTreeMap::new(), vec!["src/a.rs".into(), "src/b.rs".into(), "src/c.rs".into()],
             2, ExecutionBudgets::default(), ControllerRoleExecutionBudget::default_for_role(WorkflowRole::Coder, 4), 1,
+            headless_argon_choice(Difficulty::Hard),
         ).await;
         let original = fs::read_to_string(&fixture.fake_agy_exe).unwrap();
         let exec = original.lines().find(|line| line.starts_with("exec node ")).unwrap();

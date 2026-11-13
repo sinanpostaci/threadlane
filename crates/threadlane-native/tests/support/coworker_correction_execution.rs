@@ -25,6 +25,66 @@ struct PreparedCorrectionFixtureTask {
     expected_report_id: String,
 }
 
+fn write_codex_reviewer_override(
+    state_dir: &Path,
+    task_id: &str,
+    attempt_no: u32,
+    spec: serde_json::Value,
+) {
+    fs::write(
+        state_dir.join(format!(
+            "reviewer_override_{task_id}_attempt_{attempt_no}.json"
+        )),
+        serde_json::to_string(&spec).expect("serialize Codex Reviewer override"),
+    )
+    .expect("write Codex Reviewer override");
+}
+
+fn replace_argv_arg(argv: &mut [String], from: &str, to: &str) {
+    let index = argv
+        .iter()
+        .position(|arg| arg == from)
+        .unwrap_or_else(|| panic!("missing argv entry `{from}`"));
+    argv[index] = to.to_string();
+}
+
+async fn assert_codex_reviewer_report_rejected(
+    service: &CoworkerTaskCorrectionService,
+    session: &threadlane_native::coworker_workflow::OwnedCoworkerControllerSession,
+    job: &CoworkerJobRecord,
+    task_id: &str,
+    now_ms: u64,
+    report_path: &Path,
+    report: &threadlane_native::coworker_workflow::TaskReviewExecutionReport,
+) {
+    fs::write(
+        report_path,
+        serde_json::to_vec_pretty(report).expect("serialize tampered Reviewer report"),
+    )
+    .expect("write tampered Reviewer report");
+    fs::set_permissions(report_path, fs::Permissions::from_mode(0o600))
+        .expect("chmod 0600 tampered Reviewer report");
+    let err = service
+        .prepare_task_correction(
+            session.guard(),
+            &CoworkerTaskCorrectionPrepareRequest {
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                job_id: job.job_id.clone(),
+                task_id: task_id.to_string(),
+                prior_attempt_no: 1,
+                now_ms,
+            },
+        )
+        .await
+        .expect_err("tampered Codex Reviewer report must be rejected");
+    assert_eq!(
+        err.code(),
+        NativeErrorCode::ValidationFailed.as_str(),
+        "tampered Codex Reviewer report rejection code"
+    );
+}
+
 async fn prepare_task_for_derived_correction(
     fixture: &ControllerTestFixture,
     brief_id: &str,
@@ -43,12 +103,53 @@ async fn prepare_task_for_derived_correction(
     .await
 }
 
+async fn prepare_task_for_derived_correction_with_reviewer(
+    fixture: &ControllerTestFixture,
+    brief_id: &str,
+    plan_id: &str,
+    task_id: &str,
+    required_fixes: Vec<String>,
+    reviewer_choice: SelectedRoleChoice,
+) -> PreparedCorrectionFixtureTask {
+    prepare_task_for_derived_correction_with_reviewer_and_budgets(
+        fixture,
+        brief_id,
+        plan_id,
+        task_id,
+        required_fixes,
+        reviewer_choice,
+        ExecutionBudgets::default(),
+    )
+    .await
+}
+
 async fn prepare_task_for_derived_correction_with_budgets(
     fixture: &ControllerTestFixture,
     brief_id: &str,
     plan_id: &str,
     task_id: &str,
     required_fixes: Vec<String>,
+    approval_budgets: ExecutionBudgets,
+) -> PreparedCorrectionFixtureTask {
+    prepare_task_for_derived_correction_with_reviewer_and_budgets(
+        fixture,
+        brief_id,
+        plan_id,
+        task_id,
+        required_fixes,
+        headless_argon_choice(Difficulty::Hard),
+        approval_budgets,
+    )
+    .await
+}
+
+async fn prepare_task_for_derived_correction_with_reviewer_and_budgets(
+    fixture: &ControllerTestFixture,
+    brief_id: &str,
+    plan_id: &str,
+    task_id: &str,
+    required_fixes: Vec<String>,
+    reviewer_choice: SelectedRoleChoice,
     approval_budgets: ExecutionBudgets,
 ) -> PreparedCorrectionFixtureTask {
     write_executable_script(
@@ -66,8 +167,10 @@ async fn prepare_task_for_derived_correction_with_budgets(
             consumed_interfaces: Vec::new(),
         },
     );
-    let (job, approval_id) = create_planned_approved_and_frozen_job(
+    let (job, approval_id) = create_planned_approved_and_frozen_job_for_scope_with_reviewer(
         fixture,
+        BINDING_A,
+        THREAD_UUID_A,
         brief_id,
         plan_id,
         vec![PlanTask {
@@ -84,6 +187,11 @@ async fn prepare_task_for_derived_correction_with_budgets(
         1,
         approval_budgets,
         ControllerRoleExecutionBudget::default_for_role(WorkflowRole::Coder, 4),
+        false,
+        1,
+        2,
+        6,
+        reviewer_choice.clone(),
     )
     .await;
     assert_eq!(read_invocation_count(&fixture.agy_planning_count_file), 1);
@@ -218,7 +326,34 @@ async fn prepare_task_for_derived_correction_with_budgets(
     );
     assert!(review_1.review_receipt.is_none());
     assert_eq!(read_invocation_count(&fixture.agy_count_file), 1);
-    assert_eq!(read_invocation_count(&fixture.agy_planning_count_file), 2);
+    if reviewer_choice.adapter == ToolAdapter::CodexCli {
+        // Real `codex exec --json` emits no runtime model/effort telemetry. The report must carry
+        // the exact pinned read-only launch configuration instead, without inventing observations.
+        assert_eq!(review_1.report.provider, WorkerProvider::CodexCli);
+        assert_eq!(
+            review_1.report.requested_model.base_model,
+            reviewer_choice.model_arg
+        );
+        assert_eq!(
+            review_1.report.requested_model.effort,
+            reviewer_choice.effort
+        );
+        assert_eq!(review_1.report.observed_model, None);
+        assert_eq!(review_1.report.observed_effort, None);
+        let review_execution = review_1.report.execution();
+        assert_eq!(review_execution.provider, WorkerProvider::CodexCli);
+        assert_eq!(
+            review_execution.requested_model.base_model,
+            reviewer_choice.model_arg
+        );
+        assert_eq!(
+            review_execution.requested_model.effort,
+            reviewer_choice.effort
+        );
+        assert!(review_execution.has_pinned_codex_read_only_launch_config());
+    } else {
+        assert_eq!(read_invocation_count(&fixture.agy_planning_count_file), 2);
+    }
 
     let runtime_before_corr = fixture
         .policy_store
@@ -989,6 +1124,600 @@ async fn task_correction_executes_derived_coder_attempt_reopens_idempotently_ver
     reopened_session
         .release()
         .expect("release reopened session");
+    host_handle.shutdown().await.expect("shutdown host");
+}
+
+#[tokio::test]
+async fn task_correction_accepts_pinned_codex_reviewer_without_runtime_telemetry_and_completes_derived_go_attempt(
+) {
+    let fixture = setup_fixture();
+    let (reviewer_choice, reviewer_state_dir) = configure_codex_reviewer(&fixture);
+    write_codex_reviewer_override(
+        &reviewer_state_dir,
+        "task-corr-codex-rev",
+        1,
+        serde_json::json!({
+            "outcome": "correct_in_scope",
+            "findings": ["src/a.rs::a() returns 100 instead of 101"],
+            "required_in_scope_fixes": ["Update src/a.rs::a() so it returns 101"],
+            "summary": "Attempt 1 requires a bounded in-scope src/a.rs correction."
+        }),
+    );
+    let task_id = "task-corr-codex-rev";
+    let PreparedCorrectionFixtureTask {
+        job,
+        host_handle,
+        session,
+        step_ts,
+        verify_1,
+        review_subject_1,
+        review_1,
+        task_manifest,
+        prep_outcome,
+        receipt,
+        expected_req_key,
+        expected_eff_id,
+        expected_report_id,
+        ..
+    } = Box::pin(prepare_task_for_derived_correction_with_reviewer(
+        &fixture,
+        "brf_corr_codex_rev",
+        "plan-corr-codex-rev",
+        task_id,
+        vec!["Update src/a.rs::a() so it returns 101".to_string()],
+        reviewer_choice.clone(),
+    ))
+    .await;
+
+    // A Codex Reviewer report has no runtime model/effort telemetry; preparation must accept the
+    // verified pinned launch configuration instead of demanding fabricated observations.
+    assert_eq!(
+        prep_outcome.status,
+        CoworkerTaskCorrectionPrepareStatus::Prepared
+    );
+    assert_eq!(prep_outcome.next_attempt_no, 2);
+    assert_eq!(prep_outcome.task_stage, CoworkerTaskStage::DispatchReserved);
+    assert_eq!(prep_outcome.receipt.as_ref(), Some(&receipt));
+    assert!(prep_outcome.outbox_id.is_some());
+    assert_eq!(read_invocation_count(&fixture.agy_count_file), 1);
+    assert_eq!(
+        read_invocation_count(&reviewer_state_dir.join("agy_reviewer_count.txt")),
+        1
+    );
+
+    let correction_service = CoworkerTaskCorrectionService::new(fixture.controller.clone());
+    let prep_req = CoworkerTaskCorrectionPrepareRequest {
+        binding_id: BINDING_A.to_string(),
+        thread_uuid: THREAD_UUID_A.to_string(),
+        job_id: job.job_id.clone(),
+        task_id: task_id.to_string(),
+        prior_attempt_no: 1,
+        now_ms: step_ts + 250,
+    };
+    let reopened_prep = correction_service
+        .prepare_task_correction(session.guard(), &prep_req)
+        .await
+        .expect("repeat correction preparation must reopen");
+    assert_eq!(
+        reopened_prep.status,
+        CoworkerTaskCorrectionPrepareStatus::Reopened
+    );
+    assert!(reopened_prep.reused_existing);
+    assert_eq!(reopened_prep.receipt.as_ref(), Some(&receipt));
+    assert_eq!(reopened_prep.outbox_id, prep_outcome.outbox_id);
+    assert_eq!(read_invocation_count(&fixture.agy_count_file), 1);
+
+    let correction_exec_service =
+        CoworkerTaskCorrectionExecutionService::new(fixture.controller.clone());
+    let exec_req = CoworkerTaskCorrectionExecuteRequest {
+        binding_id: BINDING_A.to_string(),
+        thread_uuid: THREAD_UUID_A.to_string(),
+        job_id: job.job_id.clone(),
+        task_id: task_id.to_string(),
+        prior_attempt_no: 1,
+        now_ms: step_ts + 300,
+    };
+    let exec_outcome =
+        Box::pin(correction_exec_service.execute_task_correction(session.guard(), &exec_req))
+            .await
+            .expect("execute derived Go correction attempt");
+    assert_eq!(
+        exec_outcome.status,
+        CoworkerTaskCorrectionExecuteStatus::ReadyForVerification
+    );
+    assert_eq!(exec_outcome.task_stage, CoworkerTaskStage::ReadyForReview);
+    assert_eq!(exec_outcome.attempt_no, 2);
+    assert!(!exec_outcome.reused_existing);
+    assert_eq!(exec_outcome.receipt.as_ref(), Some(&receipt));
+    assert_eq!(
+        exec_outcome.request_key.as_deref(),
+        Some(expected_req_key.as_str())
+    );
+    assert_eq!(
+        exec_outcome.effect_id.as_deref(),
+        Some(expected_eff_id.as_str())
+    );
+    assert_eq!(exec_outcome.outbox_id, prep_outcome.outbox_id);
+    assert_eq!(
+        exec_outcome.report_artifact_id.as_deref(),
+        Some(expected_report_id.as_str())
+    );
+    assert_eq!(
+        read_invocation_count(&fixture.agy_count_file),
+        2,
+        "exactly one derived Go Coder attempt must run"
+    );
+    assert_eq!(
+        read_invocation_count(&reviewer_state_dir.join("agy_reviewer_count.txt")),
+        1,
+        "preparing/executing a correction must not call the Reviewer"
+    );
+
+    let repeat_exec = Box::pin(correction_exec_service.execute_task_correction(
+        session.guard(),
+        &CoworkerTaskCorrectionExecuteRequest {
+            now_ms: step_ts + 350,
+            ..exec_req.clone()
+        },
+    ))
+    .await
+    .expect("repeat correction execution must reopen");
+    assert!(repeat_exec.reused_existing);
+    assert_eq!(repeat_exec.report, exec_outcome.report);
+    assert_eq!(read_invocation_count(&fixture.agy_count_file), 2);
+
+    let verifier = CoworkerTaskVerificationService::new(fixture.controller.clone());
+    let verify_2 = Box::pin(verifier.verify_and_prepare_task_attempt(
+        session.guard(),
+        &CoworkerTaskVerificationRequest {
+            binding_id: BINDING_A.to_string(),
+            thread_uuid: THREAD_UUID_A.to_string(),
+            job_id: job.job_id.clone(),
+            task_id: task_id.to_string(),
+            attempt_no: 2,
+            now_ms: step_ts + 400,
+        },
+    ))
+    .await
+    .expect("verify derived attempt 2");
+    assert_eq!(
+        verify_2.status,
+        CoworkerTaskVerificationStatus::ReadyForReviewer
+    );
+    assert_ne!(verify_2.candidate_id, verify_1.candidate_id);
+    assert_ne!(
+        verify_2.committed_head_commit,
+        verify_1.committed_head_commit
+    );
+    let review_subject_2 = verify_2
+        .review_subject
+        .as_ref()
+        .expect("promoted ReviewSubject attempt 2");
+    assert_eq!(review_subject_2.base_commit, fixture.base_commit);
+    assert_eq!(review_subject_2.run_id, task_manifest.run_id);
+    assert_eq!(review_subject_2.task_id, review_subject_1.task_id);
+
+    write_codex_reviewer_override(
+        &reviewer_state_dir,
+        task_id,
+        2,
+        serde_json::json!({
+            "outcome": "accept",
+            "findings": [],
+            "required_in_scope_fixes": [],
+            "conflicting_paths_or_interfaces": [],
+            "summary": "Derived attempt 2 satisfies the bounded correction and passing checks."
+        }),
+    );
+
+    let review_service = CoworkerTaskReviewStageService::new(fixture.controller.clone());
+    let review_2 = review_service
+        .review_task_attempt(
+            session.guard(),
+            &CoworkerTaskReviewStageRequest {
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                job_id: job.job_id.clone(),
+                task_id: task_id.to_string(),
+                attempt_no: 2,
+                now_ms: step_ts + 500,
+                untrusted_candidate_context: Some(
+                    "Updated src/a.rs::a() to return 101".to_string(),
+                ),
+            },
+        )
+        .await
+        .expect("Codex Reviewer accepts derived attempt 2");
+    assert_eq!(review_2.status, CoworkerTaskReviewStageStatus::Accepted);
+    assert_eq!(review_2.task_stage, CoworkerTaskStage::Accepted);
+    assert_eq!(review_2.candidate_id, verify_2.candidate_id);
+    assert_eq!(review_2.report.provider, WorkerProvider::CodexCli);
+    assert_eq!(review_2.report.observed_model, None);
+    assert_eq!(review_2.report.observed_effort, None);
+    assert!(review_2
+        .report
+        .execution()
+        .has_pinned_codex_read_only_launch_config());
+    let review_receipt = review_2
+        .review_receipt
+        .as_ref()
+        .expect("real ReviewReceipt from Codex Accept");
+    assert_eq!(
+        review_receipt.subject_digest,
+        review_subject_2.subject_digest
+    );
+    assert_eq!(
+        review_receipt.task_head_commit,
+        verify_2.committed_head_commit
+    );
+    assert_eq!(
+        read_invocation_count(&reviewer_state_dir.join("agy_reviewer_count.txt")),
+        2
+    );
+
+    let int_service = CoworkerTaskIntegrationService::new(fixture.controller.clone());
+    let int_outcome = int_service
+        .integrate_accepted_task(
+            session.guard(),
+            &CoworkerTaskIntegrationRequest {
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                job_id: job.job_id.clone(),
+                task_id: task_id.to_string(),
+                attempt_no: 2,
+                now_ms: step_ts + 600,
+            },
+        )
+        .expect("integrate Codex-accepted derived attempt");
+    assert_eq!(
+        int_outcome.status,
+        CoworkerTaskIntegrationStatus::Integrated
+    );
+    assert_eq!(int_outcome.task_stage, CoworkerTaskStage::Integrated);
+    assert_eq!(int_outcome.review_receipt_id, review_receipt.receipt_id);
+    assert_eq!(
+        int_outcome.review_subject_digest,
+        review_subject_2.subject_digest
+    );
+    assert_eq!(
+        int_outcome.integrated_target_commit,
+        verify_2.committed_head_commit
+    );
+
+    let loaded_review_receipt =
+        load_review_receipt(host_handle.work_area_dir(), &review_receipt.receipt_id)
+            .expect("load durable ReviewReceipt");
+    assert_eq!(&loaded_review_receipt, review_receipt);
+    let loaded_integration_receipt = load_integration_receipt(
+        host_handle.work_area_dir(),
+        &int_outcome.integration_receipt_id,
+    )
+    .expect("load durable IntegrationReceipt");
+    assert_eq!(loaded_integration_receipt, int_outcome.integration_receipt);
+
+    let runtime_final = fixture
+        .policy_store
+        .get_job_runtime_readonly(BINDING_A, &job.job_id)
+        .expect("read final correction runtime")
+        .expect("final runtime exists");
+    assert_eq!(runtime_final.total_task_attempts_reserved, 2);
+    assert_eq!(runtime_final.total_corrections_reserved, 1);
+    assert_eq!(runtime_final.derived_attempts, vec![receipt]);
+    assert_eq!(read_invocation_count(&fixture.agy_count_file), 2);
+    assert_eq!(
+        read_invocation_count(&reviewer_state_dir.join("agy_reviewer_count.txt")),
+        2
+    );
+    assert_eq!(
+        fs::read_to_string(
+            int_outcome
+                .integration_receipt
+                .integration_checkout_path
+                .join("src/a.rs")
+        )
+        .expect("read integrated src/a.rs"),
+        "pub fn a() -> u32 { 101 }\n"
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.repo_dir.join("src/a.rs")).expect("read primary src/a.rs"),
+        "pub fn a() -> u32 { 1 }\n"
+    );
+    assert_eq!(
+        review_1.report.requested_model.base_model,
+        reviewer_choice.model_arg
+    );
+    assert_eq!(
+        review_1.report.requested_model.effort,
+        reviewer_choice.effort
+    );
+
+    session.release().expect("release controller session");
+    host_handle.shutdown().await.expect("shutdown host");
+}
+
+#[tokio::test]
+async fn task_correction_codex_reviewer_rejects_tampered_identity_and_launch_evidence_without_new_reservation(
+) {
+    let fixture = setup_fixture();
+    let (reviewer_choice, reviewer_state_dir) = configure_codex_reviewer(&fixture);
+    let task_id = "task-corr-codex-neg";
+    write_codex_reviewer_override(
+        &reviewer_state_dir,
+        task_id,
+        1,
+        serde_json::json!({
+            "outcome": "correct_in_scope",
+            "findings": ["src/a.rs::a() returns 100 instead of 101"],
+            "required_in_scope_fixes": ["Update src/a.rs::a() so it returns 101"],
+            "summary": "Attempt 1 requires a bounded in-scope src/a.rs correction."
+        }),
+    );
+    let PreparedCorrectionFixtureTask {
+        job,
+        host_handle,
+        session,
+        step_ts,
+        review_1,
+        prep_outcome,
+        receipt,
+        ..
+    } = Box::pin(prepare_task_for_derived_correction_with_reviewer(
+        &fixture,
+        "brf_corr_codex_neg",
+        "plan-corr-codex-neg",
+        task_id,
+        vec!["Update src/a.rs::a() so it returns 101".to_string()],
+        reviewer_choice,
+    ))
+    .await;
+    assert_eq!(
+        prep_outcome.status,
+        CoworkerTaskCorrectionPrepareStatus::Prepared
+    );
+    assert_eq!(prep_outcome.receipt.as_ref(), Some(&receipt));
+
+    // Reviewer report verification runs before the idempotent reopen path. Each tampered report
+    // must therefore be refused without minting another reservation or invoking any provider.
+    let report_path = PathBuf::from(&review_1.report_path);
+    let valid_report_bytes = fs::read(&report_path).expect("read valid Codex Reviewer report");
+    let base_report = review_1.report.clone();
+    let correction_service = CoworkerTaskCorrectionService::new(fixture.controller.clone());
+    let baseline_ledger = fixture
+        .workflow_store
+        .read_binding_ledger(BINDING_A)
+        .expect("read baseline ledger");
+    let baseline_outbox_count = baseline_ledger
+        .jobs
+        .iter()
+        .find(|record| record.job_id == job.job_id)
+        .expect("baseline job")
+        .outbox
+        .len();
+    let baseline_runtime = fixture
+        .policy_store
+        .get_job_runtime_readonly(BINDING_A, &job.job_id)
+        .expect("read baseline runtime")
+        .expect("baseline runtime exists");
+    let baseline_effect_count = baseline_runtime.pending_effects.len();
+    let assert_no_new_reservation = || {
+        let runtime = fixture
+            .policy_store
+            .get_job_runtime_readonly(BINDING_A, &job.job_id)
+            .expect("read runtime after rejected tamper")
+            .expect("runtime exists");
+        assert_eq!(runtime.total_task_attempts_reserved, 2);
+        assert_eq!(runtime.total_corrections_reserved, 1);
+        assert_eq!(runtime.derived_attempts, vec![receipt.clone()]);
+        assert_eq!(
+            runtime.pending_effects.len(),
+            baseline_effect_count,
+            "rejected tamper must not persist a new effect"
+        );
+        let ledger = fixture
+            .workflow_store
+            .read_binding_ledger(BINDING_A)
+            .expect("read ledger after rejected tamper");
+        let current_job = ledger
+            .jobs
+            .iter()
+            .find(|record| record.job_id == job.job_id)
+            .expect("job after rejected tamper");
+        assert_eq!(
+            current_job.outbox.len(),
+            baseline_outbox_count,
+            "rejected tamper must not persist a new outbox record"
+        );
+        assert_eq!(read_invocation_count(&fixture.agy_count_file), 1);
+        assert_eq!(
+            read_invocation_count(&reviewer_state_dir.join("agy_reviewer_count.txt")),
+            1
+        );
+    };
+
+    let mut wrong_outer_provider = base_report.clone();
+    wrong_outer_provider.provider = WorkerProvider::Antigravity;
+    assert_codex_reviewer_report_rejected(
+        &correction_service,
+        &session,
+        &job,
+        task_id,
+        step_ts + 300,
+        &report_path,
+        &wrong_outer_provider,
+    )
+    .await;
+    assert_no_new_reservation();
+
+    let mut wrong_outer_model = base_report.clone();
+    wrong_outer_model.requested_model.base_model = "gpt-6-other".to_string();
+    wrong_outer_model.requested_model.cli_model_arg = "gpt-6-other".to_string();
+    assert_codex_reviewer_report_rejected(
+        &correction_service,
+        &session,
+        &job,
+        task_id,
+        step_ts + 350,
+        &report_path,
+        &wrong_outer_model,
+    )
+    .await;
+    assert_no_new_reservation();
+
+    let mut wrong_outer_effort = base_report.clone();
+    wrong_outer_effort.requested_model.effort = Some("max".to_string());
+    assert_codex_reviewer_report_rejected(
+        &correction_service,
+        &session,
+        &job,
+        task_id,
+        step_ts + 400,
+        &report_path,
+        &wrong_outer_effort,
+    )
+    .await;
+    assert_no_new_reservation();
+
+    let mut wrong_embedded_provider = base_report.clone();
+    wrong_embedded_provider
+        .structured_execution
+        .execution
+        .provider = WorkerProvider::Antigravity;
+    assert_codex_reviewer_report_rejected(
+        &correction_service,
+        &session,
+        &job,
+        task_id,
+        step_ts + 450,
+        &report_path,
+        &wrong_embedded_provider,
+    )
+    .await;
+    assert_no_new_reservation();
+
+    let mut wrong_embedded_model = base_report.clone();
+    wrong_embedded_model
+        .structured_execution
+        .execution
+        .requested_model
+        .base_model = "gpt-6-other".to_string();
+    wrong_embedded_model
+        .structured_execution
+        .execution
+        .requested_model
+        .cli_model_arg = "gpt-6-other".to_string();
+    replace_argv_arg(
+        &mut wrong_embedded_model
+            .structured_execution
+            .execution
+            .constructed_argv,
+        "gpt-6.1-sol",
+        "gpt-6-other",
+    );
+    assert_codex_reviewer_report_rejected(
+        &correction_service,
+        &session,
+        &job,
+        task_id,
+        step_ts + 500,
+        &report_path,
+        &wrong_embedded_model,
+    )
+    .await;
+    assert_no_new_reservation();
+
+    let mut wrong_embedded_effort = base_report.clone();
+    wrong_embedded_effort
+        .structured_execution
+        .execution
+        .requested_model
+        .effort = Some("max".to_string());
+    replace_argv_arg(
+        &mut wrong_embedded_effort
+            .structured_execution
+            .execution
+            .constructed_argv,
+        "model_reasoning_effort=\"high\"",
+        "model_reasoning_effort=\"max\"",
+    );
+    assert_codex_reviewer_report_rejected(
+        &correction_service,
+        &session,
+        &job,
+        task_id,
+        step_ts + 550,
+        &report_path,
+        &wrong_embedded_effort,
+    )
+    .await;
+    assert_no_new_reservation();
+
+    let mut changed_read_only_argv = base_report.clone();
+    replace_argv_arg(
+        &mut changed_read_only_argv
+            .structured_execution
+            .execution
+            .constructed_argv,
+        "approval_policy=\"never\"",
+        "approval_policy=\"on-request\"",
+    );
+    assert_codex_reviewer_report_rejected(
+        &correction_service,
+        &session,
+        &job,
+        task_id,
+        step_ts + 600,
+        &report_path,
+        &changed_read_only_argv,
+    )
+    .await;
+    assert_no_new_reservation();
+
+    // Stream telemetry never substitutes for the pinned read-only Codex launch configuration.
+    let mut unpinned_stream_telemetry = base_report.clone();
+    let unpinned_execution = &mut unpinned_stream_telemetry.structured_execution.execution;
+    unpinned_execution.constructed_argv = vec!["--no-daemon".to_string(), "exec".to_string()];
+    unpinned_execution.evidence.model_evidence = threadlane_workers::FieldEvidence::VerifiedMatch {
+        value: "gpt-6.1-sol".to_string(),
+    };
+    unpinned_execution.evidence.effort_evidence =
+        threadlane_workers::FieldEvidence::VerifiedMatch {
+            value: "high".to_string(),
+        };
+    unpinned_stream_telemetry.observed_model = Some("gpt-6.1-sol".to_string());
+    unpinned_stream_telemetry.observed_effort = Some("high".to_string());
+    assert_codex_reviewer_report_rejected(
+        &correction_service,
+        &session,
+        &job,
+        task_id,
+        step_ts + 625,
+        &report_path,
+        &unpinned_stream_telemetry,
+    )
+    .await;
+    assert_no_new_reservation();
+
+    let mut contradictory_observations = base_report.clone();
+    contradictory_observations.observed_model =
+        Some(base_report.requested_model.base_model.clone());
+    contradictory_observations.observed_effort = Some("high".to_string());
+    assert_codex_reviewer_report_rejected(
+        &correction_service,
+        &session,
+        &job,
+        task_id,
+        step_ts + 650,
+        &report_path,
+        &contradictory_observations,
+    )
+    .await;
+    assert_no_new_reservation();
+
+    fs::write(&report_path, &valid_report_bytes).expect("restore valid Codex Reviewer report");
+    fs::set_permissions(&report_path, fs::Permissions::from_mode(0o600))
+        .expect("chmod 0600 restored Codex Reviewer report");
+
+    session.release().expect("release controller session");
     host_handle.shutdown().await.expect("shutdown host");
 }
 

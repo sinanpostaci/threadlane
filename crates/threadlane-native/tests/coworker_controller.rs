@@ -65,7 +65,7 @@ use threadlane_operations::{
 };
 use threadlane_workers::{
     resolve_exact_commit_sha, resolve_exact_tree_sha, run_sanitized_git, run_sanitized_git_bytes,
-    ExecutionBudgets, WorkerFilePermissions, WorkerRunStatus, WorktreeKind,
+    ExecutionBudgets, WorkerFilePermissions, WorkerProvider, WorkerRunStatus, WorktreeKind,
     DEFAULT_GIT_COMMAND_TIMEOUT_MS, DEFAULT_MAX_GIT_OUTPUT_BYTES, MANIFESTS_SUBDIR,
 };
 use threadlane_workflow::{
@@ -611,6 +611,85 @@ printf '%s\n' '{"type":"step_finish","sessionID":"sess-oc-initial","model":"open
         .expect("pin fake OpenCode Coder");
 }
 
+/// Registers a fake read-only Codex advisory Reviewer backed by the deterministic Node provider
+/// fixture and returns the exact frozen Reviewer choice plus its private counter/override state
+/// directory. The fixture emits no runtime model/effort telemetry, matching real `codex exec`.
+fn configure_codex_reviewer(fixture: &ControllerTestFixture) -> (SelectedRoleChoice, PathBuf) {
+    let root_dir = fixture.agy_count_file.parent().expect("fixture root dir");
+    let role_script_path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/support/fake-coworker-roles.mjs");
+    assert!(
+        role_script_path.is_file(),
+        "fake-coworker-roles.mjs must exist at {}",
+        role_script_path.display()
+    );
+    let wrapper_path = fixture.fake_agy_exe.with_file_name("fake-codex-reviewer");
+    let state_dir = root_dir.join("codex-reviewer-state");
+    fs::create_dir_all(&state_dir).expect("create codex reviewer state dir");
+    fs::set_permissions(&state_dir, fs::Permissions::from_mode(0o700))
+        .expect("chmod 0700 codex reviewer state dir");
+    write_executable_script(
+        &wrapper_path,
+        &format!(
+            "#!/bin/sh\nset -eu\nexec node \"{}\" \"{}\" \"$@\"\n",
+            role_script_path.display(),
+            state_dir.display()
+        ),
+    );
+
+    let snapshot = fixture.registry.snapshot().expect("registry snapshot");
+    fixture
+        .registry
+        .apply(
+            snapshot.revision,
+            RegistryChange::UpsertTool {
+                tool: ToolDefinition {
+                    id: "tool-codex".to_string(),
+                    label: "Offline Codex Reviewer".to_string(),
+                    adapter: ToolAdapter::CodexCli,
+                    executable_path: Some(wrapper_path),
+                    enabled: true,
+                },
+            },
+        )
+        .expect("configure fake Codex Reviewer tool");
+    fixture
+        .registry
+        .apply(
+            snapshot.revision + 1,
+            RegistryChange::UpsertModels {
+                models: vec![ModelDefinition {
+                    id: "model-codex-sol".to_string(),
+                    tool_id: "tool-codex".to_string(),
+                    label: "Codex Sol fixture".to_string(),
+                    model_arg: "gpt-6.1-sol".to_string(),
+                    efforts: vec!["high".to_string()],
+                    allow_no_effort: false,
+                }],
+            },
+        )
+        .expect("configure fake Codex Reviewer model");
+    let mut profile = snapshot.profiles[0].clone();
+    let reviewer = profile
+        .assignments
+        .iter_mut()
+        .find(|assignment| assignment.role == WorkflowRole::Reviewer)
+        .expect("Reviewer assignment");
+    reviewer.difficulty = Some(Difficulty::Hard);
+    reviewer.choice = ModelChoice {
+        model_id: "model-codex-sol".to_string(),
+        effort: Some("high".to_string()),
+    };
+    fixture
+        .registry
+        .apply(
+            snapshot.revision + 2,
+            RegistryChange::UpsertProfile { profile },
+        )
+        .expect("pin fake Codex Reviewer");
+
+    (headless_codex_reviewer_choice(Difficulty::Hard), state_dir)
+}
 fn execution_policy_for_fixture(fixture: &ControllerTestFixture) -> ExecutionPolicy {
     let mut policy = execution_policy();
     if fixture
@@ -629,6 +708,27 @@ fn execution_policy_for_fixture(fixture: &ControllerTestFixture) -> ExecutionPol
             roles: vec![WorkflowRole::Coder],
         });
     }
+    if fixture
+        .registry
+        .snapshot()
+        .expect("registry snapshot")
+        .profiles
+        .iter()
+        .any(|profile| {
+            profile.assignments.iter().any(|assignment| {
+                assignment.role == WorkflowRole::Reviewer
+                    && assignment.choice.model_id == "model-codex-sol"
+            })
+        })
+    {
+        policy.allow_rules.push(PolicyAllowRule {
+            tool_id: "tool-codex".to_string(),
+            model_id: "model-codex-sol".to_string(),
+            efforts: vec!["high".to_string()],
+            allow_no_effort: false,
+            roles: vec![WorkflowRole::Reviewer],
+        });
+    }
     policy
 }
 
@@ -639,6 +739,18 @@ fn headless_argon_choice(difficulty: Difficulty) -> SelectedRoleChoice {
         route: RoleExecutionRoute::HeadlessWorker,
         model_id: "model-argon".to_string(),
         model_arg: "gemini-4-argon-high".to_string(),
+        effort: Some("high".to_string()),
+        matched_difficulty: Some(difficulty),
+    }
+}
+
+fn headless_codex_reviewer_choice(difficulty: Difficulty) -> SelectedRoleChoice {
+    SelectedRoleChoice {
+        tool_id: "tool-codex".to_string(),
+        adapter: ToolAdapter::CodexCli,
+        route: RoleExecutionRoute::HeadlessWorker,
+        model_id: "model-codex-sol".to_string(),
+        model_arg: "gpt-6.1-sol".to_string(),
         effort: Some("high".to_string()),
         matched_difficulty: Some(difficulty),
     }
@@ -848,6 +960,46 @@ async fn create_planned_approved_and_frozen_job_for_scope_with_options(
     max_total_corrections_per_job: u32,
     max_total_task_attempts_per_job: u32,
 ) -> (CoworkerJobRecord, String) {
+    create_planned_approved_and_frozen_job_for_scope_with_reviewer(
+        fixture,
+        binding_id,
+        thread_uuid,
+        brief_id,
+        plan_id,
+        tasks,
+        task_interfaces,
+        approved_write_paths,
+        max_parallel,
+        approval_budgets,
+        coder_budget,
+        allow_check_failure_corrections,
+        max_in_scope_corrections_per_task,
+        max_total_corrections_per_job,
+        max_total_task_attempts_per_job,
+        headless_argon_choice(Difficulty::Hard),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn create_planned_approved_and_frozen_job_for_scope_with_reviewer(
+    fixture: &ControllerTestFixture,
+    binding_id: &str,
+    thread_uuid: &str,
+    brief_id: &str,
+    plan_id: &str,
+    tasks: Vec<PlanTask>,
+    task_interfaces: BTreeMap<String, TaskInterfaceOwnershipSpec>,
+    approved_write_paths: Vec<String>,
+    max_parallel: usize,
+    approval_budgets: ExecutionBudgets,
+    coder_budget: ControllerRoleExecutionBudget,
+    allow_check_failure_corrections: bool,
+    max_in_scope_corrections_per_task: u32,
+    max_total_corrections_per_job: u32,
+    max_total_task_attempts_per_job: u32,
+    reviewer_choice: SelectedRoleChoice,
+) -> (CoworkerJobRecord, String) {
     let pb = project_base(fixture);
     let reg_snap = fixture.registry.snapshot().expect("registry snapshot");
     let brief = sample_brief_for_scope(fixture, binding_id, thread_uuid, brief_id);
@@ -1009,7 +1161,7 @@ async fn create_planned_approved_and_frozen_job_for_scope_with_options(
         .expect("approve plan");
 
     let cap_env = FrozenControllerCapabilityEnvelope {
-        allowed_reviewer_choices: vec![headless_argon_choice(Difficulty::Hard)],
+        allowed_reviewer_choices: vec![reviewer_choice.clone()],
         allowed_closure_choices: vec![headless_argon_choice(Difficulty::Extreme)],
         max_in_scope_correction_attempts: max_in_scope_corrections_per_task,
         allowed_check_ids: vec!["cargo_test".to_string()],
@@ -1052,7 +1204,7 @@ async fn create_planned_approved_and_frozen_job_for_scope_with_options(
         job_id: bound_job.job_id.clone(),
         expected_job_revision: bound_job.job_revision,
         policy: execution_policy_for_fixture(fixture),
-        reviewer_choice: headless_argon_choice(Difficulty::Hard),
+        reviewer_choice,
         closure_choice: headless_argon_choice(Difficulty::Extreme),
         role_budgets,
         max_in_scope_corrections_per_task,

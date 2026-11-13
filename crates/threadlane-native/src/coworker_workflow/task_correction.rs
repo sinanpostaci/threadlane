@@ -1851,7 +1851,7 @@ pub(crate) fn verify_prior_attempt_and_persisted_reviewer_report_with_live_check
     if reviewer_choice.route != RoleExecutionRoute::HeadlessWorker
         || !matches!(
             reviewer_choice.adapter,
-            ToolAdapter::Antigravity | ToolAdapter::OpencodeV2
+            ToolAdapter::Antigravity | ToolAdapter::OpencodeV2 | ToolAdapter::CodexCli
         )
     {
         return Err(NativeError::new(
@@ -1989,6 +1989,7 @@ pub(crate) fn verify_prior_attempt_and_persisted_reviewer_report_with_live_check
     let expected_reviewer_provider = match reviewer_choice.adapter {
         ToolAdapter::Antigravity => WorkerProvider::Antigravity,
         ToolAdapter::OpencodeV2 => WorkerProvider::OpenCodeV2,
+        ToolAdapter::CodexCli => WorkerProvider::CodexCli,
         _ => {
             return Err(NativeError::new(
                 NativeErrorCode::UnsupportedCapability,
@@ -2007,27 +2008,95 @@ pub(crate) fn verify_prior_attempt_and_persisted_reviewer_report_with_live_check
             format!("invalid frozen reviewer_choice model target: {err}"),
         )
     })?;
+
+    // Bind both the outer report identity and the embedded supervised execution identity to the
+    // exact frozen Reviewer provider/model/effort target. A valid report cannot substitute a
+    // different provider or requested target through either layer.
+    let execution = persisted_report.execution();
     if persisted_report.provider != expected_reviewer_provider
         || persisted_report.requested_model != expected_reviewer_model
-        || persisted_report.observed_model.as_deref()
-            != Some(expected_reviewer_model.base_model.as_str())
-        || persisted_report.execution().effective_observed_model()
-            != Some(expected_reviewer_model.base_model.as_str())
+        || execution.provider != expected_reviewer_provider
+        || execution.requested_model != expected_reviewer_model
     {
         return Err(NativeError::new(
             NativeErrorCode::ValidationFailed,
-            "persisted TaskReviewExecutionReport provider or model does not match frozen Reviewer model choice",
+            "persisted TaskReviewExecutionReport provider or requested model/effort does not match frozen Reviewer model choice",
         ));
     }
-    if let Some(ref exp_rev_effort) = expected_reviewer_model.effort {
-        if persisted_report.observed_effort.as_deref() != Some(exp_rev_effort.as_str())
-            || persisted_report.execution().effective_observed_effort()
-                != Some(exp_rev_effort.as_str())
-        {
-            return Err(NativeError::new(
-                NativeErrorCode::ValidationFailed,
-                "persisted TaskReviewExecutionReport observed_effort does not match frozen Reviewer effort",
-            ));
+
+    match expected_reviewer_provider {
+        WorkerProvider::CodexCli => {
+            // Linux `codex exec --json` intentionally emits no runtime model/effort telemetry.
+            // Codex evidence is satisfied only by the exact pinned read-only launch configuration
+            // bound to the frozen requested target; absent observations stay absent with no
+            // requested -> observed fallback.
+            if !execution.has_pinned_codex_read_only_launch_config()
+                || !execution.has_satisfied_model_evidence()
+                || !execution.has_satisfied_effort_evidence()
+            {
+                return Err(NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "persisted Codex Reviewer report does not carry the exact pinned read-only launch configuration for the frozen model/effort",
+                ));
+            }
+            let effective_observed_model = execution.effective_observed_model();
+            let effective_observed_effort = execution.effective_observed_effort();
+            if persisted_report.observed_model.as_deref() != effective_observed_model
+                || persisted_report.observed_effort.as_deref() != effective_observed_effort
+            {
+                return Err(NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "persisted TaskReviewExecutionReport raw observations contradict the embedded Codex execution report",
+                ));
+            }
+            if persisted_report
+                .observed_model
+                .as_deref()
+                .is_some_and(|observed_model| {
+                    observed_model != expected_reviewer_model.base_model
+                        && observed_model != expected_reviewer_model.cli_model_arg
+                })
+            {
+                return Err(NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "persisted Codex Reviewer observed_model contradicts the pinned launch configuration",
+                ));
+            }
+            if persisted_report
+                .observed_effort
+                .as_deref()
+                .is_some_and(|observed_effort| {
+                    Some(observed_effort) != expected_reviewer_model.effort.as_deref()
+                })
+            {
+                return Err(NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "persisted Codex Reviewer observed_effort contradicts the pinned launch configuration",
+                ));
+            }
+        }
+        WorkerProvider::Antigravity | WorkerProvider::OpenCodeV2 => {
+            // Antigravity and OpenCode v2 retain strict runtime model/effort telemetry.
+            if persisted_report.observed_model.as_deref()
+                != Some(expected_reviewer_model.base_model.as_str())
+                || execution.effective_observed_model()
+                    != Some(expected_reviewer_model.base_model.as_str())
+            {
+                return Err(NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "persisted TaskReviewExecutionReport provider or model does not match frozen Reviewer model choice",
+                ));
+            }
+            if let Some(ref exp_rev_effort) = expected_reviewer_model.effort {
+                if persisted_report.observed_effort.as_deref() != Some(exp_rev_effort.as_str())
+                    || execution.effective_observed_effort() != Some(exp_rev_effort.as_str())
+                {
+                    return Err(NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        "persisted TaskReviewExecutionReport observed_effort does not match frozen Reviewer effort",
+                    ));
+                }
+            }
         }
     }
 
