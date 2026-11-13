@@ -12,13 +12,17 @@ import {
   type CodexChatTarget,
 } from './app-contract.ts';
 import type {
+  BacklogItem,
   ObservationCall,
   ObservationExecutor,
   ObservationRequest,
   ObservationSnapshot,
   ObservationSnapshotRequest,
   ObservationSource,
+  WorkspaceBacklogWorkerPresence,
   WorkspaceChatIdentity,
+  WorkspaceChatSummary,
+  WorkspaceChatWork,
   WorkspaceExternalResolution,
   WorkspaceJobHistory,
   WorkspaceJobSummary,
@@ -34,6 +38,7 @@ import {
   applyTrayPreferencesSaveResult,
   createInitialTrayPreferencesState,
   normalizeTrayErrorMessage,
+  projectMinimalTrayModel,
   projectTrayModel,
   TRAY_MAX_ROWS,
   TRAY_MAX_TERMINAL_RESULT_ROWS,
@@ -46,6 +51,7 @@ import {
   createUnavailableConfiguredSelection,
   createVerifiedConfiguredSelection,
   DEFAULT_WORKSPACE_SAMPLING_POLICY,
+  formatWorkspaceChatIdentityKey,
   MAX_WORKSPACE_MESSAGES_WINDOW,
   normalizeWorkspaceSnapshot,
   regenerateWorkspaceSnapshotAt,
@@ -195,6 +201,94 @@ function makeNativeSample(
       route: 'native_codex',
       diagnostic: null,
     },
+    ...overrides,
+  };
+}
+
+function makeChatSummary(
+  identity: WorkspaceChatIdentity,
+  overrides: Partial<WorkspaceChatSummary> = {}
+): WorkspaceChatSummary {
+  return {
+    identity,
+    thread_label: 'Minimal chat',
+    project_label: 'Threadlane',
+    availability: 'available',
+    activity: 'idle',
+    configured_selection: createUnavailableConfiguredSelection(),
+    active_job_count: 0,
+    attention_count: 0,
+    updated_at_ms: NOW_MS - 3_000,
+    ...overrides,
+  };
+}
+
+function makeBacklogItem(
+  identity: WorkspaceChatIdentity,
+  overrides: Partial<BacklogItem> = {}
+): BacklogItem {
+  return {
+    item_id: 'blg-minimal-1',
+    binding_id: identity.binding_id,
+    revision: 1,
+    title: 'Minimal backlog item',
+    acceptance_condition: 'The minimal slice is checked.',
+    delivery_description: 'A small reviewed change.',
+    kind: 'worker',
+    status: 'doing',
+    blocked_reason: null,
+    current_execution_ref: 'exec-1',
+    completion_note: null,
+    completion_evidence: null,
+    completed_at_ms: null,
+    created_at_ms: NOW_MS - 10_000,
+    updated_at_ms: NOW_MS - 4_000,
+    ...overrides,
+  };
+}
+
+function makeChatWork(
+  identity: WorkspaceChatIdentity,
+  overrides: Partial<WorkspaceChatWork> = {}
+): WorkspaceChatWork {
+  return {
+    identity,
+    availability: 'available',
+    items: [],
+    events: [],
+    worker_presence: [],
+    bounds: {
+      items_omitted: 0,
+      events_omitted: 0,
+      presence_omitted: 0,
+    },
+    ...overrides,
+  };
+}
+
+function makeWorkerPresence(
+  overrides: Partial<WorkspaceBacklogWorkerPresence> = {}
+): WorkspaceBacklogWorkerPresence {
+  const sampledAtMs = overrides.sampled_at_ms ?? NOW_MS - 1_000;
+  const maxSampleAgeMs = overrides.max_sample_age_ms ?? 15_000;
+  return {
+    item_id: 'blg-minimal-1',
+    execution_ref: 'exec-1',
+    approval_id: 'appr-minimal-1',
+    task_id: 'task-minimal-1',
+    run_id: 'run-minimal-1',
+    worker_id: 'worker-minimal-1',
+    claim_id: null,
+    host_instance_id: null,
+    invocation_id: null,
+    sequence: 1,
+    availability: 'live',
+    freshness: 'fresh',
+    live: true,
+    sampled_at_ms: sampledAtMs,
+    sample_age_ms: Math.max(0, NOW_MS - sampledAtMs),
+    max_sample_age_ms: maxSampleAgeMs,
+    expires_at_ms: sampledAtMs + maxSampleAgeMs,
     ...overrides,
   };
 }
@@ -364,6 +458,7 @@ function makeWorkspaceSnapshot(
     native_samples?: WorkspaceNativeSample[];
     job_histories?: WorkspaceJobHistory[];
     messages?: Partial<WorkspaceSnapshot['messages']>;
+    chat_work?: WorkspaceSnapshot['chat_work'];
   } = {}
 ): WorkspaceSnapshot {  const generatedAt = overrides.generated_at_ms ?? NOW_MS;
   return normalizeWorkspaceSnapshot({
@@ -396,6 +491,7 @@ function makeWorkspaceSnapshot(
       allows_synthetic_user_messages: false,
       ...overrides.messages,
     },
+    chat_work: overrides.chat_work ?? [],
     bounds: {
       native_samples_omitted: 0,
       job_histories_omitted: 0,
@@ -1716,4 +1812,599 @@ test('tray preferences transitions preserve confirmed value on save error and ha
   assert.equal(unavailableFromCommand.availability, 'unavailable');
   assert.equal(unavailableFromCommand.closeBehavior, 'hide_to_tray');
   assert.equal(unavailableFromCommand.error, null);
+});
+
+test('minimal tray never promotes legacy unknown, review, failed, or running jobs to NeedsYou or Working', () => {
+  const identity = makeIdentity();
+  const snapshot = makeWorkspaceSnapshot({
+    chats: [
+      makeChatSummary(identity, {
+        thread_label: 'Legacy chat',
+        project_label: 'Legacy project',
+      }),
+    ],
+    job_histories: [
+      makeJobHistory({
+        job_id: 'job-legacy-running',
+        title: 'Legacy running job',
+        state: 'running',
+        chat_identity: identity,
+      }),
+      makeJobHistory(
+        {
+          job_id: 'job-legacy-review',
+          title: 'Legacy review job',
+          state: 'reviewing',
+          chat_identity: identity,
+        },
+        {
+          current_attention: {
+            kind: 'review_required',
+            reason: 'Legacy review requires operator attention.',
+            next_step: null,
+            blocking_hold_ids: [],
+            blocking_outbox_ids: [],
+            question_id: null,
+            updated_at_ms: NOW_MS - 3_000,
+          },
+        }
+      ),
+      makeJobHistory({
+        job_id: 'job-legacy-failed',
+        title: 'Legacy failed job',
+        state: 'failed',
+        chat_identity: identity,
+      }),
+      makeJobHistory(
+        {
+          job_id: 'job-legacy-unknown',
+          title: 'Legacy unknown job',
+          state: 'unknown',
+          execution_status: 'unknown',
+          chat_identity: identity,
+        },
+        {
+          current_attention: {
+            kind: 'needs_user_input',
+            reason: 'Legacy job asks for input.',
+            next_step: null,
+            blocking_hold_ids: [],
+            blocking_outbox_ids: [],
+            question_id: null,
+            updated_at_ms: NOW_MS - 2_000,
+          },
+        }
+      ),
+    ],
+  });
+
+  const model = projectMinimalTrayModel(snapshot, { nowMs: NOW_MS });
+  assert.equal(model.status, 'empty');
+  assert.equal(model.workingCount, 0);
+  assert.equal(model.attentionCount, 0);
+  assert.deepEqual(model.rows, []);
+});
+
+test('minimal tray keeps Doing and awaiting-check backlog out of Working and NeedsYou without fresh proof', () => {
+  const identity = makeIdentity();
+  const item = makeBacklogItem(identity, {
+    item_id: 'blg-awaiting-check',
+    status: 'doing',
+    title: 'Awaiting Coworker check',
+  });
+  const snapshot = makeWorkspaceSnapshot({
+    chats: [makeChatSummary(identity, { thread_label: 'Pending check chat' })],
+    chat_work: [
+      makeChatWork(identity, {
+        items: [item],
+        events: [
+          {
+            event_id: `${item.item_id}:${item.revision}`,
+            sequence: 2,
+            item_id: item.item_id,
+            revision: item.revision,
+            action: 'worker_outcome_recorded',
+            recorded_at_ms: NOW_MS - 1_000,
+            title: item.title,
+            status: 'doing',
+            execution_ref: 'exec-1',
+            outcome: 'success',
+            note: null,
+          },
+        ],
+      }),
+    ],
+  });
+
+  const model = projectMinimalTrayModel(snapshot, { nowMs: NOW_MS });
+  assert.equal(model.status, 'empty');
+  assert.equal(model.workingCount, 0);
+  assert.equal(model.attentionCount, 0);
+  assert.deepEqual(model.rows, []);
+});
+
+test('minimal tray surfaces only fresh Coworker and exact Worker presence as Working and keeps the row cap', () => {
+  const identity = makeIdentity();
+  const workerSpecs = [1, 2, 3].map((index) => ({
+    itemId: `blg-worker-${index}`,
+    executionRef: `exec-worker-${index}`,
+    title: `Worker slice ${index}`,
+    sampledAtMs: NOW_MS - (index + 1) * 1_000,
+  }));
+  const snapshot = makeWorkspaceSnapshot({
+    chats: [makeChatSummary(identity, { thread_label: 'Mixed live chat' })],
+    native_samples: [
+      makeNativeSample({
+        chat_identity: identity,
+        activity: 'working',
+        observed_at_ms: NOW_MS - 1_000,
+        last_success_at_ms: NOW_MS - 1_000,
+      }),
+    ],
+    chat_work: [
+      makeChatWork(identity, {
+        items: workerSpecs.map((spec) =>
+          makeBacklogItem(identity, {
+            item_id: spec.itemId,
+            title: spec.title,
+            current_execution_ref: spec.executionRef,
+          })
+        ),
+        worker_presence: workerSpecs.map((spec) =>
+          makeWorkerPresence({
+            item_id: spec.itemId,
+            execution_ref: spec.executionRef,
+            sampled_at_ms: spec.sampledAtMs,
+          })
+        ),
+      }),
+    ],
+  });
+
+  const model = projectMinimalTrayModel(snapshot, { nowMs: NOW_MS });
+  assert.equal(model.status, 'ready');
+  assert.equal(model.workingCount, 4);
+  assert.equal(model.attentionCount, 0);
+  assert.equal(model.rows.length, TRAY_MAX_ROWS);
+  assert.ok(model.rows.every((row) => row.category === 'working'));
+
+  const coworkerRows = model.rows.filter(
+    (row) => row.statusLabel === 'Coworker working'
+  );
+  assert.equal(coworkerRows.length, 1);
+  assert.match(coworkerRows[0]!.detail, /^Coworker · /);
+  assert.equal(coworkerRows[0]!.coworkerTone, 'working');
+  assert.equal(coworkerRows[0]!.jobId, null);
+  assert.equal(
+    model.rows.filter((row) => row.statusLabel === 'Worker running').length,
+    2
+  );
+});
+
+test('minimal tray clears Working for a terminal Done item even when old Worker presence is supplied', () => {
+  const identity = makeIdentity();
+  const doneItem = makeBacklogItem(identity, {
+    item_id: 'blg-finished',
+    title: 'Finished minimal slice',
+    status: 'done',
+    current_execution_ref: 'exec-finished',
+    completion_note: 'Finished and independently checked.',
+    completion_evidence: 'Acceptance evidence recorded.',
+    completed_at_ms: NOW_MS - 1_000,
+  });
+  const snapshot = makeWorkspaceSnapshot({
+    chats: [makeChatSummary(identity, { thread_label: 'Finished chat' })],
+    chat_work: [
+      makeChatWork(identity, {
+        items: [doneItem],
+        worker_presence: [
+          makeWorkerPresence({
+            item_id: doneItem.item_id,
+            execution_ref: 'exec-finished',
+            sampled_at_ms: NOW_MS - 500,
+          }),
+        ],
+      }),
+    ],
+  });
+
+  const model = projectMinimalTrayModel(snapshot, { nowMs: NOW_MS });
+  assert.equal(model.status, 'ready');
+  assert.equal(model.workingCount, 0);
+  assert.equal(model.attentionCount, 0);
+  assert.equal(model.rows.length, 1);
+
+  const row = model.rows[0]!;
+  assert.equal(row.category, 'result');
+  assert.equal(row.statusLabel, 'Done');
+  assert.equal(row.tone, 'success');
+  assert.equal(row.title, 'Finished chat');
+  assert.equal(row.detail, 'Finished and independently checked.');
+  assert.equal(row.jobId, null);
+  assert.equal(row.receiptId, null);
+  assert.deepEqual(row.evidenceRefs, []);
+  assert.deepEqual(row.externalResolutionTaskIds, []);
+  assert.deepEqual(row.historicalReceiptIds, []);
+  assert.equal(row.threadUuid, identity.thread_uuid);
+  assert.deepEqual(row.codexTarget, {
+    source_id: identity.source_id,
+    thread_uuid: identity.thread_uuid,
+    job_id: null,
+  });
+});
+
+test('minimal tray counts one NeedsYou per chat for actual fresh native waiting without promoting Blocked work', () => {
+  const identity = makeIdentity();
+  const blockedItem = makeBacklogItem(identity, {
+    item_id: 'blg-blocked',
+    title: 'Blocked backlog item',
+    status: 'blocked',
+    blocked_reason: 'Waiting on a dependency.',
+    updated_at_ms: NOW_MS - 2_000,
+  });
+  const snapshot = makeWorkspaceSnapshot({
+    chats: [makeChatSummary(identity, { thread_label: 'Waiting chat' })],
+    native_samples: [
+      makeNativeSample({
+        chat_identity: identity,
+        activity: 'waiting_for_approval',
+        observed_at_ms: NOW_MS - 1_000,
+        last_success_at_ms: NOW_MS - 1_000,
+      }),
+    ],
+    chat_work: [
+      makeChatWork(identity, {
+        items: [
+          blockedItem,
+          makeBacklogItem(identity, {
+            item_id: 'blg-pending-check',
+            status: 'doing',
+            title: 'Pending Coworker check',
+          }),
+        ],
+        worker_presence: [
+          makeWorkerPresence({
+            item_id: blockedItem.item_id,
+            execution_ref: 'exec-1',
+          }),
+        ],
+      }),
+    ],
+  });
+
+  const model = projectMinimalTrayModel(snapshot, { nowMs: NOW_MS });
+  assert.equal(model.workingCount, 0);
+  assert.equal(model.attentionCount, 1);
+  const needsRows = model.rows.filter(
+    (row) => row.category === 'needs_human'
+  );
+  assert.equal(needsRows.length, 1);
+  assert.equal(needsRows[0]!.statusLabel, 'Coworker awaiting approval');
+  assert.equal(needsRows[0]!.title, 'Waiting chat');
+  assert.equal(needsRows[0]!.tone, 'attention');
+  assert.ok(
+    model.rows.every(
+      (row) => row.statusLabel !== 'Worker running' && row.category !== 'working'
+    )
+  );
+  const resultRows = model.rows.filter((row) => row.category === 'result');
+  assert.equal(resultRows.length, 1);
+  assert.equal(resultRows[0]!.statusLabel, 'Blocked');
+});
+
+test('minimal tray suppresses live indicators on stale samples, expired presence, refresh failure, and missing data', () => {
+  const staleIdentity = makeIdentity({ thread_uuid: THREAD_UUID_1 });
+  const staleSnapshot = makeWorkspaceSnapshot({
+    chats: [makeChatSummary(staleIdentity, { thread_label: 'Stale chat' })],
+    native_samples: [
+      makeNativeSample({
+        chat_identity: staleIdentity,
+        activity: 'waiting_for_input',
+        observed_at_ms: NOW_MS - 60_000,
+        last_success_at_ms: NOW_MS - 60_000,
+      }),
+    ],
+  });
+  const staleModel = projectMinimalTrayModel(staleSnapshot, {
+    nowMs: NOW_MS,
+  });
+  assert.equal(staleModel.workingCount, 0);
+  assert.equal(staleModel.attentionCount, 0);
+  assert.deepEqual(staleModel.rows, []);
+  assert.equal(staleModel.isStale, true);
+  assert.match(staleModel.emptyMessage ?? '', /withheld/);
+
+  const expiredIdentity = makeIdentity({ thread_uuid: THREAD_UUID_2 });
+  const expiredItem = makeBacklogItem(expiredIdentity, {
+    item_id: 'blg-expired-worker',
+    current_execution_ref: 'exec-expired',
+  });
+  const expiredSnapshot = makeWorkspaceSnapshot({
+    chats: [makeChatSummary(expiredIdentity, { thread_label: 'Expired chat' })],
+    chat_work: [
+      makeChatWork(expiredIdentity, {
+        items: [expiredItem],
+        worker_presence: [
+          makeWorkerPresence({
+            item_id: expiredItem.item_id,
+            execution_ref: 'exec-expired',
+            sampled_at_ms: NOW_MS - 2_000,
+            expires_at_ms: NOW_MS - 1,
+          }),
+        ],
+      }),
+    ],
+  });
+  const expiredModel = projectMinimalTrayModel(expiredSnapshot, {
+    nowMs: NOW_MS,
+  });
+  assert.equal(expiredModel.workingCount, 0);
+  assert.equal(expiredModel.attentionCount, 0);
+  assert.deepEqual(expiredModel.rows, []);
+
+  const refreshIdentity = makeIdentity({ thread_uuid: THREAD_UUID_3 });
+  const refreshSnapshot = makeWorkspaceSnapshot({
+    chats: [makeChatSummary(refreshIdentity, { thread_label: 'Retained chat' })],
+    native_samples: [
+      makeNativeSample({
+        chat_identity: refreshIdentity,
+        activity: 'working',
+        observed_at_ms: NOW_MS - 1_000,
+        last_success_at_ms: NOW_MS - 1_000,
+      }),
+    ],
+  });
+  const retainedModel = projectMinimalTrayModel(refreshSnapshot, {
+    nowMs: NOW_MS,
+    error: 'IPC desktop_workspace_snapshot timed out',
+  });
+  assert.equal(retainedModel.workingCount, 0);
+  assert.equal(retainedModel.attentionCount, 0);
+  assert.deepEqual(retainedModel.rows, []);
+  assert.equal(retainedModel.isStale, true);
+  assert.match(retainedModel.emptyMessage ?? '', /withheld/);
+  assert.match(retainedModel.refreshError ?? '', /timed out/);
+
+  const emptyModel = projectMinimalTrayModel(makeWorkspaceSnapshot(), {
+    nowMs: NOW_MS,
+  });
+  assert.equal(emptyModel.status, 'empty');
+  assert.equal(emptyModel.workingCount, 0);
+  assert.equal(emptyModel.attentionCount, 0);
+  assert.deepEqual(emptyModel.rows, []);
+});
+
+test('minimal tray keeps same-thread chats isolated by full four-part identity and scoped Codex target', () => {
+  const alphaIdentity = makeIdentity({
+    binding_id: 'bind-alpha-scope',
+    canonical_project_scope: '/work/alpha',
+  });
+  const betaIdentity = makeIdentity({
+    binding_id: 'bind-beta-scope',
+    canonical_project_scope: '/work/beta',
+  });
+  const alphaItem = makeBacklogItem(alphaIdentity, {
+    item_id: 'blg-alpha',
+    title: 'Alpha-only work',
+    current_execution_ref: 'exec-alpha',
+  });
+  const betaItem = makeBacklogItem(betaIdentity, {
+    item_id: 'blg-beta',
+    title: 'Beta-only work',
+    current_execution_ref: 'exec-beta',
+  });
+  const snapshot = makeWorkspaceSnapshot({
+    chats: [
+      makeChatSummary(alphaIdentity, {
+        thread_label: 'Alpha chat',
+        project_label: 'Alpha project',
+      }),
+      makeChatSummary(betaIdentity, {
+        thread_label: 'Beta chat',
+        project_label: 'Beta project',
+      }),
+    ],
+    chat_work: [
+      makeChatWork(alphaIdentity, { items: [alphaItem] }),
+      makeChatWork(betaIdentity, {
+        items: [betaItem],
+        worker_presence: [
+          makeWorkerPresence({
+            item_id: betaItem.item_id,
+            execution_ref: 'exec-beta',
+          }),
+        ],
+      }),
+    ],
+  });
+
+  const model = projectMinimalTrayModel(snapshot, { nowMs: NOW_MS });
+  assert.equal(model.workingCount, 1);
+  assert.equal(model.rows.length, 1);
+  const row = model.rows[0]!;
+  assert.equal(row.title, 'Beta chat');
+  assert.equal(row.projectLabel, 'Beta project');
+  assert.equal(row.chatLabel, 'Beta chat');
+  assert.deepEqual(row.chatIdentity, betaIdentity);
+  assert.deepEqual(row.codexTarget, {
+    source_id: betaIdentity.source_id,
+    thread_uuid: betaIdentity.thread_uuid,
+    job_id: null,
+  });
+  assert.equal(model.rows.some((entry) => entry.title === 'Alpha chat'), false);
+  assert.equal(JSON.stringify(row).includes('Alpha'), false);
+});
+
+test('minimal tray preserves loading, unavailable, and partial source failure handling', () => {
+  const loading = projectMinimalTrayModel(null, {
+    loading: true,
+    nowMs: NOW_MS,
+  });
+  assert.equal(loading.status, 'loading');
+  assert.equal(loading.workingCount, null);
+  assert.equal(loading.attentionCount, null);
+
+  const unavailable = projectMinimalTrayModel(null, { nowMs: NOW_MS });
+  assert.equal(unavailable.status, 'unavailable');
+  assert.equal(unavailable.workingCount, null);
+  assert.equal(unavailable.attentionCount, null);
+
+  const identity = makeIdentity({ thread_uuid: THREAD_UUID_3 });
+  const snapshot = makeWorkspaceSnapshot({
+    observation: {
+      sources: [
+        makeSource({ id: 'src-main', label: 'Threadlane Main' }),
+        makeSource({
+          id: 'src-broken',
+          label: 'Secondary Repo',
+          project_path: '/work/secondary-broken',
+          availability: 'unavailable',
+          message: 'Permission denied reading runtime ledger',
+        }),
+      ],
+    },
+    chats: [makeChatSummary(identity, { thread_label: 'Healthy chat' })],
+    native_samples: [
+      makeNativeSample({
+        chat_identity: identity,
+        activity: 'working',
+        observed_at_ms: NOW_MS - 1_000,
+        last_success_at_ms: NOW_MS - 1_000,
+      }),
+    ],
+  });
+
+  const partial = projectMinimalTrayModel(snapshot, { nowMs: NOW_MS });
+  assert.equal(partial.status, 'ready');
+  assert.equal(partial.workingCount, 1);
+  assert.equal(partial.attentionCount, 0);
+  assert.equal(partial.unavailableSourceCount, 1);
+  assert.match(partial.sourceNotice ?? '', /Secondary Repo/);
+  assert.match(partial.sourceNotice ?? '', /Permission denied/);
+  assert.doesNotMatch(partial.sourceNotice ?? '', /src-broken/);
+  assert.doesNotMatch(partial.sourceNotice ?? '', /\/work\/secondary-broken/);
+});
+
+test('minimal tray keeps archived live requests visible while hiding archived terminal-only rows', () => {
+  const archivedLiveIdentity = makeIdentity({
+    binding_id: 'bind-archived-live',
+    thread_uuid: THREAD_UUID_2,
+    canonical_project_scope: '/work/archived-live',
+  });
+  const archivedTerminalIdentity = makeIdentity({
+    binding_id: 'bind-archived-terminal',
+    thread_uuid: THREAD_UUID_3,
+    canonical_project_scope: '/work/archived-terminal',
+  });
+  const activeIdentity = makeIdentity({
+    binding_id: 'bind-active-live',
+    thread_uuid: THREAD_UUID_1,
+    canonical_project_scope: '/work/active-live',
+  });
+  const archivedLiveKey =
+    formatWorkspaceChatIdentityKey(archivedLiveIdentity);
+  const archivedTerminalKey =
+    formatWorkspaceChatIdentityKey(archivedTerminalIdentity);
+  if (archivedLiveKey === null || archivedTerminalKey === null) {
+    throw new Error('expected canonical archived chat keys');
+  }
+  const archivePreferences = {
+    [archivedLiveKey]: {
+      chat_key: archivedLiveKey,
+      identity: archivedLiveIdentity,
+      lifecycle: 'archived' as const,
+      updated_at_ms: NOW_MS - 1_000,
+    },
+    [archivedTerminalKey]: {
+      chat_key: archivedTerminalKey,
+      identity: archivedTerminalIdentity,
+      lifecycle: 'archived' as const,
+      updated_at_ms: NOW_MS - 1_000,
+    },
+  };
+
+  const archivedDoneItem = makeBacklogItem(archivedTerminalIdentity, {
+    item_id: 'blg-archived-done',
+    status: 'done',
+    current_execution_ref: null,
+    completion_note: 'Archived terminal item.',
+    completion_evidence: 'Archived acceptance evidence.',
+    completed_at_ms: NOW_MS - 2_000,
+    updated_at_ms: NOW_MS - 2_000,
+  });
+  const snapshot = makeWorkspaceSnapshot({
+    chats: [
+      makeChatSummary(archivedLiveIdentity, {
+        thread_label: 'Archived live chat',
+      }),
+      makeChatSummary(archivedTerminalIdentity, {
+        thread_label: 'Archived terminal chat',
+      }),
+      makeChatSummary(activeIdentity, {
+        thread_label: 'Active working chat',
+      }),
+    ],
+    native_samples: [
+      makeNativeSample({
+        chat_identity: archivedLiveIdentity,
+        activity: 'waiting_for_input',
+        observed_at_ms: NOW_MS - 1_000,
+        last_success_at_ms: NOW_MS - 1_000,
+      }),
+    ],
+    chat_work: [
+      makeChatWork(archivedTerminalIdentity, {
+        items: [archivedDoneItem],
+      }),
+      makeChatWork(activeIdentity, {
+        items: [
+          makeBacklogItem(activeIdentity, {
+            item_id: 'blg-active-worker',
+            current_execution_ref: 'exec-active',
+          }),
+        ],
+        worker_presence: [
+          makeWorkerPresence({
+            item_id: 'blg-active-worker',
+            execution_ref: 'exec-active',
+          }),
+        ],
+      }),
+    ],
+  });
+
+  const model = projectMinimalTrayModel(snapshot, {
+    nowMs: NOW_MS,
+    archivePreferences,
+  });
+  assert.equal(model.status, 'ready');
+  assert.equal(model.attentionCount, 1);
+  assert.equal(model.workingCount, 1);
+  assert.equal(model.rows.length, 2);
+  assert.equal(
+    model.rows.filter((row) => row.category === 'needs_human').length,
+    1
+  );
+  assert.equal(
+    model.rows.some(
+      (row) =>
+        row.title === 'Archived live chat' && row.category === 'needs_human'
+    ),
+    true
+  );
+  assert.equal(
+    model.rows.some(
+      (row) =>
+        row.title === 'Active working chat' && row.category === 'working'
+    ),
+    true
+  );
+  assert.equal(
+    model.rows.filter((row) => row.statusLabel === 'Done').length,
+    0
+  );
+  assert.equal(
+    model.rows.some((row) => row.title === 'Archived terminal chat'),
+    false
+  );
 });

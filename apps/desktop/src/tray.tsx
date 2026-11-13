@@ -27,7 +27,7 @@ import { hasTauriRuntime } from './ipc.ts';
 import { ipcWorkspaceSnapshot } from './observation/ipc.ts';
 import {
   normalizeTrayErrorMessage,
-  projectTrayModel,
+  projectMinimalTrayModel,
   TRAY_ACTION_COMMAND,
   TRAY_OPEN_EVENT,
   TRAY_REFRESH_INTERVAL_MS,
@@ -635,7 +635,7 @@ function LiveTrayPopoverApp() {
 
   const projection = useMemo(
     () =>
-      projectTrayModel(coordState.snapshot, {
+      projectMinimalTrayModel(coordState.snapshot, {
         loading: coordState.loading,
         error: coordState.error,
         nowMs: currentNowMs,

@@ -34,6 +34,12 @@ import {
   type WorkspaceJobView,
   type WorkspaceSelectedChatProjection,
 } from './app-model.ts';
+import {
+  buildChatWorkLivenessIndex,
+  readWorkspaceChatWork,
+  type ChatWorkItem,
+  type ChatWorkLiveness,
+} from './message-scroll.ts';
 import type {
   ObservationJob,
   ObservationSnapshotRequest,
@@ -41,7 +47,10 @@ import type {
 } from './observation/types.ts';
 import { formatRelativeTime } from './pages/activity-feed-model.ts';
 import {
+  formatWorkspaceChatIdentityKey,
   normalizeWorkspaceSnapshot,
+  readWorkspaceChatArchivePreferences,
+  resolveWorkspaceChatLifecycle,
   sanitizeWorkspaceSummary,
   validateCorrelationId,
 } from './workspace-contract.ts';
@@ -973,6 +982,76 @@ function sortRawCandidates(candidates: RawTrayCandidate[]): RawTrayCandidate[] {
   });
 }
 
+function buildTrayRowViews(
+  orderedCandidates: readonly RawTrayCandidate[],
+  referenceNowMs: number
+): TrayRowView[] {
+  const metaBySafeId = new Map<string, CandidateRowMeta>();
+  const compactInputs: WorkspaceCompactTrayRow[] = orderedCandidates.map(
+    (candidate, index) => {
+      const safeId = `tray.${candidate.kind}.${String(index + 1).padStart(4, '0')}`;
+      metaBySafeId.set(safeId, candidate.meta);
+      return {
+        id: safeId,
+        kind: candidate.kind,
+        title: candidate.title,
+        detail: candidate.detail,
+        updated_at_ms: candidate.updatedAtMs,
+        chat_identity: candidate.chatIdentity,
+        job_id: candidate.jobId,
+      };
+    }
+  );
+
+  const boundedCompactRows = boundWorkspaceCompactTrayRows(compactInputs);
+  return boundedCompactRows.map((row) => {
+    const meta = metaBySafeId.get(row.id) ?? {
+      tone: 'neutral' as const,
+      projectLabel: 'Project',
+      chatLabel: 'Codex chat',
+      statusLabel: 'Recorded',
+      coworkerLabel: null,
+      coworkerTone: null,
+      ageLabel: formatAgeLabel(row.updated_at_ms, referenceNowMs),
+      receiptMeta: emptyCandidateReceiptMeta(),
+    };
+    const codexTarget: CodexChatTarget | null =
+      row.chat_identity !== null
+        ? validateTrayCodexChatTarget({
+            source_id: row.chat_identity.source_id,
+            thread_uuid: row.chat_identity.thread_uuid,
+            job_id: row.job_id,
+          })
+        : null;
+
+    return {
+      key: row.id,
+      category: row.kind,
+      tone: meta.tone,
+      title: row.title,
+      projectLabel: meta.projectLabel,
+      chatLabel: meta.chatLabel,
+      statusLabel: meta.statusLabel,
+      coworkerLabel: meta.coworkerLabel,
+      coworkerTone: meta.coworkerTone,
+      detail: row.detail,
+      updatedAtMs: row.updated_at_ms,
+      ageLabel: meta.ageLabel,
+      chatIdentity: row.chat_identity,
+      threadUuid: row.chat_identity?.thread_uuid ?? null,
+      jobId: row.job_id,
+      codexTarget,
+      receiptId: meta.receiptMeta.receiptId,
+      evidenceRefs: [...meta.receiptMeta.evidenceRefs],
+      externalResolutionScope: meta.receiptMeta.externalResolutionScope,
+      externalResolutionTaskIds: [
+        ...meta.receiptMeta.externalResolutionTaskIds,
+      ],
+      historicalReceiptIds: [...meta.receiptMeta.historicalReceiptIds],
+    };
+  });
+}
+
 /**
  * Projects a typed `WorkspaceSnapshot` into the compact 3-row tray model.
  *
@@ -1845,70 +1924,10 @@ export function projectTrayModel(
     ...sortRawCandidates(selectedResultPool),
   ];
 
-  const metaBySafeId = new Map<string, CandidateRowMeta>();
-  const compactInputs: WorkspaceCompactTrayRow[] = orderedCandidates.map(
-    (candidate, index) => {
-      const safeId = `tray.${candidate.kind}.${String(index + 1).padStart(4, '0')}`;
-      metaBySafeId.set(safeId, candidate.meta);
-      return {
-        id: safeId,
-        kind: candidate.kind,
-        title: candidate.title,
-        detail: candidate.detail,
-        updated_at_ms: candidate.updatedAtMs,
-        chat_identity: candidate.chatIdentity,
-        job_id: candidate.jobId,
-      };
-    }
+  const rows: TrayRowView[] = buildTrayRowViews(
+    orderedCandidates,
+    referenceNowMs
   );
-
-  const boundedCompactRows = boundWorkspaceCompactTrayRows(compactInputs);
-  const rows: TrayRowView[] = boundedCompactRows.map((row) => {
-    const meta = metaBySafeId.get(row.id) ?? {
-      tone: 'neutral' as const,
-      projectLabel: 'Project',
-      chatLabel: 'Codex chat',
-      statusLabel: 'Recorded',
-      coworkerLabel: null,
-      coworkerTone: null,
-      ageLabel: formatAgeLabel(row.updated_at_ms, referenceNowMs),
-      receiptMeta: emptyCandidateReceiptMeta(),
-    };
-    const codexTarget: CodexChatTarget | null =
-      row.chat_identity !== null
-        ? validateTrayCodexChatTarget({
-            source_id: row.chat_identity.source_id,
-            thread_uuid: row.chat_identity.thread_uuid,
-            job_id: row.job_id,
-          })
-        : null;
-
-    return {
-      key: row.id,
-      category: row.kind,
-      tone: meta.tone,
-      title: row.title,
-      projectLabel: meta.projectLabel,
-      chatLabel: meta.chatLabel,
-      statusLabel: meta.statusLabel,
-      coworkerLabel: meta.coworkerLabel,
-      coworkerTone: meta.coworkerTone,
-      detail: row.detail,
-      updatedAtMs: row.updated_at_ms,
-      ageLabel: meta.ageLabel,
-      chatIdentity: row.chat_identity,
-      threadUuid: row.chat_identity?.thread_uuid ?? null,
-      jobId: row.job_id,
-      codexTarget,
-      receiptId: meta.receiptMeta.receiptId,
-      evidenceRefs: [...meta.receiptMeta.evidenceRefs],
-      externalResolutionScope: meta.receiptMeta.externalResolutionScope,
-      externalResolutionTaskIds: [
-        ...meta.receiptMeta.externalResolutionTaskIds,
-      ],
-      historicalReceiptIds: [...meta.receiptMeta.historicalReceiptIds],
-    };
-  });
 
   const coworkerSummary = buildAggregateCoworkerSummary(coworkerDescriptors);
   const headerStatusLabel = formatTrayHeaderSummary(
@@ -1967,6 +1986,432 @@ export function projectTrayModel(
     coworkerSummary,
     rows,
     historicalReceipts,
+    emptyMessage: null,
+    unavailableReason: null,
+  };
+}
+
+interface MinimalTrayChatMeta {
+  identity: WorkspaceChatIdentity;
+  threadLabel: string;
+  projectLabel: string;
+  lifecycle: 'active' | 'archived';
+  updatedAtMs: number | null;
+}
+
+function latestCommittedMinimalTrayItem(
+  items: readonly ChatWorkItem[]
+): ChatWorkItem | null {
+  let latest: ChatWorkItem | null = null;
+  let latestAtMs = Number.MIN_SAFE_INTEGER;
+  for (const item of items) {
+    if (item.status !== 'done' && item.status !== 'blocked') {
+      continue;
+    }
+    const atMs =
+      item.status === 'done'
+        ? (item.completed_at_ms ?? item.updated_at_ms)
+        : item.updated_at_ms;
+    const sortAtMs = atMs ?? Number.MIN_SAFE_INTEGER;
+    if (latest === null || sortAtMs > latestAtMs) {
+      latest = item;
+      latestAtMs = sortAtMs;
+      continue;
+    }
+    if (
+      sortAtMs === latestAtMs &&
+      (item.revision > latest.revision ||
+        (item.revision === latest.revision && item.item_id > latest.item_id))
+    ) {
+      latest = item;
+    }
+  }
+  return latest;
+}
+
+function resolveMinimalTrayAgentUpdatedAtMs(
+  liveness: ChatWorkLiveness,
+  agent: ChatWorkLiveness['agents'][number],
+  sample: WorkspaceSnapshot['native_samples'][number] | null,
+  fallbackUpdatedAtMs: number | null
+): number | null {
+  if (agent.role === 'coworker') {
+    return (
+      sample?.last_success_at_ms ??
+      sample?.observed_at_ms ??
+      fallbackUpdatedAtMs
+    );
+  }
+  const item =
+    agent.itemId !== null
+      ? liveness.items.find((candidate) => candidate.item_id === agent.itemId)
+      : undefined;
+  const presence =
+    item !== undefined
+      ? liveness.presence.find(
+          (candidate) =>
+            candidate.item_id === item.item_id &&
+            candidate.execution_ref === item.current_execution_ref
+        )
+      : undefined;
+  return (
+    presence?.sampled_at_ms ??
+    item?.updated_at_ms ??
+    fallbackUpdatedAtMs
+  );
+}
+
+/**
+ * Minimal chat-centered tray projection.
+ *
+ * This projection deliberately ignores legacy jobs, requests, blockers, unknown
+ * outcomes, and unaccepted results. It reuses the shared chat-work liveness helpers
+ * so only fresh native Coworker waiting/working state and exact fresh Worker
+ * presence can create live indicators. Durable `Done` and `Blocked` backlog items
+ * may appear only as terminal result rows and never as `NeedsYou` or `Working`.
+ */
+export function projectMinimalTrayModel(
+  snapshot: WorkspaceSnapshot | null,
+  options: TrayProjectionOptions = {}
+): TrayProjection {
+  const rawError = trimOrNull(options.error);
+  const errorText =
+    rawError !== null ? normalizeTrayErrorMessage(rawError) : null;
+
+  if (snapshot === null) {
+    if (options.loading && errorText === null) {
+      return {
+        status: 'loading',
+        headerStatusLabel: 'Loading status…',
+        workingCount: null,
+        attentionCount: null,
+        pendingAcceptanceCount: 0,
+        unavailableSourceCount: 0,
+        isStale: false,
+        refreshError: null,
+        sourceNotice: null,
+        coworkerSummary: null,
+        rows: [],
+        historicalReceipts: [],
+        emptyMessage: null,
+        unavailableReason: null,
+      };
+    }
+    return makeUnavailableProjection(
+      errorText ?? 'Workspace snapshot is not available.'
+    );
+  }
+
+  const normalizedSnapshot = normalizeWorkspaceSnapshot(snapshot);
+  const archivePreferences: WorkspaceChatArchivePreferenceMap =
+    options.archivePreferences ??
+    (options.preferenceStorage
+      ? readWorkspaceChatArchivePreferences(options.preferenceStorage)
+      : {});
+  const workspace = projectWorkspaceSnapshot(normalizedSnapshot, {
+    nowMs: options.nowMs,
+    loading: options.loading,
+    error: errorText,
+    archivePreferences,
+  });
+
+  const sources = normalizedSnapshot.observation.sources;
+  const unavailableSourceCount = workspace.unavailableSourceCount;
+  const availableSourceCount = sources.filter(
+    (src) => src.availability === 'available'
+  ).length;
+  const totalChatCount =
+    workspace.activeChatCount + workspace.archivedChatCount;
+
+  if (
+    workspace.status === 'unavailable' ||
+    sources.length === 0 ||
+    availableSourceCount === 0 ||
+    (errorText !== null && totalChatCount === 0)
+  ) {
+    const firstUnavailableMsg = trimOrNull(
+      workspace.unavailableSources[0]?.rawMessage
+    );
+    return makeUnavailableProjection(
+      errorText ??
+        firstUnavailableMsg ??
+        workspace.unavailableReason ??
+        'No reachable workspace observation source is currently available.',
+      unavailableSourceCount
+    );
+  }
+
+  const referenceNowMs = workspace.referenceNowMs;
+  const chatMetaByKey = new Map<string, MinimalTrayChatMeta>();
+  const addChatMeta = (
+    identity: WorkspaceChatIdentity,
+    threadLabel: string | null | undefined,
+    projectLabel: string | null | undefined,
+    lifecycle: 'active' | 'archived',
+    updatedAtMs: number | null
+  ): void => {
+    const chatKey = formatWorkspaceChatIdentityKey(identity);
+    if (chatKey === null || chatMetaByKey.has(chatKey)) {
+      return;
+    }
+    chatMetaByKey.set(chatKey, {
+      identity,
+      threadLabel: trimOrNull(threadLabel) ?? 'Codex chat',
+      projectLabel: trimOrNull(projectLabel) ?? 'Project',
+      lifecycle,
+      updatedAtMs,
+    });
+  };
+
+  for (const project of workspace.activeProjects) {
+    for (const chat of project.chats) {
+      addChatMeta(
+        chat.identity,
+        chat.threadLabel,
+        chat.projectLabel,
+        'active',
+        chat.updatedAtMs
+      );
+    }
+  }
+  for (const project of workspace.archivedProjects) {
+    for (const chat of project.chats) {
+      addChatMeta(
+        chat.identity,
+        chat.threadLabel,
+        chat.projectLabel,
+        'archived',
+        chat.updatedAtMs
+      );
+    }
+  }
+  for (const work of normalizedSnapshot.chat_work) {
+    addChatMeta(
+      work.identity,
+      null,
+      null,
+      resolveWorkspaceChatLifecycle(archivePreferences, work.identity),
+      null
+    );
+  }
+  for (const sample of normalizedSnapshot.native_samples) {
+    addChatMeta(
+      sample.chat_identity,
+      null,
+      null,
+      resolveWorkspaceChatLifecycle(archivePreferences, sample.chat_identity),
+      sample.observed_at_ms
+    );
+  }
+
+  const nativeSampleByKey = new Map<
+    string,
+    WorkspaceSnapshot['native_samples'][number]
+  >();
+  for (const sample of normalizedSnapshot.native_samples) {
+    const chatKey = formatWorkspaceChatIdentityKey(sample.chat_identity);
+    if (chatKey !== null && !nativeSampleByKey.has(chatKey)) {
+      nativeSampleByKey.set(chatKey, sample);
+    }
+  }
+
+  const livenessIndex = buildChatWorkLivenessIndex(
+    readWorkspaceChatWork(normalizedSnapshot),
+    normalizedSnapshot.native_samples,
+    {
+      nowMs: referenceNowMs,
+      staleThresholdMs: normalizedSnapshot.sampling_policy.stale_threshold_ms,
+      isStale: workspace.isStale,
+      refreshFailed: errorText !== null,
+    }
+  );
+
+  const needsHumanCandidates: RawTrayCandidate[] = [];
+  const workingCandidates: RawTrayCandidate[] = [];
+  const resultCandidates: RawTrayCandidate[] = [];
+  let workingCount = 0;
+  let attentionCount = 0;
+  let hasStaleCoworker = false;
+
+  for (const [chatKey, liveness] of livenessIndex.entries()) {
+    if (liveness.identity === null) {
+      continue;
+    }
+    const meta = chatMetaByKey.get(chatKey);
+    if (meta === undefined) {
+      continue;
+    }
+    const sample = nativeSampleByKey.get(chatKey) ?? null;
+    if (
+      liveness.coworker.samplePresent &&
+      (liveness.coworker.freshness === 'stale' ||
+        liveness.coworker.availability === 'stale')
+    ) {
+      hasStaleCoworker = true;
+    }
+
+    if (liveness.waitingForHuman) {
+      attentionCount += 1;
+      const updatedAtMs =
+        sample?.last_success_at_ms ?? sample?.observed_at_ms ?? meta.updatedAtMs;
+      const awaitingApproval =
+        liveness.coworker.activity === 'waiting_for_approval';
+      const statusLabel = awaitingApproval
+        ? 'Coworker awaiting approval'
+        : 'Coworker waiting for input';
+      needsHumanCandidates.push({
+        sortPriority: 0,
+        updatedAtMs,
+        tieKey: `${chatKey}\u0000minimal_waiting`,
+        kind: 'needs_human',
+        title: meta.threadLabel,
+        detail: awaitingApproval
+          ? 'Approval requested in Codex chat.'
+          : 'Input requested in Codex chat.',
+        chatIdentity: meta.identity,
+        jobId: null,
+        meta: {
+          tone: 'attention',
+          projectLabel: meta.projectLabel,
+          chatLabel: meta.threadLabel,
+          statusLabel,
+          coworkerLabel: statusLabel,
+          coworkerTone: 'attention',
+          ageLabel: formatAgeLabel(updatedAtMs, referenceNowMs),
+          receiptMeta: emptyCandidateReceiptMeta(),
+        },
+      });
+    }
+
+    if (liveness.workingAgentCount > 0) {
+      workingCount += liveness.workingAgentCount;
+      for (const agent of liveness.agents) {
+        if (!agent.working) {
+          continue;
+        }
+        const updatedAtMs = resolveMinimalTrayAgentUpdatedAtMs(
+          liveness,
+          agent,
+          sample,
+          meta.updatedAtMs
+        );
+        const isCoworker = agent.role === 'coworker';
+        const statusLabel = isCoworker ? 'Coworker working' : 'Worker running';
+        workingCandidates.push({
+          sortPriority: 0,
+          updatedAtMs,
+          tieKey: `${chatKey}\u0000minimal_agent\u0000${agent.key}`,
+          kind: 'working',
+          title: meta.threadLabel,
+          detail: `${agent.roleLabel} · ${agent.detail}`,
+          chatIdentity: meta.identity,
+          jobId: null,
+          meta: {
+            tone: 'working',
+            projectLabel: meta.projectLabel,
+            chatLabel: meta.threadLabel,
+            statusLabel,
+            coworkerLabel: isCoworker ? statusLabel : null,
+            coworkerTone: isCoworker ? 'working' : null,
+            ageLabel: formatAgeLabel(updatedAtMs, referenceNowMs),
+            receiptMeta: emptyCandidateReceiptMeta(),
+          },
+        });
+      }
+    }
+
+    if (meta.lifecycle !== 'active') {
+      continue;
+    }
+    const terminalItem = latestCommittedMinimalTrayItem(liveness.items);
+    if (terminalItem === null) {
+      continue;
+    }
+    const isDone = terminalItem.status === 'done';
+    const updatedAtMs = isDone
+      ? (terminalItem.completed_at_ms ??
+        terminalItem.updated_at_ms ??
+        meta.updatedAtMs)
+      : (terminalItem.updated_at_ms ?? meta.updatedAtMs);
+    const statusLabel = isDone ? 'Done' : 'Blocked';
+    resultCandidates.push({
+      sortPriority: 0,
+      updatedAtMs,
+      tieKey: `${chatKey}\u0000minimal_backlog\u0000${terminalItem.item_id}\u0000${terminalItem.revision}`,
+      kind: 'result',
+      title: meta.threadLabel,
+      detail: isDone
+        ? (trimOrNull(terminalItem.completion_note) ??
+          trimOrNull(terminalItem.title) ??
+          'Backlog item completed.')
+        : (trimOrNull(terminalItem.blocked_reason) ??
+          trimOrNull(terminalItem.title) ??
+          'Backlog item blocked.'),
+      chatIdentity: meta.identity,
+      jobId: null,
+      meta: {
+        tone: isDone ? 'success' : 'danger',
+        projectLabel: meta.projectLabel,
+        chatLabel: meta.threadLabel,
+        statusLabel,
+        coworkerLabel: null,
+        coworkerTone: null,
+        ageLabel: formatAgeLabel(updatedAtMs, referenceNowMs),
+        receiptMeta: emptyCandidateReceiptMeta(),
+      },
+    });
+  }
+
+  const orderedCandidates = [
+    ...sortRawCandidates(needsHumanCandidates),
+    ...sortRawCandidates(workingCandidates),
+    ...sortRawCandidates(resultCandidates),
+  ];
+  const rows = buildTrayRowViews(orderedCandidates, referenceNowMs);
+  const headerStatusLabel = formatTrayHeaderSummary(
+    workingCount,
+    attentionCount
+  );
+  const isStale = workspace.isStale || hasStaleCoworker;
+  const sourceNotice = buildSourceFailureNotice(workspace.unavailableSources);
+
+  if (rows.length === 0 && workingCount === 0 && attentionCount === 0) {
+    return {
+      status: 'empty',
+      headerStatusLabel,
+      workingCount: 0,
+      attentionCount: 0,
+      pendingAcceptanceCount: 0,
+      unavailableSourceCount,
+      isStale,
+      refreshError: errorText,
+      sourceNotice,
+      coworkerSummary: null,
+      rows: [],
+      historicalReceipts: [],
+      emptyMessage:
+        totalChatCount === 0
+          ? 'No chats recorded yet.'
+          : isStale
+            ? 'Live chat indicators are withheld until a fresh sample arrives.'
+            : 'No current human requests or working agents.',
+      unavailableReason: null,
+    };
+  }
+
+  return {
+    status: 'ready',
+    headerStatusLabel,
+    workingCount,
+    attentionCount,
+    pendingAcceptanceCount: 0,
+    unavailableSourceCount,
+    isStale,
+    refreshError: errorText,
+    sourceNotice,
+    coworkerSummary: null,
+    rows,
+    historicalReceipts: [],
     emptyMessage: null,
     unavailableReason: null,
   };
