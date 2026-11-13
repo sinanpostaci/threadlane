@@ -8,6 +8,10 @@ use threadlane_workers::{
     CODEX_ADVISORY_DISABLED_FEATURES, CODEX_ADVISORY_PERMISSION_PROFILE_CONFIG,
 };
 
+/// Exact earlier bounded static read-only profile retained for successful historical planning
+/// artifacts. This is a literal persisted-evidence vector, not an alias to the current constant.
+const HISTORICAL_BOUNDED_READ_ONLY_PROFILE: &str = r#"permissions.threadlane-advisory={"filesystem"={"glob_scan_max_depth"=64,":minimal"="read",":workspace_roots"={"."="read","**/.env"="deny","**/.env.*"="deny","**/codex.toml"="deny","**/.codex.toml"="deny","**/.git"="deny","**/.git/**"="deny","**/.codex"="deny","**/.codex/**"="deny","**/.agents"="deny","**/.agents/**"="deny","**/.aws"="deny","**/.aws/**"="deny"},"/nix/store"="read"},"network"={"enabled"=false}}"#;
+
 // Historical wire shape: neither executed_executable nor codex_turn_lifecycle existed.
 // Launch pins and response/usage provenance are retained exactly; no current marker is fabricated.
 fn historical_json() -> Value {
@@ -112,6 +116,36 @@ fn historical_codex_advisory_json_remains_readable_only_through_persisted_valida
     assert!(roundtrip["execution"]["evidence"]
         .get("codex_turn_lifecycle")
         .is_none());
+}
+
+#[test]
+fn historical_bounded_static_profile_remains_exact_legacy_evidence_only() {
+    let mut wire = historical_json();
+    wire["execution"]["constructed_argv"][16] = json!(HISTORICAL_BOUNDED_READ_ONLY_PROFILE);
+    let artifact = deserialize(&wire);
+    assert!(artifact
+        .execution
+        .has_complete_legacy_codex_advisory_evidence());
+    assert!(artifact.validate_persisted_verified_response(4096).is_ok());
+
+    for weakened in [
+        HISTORICAL_BOUNDED_READ_ONLY_PROFILE.replace("\".\"=\"read\"", "\".\"=\"write\""),
+        HISTORICAL_BOUNDED_READ_ONLY_PROFILE.replace(
+            "network\"={\"enabled\"=false}",
+            "network\"={\"enabled\"=true}",
+        ),
+        HISTORICAL_BOUNDED_READ_ONLY_PROFILE
+            .replace("glob_scan_max_depth\"=64", "glob_scan_max_depth\"=128"),
+        HISTORICAL_BOUNDED_READ_ONLY_PROFILE.replace("\"**/.env\"=\"deny\",", ""),
+    ] {
+        let mut wire = historical_json();
+        wire["execution"]["constructed_argv"][16] = json!(weakened);
+        let rejected = deserialize(&wire);
+        assert!(!rejected
+            .execution
+            .has_complete_legacy_codex_advisory_evidence());
+        assert!(rejected.validate_persisted_verified_response(4096).is_err());
+    }
 }
 
 #[test]

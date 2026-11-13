@@ -9,6 +9,7 @@ use crate::fs_safety::{validate_absolute_no_symlink_components, validate_existin
 use crate::spec::{
     is_control_config_path, is_path_allowed_by_scopes, validate_repo_relative_path,
     validate_simple_identifier, ResolvedModelTarget, WorkerProvider, WriteScopeKind,
+    CODEX_ADVISORY_PERMISSION_PROFILE_NAME,
 };
 
 /// Documented Antigravity CLI read permission action identifier.
@@ -200,6 +201,36 @@ pub const CODEX_TASK_FILES_PROTECTED_DENY_PATTERNS: &[&str] = &[
     "**/.cargo/config",
     "**/.cargo/config.toml",
 ];
+
+/// Protected control directory names denied by the exact rendered
+/// `permissions.threadlane-advisory` frontier at the workspace root and at any nested depth.
+pub const CODEX_ADVISORY_PROTECTED_DIRECTORY_NAMES: [&str; 4] =
+    [".git", ".aws", ".agents", ".codex"];
+
+/// Protected secret and project-configuration file names denied by the exact rendered
+/// `permissions.threadlane-advisory` frontier at the workspace root and at any nested depth.
+///
+/// `.env.*` names are additionally matched by [`build_codex_advisory_exact_permission_profile_config`]
+/// through the `.env.` prefix.
+pub const CODEX_ADVISORY_PROTECTED_FILE_NAMES: [&str; 3] = [".env", "codex.toml", ".codex.toml"];
+
+/// Root protected entries that remain mandatory exact deny rules even when absent at launch.
+///
+/// This preserves the historical fixed root `.git`/`.aws`/`.agents`/`.codex` deny intent and the
+/// fixed root secret/config names without reintroducing glob rules or descendant expansion.
+pub const CODEX_ADVISORY_MANDATORY_ROOT_DENY_PATHS: [&str; 7] = [
+    ".git",
+    ".aws",
+    ".agents",
+    ".codex",
+    ".env",
+    "codex.toml",
+    ".codex.toml",
+];
+
+/// Maximum number of exact deny rules permitted in a rendered
+/// `permissions.threadlane-advisory` frontier before the profile is rejected.
+pub const CODEX_ADVISORY_MAX_EXACT_DENY_RULES: usize = 4_096;
 
 /// Project-local Codex configuration and hook path names that must not exist in or above a
 /// [`WorkerProvider::CodexCli`] read-only advisory or `TaskFiles` working directory.
@@ -702,14 +733,29 @@ pub fn validate_advisory_read_only_workdir(
 ///    - any nested project-local Codex configuration marker ([`CODEX_PROJECT_CONFIG_MARKERS`]).
 ///
 /// No subdirectories are skipped or pruned during traversal: all directories (including `.git`/`.GIT`,
-/// `.aws`, and `.agents`) are traversed and enforced against the depth and entry bounds because
-/// finite recursive protected-glob expansion remains depth-bounded and cannot cover arbitrarily
-/// deep nested protected trees.
+/// `.aws`, and `.agents`) are traversed and enforced against the depth and entry bounds, including
+/// descendants of protected ancestors that are later omitted from the rendered exact deny
+/// frontier. [`collect_codex_advisory_deny_frontiers`] returns those exact frontiers alongside the
+/// canonical workdir.
 pub fn validate_codex_advisory_workdir(working_directory: &Path) -> Result<PathBuf, WorkerError> {
+    Ok(collect_codex_advisory_deny_frontiers(working_directory)?.0)
+}
+
+/// Validates `working_directory` exactly as [`validate_codex_advisory_workdir`] and returns the
+/// canonical workdir together with its deterministic exact protected deny frontiers.
+///
+/// The single unpruned bounded preflight walks every entry (including protected subtrees) and
+/// both validates and counts it. A protected entry is added to the returned set only when no
+/// already-captured protected ancestor covers it, so `.git` alone denies its whole observed
+/// snapshot without emitting per-file descendant rules. Root entries in
+/// [`CODEX_ADVISORY_MANDATORY_ROOT_DENY_PATHS`] are always present.
+pub fn collect_codex_advisory_deny_frontiers(
+    working_directory: &Path,
+) -> Result<(PathBuf, BTreeSet<String>), WorkerError> {
     let canonical_workdir = validate_advisory_read_only_workdir(working_directory)?;
     ensure_no_codex_project_config_in_hierarchy(&canonical_workdir)?;
-    validate_codex_advisory_workdir_tree(&canonical_workdir)?;
-    Ok(canonical_workdir)
+    let deny_frontiers = validate_codex_advisory_workdir_tree(&canonical_workdir)?;
+    Ok((canonical_workdir, deny_frontiers))
 }
 
 /// Validates `working_directory` for a [`WorkerProvider::CodexCli`] [`WorkerFilePermissions::TaskFiles`]
@@ -1061,8 +1107,338 @@ pub fn evaluate_codex_task_files_permission_profile_config(
     }
 }
 
-fn validate_codex_advisory_workdir_tree(canonical_workdir: &Path) -> Result<(), WorkerError> {
+fn validate_codex_advisory_exact_deny_key(path: &str) -> Result<(), WorkerError> {
+    let unrepresentable = |detail: &str| {
+        WorkerError::InvalidSpec(format!(
+            "Codex advisory exact deny frontier `{path}` is unrepresentable: {detail}"
+        ))
+    };
+    if path.is_empty() {
+        return Err(unrepresentable("empty key"));
+    }
+    if path.starts_with('/') || path.ends_with('/') || path.contains("//") {
+        return Err(unrepresentable(
+            "absolute, leading, trailing, or repeated path separators are not permitted",
+        ));
+    }
+    if path.contains('\\') || path.contains('\0') {
+        return Err(unrepresentable(
+            "backslash or NUL injection is not permitted",
+        ));
+    }
+    // Reject raw traversal segments before `Path::components` normalizes an internal `.` away.
+    if path.split('/').any(|segment| matches!(segment, "." | "..")) {
+        return Err(unrepresentable(
+            "raw `.` or `..` traversal segments are not permitted",
+        ));
+    }
+
+    let mut component_count = 0usize;
+    for component in Path::new(path).components() {
+        match component {
+            Component::Normal(part) => {
+                let text = part.to_string_lossy();
+                if text.is_empty() || text.chars().any(char::is_control) {
+                    return Err(unrepresentable("empty or control-character component"));
+                }
+                component_count += 1;
+            }
+            Component::CurDir
+            | Component::ParentDir
+            | Component::RootDir
+            | Component::Prefix(_) => {
+                return Err(unrepresentable(
+                    "`.` or `..` traversal or non-relative component",
+                ))
+            }
+        }
+    }
+    if component_count == 0 {
+        return Err(unrepresentable("empty path"));
+    }
+    if component_count > CODEX_ADVISORY_MAX_WORKDIR_DEPTH {
+        return Err(WorkerError::InvalidSpec(format!(
+            "Codex advisory exact deny frontier `{path}` exceeds maximum workdir depth {CODEX_ADVISORY_MAX_WORKDIR_DEPTH}"
+        )));
+    }
+    if let Some(bad_ch) = path
+        .chars()
+        .find(|&ch| is_unsafe_permission_pattern_char(ch))
+    {
+        return Err(WorkerError::InvalidSpec(format!(
+            "Codex advisory exact deny frontier `{path}` contains unrepresentable glob, control, or escape character {bad_ch:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn codex_advisory_has_deny_ancestor(accepted: &BTreeSet<String>, path: &str) -> bool {
+    let mut end = path.len();
+    while let Some(slash) = path[..end].rfind('/') {
+        if accepted.contains(&path[..slash]) {
+            return true;
+        }
+        end = slash;
+    }
+    false
+}
+
+fn codex_advisory_has_protected_ancestor(path: &str) -> bool {
+    let mut start = 0usize;
+    while let Some(offset) = path[start..].find('/') {
+        let component = &path[start..start + offset];
+        if is_codex_advisory_protected_entry_name(component) {
+            return true;
+        }
+        start += offset + 1;
+    }
+    false
+}
+
+fn escape_codex_advisory_exact_deny_key(key: &str) -> String {
+    let mut escaped = String::with_capacity(key.len() + 2);
+    escaped.push('"');
+    for ch in key.chars() {
+        match ch {
+            '"' => escaped.push_str("\\\""),
+            '\\' => escaped.push_str("\\\\"),
+            other => escaped.push(other),
+        }
+    }
+    escaped.push('"');
+    escaped
+}
+
+/// Renders the deterministic exact-frontier `permissions.threadlane-advisory` inline TOML
+/// profile for [`WorkerProvider::CodexCli`] read-only advisory launches.
+///
+/// The rendered profile preserves the `:minimal` read, canonical workspace `"."="read"`, and
+/// `/nix/store` read grants with `network.enabled=false`. It emits only exact, sorted,
+/// repository-relative deny keys: no globs, descendants of an already-denied protected ancestor,
+/// orphan descendants of protected ancestors, absolute paths, traversal components, control
+/// characters, or unrepresentable keys. Root
+/// [`CODEX_ADVISORY_MANDATORY_ROOT_DENY_PATHS`] are inserted even when absent. The result is
+/// rejected when the exact deny-rule count or serialized byte length exceeds its bound.
+pub fn build_codex_advisory_exact_permission_profile_config(
+    deny_frontiers: &BTreeSet<String>,
+) -> Result<String, WorkerError> {
+    let mut candidates: BTreeSet<String> = CODEX_ADVISORY_MANDATORY_ROOT_DENY_PATHS
+        .iter()
+        .map(|root| (*root).to_string())
+        .collect();
+    candidates.extend(deny_frontiers.iter().cloned());
+
+    let mut accepted = BTreeSet::new();
+    let mut rendered_rules = Vec::new();
+    for path in &candidates {
+        validate_codex_advisory_exact_deny_key(path)?;
+        if codex_advisory_has_deny_ancestor(&accepted, path) {
+            continue;
+        }
+        if codex_advisory_has_protected_ancestor(path) {
+            return Err(WorkerError::InvalidSpec(format!(
+                "Codex advisory exact deny frontier `{path}` is a descendant of a protected ancestor and is not a canonical frontier key"
+            )));
+        }
+        if accepted.len() >= CODEX_ADVISORY_MAX_EXACT_DENY_RULES {
+            return Err(WorkerError::InvalidSpec(format!(
+                "Codex advisory exact permission profile exceeds maximum deny-rule count of {CODEX_ADVISORY_MAX_EXACT_DENY_RULES}"
+            )));
+        }
+        accepted.insert(path.clone());
+        let escaped_key = escape_codex_advisory_exact_deny_key(path);
+        rendered_rules.push(format!("{escaped_key}=\"deny\""));
+    }
+
+    let workspace_rules = format!("\".\"=\"read\",{}", rendered_rules.join(","));
+    let config = format!(
+        "permissions.{profile}={{\"filesystem\"={{\"glob_scan_max_depth\"={depth},\":minimal\"=\"read\",\":workspace_roots\"={{{workspace_rules}}},\"/nix/store\"=\"read\"}},\"network\"={{\"enabled\"=false}}}}",
+        profile = CODEX_ADVISORY_PERMISSION_PROFILE_NAME,
+        depth = CODEX_ADVISORY_GLOB_SCAN_MAX_DEPTH,
+    );
+    if config.len() > MAX_TASK_FILES_SETTINGS_BYTES {
+        return Err(WorkerError::InvalidSpec(format!(
+            "serialized Codex advisory exact permission profile ({} bytes) exceeds maximum of {MAX_TASK_FILES_SETTINGS_BYTES} bytes",
+            config.len()
+        )));
+    }
+    Ok(config)
+}
+
+fn parse_codex_advisory_exact_deny_rules(rules_section: &str) -> Result<Vec<String>, WorkerError> {
+    let mut rules = Vec::new();
+    let mut idx = 0usize;
+    while idx < rules_section.len() {
+        let (key, next_idx) = parse_codex_advisory_toml_basic_string(rules_section, idx)?;
+        idx = next_idx;
+        let Some(after_value) = rules_section.get(idx..) else {
+            return Err(WorkerError::InvalidSpec(
+                "invalid Codex advisory exact permission profile rule boundary".to_string(),
+            ));
+        };
+        let Some(after_value) = after_value.strip_prefix("=\"deny\"") else {
+            return Err(WorkerError::InvalidSpec(format!(
+                "Codex advisory exact permission profile rule `{key}` must be denied"
+            )));
+        };
+        idx += "=\"deny\"".len();
+        rules.push(key);
+        if idx == rules_section.len() {
+            break;
+        }
+        let Some(after_separator) = after_value.strip_prefix(',') else {
+            return Err(WorkerError::InvalidSpec(
+                "Codex advisory exact permission profile rules must be comma-separated".to_string(),
+            ));
+        };
+        idx += 1;
+        if after_separator.is_empty() {
+            return Err(WorkerError::InvalidSpec(
+                "Codex advisory exact permission profile must not end with a trailing comma"
+                    .to_string(),
+            ));
+        }
+    }
+    if rules.is_empty() {
+        return Err(WorkerError::InvalidSpec(
+            "Codex advisory exact permission profile must contain exact deny rules".to_string(),
+        ));
+    }
+    Ok(rules)
+}
+
+fn parse_codex_advisory_toml_basic_string(
+    input: &str,
+    start: usize,
+) -> Result<(String, usize), WorkerError> {
+    let Some(opening) = input.get(start..) else {
+        return Err(WorkerError::InvalidSpec(
+            "invalid Codex advisory exact permission profile string boundary".to_string(),
+        ));
+    };
+    if !opening.starts_with('"') {
+        return Err(WorkerError::InvalidSpec(
+            "Codex advisory exact permission profile keys must be quoted".to_string(),
+        ));
+    }
+    let mut key = String::new();
+    let mut idx = start + 1;
+    while idx < input.len() {
+        let Some(ch) = input.get(idx..).and_then(|rest| rest.chars().next()) else {
+            break;
+        };
+        match ch {
+            '"' => return Ok((key, idx + 1)),
+            '\\' => {
+                let escape_start = idx + 1;
+                let Some(escaped) = input
+                    .get(escape_start..)
+                    .and_then(|rest| rest.chars().next())
+                else {
+                    return Err(WorkerError::InvalidSpec(
+                        "unterminated escape in Codex advisory exact permission profile key"
+                            .to_string(),
+                    ));
+                };
+                let decoded = match escaped {
+                    '\\' => '\\',
+                    '"' => '"',
+                    'n' => '\n',
+                    'r' => '\r',
+                    't' => '\t',
+                    _ => {
+                        return Err(WorkerError::InvalidSpec(
+                            "unsupported escape in Codex advisory exact permission profile key"
+                                .to_string(),
+                        ))
+                    }
+                };
+                key.push(decoded);
+                idx = escape_start + escaped.len_utf8();
+            }
+            ch if ch.is_control() => {
+                return Err(WorkerError::InvalidSpec(
+                    "raw control character in Codex advisory exact permission profile key"
+                        .to_string(),
+                ))
+            }
+            other => {
+                key.push(other);
+                idx += other.len_utf8();
+            }
+        }
+    }
+    Err(WorkerError::InvalidSpec(
+        "unterminated quoted key in Codex advisory exact permission profile".to_string(),
+    ))
+}
+
+/// Strictly parses and validates an exact-frontier `permissions.threadlane-advisory` inline TOML
+/// `-c` argument, returning its canonical deny-frontier set if and only if:
+/// 1. It uses the exact `threadlane-advisory` profile framing (`glob_scan_max_depth=64`,
+///    `:minimal="read"`, `"."="read"`, `/nix/store="read"`, `network.enabled=false`);
+/// 2. Every rule is an exact deny using a representable canonical repository-relative key;
+/// 3. All [`CODEX_ADVISORY_MANDATORY_ROOT_DENY_PATHS`] are present;
+/// 4. No key duplicates, traversal, absolute path, glob, control, redundant descendant of an
+///    already-denied protected ancestor, or orphan descendant of a protected ancestor is present;
+///    and
+/// 5. Re-rendering the parsed frontier reproduces `config_arg` byte-for-byte.
+///
+/// The known historical static profiles are intentionally not accepted here: they remain
+/// recognized only by [`crate::spec::is_pinned_codex_read_only_argv`] for persisted legacy evidence
+/// readability.
+pub fn parse_and_validate_codex_advisory_exact_permission_profile_config(
+    config_arg: &str,
+) -> Result<BTreeSet<String>, WorkerError> {
+    if config_arg.is_empty() || config_arg.len() > MAX_TASK_FILES_SETTINGS_BYTES {
+        return Err(WorkerError::InvalidSpec(
+            "invalid Codex advisory exact permission profile byte length".to_string(),
+        ));
+    }
+    let expected_prefix = format!(
+        "permissions.{profile}={{\"filesystem\"={{\"glob_scan_max_depth\"={depth},\":minimal\"=\"read\",\":workspace_roots\"={{\".\"=\"read\",",
+        profile = CODEX_ADVISORY_PERMISSION_PROFILE_NAME,
+        depth = CODEX_ADVISORY_GLOB_SCAN_MAX_DEPTH,
+    );
+    let expected_suffix = "},\"/nix/store\"=\"read\"},\"network\"={\"enabled\"=false}}";
+    let Some(after_prefix) = config_arg.strip_prefix(&expected_prefix) else {
+        return Err(WorkerError::InvalidSpec(
+            "Codex advisory exact permission profile is missing the required read-only framing"
+                .to_string(),
+        ));
+    };
+    let Some(rules_section) = after_prefix.strip_suffix(expected_suffix) else {
+        return Err(WorkerError::InvalidSpec(
+            "Codex advisory exact permission profile is missing required read grants, network=false, or canonical boundaries"
+                .to_string(),
+        ));
+    };
+    let parsed_rules = parse_codex_advisory_exact_deny_rules(rules_section)?;
+    let parsed_frontiers: BTreeSet<String> = parsed_rules.into_iter().collect();
+    let canonical = build_codex_advisory_exact_permission_profile_config(&parsed_frontiers)?;
+    if canonical != config_arg {
+        return Err(WorkerError::InvalidSpec(
+            "Codex advisory exact permission profile does not match canonical sorted exact-frontier rendering"
+                .to_string(),
+        ));
+    }
+    Ok(parsed_frontiers)
+}
+
+fn is_codex_advisory_protected_entry_name(file_name: &str) -> bool {
+    CODEX_ADVISORY_PROTECTED_DIRECTORY_NAMES.contains(&file_name)
+        || CODEX_ADVISORY_PROTECTED_FILE_NAMES.contains(&file_name)
+        || file_name.starts_with(".env.")
+}
+
+fn validate_codex_advisory_workdir_tree(
+    canonical_workdir: &Path,
+) -> Result<BTreeSet<String>, WorkerError> {
     let mut visited_entries: usize = 0;
+    let mut deny_frontiers: BTreeSet<String> = CODEX_ADVISORY_MANDATORY_ROOT_DENY_PATHS
+        .iter()
+        .map(|root| (*root).to_string())
+        .collect();
     let mut stack: Vec<(PathBuf, usize)> = vec![(canonical_workdir.to_path_buf(), 0)];
 
     while let Some((current_dir, dir_depth)) = stack.pop() {
@@ -1138,6 +1514,26 @@ fn validate_codex_advisory_workdir_tree(canonical_workdir: &Path) -> Result<(), 
                 )));
             }
 
+            if is_codex_advisory_protected_entry_name(file_name) {
+                let rel_path = entry_path.strip_prefix(canonical_workdir).map_err(|err| {
+                    WorkerError::InvalidSpec(format!(
+                        "refusing to launch `codex_cli` advisory worker in `{}`: protected entry `{}` is outside the canonical working directory: {err}",
+                        canonical_workdir.display(),
+                        entry_path.display()
+                    ))
+                })?;
+                let Some(rel_path_str) = rel_path.to_str() else {
+                    return Err(WorkerError::InvalidSpec(format!(
+                        "refusing to launch `codex_cli` advisory worker in `{}`: protected entry `{}` is not valid UTF-8",
+                        canonical_workdir.display(),
+                        entry_path.display()
+                    )));
+                };
+                if !codex_advisory_has_deny_ancestor(&deny_frontiers, rel_path_str) {
+                    deny_frontiers.insert(rel_path_str.to_string());
+                }
+            }
+
             if file_type.is_dir() {
                 stack.push((entry_path, entry_depth));
             } else if !file_type.is_file() {
@@ -1150,7 +1546,7 @@ fn validate_codex_advisory_workdir_tree(canonical_workdir: &Path) -> Result<(), 
         }
     }
 
-    Ok(())
+    Ok(deny_frontiers)
 }
 
 fn ensure_no_codex_project_config_in_hierarchy(

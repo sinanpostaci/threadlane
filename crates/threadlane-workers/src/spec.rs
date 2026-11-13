@@ -11,11 +11,14 @@ use crate::fs_safety::{
 };
 pub use crate::permissions::{
     build_antigravity_read_only_settings, build_antigravity_read_only_settings_json,
+    build_codex_advisory_exact_permission_profile_config,
     build_codex_task_files_permission_profile_config,
     build_codex_task_files_permission_profile_config_for_scopes, build_opencode_config_content,
-    build_opencode_config_content_json, evaluate_antigravity_settings,
-    evaluate_codex_task_files_permission_profile_config, evaluate_opencode_rules,
-    is_unsafe_codex_toml_scope_char, parse_and_validate_codex_task_files_permission_profile_config,
+    build_opencode_config_content_json, collect_codex_advisory_deny_frontiers,
+    evaluate_antigravity_settings, evaluate_codex_task_files_permission_profile_config,
+    evaluate_opencode_rules, is_unsafe_codex_toml_scope_char,
+    parse_and_validate_codex_advisory_exact_permission_profile_config,
+    parse_and_validate_codex_task_files_permission_profile_config,
     validate_advisory_provider_and_mode, validate_advisory_read_only_workdir,
     validate_codex_advisory_workdir, validate_codex_task_files_scope_str,
     validate_codex_task_files_workdir, AntigravityPermissionsBlock, AntigravitySessionSettings,
@@ -79,19 +82,22 @@ pub const MAX_PATH_ENTRY_LEN: usize = 512;
 /// Session-only named permission profile selected for [`WorkerProvider::CodexCli`] read-only advisory runs.
 pub const CODEX_ADVISORY_PERMISSION_PROFILE_NAME: &str = "threadlane-advisory";
 
-/// Session-only TOML inline table `-c` override defining the `threadlane-advisory` read-only
-/// permission profile for [`WorkerProvider::CodexCli`].
+/// Legacy session-only TOML inline table `-c` override defining one of the known historical
+/// `threadlane-advisory` read-only permission profiles.
 ///
-/// Scopes filesystem reads to `:minimal`, `/nix/store`, and `.` inside `:workspace_roots` with
-/// explicit `glob_scan_max_depth=64` ([`CODEX_ADVISORY_GLOB_SCAN_MAX_DEPTH`]) and a static
-/// root/non-root protected-scope partition: exact root `.git`/`.codex`/`.agents`/`.aws` denies,
-/// protected basename globs, and non-root descendant globs (`*/**/.git/**`, `*/**/.codex/**`,
-/// `*/**/.agents/**`, `*/**/.aws/**`) that avoid expanding every root Git object path. Secret
-/// filename globs (`**/.env`, `**/.env.*`, `**/codex.toml`, `**/.codex.toml`) remain denied, and
-/// network access is disabled (`"network"={"enabled"=false}`). This is not a universal argument-cap
-/// guarantee; large nested protected trees can still exceed a finite OS helper argument limit.
-/// Never combined with legacy `--sandbox` flags.
+/// This constant is retained **only** so persisted historical Codex advisory argument vectors
+/// remain readable by [`is_pinned_codex_read_only_argv`]. New launches always render a bounded
+/// exact-frontier profile from the live canonical workspace preflight via
+/// [`build_codex_advisory_exact_permission_profile_config`]; this static root/non-root glob
+/// partition is never used as a new constructor or dispatch fallback.
 pub const CODEX_ADVISORY_PERMISSION_PROFILE_CONFIG: &str = r#"permissions.threadlane-advisory={"filesystem"={"glob_scan_max_depth"=64,":minimal"="read",":workspace_roots"={"."="read","**/.env"="deny","**/.env.*"="deny","**/codex.toml"="deny","**/.codex.toml"="deny","**/.git"="deny","*/**/.git/**"="deny","**/.codex"="deny","*/**/.codex/**"="deny","**/.agents"="deny","*/**/.agents/**"="deny","**/.aws"="deny","*/**/.aws/**"="deny",".git"="deny",".codex"="deny",".agents"="deny",".aws"="deny"},"/nix/store"="read"},"network"={"enabled"=false}}"#;
+
+/// Exact earlier bounded static `threadlane-advisory` profile retained only for persisted
+/// historical evidence recognition by [`is_pinned_codex_read_only_argv`].
+///
+/// This literal predates the root/non-root split in [`CODEX_ADVISORY_PERMISSION_PROFILE_CONFIG`];
+/// new launches never construct or dispatch it.
+const CODEX_ADVISORY_PERMISSION_PROFILE_CONFIG_PREVIOUS_BOUNDED: &str = r#"permissions.threadlane-advisory={"filesystem"={"glob_scan_max_depth"=64,":minimal"="read",":workspace_roots"={"."="read","**/.env"="deny","**/.env.*"="deny","**/codex.toml"="deny","**/.codex.toml"="deny","**/.git"="deny","**/.git/**"="deny","**/.codex"="deny","**/.codex/**"="deny","**/.agents"="deny","**/.agents/**"="deny","**/.aws"="deny","**/.aws/**"="deny"},"/nix/store"="read"},"network"={"enabled"=false}}"#;
 
 /// Features explicitly disabled via `--disable <feature>` on [`WorkerProvider::CodexCli`]
 /// read-only advisory invocations.
@@ -470,7 +476,7 @@ impl WorkerSpec {
         }
 
         validate_prompt(&self.prompt)?;
-        let constructed_argv = self.build_argv_from_resolved(&resolved_model, None);
+        let constructed_argv = self.build_argv_from_resolved(&resolved_model, None)?;
         let workdir_argv_resolution_required = self.file_permissions.requires_workdir_argv();
         let argv_resolution_note = workdir_argv_resolution_required.then(|| {
             match self.provider {
@@ -682,15 +688,16 @@ impl WorkerSpec {
                 ));
             }
         };
-        Ok(build_provider_argv_from_resolved(
+        build_provider_argv_from_resolved(
             self.provider,
             &report.resolved_model,
             "accept-edits",
             self.standalone,
             self.session_id.as_deref(),
             settings_json,
+            None,
             effective_prompt.as_deref().unwrap_or(&self.prompt),
-        ))
+        )
     }
 
     /// Builds the structured OpenCode 2.2.0 V2 [`OpenCodeConfigContent`] for this spec and
@@ -771,7 +778,7 @@ impl WorkerSpec {
         &self,
         resolved: &ResolvedModelTarget,
         settings_json: Option<String>,
-    ) -> Vec<String> {
+    ) -> Result<Vec<String>, WorkerError> {
         build_provider_argv_from_resolved(
             self.provider,
             resolved,
@@ -779,6 +786,7 @@ impl WorkerSpec {
             self.standalone,
             self.session_id.as_deref(),
             settings_json,
+            None,
             &self.prompt,
         )
     }
@@ -1034,11 +1042,18 @@ impl AdvisoryWorkerSpec {
             .validate_for_provider_and_paths(self.provider, &self.allowed_write_paths)?;
 
         let canonical_executable = validate_executable_file(&self.executable)?;
-        let canonical_working_directory = match self.provider {
-            WorkerProvider::CodexCli => validate_codex_advisory_workdir(working_directory)?,
-            WorkerProvider::Antigravity | WorkerProvider::OpenCodeV2 => {
-                validate_advisory_read_only_workdir(working_directory)?
+        let (canonical_working_directory, codex_read_only_profile_config) = match self.provider {
+            WorkerProvider::CodexCli => {
+                let (canonical_workdir, deny_frontiers) =
+                    collect_codex_advisory_deny_frontiers(working_directory)?;
+                let profile_config =
+                    build_codex_advisory_exact_permission_profile_config(&deny_frontiers)?;
+                (canonical_workdir, Some(profile_config))
             }
+            WorkerProvider::Antigravity | WorkerProvider::OpenCodeV2 => (
+                validate_advisory_read_only_workdir(working_directory)?,
+                None,
+            ),
         };
         let resolved_model = self.resolve_model_target()?;
 
@@ -1124,8 +1139,9 @@ impl AdvisoryWorkerSpec {
             self.standalone,
             self.session_id.as_deref(),
             settings_json,
+            codex_read_only_profile_config,
             &self.prompt,
-        );
+        )?;
 
         Ok(AdvisorySpecValidationReport {
             provider: self.provider,
@@ -1141,6 +1157,7 @@ impl AdvisoryWorkerSpec {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_provider_argv_from_resolved(
     provider: WorkerProvider,
     resolved: &ResolvedModelTarget,
@@ -1148,8 +1165,9 @@ fn build_provider_argv_from_resolved(
     standalone: bool,
     session_id: Option<&str>,
     settings_json: Option<String>,
+    codex_read_only_profile_config: Option<String>,
     prompt: &str,
-) -> Vec<String> {
+) -> Result<Vec<String>, WorkerError> {
     match provider {
         WorkerProvider::Antigravity => {
             let effort = resolved
@@ -1173,7 +1191,7 @@ fn build_provider_argv_from_resolved(
             }
             argv.push("--print".to_string());
             argv.push(prompt.to_string());
-            argv
+            Ok(argv)
         }
         WorkerProvider::OpenCodeV2 => {
             let mut argv = Vec::with_capacity(10);
@@ -1191,7 +1209,7 @@ fn build_provider_argv_from_resolved(
             }
             argv.push("--".to_string());
             argv.push(prompt.to_string());
-            argv
+            Ok(argv)
         }
         WorkerProvider::CodexCli => {
             let effort = resolved
@@ -1223,12 +1241,18 @@ fn build_provider_argv_from_resolved(
                 argv.push("-c".to_string());
                 argv.push(profile_config);
             } else if antigravity_mode == "plan" {
+                let Some(profile_config) = codex_read_only_profile_config else {
+                    return Err(WorkerError::InvalidSpec(
+                        "Codex read-only advisory argv requires an exact bounded permission profile rendered from the canonical workspace preflight"
+                            .to_string(),
+                    ));
+                };
                 argv.push("-c".to_string());
                 argv.push(format!(
                     "default_permissions=\"{CODEX_ADVISORY_PERMISSION_PROFILE_NAME}\""
                 ));
                 argv.push("-c".to_string());
-                argv.push(CODEX_ADVISORY_PERMISSION_PROFILE_CONFIG.to_string());
+                argv.push(profile_config);
             } else {
                 argv.push("-c".to_string());
                 argv.push(format!(
@@ -1243,7 +1267,7 @@ fn build_provider_argv_from_resolved(
             }
             argv.push("--".to_string());
             argv.push(prompt.to_string());
-            argv
+            Ok(argv)
         }
     }
 }
@@ -1303,13 +1327,24 @@ fn is_valid_codex_output_last_message_arg(raw_path: &str) -> bool {
     normal_count == raw_seg_count && normal_count >= 2
 }
 
+fn is_valid_codex_read_only_permission_profile_config(config_arg: &str) -> bool {
+    config_arg == CODEX_ADVISORY_PERMISSION_PROFILE_CONFIG
+        || config_arg == CODEX_ADVISORY_PERMISSION_PROFILE_CONFIG_PREVIOUS_BOUNDED
+        || parse_and_validate_codex_advisory_exact_permission_profile_config(config_arg).is_ok()
+}
+
 /// Returns `true` if `argv` matches the exact read-only `codex` advisory argument vector
 /// pinned to `resolved` (`--no-daemon exec --json --ephemeral --ignore-user-config --model <model>`,
 /// `-c` overrides for `model_reasoning_effort`, `approval_policy`, `model_provider`,
-/// `default_permissions`, `permissions.threadlane-advisory`, `web_search`, all
+/// `default_permissions`, a canonical `permissions.threadlane-advisory` profile, `web_search`, all
 /// [`CODEX_ADVISORY_DISABLED_FEATURES`] `--disable` pairs, an optional invocation-owned
 /// `--output-last-message <canonical_private_dir>/last-message.json` pair, `--`, and a
 /// non-empty prompt).
+///
+/// The profile element accepts either a newly rendered exact-frontier profile or one of the known
+/// historical static profiles ([`CODEX_ADVISORY_PERMISSION_PROFILE_CONFIG`] and the earlier bounded
+/// profile) so persisted legacy read-only evidence remains readable. New launches never construct a
+/// historical static profile.
 #[must_use]
 pub fn is_pinned_codex_read_only_argv(argv: &[String], resolved: &ResolvedModelTarget) -> bool {
     let Some(effort) = resolved.effort.as_deref() else {
@@ -1346,7 +1381,7 @@ pub fn is_pinned_codex_read_only_argv(argv: &[String], resolved: &ResolvedModelT
         && argv[13] == "-c"
         && argv[14] == expected_default_perms
         && argv[15] == "-c"
-        && argv[16] == CODEX_ADVISORY_PERMISSION_PROFILE_CONFIG
+        && is_valid_codex_read_only_permission_profile_config(&argv[16])
         && argv[17] == "-c"
         && argv[18] == "web_search=\"disabled\"")
     {

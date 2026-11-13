@@ -10,8 +10,9 @@ use tempfile::TempDir;
 use tokio::sync::{mpsc, watch};
 
 use threadlane_workers::{
-    is_pinned_codex_read_only_argv, resolve_model_target, run_advisory_worker,
-    run_advisory_worker_with_structured_result,
+    build_codex_advisory_exact_permission_profile_config, is_pinned_codex_read_only_argv,
+    parse_and_validate_codex_advisory_exact_permission_profile_config, resolve_model_target,
+    run_advisory_worker, run_advisory_worker_with_structured_result,
     run_advisory_worker_with_structured_result_and_cancel,
     run_advisory_worker_with_structured_result_and_observer, validate_advisory_provider_and_mode,
     validate_codex_advisory_workdir, AdvisoryResponseBudget, AdvisoryResponseErrorCode,
@@ -130,7 +131,7 @@ fn codex_cli_exact_argv_permission_profile_and_mutable_or_invalid_spec_refusals(
         assert_eq!(parsed, WorkerProvider::CodexCli);
     }
 
-    // 2. Exact named permission profile TOML string check
+    // 2. Historical static permission profile constant remains available for legacy evidence.
     assert_eq!(
         CODEX_ADVISORY_PERMISSION_PROFILE_NAME,
         "threadlane-advisory"
@@ -138,6 +139,13 @@ fn codex_cli_exact_argv_permission_profile_and_mutable_or_invalid_spec_refusals(
     assert_eq!(
         CODEX_ADVISORY_PERMISSION_PROFILE_CONFIG,
         r#"permissions.threadlane-advisory={"filesystem"={"glob_scan_max_depth"=64,":minimal"="read",":workspace_roots"={"."="read","**/.env"="deny","**/.env.*"="deny","**/codex.toml"="deny","**/.codex.toml"="deny","**/.git"="deny","*/**/.git/**"="deny","**/.codex"="deny","*/**/.codex/**"="deny","**/.agents"="deny","*/**/.agents/**"="deny","**/.aws"="deny","*/**/.aws/**"="deny",".git"="deny",".codex"="deny",".agents"="deny",".aws"="deny"},"/nix/store"="read"},"network"={"enabled"=false}}"#
+    );
+    assert!(
+        parse_and_validate_codex_advisory_exact_permission_profile_config(
+            CODEX_ADVISORY_PERMISSION_PROFILE_CONFIG
+        )
+        .is_err(),
+        "historical static profile must remain legacy-evidence-only and never parse as an exact frontier"
     );
 
     // 3. Exact constructed argv and empty child_env on valid read-only AdvisoryWorkerSpec
@@ -159,6 +167,23 @@ fn codex_cli_exact_argv_permission_profile_and_mutable_or_invalid_spec_refusals(
         &validation.resolved_model
     ));
 
+    let expected_exact_profile =
+        build_codex_advisory_exact_permission_profile_config(&BTreeSet::from([".git".to_string()]))
+            .expect("render expected exact advisory profile");
+    assert_eq!(
+        parse_and_validate_codex_advisory_exact_permission_profile_config(&expected_exact_profile)
+            .expect("parse expected exact advisory profile"),
+        BTreeSet::from([
+            ".agents".to_string(),
+            ".aws".to_string(),
+            ".codex".to_string(),
+            ".codex.toml".to_string(),
+            ".env".to_string(),
+            ".git".to_string(),
+            "codex.toml".to_string(),
+        ])
+    );
+
     let mut expected_argv = vec![
         "--no-daemon".to_string(),
         "exec".to_string(),
@@ -176,7 +201,7 @@ fn codex_cli_exact_argv_permission_profile_and_mutable_or_invalid_spec_refusals(
         "-c".to_string(),
         "default_permissions=\"threadlane-advisory\"".to_string(),
         "-c".to_string(),
-        CODEX_ADVISORY_PERMISSION_PROFILE_CONFIG.to_string(),
+        expected_exact_profile,
         "-c".to_string(),
         "web_search=\"disabled\"".to_string(),
     ];

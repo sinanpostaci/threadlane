@@ -10,11 +10,13 @@ use tempfile::TempDir;
 use tokio::sync::watch;
 
 use threadlane_workers::{
+    build_codex_advisory_exact_permission_profile_config,
     build_codex_task_files_permission_profile_config,
     build_codex_task_files_permission_profile_config_for_scopes,
     evaluate_codex_task_files_permission_profile_config, execute_worker_task,
     extract_pinned_codex_task_files_write_scopes, is_pinned_codex_read_only_argv,
     is_pinned_codex_task_files_argv, is_process_alive,
+    parse_and_validate_codex_advisory_exact_permission_profile_config,
     parse_and_validate_codex_task_files_permission_profile_config, resolve_model_target,
     run_worker, run_worker_with_cancel, validate_codex_task_files_scope_str,
     validate_codex_task_files_workdir, AdvisoryWorkerSpec, CodexTurnLifecycleEvidence,
@@ -274,7 +276,8 @@ fn codex_task_files_launch_pins_model_effort_ignore_rules_scopes_and_preserves_a
         );
     }
 
-    // 2. Verify read-only AdvisoryWorkerSpec argv remains 100% unchanged and mutually exclusive.
+    // 2. Verify read-only AdvisoryWorkerSpec argv uses the exact-frontier profile and remains
+    // mutually exclusive with the mutable TaskFiles profile.
     let advisory_spec = AdvisoryWorkerSpec {
         provider: WorkerProvider::CodexCli,
         executable: fake_codex,
@@ -302,9 +305,20 @@ fn codex_task_files_launch_pins_model_effort_ignore_rules_scopes_and_preserves_a
         adv_report.constructed_argv[14],
         format!("default_permissions=\"{CODEX_ADVISORY_PERMISSION_PROFILE_NAME}\"")
     );
+    let expected_advisory_profile =
+        build_codex_advisory_exact_permission_profile_config(&BTreeSet::from([".git".to_string()]))
+            .expect("render exact read-only advisory profile");
     assert_eq!(
         adv_report.constructed_argv[16],
-        CODEX_ADVISORY_PERMISSION_PROFILE_CONFIG
+        expected_advisory_profile,
+        "Codex read-only advisory argv must use the exact-frontier renderer, not TaskFiles or legacy static rules"
+    );
+    assert!(
+        parse_and_validate_codex_advisory_exact_permission_profile_config(
+            &adv_report.constructed_argv[16]
+        )
+        .is_ok(),
+        "rendered read-only advisory profile must validate canonically"
     );
 }
 
