@@ -796,6 +796,120 @@ async fn check_failure_correction_refuses_tampered_missing_overflow_descendant_a
     assert_eq!(dirty_err.code(), NativeErrorCode::ValidationFailed.as_str());
     fs::remove_file(&dirty_file).expect("clean up dirty file");
 
+    // Ignored artifacts inside the owned task worktree remain strict dirt.
+    let task_cache_dir = original_report.checkout_path.join("target");
+    fs::create_dir_all(&task_cache_dir).expect("create ignored task worktree cache dir");
+    fs::write(
+        task_cache_dir.join("cache.bin"),
+        b"cached-task-worktree-output",
+    )
+    .expect("write ignored task worktree cache artifact");
+    let ignored_task_err = corr_service
+        .prepare_task_correction(
+            session.guard(),
+            &CoworkerTaskCorrectionPrepareRequest {
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                job_id: job.job_id.clone(),
+                task_id: "task-chk-guards".to_string(),
+                prior_attempt_no: 1,
+                now_ms: step_ts + 410,
+            },
+        )
+        .await
+        .expect_err("ignored artifact in owned task worktree must be refused");
+    assert_eq!(
+        ignored_task_err.code(),
+        NativeErrorCode::ValidationFailed.as_str()
+    );
+    fs::remove_dir_all(&task_cache_dir).expect("clean up ignored task worktree cache dir");
+
+    // Primary source cleanliness permits ignored caches but still rejects tracked, staged,
+    // and non-ignored untracked source changes before any reservation.
+    let primary_source_file = fixture.repo_dir.join("src/b.rs");
+    let original_primary_source =
+        fs::read_to_string(&primary_source_file).expect("read primary source file");
+    fs::write(&primary_source_file, "pub fn b() -> u32 { 202 }\n")
+        .expect("modify tracked primary source file");
+    let tracked_primary_err = corr_service
+        .prepare_task_correction(
+            session.guard(),
+            &CoworkerTaskCorrectionPrepareRequest {
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                job_id: job.job_id.clone(),
+                task_id: "task-chk-guards".to_string(),
+                prior_attempt_no: 1,
+                now_ms: step_ts + 420,
+            },
+        )
+        .await
+        .expect_err("tracked primary source change must be refused");
+    assert_eq!(
+        tracked_primary_err.code(),
+        NativeErrorCode::ValidationFailed.as_str()
+    );
+    fs::write(&primary_source_file, &original_primary_source)
+        .expect("restore tracked primary source file");
+
+    fs::write(&primary_source_file, "pub fn b() -> u32 { 203 }\n")
+        .expect("modify staged primary source file");
+    run_sanitized_git(
+        &fixture.repo_dir,
+        &["add", "src/b.rs"],
+        DEFAULT_GIT_COMMAND_TIMEOUT_MS,
+    )
+    .expect("stage primary source change");
+    let staged_primary_err = corr_service
+        .prepare_task_correction(
+            session.guard(),
+            &CoworkerTaskCorrectionPrepareRequest {
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                job_id: job.job_id.clone(),
+                task_id: "task-chk-guards".to_string(),
+                prior_attempt_no: 1,
+                now_ms: step_ts + 430,
+            },
+        )
+        .await
+        .expect_err("staged primary source change must be refused");
+    assert_eq!(
+        staged_primary_err.code(),
+        NativeErrorCode::ValidationFailed.as_str()
+    );
+    run_sanitized_git(
+        &fixture.repo_dir,
+        &["reset", "--quiet", "HEAD", "--", "src/b.rs"],
+        DEFAULT_GIT_COMMAND_TIMEOUT_MS,
+    )
+    .expect("unstage primary source change");
+    fs::write(&primary_source_file, &original_primary_source)
+        .expect("restore staged primary source file");
+
+    let untracked_primary_file = fixture.repo_dir.join("primary-untracked.txt");
+    fs::write(&untracked_primary_file, b"not ignored\n")
+        .expect("write non-ignored untracked primary file");
+    let untracked_primary_err = corr_service
+        .prepare_task_correction(
+            session.guard(),
+            &CoworkerTaskCorrectionPrepareRequest {
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                job_id: job.job_id.clone(),
+                task_id: "task-chk-guards".to_string(),
+                prior_attempt_no: 1,
+                now_ms: step_ts + 440,
+            },
+        )
+        .await
+        .expect_err("non-ignored untracked primary file must be refused");
+    assert_eq!(
+        untracked_primary_err.code(),
+        NativeErrorCode::ValidationFailed.as_str()
+    );
+    fs::remove_file(&untracked_primary_file).expect("remove non-ignored untracked primary file");
+
     // Verify zero counters or candidates were recorded across all refusals above.
     let runtime_before = fixture
         .policy_store
@@ -857,7 +971,8 @@ async fn check_failure_correction_refuses_tampered_missing_overflow_descendant_a
         .expect("attempt 1 Coder TaskAttemptRef after refusals");
     assert_eq!(att_1_after_refusals, &att_1_before_guards);
 
-    // Restore shared counter and verify clean preparation succeeds once.
+    // Restore shared counter and verify clean preparation succeeds once even while the primary
+    // source checkout contains ignored build caches.
     fixture
         .policy_store
         .mutate_job_runtime_for_operator(BINDING_A, &job.job_id, |state| {
@@ -865,6 +980,12 @@ async fn check_failure_correction_refuses_tampered_missing_overflow_descendant_a
             Ok(())
         })
         .expect("restore total_corrections_reserved");
+
+    let primary_cache_file = fixture.repo_dir.join("target/cache.bin");
+    fs::create_dir_all(primary_cache_file.parent().expect("primary cache parent"))
+        .expect("create ignored primary cache dir");
+    fs::write(&primary_cache_file, b"cached-primary-build-output")
+        .expect("write ignored primary cache artifact");
 
     let prepared = corr_service
         .prepare_task_correction(
@@ -883,6 +1004,10 @@ async fn check_failure_correction_refuses_tampered_missing_overflow_descendant_a
     assert_eq!(
         prepared.status,
         CoworkerTaskCorrectionPrepareStatus::Prepared
+    );
+    assert_eq!(
+        fs::read(&primary_cache_file).expect("read ignored primary cache artifact"),
+        b"cached-primary-build-output"
     );
 
     let job_after_prep = fixture

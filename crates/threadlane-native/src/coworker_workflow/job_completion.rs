@@ -49,9 +49,9 @@ use threadlane_operations::{
     OperationsError, ProposeJobIntegrationRequest, ReserveClosureAttemptRequest, ReviewReceipt,
 };
 use threadlane_workers::{
-    ensure_worktree_job_inactive_readonly, is_commit_ancestor, is_worktree_clean,
-    load_and_verify_manifest, resolve_exact_commit_sha, resolve_exact_tree_sha, run_sanitized_git,
-    WorkerRunStatus, WorktreeKind, WorktreeManager, WorktreeManifest,
+    ensure_worktree_job_inactive_readonly, is_commit_ancestor, is_source_worktree_clean,
+    is_worktree_clean, load_and_verify_manifest, resolve_exact_commit_sha, resolve_exact_tree_sha,
+    run_sanitized_git, WorkerRunStatus, WorktreeKind, WorktreeManager, WorktreeManifest,
     DEFAULT_GIT_COMMAND_TIMEOUT_MS, MANIFESTS_SUBDIR, MAX_STDERR_BYTES, MAX_STDOUT_BYTES,
 };
 
@@ -1306,7 +1306,7 @@ fn verify_primary_source_repository_clean_at_base(
         ));
     }
     let clean =
-        is_worktree_clean(&canonical_repo, DEFAULT_GIT_COMMAND_TIMEOUT_MS).map_err(|e| {
+        is_source_worktree_clean(&canonical_repo, DEFAULT_GIT_COMMAND_TIMEOUT_MS).map_err(|e| {
             NativeError::new(
                 NativeErrorCode::ValidationFailed,
                 format!("failed to verify primary source repository cleanliness: {e}"),
@@ -3324,8 +3324,8 @@ fn verify_preserved_run_integration_and_source(
     expected_head_commit: &str,
     expected_tree_sha: &str,
 ) -> Result<(), NativeError> {
-    let source_clean =
-        is_worktree_clean(canonical_repo, DEFAULT_GIT_COMMAND_TIMEOUT_MS).map_err(|e| {
+    let source_clean = is_source_worktree_clean(canonical_repo, DEFAULT_GIT_COMMAND_TIMEOUT_MS)
+        .map_err(|e| {
             NativeError::new(
                 NativeErrorCode::ValidationFailed,
                 format!("failed to verify primary source repository cleanliness post-closure: {e}"),

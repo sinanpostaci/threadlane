@@ -538,6 +538,41 @@ fn pipeline_execution_policy(fixture: &PipelineTestFixture) -> ExecutionPolicy {
     policy
 }
 
+// Commits a tracked ignore rule before approval and leaves an ignored primary cache artifact
+// in place for every pipeline transition through post-Closure source verification.
+fn install_tracked_primary_cache_ignore_and_artifact(fixture: &mut PipelineTestFixture) -> PathBuf {
+    fs::write(fixture.repo_dir.join(".gitignore"), "target/\n.local/\n")
+        .expect("write tracked primary cache ignore rule");
+    run_sanitized_git(
+        &fixture.repo_dir,
+        &["add", ".gitignore"],
+        DEFAULT_GIT_COMMAND_TIMEOUT_MS,
+    )
+    .expect("stage primary cache ignore rule");
+    run_sanitized_git(
+        &fixture.repo_dir,
+        &["commit", "-m", "track primary cache ignore rule", "--quiet"],
+        DEFAULT_GIT_COMMAND_TIMEOUT_MS,
+    )
+    .expect("commit primary cache ignore rule");
+    fixture.base_commit =
+        resolve_exact_commit_sha(&fixture.repo_dir, "HEAD", DEFAULT_GIT_COMMAND_TIMEOUT_MS)
+            .expect("resolve primary base commit with tracked ignore rule");
+    fixture.base_tree_sha = resolve_exact_tree_sha(
+        &fixture.repo_dir,
+        &fixture.base_commit,
+        DEFAULT_GIT_COMMAND_TIMEOUT_MS,
+    )
+    .expect("resolve primary base tree with tracked ignore rule");
+
+    let cache_file = fixture.repo_dir.join("target/cache.bin");
+    fs::create_dir_all(cache_file.parent().expect("primary cache parent"))
+        .expect("create ignored primary cache dir");
+    fs::write(&cache_file, b"cached-primary-build-output")
+        .expect("write ignored primary cache artifact");
+    cache_file
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cli_code_driver_full_automatic_pipeline_runs_parallel_roots_reviewer_correction_dependent_and_single_closure_to_completed(
 ) {
@@ -552,7 +587,8 @@ async fn codex_luna_full_frozen_pipeline_parallel_roots_correction_dependent_and
 #[allow(clippy::too_many_lines)]
 async fn assert_full_pipeline(codex: bool) {
     Box::pin(async {
-        let fixture = setup_fixture();
+        let mut fixture = setup_fixture();
+        let primary_cache_file = install_tracked_primary_cache_ignore_and_artifact(&mut fixture);
         if codex { configure_codex_coder(&fixture); }
         let state_dir = fixture.root.join("runtime");
         fs::create_dir_all(&state_dir).expect("create runtime state_dir");
@@ -1030,6 +1066,10 @@ async fn assert_full_pipeline(codex: bool) {
             resolve_exact_commit_sha(&fixture.repo_dir, "HEAD", DEFAULT_GIT_COMMAND_TIMEOUT_MS)
                 .expect("source repo HEAD"),
             fixture.base_commit
+        );
+        assert_eq!(
+            fs::read(&primary_cache_file).expect("read ignored primary cache artifact"),
+            b"cached-primary-build-output"
         );
 
         // 6. Post-completion idempotent `ensure`, `ensure_owner(None)`, and `reconcile`

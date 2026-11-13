@@ -11,9 +11,9 @@ use threadlane_operations::{
     IntegrationReceipt, IntegrationStrategy, ReviewReceipt, ReviewSubject,
 };
 use threadlane_workers::{
-    is_commit_ancestor, is_worktree_clean, load_and_verify_manifest, resolve_exact_commit_sha,
-    resolve_exact_tree_sha, WorkerFilePermissions, WorktreeKind, WorktreeManifest,
-    DEFAULT_GIT_COMMAND_TIMEOUT_MS,
+    is_commit_ancestor, is_source_worktree_clean, is_worktree_clean, load_and_verify_manifest,
+    resolve_exact_commit_sha, resolve_exact_tree_sha, WorkerFilePermissions, WorktreeKind,
+    WorktreeManifest, DEFAULT_GIT_COMMAND_TIMEOUT_MS,
 };
 
 use crate::conversation_change::ConversationChangeStore;
@@ -1601,7 +1601,7 @@ fn verify_clean_primary_and_task_worktrees(
     task_manifest: &WorktreeManifest,
     int_manifest: &WorktreeManifest,
 ) -> Result<String, NativeError> {
-    let primary_clean = is_worktree_clean(
+    let primary_clean = is_source_worktree_clean(
         &task_manifest.repository_path,
         DEFAULT_GIT_COMMAND_TIMEOUT_MS,
     )

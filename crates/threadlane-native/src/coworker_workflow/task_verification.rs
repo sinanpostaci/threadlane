@@ -11,10 +11,10 @@ use threadlane_operations::{
     InspectReviewSubjectRequest, ReviewPolicyBinding, ReviewSubject, TestEvidenceSummary,
 };
 use threadlane_workers::{
-    evaluate_diff_gate, is_commit_ancestor, is_worktree_clean, load_and_verify_manifest,
-    resolve_exact_commit_sha, resolve_exact_tree_sha, resolve_model_target, ChangedPathEntry,
-    WorkerFilePermissions, WorkerProvider, WorkerRunStatus, WorktreeKind, WorktreeManifest,
-    DEFAULT_GIT_COMMAND_TIMEOUT_MS,
+    evaluate_diff_gate, is_commit_ancestor, is_source_worktree_clean, is_worktree_clean,
+    load_and_verify_manifest, resolve_exact_commit_sha, resolve_exact_tree_sha,
+    resolve_model_target, ChangedPathEntry, WorkerFilePermissions, WorkerProvider, WorkerRunStatus,
+    WorktreeKind, WorktreeManifest, DEFAULT_GIT_COMMAND_TIMEOUT_MS,
 };
 use threadlane_workflow::ToolAdapter;
 
@@ -1181,14 +1181,13 @@ fn load_and_verify_owned_task_manifest(
         ));
     }
     let primary_clean =
-        is_worktree_clean(&manifest.repository_path, DEFAULT_GIT_COMMAND_TIMEOUT_MS).map_err(
-            |err| {
+        is_source_worktree_clean(&manifest.repository_path, DEFAULT_GIT_COMMAND_TIMEOUT_MS)
+            .map_err(|err| {
                 NativeError::new(
                     NativeErrorCode::ValidationFailed,
                     format!("failed to inspect primary repository cleanliness: {err}"),
                 )
-            },
-        )?;
+            })?;
     if !primary_clean {
         return Err(NativeError::new(
             NativeErrorCode::ValidationFailed,

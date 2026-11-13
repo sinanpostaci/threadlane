@@ -48,9 +48,10 @@ use threadlane_operations::{
     ReviewSubject, TestEvidenceSummary,
 };
 use threadlane_workers::{
-    evaluate_diff_gate, is_worktree_clean, load_and_verify_manifest, resolve_exact_commit_sha,
-    resolve_exact_tree_sha, resolve_model_target, WorkerFilePermissions, WorkerProvider,
-    WorkerRunStatus, WorktreeKind, DEFAULT_GIT_COMMAND_TIMEOUT_MS, MAX_PROMPT_BYTES,
+    evaluate_diff_gate, is_source_worktree_clean, is_worktree_clean, load_and_verify_manifest,
+    resolve_exact_commit_sha, resolve_exact_tree_sha, resolve_model_target, WorkerFilePermissions,
+    WorkerProvider, WorkerRunStatus, WorktreeKind, DEFAULT_GIT_COMMAND_TIMEOUT_MS,
+    MAX_PROMPT_BYTES,
 };
 use threadlane_workflow::{ToolAdapter, WorkflowRole};
 
@@ -2064,8 +2065,8 @@ pub(crate) fn verify_prior_attempt_and_persisted_reviewer_report_with_live_check
             "ReviewSubject repository_path does not match job project_base.repository_path",
         ));
     }
-    let primary_clean =
-        is_worktree_clean(primary_repo, DEFAULT_GIT_COMMAND_TIMEOUT_MS).map_err(|_| {
+    let primary_clean = is_source_worktree_clean(primary_repo, DEFAULT_GIT_COMMAND_TIMEOUT_MS)
+        .map_err(|_| {
             NativeError::new(
                 NativeErrorCode::ValidationFailed,
                 "failed to inspect primary repository cleanliness during correction preparation",
@@ -3591,7 +3592,7 @@ pub(crate) fn verify_prior_attempt_and_persisted_failed_check_reports_with_live_
     adm.linkage.project_base.verify_live_repository()?;
     let primary_repo = Path::new(&adm.linkage.project_base.repository_path);
     let primary_clean =
-        is_worktree_clean(primary_repo, DEFAULT_GIT_COMMAND_TIMEOUT_MS).map_err(|_| {
+        is_source_worktree_clean(primary_repo, DEFAULT_GIT_COMMAND_TIMEOUT_MS).map_err(|_| {
             NativeError::new(
                 NativeErrorCode::ValidationFailed,
                 "failed to inspect primary repository cleanliness during check-failure correction preparation",

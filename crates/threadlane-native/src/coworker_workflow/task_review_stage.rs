@@ -11,8 +11,9 @@ use threadlane_operations::{
     OperationsError, ReviewAcceptanceRequest, ReviewReceipt, ReviewSubject,
 };
 use threadlane_workers::{
-    is_worktree_clean, load_and_verify_manifest, validate_sha256_hex_digest, ExecutionBudgets,
-    WorkerProvider, WorkerRunStatus, WorktreeKind, DEFAULT_GIT_COMMAND_TIMEOUT_MS,
+    is_source_worktree_clean, load_and_verify_manifest, validate_sha256_hex_digest,
+    ExecutionBudgets, WorkerProvider, WorkerRunStatus, WorktreeKind,
+    DEFAULT_GIT_COMMAND_TIMEOUT_MS,
 };
 use threadlane_workflow::{ToolAdapter, WorkflowRole};
 
@@ -1316,8 +1317,8 @@ fn verify_preserved_candidate_and_live_subject(
             "ReviewSubject repository_path does not match job project_base.repository_path",
         ));
     }
-    let primary_clean =
-        is_worktree_clean(primary_repo, DEFAULT_GIT_COMMAND_TIMEOUT_MS).map_err(|_| {
+    let primary_clean = is_source_worktree_clean(primary_repo, DEFAULT_GIT_COMMAND_TIMEOUT_MS)
+        .map_err(|_| {
             NativeError::new(
                 NativeErrorCode::ValidationFailed,
                 "failed to inspect primary repository cleanliness before Reviewer stage",

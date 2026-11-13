@@ -112,6 +112,7 @@ fn init_git_repo(repo_dir: &Path) -> (String, String) {
     fs::write(repo_dir.join("src/a.rs"), "pub fn a() -> u32 { 1 }\n").expect("write src/a.rs");
     fs::write(repo_dir.join("src/b.rs"), "pub fn b() -> u32 { 2 }\n").expect("write src/b.rs");
     fs::write(repo_dir.join("src/c.rs"), "pub fn c() -> u32 { 3 }\n").expect("write src/c.rs");
+    fs::write(repo_dir.join(".gitignore"), "target/\n.local/\n").expect("write .gitignore");
 
     for args in [
         &["init", "--quiet"][..],
@@ -2453,6 +2454,13 @@ async fn assert_initial_coder_verification(opencode: bool) {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
 
+    // Ignored primary build caches are not source dirt for task verification.
+    let primary_cache_file = fixture.repo_dir.join("target/cache.bin");
+    fs::create_dir_all(primary_cache_file.parent().expect("primary cache parent"))
+        .expect("create ignored primary cache dir");
+    fs::write(&primary_cache_file, b"cached-primary-build-output")
+        .expect("write ignored primary cache artifact");
+
     let verifier = CoworkerTaskVerificationService::new(fixture.controller.clone());
     let outcome = verifier
         .verify_and_prepare_task_attempt(
@@ -2508,6 +2516,10 @@ async fn assert_initial_coder_verification(opencode: bool) {
     assert_eq!(
         fs::read_to_string(fixture.repo_dir.join("src/a.rs")).expect("read primary src/a.rs"),
         "pub fn a() -> u32 { 1 }\n"
+    );
+    assert_eq!(
+        fs::read(&primary_cache_file).expect("read ignored primary cache artifact"),
+        b"cached-primary-build-output"
     );
 
     let runtime = fixture

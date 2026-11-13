@@ -45,12 +45,13 @@ use threadlane_authority::{validation::validate_canonical_thread_uuid, ApprovedT
 use threadlane_operations::ReviewSubject;
 use threadlane_workers::{
     ensure_worktree_job_inactive_readonly, execute_worker_task_with_health_observer,
-    is_worktree_clean, load_and_verify_manifest, resolve_exact_commit_sha, resolve_exact_tree_sha,
-    resolve_model_target, run_sanitized_git, run_sanitized_git_bytes, validate_exact_40_hex_sha,
-    validate_sha256_hex_digest, ChangedPathEntry, ExecutionBudgets, ResolvedModelTarget,
-    TaskExecutionReport, WorkAcceptanceState, WorkerFilePermissions, WorkerProvider,
-    WorkerRunStatus, WorkerSpec, WorktreeKind, WorktreeManifest, DEFAULT_GIT_COMMAND_TIMEOUT_MS,
-    DEFAULT_MAX_GIT_OUTPUT_BYTES, MAX_STDERR_BYTES, MAX_STDOUT_BYTES,
+    is_source_worktree_clean, load_and_verify_manifest, resolve_exact_commit_sha,
+    resolve_exact_tree_sha, resolve_model_target, run_sanitized_git, run_sanitized_git_bytes,
+    validate_exact_40_hex_sha, validate_sha256_hex_digest, ChangedPathEntry, ExecutionBudgets,
+    ResolvedModelTarget, TaskExecutionReport, WorkAcceptanceState, WorkerFilePermissions,
+    WorkerProvider, WorkerRunStatus, WorkerSpec, WorktreeKind, WorktreeManifest,
+    DEFAULT_GIT_COMMAND_TIMEOUT_MS, DEFAULT_MAX_GIT_OUTPUT_BYTES, MAX_STDERR_BYTES,
+    MAX_STDOUT_BYTES,
 };
 use threadlane_workflow::{ToolAdapter, WorkflowRole};
 
@@ -3523,7 +3524,7 @@ fn classify_derived_execution_outcome(
     }
 
     let primary_repo = Path::new(&adm.linkage.project_base.repository_path);
-    if !is_worktree_clean(primary_repo, DEFAULT_GIT_COMMAND_TIMEOUT_MS).unwrap_or(false) {
+    if !is_source_worktree_clean(primary_repo, DEFAULT_GIT_COMMAND_TIMEOUT_MS).unwrap_or(false) {
         return (
             CoworkerTaskCorrectionExecuteStatus::FailedTerminal,
             false,
