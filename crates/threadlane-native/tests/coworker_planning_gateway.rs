@@ -485,12 +485,12 @@ async fn coworker_planning_tools_advertised_routing_guards_and_readonly_status_a
     assert_eq!(directory_entries(&fixture.plans_dir), plans_before);
     assert_eq!(directory_entries(&fixture.registry_dir), registry_before);
 
-    // 2. PairedMcpServer advertises all 5 Coworker planning tools (40 tools total) and blocks unbound calls.
+    // 2. PairedMcpServer advertises all 5 Coworker planning tools (52 tools total, including ordinary and guarded backlog tools) and blocks unbound calls.
     let pairing_store = PairingStore::open(&fixture.pairing_dir).expect("open pairing store");
     let mcp_unbound =
         PairedMcpServer::new(&fixture.state_dir, pairing_store.clone()).expect("new unbound mcp");
     let tools = mcp_unbound.list_tools();
-    assert_eq!(tools.len(), 40);
+    assert_eq!(tools.len(), 52);
     for (name, expected_ro) in [
         ("coworker_status", true),
         ("prepare_work", false),

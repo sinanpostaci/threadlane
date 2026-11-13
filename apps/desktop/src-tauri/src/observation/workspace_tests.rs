@@ -3,7 +3,7 @@ mod unix_workspace_tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::env;
     use std::fs;
-    use std::io::Write;
+    use std::io::{Read, Write};
     use std::os::unix::fs::{symlink, MetadataExt, OpenOptionsExt, PermissionsExt};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -17,16 +17,18 @@ mod unix_workspace_tests {
         AUTHORITY_SCHEMA_VERSION,
     };
     use threadlane_core::observation::{
-        current_observation_time_ms, serialize_workspace_native_sample_sidecar, ObservationJob,
-        ObservationJobState, ObservationSnapshotRequest, ObservationSourceAvailability,
-        ObservationTask, WorkspaceAcceptanceStatus, WorkspaceActivityState, WorkspaceAttentionKind,
-        WorkspaceAvailabilityState, WorkspaceBacklogPresenceAvailability,
-        WorkspaceBacklogPresenceFreshness, WorkspaceBacklogWorkerPresence,
-        WorkspaceCapabilityState, WorkspaceChatIdentity, WorkspaceChatWorkAvailability,
-        WorkspaceConfiguredSelection, WorkspaceConnectionState,
+        current_observation_time_ms, serialize_workspace_native_sample_sidecar,
+        validate_existing_private_dir_readonly, validate_existing_private_file_readonly,
+        ObservationJob, ObservationJobState, ObservationSnapshotRequest,
+        ObservationSourceAvailability, ObservationTask, WorkspaceAcceptanceStatus,
+        WorkspaceActivityState, WorkspaceAttentionKind, WorkspaceAvailabilityState,
+        WorkspaceBacklogPresenceAvailability, WorkspaceBacklogPresenceFreshness,
+        WorkspaceBacklogWorkerPresence, WorkspaceCapabilityState, WorkspaceChatIdentity,
+        WorkspaceChatWorkAvailability, WorkspaceConfiguredSelection, WorkspaceConnectionState,
         WorkspaceExternalResolutionApplicability, WorkspaceExternalResolutionScope,
         WorkspaceFreshnessState, WorkspaceMessageSourceKind, WorkspaceNativeCapabilities,
         WorkspaceNativeSample, WorkspaceSampleConnection, WorkspaceSelectionEvidence,
+        WORKSPACE_SNAPSHOT_SCHEMA_VERSION,
     };
     use threadlane_core::{
         Command, CommandOutput, Core, WorkerAcceptanceState, WorkerCompletionRecord,
@@ -54,7 +56,8 @@ mod unix_workspace_tests {
         ExternalResolutionService, ExternalResolutionTarget, RecordExternalResolutionRequest,
     };
     use threadlane_native::native_chat_observation::{
-        compute_observation_source_id, write_workspace_native_sample_sidecar,
+        compute_observation_source_id, read_workspace_native_samples_readonly,
+        write_workspace_native_sample_sidecar, NATIVE_CHAT_SAMPLES_DIR_NAME,
     };
     use threadlane_native::profile_flow::{
         ExecutionPolicy, PolicyAllowRule, RoleExecutionRoute, SelectedRoleChoice,
@@ -73,6 +76,7 @@ mod unix_workspace_tests {
         collect_bounded_workspace_presence, prepare_workspace_presence_queries,
         refresh_workspace_backlog_presence, WorkspacePresenceQuery, WorkspacePresenceResult,
     };
+    use crate::observation::workspace::apply_workspace_presence_results;
     use crate::observation::{ObservationService, ObservationSourceConfig};
 
     static WORKSPACE_TEST_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -269,6 +273,64 @@ mod unix_workspace_tests {
 
         let mut out = BTreeMap::new();
         walk(root, &mut out);
+        out
+    }
+
+    /// Collector-local fingerprint for a live runtime root.
+    ///
+    /// A genuine MCP sampler continuously rewrites `<runtime_state_dir>/native-chat-samples/`
+    /// (atomic sidecar replacement plus bounded retention pruning), so that externally produced
+    /// subtree is excluded at the walk step. Stable runtime entries still participate in the
+    /// before/after comparison, while runtime sidecar read purity remains covered by the isolated
+    /// read-only regressions. Entries that vanish between enumeration and inspection are skipped
+    /// because an atomic producer rename can legitimately invalidate a directory entry mid-walk.
+    fn snapshot_live_runtime_fingerprints(root: &Path) -> BTreeMap<PathBuf, EntryFingerprint> {
+        fn walk(root: &Path, dir: &Path, out: &mut BTreeMap<PathBuf, EntryFingerprint>) {
+            for entry in fs::read_dir(dir).expect("read live runtime dir") {
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(err) => panic!("read live runtime entry: {err}"),
+                };
+                let path = entry.path();
+                if path == root.join(NATIVE_CHAT_SAMPLES_DIR_NAME) {
+                    continue;
+                }
+                let meta = match fs::symlink_metadata(&path) {
+                    Ok(meta) => meta,
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(err) => panic!("symlink_metadata {}: {err}", path.display()),
+                };
+                let is_dir = meta.is_dir() && !meta.file_type().is_symlink();
+                let bytes = if meta.is_file() && !meta.file_type().is_symlink() {
+                    match fs::read(&path) {
+                        Ok(bytes) => bytes,
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(err) => panic!("read {}: {err}", path.display()),
+                    }
+                } else {
+                    Vec::new()
+                };
+                out.insert(
+                    path.clone(),
+                    EntryFingerprint {
+                        is_dir,
+                        mode: meta.permissions().mode() & 0o777,
+                        ino: meta.ino(),
+                        len: meta.len(),
+                        mtime_sec: meta.mtime(),
+                        mtime_nsec: meta.mtime_nsec(),
+                        bytes,
+                    },
+                );
+                if is_dir {
+                    walk(root, &path, out);
+                }
+            }
+        }
+
+        let mut out = BTreeMap::new();
+        walk(root, root, &mut out);
         out
     }
 
@@ -5194,5 +5256,536 @@ mod unix_workspace_tests {
                 & 0o777,
             0o700
         );
+    }
+
+    const MAX_NATIVE_CAPTURE_REQUEST_BYTES: u64 = 64 * 1024;
+
+    #[derive(Debug, serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct NativeCaptureRequest {
+        runtime_state_dir: PathBuf,
+        registry_dir: PathBuf,
+        plans_dir: PathBuf,
+        authority_dir: PathBuf,
+        sessions_dir: PathBuf,
+        observation_registry_dir: PathBuf,
+        project_root: PathBuf,
+        binding_id: String,
+        thread_uuid: String,
+        output_path: PathBuf,
+    }
+
+    fn require_existing_canonical_private_dir(path: &Path, label: &str) -> PathBuf {
+        assert!(path.is_absolute(), "{label} must be an absolute path");
+        let canonical = fs::canonicalize(path)
+            .unwrap_or_else(|err| panic!("{label} must be an existing canonical directory: {err}"));
+        assert_eq!(
+            canonical, path,
+            "{label} must be an absolute canonical path without symlink or traversal components"
+        );
+        validate_existing_private_dir_readonly(path).unwrap_or_else(|err| {
+            panic!("{label} must be an existing owner-private 0700 directory: {err}")
+        });
+        path.to_path_buf()
+    }
+
+    fn require_existing_canonical_project_root(path: &Path) -> PathBuf {
+        assert!(path.is_absolute(), "project_root must be an absolute path");
+        let meta = fs::symlink_metadata(path)
+            .unwrap_or_else(|err| panic!("project_root must exist: {err}"));
+        assert!(
+            !meta.file_type().is_symlink() && meta.file_type().is_dir(),
+            "project_root must be a non-symlink directory"
+        );
+        let canonical = fs::canonicalize(path)
+            .unwrap_or_else(|err| panic!("project_root must be canonicalizable: {err}"));
+        assert_eq!(
+            canonical, path,
+            "project_root must be an absolute canonical path without symlink or traversal components"
+        );
+        path.to_path_buf()
+    }
+
+    fn require_capture_output_path(path: &Path) -> PathBuf {
+        assert!(path.is_absolute(), "output_path must be an absolute path");
+        let file_name = path
+            .file_name()
+            .unwrap_or_else(|| panic!("output_path must name a file"));
+        assert!(!file_name.is_empty(), "output_path must name a file");
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| panic!("output_path must have an absolute parent directory"));
+        require_existing_canonical_private_dir(parent, "output_path parent");
+        assert_eq!(
+            path,
+            parent.join(file_name),
+            "output_path must be an absolute canonical file path without traversal components"
+        );
+        match fs::symlink_metadata(path) {
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) => panic!("output_path must not already exist; refusing to overwrite"),
+            Err(err) => panic!("output_path must be safely inspectable before create: {err}"),
+        }
+        path.to_path_buf()
+    }
+
+    fn load_native_capture_request() -> (PathBuf, NativeCaptureRequest) {
+        let raw_path = env::var("THREADLANE_NATIVE_CAPTURE_REQUEST").unwrap_or_else(|_| {
+            panic!(
+                "THREADLANE_NATIVE_CAPTURE_REQUEST must point to a private request JSON file; a missing environment variable is a hard failure"
+            )
+        });
+        assert!(
+            !raw_path.trim().is_empty(),
+            "THREADLANE_NATIVE_CAPTURE_REQUEST must be a non-empty path"
+        );
+        let request_path = PathBuf::from(raw_path);
+        assert!(
+            request_path.is_absolute(),
+            "THREADLANE_NATIVE_CAPTURE_REQUEST must be an absolute path"
+        );
+        let canonical = fs::canonicalize(&request_path).unwrap_or_else(|err| {
+            panic!("THREADLANE_NATIVE_CAPTURE_REQUEST must reference an existing file: {err}")
+        });
+        assert_eq!(
+            canonical, request_path,
+            "THREADLANE_NATIVE_CAPTURE_REQUEST must be an absolute canonical path without symlink or traversal components"
+        );
+        let parent = request_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| panic!("request file path must have an absolute parent directory"));
+        require_existing_canonical_private_dir(parent, "request file parent");
+        let expected_meta =
+            validate_existing_private_file_readonly(&request_path, MAX_NATIVE_CAPTURE_REQUEST_BYTES)
+                .unwrap_or_else(|err| {
+                    panic!(
+                        "request file must be an existing owner-private 0600 file within a private 0700 directory: {err}"
+                    )
+                });
+        let mut file = fs::File::open(&request_path)
+            .unwrap_or_else(|err| panic!("request file must open read-only: {err}"));
+        let opened_meta = file
+            .metadata()
+            .unwrap_or_else(|err| panic!("request file metadata must be readable: {err}"));
+        assert_eq!(
+            (opened_meta.dev(), opened_meta.ino()),
+            (expected_meta.dev(), expected_meta.ino()),
+            "request file identity changed while opening"
+        );
+        let mut bytes = Vec::new();
+        std::io::Read::by_ref(&mut file)
+            .take(MAX_NATIVE_CAPTURE_REQUEST_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .unwrap_or_else(|err| panic!("request file must read as private JSON: {err}"));
+        assert!(
+            bytes.len() as u64 <= MAX_NATIVE_CAPTURE_REQUEST_BYTES,
+            "request file exceeds the maximum private request size"
+        );
+        let request: NativeCaptureRequest = serde_json::from_slice(&bytes).unwrap_or_else(|err| {
+            panic!("request file must match the exact capture schema with no unknown fields: {err}")
+        });
+        (request_path, request)
+    }
+
+    /// Explicit opt-in acceptance collector for a fresh native chat before work begins.
+    ///
+    /// This test intentionally never fabricates a passing result. A missing environment variable,
+    /// malformed/unknown request field, non-private path, or absent real native sample is a hard
+    /// failure. It reads the supplied real stores read-only, runs only the production observation
+    /// chain, and writes exactly one new private JSON output file.
+    ///
+    /// The live runtime fingerprint intentionally excludes the externally produced
+    /// `native-chat-samples/` subtree because a genuine sampler rewrites it concurrently. The
+    /// isolated read-only regressions continue to prove runtime sidecar read purity.
+    #[tokio::test]
+    #[ignore = "requires explicit isolated real native acceptance context"]
+    async fn capture_real_native_workspace_before_work() {
+        let (_request_file, request) = load_native_capture_request();
+
+        let runtime_state_dir =
+            require_existing_canonical_private_dir(&request.runtime_state_dir, "runtime_state_dir");
+        let registry_dir =
+            require_existing_canonical_private_dir(&request.registry_dir, "registry_dir");
+        let plans_dir = require_existing_canonical_private_dir(&request.plans_dir, "plans_dir");
+        let authority_dir =
+            require_existing_canonical_private_dir(&request.authority_dir, "authority_dir");
+        let sessions_dir =
+            require_existing_canonical_private_dir(&request.sessions_dir, "sessions_dir");
+        let observation_registry_dir = require_existing_canonical_private_dir(
+            &request.observation_registry_dir,
+            "observation_registry_dir",
+        );
+        let project_root = require_existing_canonical_project_root(&request.project_root);
+        let output_path = require_capture_output_path(&request.output_path);
+
+        assert!(
+            fs::read_dir(&observation_registry_dir)
+                .expect("observation_registry_dir must be readable")
+                .next()
+                .is_none(),
+            "observation_registry_dir must be an empty parent-created 0700 directory; this collector never initializes linked contexts"
+        );
+
+        let expected_source_id =
+            compute_observation_source_id(&plans_dir, &authority_dir, &sessions_dir).expect(
+                "compute the actual observation source id for the supplied real store triad",
+            );
+        let expected_identity = WorkspaceChatIdentity::new(
+            &expected_source_id,
+            &request.binding_id,
+            &request.thread_uuid,
+            &path_text(&project_root),
+        )
+        .expect(
+            "request binding_id, thread_uuid, and project_root must form a valid canonical chat identity",
+        );
+        assert_eq!(
+            expected_identity.binding_id, request.binding_id,
+            "binding_id must already be in its exact canonical form"
+        );
+        assert_eq!(
+            expected_identity.thread_uuid, request.thread_uuid,
+            "thread_uuid must already be a canonical non-nil lowercase UUID"
+        );
+
+        let stores_before = [
+            (
+                "runtime_state_dir",
+                snapshot_live_runtime_fingerprints(&runtime_state_dir),
+            ),
+            ("registry_dir", snapshot_tree_fingerprints(&registry_dir)),
+            ("plans_dir", snapshot_tree_fingerprints(&plans_dir)),
+            ("authority_dir", snapshot_tree_fingerprints(&authority_dir)),
+            ("sessions_dir", snapshot_tree_fingerprints(&sessions_dir)),
+            (
+                "observation_registry_dir",
+                snapshot_tree_fingerprints(&observation_registry_dir),
+            ),
+        ];
+
+        let service = ObservationService::new(ObservationSourceConfig {
+            runtime_state_dir: Some(runtime_state_dir.clone()),
+            registry_dir: registry_dir.clone(),
+            plans_dir: plans_dir.clone(),
+            authority_dir: authority_dir.clone(),
+            sessions_dir: sessions_dir.clone(),
+            app_data_dir: observation_registry_dir.clone(),
+        });
+
+        let before_ms = current_observation_time_ms();
+        let mut bundle = service
+            .workspace_snapshot_bundle(Some(ObservationSnapshotRequest {
+                source_id: Some(expected_source_id.clone()),
+                ..Default::default()
+            }))
+            .expect(
+                "production workspace_snapshot_bundle must succeed for the isolated real acceptance context",
+            );
+        let after_ms = current_observation_time_ms();
+
+        assert!(
+            bundle.presence_queries.is_empty(),
+            "a fresh before-work chat must have no Worker presence queries"
+        );
+        let presence_query_count = bundle.presence_queries.len();
+        let presence = refresh_workspace_backlog_presence(bundle.presence_queries).await;
+        let presence_result_count = presence.len();
+        assert_eq!(
+            presence_result_count, 0,
+            "a fresh before-work chat must produce no host presence results"
+        );
+        let snapshot = apply_workspace_presence_results(&mut bundle.snapshot, presence);
+
+        let stores_after = [
+            (
+                "runtime_state_dir",
+                snapshot_live_runtime_fingerprints(&runtime_state_dir),
+            ),
+            ("registry_dir", snapshot_tree_fingerprints(&registry_dir)),
+            ("plans_dir", snapshot_tree_fingerprints(&plans_dir)),
+            ("authority_dir", snapshot_tree_fingerprints(&authority_dir)),
+            ("sessions_dir", snapshot_tree_fingerprints(&sessions_dir)),
+            (
+                "observation_registry_dir",
+                snapshot_tree_fingerprints(&observation_registry_dir),
+            ),
+        ];
+        for ((label, before), (after_label, after)) in stores_before.into_iter().zip(stores_after) {
+            assert_eq!(label, after_label);
+            assert!(
+                before == after,
+                "{label} changed during the production observation chain; only the explicit private output file may be written"
+            );
+        }
+
+        assert_eq!(
+            snapshot.schema_version, WORKSPACE_SNAPSHOT_SCHEMA_VERSION,
+            "collector must capture the current production workspace schema"
+        );
+        assert!(
+            snapshot.generated_at_ms >= before_ms && snapshot.generated_at_ms <= after_ms,
+            "workspace snapshot must be generated from the real current time"
+        );
+        assert_eq!(
+            snapshot.observation.sources.len(),
+            1,
+            "the isolated acceptance context must expose exactly one observation source"
+        );
+        assert_eq!(
+            snapshot.observation.sources[0].id, expected_source_id,
+            "observation source id must match the actual supplied store triad"
+        );
+        assert_eq!(
+            snapshot.observation.sources[0].availability,
+            ObservationSourceAvailability::Available,
+            "the supplied real observation source must be available"
+        );
+
+        assert_eq!(
+            snapshot.chats.len(),
+            1,
+            "the isolated acceptance context must expose exactly one verified chat"
+        );
+        let chat = &snapshot.chats[0];
+        assert_eq!(
+            chat.identity, expected_identity,
+            "chat scope must match the exact actual source, binding, thread, and canonical project"
+        );
+        assert_eq!(chat.identity.source_id, expected_source_id);
+        assert_eq!(chat.identity.binding_id, request.binding_id);
+        assert_eq!(chat.identity.thread_uuid, request.thread_uuid);
+        assert_eq!(
+            chat.identity.canonical_project_scope,
+            path_text(&project_root)
+        );
+        assert_eq!(
+            chat.availability,
+            WorkspaceAvailabilityState::Available,
+            "the actual native sample must be fresh at capture time"
+        );
+        assert_eq!(chat.active_job_count, 0);
+        assert_eq!(chat.attention_count, 0);
+
+        assert_eq!(
+            snapshot.native_samples.len(),
+            1,
+            "the isolated before-work chat must have exactly one actual native sample"
+        );
+        let sample = &snapshot.native_samples[0];
+        assert_eq!(
+            sample.chat_identity, expected_identity,
+            "native sample scope must match the exact actual chat identity"
+        );
+        sample
+            .validate()
+            .expect("the actual native sample must satisfy the production contract");
+        let observed_at_ms = sample
+            .observed_at_ms
+            .expect("the actual native sample must carry observed_at_ms");
+        let last_success_at_ms = sample
+            .last_success_at_ms
+            .expect("the actual native sample must carry last_success_at_ms");
+        assert!(
+            observed_at_ms > 0 && last_success_at_ms > 0,
+            "actual native sample timestamps must be positive"
+        );
+        assert!(
+            observed_at_ms <= snapshot.generated_at_ms,
+            "native sample observed_at_ms must not be advanced past the real capture time"
+        );
+        assert!(
+            last_success_at_ms <= observed_at_ms,
+            "native sample last_success_at_ms must not exceed observed_at_ms"
+        );
+        let stale_threshold_ms = snapshot.sampling_policy.stale_threshold_ms as i64;
+        assert!(
+            snapshot.generated_at_ms - observed_at_ms <= stale_threshold_ms,
+            "native sample must be fresh from its original observed_at_ms"
+        );
+        assert!(
+            snapshot.generated_at_ms - last_success_at_ms <= stale_threshold_ms,
+            "native sample must be fresh from its original last_success_at_ms"
+        );
+        let evaluated = sample.evaluate_at(
+            snapshot.generated_at_ms,
+            snapshot.sampling_policy.stale_threshold_ms,
+        );
+        assert_eq!(
+            evaluated.effective_availability,
+            WorkspaceAvailabilityState::Available,
+            "the actual native sample must evaluate as available at capture time"
+        );
+
+        // A genuine live MCP sampler may persist a newer sequence while the collector runs.
+        // Re-read at the actual current clock, never at the frozen snapshot clock, and accept only
+        // the same four-part chat scope / producer epoch / backend process identity. The captured
+        // snapshot sample is never regenerated, advanced, or written back to its sidecar.
+        let reread_at_ms = current_observation_time_ms();
+        assert!(
+            snapshot.generated_at_ms <= reread_at_ms,
+            "the live reread clock must not precede the real snapshot capture time"
+        );
+        assert!(
+            observed_at_ms <= reread_at_ms && last_success_at_ms <= reread_at_ms,
+            "the captured sample timestamps must remain at or before the actual current clock"
+        );
+        let raw_report = read_workspace_native_samples_readonly(
+            &runtime_state_dir,
+            Some(&expected_source_id),
+            reread_at_ms,
+        )
+        .expect("read the actual native sample sidecars read-only");
+        let raw_entry = raw_report
+            .entries
+            .iter()
+            .find(|entry| entry.sample.chat_identity == expected_identity)
+            .expect("the matching actual native sample sidecar must exist");
+        let raw_sample = &raw_entry.sample;
+        assert_eq!(
+            raw_sample.chat_identity, sample.chat_identity,
+            "the live sidecar must retain the exact four-part chat scope"
+        );
+        assert_eq!(
+            raw_sample.producer_epoch, sample.producer_epoch,
+            "the live sidecar must retain the captured producer epoch"
+        );
+        assert_eq!(
+            raw_sample.backend_process_instance, sample.backend_process_instance,
+            "the live sidecar must retain the captured backend process identity"
+        );
+        assert!(
+            raw_sample.sequence >= sample.sequence,
+            "the live sidecar sequence must not regress below the captured sequence"
+        );
+        if raw_sample.sequence == sample.sequence {
+            assert_eq!(
+                raw_sample.observed_at_ms, sample.observed_at_ms,
+                "an unchanged live sequence must preserve the exact captured observed_at_ms bytes"
+            );
+            assert_eq!(
+                raw_sample.last_success_at_ms, sample.last_success_at_ms,
+                "an unchanged live sequence must preserve the exact captured last_success_at_ms bytes"
+            );
+        } else {
+            let raw_observed_at_ms = raw_sample
+                .observed_at_ms
+                .expect("a newer live sidecar must carry observed_at_ms");
+            let raw_last_success_at_ms = raw_sample
+                .last_success_at_ms
+                .expect("a newer live sidecar must carry last_success_at_ms");
+            assert!(
+                raw_observed_at_ms >= observed_at_ms,
+                "a newer live sequence must carry a monotonic original observed_at_ms"
+            );
+            assert!(
+                raw_last_success_at_ms >= last_success_at_ms,
+                "a newer live sequence must carry a monotonic original last_success_at_ms"
+            );
+        }
+
+        assert!(
+            snapshot.observation.jobs.is_empty(),
+            "a fresh before-work chat must have no observation jobs"
+        );
+        assert!(
+            snapshot.job_histories.is_empty(),
+            "a fresh before-work chat must have no job history"
+        );
+        assert_eq!(
+            snapshot.chat_work.len(),
+            1,
+            "the isolated before-work chat must expose exactly one bounded chat work entry"
+        );
+        let work = &snapshot.chat_work[0];
+        assert_eq!(
+            work.identity, expected_identity,
+            "chat work scope must match the exact actual chat identity"
+        );
+        assert!(
+            work.items.is_empty(),
+            "a fresh before-work chat must have no backlog items"
+        );
+        assert!(
+            work.events.is_empty(),
+            "a fresh before-work chat must have no backlog events"
+        );
+        assert!(
+            work.worker_presence.is_empty(),
+            "a fresh before-work chat must have no worker presence rows"
+        );
+        assert_eq!(work.bounds.items_omitted, 0);
+        assert_eq!(work.bounds.events_omitted, 0);
+        assert_eq!(work.bounds.presence_omitted, 0);
+
+        let projected_snapshot_json = serde_json::to_vec_pretty(&snapshot)
+            .expect("serialize the actual projected workspace snapshot");
+        assert!(
+            !projected_snapshot_json.is_empty(),
+            "serialized workspace snapshot must not be empty"
+        );
+
+        let mut output_options = fs::OpenOptions::new();
+        output_options.write(true).create_new(true).mode(0o600);
+        let mut output_file = output_options.open(&output_path).unwrap_or_else(|err| {
+            panic!("output_path must be creatable exactly once with create-new semantics: {err}")
+        });
+        output_file
+            .write_all(&projected_snapshot_json)
+            .unwrap_or_else(|err| panic!("output file must accept the serialized snapshot: {err}"));
+        output_file
+            .sync_all()
+            .unwrap_or_else(|err| panic!("output file must sync before success: {err}"));
+        drop(output_file);
+        set_mode(&output_path, 0o600);
+        let output_meta = validate_existing_private_file_readonly(
+            &output_path,
+            projected_snapshot_json.len() as u64,
+        )
+        .expect("the explicit output file must remain owner-private 0600");
+        assert_eq!(
+            output_meta.len(),
+            projected_snapshot_json.len() as u64,
+            "the explicit output file must contain the complete serialized snapshot"
+        );
+
+        let backlog_items = snapshot
+            .chat_work
+            .iter()
+            .map(|entry| entry.items.len())
+            .sum::<usize>();
+        let backlog_events = snapshot
+            .chat_work
+            .iter()
+            .map(|entry| entry.events.len())
+            .sum::<usize>();
+        let worker_presence = snapshot
+            .chat_work
+            .iter()
+            .map(|entry| entry.worker_presence.len())
+            .sum::<usize>();
+        let summary = format!(
+            "threadlane native workspace capture: status=captured schema_version={} sources={} chats={} native_samples={} job_histories={} observation_jobs={} chat_work={} backlog_items={} backlog_events={} worker_presence={} presence_queries={} presence_results={} messages={} output_bytes={}",
+            snapshot.schema_version,
+            snapshot.observation.sources.len(),
+            snapshot.chats.len(),
+            snapshot.native_samples.len(),
+            snapshot.job_histories.len(),
+            snapshot.observation.jobs.len(),
+            snapshot.chat_work.len(),
+            backlog_items,
+            backlog_events,
+            worker_presence,
+            presence_query_count,
+            presence_result_count,
+            snapshot.messages.items.len(),
+            projected_snapshot_json.len(),
+        );
+        assert!(
+            summary.len() <= 512,
+            "collector summary must remain bounded and contain only counts/status"
+        );
+        println!("{summary}");
     }
 }

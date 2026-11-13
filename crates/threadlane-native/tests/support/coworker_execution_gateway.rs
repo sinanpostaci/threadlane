@@ -204,12 +204,12 @@ async fn execution_gateway_mcp_schemas_enrollment_scope_isolation_unapproved_ref
         fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).expect("chmod 0700");
     }
 
-    // 1. Verify all 4 execution tools are advertised (40 tools total) with strict schemas and annotations.
+    // 1. Verify all 4 execution tools are advertised (52 tools total, including ordinary and guarded backlog tools) with strict schemas and annotations.
     let pairing_store = PairingStore::open(&pairing_dir).expect("open pairing store");
     let mcp_unbound =
         PairedMcpServer::new(&state_dir, pairing_store.clone()).expect("create unbound mcp");
     let tools = mcp_unbound.list_tools();
-    assert_eq!(tools.len(), 40);
+    assert_eq!(tools.len(), 52);
 
     for (
         tool_name,
