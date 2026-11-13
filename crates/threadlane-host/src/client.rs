@@ -1552,6 +1552,66 @@ impl ApprovedHostClient {
         }
     }
 
+    /// Returns the truthful task result on a live authenticated `Ready` host or on a verifiably
+    /// stopped host whose checkpointed session history is still readable.
+    ///
+    /// - `Ready` delegates to the existing authenticated, strictly read-only [`Self::get_task`],
+    ///   then re-verifies the returned snapshot against the exact current session, frozen task,
+    ///   sealed receipt, and worker identity before returning it.
+    /// - `Stopped` re-verifies the caller scope, private session path, stopped manifest, existing
+    ///   `host.lock`, released supervisor lock, session binding/thread, exact frozen task and
+    ///   sealed receipt, owned work area, and worker identity before reading one bounded
+    ///   [`WorkerSnapshot`] from the checkpointed `state.db` without opening `Core`, running
+    ///   migrations/recovery, creating directories, or writing rows, cursors, receipts or sidecars.
+    /// - `Bootstrapping`, `Stopping`, and `Failed` remain explicit [`HostError::HostNotReady`]
+    ///   refusals; this method never starts or restarts the host or a provider.
+    ///
+    /// A worker `Completed` result remains `ReadyForReview` with `accepted: false`. A missing
+    /// receipt reports `NotStarted` (or `Unknown` when a dispatch intent exists) and never invents
+    /// a `run_id`. Availability of a result is not review acceptance or backlog completion.
+    pub async fn get_task_live_or_stopped(
+        &self,
+        approval_id: &str,
+        task_id: &str,
+    ) -> Result<TaskStateSnapshot, HostError> {
+        validate_identifier("task_id", task_id)?;
+        let record = self.resolve_authorized_approval(approval_id)?;
+        let session_dir = verify_existing_session_dir(&self.sessions_dir, &record.approval_id)?;
+        let manifest = read_host_manifest_optional(&session_dir, &record)?.ok_or_else(|| {
+            HostError::HostNotReady {
+                approval_id: record.approval_id.clone(),
+                phase: None,
+                reason: "host-manifest.json does not exist".to_string(),
+            }
+        })?;
+
+        match manifest.phase {
+            HostPhase::Ready => {
+                let snapshot = self.get_task(approval_id, task_id).await?;
+                // Re-verify the returned snapshot against the exact current authenticated
+                // session, frozen task and sealed receipt before exposing the new result API.
+                self.verify_live_task_result(approval_id, task_id, &snapshot)
+                    .await?;
+                Ok(snapshot)
+            }
+            HostPhase::Stopped => {
+                self.query_stopped_session_task(&record, &session_dir, &manifest, task_id)
+            }
+            HostPhase::Bootstrapping | HostPhase::Stopping | HostPhase::Failed => {
+                Err(HostError::HostNotReady {
+                    approval_id: record.approval_id.clone(),
+                    phase: Some(manifest.phase),
+                    reason: manifest.last_error.clone().unwrap_or_else(|| {
+                        format!(
+                            "task result requires a Ready or verifiably Stopped host session, found `{}`",
+                            manifest.phase
+                        )
+                    }),
+                })
+            }
+        }
+    }
+
     /// Requests revision-checked cancellation of an in-flight worker task using the sealed
     /// `task_id -> run_id` receipt and a deterministic cancellation command key.
     pub async fn cancel_task(
@@ -1882,7 +1942,7 @@ impl ApprovedHostClient {
             kind,
         )
         .map_err(|err| {
-            map_readonly_sqlite_activity_error(
+            map_readonly_sqlite_read_error(
                 err,
                 &record.approval_id,
                 &db_path,
@@ -1918,6 +1978,302 @@ impl ApprovedHostClient {
 
         host_lock_guard.verify_identity(&session_dir)?;
         Ok(page)
+    }
+
+    fn query_stopped_session_task(
+        &self,
+        record: &ApprovalRecord,
+        initial_session_dir: &Path,
+        initial_manifest: &HostSessionManifest,
+        task_id: &str,
+    ) -> Result<TaskStateSnapshot, HostError> {
+        if initial_manifest.phase != HostPhase::Stopped
+            || initial_manifest.gates.supervisor_authenticated_ready
+            || initial_manifest.pid.is_some()
+        {
+            return Err(HostError::HostNotReady {
+                approval_id: record.approval_id.clone(),
+                phase: Some(initial_manifest.phase),
+                reason: "stopped host manifest still reports active readiness or pid".to_string(),
+            });
+        }
+
+        let session_binding_id = initial_manifest.session_binding_id.clone().ok_or_else(|| {
+            HostError::CorruptManifest {
+                path: initial_session_dir.display().to_string(),
+                reason: "stopped manifest is missing session_binding_id".to_string(),
+            }
+        })?;
+
+        // Hold the existing session lifetime lock while reading durable history. A still-held
+        // `host.lock` means the host did not stop cleanly and no result may be served from it.
+        let host_lock_guard = ExistingHostLockGuard::acquire(
+            initial_session_dir,
+            &record.approval_id,
+            HostPhase::Stopped,
+        )?;
+
+        let session_dir = verify_existing_session_dir(&self.sessions_dir, &record.approval_id)?;
+        let locked_manifest =
+            read_host_manifest_optional(&session_dir, record)?.ok_or_else(|| {
+                HostError::HostNotReady {
+                    approval_id: record.approval_id.clone(),
+                    phase: None,
+                    reason: "host-manifest.json disappeared during stopped-result read".to_string(),
+                }
+            })?;
+
+        if locked_manifest.phase != HostPhase::Stopped
+            || locked_manifest.gates.supervisor_authenticated_ready
+            || locked_manifest.pid.is_some()
+            || locked_manifest.instance_id != initial_manifest.instance_id
+            || locked_manifest.session_binding_id.as_deref() != Some(session_binding_id.as_str())
+        {
+            return Err(HostError::HostNotReady {
+                approval_id: record.approval_id.clone(),
+                phase: Some(locked_manifest.phase),
+                reason: format!(
+                    "host session changed state to `{}` before stopped-result read",
+                    locked_manifest.phase
+                ),
+            });
+        }
+
+        host_lock_guard.verify_identity(&session_dir)?;
+        let runtime_state_dir =
+            verify_existing_private_dir(&session_dir.join(RUNTIME_STATE_SUBDIR))?;
+        let work_area_dir = verify_existing_private_dir(&session_dir.join(WORK_AREA_SUBDIR))?;
+        verify_stopped_supervisor_lock_not_held(
+            &runtime_state_dir,
+            &record.approval_id,
+            HostPhase::Stopped,
+        )?;
+
+        let task = record
+            .tasks
+            .iter()
+            .find(|t| t.task_id == task_id)
+            .ok_or_else(|| HostError::UnknownTask {
+                approval_id: record.approval_id.clone(),
+                task_id: task_id.to_string(),
+            })?;
+
+        if !task.is_frozen_headless_worker() {
+            return Err(HostError::NativeRouteRequired {
+                approval_id: record.approval_id.clone(),
+                task_id: task.task_id.clone(),
+                adapter: task.adapter,
+            });
+        }
+
+        let (intent, receipt) =
+            read_task_ledger_entry(&session_dir, record, &session_binding_id, task_id)?;
+
+        let snapshot = match receipt {
+            None => {
+                // No sealed task-to-run receipt means no result exists. Preserve the explicit
+                // NotStarted/Unknown split without inventing a run from the dispatch intent or
+                // command key.
+                build_task_snapshot(
+                    record,
+                    &session_dir,
+                    &session_binding_id,
+                    task,
+                    intent.as_ref(),
+                    None,
+                    None,
+                    None,
+                )
+            }
+            Some(receipt) => {
+                let db_path = runtime_state_dir.join("state.db");
+                let worker = Core::get_worker_readonly(
+                    &db_path,
+                    &session_binding_id,
+                    &self.native_thread_uuid,
+                    &receipt.run_id,
+                )
+                .map_err(|err| {
+                    map_readonly_sqlite_read_error(
+                        err,
+                        &record.approval_id,
+                        &db_path,
+                        &session_binding_id,
+                        &self.native_thread_uuid,
+                    )
+                })?;
+
+                verify_exact_task_worker(
+                    record,
+                    &session_binding_id,
+                    &work_area_dir,
+                    task,
+                    &receipt,
+                    &worker,
+                )?;
+
+                let dependency_input = self.historical_dependency_summary_in_workspace(
+                    record,
+                    &session_binding_id,
+                    &work_area_dir,
+                    task,
+                    receipt.execution_binding.as_ref(),
+                );
+
+                build_task_snapshot(
+                    record,
+                    &session_dir,
+                    &session_binding_id,
+                    task,
+                    intent.as_ref(),
+                    Some(&receipt),
+                    Some(worker),
+                    dependency_input,
+                )
+            }
+        };
+
+        // Recheck the manifest, session lifetime lock, and released supervisor lock after the
+        // read so a concurrent restart or replacement cannot be mistaken for stopped history.
+        let post_manifest =
+            read_host_manifest_optional(&session_dir, record)?.ok_or_else(|| {
+                HostError::HostNotReady {
+                    approval_id: record.approval_id.clone(),
+                    phase: None,
+                    reason: "host-manifest.json disappeared during stopped-result read".to_string(),
+                }
+            })?;
+        if post_manifest.phase != HostPhase::Stopped
+            || post_manifest.gates.supervisor_authenticated_ready
+            || post_manifest.pid.is_some()
+            || post_manifest.instance_id != locked_manifest.instance_id
+            || post_manifest.session_binding_id.as_deref() != Some(session_binding_id.as_str())
+        {
+            return Err(HostError::HostNotReady {
+                approval_id: record.approval_id.clone(),
+                phase: Some(post_manifest.phase),
+                reason: format!(
+                    "host session changed state to `{}` during stopped-result read",
+                    post_manifest.phase
+                ),
+            });
+        }
+        host_lock_guard.verify_identity(&session_dir)?;
+        verify_stopped_supervisor_lock_not_held(
+            &runtime_state_dir,
+            &record.approval_id,
+            HostPhase::Stopped,
+        )?;
+
+        Ok(snapshot)
+    }
+
+    async fn verify_live_task_result(
+        &self,
+        approval_id: &str,
+        task_id: &str,
+        snapshot: &TaskStateSnapshot,
+    ) -> Result<(), HostError> {
+        let session = self.verify_active_ready_session(approval_id).await?;
+        let task = session
+            .record
+            .tasks
+            .iter()
+            .find(|t| t.task_id == task_id)
+            .ok_or_else(|| HostError::UnknownTask {
+                approval_id: session.record.approval_id.clone(),
+                task_id: task_id.to_string(),
+            })?;
+        let corrupt = |reason: String| HostError::CorruptSessionState { reason };
+
+        if snapshot.approval_id != session.record.approval_id
+            || snapshot.subject_digest != session.record.subject_digest
+            || snapshot.binding_id != session.record.binding_id
+            || snapshot.thread_uuid != self.native_thread_uuid
+            || snapshot.session_binding_id != session.live_binding.binding_id
+            || snapshot.task_id != task.task_id
+            || snapshot.task_digest != task.task_digest
+            || snapshot.adapter != task.adapter
+            || snapshot.provider != task.provider
+            || snapshot.depends_on != task.depends_on
+            || snapshot.profile_id != task.profile_id
+            || snapshot.command_key != task.command_key
+            || snapshot.accepted
+        {
+            return Err(corrupt(
+                "live task result does not match the current authorized approval, session, or frozen task identity"
+                    .to_string(),
+            ));
+        }
+
+        if !task.is_frozen_headless_worker() {
+            if snapshot.status != TaskExecutionStatus::NativeRouteRequired
+                || snapshot.run_id.is_some()
+                || snapshot.worker_id.is_some()
+                || snapshot.worker.is_some()
+            {
+                return Err(corrupt(
+                    "native-route task result unexpectedly carries worker or completion identity"
+                        .to_string(),
+                ));
+            }
+            return Ok(());
+        }
+
+        let (_, receipt) = read_task_ledger_entry(
+            &session.session_dir,
+            &session.record,
+            &session.live_binding.binding_id,
+            task_id,
+        )?;
+
+        let Some(receipt) = receipt else {
+            if snapshot.run_id.is_some()
+                || snapshot.worker_id.is_some()
+                || snapshot.worker.is_some()
+                || !matches!(
+                    snapshot.status,
+                    TaskExecutionStatus::NotStarted
+                        | TaskExecutionStatus::Unknown
+                        | TaskExecutionStatus::DependencyInputsUnverified
+                        | TaskExecutionStatus::DependencyInputsReady
+                )
+            {
+                return Err(corrupt(
+                    "live task result carries run/worker or completion state without a current sealed receipt"
+                        .to_string(),
+                ));
+            }
+            return Ok(());
+        };
+
+        if snapshot.run_id.as_deref() != Some(receipt.run_id.as_str())
+            || snapshot.worker_id.as_deref() != Some(receipt.worker_id.as_str())
+        {
+            return Err(corrupt(
+                "live task result run/worker identity does not match the current sealed receipt"
+                    .to_string(),
+            ));
+        }
+        let Some(worker) = snapshot.worker.as_ref() else {
+            return Err(corrupt(
+                "live task result is missing the exact worker snapshot for its current sealed receipt"
+                    .to_string(),
+            ));
+        };
+        if snapshot.status != TaskExecutionStatus::from_worker_snapshot(worker) {
+            return Err(corrupt(
+                "live task result status does not match its verified worker snapshot".to_string(),
+            ));
+        }
+        verify_exact_task_worker(
+            &session.record,
+            &session.live_binding.binding_id,
+            &session.work_area_dir,
+            task,
+            &receipt,
+            worker,
+        )
     }
 
     fn resolve_started_task_run_id(
@@ -1997,20 +2353,32 @@ impl ApprovedHostClient {
         task: &ApprovedTaskRecord,
         binding: Option<&WorkerExecutionBinding>,
     ) -> Option<DependencyInputSummary> {
-        let binding = binding?;
-        let profile = build_validated_task_profile(
+        self.historical_dependency_summary_in_workspace(
             &session.record,
             &session.live_binding.binding_id,
             &session.work_area_dir,
             task,
+            binding,
         )
-        .ok()?;
+    }
+
+    fn historical_dependency_summary_in_workspace(
+        &self,
+        record: &ApprovalRecord,
+        session_binding_id: &str,
+        work_area_dir: &Path,
+        task: &ApprovedTaskRecord,
+        binding: Option<&WorkerExecutionBinding>,
+    ) -> Option<DependencyInputSummary> {
+        let binding = binding?;
+        let profile =
+            build_validated_task_profile(record, session_binding_id, work_area_dir, task).ok()?;
         let policy = profile.dependency_input.as_ref()?;
         let verified = read_dependency_input(
             policy,
-            &session.record.repository_path,
-            &session.work_area_dir,
-            &session.record.base_commit,
+            &record.repository_path,
+            work_area_dir,
+            &record.base_commit,
             &task.instruction,
             &policy.command_key,
         )
@@ -2997,7 +3365,136 @@ fn open_existing_lock_file_readonly(
     Ok(file)
 }
 
-fn map_readonly_sqlite_activity_error(
+fn verify_exact_task_worker(
+    record: &ApprovalRecord,
+    session_binding_id: &str,
+    work_area_dir: &Path,
+    task: &ApprovedTaskRecord,
+    receipt: &TaskRunReceipt,
+    worker: &WorkerSnapshot,
+) -> Result<(), HostError> {
+    let corrupt = |reason: String| HostError::CorruptSessionState { reason };
+
+    if worker.binding_id != session_binding_id {
+        return Err(HostError::ScopeMismatch {
+            field: "session_binding_id".to_string(),
+            expected: session_binding_id.to_string(),
+            actual: worker.binding_id.clone(),
+            reason: "worker snapshot binding_id mismatch".to_string(),
+        });
+    }
+    if worker.run_id != receipt.run_id || worker.worker_id != receipt.worker_id {
+        return Err(corrupt(format!(
+            "worker snapshot identity `{}`/`{}` does not match sealed receipt `{}`/`{}`",
+            worker.run_id, worker.worker_id, receipt.run_id, receipt.worker_id
+        )));
+    }
+    if task.task_digest != receipt.task_digest
+        || task.profile_id.as_deref() != Some(receipt.profile_id.as_str())
+        || task.command_key.as_deref() != Some(receipt.command_key.as_str())
+    {
+        return Err(corrupt(format!(
+            "sealed receipt for task `{}` does not match the frozen task digest, profile, or command key",
+            task.task_id
+        )));
+    }
+
+    let profile = build_validated_task_profile(record, session_binding_id, work_area_dir, task)
+        .map_err(|reason| {
+            corrupt(format!(
+                "failed to validate frozen worker profile for task `{}`: {reason}",
+                task.task_id
+            ))
+        })?;
+
+    if worker.profile_id != profile.profile_id
+        || worker.profile_digest != profile.profile_digest
+        || worker.provider != profile.provider_str()
+        || worker.requested_model != profile.requested_model_str()
+        || worker.requested_effort != profile.requested_effort
+        || worker.instruction != task.instruction
+    {
+        return Err(corrupt(format!(
+            "worker `{}` profile, model, effort, or instruction does not match the frozen task identity",
+            worker.worker_id
+        )));
+    }
+
+    if worker.execution_binding.as_ref() != receipt.execution_binding.as_ref() {
+        return Err(corrupt(format!(
+            "worker `{}` execution binding does not match the sealed task receipt",
+            worker.worker_id
+        )));
+    }
+
+    if let Some(binding) = worker.execution_binding.as_ref() {
+        binding
+            .verify_against(
+                &profile.profile_digest,
+                &task.instruction,
+                &worker.worktree.base_commit,
+            )
+            .map_err(|err| {
+                corrupt(format!(
+                    "worker `{}` execution binding verification failed: {err}",
+                    worker.worker_id
+                ))
+            })?;
+    } else if !task.depends_on.is_empty() {
+        return Err(corrupt(format!(
+            "dependent worker `{}` is missing its required execution binding",
+            worker.worker_id
+        )));
+    } else if worker.worktree.base_commit != record.base_commit {
+        return Err(corrupt(format!(
+            "worker `{}` worktree base commit does not match the frozen approval base commit",
+            worker.worker_id
+        )));
+    }
+
+    let run_tag = compact_worktree_tag(&worker.run_id, "r");
+    let task_tag = compact_worktree_tag(&worker.worker_id, "w");
+    if worker
+        .worktree
+        .run_worktree_id
+        .as_deref()
+        .is_some_and(|id| !id.starts_with(&format!("wt-run-{run_tag}-")))
+    {
+        return Err(corrupt(format!(
+            "worker `{}` run worktree id does not match its run identity",
+            worker.worker_id
+        )));
+    }
+    if worker
+        .worktree
+        .task_worktree_id
+        .as_deref()
+        .is_some_and(|id| !id.starts_with(&format!("wt-task-{run_tag}-{task_tag}-")))
+    {
+        return Err(corrupt(format!(
+            "worker `{}` task worktree id does not match its run/worker identity",
+            worker.worker_id
+        )));
+    }
+    for path in [
+        worker.worktree.run_worktree_path.as_deref(),
+        worker.worktree.task_worktree_path.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !Path::new(path).starts_with(work_area_dir) {
+            return Err(corrupt(format!(
+                "worker `{}` worktree path is outside the verified owned work area",
+                worker.worker_id
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn map_readonly_sqlite_read_error(
     err: ReadonlySqliteError,
     approval_id: &str,
     db_path: &Path,
@@ -3032,6 +3529,14 @@ fn map_readonly_sqlite_activity_error(
                 reason: "stopped session state.db binding_id does not match manifest session_binding_id".to_string(),
             }
         }
+        ReadonlySqliteError::Core(CoreError::WorkerNotFound {
+            binding_id,
+            worker_id,
+        }) => HostError::CorruptSessionState {
+            reason: format!(
+                "sealed task receipt references missing worker `{worker_id}` on stopped session binding `{binding_id}`"
+            ),
+        },
         ReadonlySqliteError::Core(CoreError::Validation {
             field: "thread_uuid",
             reason,

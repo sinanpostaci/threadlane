@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -8,9 +10,9 @@ use crate::engine::{
 use crate::error::CoreError;
 use crate::limits::{
     validate_bounded_text, validate_command_key, validate_identifier, validate_optional_text,
-    validate_timestamp_ms, MAX_CANCEL_REASON_LEN, MAX_ID_LEN, MAX_INSTRUCTION_LEN,
-    MAX_WORKER_CHANGED_PATHS_PREVIEW, MAX_WORKER_DIGEST_LEN, MAX_WORKER_PATH_BYTES,
-    MAX_WORKER_PROFILE_ID_LEN, MAX_WORKER_PROGRESS_EVENTS_PER_ATTEMPT,
+    validate_thread_uuid, validate_timestamp_ms, MAX_CANCEL_REASON_LEN, MAX_ID_LEN,
+    MAX_INSTRUCTION_LEN, MAX_WORKER_CHANGED_PATHS_PREVIEW, MAX_WORKER_DIGEST_LEN,
+    MAX_WORKER_PATH_BYTES, MAX_WORKER_PROFILE_ID_LEN, MAX_WORKER_PROGRESS_EVENTS_PER_ATTEMPT,
     MAX_WORKER_SUMMARY_TEXT_BYTES, MAX_WORKER_VIOLATION_SUMMARIES,
 };
 use crate::types::{CommandOutput, EventKind, EventPayload, RunStatus};
@@ -888,6 +890,65 @@ impl Core {
         let snapshot = Self::load_worker_conn(&self.conn, &clean_binding_id, &clean_target_id)?;
         enforce_compact_response_budget(&CommandOutput::Worker(Box::new(snapshot.clone())))?;
         Ok(snapshot)
+    }
+
+    /// Fetches one exact [`WorkerSnapshot`] from an existing, checkpointed `state.db` without
+    /// opening a mutating [`Core`], running migrations or recovery, creating directories or
+    /// sidecar files, or writing any rows.
+    ///
+    /// The transaction requires exactly one stored session binding and validates its
+    /// `binding_id` and `thread_uuid` before the exact `run_id`/`worker_id` lookup. This is a
+    /// frozen stopped-session read path, not an alternative live-worker or cross-binding lookup.
+    pub fn get_worker_readonly(
+        database_path: impl AsRef<Path>,
+        binding_id: &str,
+        expected_thread_uuid: &str,
+        run_or_worker_id: &str,
+    ) -> Result<WorkerSnapshot, crate::observation::ReadonlySqliteError> {
+        let clean_binding_id = validate_identifier("binding_id", binding_id)?;
+        let clean_thread_uuid = validate_thread_uuid(expected_thread_uuid)?;
+        let clean_target_id = validate_identifier("run_id", run_or_worker_id)?;
+
+        crate::observation::with_existing_readonly_sqlite_tx(database_path.as_ref(), |tx| {
+            // A stopped host session owns exactly one runtime binding. Count first so an
+            // unexpected multi-binding database is rejected without materializing its rows.
+            let binding_count: i64 =
+                tx.query_row("SELECT COUNT(*) FROM bindings", [], |row| row.get(0))?;
+            if binding_count != 1 {
+                return Err(CoreError::CorruptState(format!(
+                    "expected 1 binding in stopped session state.db, found {binding_count}"
+                )));
+            }
+
+            let stored: Option<(String, String)> = tx
+                .query_row(
+                    "SELECT binding_id, thread_uuid FROM bindings LIMIT 1",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            let Some((stored_binding_id, stored_thread_uuid)) = stored else {
+                return Err(CoreError::CorruptState(
+                    "stopped session state.db contains no binding".to_string(),
+                ));
+            };
+            if stored_binding_id != clean_binding_id {
+                return Err(CoreError::BindingNotFound {
+                    binding_id: stored_binding_id,
+                });
+            }
+            if stored_thread_uuid != clean_thread_uuid {
+                return Err(CoreError::Validation {
+                        field: "thread_uuid",
+                        reason: format!(
+                            "stored binding thread_uuid `{stored_thread_uuid}` does not match expected `{clean_thread_uuid}`"
+                        ),
+                    });
+            }
+            let snapshot = Self::load_worker_conn(tx, &clean_binding_id, &clean_target_id)?;
+            enforce_compact_response_budget(&CommandOutput::Worker(Box::new(snapshot.clone())))?;
+            Ok(snapshot)
+        })
     }
 
     /// Lists up to `limit` queued worker snapshots across all bindings in FIFO admission order.

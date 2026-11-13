@@ -5,9 +5,11 @@
 //! This test spawns the actual binary built for the integration target, waits for
 //! authenticated host-control readiness, stops the host through the public client,
 //! verifies the real child exits naturally with status 0, and then performs an
-//! explicit stopped-session restart. In-process `run_serve` calls cannot prove
-//! process ownership or `host.lock` release, so the assertions here are tied to
-//! the spawned `std::process::Child` and durable session state.
+//! explicit stopped-session restart. It also verifies that one completed root
+//! worker result remains readable after a clean stop with unchanged durable files
+//! and no provider relaunch. In-process `run_serve` calls cannot prove process
+//! ownership or `host.lock` release, so the assertions here are tied to the
+//! spawned `std::process::Child` and durable session state.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
@@ -17,12 +19,14 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
+use fs2::FileExt;
 use tempfile::TempDir;
 use threadlane_authority::{ApprovalRecord, AuthorityStore, OperatorApprovalRequest};
 use threadlane_host::{
     is_host_lock_held, read_host_manifest_optional, read_task_dispatch_intent, read_task_receipt,
     ApprovedHostClient, HostControlRuntimeState, HostControlStatusResponse, HostError, HostPhase,
-    HostSessionSummary, WORK_AREA_SUBDIR,
+    HostSessionSummary, TaskExecutionStatus, TaskStateSnapshot, RUNTIME_STATE_SUBDIR,
+    TASK_RECEIPTS_FILENAME, WORK_AREA_SUBDIR,
 };
 use threadlane_plans::{
     compile_plan_revision, Difficulty, ModelChoice, ModelDefinition, PlanChange, PlanStore,
@@ -66,9 +70,18 @@ impl HostProcessFixture {
             .expect("load persisted approval record")
     }
 
+    fn provider_invocation_count(&self) -> usize {
+        match fs::read_to_string(&self.unexpected_invocations) {
+            Ok(text) => text.lines().count(),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(err) => panic!("read fake AGY invocation marker: {err}"),
+        }
+    }
+
     fn assert_no_provider_invocation(&self) {
-        assert!(
-            !self.unexpected_invocations.exists(),
+        assert_eq!(
+            self.provider_invocation_count(),
+            0,
             "fake AGY provider was invoked unexpectedly"
         );
     }
@@ -163,15 +176,29 @@ fn init_disposable_git_repo(repo_dir: &Path) -> String {
         .expect("resolve HEAD")
 }
 
-fn write_unexpected_provider_script(script_path: &Path) {
-    // The host must never invoke this ignored provider: any invocation records evidence
-    // and exits 97 instead of pretending to execute an approved task.
+fn write_fake_provider_script(script_path: &Path) {
+    // Every invocation is recorded so lifecycle reads can prove that no provider was launched.
+    // A deliberately dispatched worker completes with matching model/effort telemetry and one
+    // bounded in-scope edit; no host startup, stop, restart, or history read invokes it.
     let script = r#"#!/bin/sh
 set -eu
 marker="${0%/*}/unexpected-agy-invocations.txt"
-printf 'unexpected fake AGY invocation\n' >> "$marker"
-printf 'unexpected fake AGY invocation\n' >&2
-exit 97
+printf 'fake AGY invocation\n' >> "$marker"
+MODEL=""
+EFFORT=""
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --model) MODEL="$2"; shift 2 ;;
+        --effort) EFFORT="$2"; shift 2 ;;
+        *) shift 1 ;;
+    esac
+done
+printf '{"type":"init","session_id":"sess-lifecycle-1","model":"%s","effort":"%s"}\n' "$MODEL" "$EFFORT"
+if [ -d "src" ]; then
+    printf "// completed by fake AGY\npub fn alpha() -> u32 { 42 }\n" > "src/lib.rs"
+fi
+printf '{"type":"result","subtype":"success","session_id":"sess-lifecycle-1","model":"%s","effort":"%s"}\n' "$MODEL" "$EFFORT"
+exit 0
 "#;
 
     let mut file = File::create(script_path).expect("create fake AGY executable");
@@ -211,7 +238,7 @@ fn setup_host_process_fixture() -> HostProcessFixture {
         .expect("chmod fixture bin dir 0700");
     let fake_agy_exe = bin_dir.join("fake-agy");
     let unexpected_invocations = bin_dir.join("unexpected-agy-invocations.txt");
-    write_unexpected_provider_script(&fake_agy_exe);
+    write_fake_provider_script(&fake_agy_exe);
 
     let registry_dir = root.join("registry-store");
     let plans_dir = root.join("plans-store");
@@ -713,4 +740,491 @@ async fn real_cli_process_idle_stop_and_restart_release_host_lock_without_task_r
         &stopped_second,
     );
     fixture.assert_no_provider_invocation();
+}
+
+async fn wait_for_host_idle(
+    client: &ApprovedHostClient,
+    approval_id: &str,
+    child: &mut HostChild,
+) -> HostControlStatusResponse {
+    let deadline = tokio::time::Instant::now() + START_TIMEOUT;
+    loop {
+        child.assert_running();
+        if let Ok(Some(status)) = client.host_control_status(approval_id).await {
+            if status.state == HostControlRuntimeState::Ready
+                && status.idle
+                && status.busy.is_idle()
+            {
+                return status;
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "host did not become idle after the completed task within {START_TIMEOUT:?}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+async fn wait_for_task_ready(
+    client: &ApprovedHostClient,
+    approval_id: &str,
+    task_id: &str,
+    child: &mut HostChild,
+) -> TaskStateSnapshot {
+    let deadline = tokio::time::Instant::now() + START_TIMEOUT;
+    loop {
+        child.assert_running();
+        let snapshot = client
+            .get_task_live_or_stopped(approval_id, task_id)
+            .await
+            .expect("read live task result");
+        if snapshot.status == TaskExecutionStatus::ReadyForReview {
+            return snapshot;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "task `{task_id}` did not become ReadyForReview: {:?}",
+            snapshot.status
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct StoppedReadFingerprint {
+    manifest: Option<Vec<u8>>,
+    receipts: Option<Vec<u8>>,
+    database: Option<Vec<u8>>,
+    wal: Option<Vec<u8>>,
+    shm: Option<Vec<u8>>,
+}
+
+fn read_optional_bytes(path: &Path) -> Option<Vec<u8>> {
+    match fs::read(path) {
+        Ok(bytes) => Some(bytes),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => panic!("read fixture file `{}`: {err}", path.display()),
+    }
+}
+
+fn capture_stopped_read_fingerprint(fixture: &HostProcessFixture) -> StoppedReadFingerprint {
+    let session_dir = fixture.session_dir();
+    let runtime_state_dir = session_dir.join(RUNTIME_STATE_SUBDIR);
+    StoppedReadFingerprint {
+        manifest: read_optional_bytes(&session_dir.join("host-manifest.json")),
+        receipts: read_optional_bytes(&session_dir.join(TASK_RECEIPTS_FILENAME)),
+        database: read_optional_bytes(&runtime_state_dir.join("state.db")),
+        wal: read_optional_bytes(&runtime_state_dir.join("state.db-wal")),
+        shm: read_optional_bytes(&runtime_state_dir.join("state.db-shm")),
+    }
+}
+
+fn stopped_read_backup_path(fixture: &HostProcessFixture, file_name: &str) -> PathBuf {
+    let fixture_root = fixture
+        .sessions_dir
+        .parent()
+        .expect("fixture sessions root parent");
+    let backup_dir = fixture_root.join("stopped-read-backups");
+    fs::create_dir_all(&backup_dir).expect("create out-of-session backup directory");
+    fs::set_permissions(&backup_dir, fs::Permissions::from_mode(0o700))
+        .expect("chmod out-of-session backup directory 0700");
+    assert!(
+        !backup_dir.starts_with(&fixture.sessions_dir),
+        "missing-file backups must stay outside the guarded session tree"
+    );
+    backup_dir.join(file_name)
+}
+
+fn assert_scope_error(result: Result<TaskStateSnapshot, HostError>, expected_field: &str) {
+    match result {
+        Err(HostError::ScopeMismatch { field, .. }) => {
+            assert_eq!(field, expected_field, "unexpected scope mismatch field");
+        }
+        other => panic!("expected ScopeMismatch on `{expected_field}`, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn completed_task_result_is_readable_live_and_after_real_cli_idle_stop_without_mutation() {
+    let fixture = setup_host_process_fixture();
+    fixture.assert_no_provider_invocation();
+
+    let client = ApprovedHostClient::open(
+        &fixture.registry_dir,
+        &fixture.plans_dir,
+        &fixture.authority_dir,
+        &fixture.sessions_dir,
+        CONTROL_BINDING_ID,
+        THREAD_UUID,
+    )
+    .expect("open authoritative approved host client");
+
+    let mut host = spawn_host_process(&fixture, "result", None);
+    let status =
+        wait_for_authenticated_ready(&client, &fixture.approval_id, &mut host, |_| true).await;
+    host.assert_running();
+    assert_live_ready(&fixture, &client, &mut host, &status);
+    fixture.assert_no_provider_invocation();
+
+    client
+        .dispatch_task(&fixture.approval_id, TASK_ID)
+        .await
+        .expect("dispatch approved root task");
+    let live_result = wait_for_task_ready(&client, &fixture.approval_id, TASK_ID, &mut host).await;
+    assert_eq!(live_result.status, TaskExecutionStatus::ReadyForReview);
+    assert!(!live_result.accepted);
+    assert_eq!(live_result.task_id, TASK_ID);
+    assert!(live_result.run_id.is_some());
+    assert!(live_result.worker_id.is_some());
+    let live_worker = live_result.worker.as_ref().expect("live worker snapshot");
+    assert_eq!(live_worker.status, threadlane::WorkerStatus::Completed);
+    assert_eq!(
+        live_worker
+            .outcome
+            .as_ref()
+            .expect("completed outcome")
+            .acceptance_state,
+        threadlane::WorkerAcceptanceState::ReadyForReview
+    );
+    let completed_provider_invocations = fixture.provider_invocation_count();
+    assert!(
+        completed_provider_invocations >= 1,
+        "the dispatched fake worker must have invoked its provider at least once"
+    );
+
+    let idle_status = wait_for_host_idle(&client, &fixture.approval_id, &mut host).await;
+
+    // Live regression: a valid-shaped receipt worker_id mismatch for the same run is still
+    // accepted by legacy get_task, but the new exact result API must refuse it.
+    let live_receipts_path = fixture.session_dir().join(TASK_RECEIPTS_FILENAME);
+    let live_original_receipts = fs::read(&live_receipts_path).expect("read live receipts fixture");
+    let actual_worker_id = live_result
+        .worker_id
+        .clone()
+        .expect("live result worker id");
+    let tampered_worker_id = if actual_worker_id == "wrk_00000000000000000000000000000001" {
+        "wrk_ffffffffffffffffffffffffffffffff"
+    } else {
+        "wrk_00000000000000000000000000000001"
+    };
+    let mut live_ledger: serde_json::Value =
+        serde_json::from_slice(&live_original_receipts).expect("parse live receipts fixture");
+    let live_receipt_entry = live_ledger["receipts"]
+        .as_array_mut()
+        .expect("live receipts array")
+        .first_mut()
+        .expect("live sealed receipt entry");
+    live_receipt_entry["worker_id"] = serde_json::Value::String(tampered_worker_id.to_string());
+    fs::write(
+        &live_receipts_path,
+        serde_json::to_vec_pretty(&live_ledger).expect("serialize live tampered receipts"),
+    )
+    .expect("write live tampered receipts fixture");
+    fs::set_permissions(&live_receipts_path, fs::Permissions::from_mode(0o600))
+        .expect("keep live tampered receipts private");
+
+    let legacy_live = client
+        .get_task(&fixture.approval_id, TASK_ID)
+        .await
+        .expect("legacy get_task keeps accepting a receipt worker mismatch for the same run");
+    assert_eq!(legacy_live.status, TaskExecutionStatus::ReadyForReview);
+    assert_eq!(legacy_live.run_id, live_result.run_id);
+    assert_eq!(legacy_live.worker_id.as_deref(), Some(tampered_worker_id));
+    assert_eq!(
+        legacy_live
+            .worker
+            .as_ref()
+            .expect("legacy live worker snapshot")
+            .worker_id,
+        actual_worker_id
+    );
+    let live_mismatch_err = client
+        .get_task_live_or_stopped(&fixture.approval_id, TASK_ID)
+        .await
+        .expect_err("new live result API must reject a mismatched receipt worker identity");
+    assert_eq!(live_mismatch_err.code(), "corrupt_session_state");
+
+    fs::write(&live_receipts_path, &live_original_receipts).expect("restore live receipts fixture");
+    fs::set_permissions(&live_receipts_path, fs::Permissions::from_mode(0o600))
+        .expect("restore live receipts permissions");
+    let restored_live = client
+        .get_task_live_or_stopped(&fixture.approval_id, TASK_ID)
+        .await
+        .expect("live exact result is readable after receipt restoration");
+    assert_eq!(restored_live, live_result);
+    assert_eq!(
+        fixture.provider_invocation_count(),
+        completed_provider_invocations,
+        "live identity regression and restoration must not launch the provider"
+    );
+
+    let instance_id = idle_status.instance_id.clone();
+    let session_binding_id = idle_status.session_binding_id.clone();
+    let stopped = client
+        .stop_idle_session(&fixture.approval_id, &instance_id)
+        .await
+        .expect("authenticated idle stop after completed result");
+    let exit = host.wait_for_exit(EXIT_TIMEOUT).await;
+    assert_eq!(
+        exit.code(),
+        Some(0),
+        "host process must exit naturally after serving a completed result"
+    );
+    assert_durable_stopped(&fixture, &instance_id, &session_binding_id, &stopped);
+    assert_eq!(
+        fixture.provider_invocation_count(),
+        completed_provider_invocations,
+        "idle stop must not launch the provider again"
+    );
+
+    let receipt = read_task_receipt(
+        &fixture.session_dir(),
+        &fixture.approval_record(),
+        &session_binding_id,
+        TASK_ID,
+    )
+    .expect("read sealed stopped task receipt")
+    .expect("completed task receipt exists");
+    assert_eq!(receipt.run_id, live_result.run_id.clone().unwrap());
+    assert_eq!(receipt.worker_id, live_result.worker_id.clone().unwrap());
+
+    let fingerprint_before = capture_stopped_read_fingerprint(&fixture);
+    let stopped_result = client
+        .get_task_live_or_stopped(&fixture.approval_id, TASK_ID)
+        .await
+        .expect("read stopped task result");
+    let fingerprint_after = capture_stopped_read_fingerprint(&fixture);
+
+    assert_eq!(
+        stopped_result, live_result,
+        "stopped result must preserve the live task, run, worker and outcome identities"
+    );
+    assert_eq!(stopped_result.status, TaskExecutionStatus::ReadyForReview);
+    assert!(!stopped_result.accepted);
+    assert_eq!(
+        fingerprint_before, fingerprint_after,
+        "stopped result read must not change manifest, receipts, DB, cursors, or sidecars"
+    );
+    assert!(
+        fingerprint_after.wal.is_none() && fingerprint_after.shm.is_none(),
+        "clean stopped history must not gain WAL/SHM sidecars"
+    );
+    assert_eq!(
+        fixture.provider_invocation_count(),
+        completed_provider_invocations,
+        "stopped result read must not launch the provider"
+    );
+
+    // A missing sealed receipt is explicit NotStarted, not an invented run or a synthetic Done.
+    let receipts_path = fixture.session_dir().join(TASK_RECEIPTS_FILENAME);
+    let missing_receipts_path = stopped_read_backup_path(&fixture, "task-receipts.json.missing");
+    fs::rename(&receipts_path, &missing_receipts_path).expect("move receipts ledger");
+    let not_started = client
+        .get_task_live_or_stopped(&fixture.approval_id, TASK_ID)
+        .await
+        .expect("missing receipt reports an explicit not-started outcome");
+    assert_eq!(not_started.status, TaskExecutionStatus::NotStarted);
+    assert!(not_started.run_id.is_none());
+    assert!(not_started.worker_id.is_none());
+    assert!(not_started.worker.is_none());
+    assert!(!not_started.accepted);
+    fs::rename(&missing_receipts_path, &receipts_path).expect("restore receipts ledger");
+
+    // An unresolved dispatch intent without a sealed receipt remains Unknown and never borrows a
+    // run identity from another task or from the intent's command key.
+    let original_receipts = fs::read(&receipts_path).expect("read original receipts fixture");
+    let original_ledger: serde_json::Value =
+        serde_json::from_slice(&original_receipts).expect("parse original receipts fixture");
+    let sealed_receipt = original_ledger["receipts"]
+        .as_array()
+        .expect("receipts array")
+        .first()
+        .expect("sealed receipt entry")
+        .clone();
+    let unresolved_intent = serde_json::json!({
+        "task_id": sealed_receipt["task_id"].clone(),
+        "task_digest": sealed_receipt["task_digest"].clone(),
+        "profile_id": sealed_receipt["profile_id"].clone(),
+        "command_key": sealed_receipt["command_key"].clone(),
+        "recorded_at_ms": sealed_receipt["recorded_at_ms"].clone(),
+    });
+    let mut intent_only_ledger = original_ledger.clone();
+    intent_only_ledger["receipts"] = serde_json::Value::Array(Vec::new());
+    intent_only_ledger["pending_intents"] = serde_json::Value::Array(vec![unresolved_intent]);
+    let intent_only_bytes =
+        serde_json::to_vec_pretty(&intent_only_ledger).expect("serialize intent-only ledger");
+    fs::write(&receipts_path, intent_only_bytes).expect("write intent-only ledger fixture");
+    fs::set_permissions(&receipts_path, fs::Permissions::from_mode(0o600))
+        .expect("keep intent-only ledger private");
+    let unknown_intent = client
+        .get_task_live_or_stopped(&fixture.approval_id, TASK_ID)
+        .await
+        .expect("unresolved intent reports an explicit unknown outcome");
+    assert_eq!(unknown_intent.status, TaskExecutionStatus::Unknown);
+    assert!(unknown_intent.run_id.is_none());
+    assert!(unknown_intent.worker_id.is_none());
+    assert!(unknown_intent.worker.is_none());
+    assert!(!unknown_intent.accepted);
+    fs::write(&receipts_path, &original_receipts).expect("restore receipts ledger");
+    fs::set_permissions(&receipts_path, fs::Permissions::from_mode(0o600))
+        .expect("restore receipts permissions");
+
+    // Caller scope remains authoritative: neither another binding nor another native thread can
+    // read this task's stopped result.
+    let wrong_binding = ApprovedHostClient::open(
+        &fixture.registry_dir,
+        &fixture.plans_dir,
+        &fixture.authority_dir,
+        &fixture.sessions_dir,
+        "bnd_wrong_scope",
+        THREAD_UUID,
+    )
+    .expect("open wrong-binding client");
+    assert_scope_error(
+        wrong_binding
+            .get_task_live_or_stopped(&fixture.approval_id, TASK_ID)
+            .await,
+        "control_binding_id",
+    );
+
+    let other_thread_uuid = "660e8400-e29b-41d4-a716-446655440001";
+    let wrong_thread = ApprovedHostClient::open(
+        &fixture.registry_dir,
+        &fixture.plans_dir,
+        &fixture.authority_dir,
+        &fixture.sessions_dir,
+        CONTROL_BINDING_ID,
+        other_thread_uuid,
+    )
+    .expect("open wrong-thread client");
+    assert_scope_error(
+        wrong_thread
+            .get_task_live_or_stopped(&fixture.approval_id, TASK_ID)
+            .await,
+        "thread_uuid",
+    );
+
+    // A still-held session lifetime lock is not clean stopped history.
+    let host_lock = OpenOptions::new()
+        .read(true)
+        .open(fixture.session_dir().join("host.lock"))
+        .expect("open stopped host.lock");
+    host_lock
+        .lock_exclusive()
+        .expect("hold stopped host.lock for rejection test");
+    let locked_err = client
+        .get_task_live_or_stopped(&fixture.approval_id, TASK_ID)
+        .await
+        .expect_err("held host.lock must refuse stopped result");
+    assert_eq!(locked_err.code(), "host_not_ready");
+    drop(host_lock);
+
+    // Residual WAL frames are not a clean checkpointed history and must fail closed without
+    // creating a SHM sidecar or mutating the database.
+    let runtime_state_dir = fixture.session_dir().join(RUNTIME_STATE_SUBDIR);
+    let wal_path = runtime_state_dir.join("state.db-wal");
+    let shm_path = runtime_state_dir.join("state.db-shm");
+    let db_path = runtime_state_dir.join("state.db");
+    let wal = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&wal_path)
+        .expect("create residual WAL fixture");
+    wal.sync_all().expect("sync residual WAL fixture");
+    drop(wal);
+    let db_before_wal_rejection = read_optional_bytes(&db_path);
+    let wal_err = client
+        .get_task_live_or_stopped(&fixture.approval_id, TASK_ID)
+        .await
+        .expect_err("residual WAL must refuse stopped result");
+    assert_eq!(wal_err.code(), "host_not_ready");
+    assert!(!shm_path.exists(), "must not create a missing SHM sidecar");
+    assert_eq!(read_optional_bytes(&db_path), db_before_wal_rejection);
+    fs::remove_file(&wal_path).expect("remove residual WAL fixture");
+
+    // Missing checkpointed database is missing stopped history, not an empty or fresh result.
+    let db_missing_path = stopped_read_backup_path(&fixture, "state.db.missing");
+    fs::rename(&db_path, &db_missing_path).expect("move state.db for missing-file rejection");
+    let missing_err = client
+        .get_task_live_or_stopped(&fixture.approval_id, TASK_ID)
+        .await
+        .expect_err("missing state.db must refuse stopped result");
+    assert_eq!(missing_err.code(), "corrupt_session_state");
+    fs::rename(&db_missing_path, &db_path).expect("restore state.db");
+
+    // Missing manifest cannot authenticate a stopped session.
+    let manifest_path = fixture.session_dir().join("host-manifest.json");
+    let missing_manifest_path = stopped_read_backup_path(&fixture, "host-manifest.json.missing");
+    fs::rename(&manifest_path, &missing_manifest_path).expect("move stopped manifest");
+    let manifest_err = client
+        .get_task_live_or_stopped(&fixture.approval_id, TASK_ID)
+        .await
+        .expect_err("missing stopped manifest must refuse stopped result");
+    assert_eq!(manifest_err.code(), "host_not_ready");
+    fs::rename(&missing_manifest_path, &manifest_path).expect("restore stopped manifest");
+
+    // Tampered task/run/profile/command/worker receipt fields must never resolve to a result.
+    let tampered_fields = [
+        ("task_digest", serde_json::Value::String("f".repeat(64))),
+        (
+            "run_id",
+            serde_json::Value::String("run_00000000000000000000000000000001".to_string()),
+        ),
+        (
+            "worker_id",
+            serde_json::Value::String("wrk_00000000000000000000000000000001".to_string()),
+        ),
+        (
+            "profile_id",
+            serde_json::Value::String("tampered-profile".to_string()),
+        ),
+        (
+            "command_key",
+            serde_json::Value::String("tampered-command-key".to_string()),
+        ),
+    ];
+    for (field, tampered_value) in tampered_fields {
+        let mut ledger: serde_json::Value =
+            serde_json::from_slice(&original_receipts).expect("parse receipts fixture JSON");
+        let receipt_entry = ledger["receipts"]
+            .as_array_mut()
+            .expect("receipts array")
+            .first_mut()
+            .expect("sealed receipt entry");
+        receipt_entry[field] = tampered_value;
+        let tampered_bytes =
+            serde_json::to_vec_pretty(&ledger).expect("serialize tampered receipts");
+        fs::write(&receipts_path, tampered_bytes).expect("write tampered receipts fixture");
+        fs::set_permissions(&receipts_path, fs::Permissions::from_mode(0o600))
+            .expect("keep tampered receipts private");
+
+        let tampered_err = client
+            .get_task_live_or_stopped(&fixture.approval_id, TASK_ID)
+            .await
+            .expect_err("tampered receipt field must refuse stopped result");
+        assert!(
+            matches!(
+                &tampered_err,
+                HostError::CorruptReceipts { .. } | HostError::CorruptSessionState { .. }
+            ),
+            "unexpected tampered `{field}` error: {tampered_err:?}"
+        );
+
+        fs::write(&receipts_path, &original_receipts).expect("restore receipts fixture");
+        fs::set_permissions(&receipts_path, fs::Permissions::from_mode(0o600))
+            .expect("restore receipts permissions");
+    }
+
+    let final_result = client
+        .get_task_live_or_stopped(&fixture.approval_id, TASK_ID)
+        .await
+        .expect("stopped result remains readable after rejection probes");
+    assert_eq!(final_result, live_result);
+    assert_eq!(
+        fixture.provider_invocation_count(),
+        completed_provider_invocations,
+        "rejection probes and final stopped read must not launch the provider"
+    );
 }
