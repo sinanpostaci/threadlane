@@ -21,6 +21,9 @@ use std::time::Duration;
 
 use fs2::FileExt;
 use tempfile::TempDir;
+use threadlane::presence::{
+    WorkerPresenceAvailability, WorkerPresenceFreshness, WorkerPresenceSnapshot,
+};
 use threadlane_authority::{ApprovalRecord, AuthorityStore, OperatorApprovalRequest};
 use threadlane_host::{
     is_host_lock_held, read_host_manifest_optional, read_task_dispatch_intent, read_task_receipt,
@@ -44,6 +47,7 @@ const CONTROL_BINDING_ID: &str = "bnd_process_lifecycle";
 const PLAN_ID: &str = "plan-host-process-lifecycle";
 const TASK_ID: &str = "task-process-agy";
 const FAILED_TASK_ID: &str = "task-process-failed";
+const PRESENCE_TASK_ID: &str = "task-process-presence";
 const START_TIMEOUT: Duration = Duration::from_secs(30);
 const EXIT_TIMEOUT: Duration = Duration::from_secs(10);
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -55,6 +59,8 @@ struct HostProcessFixture {
     authority_dir: PathBuf,
     sessions_dir: PathBuf,
     unexpected_invocations: PathBuf,
+    presence_started: PathBuf,
+    presence_release: PathBuf,
     logs_dir: PathBuf,
     approval_id: String,
     authority: AuthorityStore,
@@ -142,6 +148,29 @@ impl Drop for HostChild {
     }
 }
 
+struct PresenceReleaseGuard {
+    path: PathBuf,
+}
+
+impl PresenceReleaseGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+
+    fn release(&self) {
+        fs::write(&self.path, b"release\n").expect("write presence release marker");
+    }
+}
+
+impl Drop for PresenceReleaseGuard {
+    fn drop(&mut self) {
+        // Bounded fake child cleanup: release the marker even when an assertion unwinds.
+        if !self.path.exists() {
+            let _ = fs::write(&self.path, b"release\n");
+        }
+    }
+}
+
 fn init_disposable_git_repo(repo_dir: &Path) -> String {
     fs::create_dir_all(repo_dir.join("src")).expect("create disposable repo src");
     fs::write(repo_dir.join("src/lib.rs"), "pub fn alpha() -> u32 { 1 }\n")
@@ -180,8 +209,10 @@ fn init_disposable_git_repo(repo_dir: &Path) -> String {
 fn write_fake_provider_script(script_path: &Path) {
     // Every invocation is recorded so lifecycle reads can prove that no provider was launched.
     // A deliberately dispatched worker completes with matching model/effort telemetry and one
-    // bounded in-scope edit; a prompt tagged with FAILED_DELIVERY_TASK fails instead. No host
-    // startup, stop, restart, or result/delivery read invokes it.
+    // bounded in-scope edit; a prompt tagged with FAILED_DELIVERY_TASK fails instead. A prompt
+    // tagged with PRESENCE_HOLD_TASK stays silent and live until the fixture release marker, with
+    // a bounded timeout so cleanup can never leave an unbounded fake child. No host startup,
+    // stop, restart, presence, or result/delivery read invokes it.
     let script = r#"#!/bin/sh
 set -eu
 marker="${0%/*}/unexpected-agy-invocations.txt"
@@ -197,13 +228,31 @@ while [ "$#" -gt 0 ]; do
         *) shift 1 ;;
     esac
 done
-printf '{"type":"init","session_id":"sess-lifecycle-1","model":"%s","effort":"%s"}\n' "$MODEL" "$EFFORT"
 case "$PROMPT" in
+    *PRESENCE_HOLD_TASK*)
+        : > "${0%/*}/presence-child-started.txt"
+        i=0
+        while [ ! -f "${0%/*}/presence-child-release.txt" ]; do
+            i=$((i + 1))
+            if [ "$i" -ge 400 ]; then
+                exit 19
+            fi
+            sleep 0.05
+        done
+        if [ -d "src" ]; then
+            printf "// completed by fake AGY presence worker\npub fn alpha() -> u32 { 43 }\n" > "src/lib.rs"
+        fi
+        printf '{"type":"init","session_id":"sess-lifecycle-presence","model":"%s","effort":"%s"}\n' "$MODEL" "$EFFORT"
+        printf '{"type":"result","subtype":"success","session_id":"sess-lifecycle-presence","model":"%s","effort":"%s"}\n' "$MODEL" "$EFFORT"
+        exit 0
+        ;;
     *FAILED_DELIVERY_TASK*)
+        printf '{"type":"init","session_id":"sess-lifecycle-1","model":"%s","effort":"%s"}\n' "$MODEL" "$EFFORT"
         printf '{"type":"error","error":{"code":"fixture_failure","message":"fake AGY failed task"}}\n'
         exit 17
         ;;
 esac
+printf '{"type":"init","session_id":"sess-lifecycle-1","model":"%s","effort":"%s"}\n' "$MODEL" "$EFFORT"
 if [ -d "src" ]; then
     printf "// completed by fake AGY\npub fn alpha() -> u32 { 42 }\n" > "src/lib.rs"
 fi
@@ -234,15 +283,20 @@ fn private_log_file(path: &Path) -> File {
 }
 
 fn setup_host_process_fixture() -> HostProcessFixture {
-    setup_host_process_fixture_with_optional_failed_task(false)
+    setup_host_process_fixture_with_tasks(false, false)
 }
 
 fn setup_host_process_fixture_with_failed_task() -> HostProcessFixture {
-    setup_host_process_fixture_with_optional_failed_task(true)
+    setup_host_process_fixture_with_tasks(true, false)
 }
 
-fn setup_host_process_fixture_with_optional_failed_task(
+fn setup_host_presence_fixture() -> HostProcessFixture {
+    setup_host_process_fixture_with_tasks(true, true)
+}
+
+fn setup_host_process_fixture_with_tasks(
     include_failed_task: bool,
+    include_presence_task: bool,
 ) -> HostProcessFixture {
     let tmp = TempDir::new().expect("create private fixture tempdir");
     let root = fs::canonicalize(tmp.path()).expect("canonicalize fixture tempdir");
@@ -258,6 +312,8 @@ fn setup_host_process_fixture_with_optional_failed_task(
         .expect("chmod fixture bin dir 0700");
     let fake_agy_exe = bin_dir.join("fake-agy");
     let unexpected_invocations = bin_dir.join("unexpected-agy-invocations.txt");
+    let presence_started = bin_dir.join("presence-child-started.txt");
+    let presence_release = bin_dir.join("presence-child-release.txt");
     write_fake_provider_script(&fake_agy_exe);
 
     let registry_dir = root.join("registry-store");
@@ -345,6 +401,19 @@ fn setup_host_process_fixture_with_optional_failed_task(
             allowed_write_paths: vec!["src/lib.rs".to_string()],
         });
     }
+    if include_presence_task {
+        plan_tasks.push(PlanTask {
+            id: PRESENCE_TASK_ID.to_string(),
+            title: "Marker-gated fake AGY presence task".to_string(),
+            instruction:
+                "PRESENCE_HOLD_TASK: remain live until the fixture writes its release marker."
+                    .to_string(),
+            role: WorkflowRole::Coder,
+            difficulty: Difficulty::Hard,
+            depends_on: Vec::new(),
+            allowed_write_paths: vec!["src/lib.rs".to_string()],
+        });
+    }
     let draft = plans
         .change_at(
             0,
@@ -377,6 +446,9 @@ fn setup_host_process_fixture_with_optional_failed_task(
     if include_failed_task {
         approved_task_ids.push(FAILED_TASK_ID.to_string());
     }
+    if include_presence_task {
+        approved_task_ids.push(PRESENCE_TASK_ID.to_string());
+    }
     let approval = authority
         .approve_at(
             OperatorApprovalRequest {
@@ -397,7 +469,8 @@ fn setup_host_process_fixture_with_optional_failed_task(
         )
         .expect("persist operator approval");
     assert_eq!(approval.plan_id.as_str(), PLAN_ID);
-    let expected_worker_profiles = if include_failed_task { 2 } else { 1 };
+    let expected_worker_profiles =
+        1 + (if include_failed_task { 1 } else { 0 }) + (if include_presence_task { 1 } else { 0 });
     assert_eq!(approval.worker_profile_count, expected_worker_profiles);
     assert_eq!(approval.native_route_count, 0);
 
@@ -408,6 +481,8 @@ fn setup_host_process_fixture_with_optional_failed_task(
         authority_dir,
         sessions_dir,
         unexpected_invocations,
+        presence_started,
+        presence_release,
         logs_dir,
         approval_id: approval.approval_id,
         authority,
@@ -502,6 +577,72 @@ async fn wait_for_authenticated_ready(
             "{label} did not reach authenticated host-control readiness within {START_TIMEOUT:?}"
         );
         tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+async fn wait_for_presence_child_started(fixture: &HostProcessFixture, child: &mut HostChild) {
+    let deadline = tokio::time::Instant::now() + START_TIMEOUT;
+    loop {
+        child.assert_running();
+        if fixture.presence_started.exists() {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "marker-gated fake presence child did not start within {START_TIMEOUT:?}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+async fn wait_for_live_presence(
+    client: &ApprovedHostClient,
+    approval_id: &str,
+    task_id: &str,
+    child: &mut HostChild,
+) -> WorkerPresenceSnapshot {
+    let deadline = tokio::time::Instant::now() + START_TIMEOUT;
+    loop {
+        child.assert_running();
+        if let Ok(Some(presence)) = client.get_task_presence(approval_id, task_id).await {
+            if presence.availability == WorkerPresenceAvailability::Live
+                && presence.freshness == WorkerPresenceFreshness::Fresh
+                && presence.live
+            {
+                return presence;
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "task `{task_id}` did not expose live worker presence within {START_TIMEOUT:?}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+fn assert_no_live_presence(
+    result: Result<Option<WorkerPresenceSnapshot>, HostError>,
+    context: &str,
+) {
+    match result {
+        Ok(None) => {}
+        Ok(Some(presence)) => panic!(
+            "{context}: unexpected live presence for run `{}`",
+            presence.run_id
+        ),
+        Err(err) => panic!("{context}: unexpected presence error {err:?}"),
+    }
+}
+
+fn assert_not_live_presence(
+    result: Result<Option<WorkerPresenceSnapshot>, HostError>,
+    context: &str,
+) {
+    if let Ok(Some(presence)) = result {
+        panic!(
+            "{context}: unexpected live presence for run `{}`",
+            presence.run_id
+        );
     }
 }
 
@@ -1543,5 +1684,339 @@ async fn approved_host_delivery_inspection_reads_live_and_stopped_results_withou
     assert!(
         !is_host_lock_held(&fixture.session_dir()).expect("probe stopped host.lock"),
         "artifact mismatch probes must not restart the host"
+    );
+}
+
+#[tokio::test]
+async fn actual_worker_presence_is_scoped_fresh_and_never_survives_clean_stop() {
+    let fixture = setup_host_presence_fixture();
+    fixture.assert_no_provider_invocation();
+
+    let client = ApprovedHostClient::open(
+        &fixture.registry_dir,
+        &fixture.plans_dir,
+        &fixture.authority_dir,
+        &fixture.sessions_dir,
+        CONTROL_BINDING_ID,
+        THREAD_UUID,
+    )
+    .expect("open authoritative approved host client");
+    let release = PresenceReleaseGuard::new(fixture.presence_release.clone());
+
+    // Frozen authority and exact task resolution happen even before a host session exists.
+    assert_no_live_presence(
+        client
+            .get_task_presence(&fixture.approval_id, PRESENCE_TASK_ID)
+            .await,
+        "pre-launch presence",
+    );
+    match client
+        .get_task_presence(&fixture.approval_id, "task-not-approved")
+        .await
+    {
+        Err(HostError::UnknownTask { .. }) => {}
+        other => panic!("expected UnknownTask before launch, got {other:?}"),
+    }
+    let wrong_binding = ApprovedHostClient::open(
+        &fixture.registry_dir,
+        &fixture.plans_dir,
+        &fixture.authority_dir,
+        &fixture.sessions_dir,
+        "bnd_wrong_presence_scope",
+        THREAD_UUID,
+    )
+    .expect("open wrong-binding presence client");
+    match wrong_binding
+        .get_task_presence(&fixture.approval_id, PRESENCE_TASK_ID)
+        .await
+    {
+        Err(HostError::ScopeMismatch { field, .. }) => {
+            assert_eq!(field, "control_binding_id");
+        }
+        other => panic!("expected foreign-binding presence refusal, got {other:?}"),
+    }
+    let other_thread_uuid = "660e8400-e29b-41d4-a716-446655440001";
+    let wrong_thread = ApprovedHostClient::open(
+        &fixture.registry_dir,
+        &fixture.plans_dir,
+        &fixture.authority_dir,
+        &fixture.sessions_dir,
+        CONTROL_BINDING_ID,
+        other_thread_uuid,
+    )
+    .expect("open wrong-thread presence client");
+    match wrong_thread
+        .get_task_presence(&fixture.approval_id, PRESENCE_TASK_ID)
+        .await
+    {
+        Err(HostError::ScopeMismatch { field, .. }) => {
+            assert_eq!(field, "thread_uuid");
+        }
+        other => panic!("expected foreign-thread presence refusal, got {other:?}"),
+    }
+
+    let mut host = spawn_host_process(&fixture, "presence", None);
+    let status =
+        wait_for_authenticated_ready(&client, &fixture.approval_id, &mut host, |_| true).await;
+    assert_live_ready(&fixture, &client, &mut host, &status);
+    assert_no_live_presence(
+        client
+            .get_task_presence(&fixture.approval_id, PRESENCE_TASK_ID)
+            .await,
+        "unstarted presence",
+    );
+    fixture.assert_no_provider_invocation();
+
+    client
+        .dispatch_task(&fixture.approval_id, PRESENCE_TASK_ID)
+        .await
+        .expect("dispatch marker-gated presence task");
+    wait_for_presence_child_started(&fixture, &mut host).await;
+    let live =
+        wait_for_live_presence(&client, &fixture.approval_id, PRESENCE_TASK_ID, &mut host).await;
+
+    let record = fixture.approval_record();
+    let session_binding_id = status.session_binding_id.clone();
+    let receipt = read_task_receipt(
+        &fixture.session_dir(),
+        &record,
+        &session_binding_id,
+        PRESENCE_TASK_ID,
+    )
+    .expect("read presence task receipt")
+    .expect("presence task receipt exists");
+
+    assert_eq!(live.binding_id, session_binding_id);
+    assert_eq!(live.run_id, receipt.run_id);
+    assert_eq!(live.worker_id, receipt.worker_id);
+    assert_eq!(live.profile_id, receipt.profile_id);
+    assert_eq!(live.execution_binding, receipt.execution_binding);
+    assert!(!live.worker_status.is_terminal());
+    assert!(live.claim_id.is_some());
+    assert!(live.attempt_count >= 1);
+    let expected_owner = threadlane::HostControlConfig {
+        approval_id: fixture.approval_id.clone(),
+        subject_digest: record.subject_digest.clone(),
+        control_binding_id: record.binding_id.clone(),
+        thread_uuid: record.thread_uuid.clone(),
+        session_binding_id: session_binding_id.clone(),
+        instance_id: status.instance_id.clone(),
+    };
+    assert_eq!(live.owner.as_ref(), Some(&expected_owner));
+    let process = live.process.as_ref().expect("live owned process snapshot");
+    assert!(process.is_valid());
+    assert!(process.is_live());
+    assert_eq!(
+        process
+            .process_group_id
+            .and_then(|pgid| u32::try_from(pgid).ok()),
+        process.child_pid
+    );
+    assert!(live.max_sample_age_ms > 0);
+    assert!(
+        live.sample_age_ms
+            .is_some_and(|age| age <= live.max_sample_age_ms),
+        "live presence sample age must stay within its bound"
+    );
+    assert!(live.sampled_at_ms.is_some());
+
+    let running_task = client
+        .get_task_live_or_stopped(&fixture.approval_id, PRESENCE_TASK_ID)
+        .await
+        .expect("read running presence task snapshot");
+    let running_worker = running_task
+        .worker
+        .as_ref()
+        .expect("running presence worker snapshot");
+    assert_eq!(live.worker_revision, running_worker.revision);
+    assert_eq!(live.worker_status, running_worker.status);
+    assert_eq!(live.claim_id, running_worker.claim_id);
+    assert_eq!(live.attempt_count, running_worker.attempt_count);
+    assert_eq!(live.profile_digest, running_worker.profile_digest);
+    assert_eq!(live.execution_binding, running_worker.execution_binding);
+
+    let invocations_after_dispatch = fixture.provider_invocation_count();
+    assert!(
+        invocations_after_dispatch >= 1,
+        "the marker-gated fake worker must have invoked its provider"
+    );
+
+    let manifest_path = fixture.session_dir().join("host-manifest.json");
+    let receipts_path = fixture.session_dir().join(TASK_RECEIPTS_FILENAME);
+    let manifest_before = read_optional_bytes(&manifest_path);
+    let receipts_before = read_optional_bytes(&receipts_path);
+    let repeated = client
+        .get_task_presence(&fixture.approval_id, PRESENCE_TASK_ID)
+        .await
+        .expect("repeat live presence read")
+        .expect("live presence remains available");
+    assert_eq!(repeated.run_id, live.run_id);
+    assert_eq!(repeated.worker_id, live.worker_id);
+    assert_eq!(repeated.claim_id, live.claim_id);
+    assert_eq!(repeated.attempt_count, live.attempt_count);
+    assert!(
+        repeated
+            .sample_age_ms
+            .is_some_and(|age| age <= repeated.max_sample_age_ms),
+        "repeated presence sample age must stay within its bound"
+    );
+    assert_eq!(read_optional_bytes(&manifest_path), manifest_before);
+    assert_eq!(read_optional_bytes(&receipts_path), receipts_before);
+    assert_eq!(
+        fixture.provider_invocation_count(),
+        invocations_after_dispatch,
+        "live presence reads must not launch the provider"
+    );
+
+    // A mismatched sealed receipt worker identity must not be adopted as live presence.
+    let original_receipts = fs::read(&receipts_path).expect("read live receipts fixture");
+    let mut ledger: serde_json::Value =
+        serde_json::from_slice(&original_receipts).expect("parse live receipts fixture");
+    let receipt_entry = ledger["receipts"]
+        .as_array_mut()
+        .expect("live receipts array")
+        .iter_mut()
+        .find(|entry| {
+            entry.get("task_id").and_then(|value| value.as_str()) == Some(PRESENCE_TASK_ID)
+        })
+        .expect("presence task receipt entry");
+    let actual_worker_id = receipt.worker_id.clone();
+    let tampered_worker_id = if actual_worker_id == "wrk_00000000000000000000000000000001" {
+        "wrk_ffffffffffffffffffffffffffffffff"
+    } else {
+        "wrk_00000000000000000000000000000001"
+    };
+    receipt_entry["worker_id"] = serde_json::Value::String(tampered_worker_id.to_string());
+    fs::write(
+        &receipts_path,
+        serde_json::to_vec_pretty(&ledger).expect("serialize tampered presence receipts"),
+    )
+    .expect("write tampered presence receipts fixture");
+    fs::set_permissions(&receipts_path, fs::Permissions::from_mode(0o600))
+        .expect("keep tampered presence receipts private");
+    assert_not_live_presence(
+        client
+            .get_task_presence(&fixture.approval_id, PRESENCE_TASK_ID)
+            .await,
+        "tampered receipt presence",
+    );
+    assert_eq!(
+        fixture.provider_invocation_count(),
+        invocations_after_dispatch,
+        "receipt mismatch probes must not launch the provider"
+    );
+    fs::write(&receipts_path, &original_receipts).expect("restore live receipts fixture");
+    fs::set_permissions(&receipts_path, fs::Permissions::from_mode(0o600))
+        .expect("restore live receipts permissions");
+
+    // A foreign current manifest instance must not match the runtime owner tuple.
+    let original_manifest = fs::read(&manifest_path).expect("read live manifest fixture");
+    let mut manifest_json: serde_json::Value =
+        serde_json::from_slice(&original_manifest).expect("parse live manifest fixture");
+    manifest_json["instance_id"] =
+        serde_json::Value::String("hst_00000000000000000000000000000001".to_string());
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest_json).expect("serialize tampered live manifest"),
+    )
+    .expect("write tampered live manifest fixture");
+    fs::set_permissions(&manifest_path, fs::Permissions::from_mode(0o600))
+        .expect("keep tampered live manifest private");
+    assert_not_live_presence(
+        client
+            .get_task_presence(&fixture.approval_id, PRESENCE_TASK_ID)
+            .await,
+        "tampered instance presence",
+    );
+    assert_eq!(
+        fixture.provider_invocation_count(),
+        invocations_after_dispatch,
+        "instance mismatch probes must not launch the provider"
+    );
+    fs::write(&manifest_path, &original_manifest).expect("restore live manifest fixture");
+    fs::set_permissions(&manifest_path, fs::Permissions::from_mode(0o600))
+        .expect("restore live manifest permissions");
+    let restored = client
+        .get_task_presence(&fixture.approval_id, PRESENCE_TASK_ID)
+        .await
+        .expect("restored live presence read")
+        .expect("restored live presence remains available");
+    assert_eq!(restored.run_id, live.run_id);
+
+    release.release();
+    let live_result =
+        wait_for_task_ready(&client, &fixture.approval_id, PRESENCE_TASK_ID, &mut host).await;
+    assert_eq!(live_result.status, TaskExecutionStatus::ReadyForReview);
+    let invocations_after_success = fixture.provider_invocation_count();
+    assert_eq!(
+        invocations_after_success, invocations_after_dispatch,
+        "completing the marker-gated worker must not relaunch the provider"
+    );
+    assert_no_live_presence(
+        client
+            .get_task_presence(&fixture.approval_id, PRESENCE_TASK_ID)
+            .await,
+        "completed presence",
+    );
+
+    client
+        .dispatch_task(&fixture.approval_id, FAILED_TASK_ID)
+        .await
+        .expect("dispatch approved failing task");
+    let failed_result = wait_for_task_status(
+        &client,
+        &fixture.approval_id,
+        FAILED_TASK_ID,
+        &mut host,
+        TaskExecutionStatus::Failed,
+    )
+    .await;
+    assert_eq!(failed_result.status, TaskExecutionStatus::Failed);
+    assert_no_live_presence(
+        client
+            .get_task_presence(&fixture.approval_id, FAILED_TASK_ID)
+            .await,
+        "failed presence",
+    );
+    let invocations_after_failure = fixture.provider_invocation_count();
+    assert!(invocations_after_failure > invocations_after_success);
+    assert_eq!(
+        fixture.provider_invocation_count(),
+        invocations_after_failure,
+        "failed presence reads must not launch the provider"
+    );
+
+    let idle = wait_for_host_idle(&client, &fixture.approval_id, &mut host).await;
+    let instance_id = idle.instance_id.clone();
+    let stopped = client
+        .stop_idle_session(&fixture.approval_id, &instance_id)
+        .await
+        .expect("authenticated idle stop after presence observations");
+    let exit = host.wait_for_exit(EXIT_TIMEOUT).await;
+    assert_eq!(
+        exit.code(),
+        Some(0),
+        "host process must exit naturally after presence observations"
+    );
+    assert_durable_stopped(&fixture, &instance_id, &session_binding_id, &stopped);
+    assert_no_live_presence(
+        client
+            .get_task_presence(&fixture.approval_id, PRESENCE_TASK_ID)
+            .await,
+        "stopped presence",
+    );
+    assert!(
+        !is_host_lock_held(&fixture.session_dir()).expect("probe stopped host.lock"),
+        "presence reads must not revive the stopped host"
+    );
+    let stopped_result = client
+        .get_task_live_or_stopped(&fixture.approval_id, PRESENCE_TASK_ID)
+        .await
+        .expect("original stopped task result remains readable");
+    assert_eq!(stopped_result, live_result);
+    assert_eq!(
+        fixture.provider_invocation_count(),
+        invocations_after_failure,
+        "stopped presence and result reads must not launch the provider"
     );
 }

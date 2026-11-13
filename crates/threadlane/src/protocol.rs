@@ -1,3 +1,8 @@
+pub use crate::presence::{
+    WorkerPresenceAvailability, WorkerPresenceFreshness, WorkerPresenceSnapshot,
+    WorkerPresenceUnavailableReason, WORKER_PRESENCE_MAX_SAMPLE_AGE_MS,
+    WORKER_PRESENCE_SCHEMA_VERSION,
+};
 use serde::{Deserialize, Serialize};
 use threadlane_core::{
     AckResult, BacklogHistoryPage, BacklogItem, BacklogItemKind, BacklogItemPage, Binding, Command,
@@ -347,6 +352,12 @@ pub enum ScopedRequest {
         #[serde(alias = "worker_id")]
         run_id: String,
     },
+    /// Fetch an ephemeral, claim-scoped process presence snapshot for `run_id` within the binding.
+    GetWorkerPresence {
+        /// Target worker run identifier (`run_<uuid>`) or worker identifier (`wrk_<uuid>`).
+        #[serde(alias = "worker_id")]
+        run_id: String,
+    },
     /// Request revision-checked cancellation of a worker run within the binding.
     CancelWorker {
         /// Caller-supplied idempotency key scoped to the binding.
@@ -372,6 +383,7 @@ impl ScopedRequest {
         match self {
             Self::Status
             | Self::StartWorker { .. }
+            | Self::GetWorkerPresence { .. }
             | Self::BacklogCreate { .. }
             | Self::BacklogGet { .. }
             | Self::BacklogList { .. }
@@ -710,6 +722,8 @@ pub enum ScopedResponse {
     Run(Run),
     /// Compact durable worker snapshot (`StartWorker`, `GetWorker`, `CancelWorker`).
     Worker(WorkerSnapshot),
+    /// Ephemeral claim-scoped process presence snapshot (`GetWorkerPresence`).
+    WorkerPresence(WorkerPresenceSnapshot),
     /// Bounded keyset-paginated run list page (`ListRuns`).
     RunList(RunListPage),
     /// Bounded keyset-paginated run revision history page (`ListRunRevisions`).
@@ -767,6 +781,14 @@ impl ScopedResponse {
     pub fn into_worker(self) -> Option<WorkerSnapshot> {
         match self {
             Self::Worker(worker) => Some(worker),
+            _ => None,
+        }
+    }
+
+    /// Extracts the inner [`WorkerPresenceSnapshot`] if this is `ScopedResponse::WorkerPresence`.
+    pub fn into_worker_presence(self) -> Option<WorkerPresenceSnapshot> {
+        match self {
+            Self::WorkerPresence(presence) => Some(presence),
             _ => None,
         }
     }

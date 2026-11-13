@@ -51,6 +51,12 @@ use crate::approved_mcp::{
 use crate::auto_pair::{
     parse_thread_hint, AutomaticPairing, AutomaticPairingRuntime, CALL_THREAD_HINT,
 };
+use crate::backlog_worker::{
+    WorkerBacklogCompleteOutcome, WorkerBacklogCompleteParams, WorkerBacklogError,
+    WorkerBacklogResultOutcome, WorkerBacklogResultParams, WorkerBacklogService,
+    WorkerBacklogStartParams, WORKER_BACKLOG_COMPLETE_TOOL, WORKER_BACKLOG_RESULT_TOOL,
+    WORKER_BACKLOG_START_TOOL,
+};
 use crate::error::{NativeError, NativeErrorCode};
 use crate::execution_gateway::{
     CoworkerExecutionGateway, ExecutionStatusParams, PreviewExecutionParams, StartExecutionParams,
@@ -1831,6 +1837,11 @@ impl PairedMcpServer {
             | "approved_ack_events" => {
                 self.prepare_workflow_or_approved_tool_json_future(tool_name, arguments)
             }
+            WORKER_BACKLOG_START_TOOL
+            | WORKER_BACKLOG_RESULT_TOOL
+            | WORKER_BACKLOG_COMPLETE_TOOL => {
+                self.prepare_backlog_worker_tool_json_future(tool_name, arguments)
+            }
             "coworker_status"
             | "prepare_work"
             | "consult_architect"
@@ -2037,6 +2048,39 @@ impl PairedMcpServer {
             "approved_ack_events" => {
                 let params = self.parse_enrolled_tool_params(tool_name, arguments)?;
                 Ok(self.approved_ack_events_boxed(params))
+            }
+            _ => Err(Self::format_pairing_error(
+                tool_name,
+                NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "unknown MCP tool requested",
+                ),
+            )),
+        }
+    }
+
+    fn prepare_backlog_worker_tool_json_future<'a>(
+        &'a self,
+        tool_name: &'a str,
+        arguments: Value,
+    ) -> Result<BoxedTaskLocalFuture<'a, Result<CallToolResult, CallToolResult>>, CallToolResult>
+    {
+        Self::ensure_no_rebind_keys(tool_name, &arguments)?;
+        match tool_name {
+            WORKER_BACKLOG_START_TOOL => {
+                let params: WorkerBacklogStartParams =
+                    Self::parse_tool_params(tool_name, arguments)?;
+                Ok(self.backlog_worker_start_boxed(params))
+            }
+            WORKER_BACKLOG_RESULT_TOOL => {
+                let params: WorkerBacklogResultParams =
+                    Self::parse_tool_params(tool_name, arguments)?;
+                Ok(self.backlog_worker_result_boxed(params))
+            }
+            WORKER_BACKLOG_COMPLETE_TOOL => {
+                let params: WorkerBacklogCompleteParams =
+                    Self::parse_tool_params(tool_name, arguments)?;
+                Ok(self.backlog_worker_complete_boxed(params))
             }
             _ => Err(Self::format_pairing_error(
                 tool_name,
@@ -3656,6 +3700,343 @@ impl PairedMcpServer {
         })
     }
 
+    fn backlog_worker_service(
+        &self,
+        stores: &HostStores,
+    ) -> Result<WorkerBacklogService, WorkerBacklogError> {
+        WorkerBacklogService::new(
+            &self.state_dir,
+            Arc::clone(&stores.authority),
+            stores.sessions_dir.clone(),
+            self.host_launcher.clone(),
+        )
+    }
+
+    fn backlog_worker_final_recheck(
+        &self,
+        tool_name: &'static str,
+        expected_binding_id: String,
+        expected_thread_uuid: String,
+    ) -> impl Fn() -> Result<(), WorkerBacklogError> + Send + 'static {
+        let pairing_store = self.pairing_store.clone();
+        let nonce = self.connection_nonce.clone();
+        let epoch = self.epoch_id.clone();
+        let server = self.clone();
+        move || {
+            let store_result = pairing_store.verify_enrolled_binding(&nonce, &epoch);
+            let enrollment = server
+                .revalidate_enrollment_record_on_task(tool_name, store_result)
+                .map_err(WorkerBacklogError::from_tool_result)?;
+            if !constant_time_str_eq(&enrollment.binding_id, &expected_binding_id)
+                || !constant_time_str_eq(&enrollment.thread_id, &expected_thread_uuid)
+            {
+                return Err(WorkerBacklogError::new(
+                    "rebind_rejected",
+                    "Enrolled binding or native thread changed during the Worker backlog operation.",
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    fn backlog_worker_start_boxed(
+        &self,
+        params: WorkerBacklogStartParams,
+    ) -> BoxedTaskLocalFuture<'_, Result<CallToolResult, CallToolResult>> {
+        Box::pin(async move {
+            let startup_deadline = self
+                .host_launcher
+                .as_ref()
+                .map(|launcher| Instant::now() + launcher.policy().startup_timeout());
+            let enrollment = self
+                .verify_enrolled_binding_for_tool_until(WORKER_BACKLOG_START_TOOL, startup_deadline)
+                .await?;
+            self.backlog_worker_start_with_deadline(params, startup_deadline, enrollment)
+                .await
+        })
+    }
+
+    fn backlog_worker_start_with_deadline(
+        &self,
+        params: WorkerBacklogStartParams,
+        startup_deadline: Option<Instant>,
+        enrollment: EnrollmentRecord,
+    ) -> BoxedTaskLocalFuture<'_, Result<CallToolResult, CallToolResult>> {
+        Box::pin(async move {
+            let trusted_binding_id = enrollment.binding_id;
+            let trusted_thread_uuid = enrollment.thread_id;
+            let Some(stores) = self.host_stores.clone() else {
+                return Err(Self::format_scoped_error(
+                    &trusted_binding_id,
+                    WORKER_BACKLOG_START_TOOL,
+                    "host_not_configured",
+                    HOST_NOT_CONFIGURED_MESSAGE,
+                ));
+            };
+            let service = self.backlog_worker_service(&stores).map_err(|error| {
+                Self::format_scoped_error(
+                    &trusted_binding_id,
+                    WORKER_BACKLOG_START_TOOL,
+                    error.code(),
+                    error.message(),
+                )
+            })?;
+            let managed_host_notice =
+                self.managed_host_notice_request(&trusted_binding_id, &trusted_thread_uuid);
+            let post_dispatch_recheck = self.backlog_worker_final_recheck(
+                WORKER_BACKLOG_START_TOOL,
+                trusted_binding_id.clone(),
+                trusted_thread_uuid.clone(),
+            );
+
+            let guard_binding_id = trusted_binding_id.clone();
+            let guard_thread_uuid = trusted_thread_uuid.clone();
+            let guard_approval_id = params.approval_id.clone();
+            let guard_task_id = params.task_id.clone();
+            let expected_binding_id = trusted_binding_id.clone();
+            let expected_thread_uuid = trusted_thread_uuid.clone();
+            let pairing_store_for_recheck = self.pairing_store.clone();
+            let nonce_for_recheck = self.connection_nonce.clone();
+            let epoch_for_recheck = self.epoch_id.clone();
+            let server_for_recheck = self.clone();
+            let authority_for_guard = Arc::clone(&stores.authority);
+
+            let obs = match self
+                .begin_paired_observation_until(
+                    &guard_binding_id,
+                    &guard_thread_uuid,
+                    WORKER_BACKLOG_START_TOOL,
+                    None,
+                    Some(&guard_approval_id),
+                    Some(&guard_task_id),
+                    startup_deadline,
+                )
+                .await
+            {
+                Ok(handle) => handle,
+                Err(timed_out_handle) => {
+                    let res = Err(Self::format_scoped_error(
+                        &guard_binding_id,
+                        WORKER_BACKLOG_START_TOOL,
+                        "host_not_ready",
+                        HOST_NOT_READY_STARTUP_TIMEOUT_MESSAGE,
+                    ));
+                    self.finish_paired_observation_until(timed_out_handle, startup_deadline, &res)
+                        .await;
+                    return res;
+                }
+            };
+
+            let guarded = crate::dispatch_guard::with_guarded_native_dispatch_until(
+                &authority_for_guard,
+                &guard_binding_id,
+                &guard_thread_uuid,
+                &guard_approval_id,
+                &guard_task_id,
+                None,
+                startup_deadline,
+                || async move {
+                    service
+                        .start(
+                            &trusted_binding_id,
+                            &trusted_thread_uuid,
+                            params,
+                            startup_deadline,
+                            managed_host_notice,
+                            move || {
+                                Ok(pairing_store_for_recheck
+                                    .verify_enrolled_binding(&nonce_for_recheck, &epoch_for_recheck))
+                            },
+                            move |store_result| {
+                                let enrollment = server_for_recheck
+                                    .revalidate_enrollment_record_on_task(
+                                        WORKER_BACKLOG_START_TOOL,
+                                        store_result,
+                                    )?;
+                                if !constant_time_str_eq(
+                                    &enrollment.binding_id,
+                                    &expected_binding_id,
+                                ) || !constant_time_str_eq(
+                                    &enrollment.thread_id,
+                                    &expected_thread_uuid,
+                                ) {
+                                    return Err(Self::format_pairing_error(
+                                        WORKER_BACKLOG_START_TOOL,
+                                        NativeError::new(
+                                            NativeErrorCode::RebindRejected,
+                                            "enrolled binding or native thread changed during Worker backlog start",
+                                        ),
+                                    ));
+                                }
+                                Ok(())
+                            },
+                            post_dispatch_recheck,
+                        )
+                        .await
+                        .map_err(|error| {
+                            crate::dispatch_guard::GuardedDispatchError::pre_effect(
+                                error.code(),
+                                error.message(),
+                            )
+                        })
+                },
+            )
+            .await;
+
+            let res = match guarded {
+                Ok(outcome) => Self::format_planning_gateway_result(
+                    &guard_binding_id,
+                    WORKER_BACKLOG_START_TOOL,
+                    outcome,
+                ),
+                Err(crate::dispatch_guard::GuardedDispatchError::PreEffect { code, message }) => {
+                    Err(Self::format_scoped_error(
+                        &guard_binding_id,
+                        WORKER_BACKLOG_START_TOOL,
+                        code,
+                        message,
+                    ))
+                }
+                Err(crate::dispatch_guard::GuardedDispatchError::Host(host_err)) => {
+                    let (code, message) = crate::approved_mcp::map_host_error_to_mcp(&host_err);
+                    Err(Self::format_scoped_error(
+                        &guard_binding_id,
+                        WORKER_BACKLOG_START_TOOL,
+                        code,
+                        message,
+                    ))
+                }
+            };
+            self.finish_paired_observation_until(obs, startup_deadline, &res)
+                .await;
+            res
+        })
+    }
+
+    fn backlog_worker_result_boxed(
+        &self,
+        params: WorkerBacklogResultParams,
+    ) -> BoxedTaskLocalFuture<'_, Result<CallToolResult, CallToolResult>> {
+        Box::pin(async move {
+            let enrollment = self.verify_enrolled_binding_for_tool(WORKER_BACKLOG_RESULT_TOOL)?;
+            let Some(stores) = self.host_stores.clone() else {
+                return Err(Self::format_scoped_error(
+                    &enrollment.binding_id,
+                    WORKER_BACKLOG_RESULT_TOOL,
+                    "host_not_configured",
+                    HOST_NOT_CONFIGURED_MESSAGE,
+                ));
+            };
+            let service = self.backlog_worker_service(&stores).map_err(|error| {
+                Self::format_scoped_error(
+                    &enrollment.binding_id,
+                    WORKER_BACKLOG_RESULT_TOOL,
+                    error.code(),
+                    error.message(),
+                )
+            })?;
+            let final_recheck = self.backlog_worker_final_recheck(
+                WORKER_BACKLOG_RESULT_TOOL,
+                enrollment.binding_id.clone(),
+                enrollment.thread_id.clone(),
+            );
+            let req_id = self
+                .begin_paired_observation(
+                    &enrollment.binding_id,
+                    &enrollment.thread_id,
+                    WORKER_BACKLOG_RESULT_TOOL,
+                    None,
+                    None,
+                )
+                .await;
+            let result: Result<WorkerBacklogResultOutcome, WorkerBacklogError> = service
+                .result(
+                    &enrollment.binding_id,
+                    &enrollment.thread_id,
+                    params,
+                    final_recheck,
+                )
+                .await;
+            let res = match result {
+                Ok(outcome) => Self::format_planning_gateway_result(
+                    &enrollment.binding_id,
+                    WORKER_BACKLOG_RESULT_TOOL,
+                    outcome,
+                ),
+                Err(error) => Err(Self::format_scoped_error(
+                    &enrollment.binding_id,
+                    WORKER_BACKLOG_RESULT_TOOL,
+                    error.code(),
+                    error.message(),
+                )),
+            };
+            self.finish_paired_observation(req_id, &res).await;
+            res
+        })
+    }
+
+    fn backlog_worker_complete_boxed(
+        &self,
+        params: WorkerBacklogCompleteParams,
+    ) -> BoxedTaskLocalFuture<'_, Result<CallToolResult, CallToolResult>> {
+        Box::pin(async move {
+            let enrollment = self.verify_enrolled_binding_for_tool(WORKER_BACKLOG_COMPLETE_TOOL)?;
+            let Some(stores) = self.host_stores.clone() else {
+                return Err(Self::format_scoped_error(
+                    &enrollment.binding_id,
+                    WORKER_BACKLOG_COMPLETE_TOOL,
+                    "host_not_configured",
+                    HOST_NOT_CONFIGURED_MESSAGE,
+                ));
+            };
+            let service = self.backlog_worker_service(&stores).map_err(|error| {
+                Self::format_scoped_error(
+                    &enrollment.binding_id,
+                    WORKER_BACKLOG_COMPLETE_TOOL,
+                    error.code(),
+                    error.message(),
+                )
+            })?;
+            let final_recheck = self.backlog_worker_final_recheck(
+                WORKER_BACKLOG_COMPLETE_TOOL,
+                enrollment.binding_id.clone(),
+                enrollment.thread_id.clone(),
+            );
+            let req_id = self
+                .begin_paired_observation(
+                    &enrollment.binding_id,
+                    &enrollment.thread_id,
+                    WORKER_BACKLOG_COMPLETE_TOOL,
+                    None,
+                    None,
+                )
+                .await;
+            let result: Result<WorkerBacklogCompleteOutcome, WorkerBacklogError> = service
+                .complete(
+                    &enrollment.binding_id,
+                    &enrollment.thread_id,
+                    params,
+                    final_recheck,
+                )
+                .await;
+            let res = match result {
+                Ok(outcome) => Self::format_planning_gateway_result(
+                    &enrollment.binding_id,
+                    WORKER_BACKLOG_COMPLETE_TOOL,
+                    outcome,
+                ),
+                Err(error) => Err(Self::format_scoped_error(
+                    &enrollment.binding_id,
+                    WORKER_BACKLOG_COMPLETE_TOOL,
+                    error.code(),
+                    error.message(),
+                )),
+            };
+            self.finish_paired_observation(req_id, &res).await;
+            res
+        })
+    }
+
     fn catalog_boxed(
         &self,
         params: CatalogParams,
@@ -4210,7 +4591,7 @@ impl PairedMcpServer {
     /// Delegated `operating_guide` tool (requires verified operator enrollment).
     #[tool(
         name = "operating_guide",
-        description = "Fetch the versioned, read-only Threadlane MCP operating guide (version 2026-11-09.v1) for the enrolled chat binding. Call on initial connection, session resume, or context uncertainty/compaction, then refresh live scoped status/plan/session revisions without a polling loop. Includes trusted-local complete job admission, durability checks for unchanged Complete receipts, bounded historical fatal_error and advisory original-host Worker (coder) progress-attention limits. Does not mutate state or acknowledge events.",
+        description = "Fetch the versioned, read-only Threadlane MCP operating guide (version 2026-11-13.v1) for the enrolled chat binding. Call on initial connection, session resume, or context uncertainty/compaction, then refresh live scoped backlog/status state without a polling loop. Includes ordinary backlog workflow, guarded Worker (coder) reservation/result/completion contracts, and optional legacy complete job admission with durability and receipt limits. Does not mutate state or acknowledge events.",
         annotations(
             title = "Get Threadlane MCP Operating Guide",
             read_only_hint = true,
@@ -4661,6 +5042,63 @@ impl PairedMcpServer {
         Parameters(params): Parameters<BacklogHistoryParams>,
     ) -> Result<CallToolResult, CallToolResult> {
         self.backlog_history_boxed(params).await
+    }
+
+    /// Reserves and starts one Worker backlog item through the existing approved single-task route (requires verified operator enrollment).
+    #[tool(
+        name = "backlog_worker_start",
+        description = "Atomically reserve the Worker backlog item at expected_revision through the control supervisor before any host/provider effect, then reconcile the exact frozen approval/task and existing invocation. Only a demonstrably unstarted eligible original task may use the existing approved auto-launch/dispatch route. Unknown dispatch intent is returned as uncertainty without replay; a pre-effect refusal leaves the original reservation recoverable.",
+        annotations(
+            title = "Start Guarded Worker Backlog Item",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    pub async fn backlog_worker_start(
+        &self,
+        Parameters(params): Parameters<WorkerBacklogStartParams>,
+    ) -> Result<CallToolResult, CallToolResult> {
+        self.backlog_worker_start_boxed(params).await
+    }
+
+    /// Reconciles the exact stored Worker execution against genuine live or stopped host state (requires verified operator enrollment).
+    #[tool(
+        name = "backlog_worker_result",
+        description = "Reconcile one exact stored Worker execution for a backlog item. Attaches only a genuine host dispatch receipt, records a verified success only with an actual physical delivery inspection, records a verified failure/unknown only from concrete host evidence, and leaves successful results in Doing for separate Coworker acceptance. Pending/running returns state without an outcome; transient unavailability never overwrites a known outcome.",
+        annotations(
+            title = "Reconcile Worker Backlog Result",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    pub async fn backlog_worker_result(
+        &self,
+        Parameters(params): Parameters<WorkerBacklogResultParams>,
+    ) -> Result<CallToolResult, CallToolResult> {
+        self.backlog_worker_result_boxed(params).await
+    }
+
+    /// Commits separate Coworker acceptance completion for an exact successful Worker execution (requires verified operator enrollment).
+    #[tool(
+        name = "backlog_worker_complete",
+        description = "Commit separate Coworker acceptance completion for one exact stored successful Worker execution. Requires the exact expected result and physical delivery digests, bounded acceptance note/evidence, immutable authority/task conditions, a fresh host delivery recheck, and a final enrollment recheck. Changed bytes/digests are refused rather than replaced. This records Done only; it implies no main merge, commit, or automatic acceptance. Exact durable completion replay does not require the old checkout.",
+        annotations(
+            title = "Complete Guarded Worker Backlog Item",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    pub async fn backlog_worker_complete(
+        &self,
+        Parameters(params): Parameters<WorkerBacklogCompleteParams>,
+    ) -> Result<CallToolResult, CallToolResult> {
+        self.backlog_worker_complete_boxed(params).await
     }
 
     /// Lists a bounded page of configured workflow profiles from the operator registry (requires verified operator enrollment).
@@ -5872,7 +6310,7 @@ mod backlog_paired_tests {
         let unbound = PairedMcpServer::new(&state_dir, pairing_store).expect("unbound server");
 
         let tools = unbound.list_tools();
-        assert_eq!(tools.len(), 48, "PairedMcpServer must expose 48 tools");
+        assert_eq!(tools.len(), 51, "PairedMcpServer must expose 51 tools");
 
         let cases: [(&str, bool, &[&str], &[&str]); 8] = [
             (

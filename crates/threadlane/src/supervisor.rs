@@ -17,7 +17,7 @@ use threadlane_core::{
     WakeupStatus, WorkerClaim, WorkerStatus, DEFAULT_PAGE_LIMIT, MAX_COMPACT_RESPONSE_BYTES,
     MAX_STATUS_RECENT_RUNS,
 };
-use threadlane_workers::NormalizedWorkerEvent;
+use threadlane_workers::{NormalizedWorkerEvent, OwnedProcessSnapshot};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch, Mutex, MutexGuard, Notify};
 use tokio::task::{JoinHandle, JoinSet};
@@ -29,6 +29,15 @@ use crate::descriptor::{
     LOOPBACK_HOST,
 };
 use crate::error::{ApiError, Error, ErrorCode};
+use crate::operator_backlog::{
+    enforce_operator_worker_backlog_response_budget, execute_operator_worker_backlog,
+    OperatorWorkerBacklogRequest, OperatorWorkerBacklogResponse, OPERATOR_WORKER_BACKLOG_PATH,
+};
+use crate::presence::{
+    apply_physical_verification, evaluate_cached_presence, same_process_identity,
+    unavailable_from_worker, verify_linux_process, PresenceEvaluation, WorkerPresenceCache,
+    WorkerPresenceSnapshot, WorkerPresenceUnavailableReason,
+};
 use crate::protocol::{
     BindingListResponse, CreateBindingRequest, GetOrCreateBindingRequest,
     GetOrCreateBindingResponse, HostControlBusyCounts, HostControlConfig, HostControlInfoRequest,
@@ -127,16 +136,17 @@ struct ActiveWorkerControl {
     claim: WorkerClaim,
     cancel_tx: watch::Sender<bool>,
     user_cancel_requested: Arc<AtomicBool>,
+    presence: Arc<WorkerPresenceCache>,
 }
 
 struct ActiveWorkerGuard {
     state: Arc<SharedState>,
-    run_id: String,
+    claim: WorkerClaim,
 }
 
 impl Drop for ActiveWorkerGuard {
     fn drop(&mut self) {
-        self.state.unregister_active_worker(&self.run_id);
+        self.state.unregister_active_worker(&self.claim);
     }
 }
 
@@ -186,6 +196,7 @@ impl SharedState {
         claim: WorkerClaim,
         cancel_tx: watch::Sender<bool>,
         user_cancel_requested: Arc<AtomicBool>,
+        presence: Arc<WorkerPresenceCache>,
     ) {
         let mut map = self
             .active_workers
@@ -197,16 +208,47 @@ impl SharedState {
                 claim,
                 cancel_tx,
                 user_cancel_requested,
+                presence,
             },
         );
     }
 
-    fn unregister_active_worker(&self, run_id: &str) {
+    fn unregister_active_worker(&self, claim: &WorkerClaim) {
         let mut map = self
             .active_workers
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        map.remove(run_id);
+        if map
+            .get(&claim.run_id)
+            .is_some_and(|entry| entry.claim == *claim)
+        {
+            map.remove(&claim.run_id);
+        }
+    }
+
+    fn active_worker_presence(
+        &self,
+        binding_id: &str,
+        run_id: &str,
+    ) -> Option<(WorkerClaim, Arc<WorkerPresenceCache>)> {
+        let map = self
+            .active_workers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let entry = map.get(run_id)?;
+        if entry.claim.binding_id != binding_id {
+            return None;
+        }
+        Some((entry.claim.clone(), Arc::clone(&entry.presence)))
+    }
+
+    fn presence_owner(&self, binding_id: &str) -> Option<HostControlConfig> {
+        self.host_control
+            .as_ref()
+            .filter(|control| {
+                control.session_binding_id == binding_id || control.control_binding_id == binding_id
+            })
+            .cloned()
     }
 
     fn request_worker_cancellation(&self, run_id: &str, worker_id: &str) {
@@ -326,12 +368,128 @@ impl SharedState {
         Some(CoreAccessGuard { state: self, guard })
     }
 
+    async fn resolve_worker_presence(
+        &self,
+        binding_id: &str,
+        worker: threadlane_core::WorkerSnapshot,
+    ) -> Result<WorkerPresenceSnapshot, (StatusCode, Json<ApiError>)> {
+        // Terminal, stopped, stale, and unavailable cache outcomes need no Core access. No await
+        // occurs before this evaluation, so its flags and cache are current.
+        let owner = self.presence_owner(binding_id);
+        let retired = self.retired.load(Ordering::SeqCst) || self.fatal_error().is_some();
+        let stopping = self.stopping.load(Ordering::SeqCst);
+        let active = self.active_worker_presence(binding_id, &worker.run_id);
+        let cached = active.as_ref().map(|(_, cache)| cache.read());
+        if let PresenceEvaluation::Final(presence) = evaluate_cached_presence(
+            &worker,
+            active.as_ref().map(|(claim, _)| claim),
+            cached.as_ref(),
+            owner.as_ref(),
+            stopping,
+            retired,
+        ) {
+            return Ok(presence);
+        }
+
+        // Physical proof is only valid for the sample observed after the final Core wait.
+        let mut access = match self.acquire_for_request().await {
+            Ok(access) => access,
+            Err(_) => {
+                let owner = self.presence_owner(binding_id);
+                let retired = self.retired.load(Ordering::SeqCst) || self.fatal_error().is_some();
+                let stopping = self.stopping.load(Ordering::SeqCst);
+                let reason = if retired {
+                    WorkerPresenceUnavailableReason::SupervisorRetired
+                } else if stopping {
+                    WorkerPresenceUnavailableReason::SupervisorStopping
+                } else {
+                    WorkerPresenceUnavailableReason::SupervisorUnavailable
+                };
+                return Ok(unavailable_from_worker(&worker, owner.as_ref(), reason));
+            }
+        };
+
+        // Refresh mutable inputs after the awaited acquisition, then read the scoped worker and
+        // its exact claim/cache under the same Core guard used for physical inspection.
+        let owner = self.presence_owner(binding_id);
+        let retired = self.retired.load(Ordering::SeqCst) || self.fatal_error().is_some();
+        let stopping = self.stopping.load(Ordering::SeqCst);
+        let latest = access
+            .core_mut()
+            .get_worker(binding_id, &worker.run_id)
+            .map_err(|err| map_core_error(self, "worker presence physical recheck failed", err))?;
+        let active = self.active_worker_presence(binding_id, &latest.run_id);
+        let cached = active.as_ref().map(|(_, cache)| cache.read());
+        let (_base, process) = match evaluate_cached_presence(
+            &latest,
+            active.as_ref().map(|(claim, _)| claim),
+            cached.as_ref(),
+            owner.as_ref(),
+            stopping,
+            retired,
+        ) {
+            PresenceEvaluation::Final(presence) => return Ok(presence),
+            PresenceEvaluation::RequiresPhysicalCheck(base, process) => (base, process),
+        };
+
+        // Bounded synchronous `/proc` inspection. Nothing is carried across an await.
+        let verification = verify_linux_process(&process);
+
+        // The observer and shutdown flags can move while inspection runs. Re-evaluate them before
+        // replying and apply proof only to the same claim and process identity.
+        let owner_now = self.presence_owner(binding_id);
+        let retired_now = self.retired.load(Ordering::SeqCst) || self.fatal_error().is_some();
+        let stopping_now = self.stopping.load(Ordering::SeqCst);
+        let active_now = self.active_worker_presence(binding_id, &latest.run_id);
+        let cached_now = active_now.as_ref().map(|(_, cache)| cache.read());
+        match evaluate_cached_presence(
+            &latest,
+            active_now.as_ref().map(|(claim, _)| claim),
+            cached_now.as_ref(),
+            owner_now.as_ref(),
+            stopping_now,
+            retired_now,
+        ) {
+            PresenceEvaluation::Final(presence) => Ok(presence),
+            PresenceEvaluation::RequiresPhysicalCheck(post_base, post_process) => {
+                let same_claim = match (active.as_ref(), active_now.as_ref()) {
+                    (Some((before, _)), Some((after, _))) => before == after,
+                    (None, None) => true,
+                    _ => false,
+                };
+                if !same_claim || !same_process_identity(&process, &post_process) {
+                    return Ok(unavailable_from_worker(
+                        &latest,
+                        owner_now.as_ref(),
+                        WorkerPresenceUnavailableReason::ObservationChanged,
+                    ));
+                }
+                // A concurrent heartbeat may advance the sample while the bounded inspection
+                // runs. Re-inspect only when it is a different observation of the same process.
+                let post_verification = if post_process == process {
+                    verification
+                } else {
+                    verify_linux_process(&post_process)
+                };
+                Ok(apply_physical_verification(post_base, post_verification))
+            }
+        }
+    }
+
     fn ensure_not_stopping(&self) -> Result<(), (StatusCode, Json<ApiError>)> {
         if self.stopping.load(Ordering::SeqCst) {
             return Err(stopping_response());
         }
         Ok(())
     }
+}
+
+fn new_process_presence_channel() -> (
+    watch::Sender<Option<OwnedProcessSnapshot>>,
+    Arc<WorkerPresenceCache>,
+) {
+    let (process_tx, process_rx) = watch::channel::<Option<OwnedProcessSnapshot>>(None);
+    (process_tx, Arc::new(WorkerPresenceCache::new(process_rx)))
 }
 
 fn retired_response() -> (StatusCode, Json<ApiError>) {
@@ -723,6 +881,10 @@ fn build_router(state: Arc<SharedState>) -> Router {
             "/v1/host-control/rearm-wakeup",
             post(handle_rearm_host_wakeup),
         )
+        .route(
+            OPERATOR_WORKER_BACKLOG_PATH,
+            post(handle_operator_worker_backlog),
+        )
         .fallback(handle_fallback)
         .layer(DefaultBodyLimit::max(MAX_HTTP_BODY_BYTES))
         .with_state(state)
@@ -924,7 +1086,12 @@ async fn handle_scoped_command(
             state.ensure_not_stopping()?;
         }
         if !state.stopping.load(Ordering::SeqCst)
-            && !matches!(req, ScopedRequest::ListActivity { .. })
+            && !matches!(
+                req,
+                ScopedRequest::ListActivity { .. }
+                    | ScopedRequest::GetWorkerPresence { .. }
+                    | ScopedRequest::GetWorker { .. }
+            )
             && !req.is_backlog()
         {
             let report = access
@@ -1188,6 +1355,31 @@ async fn handle_scoped_command(
                     .map_err(|err| map_core_error(&state, "start_worker execution failed", err))?;
                 ScopedResponse::from(output)
             }
+            ScopedRequest::GetWorkerPresence { run_id } => {
+                let worker = access
+                    .core_mut()
+                    .get_worker(&binding_id, &run_id)
+                    .map_err(|err| {
+                        map_core_error(&state, "worker presence get_worker failed", err)
+                    })?;
+                drop(access);
+                let presence = state.resolve_worker_presence(&binding_id, worker).await?;
+                let response = ScopedResponse::WorkerPresence(presence);
+                let serialized_len = estimate_wire_response_bytes(&response).map_err(|err| {
+                    map_core_error(&state, "worker presence serialization failed", err)
+                })?;
+                if serialized_len > MAX_COMPACT_RESPONSE_BYTES {
+                    return Err(map_core_error(
+                        &state,
+                        "worker presence budget check failed",
+                        CoreError::ResponseTooLarge {
+                            size_bytes: serialized_len,
+                            max_bytes: MAX_COMPACT_RESPONSE_BYTES,
+                        },
+                    ));
+                }
+                response
+            }
             other_req => {
                 let is_cancel_worker = matches!(other_req, ScopedRequest::CancelWorker { .. });
                 let cmd = other_req
@@ -1211,6 +1403,31 @@ async fn handle_scoped_command(
         state.wake_notify.notify_one();
     }
 
+    Ok(Json(response))
+}
+
+async fn handle_operator_worker_backlog(
+    State(state): State<Arc<SharedState>>,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> Result<Json<OperatorWorkerBacklogResponse>, (StatusCode, Json<ApiError>)> {
+    verify_bearer_auth(&headers, &state.token)?;
+    let req: OperatorWorkerBacklogRequest = parse_json_body(body)?;
+    let now = current_time_ms();
+
+    let mut access = state.acquire_for_request().await?;
+    if req.is_mutating() {
+        state.ensure_not_stopping()?;
+    }
+    let response = execute_operator_worker_backlog(access.core_mut(), now, req)
+        .map_err(|err| map_core_error(&state, "operator worker backlog failed", err))?;
+    enforce_operator_worker_backlog_response_budget(&response).map_err(|err| {
+        map_core_error(
+            &state,
+            "operator worker backlog response budget failed",
+            err,
+        )
+    })?;
     Ok(Json(response))
 }
 
@@ -1675,10 +1892,12 @@ async fn run_background_worker(state: Arc<SharedState>, mut shutdown_rx: watch::
                                 Ok(claim) => {
                                     let (cancel_tx, cancel_rx) = watch::channel(false);
                                     let user_cancel_requested = Arc::new(AtomicBool::new(false));
+                                    let (process_tx, presence) = new_process_presence_channel();
                                     state.register_active_worker(
                                         claim.clone(),
                                         cancel_tx.clone(),
                                         Arc::clone(&user_cancel_requested),
+                                        Arc::clone(&presence),
                                     );
                                     newly_claimed.push((
                                         resolved,
@@ -1686,6 +1905,8 @@ async fn run_background_worker(state: Arc<SharedState>, mut shutdown_rx: watch::
                                         cancel_tx,
                                         cancel_rx,
                                         user_cancel_requested,
+                                        process_tx,
+                                        presence,
                                     ));
                                 }
                                 Err(
@@ -1717,8 +1938,15 @@ async fn run_background_worker(state: Arc<SharedState>, mut shutdown_rx: watch::
                         break;
                     }
 
-                    for (resolved, claim, cancel_tx, cancel_rx, user_cancel_requested) in
-                        claimed_batch
+                    for (
+                        resolved,
+                        claim,
+                        cancel_tx,
+                        cancel_rx,
+                        user_cancel_requested,
+                        process_tx,
+                        presence,
+                    ) in claimed_batch
                     {
                         let task_state = Arc::clone(&state);
                         let task_shutdown_rx = shutdown_rx.clone();
@@ -1731,6 +1959,8 @@ async fn run_background_worker(state: Arc<SharedState>, mut shutdown_rx: watch::
                                 cancel_rx,
                                 user_cancel_requested,
                                 task_shutdown_rx,
+                                process_tx,
+                                presence,
                             )
                             .await
                         });
@@ -1861,6 +2091,7 @@ async fn run_background_worker(state: Arc<SharedState>, mut shutdown_rx: watch::
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_single_claimed_worker(
     state: Arc<SharedState>,
     resolved: ResolvedWorkerExecution,
@@ -1869,11 +2100,13 @@ async fn run_single_claimed_worker(
     mut cancel_rx: watch::Receiver<bool>,
     user_cancel_requested: Arc<AtomicBool>,
     shutdown_rx: watch::Receiver<bool>,
+    process_tx: watch::Sender<Option<OwnedProcessSnapshot>>,
+    presence: Arc<WorkerPresenceCache>,
 ) -> String {
     let run_id = claim.run_id.clone();
     let _active_guard = ActiveWorkerGuard {
         state: Arc::clone(&state),
-        run_id: run_id.clone(),
+        claim: claim.clone(),
     };
 
     // 1. Prepare owned per-run and per-task worktrees without holding the Core mutex, while
@@ -2069,6 +2302,9 @@ async fn run_single_claimed_worker(
         }
     };
 
+    // The runner and its observer must be polled concurrently: awaiting only for a watch
+    // change would leave the runner pinned and never produce the next process sample.
+    let process_fut = presence.watch_changes();
     let exec_fut = execute_claimed_worker(
         &resolved,
         &claim,
@@ -2076,8 +2312,9 @@ async fn run_single_claimed_worker(
         &mut cancel_rx,
         progress_tx,
         health_tx,
+        Some(process_tx),
     );
-    let (exec_res, (), ()) = tokio::join!(exec_fut, progress_fut, health_fut);
+    let (exec_res, (), (), ()) = tokio::join!(exec_fut, progress_fut, health_fut, process_fut);
 
     // 4. Persist terminal outcome (unless stopped solely due to supervisor shutdown/fault).
     if state.fatal_error().is_some() {
@@ -3051,10 +3288,12 @@ mod tests {
         // 3. Even when all persisted SQLite rows are terminal, a registered entry in
         //    SharedState::active_workers (live_worker_tasks == 1) must prevent stop_idle_host.
         let (cancel_tx, _cancel_rx) = watch::channel(false);
+        let (_process_tx, presence) = new_process_presence_channel();
         handle.shared.register_active_worker(
             claim.clone(),
             cancel_tx,
             Arc::new(AtomicBool::new(false)),
+            presence,
         );
 
         match client
@@ -3072,7 +3311,36 @@ mod tests {
             other => panic!("unexpected: {other:?}"),
         }
 
-        handle.shared.unregister_active_worker(&claim.run_id);
+        let replacement = WorkerClaim {
+            claim_id: "wclm_99999999-9999-4999-8999-999999999999".to_string(),
+            ..claim.clone()
+        };
+        let (_replacement_process_tx, replacement_presence) = new_process_presence_channel();
+        let (replacement_cancel_tx, _replacement_cancel_rx) = watch::channel(false);
+        handle.shared.register_active_worker(
+            replacement.clone(),
+            replacement_cancel_tx,
+            Arc::new(AtomicBool::new(false)),
+            replacement_presence,
+        );
+        drop(ActiveWorkerGuard {
+            state: Arc::clone(&handle.shared),
+            claim: claim.clone(),
+        });
+        {
+            let map = handle
+                .shared
+                .active_workers
+                .lock()
+                .unwrap_or_else(|err| err.into_inner());
+            assert_eq!(
+                map.get(&claim.run_id)
+                    .map(|entry| entry.claim.claim_id.as_str()),
+                Some(replacement.claim_id.as_str()),
+                "an old guard must not remove its replacement claim"
+            );
+        }
+        handle.shared.unregister_active_worker(&replacement);
 
         let stopped = client
             .stop_idle_host(&scope)
@@ -3371,5 +3639,490 @@ mod tests {
 
         let fatal = handle_allowed.shutdown_and_take_fatal().await;
         assert!(fatal.is_none());
+    }
+    #[cfg(target_os = "linux")]
+    struct PresenceTestChild {
+        child: Option<std::process::Child>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl PresenceTestChild {
+        fn spawn() -> Self {
+            use std::os::unix::process::CommandExt;
+
+            let mut command = std::process::Command::new("sleep");
+            command.arg("30").process_group(0);
+            Self {
+                child: Some(command.spawn().expect("spawn presence regression child")),
+            }
+        }
+
+        fn pid(&self) -> u32 {
+            self.child.as_ref().expect("live test child").id()
+        }
+
+        fn terminate(&mut self) {
+            if let Some(mut child) = self.child.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for PresenceTestChild {
+        fn drop(&mut self) {
+            self.terminate();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn presence_test_observation(child_pid: u32) -> OwnedProcessSnapshot {
+        use threadlane_workers::{OwnedProcessOrigin, OwnedProcessState};
+
+        let stat = std::fs::read_to_string(format!("/proc/{child_pid}/stat"))
+            .expect("read presence regression child stat");
+        let command_end = stat.rfind(')').expect("command terminator");
+        let fields: Vec<&str> = stat[command_end + 1..].split_whitespace().collect();
+        let process_group_id = fields[2]
+            .parse::<i32>()
+            .expect("presence regression child process group");
+        let start_ticks = fields[19]
+            .parse::<u64>()
+            .expect("presence regression child start ticks");
+        OwnedProcessSnapshot {
+            schema_version: 1,
+            origin: OwnedProcessOrigin::RunnerOwnedChild,
+            invocation_id: "00000000-0000-4000-8000-000000000001".to_string(),
+            state: OwnedProcessState::Running,
+            unknown_reason: None,
+            sequence: 1,
+            elapsed_ms: 1_000,
+            heartbeat_interval_ms: 1_000,
+            child_pid: Some(child_pid),
+            process_group_id: Some(process_group_id),
+            linux_process_start_ticks: Some(start_ticks),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn presence_never_carries_physical_proof_across_a_core_wait() {
+        let temp = tempfile::tempdir().expect("private root");
+        let state_dir = temp.path().join("state");
+        let mut config = SupervisorConfig::new(&state_dir);
+        config.tick_interval = Duration::from_secs(30);
+        let mut handle = Supervisor::start(config).await.expect("start");
+        // Isolate the presence await boundary from the ordinary background dispatcher.
+        let worker_task = handle.worker_task.take().expect("worker task");
+        worker_task.abort();
+        let _ = worker_task.await;
+        let client = SupervisorClient::from_state_dir(&state_dir).expect("client");
+        let binding = client
+            .create_binding(THREAD_UUID, "presence await regression")
+            .await
+            .expect("binding");
+        let digest = "a".repeat(64);
+        let (worker, claim) = {
+            let mut access = handle.shared.acquire_for_request().await.expect("core");
+            let worker = access
+                .core_mut()
+                .execute(
+                    &binding.binding_id,
+                    Command::StartWorker {
+                        command_key: "presence-await-core".to_string(),
+                        profile_id: "prof_test".to_string(),
+                        profile_digest: digest.clone(),
+                        provider: "antigravity".to_string(),
+                        requested_model: "gemini-4-argon-high".to_string(),
+                        requested_effort: "high".to_string(),
+                        base_commit: "1".repeat(40),
+                        instruction: "presence await regression".to_string(),
+                        execution_binding: None,
+                        now_ms: current_time_ms(),
+                    },
+                )
+                .expect("queue worker")
+                .into_worker()
+                .expect("queued worker");
+            let claim = access
+                .core_mut()
+                .claim_worker(
+                    &binding.binding_id,
+                    &worker.run_id,
+                    worker.revision,
+                    &digest,
+                    current_time_ms(),
+                )
+                .expect("claim worker");
+            let current = access
+                .core_mut()
+                .get_worker(&binding.binding_id, &worker.run_id)
+                .expect("current worker");
+            (current, claim)
+        };
+
+        let mut child = PresenceTestChild::spawn();
+        let (process_tx, presence) = new_process_presence_channel();
+        let (cancel_tx, _cancel_rx) = watch::channel(false);
+        handle.shared.register_active_worker(
+            claim.clone(),
+            cancel_tx,
+            Arc::new(AtomicBool::new(false)),
+            Arc::clone(&presence),
+        );
+        let observer = tokio::spawn(Arc::clone(&presence).watch_changes());
+        let observation = presence_test_observation(child.pid());
+        assert!(
+            observation.is_valid(),
+            "presence regression child observation must be valid"
+        );
+        process_tx
+            .send(Some(observation))
+            .expect("send running observation");
+
+        let live = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let current = handle
+                    .shared
+                    .resolve_worker_presence(&binding.binding_id, worker.clone())
+                    .await
+                    .expect("presence while child is running");
+                if current.live {
+                    break current;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("running silent child must become live");
+        assert_eq!(live.claim_id.as_deref(), Some(claim.claim_id.as_str()));
+
+        // A shutdown latch set while the presence request waits for Core must be applied after the
+        // wait rather than relying on flags captured beside the earlier physical proof.
+        let gate = handle.shared.active.lock().await;
+        let request_started = Arc::new(AtomicBool::new(false));
+        let shared = Arc::clone(&handle.shared);
+        let binding_id = binding.binding_id.clone();
+        let request_worker = worker.clone();
+        let started = Arc::clone(&request_started);
+        let pending = tokio::spawn(async move {
+            started.store(true, Ordering::SeqCst);
+            shared
+                .resolve_worker_presence(&binding_id, request_worker)
+                .await
+        });
+        while !request_started.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+        handle.shared.stopping.store(true, Ordering::SeqCst);
+        drop(gate);
+        let stopping = tokio::time::timeout(Duration::from_secs(2), pending)
+            .await
+            .expect("stopping presence request bound")
+            .expect("stopping presence task")
+            .expect("stopping presence result");
+        assert!(!stopping.live);
+        assert_eq!(
+            stopping.unavailable_reason,
+            Some(WorkerPresenceUnavailableReason::SupervisorStopping)
+        );
+        handle.shared.stopping.store(false, Ordering::SeqCst);
+
+        // Ending the actual child only while the request waits for Core must not leave a stale
+        // successful `/proc` result that is applied to the post-wait sample.
+        let gate = handle.shared.active.lock().await;
+        let request_started = Arc::new(AtomicBool::new(false));
+        let shared = Arc::clone(&handle.shared);
+        let binding_id = binding.binding_id.clone();
+        let request_worker = worker.clone();
+        let started = Arc::clone(&request_started);
+        let pending = tokio::spawn(async move {
+            started.store(true, Ordering::SeqCst);
+            shared
+                .resolve_worker_presence(&binding_id, request_worker)
+                .await
+        });
+        while !request_started.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+        child.terminate();
+        drop(gate);
+        let after_exit = tokio::time::timeout(Duration::from_secs(2), pending)
+            .await
+            .expect("exited-child presence request bound")
+            .expect("exited-child presence task")
+            .expect("exited-child presence result");
+        assert!(
+            !after_exit.live,
+            "an exited child must never be reported live"
+        );
+        assert_ne!(
+            after_exit.availability,
+            crate::presence::WorkerPresenceAvailability::Live
+        );
+        assert!(matches!(
+            after_exit.unavailable_reason,
+            Some(
+                WorkerPresenceUnavailableReason::ProcessMissing
+                    | WorkerPresenceUnavailableReason::ProcessExited
+                    | WorkerPresenceUnavailableReason::ProcessZombie
+                    | WorkerPresenceUnavailableReason::ProcessIdentityMismatch
+                    | WorkerPresenceUnavailableReason::ProcessGroupMismatch
+            )
+        ));
+        assert_eq!(
+            after_exit.claim_id.as_deref(),
+            Some(claim.claim_id.as_str())
+        );
+
+        drop(process_tx);
+        observer.await.expect("presence observer task");
+        handle.shared.unregister_active_worker(&claim);
+        handle.shutdown().await;
+    }
+    #[tokio::test]
+    async fn get_worker_reads_never_tick_due_demo_or_other_binding_state() {
+        let temp = tempfile::tempdir().expect("private root");
+        let state_dir = temp.path().join("state");
+        let mut config = SupervisorConfig::new(&state_dir);
+        // Pause the real background tick so a stray pre-read tick is unmistakable.
+        config.tick_interval = Duration::from_secs(30);
+        let mut handle = Supervisor::start(config).await.expect("start");
+        let worker_task = handle.worker_task.take().expect("background worker task");
+        worker_task.abort();
+        let _ = worker_task.await;
+
+        let client = SupervisorClient::from_state_dir(&state_dir).expect("client");
+        let due_binding = client
+            .create_binding(THREAD_UUID, "due demo read isolation")
+            .await
+            .expect("due binding");
+        let other_binding = client
+            .create_binding(OTHER_THREAD_UUID, "worker read isolation")
+            .await
+            .expect("other binding");
+        let due_scoped = client
+            .clone()
+            .scoped(&due_binding.binding_id)
+            .expect("due scoped client");
+        let other_scoped = client
+            .scoped(&other_binding.binding_id)
+            .expect("other scoped client");
+
+        let due_run = due_scoped
+            .start_demo(
+                "read-isolation-due-demo".to_string(),
+                "due demo state must survive worker reads".to_string(),
+                Some(0),
+            )
+            .await
+            .expect("start due demo");
+
+        let digest = "a".repeat(64);
+        let worker = {
+            let mut access = handle.shared.acquire_for_request().await.expect("core");
+            access
+                .core_mut()
+                .execute(
+                    &due_binding.binding_id,
+                    Command::StartWorker {
+                        command_key: "read-isolation-worker".to_string(),
+                        profile_id: "prof_read_isolation".to_string(),
+                        profile_digest: digest,
+                        provider: "antigravity".to_string(),
+                        requested_model: "gemini-4-argon-high".to_string(),
+                        requested_effort: "high".to_string(),
+                        base_commit: "1".repeat(40),
+                        instruction: "owned worker read fixture".to_string(),
+                        execution_binding: None,
+                        now_ms: current_time_ms(),
+                    },
+                )
+                .expect("queue owned worker")
+                .into_worker()
+                .expect("owned worker snapshot")
+        };
+
+        let (run_before, questions_before, activity_before, wakeup_before) = {
+            let mut access = handle.shared.acquire_for_request().await.expect("core");
+            (
+                access
+                    .core_mut()
+                    .get_run(&due_binding.binding_id, &due_run.run_id)
+                    .expect("due run before reads"),
+                access
+                    .core_mut()
+                    .list_run_questions(&due_binding.binding_id, &due_run.run_id, None, 50)
+                    .expect("due questions before reads"),
+                access
+                    .core_mut()
+                    .list_activity(&due_binding.binding_id, None, None, 50, None, None)
+                    .expect("due activity before reads"),
+                access
+                    .core_mut()
+                    .get_wakeup(&due_binding.binding_id)
+                    .expect("due wakeup before reads"),
+            )
+        };
+        let (other_activity_before, other_wakeup_before) = {
+            let mut access = handle.shared.acquire_for_request().await.expect("core");
+            (
+                access
+                    .core_mut()
+                    .list_activity(&other_binding.binding_id, None, None, 50, None, None)
+                    .expect("other activity before reads"),
+                access
+                    .core_mut()
+                    .get_wakeup(&other_binding.binding_id)
+                    .expect("other wakeup before reads"),
+            )
+        };
+        assert_eq!(run_before.status, threadlane_core::RunStatus::Running);
+        assert_eq!(run_before.revision, due_run.revision);
+        let due_at_ms = run_before
+            .next_step_at_ms
+            .expect("due demo must schedule a next step");
+        assert!(
+            due_at_ms <= current_time_ms(),
+            "fixture must be due before the read-only requests"
+        );
+
+        // A successful owned-worker read must stay read-only even with another due demo.
+        let read_worker = due_scoped
+            .get_worker(worker.run_id.clone())
+            .await
+            .expect("owned worker read");
+        assert_eq!(read_worker.run_id, worker.run_id);
+        assert_eq!(read_worker.worker_id, worker.worker_id);
+        assert_eq!(read_worker.binding_id, due_binding.binding_id);
+        assert_eq!(read_worker.revision, worker.revision);
+        assert_eq!(read_worker.status, WorkerStatus::Queued);
+
+        let presence = due_scoped
+            .get_worker_presence(worker.run_id.clone())
+            .await
+            .expect("owned worker presence read");
+        assert_eq!(presence.run_id, worker.run_id);
+        assert_eq!(presence.binding_id, due_binding.binding_id);
+        assert!(!presence.live);
+
+        // A missing or foreign worker read from another binding must not tick the due demo in
+        // the first binding, and strict scope must still return a normal WorkerNotFound.
+        let missing_run_id = "run_00000000-0000-4000-8000-000000000000".to_string();
+        let missing = other_scoped
+            .get_worker(missing_run_id)
+            .await
+            .expect_err("missing worker read must fail");
+        assert_eq!(missing.to_api_error().code, ErrorCode::WorkerNotFound);
+
+        let foreign = other_scoped
+            .get_worker(worker.run_id.clone())
+            .await
+            .expect_err("foreign worker read must fail");
+        assert_eq!(foreign.to_api_error().code, ErrorCode::WorkerNotFound);
+
+        let foreign_presence = other_scoped
+            .get_worker_presence(worker.run_id.clone())
+            .await
+            .expect_err("foreign worker presence read must fail");
+        assert_eq!(
+            foreign_presence.to_api_error().code,
+            ErrorCode::WorkerNotFound
+        );
+
+        let (run_after, questions_after, activity_after, wakeup_after) = {
+            let mut access = handle.shared.acquire_for_request().await.expect("core");
+            (
+                access
+                    .core_mut()
+                    .get_run(&due_binding.binding_id, &due_run.run_id)
+                    .expect("due run after reads"),
+                access
+                    .core_mut()
+                    .list_run_questions(&due_binding.binding_id, &due_run.run_id, None, 50)
+                    .expect("due questions after reads"),
+                access
+                    .core_mut()
+                    .list_activity(&due_binding.binding_id, None, None, 50, None, None)
+                    .expect("due activity after reads"),
+                access
+                    .core_mut()
+                    .get_wakeup(&due_binding.binding_id)
+                    .expect("due wakeup after reads"),
+            )
+        };
+        let (other_activity_after, other_wakeup_after) = {
+            let mut access = handle.shared.acquire_for_request().await.expect("core");
+            (
+                access
+                    .core_mut()
+                    .list_activity(&other_binding.binding_id, None, None, 50, None, None)
+                    .expect("other activity after reads"),
+                access
+                    .core_mut()
+                    .get_wakeup(&other_binding.binding_id)
+                    .expect("other wakeup after reads"),
+            )
+        };
+        assert_eq!(run_after, run_before, "worker reads changed the due run");
+        assert_eq!(
+            questions_after, questions_before,
+            "worker reads changed due questions"
+        );
+        assert_eq!(
+            activity_after, activity_before,
+            "worker reads changed due activity sequence"
+        );
+        assert_eq!(
+            wakeup_after, wakeup_before,
+            "worker reads changed the due wakeup"
+        );
+        assert_eq!(
+            other_activity_after, other_activity_before,
+            "worker reads changed other-binding activity"
+        );
+        assert_eq!(
+            other_wakeup_after, other_wakeup_before,
+            "worker reads changed the other-binding wakeup"
+        );
+
+        // The fixture was actually due: a normal explicit tick still advances it.
+        {
+            let mut access = handle.shared.acquire_for_request().await.expect("core");
+            let report = access
+                .core_mut()
+                .tick(current_time_ms())
+                .expect("explicit tick");
+            assert_eq!(report.advanced_runs, vec![due_run.run_id.clone()]);
+            assert_eq!(report.emitted_events, 2);
+        }
+        let (advanced_run, advanced_questions, advanced_wakeup) = {
+            let mut access = handle.shared.acquire_for_request().await.expect("core");
+            (
+                access
+                    .core_mut()
+                    .get_run(&due_binding.binding_id, &due_run.run_id)
+                    .expect("advanced due run"),
+                access
+                    .core_mut()
+                    .list_run_questions(&due_binding.binding_id, &due_run.run_id, None, 50)
+                    .expect("advanced due questions"),
+                access
+                    .core_mut()
+                    .get_wakeup(&due_binding.binding_id)
+                    .expect("advanced due wakeup"),
+            )
+        };
+        assert_eq!(
+            advanced_run.status,
+            threadlane_core::RunStatus::WaitingInput
+        );
+        assert_eq!(advanced_run.revision, due_run.revision);
+        assert!(advanced_run.active_question_id.is_some());
+        assert_eq!(advanced_questions.questions.len(), 1);
+        assert_eq!(advanced_wakeup.status, WakeupStatus::Pending);
+
+        handle.shutdown().await;
     }
 }

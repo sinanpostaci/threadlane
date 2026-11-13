@@ -38,10 +38,13 @@ pub use backlog::{
     MAX_BACKLOG_TITLE_LEN,
 };
 pub use backlog_worker::{
-    WorkerBacklogAttemptIdentity, WorkerBacklogAttemptPage, WorkerBacklogAuthority,
-    WorkerBacklogCompletion, WorkerBacklogCompletionReceipt, WorkerBacklogCompletionRecord,
-    WorkerBacklogDispatchReceipt, WorkerBacklogExecution, WorkerBacklogOutcome,
-    WorkerBacklogOutcomeReport, WorkerBacklogRecordedOutcome, MAX_WORKER_BACKLOG_OUTCOME_NOTE_LEN,
+    WorkerBacklogAcceptanceRejection, WorkerBacklogAcceptanceRejectionReceipt,
+    WorkerBacklogAcceptanceRejectionRecord, WorkerBacklogAttemptIdentity, WorkerBacklogAttemptPage,
+    WorkerBacklogAuthority, WorkerBacklogCompletion, WorkerBacklogCompletionReceipt,
+    WorkerBacklogCompletionRecord, WorkerBacklogDispatchReceipt, WorkerBacklogExecution,
+    WorkerBacklogOutcome, WorkerBacklogOutcomeReport, WorkerBacklogRecordedOutcome,
+    MAX_WORKER_BACKLOG_OUTCOME_NOTE_LEN, MAX_WORKER_BACKLOG_REJECTION_EVIDENCE_LEN,
+    MAX_WORKER_BACKLOG_REJECTION_REASON_LEN,
 };
 pub use engine::Core;
 pub use error::{AckErrorReason, CoreError};

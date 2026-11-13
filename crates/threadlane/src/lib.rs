@@ -25,6 +25,10 @@ pub mod mcp;
 pub mod native_endpoint;
 /// Explicit operator-selected native tool-output wake-up configuration and transport.
 pub mod native_tool_output;
+/// Trusted-local operator transport for durable Worker backlog execution state.
+pub mod operator_backlog;
+/// Ephemeral claim-scoped worker process presence snapshots and bounded Linux verification.
+pub mod presence;
 /// Wire protocol requests, compact status snapshots, and responses.
 pub mod protocol;
 /// Single-owner SQLite, demo tick, and bounded worker dispatch supervisor over authenticated loopback HTTP.
@@ -62,6 +66,7 @@ pub use mcp::{
 };
 pub use native_endpoint::NativeReconnectConfig;
 pub use native_tool_output::{NativeNotificationDelivery, NativeToolOutputConfig};
+pub use operator_backlog::{OperatorWorkerBacklogRequest, OperatorWorkerBacklogResponse};
 pub use protocol::{
     ActivityPage, BindingListResponse, CreateBindingRequest, EnsureBindingOutcome,
     EnsureBindingRequest, EnsureBindingResponse, Event, EventKind, EventPayload,
@@ -71,10 +76,12 @@ pub use protocol::{
     RearmHostWakeupRequest, RearmHostWakeupResponse, RetryWakeupRequest, RunSummary, ScopedRequest,
     ScopedResponse, StatusResponse, StopIdleHostRequest, WorkerAcceptanceState, WorkerClaim,
     WorkerCompletionRecord, WorkerExecutionBinding, WorkerOutcomeSummary,
-    WorkerProgressAttentionReason, WorkerProgressSummary, WorkerProgressUpdate,
-    WorkerProgressWatchdogSnapshot, WorkerProgressWatchdogStatus, WorkerSnapshot, WorkerStatus,
-    WorkerWorktreeSummary, WorkerWorktreeUpdate, MAX_STATUS_RECENT_RUNS,
-    WORKER_EXECUTION_BINDING_SCHEMA_VERSION,
+    WorkerPresenceAvailability, WorkerPresenceFreshness, WorkerPresenceSnapshot,
+    WorkerPresenceUnavailableReason, WorkerProgressAttentionReason, WorkerProgressSummary,
+    WorkerProgressUpdate, WorkerProgressWatchdogSnapshot, WorkerProgressWatchdogStatus,
+    WorkerSnapshot, WorkerStatus, WorkerWorktreeSummary, WorkerWorktreeUpdate,
+    MAX_STATUS_RECENT_RUNS, WORKER_EXECUTION_BINDING_SCHEMA_VERSION,
+    WORKER_PRESENCE_MAX_SAMPLE_AGE_MS, WORKER_PRESENCE_SCHEMA_VERSION,
 };
 pub use supervisor::{
     Supervisor, SupervisorConfig, SupervisorHandle, DEFAULT_TICK_INTERVAL_MS, MAX_HTTP_BODY_BYTES,

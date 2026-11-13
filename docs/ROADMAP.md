@@ -14,16 +14,24 @@ multi-role workflow requirements in older planning documents. It keeps native
 Codex as the conversational Coworker, a small durable per-chat
 Todo/Doing/Done/Blocked backlog, and the existing single-task runner, authority,
 and isolation without a mandatory Orchestrator/Reviewer/Closure/Job/controller
-stage.
+stage. A real Worker execution still freezes its execution profile, registry
+revision, and exact model/effort/canonical pins in authority; Coworker-only
+backlog work has no execution profile. The optional part is the multi-role stage,
+not the Worker profile.
 
 The historical first-use acceptance plan and prioritized fixes remain recorded
 in [First personal MVP acceptance](MVP-READINESS.md). Older checkpoint, pilot,
 and multi-role sections below describe their original evidence only; they are
 not new evidence for the 2026-11-13 contract.
 
-The first foundation slice adds only core backlog storage and the current
-contract. Worker reservation, verified completion, MCP/UI integration, liveness,
-`NeedsYou`, and live acceptance remain open.
+The combined checkout now contains a source-level foundation for this contract:
+additive core backlog storage, paired MCP backlog tools, and the guarded Worker
+reservation/result/completion facade. This is not full-product delivery. The
+desktop conversation stream and backlog drawer, liveness and `NeedsYou`
+derivation, live provider/native-callback acceptance, final Nix packaging,
+integrated formatting/Clippy/test validation, and the package-closing review
+remain pending. Only the parent records integrated test evidence; source presence
+is not acceptance.
 
 The user stays in the native Codex conversation, including frequent Steer and
 questions. Codex interprets intent and plans. Threadlane owns validated execution,

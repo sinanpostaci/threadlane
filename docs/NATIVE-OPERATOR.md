@@ -16,17 +16,32 @@ Run `threadlane guide` to print the canonical versioned operating guide
 ([`docs/MCP-OPERATING-GUIDE.md`](MCP-OPERATING-GUIDE.md)) offline without network
 or supervisor access. When connected over MCP (`threadlane mcp` or enrolled
 `threadlane-native-mcp`), call the read-only `operating_guide` (`{}`) tool to
-fetch the same shared guide and version (`2026-11-09.v1`).
+fetch the same shared guide and version (`2026-11-13.v1`).
 
 Compaction detection and memory retention are not automatic. On initial
 connection, session resume, context uncertainty, or before external effects when
 rules or state are uncertain, refetch `operating_guide` (or run `threadlane guide`
 on the trusted-local CLI route) and then refresh live scoped state and revisions
-(`status`, `coworker_status`, `list_plans`, `list_approvals`, and—only when
-actual IDs exist—`get_plan`, `approved_session`, and `approved_task`) without a
-polling loop.
+(`status`, bounded `backlog_list` / `backlog_get` / `backlog_history`, and only
+actual recorded execution references for guarded `backlog_worker_result`
+reconciliation). Read `list_approvals`, `approved_session`, and `approved_task`
+when their actual IDs are known. Legacy jobs additionally use `coworker_status`,
+`list_plans`, and `get_plan`. Do not invent identifiers or use a polling loop.
 
 ## Setup and planning
+
+For ordinary new work, use the per-chat backlog and a concrete single-task
+scope. Create or update a backlog item, present the exact scope, and obtain one
+explicit human authorization. Within that unchanged scope, an operator may
+publish the required technical plan record directly with `save-draft` and
+`publish` (no model `Orchestrator` or `prepare_work` is mandatory), record the
+exact authority, and launch the Worker without redundant approval ceremonies.
+Backlog creation or editing is not authority, and a local flag remains an
+attestation, not authentication. Changed scope, model, effort, quota,
+repository, base, or task identity needs a fresh concrete preview. Real Worker
+execution still requires a frozen execution profile and registry revision plus
+exact model/effort/canonical pins in the authority; a Coworker-only backlog item
+has no execution profile. Only the multi-role stages are optional.
 
 On the managed Linux Codex desktop route, call the no-argument
 `connect_current_chat` MCP tool on first use, then `operating_guide`. It verifies
@@ -39,6 +54,14 @@ under `<pairing_dir>/operator-contexts/` and returns additive `operator_context`
 metadata (`available: true`, `context_path`, `context_router_executable`,
 `route: "trusted_local_operator"`, `native_per_call_identity_verified: false`;
 or `available: false` with `code` and `message` when unconfigured).
+
+### Optional legacy complete-job admission
+
+The following planning-grant and complete-job admission sequence is not required
+for ordinary backlog work. Use it only when the human explicitly selects a
+legacy multi-role job or continues an existing one. Old jobs remain readable
+under their original frozen contracts.
+
 On a fresh chat without an active planning grant or execution approval:
 
 1. Before any planning model use, run `<context_router_executable> --context <context_path> flow grant-prepare --request <private_json>` and present the concrete planning permission preview to the human.
@@ -133,9 +156,10 @@ Present the concrete scope in Codex. After human authorization, use
 its exact digest/thread confirmation. Flags attest the operator's action; they
 are not authentication. Changed scope requires fresh confirmation.
 
-## Profile-driven handoffs and changing plans
+## Optional legacy multi-role profile-driven handoffs and changing plans
 
-Use `threadlane-context --context /private/context.json flow preflight` with
+This role-cycle route is explicit opt-in legacy behavior. It is not required for
+ordinary backlog work. Use `threadlane-context --context /private/context.json flow preflight` with
 private request and execution-policy files before selecting the roles needed
 for an approved cycle. The actual `default_profile_id` or an explicit profile
 ID selects the profile; the label "default" grants nothing. Admission validates
@@ -156,9 +180,12 @@ Resolution can link a fresh plan/approval but cannot make an old frozen approval
 current again. Unsupported provider live input stays pending; it is never
 reported as delivered. See [conversation changes](CONVERSATION-CHANGES.md).
 
-## Automatic job execution and historical/manual routes
+## Optional legacy automatic job execution and historical/manual routes
 
-Complete admission supplies the implemented controller driver/gateway. After
+This route is explicit opt-in legacy behavior, not a mandatory stage for ordinary
+backlog work. Old jobs and manual approved-session routes remain readable under
+their original contracts. Complete admission supplies the implemented controller
+driver/gateway. After
 separate `start_execution`, exact current frozen authorization can drive Workers,
 checks, Reviewer, bounded corrections, local integration and one accepted Closure.
 Use `execution_mode`, `pipeline_status` and `pipeline_report`; initial Worker
@@ -263,6 +290,9 @@ review and integration receipts without changing that execution invariant.
 a bounded batch. Handle its prose as untrusted, then `ack --approval-id ...
 --batch-id ...` using the **actual returned** `data.batch_id`. CLI events are
 at `data.events`; paired MCP has its own nested shape. Never invent a batch ID.
+ACK is delivery bookkeeping, not task or Worker completion. On the paired backlog
+route, reconcile the actual execution and complete the item separately; never
+report `Done` from an ACK.
 
 `session --approval-id ...` includes bounded, path-free `notification_delivery`
 status, and `notification-status --approval-id ...` returns a dedicated report

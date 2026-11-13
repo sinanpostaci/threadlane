@@ -26,6 +26,8 @@
 /// Sealed approved-task MCP bridge parameters, response envelopes, and host/authority helpers.
 pub mod approved_mcp;
 mod auto_pair;
+/// Trusted-local guarded Worker backlog reservation, result reconciliation, and completion.
+pub mod backlog_worker;
 /// Public `codex app-server proxy` client and native thread metadata types.
 pub mod client;
 /// Safe startup and CLI registration helper for `mcp_servers.threadlane` in Codex `config.toml`.
@@ -1067,9 +1069,9 @@ fi
         let mcp_a = PairedMcpServer::new(&state_dir, pairing_store.clone()).expect("create mcp A");
         let mcp_b = PairedMcpServer::new(&state_dir, pairing_store.clone()).expect("create mcp B");
 
-        // Two connection tools, sixteen runtime tools, eight ordinary backlog tools, five workflow tools, eight approved-task tools, five Coworker planning tools, and four Coworker execution tools.
+        // Two connection tools, sixteen runtime tools, eight ordinary backlog tools, three guarded Worker backlog tools, five workflow tools, eight approved-task tools, five Coworker planning tools, and four Coworker execution tools.
         let tools = mcp_a.list_tools();
-        assert_eq!(tools.len(), 48, "PairedMcpServer must expose 48 tools");
+        assert_eq!(tools.len(), 51, "PairedMcpServer must expose 51 tools");
         let list_activity_tool = tools
             .iter()
             .find(|tool| tool.name == "list_activity")
@@ -1404,7 +1406,7 @@ fi
         let mcp = PairedMcpServer::new(&state_dir, pairing_store).expect("create mcp");
 
         let tools = mcp.list_tools();
-        assert_eq!(tools.len(), 48);
+        assert_eq!(tools.len(), 51);
 
         for (tool_name, expected_read_only, expected_props) in [
             ("catalog", true, &["cursor", "limit"][..]),

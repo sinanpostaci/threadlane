@@ -1,9 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
+use threadlane::presence::{
+    WorkerPresenceAvailability, WorkerPresenceFreshness, WorkerPresenceSnapshot,
+};
 use threadlane::{
     resolve_worker_execution, ActivityPage, ErrorCode as RuntimeErrorCode, EventKind,
     HostControlInfoRequest, HostControlOwnerScope, HostControlRuntimeState,
@@ -1613,6 +1616,224 @@ impl ApprovedHostClient {
                 })
             }
         }
+    }
+
+    /// Returns the runtime's actual, bounded worker-process presence for `task_id` in
+    /// `approval_id` when an active authenticated host session currently owns that exact run.
+    ///
+    /// - Strictly read-only: never starts, restarts, dispatches, retries, cancels, or records
+    ///   receipts.
+    /// - Resolves the frozen approval, exact task, caller `control_binding_id`, and native thread
+    ///   before inspecting session state, including for unstarted and stopped sessions.
+    /// - Returns `Ok(None)` for an unstarted task, a non-`Ready` session, a non-sealed receipt, or
+    ///   any observation that is not live, fresh, and bound to the current manifest instance,
+    ///   sealed receipt, worker claim, and attempt. Corrupt or foreign observation identities are
+    ///   explicit errors.
+    /// - The returned snapshot is only the runtime DTO. It carries no path, provider prose, raw
+    ///   error, or credential. A live observation is not a claim that the physical child process
+    ///   remains alive after this call returns.
+    pub async fn get_task_presence(
+        &self,
+        approval_id: &str,
+        task_id: &str,
+    ) -> Result<Option<WorkerPresenceSnapshot>, HostError> {
+        validate_identifier("task_id", task_id)?;
+        let record = self.resolve_authorized_approval(approval_id)?;
+        let task = record
+            .tasks
+            .iter()
+            .find(|t| t.task_id == task_id)
+            .ok_or_else(|| HostError::UnknownTask {
+                approval_id: record.approval_id.clone(),
+                task_id: task_id.to_string(),
+            })?;
+        if !task.is_frozen_headless_worker() {
+            return Err(HostError::NativeRouteRequired {
+                approval_id: record.approval_id.clone(),
+                task_id: task.task_id.clone(),
+                adapter: task.adapter,
+            });
+        }
+
+        let session_candidate = self.sessions_dir.join(&record.approval_id);
+        match std::fs::symlink_metadata(&session_candidate) {
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => {
+                return Err(HostError::Io {
+                    operation: "symlink_metadata(presence session_dir)".to_string(),
+                    reason: err.to_string(),
+                });
+            }
+        }
+        let session_dir = verify_existing_session_dir(&self.sessions_dir, &record.approval_id)?;
+        let Some(initial_manifest) = read_host_manifest_optional(&session_dir, &record)? else {
+            return Ok(None);
+        };
+        if initial_manifest.phase != HostPhase::Ready
+            || !initial_manifest.gates.supervisor_authenticated_ready
+        {
+            return Ok(None);
+        }
+
+        let session = self.verify_active_ready_session(approval_id).await?;
+        let task = session
+            .record
+            .tasks
+            .iter()
+            .find(|t| t.task_id == task_id)
+            .ok_or_else(|| HostError::UnknownTask {
+                approval_id: session.record.approval_id.clone(),
+                task_id: task_id.to_string(),
+            })?;
+        if !task.is_frozen_headless_worker() {
+            return Err(HostError::NativeRouteRequired {
+                approval_id: session.record.approval_id.clone(),
+                task_id: task.task_id.clone(),
+                adapter: task.adapter,
+            });
+        }
+
+        let Some(instance_id) = session.manifest.instance_id.clone() else {
+            return Ok(None);
+        };
+        let session_binding_id = session.manifest.session_binding_id.clone().ok_or_else(|| {
+            HostError::CorruptManifest {
+                path: session.session_dir.display().to_string(),
+                reason: "ready manifest is missing session_binding_id".to_string(),
+            }
+        })?;
+
+        let (_, receipt) = read_task_ledger_entry(
+            &session.session_dir,
+            &session.record,
+            &session.live_binding.binding_id,
+            task_id,
+        )?;
+        let Some(receipt) = receipt else {
+            return Ok(None);
+        };
+        if receipt.task_id != task.task_id
+            || receipt.task_digest != task.task_digest
+            || Some(receipt.profile_id.as_str()) != task.profile_id.as_deref()
+            || Some(receipt.command_key.as_str()) != task.command_key.as_deref()
+        {
+            return Err(HostError::CorruptSessionState {
+                reason: format!(
+                    "sealed receipt for task `{}` does not match the frozen task identity",
+                    task.task_id
+                ),
+            });
+        }
+
+        let worker_before = match session
+            .scoped_client
+            .get_worker(receipt.run_id.clone())
+            .await
+        {
+            Ok(worker) => worker,
+            Err(threadlane::Error::Remote(api_err))
+                if api_err.code == RuntimeErrorCode::WorkerNotFound =>
+            {
+                return Ok(None);
+            }
+            Err(err) => return Err(err.into()),
+        };
+        verify_exact_task_worker(
+            &session.record,
+            &session.live_binding.binding_id,
+            &session.work_area_dir,
+            task,
+            &receipt,
+            &worker_before,
+        )?;
+
+        // Start the monotonic age extension before the presence request. The runtime's
+        // server-side sample age does not cover response transit or deserialization, and a
+        // backwards wall clock during that delay must not make an expired sample look fresh.
+        // Conservatively include the entire elapsed interval through the post-sample worker,
+        // manifest, and receipt checks; the runtime's original sample timestamp and expiry remain
+        // authoritative and are never renewed.
+        let presence_request_started = Instant::now();
+        let mut presence = match session
+            .scoped_client
+            .get_worker_presence(receipt.run_id.clone())
+            .await
+        {
+            Ok(presence) => presence,
+            Err(threadlane::Error::Remote(api_err))
+                if api_err.code == RuntimeErrorCode::WorkerNotFound =>
+            {
+                return Ok(None);
+            }
+            Err(err) => return Err(err.into()),
+        };
+
+        // Reconcile once against the current worker after the presence sample. A newer claim,
+        // attempt, revision, or lifecycle transition invalidates the older observation instead of
+        // letting this adapter adopt it.
+        let worker_after = match session
+            .scoped_client
+            .get_worker(receipt.run_id.clone())
+            .await
+        {
+            Ok(worker) => worker,
+            Err(threadlane::Error::Remote(api_err))
+                if api_err.code == RuntimeErrorCode::WorkerNotFound =>
+            {
+                return Ok(None);
+            }
+            Err(err) => return Err(err.into()),
+        };
+        verify_exact_task_worker(
+            &session.record,
+            &session.live_binding.binding_id,
+            &session.work_area_dir,
+            task,
+            &receipt,
+            &worker_after,
+        )?;
+
+        if !verify_live_task_presence(
+            &session.record,
+            &session.live_binding.binding_id,
+            &instance_id,
+            &receipt,
+            &worker_after,
+            &presence,
+        )? {
+            return Ok(None);
+        }
+
+        // Final checks are synchronous and use only freshly read state after the last await.
+        let final_manifest = read_host_manifest_optional(&session.session_dir, &session.record)?;
+        let Some(final_manifest) = final_manifest else {
+            return Ok(None);
+        };
+        if final_manifest.phase != HostPhase::Ready
+            || !final_manifest.gates.supervisor_authenticated_ready
+            || final_manifest.instance_id.as_deref() != Some(instance_id.as_str())
+            || final_manifest.session_binding_id.as_deref() != Some(session_binding_id.as_str())
+            || !is_host_lock_held(&session.session_dir)?
+        {
+            return Ok(None);
+        }
+        let (_, final_receipt) = read_task_ledger_entry(
+            &session.session_dir,
+            &session.record,
+            &session_binding_id,
+            task_id,
+        )?;
+        if final_receipt.as_ref() != Some(&receipt) {
+            return Ok(None);
+        }
+
+        let elapsed_ms =
+            u64::try_from(presence_request_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        if !advance_presence_sample_age(&mut presence, elapsed_ms) {
+            return Ok(None);
+        }
+        Ok(Some(presence))
     }
 
     /// Inspects the physical delivery of the exact terminal result for `task_id` in
@@ -3451,6 +3672,147 @@ fn open_existing_lock_file_readonly(
     Ok(file)
 }
 
+fn verify_live_task_presence(
+    record: &ApprovalRecord,
+    session_binding_id: &str,
+    instance_id: &str,
+    receipt: &TaskRunReceipt,
+    worker: &WorkerSnapshot,
+    presence: &WorkerPresenceSnapshot,
+) -> Result<bool, HostError> {
+    if presence.availability != WorkerPresenceAvailability::Live
+        || presence.freshness != WorkerPresenceFreshness::Fresh
+        || !presence.live
+        || presence.max_sample_age_ms == 0
+    {
+        return Ok(false);
+    }
+
+    if presence.binding_id != session_binding_id {
+        return Err(HostError::ScopeMismatch {
+            field: "session_binding_id".to_string(),
+            expected: session_binding_id.to_string(),
+            actual: presence.binding_id.clone(),
+            reason: "live worker presence returned a mismatched session_binding_id".to_string(),
+        });
+    }
+    if presence.run_id != receipt.run_id || presence.worker_id != receipt.worker_id {
+        return Err(HostError::CorruptSessionState {
+            reason: "live worker presence run/worker identity does not match the sealed receipt"
+                .to_string(),
+        });
+    }
+    if presence.profile_id != receipt.profile_id
+        || presence.profile_id != worker.profile_id
+        || presence.profile_digest != worker.profile_digest
+    {
+        return Err(HostError::CorruptSessionState {
+            reason:
+                "live worker presence profile identity does not match the sealed receipt or worker"
+                    .to_string(),
+        });
+    }
+    if presence.execution_binding.as_ref() != receipt.execution_binding.as_ref()
+        || worker.execution_binding.as_ref() != receipt.execution_binding.as_ref()
+    {
+        return Err(HostError::CorruptSessionState {
+            reason:
+                "live worker presence execution binding does not match the sealed receipt or worker"
+                    .to_string(),
+        });
+    }
+
+    let expected_owner = threadlane::HostControlConfig {
+        approval_id: record.approval_id.clone(),
+        subject_digest: record.subject_digest.clone(),
+        control_binding_id: record.binding_id.clone(),
+        thread_uuid: record.thread_uuid.clone(),
+        session_binding_id: session_binding_id.to_string(),
+        instance_id: instance_id.to_string(),
+    };
+    match presence.owner.as_ref() {
+        Some(owner) if owner == &expected_owner => {}
+        Some(_) => {
+            return Err(HostError::CorruptSessionState {
+                reason: "live worker presence owner does not match the current host session"
+                    .to_string(),
+            });
+        }
+        None => {
+            return Err(HostError::CorruptSessionState {
+                reason: "live worker presence is missing its owner scope".to_string(),
+            });
+        }
+    }
+
+    // A concurrent claim or lifecycle transition invalidates the sampled observation instead of
+    // making this adapter adopt an older claim, attempt, revision, or status. A terminal worker is
+    // never presented as live presence.
+    if worker.status.is_terminal()
+        || presence.worker_revision != worker.revision
+        || presence.worker_status != worker.status
+        || presence.claim_id != worker.claim_id
+        || presence.attempt_count != worker.attempt_count
+    {
+        return Ok(false);
+    }
+
+    if !presence
+        .process
+        .as_ref()
+        .is_some_and(|process| process.is_valid() && process.is_live())
+    {
+        return Err(HostError::CorruptSessionState {
+            reason: "live worker presence is missing a valid runner-owned process snapshot"
+                .to_string(),
+        });
+    }
+    Ok(true)
+}
+
+fn advance_presence_sample_age(presence: &mut WorkerPresenceSnapshot, elapsed_ms: u64) -> bool {
+    let Some(age) = compute_advanced_presence_sample_age(
+        presence.sample_age_ms,
+        presence.sampled_at_ms,
+        presence.expires_at_ms,
+        presence.max_sample_age_ms,
+        now_epoch_ms(),
+        elapsed_ms,
+    ) else {
+        return false;
+    };
+    presence.sample_age_ms = Some(age);
+    true
+}
+
+fn compute_advanced_presence_sample_age(
+    sample_age_ms: Option<u64>,
+    sampled_at_ms: Option<i64>,
+    expires_at_ms: Option<i64>,
+    max_sample_age_ms: u64,
+    now_ms: i64,
+    elapsed_ms: u64,
+) -> Option<u64> {
+    if max_sample_age_ms == 0 {
+        return None;
+    }
+    let sampled_at_ms = sampled_at_ms?;
+    let wall_age = now_ms.checked_sub(sampled_at_ms)?;
+    let wall_age = u64::try_from(wall_age).ok()?;
+    let mut age = match sample_age_ms {
+        Some(age) => age.checked_add(elapsed_ms)?,
+        None => wall_age,
+    };
+    age = age.max(wall_age);
+    if age > max_sample_age_ms {
+        return None;
+    }
+    if expires_at_ms.is_some_and(|expires_at_ms| now_ms >= expires_at_ms) {
+        return None;
+    }
+    Some(age)
+}
+
 fn verify_exact_task_worker(
     record: &ApprovalRecord,
     session_binding_id: &str,
@@ -3985,5 +4347,157 @@ mod tests {
             verify_post_dispatch_worker_snapshot("bnd_sess_1", "bnd_sess_1", None, Some(&binding))
                 .expect_err("mismatched post-start execution_binding must be uncertain");
         assert_eq!(exec_err.code(), "outcome_unknown");
+    }
+
+    #[test]
+    fn presence_sample_age_rejects_delayed_response_at_freshness_boundary() {
+        let now_ms = 1_700_000_000_000_i64;
+        let sampled_at_ms = now_ms - 100;
+        let expires_at_ms = now_ms + 60_000;
+
+        assert_eq!(
+            compute_advanced_presence_sample_age(
+                Some(999),
+                Some(sampled_at_ms),
+                Some(expires_at_ms),
+                1_000,
+                now_ms,
+                2,
+            ),
+            None,
+            "a near-bound server age plus delayed response/check time must fail closed"
+        );
+        assert_eq!(
+            compute_advanced_presence_sample_age(
+                Some(900),
+                Some(sampled_at_ms),
+                Some(expires_at_ms),
+                1_000,
+                now_ms,
+                101,
+            ),
+            None,
+            "elapsed time that crosses the freshness bound must fail closed"
+        );
+        assert_eq!(
+            compute_advanced_presence_sample_age(
+                Some(900),
+                Some(sampled_at_ms),
+                Some(expires_at_ms),
+                1_000,
+                now_ms,
+                100,
+            ),
+            Some(1_000),
+            "exactly at the freshness bound remains valid"
+        );
+    }
+
+    #[test]
+    fn presence_sample_age_rejects_missing_future_expired_and_overflowing_samples() {
+        let now_ms = 1_700_000_000_000_i64;
+        let max_sample_age_ms = 1_000;
+
+        assert_eq!(
+            compute_advanced_presence_sample_age(None, None, None, max_sample_age_ms, now_ms, 0),
+            None,
+            "a missing wall-clock sample time must fail closed"
+        );
+        assert_eq!(
+            compute_advanced_presence_sample_age(
+                Some(1),
+                None,
+                Some(now_ms + 60_000),
+                max_sample_age_ms,
+                now_ms,
+                0,
+            ),
+            None,
+            "a server age without a wall-clock sample time must fail closed"
+        );
+        assert_eq!(
+            compute_advanced_presence_sample_age(
+                Some(1),
+                Some(now_ms + 1),
+                Some(now_ms + 60_000),
+                max_sample_age_ms,
+                now_ms,
+                0,
+            ),
+            None,
+            "a future wall-clock sample time must fail closed"
+        );
+        assert_eq!(
+            compute_advanced_presence_sample_age(
+                Some(1),
+                Some(now_ms - 1),
+                Some(now_ms),
+                max_sample_age_ms,
+                now_ms,
+                0,
+            ),
+            None,
+            "an expired sample must fail closed at its original expiry"
+        );
+        assert_eq!(
+            compute_advanced_presence_sample_age(
+                Some(u64::MAX),
+                Some(now_ms - 1),
+                None,
+                max_sample_age_ms,
+                now_ms,
+                1,
+            ),
+            None,
+            "elapsed overflow must fail closed"
+        );
+        assert_eq!(
+            compute_advanced_presence_sample_age(Some(0), Some(now_ms), None, 0, now_ms, 0),
+            None,
+            "a zero maximum sample age must fail closed"
+        );
+    }
+
+    #[test]
+    fn presence_sample_age_within_ttl_advances_without_renewing_the_sample() {
+        let now_ms = 1_700_000_000_000_i64;
+        let sampled_at_ms = now_ms - 250;
+        let expires_at_ms = now_ms + 60_000;
+
+        let first = compute_advanced_presence_sample_age(
+            Some(400),
+            Some(sampled_at_ms),
+            Some(expires_at_ms),
+            1_000,
+            now_ms,
+            100,
+        )
+        .expect("first within-TTL sample remains fresh");
+        let second = compute_advanced_presence_sample_age(
+            Some(first),
+            Some(sampled_at_ms),
+            Some(expires_at_ms),
+            1_000,
+            now_ms,
+            200,
+        )
+        .expect("second within-TTL sample remains fresh");
+        let third = compute_advanced_presence_sample_age(
+            Some(second),
+            Some(sampled_at_ms),
+            Some(expires_at_ms),
+            1_000,
+            now_ms,
+            300,
+        )
+        .expect("third within-TTL sample remains fresh");
+
+        assert_eq!(first, 500);
+        assert_eq!(second, 700);
+        assert_eq!(third, 1_000);
+        assert!(
+            first <= second && second <= third,
+            "advanced sample ages must be nondecreasing"
+        );
     }
 }

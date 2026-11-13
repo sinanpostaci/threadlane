@@ -22,8 +22,11 @@
 //! A reservation is not proof that a process is running. Recording a successful
 //! outcome leaves the item in `Doing` until a separate completion receipt is
 //! committed. `Failure` and `Unknown` block the item while preserving the
-//! execution identity and evidence. A later reservation after a known failure
-//! requires a different fresh approval/task identity and a new revision check.
+//! execution identity and evidence. A technically successful delivery that
+//! fails Coworker acceptance can be separately rejected, which blocks the item
+//! without rewriting the immutable `Success` outcome. A later reservation after
+//! a known failure or acceptance rejection requires a different fresh
+//! approval/task identity and a new revision check.
 
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
@@ -50,10 +53,21 @@ use crate::limits::{
 /// smaller than [`MAX_BACKLOG_BLOCKED_REASON_LEN`] after the fixed prefix.
 pub const MAX_WORKER_BACKLOG_OUTCOME_NOTE_LEN: usize = 768;
 
+/// Maximum byte length for one failed-acceptance rejection reason.
+///
+/// The reason is also embedded in the bounded blocked reason, so it stays
+/// smaller than [`MAX_BACKLOG_BLOCKED_REASON_LEN`] after the fixed prefix.
+pub const MAX_WORKER_BACKLOG_REJECTION_REASON_LEN: usize = 768;
+
+/// Maximum byte length for one failed-acceptance rejection evidence
+/// attestation.
+pub const MAX_WORKER_BACKLOG_REJECTION_EVIDENCE_LEN: usize = 2_048;
+
 const RESERVE_OPERATION: &str = "backlog_worker_reserve";
 const ATTACH_OPERATION: &str = "backlog_worker_attach";
 const OUTCOME_OPERATION: &str = "backlog_worker_outcome";
 const COMPLETE_OPERATION: &str = "backlog_worker_complete";
+const REJECT_OPERATION: &str = "backlog_worker_acceptance_reject";
 const WORKER_CURSOR_VERSION: &str = "tlb1";
 const WORKER_ATTEMPTS_CURSOR_KIND: &str = "worker_attempts";
 
@@ -102,7 +116,8 @@ pub struct WorkerBacklogDispatchReceipt {
 #[serde(rename_all = "snake_case")]
 pub enum WorkerBacklogOutcome {
     /// The trusted caller verified successful execution; the item remains
-    /// `Doing` until separate Coworker acceptance completion.
+    /// `Doing` until separate Coworker acceptance completion or a stored
+    /// acceptance rejection.
     Success,
     /// The trusted caller verified failure.
     Failure,
@@ -173,6 +188,31 @@ pub struct WorkerBacklogCompletion {
     pub delivery_digest: String,
 }
 
+/// Revision-checked trusted-operator-only acceptance rejection request.
+///
+/// This is a trusted-local operator input, never a scoped MCP request. It is
+/// only valid for the exact current execution of a `Doing` Worker item whose
+/// immutable technical outcome is `Success`. The request must echo the stored
+/// successful result digest and carry the upstream-checked delivery digest plus
+/// bounded concrete failed-acceptance reason/evidence. The upstream guarded
+/// facade must independently re-read the real terminal result and delivery
+/// before calling this core operation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerBacklogAcceptanceRejection {
+    /// Exact current execution reference being rejected.
+    pub execution_ref: String,
+    /// Exact stored successful `result_digest`.
+    pub result_digest: String,
+    /// Lowercase hex delivery digest computed by the trusted upstream delivery
+    /// checker. Core validates shape only and does not inspect disk state.
+    pub delivery_digest: String,
+    /// Bounded concrete reason the delivered result failed acceptance.
+    pub reason: String,
+    /// Bounded concrete evidence checked during failed acceptance.
+    pub evidence: String,
+}
+
 /// Durable recorded outcome for one execution attempt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerBacklogRecordedOutcome {
@@ -205,6 +245,22 @@ pub struct WorkerBacklogCompletionRecord {
     pub completed_at_ms: i64,
 }
 
+/// Durable failed-acceptance rejection stored separately from the immutable
+/// technical outcome.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerBacklogAcceptanceRejectionRecord {
+    /// Successful result digest copied from the recorded outcome.
+    pub result_digest: String,
+    /// Upstream-checked delivery digest.
+    pub delivery_digest: String,
+    /// Bounded concrete reason the delivered result failed acceptance.
+    pub reason: String,
+    /// Bounded concrete evidence checked during failed acceptance.
+    pub evidence: String,
+    /// Timestamp (ms) when the rejection was recorded.
+    pub rejected_at_ms: i64,
+}
+
 /// Durable execution attempt linked to one Worker backlog item.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerBacklogExecution {
@@ -232,6 +288,14 @@ pub struct WorkerBacklogExecution {
     pub outcome: Option<WorkerBacklogRecordedOutcome>,
     /// Separate Coworker acceptance and delivery completion when recorded.
     pub completion: Option<WorkerBacklogCompletionRecord>,
+    /// Separate failed-acceptance rejection when the Coworker rejected a
+    /// technically successful delivery.
+    ///
+    /// Absent on legacy records and on attempts that were not rejected. The
+    /// original successful outcome remains unchanged when this is present, and
+    /// it is mutually exclusive with [`Self::completion`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acceptance_rejection: Option<WorkerBacklogAcceptanceRejectionRecord>,
 }
 
 /// Durable completion receipt returned by the separate completion commit.
@@ -241,6 +305,16 @@ pub struct WorkerBacklogCompletionReceipt {
     pub item: BacklogItem,
     /// Final execution snapshot containing the authority tuple, dispatch
     /// identity, result digest, delivery digest, and acceptance attestation.
+    pub execution: WorkerBacklogExecution,
+}
+
+/// Durable rejection receipt returned by the acceptance-rejection commit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerBacklogAcceptanceRejectionReceipt {
+    /// Final item snapshot after rejection.
+    pub item: BacklogItem,
+    /// Final execution snapshot preserving the original successful outcome and
+    /// carrying the separate rejection record.
     pub execution: WorkerBacklogExecution,
 }
 
@@ -338,9 +412,10 @@ impl Core {
     /// create a run, job, worker, process, or proof that execution started.
     ///
     /// A `Todo` item may reserve directly. A manually `Blocked` item with no
-    /// execution may reserve from `Blocked`. After a known `Failure`, a new
-    /// reservation is allowed only with a different fresh approval/task pair and
-    /// the current revision. An `Unknown` or successful pending attempt cannot
+    /// execution may reserve from `Blocked`. After a known `Failure` or a stored
+    /// acceptance rejection of a technical `Success`, a new reservation is
+    /// allowed only with a different fresh approval/task pair and the current
+    /// revision. An `Unknown` or successful attempt pending acceptance cannot
     /// reserve a replacement.
     #[allow(clippy::too_many_arguments)]
     pub fn reserve_worker_backlog_execution_operator_attested(
@@ -402,11 +477,12 @@ impl Core {
                         .outcome
                         .as_ref()
                         .is_some_and(|outcome| outcome.outcome == WorkerBacklogOutcome::Failure);
-                    if !failed {
+                    let rejected = latest.acceptance_rejection.is_some();
+                    if !failed && !rejected {
                         return Err(invalid_worker_transition(
                             &backlog_item,
                             "reserve",
-                            "a previous attempt is unresolved or successful pending completion",
+                            "a previous attempt is unresolved or successful pending acceptance rejection",
                         ));
                     }
                 } else if backlog_item.current_execution_ref.is_some() {
@@ -452,6 +528,7 @@ impl Core {
             attached_at_ms: None,
             outcome: None,
             completion: None,
+            acceptance_rejection: None,
         };
         validate_worker_execution(&execution)?;
         insert_worker_execution_tx(&tx, &execution)?;
@@ -739,6 +816,12 @@ impl Core {
                 reason: "a completed Worker execution cannot record another outcome".to_string(),
             });
         }
+        if execution.acceptance_rejection.is_some() {
+            return Err(CoreError::Validation {
+                field: "acceptance_rejection",
+                reason: "a rejected Worker execution cannot record another outcome".to_string(),
+            });
+        }
         if let Some(previous) = execution.outcome.as_ref() {
             let reconciling_unknown =
                 previous.outcome == WorkerBacklogOutcome::Unknown && report.outcome.is_known();
@@ -893,6 +976,12 @@ impl Core {
             &clean_item_id,
             &clean_completion.execution_ref,
         )?;
+        if execution.acceptance_rejection.is_some() {
+            return Err(CoreError::Validation {
+                field: "acceptance_rejection",
+                reason: "a rejected Worker execution cannot be completed".to_string(),
+            });
+        }
         if execution.dispatch_receipt.is_none() {
             return Err(CoreError::Validation {
                 field: "dispatch_receipt",
@@ -983,6 +1072,194 @@ impl Core {
             &clean_binding_id,
             &clean_key,
             COMPLETE_OPERATION,
+            &payload_hash,
+            &response_json,
+            valid_now,
+        )?;
+        tx.commit()?;
+        Ok(receipt)
+    }
+
+    /// Rejects the Coworker acceptance of a technically successful Worker
+    /// execution and blocks the item for a fresh authorized attempt.
+    ///
+    /// Trusted-local operator-attested method, never part of scoped MCP. The
+    /// request must name the exact current execution and item revision, echo the
+    /// stored successful `result_digest`, carry the upstream-checked
+    /// `delivery_digest`, and include bounded concrete failed-acceptance
+    /// reason/evidence. Core checks the reservation's frozen condition digests,
+    /// persists the rejection in a separate durable record, stores `Blocked` with
+    /// the bounded reason, appends one history entry, and records command
+    /// deduplication in one transaction. The immutable technical `Success`
+    /// outcome is never overwritten, and no run, job, worker, event, question, or
+    /// human request is created. Replaying the exact request returns the original
+    /// receipt without another revision or history entry.
+    #[allow(clippy::too_many_arguments)]
+    pub fn reject_worker_backlog_acceptance_operator_attested(
+        &mut self,
+        binding_id: &str,
+        command_key: &str,
+        item_id: &str,
+        expected_revision: u64,
+        rejection: WorkerBacklogAcceptanceRejection,
+        now_ms: i64,
+    ) -> Result<WorkerBacklogAcceptanceRejectionReceipt, CoreError> {
+        let clean_binding_id = validate_identifier("binding_id", binding_id)?;
+        let clean_key = validate_command_key(command_key)?;
+        let clean_item_id = validate_backlog_item_id(item_id)?;
+        validate_expected_revision(expected_revision)?;
+        let clean_rejection = validate_acceptance_rejection(rejection)?;
+        let valid_now = validate_timestamp_ms("now_ms", now_ms)?;
+        let payload_hash = hash_dedup_payload(&(
+            REJECT_OPERATION,
+            &clean_item_id,
+            expected_revision,
+            &clean_rejection,
+        ))?;
+
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        Self::ensure_binding_exists(&tx, &clean_binding_id)?;
+        if let Some(existing) = check_worker_acceptance_rejection_replay(
+            &tx,
+            &clean_binding_id,
+            &clean_key,
+            REJECT_OPERATION,
+            &payload_hash,
+            &clean_item_id,
+            &clean_rejection.execution_ref,
+        )? {
+            return Ok(existing);
+        }
+
+        let mut backlog_item = load_backlog_item_conn(&tx, &clean_binding_id, &clean_item_id)?;
+        if backlog_item.revision != expected_revision {
+            return Err(CoreError::StaleRevision {
+                run_id: clean_item_id,
+                expected_revision,
+                actual_revision: backlog_item.revision,
+            });
+        }
+        if backlog_item.kind != BacklogItemKind::Worker {
+            return Err(worker_api_requires_worker(
+                &backlog_item,
+                "reject Worker acceptance",
+            ));
+        }
+        if backlog_item.status != BacklogStatus::Doing {
+            return Err(invalid_worker_transition(
+                &backlog_item,
+                "reject Worker acceptance",
+                "a technically successful execution pending acceptance is required",
+            ));
+        }
+        if backlog_item.current_execution_ref.as_deref()
+            != Some(clean_rejection.execution_ref.as_str())
+        {
+            return Err(CoreError::Validation {
+                field: "execution_ref",
+                reason: format!(
+                    "execution `{}` is not the current execution for backlog item `{clean_item_id}`",
+                    clean_rejection.execution_ref
+                ),
+            });
+        }
+
+        let mut execution = load_worker_execution_conn(
+            &tx,
+            &clean_binding_id,
+            &clean_item_id,
+            &clean_rejection.execution_ref,
+        )?;
+        if execution.completion.is_some() {
+            return Err(CoreError::Validation {
+                field: "completion",
+                reason: "a completed Worker execution cannot be rejected".to_string(),
+            });
+        }
+        if execution.acceptance_rejection.is_some() {
+            return Err(CoreError::Validation {
+                field: "acceptance_rejection",
+                reason: "the execution already has an acceptance rejection record".to_string(),
+            });
+        }
+        let outcome = execution
+            .outcome
+            .as_ref()
+            .ok_or_else(|| CoreError::Validation {
+                field: "outcome",
+                reason: "acceptance rejection requires a recorded successful outcome".to_string(),
+            })?;
+        if outcome.outcome != WorkerBacklogOutcome::Success {
+            return Err(CoreError::Validation {
+                field: "outcome",
+                reason: "acceptance rejection requires a recorded successful outcome".to_string(),
+            });
+        }
+        if execution.dispatch_receipt.is_none() {
+            return Err(CoreError::Validation {
+                field: "dispatch_receipt",
+                reason: "acceptance rejection requires an attached dispatch receipt".to_string(),
+            });
+        }
+        let stored_result_digest = outcome.result_digest.as_deref().ok_or_else(|| {
+            CoreError::CorruptState(format!(
+                "successful execution `{}` has no stored result_digest",
+                clean_rejection.execution_ref
+            ))
+        })?;
+        if stored_result_digest != clean_rejection.result_digest {
+            return Err(CoreError::Validation {
+                field: "result_digest",
+                reason: "result_digest does not match the stored successful outcome".to_string(),
+            });
+        }
+        let (acceptance_condition_digest, delivery_description_digest) =
+            condition_digests(&backlog_item)?;
+        if acceptance_condition_digest != execution.acceptance_condition_digest {
+            return Err(CoreError::Validation {
+                field: "acceptance_condition",
+                reason: "acceptance condition no longer matches the reservation digest".to_string(),
+            });
+        }
+        if delivery_description_digest != execution.delivery_description_digest {
+            return Err(CoreError::Validation {
+                field: "delivery_description",
+                reason: "delivery description no longer matches the reservation digest".to_string(),
+            });
+        }
+
+        let rejection_record = WorkerBacklogAcceptanceRejectionRecord {
+            result_digest: clean_rejection.result_digest.clone(),
+            delivery_digest: clean_rejection.delivery_digest.clone(),
+            reason: clean_rejection.reason.clone(),
+            evidence: clean_rejection.evidence.clone(),
+            rejected_at_ms: valid_now,
+        };
+        execution.acceptance_rejection = Some(rejection_record);
+
+        backlog_item.status = BacklogStatus::Blocked;
+        backlog_item.blocked_reason = Some(blocked_reason_for_rejection(&clean_rejection.reason)?);
+        let previous_revision = backlog_item.revision;
+        backlog_item.revision = next_backlog_revision(&backlog_item)?;
+        backlog_item.updated_at_ms = valid_now;
+        crate::backlog::validate_backlog_item(&backlog_item, &clean_binding_id)?;
+        validate_worker_execution(&execution)?;
+        update_backlog_item_tx(&tx, &backlog_item, previous_revision)?;
+        insert_worker_acceptance_rejection_tx(&tx, &execution)?;
+        record_backlog_history_tx(&tx, &backlog_item, BacklogHistoryAction::Blocked, valid_now)?;
+
+        let receipt = WorkerBacklogAcceptanceRejectionReceipt {
+            item: backlog_item,
+            execution,
+        };
+        let response_json = serialize_worker_response(&receipt)?;
+        record_backlog_dedup_raw(
+            &tx,
+            &clean_binding_id,
+            &clean_key,
+            REJECT_OPERATION,
             &payload_hash,
             &response_json,
             valid_now,
@@ -1089,6 +1366,26 @@ fn validate_completion(
     })
 }
 
+fn validate_acceptance_rejection(
+    rejection: WorkerBacklogAcceptanceRejection,
+) -> Result<WorkerBacklogAcceptanceRejection, CoreError> {
+    Ok(WorkerBacklogAcceptanceRejection {
+        execution_ref: validate_execution_ref(&rejection.execution_ref)?,
+        result_digest: validate_worker_digest("result_digest", &rejection.result_digest)?,
+        delivery_digest: validate_worker_digest("delivery_digest", &rejection.delivery_digest)?,
+        reason: validate_bounded_text(
+            "reason",
+            &rejection.reason,
+            MAX_WORKER_BACKLOG_REJECTION_REASON_LEN,
+        )?,
+        evidence: validate_bounded_text(
+            "evidence",
+            &rejection.evidence,
+            MAX_WORKER_BACKLOG_REJECTION_EVIDENCE_LEN,
+        )?,
+    })
+}
+
 fn validate_execution_ref(raw: &str) -> Result<String, CoreError> {
     let clean = validate_identifier("execution_ref", raw)?;
     if clean.contains(':') {
@@ -1165,6 +1462,16 @@ fn blocked_reason_for_outcome(
     let reason = format!("worker {}: {note}", outcome.as_str());
     validate_bounded_text("blocked_reason", &reason, MAX_BACKLOG_BLOCKED_REASON_LEN)?;
     Ok(reason)
+}
+
+fn blocked_reason_for_rejection(reason: &str) -> Result<String, CoreError> {
+    let blocked_reason = format!("worker acceptance rejected: {reason}");
+    validate_bounded_text(
+        "blocked_reason",
+        &blocked_reason,
+        MAX_BACKLOG_BLOCKED_REASON_LEN,
+    )?;
+    Ok(blocked_reason)
 }
 
 fn worker_api_requires_worker(item: &BacklogItem, action: &'static str) -> CoreError {
@@ -1313,6 +1620,50 @@ fn validate_worker_execution(execution: &WorkerBacklogExecution) -> Result<(), C
         if completion.completed_at_ms < 0 {
             return Err(CoreError::CorruptState(format!(
                 "completed worker execution `{}` has a negative completion timestamp",
+                execution.execution_ref
+            )));
+        }
+    }
+    if let Some(rejection) = execution.acceptance_rejection.as_ref() {
+        if execution.completion.is_some() {
+            return Err(CoreError::CorruptState(format!(
+                "worker execution `{}` has both completion and acceptance rejection data",
+                execution.execution_ref
+            )));
+        }
+        let outcome = execution.outcome.as_ref().ok_or_else(|| {
+            CoreError::CorruptState(format!(
+                "rejected worker execution `{}` has no outcome",
+                execution.execution_ref
+            ))
+        })?;
+        if outcome.outcome != WorkerBacklogOutcome::Success {
+            return Err(CoreError::CorruptState(format!(
+                "rejected worker execution `{}` does not have a successful outcome",
+                execution.execution_ref
+            )));
+        }
+        if outcome.result_digest.as_deref() != Some(rejection.result_digest.as_str()) {
+            return Err(CoreError::CorruptState(format!(
+                "rejected worker execution `{}` result digest does not match its outcome",
+                execution.execution_ref
+            )));
+        }
+        validate_worker_digest("rejection_result_digest", &rejection.result_digest)?;
+        validate_worker_digest("rejection_delivery_digest", &rejection.delivery_digest)?;
+        validate_bounded_text(
+            "rejection_reason",
+            &rejection.reason,
+            MAX_WORKER_BACKLOG_REJECTION_REASON_LEN,
+        )?;
+        validate_bounded_text(
+            "rejection_evidence",
+            &rejection.evidence,
+            MAX_WORKER_BACKLOG_REJECTION_EVIDENCE_LEN,
+        )?;
+        if rejection.rejected_at_ms < 0 {
+            return Err(CoreError::CorruptState(format!(
+                "rejected worker execution `{}` has a negative rejection timestamp",
                 execution.execution_ref
             )));
         }
@@ -1500,6 +1851,87 @@ fn update_worker_execution_tx(
         )));
     }
     Ok(())
+}
+
+fn insert_worker_acceptance_rejection_tx(
+    tx: &Transaction<'_>,
+    execution: &WorkerBacklogExecution,
+) -> Result<(), CoreError> {
+    let rejection = execution.acceptance_rejection.as_ref().ok_or_else(|| {
+        CoreError::CorruptState(format!(
+            "worker execution `{}` has no acceptance rejection to persist",
+            execution.execution_ref
+        ))
+    })?;
+    tx.execute(
+        "INSERT INTO backlog_worker_acceptance_rejections (
+            execution_ref, binding_id, item_id, result_digest, delivery_digest,
+            reason, evidence, rejected_at_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            execution.execution_ref,
+            execution.binding_id,
+            execution.item_id,
+            rejection.result_digest,
+            rejection.delivery_digest,
+            rejection.reason,
+            rejection.evidence,
+            rejection.rejected_at_ms,
+        ],
+    )?;
+    Ok(())
+}
+
+fn load_worker_acceptance_rejection_conn(
+    conn: &Connection,
+    binding_id: &str,
+    item_id: &str,
+    execution_ref: &str,
+) -> Result<Option<WorkerBacklogAcceptanceRejectionRecord>, CoreError> {
+    let row: Option<(String, String, String, String, String, String, i64)> = conn
+        .query_row(
+            "SELECT binding_id, item_id, result_digest, delivery_digest, reason,
+                    evidence, rejected_at_ms
+             FROM backlog_worker_acceptance_rejections
+             WHERE execution_ref = ?1",
+            params![execution_ref],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        stored_binding_id,
+        stored_item_id,
+        result_digest,
+        delivery_digest,
+        reason,
+        evidence,
+        rejected_at_ms,
+    )) = row
+    else {
+        return Ok(None);
+    };
+    if stored_binding_id != binding_id || stored_item_id != item_id {
+        return Err(CoreError::CorruptState(format!(
+            "acceptance rejection for execution `{execution_ref}` belongs to `{stored_binding_id}`/`{stored_item_id}` instead of `{binding_id}`/`{item_id}`"
+        )));
+    }
+    Ok(Some(WorkerBacklogAcceptanceRejectionRecord {
+        result_digest,
+        delivery_digest,
+        reason,
+        evidence,
+        rejected_at_ms,
+    }))
 }
 
 fn load_worker_execution_conn(
@@ -1696,6 +2128,13 @@ fn load_worker_execution_conn(
         }
     };
 
+    let acceptance_rejection = load_worker_acceptance_rejection_conn(
+        conn,
+        &stored_binding_id,
+        &stored_item_id,
+        &stored_execution_ref,
+    )?;
+
     let execution = WorkerBacklogExecution {
         execution_ref: stored_execution_ref,
         binding_id: stored_binding_id,
@@ -1714,6 +2153,7 @@ fn load_worker_execution_conn(
         attached_at_ms,
         outcome,
         completion,
+        acceptance_rejection,
     };
     if execution.binding_id != binding_id || execution.item_id != item_id {
         return Err(CoreError::CorruptState(format!(
@@ -1837,6 +2277,53 @@ fn check_worker_completion_replay(
         return Err(CoreError::CorruptState(format!(
             "Worker completion idempotency record for command `{command_key}` returned execution `{}`",
             receipt.execution.execution_ref
+        )));
+    }
+    crate::backlog::validate_backlog_item(&receipt.item, binding_id)?;
+    validate_worker_execution(&receipt.execution)?;
+    enforce_worker_response_budget(&receipt, MAX_COMPACT_RESPONSE_BYTES)?;
+    Ok(Some(receipt))
+}
+
+fn check_worker_acceptance_rejection_replay(
+    tx: &Transaction<'_>,
+    binding_id: &str,
+    command_key: &str,
+    operation: &str,
+    payload_hash: &str,
+    expected_item_id: &str,
+    expected_execution_ref: &str,
+) -> Result<Option<WorkerBacklogAcceptanceRejectionReceipt>, CoreError> {
+    let Some((stored_operation, stored_hash, response_json)) =
+        check_backlog_dedup_raw(tx, binding_id, command_key)?
+    else {
+        return Ok(None);
+    };
+    if stored_operation != operation || stored_hash != payload_hash {
+        return Err(CoreError::IdempotencyConflict {
+            binding_id: binding_id.to_string(),
+            command_key: command_key.to_string(),
+        });
+    }
+    let receipt: WorkerBacklogAcceptanceRejectionReceipt = serde_json::from_str(&response_json)?;
+    if receipt.item.binding_id != binding_id || receipt.item.item_id != expected_item_id {
+        return Err(CoreError::CorruptState(format!(
+            "Worker acceptance rejection idempotency record for command `{command_key}` returned item `{}` on binding `{}`",
+            receipt.item.item_id, receipt.item.binding_id
+        )));
+    }
+    if receipt.execution.execution_ref != expected_execution_ref
+        || receipt.execution.binding_id != binding_id
+        || receipt.execution.item_id != expected_item_id
+    {
+        return Err(CoreError::CorruptState(format!(
+            "Worker acceptance rejection idempotency record for command `{command_key}` returned execution `{}`",
+            receipt.execution.execution_ref
+        )));
+    }
+    if receipt.execution.acceptance_rejection.is_none() {
+        return Err(CoreError::CorruptState(format!(
+            "Worker acceptance rejection idempotency record for command `{command_key}` has no rejection data"
         )));
     }
     crate::backlog::validate_backlog_item(&receipt.item, binding_id)?;
@@ -2170,6 +2657,64 @@ mod tests {
         }
     }
 
+    fn acceptance_rejection(
+        execution_ref: &str,
+        result_digest: &str,
+        delivery_digest: &str,
+    ) -> WorkerBacklogAcceptanceRejection {
+        WorkerBacklogAcceptanceRejection {
+            execution_ref: execution_ref.to_string(),
+            result_digest: result_digest.to_string(),
+            delivery_digest: delivery_digest.to_string(),
+            reason: "The delivered result does not satisfy the acceptance condition".to_string(),
+            evidence: "Compared the bounded delivery with the frozen acceptance condition"
+                .to_string(),
+        }
+    }
+
+    fn reserve_attach_success(
+        core: &mut Core,
+        binding_id: &str,
+        item_id: &str,
+        tag: &str,
+        result_digest: &str,
+    ) -> WorkerBacklogExecution {
+        let reserved = core
+            .reserve_worker_backlog_execution_operator_attested(
+                binding_id,
+                &format!("reserve-{tag}"),
+                item_id,
+                1,
+                authority(tag),
+                1_010,
+            )
+            .expect("reserve Worker execution");
+        core.attach_worker_backlog_dispatch_receipt_operator_attested(
+            binding_id,
+            &format!("attach-{tag}"),
+            item_id,
+            &reserved.execution_ref,
+            2,
+            receipt(tag),
+            1_020,
+        )
+        .expect("attach dispatch receipt");
+        core.record_worker_backlog_outcome_operator_attested(
+            binding_id,
+            &format!("success-{tag}"),
+            item_id,
+            &reserved.execution_ref,
+            3,
+            WorkerBacklogOutcomeReport {
+                outcome: WorkerBacklogOutcome::Success,
+                note: "verified technical success".to_string(),
+                result_digest: Some(result_digest.to_string()),
+            },
+            1_030,
+        )
+        .expect("record successful outcome")
+    }
+
     fn history_entries(core: &Core, binding_id: &str, item_id: &str) -> Vec<BacklogHistoryEntry> {
         let mut all_entries = Vec::new();
         let mut cursor: Option<String> = None;
@@ -2221,6 +2766,16 @@ mod tests {
             )
             .expect("count executions");
         (items, history, dedup, executions)
+    }
+
+    fn rejection_count(core: &Core) -> i64 {
+        core.conn
+            .query_row(
+                "SELECT COUNT(*) FROM backlog_worker_acceptance_rejections",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count acceptance rejections")
     }
 
     fn assert_validation(err: CoreError, expected_field: &str) {
@@ -3526,6 +4081,885 @@ mod tests {
             history_count
         );
         assert_eq!(table_counts(&reopened), after_completion_counts);
+    }
+
+    #[test]
+    fn acceptance_rejection_preserves_success_blocks_item_and_replays_exactly() {
+        let (_dir, db_path, mut core) = open_temp_core();
+        let binding_id = create_binding(&mut core, THREAD_A, "acceptance rejection");
+        let item = core
+            .create_backlog_item(
+                &binding_id,
+                "create",
+                worker_item("Rejected acceptance"),
+                1_000,
+            )
+            .expect("create Worker item");
+        let result_digest = "a".repeat(64);
+        let delivery_digest = "b".repeat(64);
+        let success = reserve_attach_success(
+            &mut core,
+            &binding_id,
+            &item.item_id,
+            "reject_success",
+            &result_digest,
+        );
+        let before_history = history_entries(&core, &binding_id, &item.item_id);
+
+        let request =
+            acceptance_rejection(&success.execution_ref, &result_digest, &delivery_digest);
+        let rejected = core
+            .reject_worker_backlog_acceptance_operator_attested(
+                &binding_id,
+                "reject-acceptance",
+                &item.item_id,
+                4,
+                request.clone(),
+                1_040,
+            )
+            .expect("reject Worker acceptance");
+
+        assert_eq!(rejected.item.status, BacklogStatus::Blocked);
+        assert_eq!(rejected.item.revision, 5);
+        assert!(rejected.item.completion_note.is_none());
+        assert!(rejected.item.completed_at_ms.is_none());
+        assert_eq!(
+            rejected.item.current_execution_ref.as_deref(),
+            Some(success.execution_ref.as_str())
+        );
+        assert!(rejected
+            .item
+            .blocked_reason
+            .as_deref()
+            .is_some_and(|reason| {
+                reason.starts_with("worker acceptance rejected: ")
+                    && reason.contains(&request.reason)
+            }));
+        assert_eq!(
+            rejected
+                .execution
+                .outcome
+                .as_ref()
+                .expect("original success")
+                .outcome,
+            WorkerBacklogOutcome::Success
+        );
+        assert_eq!(
+            rejected
+                .execution
+                .outcome
+                .as_ref()
+                .and_then(|outcome| outcome.result_digest.as_deref()),
+            Some(result_digest.as_str())
+        );
+        let rejection = rejected
+            .execution
+            .acceptance_rejection
+            .as_ref()
+            .expect("acceptance rejection record");
+        assert_eq!(rejection.result_digest, result_digest);
+        assert_eq!(rejection.delivery_digest, delivery_digest);
+        assert_eq!(rejection.reason, request.reason);
+        assert_eq!(rejection.evidence, request.evidence);
+        assert_eq!(rejection.rejected_at_ms, 1_040);
+        assert!(rejected.execution.completion.is_none());
+        assert!(
+            crate::limits::estimate_wire_response_bytes(&rejected)
+                .expect("rejection response bytes")
+                <= crate::limits::MAX_COMPACT_RESPONSE_BYTES
+        );
+
+        let after_rejection_counts = table_counts(&core);
+        let after_rejection_history = history_entries(&core, &binding_id, &item.item_id);
+        assert_eq!(after_rejection_history.len(), before_history.len() + 1);
+        assert_eq!(
+            after_rejection_history
+                .last()
+                .expect("rejection history")
+                .action,
+            BacklogHistoryAction::Blocked
+        );
+        assert_eq!(
+            after_rejection_history
+                .last()
+                .expect("rejection history")
+                .revision,
+            5
+        );
+        assert_eq!(rejection_count(&core), 1);
+        assert_eq!(
+            core.get_backlog_item(&binding_id, &item.item_id)
+                .expect("blocked item"),
+            rejected.item
+        );
+        assert_eq!(
+            core.get_worker_backlog_execution_operator_attested(
+                &binding_id,
+                &item.item_id,
+                &success.execution_ref,
+            )
+            .expect("rejected execution"),
+            rejected.execution
+        );
+
+        assert!(core
+            .list_runs(&binding_id, None, MAX_PAGE_LIMIT)
+            .expect("list runs")
+            .runs
+            .is_empty());
+        assert!(core
+            .list_activity(&binding_id, None, None, MAX_PAGE_LIMIT, None, None)
+            .expect("list activity")
+            .events
+            .is_empty());
+        let worker_count: i64 = core
+            .conn
+            .query_row("SELECT COUNT(*) FROM workers", [], |row| row.get(0))
+            .expect("count workers");
+        assert_eq!(worker_count, 0);
+
+        let replay = core
+            .reject_worker_backlog_acceptance_operator_attested(
+                &binding_id,
+                "reject-acceptance",
+                &item.item_id,
+                4,
+                request.clone(),
+                9_999,
+            )
+            .expect("replay acceptance rejection");
+        assert_eq!(replay, rejected);
+        assert_eq!(table_counts(&core), after_rejection_counts);
+        assert_eq!(rejection_count(&core), 1);
+        assert_eq!(
+            history_entries(&core, &binding_id, &item.item_id),
+            after_rejection_history
+        );
+
+        let mut changed_payload = request.clone();
+        changed_payload.reason = "A different failed-acceptance reason".to_string();
+        assert_idempotency_conflict(
+            core.reject_worker_backlog_acceptance_operator_attested(
+                &binding_id,
+                "reject-acceptance",
+                &item.item_id,
+                4,
+                changed_payload,
+                9_998,
+            )
+            .expect_err("same command key with changed payload must conflict"),
+        );
+        assert_stale_revision(
+            core.reject_worker_backlog_acceptance_operator_attested(
+                &binding_id,
+                "stale-after-rejection",
+                &item.item_id,
+                4,
+                request.clone(),
+                9_997,
+            )
+            .expect_err("stale rejection revision must fail after the commit"),
+            4,
+            5,
+        );
+        assert_eq!(table_counts(&core), after_rejection_counts);
+        assert_eq!(rejection_count(&core), 1);
+
+        let before_reread = table_counts(&core);
+        assert_validation(
+            core.record_worker_backlog_outcome_operator_attested(
+                &binding_id,
+                "post-rejection-result-reread",
+                &item.item_id,
+                &success.execution_ref,
+                5,
+                WorkerBacklogOutcomeReport {
+                    outcome: WorkerBacklogOutcome::Success,
+                    note: "reread of the original successful result".to_string(),
+                    result_digest: Some(result_digest.clone()),
+                },
+                1_050,
+            )
+            .expect_err("post-rejection result reread must not mutate"),
+            "acceptance_rejection",
+        );
+        assert_eq!(table_counts(&core), before_reread);
+        assert_eq!(rejection_count(&core), 1);
+        assert_eq!(
+            core.get_backlog_item(&binding_id, &item.item_id)
+                .expect("item after result reread"),
+            rejected.item
+        );
+        assert_validation(
+            core.complete_worker_backlog_item_operator_attested(
+                &binding_id,
+                "post-rejection-completion",
+                &item.item_id,
+                5,
+                completion(&success.execution_ref, &result_digest, &delivery_digest),
+                1_060,
+            )
+            .expect_err("a rejected execution cannot complete"),
+            "status",
+        );
+        assert_validation(
+            core.block_backlog_item(
+                &binding_id,
+                "post-rejection-block",
+                &item.item_id,
+                5,
+                "must not overwrite the rejection reason",
+                1_070,
+            )
+            .expect_err("blocked item cannot be blocked again"),
+            "status",
+        );
+
+        drop(core);
+        let reopened = Core::open(&db_path).expect("reopen core");
+        assert_eq!(
+            reopened
+                .get_backlog_item(&binding_id, &item.item_id)
+                .expect("reopened blocked item"),
+            rejected.item
+        );
+        assert_eq!(
+            reopened
+                .get_worker_backlog_execution_operator_attested(
+                    &binding_id,
+                    &item.item_id,
+                    &success.execution_ref,
+                )
+                .expect("reopened rejected execution"),
+            rejected.execution
+        );
+        assert_eq!(rejection_count(&reopened), 1);
+    }
+
+    #[test]
+    fn acceptance_rejection_rejects_bad_scope_revision_ref_digest_and_non_success() {
+        let (_dir, _db_path, mut core) = open_temp_core();
+        let binding_a = create_binding(&mut core, THREAD_A, "rejection scope A");
+        let binding_b = create_binding(&mut core, THREAD_B, "rejection scope B");
+        let item = core
+            .create_backlog_item(
+                &binding_a,
+                "create",
+                worker_item("Rejection validation"),
+                1_000,
+            )
+            .expect("create Worker item");
+        let result_digest = "a".repeat(64);
+        let delivery_digest = "b".repeat(64);
+        let success = reserve_attach_success(
+            &mut core,
+            &binding_a,
+            &item.item_id,
+            "reject_validation",
+            &result_digest,
+        );
+        let request =
+            acceptance_rejection(&success.execution_ref, &result_digest, &delivery_digest);
+        let before_counts = table_counts(&core);
+        let before_item = core
+            .get_backlog_item(&binding_a, &item.item_id)
+            .expect("item before rejected requests");
+        let before_execution = core
+            .get_worker_backlog_execution_operator_attested(
+                &binding_a,
+                &item.item_id,
+                &success.execution_ref,
+            )
+            .expect("execution before rejected requests");
+
+        assert_validation(
+            core.reject_worker_backlog_acceptance_operator_attested(
+                &binding_b,
+                "wrong-binding",
+                &item.item_id,
+                4,
+                request.clone(),
+                1_040,
+            )
+            .expect_err("cross-binding rejection must fail"),
+            "item_id",
+        );
+        assert_stale_revision(
+            core.reject_worker_backlog_acceptance_operator_attested(
+                &binding_a,
+                "stale-revision",
+                &item.item_id,
+                3,
+                request.clone(),
+                1_050,
+            )
+            .expect_err("stale rejection must fail"),
+            3,
+            4,
+        );
+        let mut wrong_ref = request.clone();
+        wrong_ref.execution_ref = "wbe_missing".to_string();
+        assert_validation(
+            core.reject_worker_backlog_acceptance_operator_attested(
+                &binding_a,
+                "wrong-ref",
+                &item.item_id,
+                4,
+                wrong_ref,
+                1_060,
+            )
+            .expect_err("wrong execution reference must fail"),
+            "execution_ref",
+        );
+        let mut wrong_result = request.clone();
+        wrong_result.result_digest = "c".repeat(64);
+        assert_validation(
+            core.reject_worker_backlog_acceptance_operator_attested(
+                &binding_a,
+                "wrong-result",
+                &item.item_id,
+                4,
+                wrong_result,
+                1_070,
+            )
+            .expect_err("wrong result digest must fail"),
+            "result_digest",
+        );
+        let mut wrong_delivery = request.clone();
+        wrong_delivery.delivery_digest = "B".repeat(64);
+        assert_validation(
+            core.reject_worker_backlog_acceptance_operator_attested(
+                &binding_a,
+                "wrong-delivery",
+                &item.item_id,
+                4,
+                wrong_delivery,
+                1_080,
+            )
+            .expect_err("malformed delivery digest must fail"),
+            "delivery_digest",
+        );
+        let mut blank_reason = request.clone();
+        blank_reason.reason = "   ".to_string();
+        assert_validation(
+            core.reject_worker_backlog_acceptance_operator_attested(
+                &binding_a,
+                "blank-reason",
+                &item.item_id,
+                4,
+                blank_reason,
+                1_090,
+            )
+            .expect_err("blank rejection reason must fail"),
+            "reason",
+        );
+        let mut oversized_reason = request.clone();
+        oversized_reason.reason = "r".repeat(MAX_WORKER_BACKLOG_REJECTION_REASON_LEN + 1);
+        assert_validation(
+            core.reject_worker_backlog_acceptance_operator_attested(
+                &binding_a,
+                "oversized-reason",
+                &item.item_id,
+                4,
+                oversized_reason,
+                1_100,
+            )
+            .expect_err("oversized rejection reason must fail"),
+            "reason",
+        );
+        let mut oversized_evidence = request.clone();
+        oversized_evidence.evidence = "e".repeat(MAX_WORKER_BACKLOG_REJECTION_EVIDENCE_LEN + 1);
+        assert_validation(
+            core.reject_worker_backlog_acceptance_operator_attested(
+                &binding_a,
+                "oversized-evidence",
+                &item.item_id,
+                4,
+                oversized_evidence,
+                1_110,
+            )
+            .expect_err("oversized rejection evidence must fail"),
+            "evidence",
+        );
+
+        assert_eq!(table_counts(&core), before_counts);
+        assert_eq!(rejection_count(&core), 0);
+        assert_eq!(
+            core.get_backlog_item(&binding_a, &item.item_id)
+                .expect("item after rejected requests"),
+            before_item
+        );
+        assert_eq!(
+            core.get_worker_backlog_execution_operator_attested(
+                &binding_a,
+                &item.item_id,
+                &success.execution_ref,
+            )
+            .expect("execution after rejected requests"),
+            before_execution
+        );
+
+        let unstarted_item = core
+            .create_backlog_item(
+                &binding_a,
+                "create-unstarted",
+                worker_item("Unstarted rejection"),
+                1_200,
+            )
+            .expect("create unstarted Worker item");
+        let unstarted = core
+            .reserve_worker_backlog_execution_operator_attested(
+                &binding_a,
+                "reserve-unstarted",
+                &unstarted_item.item_id,
+                1,
+                authority("reject_unstarted"),
+                1_210,
+            )
+            .expect("reserve without success");
+        assert_validation(
+            core.reject_worker_backlog_acceptance_operator_attested(
+                &binding_a,
+                "reject-unstarted",
+                &unstarted_item.item_id,
+                2,
+                acceptance_rejection(&unstarted.execution_ref, &result_digest, &delivery_digest),
+                1_220,
+            )
+            .expect_err("unstarted execution cannot be rejected"),
+            "outcome",
+        );
+
+        let failed_item = core
+            .create_backlog_item(
+                &binding_a,
+                "create-failed",
+                worker_item("Failed rejection"),
+                1_300,
+            )
+            .expect("create failed Worker item");
+        let failed = core
+            .reserve_worker_backlog_execution_operator_attested(
+                &binding_a,
+                "reserve-failed",
+                &failed_item.item_id,
+                1,
+                authority("reject_failed"),
+                1_310,
+            )
+            .expect("reserve failed Worker item");
+        core.attach_worker_backlog_dispatch_receipt_operator_attested(
+            &binding_a,
+            "attach-failed",
+            &failed_item.item_id,
+            &failed.execution_ref,
+            2,
+            receipt("reject_failed"),
+            1_320,
+        )
+        .expect("attach failed receipt");
+        core.record_worker_backlog_outcome_operator_attested(
+            &binding_a,
+            "failure",
+            &failed_item.item_id,
+            &failed.execution_ref,
+            3,
+            WorkerBacklogOutcomeReport {
+                outcome: WorkerBacklogOutcome::Failure,
+                note: "verified failure".to_string(),
+                result_digest: Some("d".repeat(64)),
+            },
+            1_330,
+        )
+        .expect("record failure");
+        assert_validation(
+            core.reject_worker_backlog_acceptance_operator_attested(
+                &binding_a,
+                "reject-failed",
+                &failed_item.item_id,
+                4,
+                acceptance_rejection(&failed.execution_ref, &result_digest, &delivery_digest),
+                1_340,
+            )
+            .expect_err("failed execution cannot use acceptance rejection"),
+            "status",
+        );
+
+        let unknown_item = core
+            .create_backlog_item(
+                &binding_a,
+                "create-unknown",
+                worker_item("Unknown rejection"),
+                1_400,
+            )
+            .expect("create unknown Worker item");
+        let unknown = core
+            .reserve_worker_backlog_execution_operator_attested(
+                &binding_a,
+                "reserve-unknown",
+                &unknown_item.item_id,
+                1,
+                authority("reject_unknown"),
+                1_410,
+            )
+            .expect("reserve unknown Worker item");
+        core.record_worker_backlog_outcome_operator_attested(
+            &binding_a,
+            "unknown",
+            &unknown_item.item_id,
+            &unknown.execution_ref,
+            2,
+            WorkerBacklogOutcomeReport {
+                outcome: WorkerBacklogOutcome::Unknown,
+                note: "ambiguous process state".to_string(),
+                result_digest: None,
+            },
+            1_420,
+        )
+        .expect("record unknown");
+        assert_validation(
+            core.reject_worker_backlog_acceptance_operator_attested(
+                &binding_a,
+                "reject-unknown",
+                &unknown_item.item_id,
+                3,
+                acceptance_rejection(&unknown.execution_ref, &result_digest, &delivery_digest),
+                1_430,
+            )
+            .expect_err("unknown execution cannot use acceptance rejection"),
+            "status",
+        );
+    }
+
+    #[test]
+    fn acceptance_rejection_allows_only_fresh_authority_correction_and_preserves_history() {
+        let (_dir, db_path, mut core) = open_temp_core();
+        let binding_id = create_binding(&mut core, THREAD_A, "rejection retry");
+        let item = core
+            .create_backlog_item(&binding_id, "create", worker_item("Rejection retry"), 1_000)
+            .expect("create Worker item");
+        let old_result_digest = "a".repeat(64);
+        let old_delivery_digest = "b".repeat(64);
+        let old_success = reserve_attach_success(
+            &mut core,
+            &binding_id,
+            &item.item_id,
+            "retry_old",
+            &old_result_digest,
+        );
+        let old_request = acceptance_rejection(
+            &old_success.execution_ref,
+            &old_result_digest,
+            &old_delivery_digest,
+        );
+        let rejected = core
+            .reject_worker_backlog_acceptance_operator_attested(
+                &binding_id,
+                "reject-old",
+                &item.item_id,
+                4,
+                old_request.clone(),
+                1_040,
+            )
+            .expect("reject old acceptance");
+        let rejected_item = rejected.item.clone();
+
+        let before_old_authority = table_counts(&core);
+        assert_validation(
+            core.reserve_worker_backlog_execution_operator_attested(
+                &binding_id,
+                "reuse-old-authority",
+                &item.item_id,
+                rejected_item.revision,
+                authority("retry_old"),
+                1_050,
+            )
+            .expect_err("a rejected approval/task pair must not be reused"),
+            "authority",
+        );
+        assert_eq!(table_counts(&core), before_old_authority);
+        assert_eq!(
+            core.get_backlog_item(&binding_id, &item.item_id)
+                .expect("item after refused old authority"),
+            rejected_item
+        );
+
+        let replacement = core
+            .reserve_worker_backlog_execution_operator_attested(
+                &binding_id,
+                "reserve-correction",
+                &item.item_id,
+                rejected_item.revision,
+                authority("retry_fresh"),
+                1_060,
+            )
+            .expect("a genuine rejection permits a fresh authority");
+        assert_ne!(replacement.execution_ref, old_success.execution_ref);
+        let replacement_item = core
+            .get_backlog_item(&binding_id, &item.item_id)
+            .expect("replacement item");
+        assert_eq!(replacement_item.status, BacklogStatus::Doing);
+        assert_eq!(
+            replacement_item.current_execution_ref.as_deref(),
+            Some(replacement.execution_ref.as_str())
+        );
+        assert!(replacement_item.blocked_reason.is_none());
+        let old_execution_after_retry = core
+            .get_worker_backlog_execution_operator_attested(
+                &binding_id,
+                &item.item_id,
+                &old_success.execution_ref,
+            )
+            .expect("old execution after retry");
+        assert_eq!(
+            old_execution_after_retry
+                .outcome
+                .as_ref()
+                .expect("old success")
+                .outcome,
+            WorkerBacklogOutcome::Success
+        );
+        assert_eq!(
+            old_execution_after_retry.acceptance_rejection.as_ref(),
+            rejected.execution.acceptance_rejection.as_ref()
+        );
+        assert!(old_execution_after_retry.completion.is_none());
+        let attempt_identities = attempts(&core, &binding_id, &item.item_id);
+        assert_eq!(attempt_identities.len(), 2);
+        assert_eq!(
+            attempt_identities[0].execution_ref,
+            old_success.execution_ref
+        );
+        assert_eq!(
+            attempt_identities[1].execution_ref,
+            replacement.execution_ref
+        );
+        let retry_history = history_entries(&core, &binding_id, &item.item_id);
+        assert!(retry_history.iter().any(|entry| {
+            entry.item.current_execution_ref.as_deref() == Some(old_success.execution_ref.as_str())
+                && entry.item.blocked_reason.is_some()
+        }));
+
+        let new_result_digest = "d".repeat(64);
+        let new_delivery_digest = "e".repeat(64);
+        core.attach_worker_backlog_dispatch_receipt_operator_attested(
+            &binding_id,
+            "attach-correction",
+            &item.item_id,
+            &replacement.execution_ref,
+            6,
+            receipt("retry_fresh"),
+            1_070,
+        )
+        .expect("attach correction receipt");
+        core.record_worker_backlog_outcome_operator_attested(
+            &binding_id,
+            "success-correction",
+            &item.item_id,
+            &replacement.execution_ref,
+            7,
+            WorkerBacklogOutcomeReport {
+                outcome: WorkerBacklogOutcome::Success,
+                note: "verified corrected technical success".to_string(),
+                result_digest: Some(new_result_digest.clone()),
+            },
+            1_080,
+        )
+        .expect("record corrected success");
+        let completed = core
+            .complete_worker_backlog_item_operator_attested(
+                &binding_id,
+                "complete-correction",
+                &item.item_id,
+                8,
+                completion(
+                    &replacement.execution_ref,
+                    &new_result_digest,
+                    &new_delivery_digest,
+                ),
+                1_090,
+            )
+            .expect("complete corrected attempt");
+        assert_eq!(completed.item.status, BacklogStatus::Done);
+        assert_eq!(completed.item.revision, 9);
+        assert!(completed.item.blocked_reason.is_none());
+        assert_eq!(
+            completed
+                .execution
+                .completion
+                .as_ref()
+                .expect("corrected completion")
+                .result_digest,
+            new_result_digest
+        );
+        let old_execution_after_done = core
+            .get_worker_backlog_execution_operator_attested(
+                &binding_id,
+                &item.item_id,
+                &old_success.execution_ref,
+            )
+            .expect("old execution after corrected completion");
+        assert_eq!(
+            old_execution_after_done.acceptance_rejection.as_ref(),
+            rejected.execution.acceptance_rejection.as_ref()
+        );
+        assert!(old_execution_after_done.completion.is_none());
+        let final_history = history_entries(&core, &binding_id, &item.item_id);
+        assert!(final_history
+            .iter()
+            .any(|entry| entry.action == BacklogHistoryAction::Blocked));
+        assert_eq!(
+            final_history.last().expect("final history").action,
+            BacklogHistoryAction::Completed
+        );
+
+        drop(core);
+        let reopened = Core::open(&db_path).expect("reopen corrected store");
+        assert_eq!(
+            reopened
+                .get_backlog_item(&binding_id, &item.item_id)
+                .expect("reopened completed item"),
+            completed.item
+        );
+        let reopened_old = reopened
+            .get_worker_backlog_execution_operator_attested(
+                &binding_id,
+                &item.item_id,
+                &old_success.execution_ref,
+            )
+            .expect("reopened old rejected execution");
+        assert_eq!(
+            reopened_old.acceptance_rejection.as_ref(),
+            rejected.execution.acceptance_rejection.as_ref()
+        );
+        assert!(reopened_old.completion.is_none());
+    }
+
+    #[test]
+    fn legacy_execution_without_rejection_data_reads_none_after_additive_schema_open() {
+        let (_dir, db_path, mut core) = open_temp_core();
+        let binding_id = create_binding(&mut core, THREAD_A, "legacy rejection compatibility");
+        let item = core
+            .create_backlog_item(
+                &binding_id,
+                "create",
+                worker_item("Legacy rejection compatibility"),
+                1_000,
+            )
+            .expect("create Worker item");
+        let result_digest = "a".repeat(64);
+        let success = reserve_attach_success(
+            &mut core,
+            &binding_id,
+            &item.item_id,
+            "legacy_rejection",
+            &result_digest,
+        );
+        assert!(success.acceptance_rejection.is_none());
+
+        drop(core);
+        {
+            // Simulate an older store that predates the additive rejection table.
+            let conn = rusqlite::Connection::open(&db_path).expect("open raw legacy database");
+            conn.execute("DROP TABLE backlog_worker_acceptance_rejections", [])
+                .expect("drop additive rejection table");
+        }
+
+        let mut reopened = Core::open(&db_path).expect("reopen legacy store");
+        let loaded = reopened
+            .get_worker_backlog_execution_operator_attested(
+                &binding_id,
+                &item.item_id,
+                &success.execution_ref,
+            )
+            .expect("legacy execution read");
+        assert!(loaded.acceptance_rejection.is_none());
+        assert_eq!(loaded, success);
+        let mut legacy_value = serde_json::to_value(&loaded).expect("serialize current execution");
+        let removed_rejection = legacy_value
+            .as_object_mut()
+            .expect("execution object")
+            .remove("acceptance_rejection");
+        assert!(removed_rejection.is_none());
+        let decoded: WorkerBacklogExecution =
+            serde_json::from_value(legacy_value).expect("deserialize legacy execution");
+        assert!(decoded.acceptance_rejection.is_none());
+        assert_eq!(decoded, loaded);
+        assert_eq!(rejection_count(&reopened), 0);
+        assert_eq!(
+            reopened
+                .get_backlog_item(&binding_id, &item.item_id)
+                .expect("legacy success item")
+                .status,
+            BacklogStatus::Doing
+        );
+        assert_validation(
+            reopened
+                .reserve_worker_backlog_execution_operator_attested(
+                    &binding_id,
+                    "legacy-success-is-not-a-rejection",
+                    &item.item_id,
+                    4,
+                    authority("legacy_replacement"),
+                    1_040,
+                )
+                .expect_err("missing legacy rejection data must never infer rejection"),
+            "status",
+        );
+    }
+
+    #[test]
+    fn reopened_rejection_must_match_the_original_success_result() {
+        let (_dir, db_path, mut core) = open_temp_core();
+        let binding_id = create_binding(&mut core, THREAD_A, "rejection correlation");
+        let item = core
+            .create_backlog_item(
+                &binding_id,
+                "create",
+                worker_item("Rejection correlation"),
+                1_000,
+            )
+            .expect("create Worker item");
+        let result_digest = "a".repeat(64);
+        let success = reserve_attach_success(
+            &mut core,
+            &binding_id,
+            &item.item_id,
+            "reject_correlation",
+            &result_digest,
+        );
+        let request = acceptance_rejection(&success.execution_ref, &result_digest, &"b".repeat(64));
+        core.reject_worker_backlog_acceptance_operator_attested(
+            &binding_id,
+            "reject-correlation",
+            &item.item_id,
+            4,
+            request,
+            1_040,
+        )
+        .expect("reject acceptance");
+
+        drop(core);
+        {
+            let conn = rusqlite::Connection::open(&db_path).expect("open raw database");
+            conn.execute(
+                "UPDATE backlog_worker_acceptance_rejections
+                 SET result_digest = ?1
+                 WHERE execution_ref = ?2",
+                rusqlite::params!["f".repeat(64), success.execution_ref],
+            )
+            .expect("tamper rejection result digest");
+        }
+
+        let reopened = Core::open(&db_path).expect("reopen corrupted rejection store");
+        let err = reopened
+            .get_worker_backlog_execution_operator_attested(
+                &binding_id,
+                &item.item_id,
+                &success.execution_ref,
+            )
+            .expect_err("reopened rejection correlation mismatch must fail closed");
+        assert!(matches!(err, CoreError::CorruptState(_)));
     }
 
     #[test]

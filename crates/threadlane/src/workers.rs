@@ -12,8 +12,8 @@ use threadlane_core::{
     MAX_WORKER_PROFILE_ID_LEN, MAX_WORKER_SUMMARY_TEXT_BYTES, MAX_WORKER_VIOLATION_SUMMARIES,
 };
 use threadlane_workers::git::{
-    resolve_allowed_write_scopes_at_base, DEFAULT_GIT_COMMAND_TIMEOUT_MS, MANIFESTS_SUBDIR,
-    WORK_AREA_LOCK_FILENAME,
+    execute_worker_task_with_process_observer, resolve_allowed_write_scopes_at_base,
+    DEFAULT_GIT_COMMAND_TIMEOUT_MS, MANIFESTS_SUBDIR, WORK_AREA_LOCK_FILENAME,
 };
 pub use threadlane_workers::{
     dependency_input_lock_path, read_dependency_input, validate_dependency_input_policy,
@@ -22,11 +22,11 @@ pub use threadlane_workers::{
     DEPENDENCY_INPUT_SCHEMA_VERSION, MAX_DEPENDENCY_INPUT_BYTES, MAX_DEPENDENCY_PREDECESSORS,
 };
 use threadlane_workers::{
-    execute_worker_task_with_health_observer, sanitize_and_redact,
-    validate_absolute_no_symlink_components, validate_simple_identifier, ExecutionBudgets,
-    NormalizedEventKind, NormalizedWorkerEvent, OutputOverflowKind, ResolvedModelTarget,
-    TaskExecutionReport, WorkAcceptanceState, WorkerError, WorkerExecutionReport, WorkerProvider,
-    WorkerRunStatus, WorkerSpec, WorktreeManager,
+    sanitize_and_redact, validate_absolute_no_symlink_components, validate_simple_identifier,
+    ExecutionBudgets, NormalizedEventKind, NormalizedWorkerEvent, OutputOverflowKind,
+    OwnedProcessObserver, ResolvedModelTarget, TaskExecutionReport, WorkAcceptanceState,
+    WorkerError, WorkerExecutionReport, WorkerProvider, WorkerRunStatus, WorkerSpec,
+    WorktreeManager,
 };
 use tokio::sync::{mpsc, watch};
 
@@ -1263,6 +1263,7 @@ pub(crate) async fn execute_claimed_worker(
     cancel_rx: &mut watch::Receiver<bool>,
     progress_tx: mpsc::Sender<NormalizedWorkerEvent>,
     health_observer: threadlane_workers::ProviderHealthObserver,
+    process_observer: Option<OwnedProcessObserver>,
 ) -> Result<TaskExecutionReport, WorkerError> {
     if resolved.spec.base_commit != claim.base_commit
         || resolved.spec.prompt != claim.instruction
@@ -1341,7 +1342,7 @@ pub(crate) async fn execute_claimed_worker(
 
     let wt_run_tag = compact_worktree_tag(&claim.run_id, "r");
     let wt_task_tag = compact_worktree_tag(&claim.worker_id, "w");
-    execute_worker_task_with_health_observer(
+    execute_worker_task_with_process_observer(
         &resolved.spec,
         &wt_run_tag,
         &wt_task_tag,
@@ -1349,6 +1350,7 @@ pub(crate) async fn execute_claimed_worker(
         cancel_rx,
         Some(progress_tx),
         Some(health_observer),
+        process_observer,
     )
     .await
 }

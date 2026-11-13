@@ -13,11 +13,14 @@ use threadlane_core::{
 
 use crate::descriptor::{read_and_validate_descriptor, validate_lazy_state_dir, RuntimeDescriptor};
 use crate::error::{ApiError, Error};
+use crate::operator_backlog::{
+    OperatorWorkerBacklogRequest, OperatorWorkerBacklogResponse, OPERATOR_WORKER_BACKLOG_PATH,
+};
 use crate::protocol::{
     BindingListResponse, CreateBindingRequest, GetOrCreateBindingRequest,
     GetOrCreateBindingResponse, HostControlInfoRequest, HostControlStatusResponse,
     RearmHostWakeupRequest, RearmHostWakeupResponse, RetryWakeupRequest, ScopedRequest,
-    ScopedResponse, StatusResponse, StopIdleHostRequest,
+    ScopedResponse, StatusResponse, StopIdleHostRequest, WorkerPresenceSnapshot,
 };
 
 /// Maximum response body size accepted by [`SupervisorClient`] (2 MiB).
@@ -141,6 +144,21 @@ impl SupervisorClient {
             label: label.to_string(),
         };
         self.send_json(Method::POST, "/v1/bindings/get-or-create", Some(&req))
+            .await
+    }
+
+    /// Executes one trusted-local operator Worker backlog storage/control operation.
+    ///
+    /// Uses the same private loopback descriptor/token trust as
+    /// [`SupervisorClient::get_or_create_binding`]. Only the trusted native facade should
+    /// resolve real approval, result, and delivery evidence before calling this method.
+    /// This endpoint is not exposed on [`ScopedClient`], MCP, or CLI tool routes; it does
+    /// not start a host, dispatch a provider, tick the core, or notify wake-ups.
+    pub async fn worker_backlog_operator_attested(
+        &self,
+        request: &OperatorWorkerBacklogRequest,
+    ) -> Result<OperatorWorkerBacklogResponse, Error> {
+        self.send_json(Method::POST, OPERATOR_WORKER_BACKLOG_PATH, Some(request))
             .await
     }
 
@@ -750,6 +768,21 @@ impl ScopedClient {
         let resp = self.execute(&ScopedRequest::GetWorker { run_id }).await?;
         resp.into_worker()
             .ok_or_else(|| Error::Transport("unexpected response kind for get_worker".to_string()))
+    }
+
+    /// Fetches an ephemeral claim-scoped [`WorkerPresenceSnapshot`] for `run_id` within the fixed binding.
+    ///
+    /// This read performs no core tick, scheduling, wake-up, provider launch, or durable write.
+    pub async fn get_worker_presence(
+        &self,
+        run_id: String,
+    ) -> Result<WorkerPresenceSnapshot, Error> {
+        let resp = self
+            .execute(&ScopedRequest::GetWorkerPresence { run_id })
+            .await?;
+        resp.into_worker_presence().ok_or_else(|| {
+            Error::Transport("unexpected response kind for get_worker_presence".to_string())
+        })
     }
 
     /// Requests revision-checked cancellation of a worker run within the fixed binding.

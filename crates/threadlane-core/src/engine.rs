@@ -1555,6 +1555,20 @@ impl Core {
             CREATE UNIQUE INDEX IF NOT EXISTS idx_backlog_worker_executions_approval_task
                 ON backlog_worker_executions(approval_id, task_id);
 
+            CREATE TABLE IF NOT EXISTS backlog_worker_acceptance_rejections (
+                execution_ref TEXT PRIMARY KEY
+                    REFERENCES backlog_worker_executions(execution_ref),
+                binding_id TEXT NOT NULL REFERENCES bindings(binding_id),
+                item_id TEXT NOT NULL REFERENCES backlog_items(item_id),
+                result_digest TEXT NOT NULL,
+                delivery_digest TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                evidence TEXT NOT NULL,
+                rejected_at_ms INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_backlog_worker_acceptance_rejections_binding_item
+                ON backlog_worker_acceptance_rejections(binding_id, item_id);
+
             CREATE TABLE IF NOT EXISTS wakeups (
                 binding_id TEXT PRIMARY KEY REFERENCES bindings(binding_id),
                 thread_uuid TEXT NOT NULL,

@@ -1945,6 +1945,33 @@ pub async fn execute_worker_task_with_health_observer(
     progress_tx: Option<mpsc::Sender<NormalizedWorkerEvent>>,
     health_observer: Option<crate::provider_health::ProviderHealthObserver>,
 ) -> Result<TaskExecutionReport, WorkerError> {
+    execute_worker_task_with_process_observer(
+        spec,
+        run_id,
+        task_id,
+        existing_worktree_id,
+        cancel_rx,
+        progress_tx,
+        health_observer,
+        None,
+    )
+    .await
+}
+
+/// Executes in the same verified worktree while optionally forwarding the runner-owned process
+/// observation channel. The observer is independent of provider stdout and never changes the
+/// diff gate, acceptance, or task-attempt identity.
+#[allow(clippy::too_many_arguments)]
+pub async fn execute_worker_task_with_process_observer(
+    spec: &WorkerSpec,
+    run_id: &str,
+    task_id: &str,
+    existing_worktree_id: Option<&str>,
+    cancel_rx: &mut watch::Receiver<bool>,
+    progress_tx: Option<mpsc::Sender<NormalizedWorkerEvent>>,
+    health_observer: Option<crate::provider_health::ProviderHealthObserver>,
+    process_observer: Option<crate::OwnedProcessObserver>,
+) -> Result<TaskExecutionReport, WorkerError> {
     let _validation = spec.validate()?;
     let manager = WorktreeManager::new(
         &spec.repository_path,
@@ -1982,12 +2009,13 @@ pub async fn execute_worker_task_with_health_observer(
     let guard = manager.begin_job(&manifest.worktree_id)?;
     let mut launch_spec = spec.clone();
     launch_spec.base_commit = manifest.base_commit.clone();
-    let worker_report = crate::supervisor::run_worker_with_health_observer(
+    let worker_report = crate::supervisor::run_worker_with_process_observer(
         &launch_spec,
         &manifest.checkout_path,
         cancel_rx,
         progress_tx,
         health_observer,
+        process_observer,
     )
     .await?;
     let diff_gate = evaluate_diff_gate(manager.work_area_root(), &manifest.worktree_id)?;

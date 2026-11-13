@@ -1118,8 +1118,8 @@ async fn approved_mcp_tools_registered_in_router_with_strict_schemas_and_store_c
 
     // 3. Verify all 8 approved-task tools are registered in the actual `rmcp` tool router with strict schemas.
     let tools = configured_mcp.list_tools();
-    // Parent combined router: 40 base tools + 8 backlog tools.
-    assert_eq!(tools.len(), 48);
+    // Parent combined router: 40 base tools + 8 backlog tools + 3 guarded Worker backlog tools.
+    assert_eq!(tools.len(), 51);
 
     for (
         tool_name,
@@ -3540,8 +3540,8 @@ async fn codex_first_auto_start_cli_and_policy_prerequisites_and_default_off_inv
     assert!(enabled_server.has_host_launcher_policy());
     assert_eq!(enabled_server.host_launcher_policy(), Some(&sibling_policy));
     let enabled_tools = enabled_server.list_tools();
-    // Parent combined router: 40 base tools + 8 backlog tools.
-    assert_eq!(enabled_tools.len(), 48);
+    // Parent combined router: 40 base tools + 8 backlog tools + 3 guarded Worker backlog tools.
+    assert_eq!(enabled_tools.len(), 51);
     for planning_tool in [
         "prepare_work",
         "consult_architect",
@@ -5959,3 +5959,6 @@ async fn host_launcher_rejects_cached_ready_after_shutdown_without_reconciling_l
 
 #[path = "approved_tests/closure_regressions.rs"]
 mod closure_regressions;
+
+#[path = "approved_tests/backlog_worker.rs"]
+mod backlog_worker;
