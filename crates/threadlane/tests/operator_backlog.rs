@@ -13,9 +13,10 @@ use threadlane::{
     ThreadlaneMcpServer, MAX_CLIENT_RESPONSE_BYTES,
 };
 use threadlane_core::{
-    estimate_wire_response_bytes, BacklogItemKind, BacklogStatus, WorkerBacklogAuthority,
-    WorkerBacklogCompletion, WorkerBacklogDispatchReceipt, WorkerBacklogExecution,
-    WorkerBacklogOutcome, WorkerBacklogOutcomeReport, MAX_COMPACT_RESPONSE_BYTES,
+    estimate_wire_response_bytes, BacklogItemKind, BacklogStatus, WorkerBacklogAcceptanceRejection,
+    WorkerBacklogAcceptanceRejectionReceipt, WorkerBacklogAuthority, WorkerBacklogCompletion,
+    WorkerBacklogDispatchReceipt, WorkerBacklogExecution, WorkerBacklogOutcome,
+    WorkerBacklogOutcomeReport, MAX_COMPACT_RESPONSE_BYTES,
 };
 
 const THREAD_UUID_A: &str = "11111111-2222-4333-8444-555555555555";
@@ -247,6 +248,15 @@ fn completion_of(response: &OperatorWorkerBacklogResponse) {
     }
 }
 
+fn rejection_of(
+    response: &OperatorWorkerBacklogResponse,
+) -> &WorkerBacklogAcceptanceRejectionReceipt {
+    match response {
+        OperatorWorkerBacklogResponse::AcceptanceRejection { rejection } => rejection,
+        other => panic!("expected operator acceptance rejection response, got {other:?}"),
+    }
+}
+
 fn attempt_count_of(response: &OperatorWorkerBacklogResponse) -> usize {
     match response {
         OperatorWorkerBacklogResponse::AttemptPage { page } => page.attempts.len(),
@@ -334,6 +344,25 @@ fn complete_body(
     })
 }
 
+fn reject_body(
+    binding_id: &str,
+    thread_uuid: &str,
+    command_key: &str,
+    item_id: &str,
+    expected_revision: u64,
+    rejection: &WorkerBacklogAcceptanceRejection,
+) -> Value {
+    json!({
+        "op": "reject_acceptance",
+        "binding_id": binding_id,
+        "thread_uuid": thread_uuid,
+        "command_key": command_key,
+        "item_id": item_id,
+        "expected_revision": expected_revision,
+        "rejection": rejection,
+    })
+}
+
 fn get_execution_body(
     binding_id: &str,
     thread_uuid: &str,
@@ -411,6 +440,21 @@ fn completion_fixture(
         acceptance_note: note.to_string(),
         acceptance_evidence: "bounded operator evidence".to_string(),
         delivery_digest: HEX64_C.to_string(),
+    }
+}
+
+fn rejection_fixture(
+    execution_ref: &str,
+    result_digest: &str,
+    delivery_digest: &str,
+    reason: &str,
+) -> WorkerBacklogAcceptanceRejection {
+    WorkerBacklogAcceptanceRejection {
+        execution_ref: execution_ref.to_string(),
+        result_digest: result_digest.to_string(),
+        delivery_digest: delivery_digest.to_string(),
+        reason: reason.to_string(),
+        evidence: "bounded operator evidence".to_string(),
     }
 }
 
@@ -883,6 +927,436 @@ async fn operator_worker_backlog_is_attested_idempotent_isolated_and_non_schedul
 }
 
 #[tokio::test]
+async fn operator_worker_backlog_acceptance_rejection_preserves_success_and_replays_after_reopen() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let state_dir = temp
+        .path()
+        .join("operator_backlog_acceptance_rejection_state");
+    let (handle, supervisor, scoped_a, _scoped_b) = start_fixture(&state_dir).await;
+    let binding_id = scoped_a.binding_id().to_string();
+
+    let status_before = bounded("rejection status before", scoped_a.status())
+        .await
+        .expect("rejection status before");
+    assert_eq!(status_before.total_runs, 0);
+
+    let (item_id, revision) = create_worker_item(
+        &scoped_a,
+        "create-rejection-item",
+        "Rejected Worker delivery",
+    )
+    .await;
+    let authority = authority_fixture(APPROVAL_ID_A, TASK_ID_A);
+    let receipt = receipt_fixture(&binding_id, RUN_ID_A, WORKER_ID_A, PROFILE_ID_A, HEX64_A);
+
+    let reserved = call_operator(
+        &supervisor,
+        reserve_body(
+            &binding_id,
+            THREAD_UUID_A,
+            "reject-reserve",
+            &item_id,
+            revision,
+            &authority,
+        ),
+    )
+    .await
+    .expect("reserve rejection item");
+    let execution_ref = execution_of(&reserved).execution_ref.clone();
+
+    let attach_revision = item_snapshot(&scoped_a, &item_id).await.revision;
+    let attached = call_operator(
+        &supervisor,
+        attach_body(
+            &binding_id,
+            THREAD_UUID_A,
+            "reject-attach",
+            &item_id,
+            &execution_ref,
+            attach_revision,
+            &receipt,
+        ),
+    )
+    .await
+    .expect("attach rejection receipt");
+    assert_eq!(execution_of(&attached).execution_ref, execution_ref);
+
+    let record_revision = item_snapshot(&scoped_a, &item_id).await.revision;
+    let recorded = call_operator(
+        &supervisor,
+        record_body(
+            &binding_id,
+            THREAD_UUID_A,
+            "reject-record",
+            &item_id,
+            &execution_ref,
+            record_revision,
+            &success_report_fixture(HEX64_B),
+        ),
+    )
+    .await
+    .expect("record rejection success");
+    assert_eq!(execution_of(&recorded).execution_ref, execution_ref);
+
+    let before_rejection = item_snapshot(&scoped_a, &item_id).await;
+    assert_eq!(before_rejection.status, BacklogStatus::Doing);
+    let before_rejection_revision = before_rejection.revision;
+    let before_execution = call_operator(
+        &supervisor,
+        get_execution_body(&binding_id, THREAD_UUID_A, &item_id, &execution_ref),
+    )
+    .await
+    .expect("execution before rejection");
+    let history_before_rejection = backlog_history_count(&scoped_a, &item_id).await;
+
+    let rejection = rejection_fixture(
+        &execution_ref,
+        HEX64_B,
+        HEX64_C,
+        "Delivered artifact did not satisfy the checked acceptance condition",
+    );
+
+    // Caller-supplied time is still rejected by the strict request contract.
+    let mut injected_time = reject_body(
+        &binding_id,
+        THREAD_UUID_A,
+        "reject-injected-time",
+        &item_id,
+        before_rejection_revision,
+        &rejection,
+    );
+    injected_time["now_ms"] = json!(1);
+    assert!(
+        serde_json::from_value::<OperatorWorkerBacklogRequest>(injected_time).is_err(),
+        "rejection requests must reject caller time"
+    );
+
+    // Cross-thread scope is validated before any idempotency replay or mutation.
+    let cross_thread = call_operator(
+        &supervisor,
+        reject_body(
+            &binding_id,
+            THREAD_UUID_B,
+            "reject-cross-thread",
+            &item_id,
+            before_rejection_revision,
+            &rejection,
+        ),
+    )
+    .await
+    .expect_err("foreign thread UUID must fail");
+    assert_eq!(
+        cross_thread.to_api_error().code,
+        ErrorCode::ValidationFailed
+    );
+    assert_eq!(item_snapshot(&scoped_a, &item_id).await, before_rejection);
+    let after_cross_thread_execution = call_operator(
+        &supervisor,
+        get_execution_body(&binding_id, THREAD_UUID_A, &item_id, &execution_ref),
+    )
+    .await
+    .expect("execution after cross-thread rejection");
+    assert_eq!(
+        value_of(&after_cross_thread_execution),
+        value_of(&before_execution)
+    );
+    assert_eq!(
+        backlog_history_count(&scoped_a, &item_id).await,
+        history_before_rejection
+    );
+
+    // Stale revisions are refused without mutating the item or its execution.
+    let stale = call_operator(
+        &supervisor,
+        reject_body(
+            &binding_id,
+            THREAD_UUID_A,
+            "reject-stale",
+            &item_id,
+            before_rejection_revision - 1,
+            &rejection,
+        ),
+    )
+    .await
+    .expect_err("stale rejection must fail");
+    assert_eq!(stale.to_api_error().code, ErrorCode::StaleRevision);
+    assert_eq!(item_snapshot(&scoped_a, &item_id).await, before_rejection);
+    assert_eq!(
+        backlog_history_count(&scoped_a, &item_id).await,
+        history_before_rejection
+    );
+
+    // A different, structurally valid result digest is refused.
+    let mut bad_result_digest = rejection.clone();
+    bad_result_digest.result_digest = HEX64_D.to_string();
+    let bad_result = call_operator(
+        &supervisor,
+        reject_body(
+            &binding_id,
+            THREAD_UUID_A,
+            "reject-bad-result-digest",
+            &item_id,
+            before_rejection_revision,
+            &bad_result_digest,
+        ),
+    )
+    .await
+    .expect_err("mismatched result digest must fail");
+    assert_eq!(bad_result.to_api_error().code, ErrorCode::ValidationFailed);
+    assert_eq!(item_snapshot(&scoped_a, &item_id).await, before_rejection);
+    assert_eq!(
+        backlog_history_count(&scoped_a, &item_id).await,
+        history_before_rejection
+    );
+
+    // A malformed delivery digest is refused before any record is committed.
+    let mut bad_delivery_digest = rejection.clone();
+    bad_delivery_digest.delivery_digest = "B".repeat(64);
+    let bad_delivery = call_operator(
+        &supervisor,
+        reject_body(
+            &binding_id,
+            THREAD_UUID_A,
+            "reject-bad-delivery-digest",
+            &item_id,
+            before_rejection_revision,
+            &bad_delivery_digest,
+        ),
+    )
+    .await
+    .expect_err("malformed delivery digest must fail");
+    assert_eq!(
+        bad_delivery.to_api_error().code,
+        ErrorCode::ValidationFailed
+    );
+    assert_eq!(item_snapshot(&scoped_a, &item_id).await, before_rejection);
+    assert_eq!(
+        backlog_history_count(&scoped_a, &item_id).await,
+        history_before_rejection
+    );
+    let after_refusals_execution = call_operator(
+        &supervisor,
+        get_execution_body(&binding_id, THREAD_UUID_A, &item_id, &execution_ref),
+    )
+    .await
+    .expect("execution after refused rejections");
+    assert_eq!(
+        value_of(&after_refusals_execution),
+        value_of(&before_execution)
+    );
+
+    let rejected_response = call_operator(
+        &supervisor,
+        reject_body(
+            &binding_id,
+            THREAD_UUID_A,
+            "reject-acceptance",
+            &item_id,
+            before_rejection_revision,
+            &rejection,
+        ),
+    )
+    .await
+    .expect("reject Worker acceptance");
+    let rejected = rejection_of(&rejected_response);
+    assert_eq!(rejected.item.status, BacklogStatus::Blocked);
+    assert_eq!(rejected.item.revision, before_rejection_revision + 1);
+    assert!(rejected.item.completion_note.is_none());
+    assert!(rejected.item.completion_evidence.is_none());
+    assert!(rejected.item.completed_at_ms.is_none());
+    assert_eq!(
+        rejected.item.current_execution_ref.as_deref(),
+        Some(execution_ref.as_str())
+    );
+    assert!(rejected
+        .item
+        .blocked_reason
+        .as_deref()
+        .is_some_and(|reason| {
+            reason.starts_with("worker acceptance rejected: ") && reason.contains(&rejection.reason)
+        }));
+    let original_outcome = rejected
+        .execution
+        .outcome
+        .as_ref()
+        .expect("original successful outcome");
+    assert_eq!(original_outcome.outcome, WorkerBacklogOutcome::Success);
+    assert_eq!(original_outcome.result_digest.as_deref(), Some(HEX64_B));
+    assert!(rejected.execution.completion.is_none());
+    let stored_rejection = rejected
+        .execution
+        .acceptance_rejection
+        .as_ref()
+        .expect("stored acceptance rejection");
+    assert_eq!(stored_rejection.result_digest, HEX64_B);
+    assert_eq!(stored_rejection.delivery_digest, HEX64_C);
+    assert_eq!(stored_rejection.reason, rejection.reason);
+    assert_eq!(stored_rejection.evidence, rejection.evidence);
+    assert!(stored_rejection.rejected_at_ms > 0);
+
+    let rejected_value = value_of(&rejected_response);
+    assert_eq!(rejected_value["kind"], json!("acceptance_rejection"));
+    let rejected_item = rejected.item.clone();
+    let rejected_execution = rejected.execution.clone();
+    let rejected_revision = rejected_item.revision;
+    let history_after_rejection = backlog_history_count(&scoped_a, &item_id).await;
+    assert_eq!(history_after_rejection, history_before_rejection + 1);
+
+    // The exact command key remains bound to the current thread identity.
+    let cross_thread_replay = call_operator(
+        &supervisor,
+        reject_body(
+            &binding_id,
+            THREAD_UUID_B,
+            "reject-acceptance",
+            &item_id,
+            before_rejection_revision,
+            &rejection,
+        ),
+    )
+    .await;
+    assert!(
+        cross_thread_replay.is_err(),
+        "thread scope must be checked before command replay"
+    );
+    assert_eq!(
+        item_snapshot(&scoped_a, &item_id).await.revision,
+        rejected_revision
+    );
+
+    // An exact replay returns the original rejection receipt without a new revision,
+    // history entry, rejection record, or fabricated runtime state.
+    let replayed_response = call_operator(
+        &supervisor,
+        reject_body(
+            &binding_id,
+            THREAD_UUID_A,
+            "reject-acceptance",
+            &item_id,
+            before_rejection_revision,
+            &rejection,
+        ),
+    )
+    .await
+    .expect("replay acceptance rejection");
+    assert_eq!(value_of(&replayed_response), rejected_value);
+    assert_eq!(item_snapshot(&scoped_a, &item_id).await, rejected_item);
+    assert_eq!(
+        backlog_history_count(&scoped_a, &item_id).await,
+        history_after_rejection
+    );
+
+    let status_after = bounded("rejection status after", scoped_a.status())
+        .await
+        .expect("rejection status after");
+    assert_eq!(status_after.total_runs, 0);
+    assert_eq!(status_after.active_runs, 0);
+    assert!(status_after.recent_runs.is_empty());
+    assert_eq!(status_after.binding.delivered_seq, 0);
+    assert_eq!(status_after.binding.acked_seq, 0);
+    assert_eq!(status_after.wakeup.status, status_before.wakeup.status);
+    let activity = bounded(
+        "rejection activity after",
+        scoped_a.list_activity(None, None, Some(20), None, None),
+    )
+    .await
+    .expect("rejection activity after");
+    assert!(activity.events.is_empty());
+    let runs = bounded("rejection runs after", scoped_a.list_runs(None, Some(10)))
+        .await
+        .expect("rejection runs after");
+    assert!(runs.runs.is_empty());
+    let worker_error = bounded(
+        "rejection worker lookup",
+        scoped_a.get_worker(RUN_ID_A.to_string()),
+    )
+    .await;
+    assert!(
+        worker_error.is_err(),
+        "acceptance rejection must not create a runtime worker record"
+    );
+
+    handle.shutdown().await;
+
+    let reopened_handle = bounded(
+        "reopen rejection supervisor",
+        Supervisor::start(fast_supervisor_config(&state_dir)),
+    )
+    .await
+    .expect("reopen rejection supervisor");
+    let reopened = SupervisorClient::from_state_dir(&state_dir).expect("reopened rejection client");
+    let reopened_scoped = reopened
+        .clone()
+        .scoped(&binding_id)
+        .expect("reopened rejection scoped binding");
+
+    let reopened_replay = call_operator(
+        &reopened,
+        reject_body(
+            &binding_id,
+            THREAD_UUID_A,
+            "reject-acceptance",
+            &item_id,
+            before_rejection_revision,
+            &rejection,
+        ),
+    )
+    .await
+    .expect("replayed rejection after reopen");
+    assert_eq!(value_of(&reopened_replay), rejected_value);
+    assert_eq!(
+        item_snapshot(&reopened_scoped, &item_id).await,
+        rejected_item
+    );
+    let retained_execution = call_operator(
+        &reopened,
+        get_execution_body(&binding_id, THREAD_UUID_A, &item_id, &execution_ref),
+    )
+    .await
+    .expect("reopened rejected execution");
+    assert_eq!(execution_of(&retained_execution), &rejected_execution);
+    assert_eq!(
+        backlog_history_count(&reopened_scoped, &item_id).await,
+        history_after_rejection
+    );
+    let attempts = call_operator(
+        &reopened,
+        list_attempts_body(&binding_id, THREAD_UUID_A, &item_id, 10),
+    )
+    .await
+    .expect("reopened rejection attempts");
+    assert_eq!(attempt_count_of(&attempts), 1);
+
+    // A blocked item cannot be rejected a second time by a new command key.
+    let after_reopen_rejection = call_operator(
+        &reopened,
+        reject_body(
+            &binding_id,
+            THREAD_UUID_A,
+            "reject-after-reopen",
+            &item_id,
+            rejected_revision,
+            &rejection,
+        ),
+    )
+    .await;
+    assert!(
+        after_reopen_rejection.is_err(),
+        "a blocked item cannot be rejected again"
+    );
+    assert_eq!(
+        item_snapshot(&reopened_scoped, &item_id).await,
+        rejected_item
+    );
+    assert_eq!(
+        backlog_history_count(&reopened_scoped, &item_id).await,
+        history_after_rejection
+    );
+
+    reopened_handle.shutdown().await;
+}
+
+#[tokio::test]
 async fn operator_worker_backlog_rejects_unauthorized_foreign_scope_and_unknown_replay() {
     let temp = tempfile::tempdir().expect("tempdir");
     let state_dir = temp.path().join("operator_backlog_reject_state");
@@ -1162,6 +1636,7 @@ async fn operator_worker_backlog_rejects_unauthorized_foreign_scope_and_unknown_
         "attach_dispatch_receipt",
         "record_outcome",
         "complete",
+        "reject_acceptance",
         "get_execution",
         "list_attempts",
     ] {
@@ -1560,4 +2035,176 @@ async fn operator_worker_backlog_completion_http_budget_applies_to_inner_payload
     assert_eq!(retained.status, BacklogStatus::Done);
     assert_eq!(retained.revision, completed_revision);
     reopened_handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn operator_worker_backlog_acceptance_rejection_http_budget_applies_before_commit() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let state_dir = temp.path().join("operator_backlog_rejection_budget_state");
+    let (handle, supervisor, scoped_a, _scoped_b) = start_fixture(&state_dir).await;
+    let binding_id = scoped_a.binding_id().to_string();
+    let descriptor = read_and_validate_descriptor(&state_dir).expect("operator descriptor");
+    let url = format!(
+        "{}{OPERATOR_WORKER_BACKLOG_PATH}",
+        descriptor.base_url().expect("operator base URL")
+    );
+    let http = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(FIXTURE_TIMEOUT)
+        .build()
+        .expect("operator rejection budget HTTP client");
+
+    let control = "\u{1}";
+    let title = control.repeat(256);
+    let acceptance_condition = control.repeat(2_048);
+    let delivery_description = "b".repeat(2_048);
+    let (item_id, revision) = create_worker_item_with_details(
+        &scoped_a,
+        "reject-budget-create",
+        &title,
+        &acceptance_condition,
+        &delivery_description,
+    )
+    .await;
+    let authority = authority_fixture(APPROVAL_ID_A, TASK_ID_A);
+    let receipt = receipt_fixture(&binding_id, RUN_ID_A, WORKER_ID_A, PROFILE_ID_A, HEX64_A);
+    let reserved = call_operator(
+        &supervisor,
+        reserve_body(
+            &binding_id,
+            THREAD_UUID_A,
+            "reject-budget-reserve",
+            &item_id,
+            revision,
+            &authority,
+        ),
+    )
+    .await
+    .expect("reserve rejection budget item");
+    let execution_ref = execution_of(&reserved).execution_ref.clone();
+
+    let attach_revision = item_snapshot(&scoped_a, &item_id).await.revision;
+    let attached = call_operator(
+        &supervisor,
+        attach_body(
+            &binding_id,
+            THREAD_UUID_A,
+            "reject-budget-attach",
+            &item_id,
+            &execution_ref,
+            attach_revision,
+            &receipt,
+        ),
+    )
+    .await
+    .expect("attach rejection budget receipt");
+    assert_eq!(execution_of(&attached).execution_ref, execution_ref);
+
+    let record_revision = item_snapshot(&scoped_a, &item_id).await.revision;
+    let recorded = call_operator(
+        &supervisor,
+        record_body(
+            &binding_id,
+            THREAD_UUID_A,
+            "reject-budget-record",
+            &item_id,
+            &execution_ref,
+            record_revision,
+            &success_report_fixture(HEX64_C),
+        ),
+    )
+    .await
+    .expect("record rejection budget success");
+    assert_eq!(execution_of(&recorded).execution_ref, execution_ref);
+
+    let before_rejection = item_snapshot(&scoped_a, &item_id).await;
+    assert_eq!(before_rejection.status, BacklogStatus::Doing);
+    let before_rejection_revision = before_rejection.revision;
+    let history_before = backlog_history_count(&scoped_a, &item_id).await;
+
+    // Maximum-length control-heavy item and rejection texts push the inner
+    // receipt over the compact budget even though each field is valid.
+    let oversize_rejection = WorkerBacklogAcceptanceRejection {
+        execution_ref: execution_ref.clone(),
+        result_digest: HEX64_C.to_string(),
+        delivery_digest: HEX64_D.to_string(),
+        reason: "\u{1}".repeat(768),
+        evidence: "\u{1}".repeat(2_048),
+    };
+    let oversize_body = reject_body(
+        &binding_id,
+        THREAD_UUID_A,
+        "reject-budget",
+        &item_id,
+        before_rejection_revision,
+        &oversize_rejection,
+    );
+    let oversize = bounded(
+        "oversize rejection HTTP response",
+        http.post(&url)
+            .bearer_auth(descriptor.token.as_str())
+            .json(&oversize_body)
+            .send(),
+    )
+    .await
+    .expect("oversize rejection HTTP response");
+    assert_eq!(oversize.status(), reqwest::StatusCode::PAYLOAD_TOO_LARGE);
+    let oversize_error: Value = bounded("oversize rejection body", oversize.json())
+        .await
+        .expect("oversize rejection body");
+    assert_eq!(oversize_error["code"], json!("payload_too_large"));
+    assert_eq!(
+        oversize_error["details"]["max_bytes"].as_u64(),
+        Some(MAX_COMPACT_RESPONSE_BYTES as u64)
+    );
+    let oversize_size = oversize_error["details"]["size_bytes"]
+        .as_u64()
+        .expect("oversize rejection size_bytes");
+    assert!(oversize_size > MAX_COMPACT_RESPONSE_BYTES as u64);
+
+    // The refused response is not committed, so the item, history, and execution
+    // remain unchanged and the command key is not poisoned.
+    let after_oversize = item_snapshot(&scoped_a, &item_id).await;
+    assert_eq!(after_oversize, before_rejection);
+    assert_eq!(
+        backlog_history_count(&scoped_a, &item_id).await,
+        history_before
+    );
+    let execution_after_oversize = call_operator(
+        &supervisor,
+        get_execution_body(&binding_id, THREAD_UUID_A, &item_id, &execution_ref),
+    )
+    .await
+    .expect("execution after oversize rejection");
+    assert!(execution_of(&execution_after_oversize)
+        .acceptance_rejection
+        .is_none());
+
+    let rejection = rejection_fixture(
+        &execution_ref,
+        HEX64_C,
+        HEX64_D,
+        "Bounded failed acceptance after the oversized refusal",
+    );
+    let recovered = call_operator(
+        &supervisor,
+        reject_body(
+            &binding_id,
+            THREAD_UUID_A,
+            "reject-budget",
+            &item_id,
+            before_rejection_revision,
+            &rejection,
+        ),
+    )
+    .await
+    .expect("rejection after oversized refusal");
+    let recovered = rejection_of(&recovered);
+    assert_eq!(recovered.item.status, BacklogStatus::Blocked);
+    assert_eq!(
+        backlog_history_count(&scoped_a, &item_id).await,
+        history_before + 1
+    );
+
+    handle.shutdown().await;
 }

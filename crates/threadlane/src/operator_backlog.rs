@@ -1,6 +1,6 @@
 //! Trusted-local operator transport for durable Worker backlog execution state.
 //!
-//! This module is storage/control plumbing only. It exposes the six operator-attested
+//! This module is storage/control plumbing only. It exposes the seven operator-attested
 //! Worker backlog operations over the existing private loopback HTTP endpoint and
 //! deliberately performs no execution, scheduling, wake-up notification, host start,
 //! or provider dispatch.
@@ -26,10 +26,11 @@
 
 use serde::{Deserialize, Serialize};
 use threadlane_core::{
-    estimate_wire_response_bytes, Core, CoreError, WorkerBacklogAttemptPage,
-    WorkerBacklogAuthority, WorkerBacklogCompletion, WorkerBacklogCompletionReceipt,
-    WorkerBacklogDispatchReceipt, WorkerBacklogExecution, WorkerBacklogOutcomeReport,
-    MAX_COMPACT_RESPONSE_BYTES, MAX_PAGE_RESPONSE_BYTES,
+    estimate_wire_response_bytes, Core, CoreError, WorkerBacklogAcceptanceRejection,
+    WorkerBacklogAcceptanceRejectionReceipt, WorkerBacklogAttemptPage, WorkerBacklogAuthority,
+    WorkerBacklogCompletion, WorkerBacklogCompletionReceipt, WorkerBacklogDispatchReceipt,
+    WorkerBacklogExecution, WorkerBacklogOutcomeReport, MAX_COMPACT_RESPONSE_BYTES,
+    MAX_PAGE_RESPONSE_BYTES,
 };
 
 /// Trusted-local HTTP path for the operator Worker backlog operations.
@@ -106,6 +107,21 @@ pub enum OperatorWorkerBacklogRequest {
         /// Bounded completion attestation.
         completion: WorkerBacklogCompletion,
     },
+    /// Reject Coworker acceptance of a technically successful Worker execution.
+    RejectAcceptance {
+        /// Owning binding identifier.
+        binding_id: String,
+        /// Canonical hyphenated native Codex thread UUID bound to `binding_id`.
+        thread_uuid: String,
+        /// Caller-supplied idempotency key scoped to the binding.
+        command_key: String,
+        /// Target Worker backlog item identifier.
+        item_id: String,
+        /// Expected current backlog item revision.
+        expected_revision: u64,
+        /// Bounded failed-acceptance rejection attestation.
+        rejection: WorkerBacklogAcceptanceRejection,
+    },
     /// Read one durable Worker backlog execution by reference.
     GetExecution {
         /// Owning binding identifier.
@@ -141,6 +157,7 @@ impl OperatorWorkerBacklogRequest {
             | Self::AttachDispatchReceipt { binding_id, .. }
             | Self::RecordOutcome { binding_id, .. }
             | Self::Complete { binding_id, .. }
+            | Self::RejectAcceptance { binding_id, .. }
             | Self::GetExecution { binding_id, .. }
             | Self::ListAttempts { binding_id, .. } => binding_id,
         }
@@ -153,6 +170,7 @@ impl OperatorWorkerBacklogRequest {
             | Self::AttachDispatchReceipt { thread_uuid, .. }
             | Self::RecordOutcome { thread_uuid, .. }
             | Self::Complete { thread_uuid, .. }
+            | Self::RejectAcceptance { thread_uuid, .. }
             | Self::GetExecution { thread_uuid, .. }
             | Self::ListAttempts { thread_uuid, .. } => thread_uuid,
         }
@@ -166,6 +184,7 @@ impl OperatorWorkerBacklogRequest {
                 | Self::AttachDispatchReceipt { .. }
                 | Self::RecordOutcome { .. }
                 | Self::Complete { .. }
+                | Self::RejectAcceptance { .. }
         )
     }
 }
@@ -189,6 +208,11 @@ pub enum OperatorWorkerBacklogResponse {
     Completion {
         /// Compact completion receipt.
         completion: WorkerBacklogCompletionReceipt,
+    },
+    /// Durable acceptance-rejection receipt returned by reject.
+    AcceptanceRejection {
+        /// Compact acceptance-rejection receipt.
+        rejection: WorkerBacklogAcceptanceRejectionReceipt,
     },
     /// Bounded attempt page returned by list.
     AttemptPage {
@@ -289,6 +313,22 @@ pub(crate) fn execute_operator_worker_backlog(
                 now_ms,
             )?,
         },
+        OperatorWorkerBacklogRequest::RejectAcceptance {
+            command_key,
+            item_id,
+            expected_revision,
+            rejection,
+            ..
+        } => OperatorWorkerBacklogResponse::AcceptanceRejection {
+            rejection: core.reject_worker_backlog_acceptance_operator_attested(
+                &binding_id,
+                &command_key,
+                &item_id,
+                expected_revision,
+                rejection,
+                now_ms,
+            )?,
+        },
         OperatorWorkerBacklogRequest::GetExecution {
             item_id,
             execution_ref,
@@ -320,10 +360,11 @@ pub(crate) fn execute_operator_worker_backlog(
 }
 
 /// Enforces the existing compact/page serialized response budgets on the inner typed
-/// operator payload (`execution`, `completion`, or `page`), matching the core's
-/// transactional precommit guarantee. The fixed operator response enum envelope is not
-/// included; the independent HTTP/client response cap already bounds the actual
-/// serialized reply well above the inner payload plus that small fixed wrapper.
+/// operator payload (`execution`, `completion`, `rejection`, or `page`), matching the
+/// core's transactional precommit guarantee. The fixed operator response enum
+/// envelope is not included; the independent HTTP/client response cap already bounds
+/// the actual serialized reply well above the inner payload plus that small fixed
+/// wrapper.
 pub(crate) fn enforce_operator_worker_backlog_response_budget(
     response: &OperatorWorkerBacklogResponse,
 ) -> Result<(), CoreError> {
@@ -333,6 +374,9 @@ pub(crate) fn enforce_operator_worker_backlog_response_budget(
         }
         OperatorWorkerBacklogResponse::Completion { completion } => {
             enforce_inner_response_budget(completion, MAX_COMPACT_RESPONSE_BYTES)
+        }
+        OperatorWorkerBacklogResponse::AcceptanceRejection { rejection } => {
+            enforce_inner_response_budget(rejection, MAX_COMPACT_RESPONSE_BYTES)
         }
         OperatorWorkerBacklogResponse::AttemptPage { page } => {
             enforce_inner_response_budget(page, MAX_PAGE_RESPONSE_BYTES)
