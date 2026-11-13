@@ -1,8 +1,22 @@
 # First personal MVP acceptance
 
-This is the current implementation and acceptance plan approved on 2026-11-05.
-It supersedes older milestone wording when describing the first usable personal
-Linux release. Historical pilot reports remain evidence for their exact scope.
+## Current human-approved scope (2026-11-13)
+
+The current product contract is the
+[minimal chat-centered MVP](MINIMAL-CHAT-MVP.md), approved on 2026-11-13. It
+supersedes conflicting multi-role workflow requirements in this and older
+planning documents. Its core backlog storage slice is implemented in source but
+is not full MVP delivery; its Worker execution, MCP/UI, liveness, and live
+acceptance gates remain open.
+
+Everything below this note is the historical 2026-11-05 multi-role acceptance
+plan and its evidence. It is retained for historical traceability and is not the
+current mandatory workflow. Its old gates are not new evidence for the
+2026-11-13 contract.
+
+This historical plan was approved on 2026-11-05 and superseded older milestone
+wording when describing the first usable personal Linux release. Historical
+pilot reports remain evidence for their exact scope.
 
 ## Supported initial scope
 
@@ -86,7 +100,7 @@ and capacity visibility, complete automatic Linux PR checks, reservation-aware
 aggregate budgets, and privacy-safe backup/restore. Current bounded ledgers must
 never be described as unlimited long-session storage.
 
-## Current integration and remaining acceptance gates (2026-11-11)
+## Historical integration and remaining acceptance gates (2026-11-11)
 
 - **Production desktop entry wired in source**: `apps/desktop/index.html` →
   `apps/desktop/src/main.ts` → `apps/desktop/src/app.tsx` connects

@@ -6,8 +6,11 @@
 //! This crate owns the SQLite persistence layer, deterministic demo run state machine,
 //! per-binding isolation, revision-checked answer/steer/cancel mutations, idempotent
 //! command deduplication, ordered event batches with high-water-mark acknowledgements,
-//! and persistent wake-up notice coalescing and recovery.
+//! persistent wake-up notice coalescing and recovery, and the durable per-chat
+//! Todo/Doing/Done/Blocked backlog used by the minimal chat-centered MVP.
 
+/// Durable per-chat backlog storage and revision-checked item mutations.
+pub mod backlog;
 mod engine;
 /// Domain and storage error types.
 pub mod error;
@@ -22,6 +25,13 @@ pub mod types;
 /// Durable worker dispatch ledger, claims, progress, and outcome types.
 pub mod worker;
 
+pub use backlog::{
+    BacklogHistoryAction, BacklogHistoryEntry, BacklogHistoryPage, BacklogItem, BacklogItemEdit,
+    BacklogItemKind, BacklogItemPage, BacklogStatus, NewBacklogItem, MAX_BACKLOG_ACCEPTANCE_LEN,
+    MAX_BACKLOG_BLOCKED_REASON_LEN, MAX_BACKLOG_COMPLETION_EVIDENCE_LEN,
+    MAX_BACKLOG_COMPLETION_NOTE_LEN, MAX_BACKLOG_DELIVERY_LEN, MAX_BACKLOG_EXECUTION_REF_LEN,
+    MAX_BACKLOG_TITLE_LEN,
+};
 pub use engine::Core;
 pub use error::{AckErrorReason, CoreError};
 pub use limits::{

@@ -1378,6 +1378,8 @@ impl Core {
     }
 
     fn init_schema_and_recover(tx: &Transaction<'_>) -> Result<(), CoreError> {
+        // Backlog tables are additive: they are created idempotently on every
+        // open without altering existing tables, schema version, or recovery.
         tx.execute_batch(
             "CREATE TABLE IF NOT EXISTS schema_meta (
                 id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -1467,6 +1469,49 @@ impl Core {
             );
 
             CREATE TABLE IF NOT EXISTS command_dedup (
+                binding_id TEXT NOT NULL REFERENCES bindings(binding_id),
+                command_key TEXT NOT NULL,
+                operation TEXT NOT NULL,
+                payload_hash TEXT NOT NULL,
+                response_json TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                PRIMARY KEY (binding_id, command_key)
+            );
+
+            CREATE TABLE IF NOT EXISTS backlog_items (
+                item_id TEXT PRIMARY KEY,
+                binding_id TEXT NOT NULL REFERENCES bindings(binding_id),
+                revision INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                acceptance_condition TEXT NOT NULL,
+                delivery_description TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                status TEXT NOT NULL,
+                blocked_reason TEXT,
+                current_execution_ref TEXT,
+                completion_note TEXT,
+                completion_evidence TEXT,
+                completed_at_ms INTEGER,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_backlog_items_binding_order
+                ON backlog_items(binding_id);
+
+            CREATE TABLE IF NOT EXISTS backlog_history (
+                history_id TEXT PRIMARY KEY,
+                binding_id TEXT NOT NULL REFERENCES bindings(binding_id),
+                item_id TEXT NOT NULL REFERENCES backlog_items(item_id),
+                revision INTEGER NOT NULL,
+                action TEXT NOT NULL,
+                item_json TEXT NOT NULL,
+                recorded_at_ms INTEGER NOT NULL,
+                UNIQUE (item_id, revision)
+            );
+            CREATE INDEX IF NOT EXISTS idx_backlog_history_binding_item_order
+                ON backlog_history(binding_id, item_id);
+
+            CREATE TABLE IF NOT EXISTS backlog_command_dedup (
                 binding_id TEXT NOT NULL REFERENCES bindings(binding_id),
                 command_key TEXT NOT NULL,
                 operation TEXT NOT NULL,

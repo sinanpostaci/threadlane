@@ -8,9 +8,22 @@ planned capabilities from qualified behavior.
 
 ## Product contract
 
-The active first-use scope, prioritized fixes and acceptance gates are recorded
-in [First personal MVP acceptance](MVP-READINESS.md). Older checkpoint sections
-below describe their original evidence and may predate the current role driver.
+The current human-approved product scope, dated 2026-11-13, is the
+[minimal chat-centered MVP](MINIMAL-CHAT-MVP.md). It supersedes conflicting
+multi-role workflow requirements in older planning documents. It keeps native
+Codex as the conversational Coworker, a small durable per-chat
+Todo/Doing/Done/Blocked backlog, and the existing single-task runner, authority,
+and isolation without a mandatory Orchestrator/Reviewer/Closure/Job/controller
+stage.
+
+The historical first-use acceptance plan and prioritized fixes remain recorded
+in [First personal MVP acceptance](MVP-READINESS.md). Older checkpoint, pilot,
+and multi-role sections below describe their original evidence only; they are
+not new evidence for the 2026-11-13 contract.
+
+The first foundation slice adds only core backlog storage and the current
+contract. Worker reservation, verified completion, MCP/UI integration, liveness,
+`NeedsYou`, and live acceptance remain open.
 
 The user stays in the native Codex conversation, including frequent Steer and
 questions. Codex interprets intent and plans. Threadlane owns validated execution,
@@ -49,7 +62,10 @@ task dispatch and follow-up must not require a panel visit for each action.
 Linux/NixOS is the first supported test host. Shared core boundaries support future
 platform work without implying that untested macOS or Windows builds are supported.
 
-## Current checkpoint
+## Historical checkpoints and evidence
+
+The entries in this section are historical evidence for their stated scopes.
+They do not define the 2026-11-13 minimal chat-centered contract.
 
 The managed Linux desktop route now exposes a no-argument
 `connect_current_chat` MCP operation. It checks the calling process's parent
