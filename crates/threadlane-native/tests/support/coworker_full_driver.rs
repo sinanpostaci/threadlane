@@ -619,19 +619,6 @@ fn configure_codex_reviewer(fixture: &PipelineTestFixture) {
         .unwrap();
 }
 
-/// The exact frozen OpenCode v2 Go/max Coder choice used by the mixed-provider pipeline.
-fn headless_opencode_go_choice(difficulty: Difficulty) -> SelectedRoleChoice {
-    SelectedRoleChoice {
-        tool_id: "tool-opencode".to_string(),
-        adapter: ToolAdapter::OpencodeV2,
-        route: RoleExecutionRoute::HeadlessWorker,
-        model_id: "model-deepseek".to_string(),
-        model_arg: "opencode-go/deepseek-v4.1-flash".to_string(),
-        effort: Some("max".to_string()),
-        matched_difficulty: Some(difficulty),
-    }
-}
-
 /// Registers the exact frozen OpenCode v2 Go/max Coder choice while leaving the profile Reviewer
 /// untouched. The fake Node role provider interprets `api --standalone session.create`,
 /// `session export --standalone --sanitize`, and `--standalone run ... --format json`, emitting

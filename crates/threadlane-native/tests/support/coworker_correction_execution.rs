@@ -132,14 +132,16 @@ async fn prepare_task_for_derived_correction_with_reviewer(
     required_fixes: Vec<String>,
     reviewer_choice: SelectedRoleChoice,
 ) -> PreparedCorrectionFixtureTask {
-    prepare_task_for_derived_correction_with_reviewer_and_budgets(
-        fixture,
-        brief_id,
-        plan_id,
-        task_id,
-        required_fixes,
-        reviewer_choice,
-        ExecutionBudgets::default(),
+    Box::pin(
+        prepare_task_for_derived_correction_with_reviewer_and_budgets(
+            fixture,
+            brief_id,
+            plan_id,
+            task_id,
+            required_fixes,
+            reviewer_choice,
+            ExecutionBudgets::default(),
+        ),
     )
     .await
 }
@@ -152,14 +154,16 @@ async fn prepare_task_for_derived_correction_with_budgets(
     required_fixes: Vec<String>,
     approval_budgets: ExecutionBudgets,
 ) -> PreparedCorrectionFixtureTask {
-    prepare_task_for_derived_correction_with_reviewer_and_budgets(
-        fixture,
-        brief_id,
-        plan_id,
-        task_id,
-        required_fixes,
-        headless_argon_choice(Difficulty::Hard),
-        approval_budgets,
+    Box::pin(
+        prepare_task_for_derived_correction_with_reviewer_and_budgets(
+            fixture,
+            brief_id,
+            plan_id,
+            task_id,
+            required_fixes,
+            headless_argon_choice(Difficulty::Hard),
+            approval_budgets,
+        ),
     )
     .await
 }
