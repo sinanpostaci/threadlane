@@ -57,7 +57,8 @@ use crate::execution_gateway::{
 use crate::fs_safety::{constant_time_str_eq, ensure_platform_supported};
 use crate::host_launcher::{
     execute_start_approved_task_with_launcher_until, validate_host_executable_path,
-    ApprovedHostLauncher, ApprovedHostLauncherPolicy,
+    ApprovedHostLauncher, ApprovedHostLauncherPolicy, ManagedHostNoticeRequest,
+    ManagedHostNoticeTarget,
 };
 use crate::native_chat_observation::{
     resolve_native_sample_store_scope, ManagedParentConnectionConfig, ManagedParentEnvironment,
@@ -2948,6 +2949,39 @@ impl PairedMcpServer {
         Ok((trusted_binding_id, trusted_thread_uuid, gateway))
     }
 
+    fn managed_host_notice_request(
+        &self,
+        binding_id: &str,
+        thread_uuid: &str,
+    ) -> ManagedHostNoticeRequest {
+        if !self.coworker_native_notices || self.host_launcher.is_none() {
+            return ManagedHostNoticeRequest::NotRequested;
+        }
+        let Some(context) = self.matched_observation_context(binding_id, thread_uuid) else {
+            return ManagedHostNoticeRequest::Unavailable;
+        };
+        let Some(project_path) = context.project_path.as_deref().map(PathBuf::from) else {
+            return ManagedHostNoticeRequest::Unavailable;
+        };
+        let Some((reconnect, backend_pid)) = self
+            .managed_parent_environment()
+            .discover_reconnect(
+                NativeErrorCode::NotConfigured,
+                "coworker native notices require a verified managed native MCP session",
+            )
+            .ok()
+        else {
+            return ManagedHostNoticeRequest::Unavailable;
+        };
+        ManagedHostNoticeRequest::Verified(ManagedHostNoticeTarget {
+            reconnect,
+            backend_pid,
+            thread_uuid: thread_uuid.to_string(),
+            project_path,
+            verified_socket_path: None,
+        })
+    }
+
     fn verified_execution_gateway(
         &self,
         tool_name: &str,
@@ -3161,6 +3195,8 @@ impl PairedMcpServer {
                     HOST_NOT_CONFIGURED_MESSAGE,
                 ));
             };
+            let managed_host_notice =
+                self.managed_host_notice_request(&trusted_binding_id, &trusted_thread_uuid);
 
             let authority_for_guard = Arc::clone(&stores.authority);
             let guard_binding_id = trusted_binding_id.clone();
@@ -3217,6 +3253,7 @@ impl PairedMcpServer {
                         trusted_thread_uuid,
                         params,
                         host_launcher,
+                        managed_host_notice,
                         startup_deadline,
                         move || {
                             Ok(pairing_store_for_recheck

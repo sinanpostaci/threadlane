@@ -24,6 +24,19 @@ Opting in can resume the original Codex chat and consume tokens. It does not
 select or override that chat's model, effort or permissions. Keep it off until
 the intended native chat exposes the new paired MCP tools.
 
+The standard owned managed desktop registration also opts into fresh-only
+approved-host auto-start and managed native notices together. When both are
+enabled on a verified managed session, an eligible initial direct
+`start_approved_task` attaches this fixed native notice transport before
+spawning its fresh host. The target is derived only from the enrolled scope, the
+independently verified observation/managed parent and the frozen approval
+repository/thread; MCP arguments cannot supply socket, executable, model,
+effort or notification overrides, and no legacy queue or shell fallback is used.
+Auto-start or notices alone do not enable this path. Existing hosts keep their
+recorded policy, and stopped, failed, orphaned, unknown or non-fresh sessions are
+never resurrected. A known notice-setup refusal before spawn is reported as a
+pre-effect error, not as `outcome_unknown`, and does not create a launch intent.
+
 Trusted CLI operators can supply `--notify-codex /absolute/trusted/executable`
 and optional `--notify-timeout-ms` to `threadlane-host serve`. Omit both for off.
 The timeout defaults to 10,000 ms and must be in 1..=300,000 ms. A timeout without
@@ -66,8 +79,11 @@ accepts a patch, merges a branch or changes user authorization.
 An uncertain external submission becomes `Unknown` and is never retried
 automatically. Review the actual chat and runtime evidence before an explicit
 trusted retry. Restarting a host without notification flags leaves notifications
-off even if its previous manifest recorded an enabled policy. Closing the GUI
-does not stop the separately owned host.
+off even if its previous manifest recorded an enabled policy; the managed
+approved-task notice is attached only during a truly eligible initial fresh
+launch and does not restore itself on restart. Already-running hosts keep their
+recorded policy, and stopped, failed, orphaned, unknown or non-fresh sessions are
+never resurrected. Closing the GUI does not stop the separately owned host.
 
 Two real native chats, busy-turn delivery, MCP refresh behavior and live
 restart/recovery remain explicit acceptance gates. The local fixtures use fake

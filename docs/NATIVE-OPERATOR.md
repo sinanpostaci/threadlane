@@ -218,9 +218,18 @@ manual task dispatch and its review/integration limits, distinct from the comple
 automatic job route above.
 
 Start `threadlane-host serve` explicitly for the recorded approval with the same
-stores. Session reads never launch a host. Notifications are a separate,
-default-off [startup policy](APPROVED-NOTIFICATIONS.md). CLI-only conversations
-can explicitly choose [the operator notification route](NATIVE-OPERATOR-NOTIFICATIONS.md)
+stores. Session reads never launch a host. For raw and manual callers,
+notifications remain a separate, default-off
+[startup policy](APPROVED-NOTIFICATIONS.md). The standard owned
+managed MCP registration opts into fresh-only approved-host auto-start and managed
+native notices together; an eligible initial direct `start_approved_task` then
+attaches a fixed notice to the exact verified managed chat before spawn. Raw CLI,
+manual and library defaults stay off. Already-running hosts keep their recorded
+policy, and stopped, failed, orphaned, unknown or non-fresh sessions are never
+resurrected. A notice is not approval, acceptance or proof of human reading.
+Fixture coverage does not establish live native-chat delivery or reboot recovery.
+CLI-only conversations can explicitly choose
+[the operator notification route](NATIVE-OPERATOR-NOTIFICATIONS.md)
 with `--notify-codex ... --notify-route operator-cli`.
 
 ```sh

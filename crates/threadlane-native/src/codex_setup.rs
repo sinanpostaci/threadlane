@@ -56,7 +56,7 @@ const MSG_UNCHANGED: &str =
 const MSG_NOT_REGISTERED_ABSENT: &str =
     "Codex mcp_servers.threadlane is not yet registered in config.toml.";
 const MSG_NOT_REGISTERED_OUTDATED: &str =
-    "Codex mcp_servers.threadlane has a previously managed registration that differs from the current binary or store paths.";
+    "Codex mcp_servers.threadlane has a previously managed registration that differs from the current managed binary, store paths or startup flags.";
 const MSG_DISABLED: &str =
     "Codex mcp_servers.threadlane is disabled (enabled = false) in config.toml and was left disabled.";
 const MSG_CONFLICT: &str =
@@ -657,7 +657,12 @@ pub fn resolve_native_mcp_executable_with(
     ))
 }
 
-/// Builds the exact 13-element argument vector for the unbound paired `threadlane-native-mcp` entry.
+/// Builds the exact 14-element argument vector for the standard owned managed
+/// `threadlane-native-mcp` entry.
+///
+/// The managed desktop registration opts into fresh-only approved-host startup and managed
+/// native notices. Raw [`crate::NativeMcpCli`] and [`crate::PairedMcpServer`] defaults remain
+/// off for legacy and manual callers.
 pub fn build_desired_mcp_args(
     state_dir: &str,
     pairing_dir: &str,
@@ -680,6 +685,7 @@ pub fn build_desired_mcp_args(
         "--sessions-dir".to_string(),
         sessions_dir.to_string(),
         "--coworker-native-notices".to_string(),
+        "--auto-start-approved-hosts".to_string(),
     ]
 }
 
@@ -1157,13 +1163,27 @@ fn matches_unbound_paired_args_shape(args: &[String]) -> bool {
         "--sessions-dir",
     ];
     const COWORKER_NATIVE_NOTICES_FLAG: &str = "--coworker-native-notices";
+    const AUTO_START_APPROVED_HOSTS_FLAG: &str = "--auto-start-approved-hosts";
 
     let legacy_len = EXPECTED_FLAGS.len() * 2;
-    let current_len = legacy_len + 1;
-    if args.len() != legacy_len && args.len() != current_len {
-        return false;
-    }
-    if args.len() == current_len && args[current_len - 1].as_str() != COWORKER_NATIVE_NOTICES_FLAG {
+    let notices_len = legacy_len + 1;
+    let managed_len = legacy_len + 2;
+    // Accept only the exact historical managed shapes for a receipt-verified upgrade:
+    // - legacy 12-element store-only args
+    // - 13-element args ending in `--coworker-native-notices`
+    // - current 14-element args ending in `--coworker-native-notices --auto-start-approved-hosts`
+    let recognized_shape = if args.len() == legacy_len {
+        // Legacy store-only shape.
+        true
+    } else if args.len() == notices_len {
+        args[notices_len - 1].as_str() == COWORKER_NATIVE_NOTICES_FLAG
+    } else if args.len() == managed_len {
+        args[managed_len - 2].as_str() == COWORKER_NATIVE_NOTICES_FLAG
+            && args[managed_len - 1].as_str() == AUTO_START_APPROVED_HOSTS_FLAG
+    } else {
+        false
+    };
+    if !recognized_shape {
         return false;
     }
     for (idx, expected_flag) in EXPECTED_FLAGS.iter().enumerate() {
@@ -1834,6 +1854,19 @@ mod tests {
         current.push("--coworker-native-notices".to_string());
         assert!(matches_unbound_paired_args_shape(&current));
 
+        let mut managed = current.clone();
+        managed.push("--auto-start-approved-hosts".to_string());
+        assert!(matches_unbound_paired_args_shape(&managed));
+
+        let mut auto_start_only = legacy.clone();
+        auto_start_only.push("--auto-start-approved-hosts".to_string());
+        assert!(!matches_unbound_paired_args_shape(&auto_start_only));
+
+        let mut reversed = legacy.clone();
+        reversed.push("--auto-start-approved-hosts".to_string());
+        reversed.push("--coworker-native-notices".to_string());
+        assert!(!matches_unbound_paired_args_shape(&reversed));
+
         let mut wrong_value = legacy.clone();
         wrong_value.push("--coworker-native-notices=false".to_string());
         assert!(!matches_unbound_paired_args_shape(&wrong_value));
@@ -1842,10 +1875,14 @@ mod tests {
         wrong_flag.push("--notify".to_string());
         assert!(!matches_unbound_paired_args_shape(&wrong_flag));
 
-        let mut extra_arg = legacy;
-        extra_arg.push("--coworker-native-notices".to_string());
+        let mut extra_arg = managed;
         extra_arg.push("--unexpected".to_string());
         assert!(!matches_unbound_paired_args_shape(&extra_arg));
+
+        let mut duplicate_auto_start = current;
+        duplicate_auto_start.push("--auto-start-approved-hosts".to_string());
+        duplicate_auto_start.push("--auto-start-approved-hosts".to_string());
+        assert!(!matches_unbound_paired_args_shape(&duplicate_auto_start));
     }
 
     #[test]
@@ -1903,14 +1940,15 @@ mod tests {
                 "--sessions-dir",
                 req.sessions_dir.to_str().unwrap(),
                 "--coworker-native-notices",
+                "--auto-start-approved-hosts",
             ]
         );
         for forbidden in [
             "--binding",
             "--thread",
-            "--auto-start-approved-hosts",
             "--host-executable",
             "--notify",
+            "--env",
         ] {
             assert!(
                 !content.contains(forbidden),
@@ -2155,6 +2193,98 @@ OTHER_TOKEN = "secret-other-token-999"
             .map(|v| v.as_str().unwrap())
             .collect();
         assert_eq!(args[1], req.state_dir.to_str().unwrap());
+    }
+
+    #[test]
+    fn receipt_verified_upgrade_accepts_only_exact_legacy_and_notice_shapes() {
+        let tmp = TempDir::new().expect("tempdir");
+        let req = build_fixture_request(tmp.path());
+        fs::create_dir_all(&req.codex_home).expect("create codex_home");
+        assert_eq!(
+            apply_codex_mcp_setup(&req).state,
+            CodexSetupState::Registered
+        );
+
+        let config_path = req.codex_home.join(CODEX_CONFIG_FILENAME);
+        let receipt_path = req.management_dir.join(CODEX_SETUP_RECEIPT_FILENAME);
+        let command = req.mcp_executable.to_str().expect("utf8 command");
+        let config_path_str = config_path.to_str().expect("utf8 config path");
+        let base_args = vec![
+            "--state-dir".to_string(),
+            req.state_dir.to_str().unwrap().to_string(),
+            "--pairing-dir".to_string(),
+            req.pairing_dir.to_str().unwrap().to_string(),
+            "--registry-dir".to_string(),
+            req.registry_dir.to_str().unwrap().to_string(),
+            "--plans-dir".to_string(),
+            req.plans_dir.to_str().unwrap().to_string(),
+            "--authority-dir".to_string(),
+            req.authority_dir.to_str().unwrap().to_string(),
+            "--sessions-dir".to_string(),
+            req.sessions_dir.to_str().unwrap().to_string(),
+        ];
+
+        for legacy_args in [base_args.clone(), {
+            let mut args = base_args.clone();
+            args.push("--coworker-native-notices".to_string());
+            args
+        }] {
+            let mut doc = "".parse::<DocumentMut>().expect("empty TOML document");
+            apply_desired_table_to_document(&mut doc, command, &legacy_args).unwrap();
+            fs::write(&config_path, doc.to_string()).unwrap();
+            fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600)).unwrap();
+            write_receipt(
+                &req.management_dir,
+                config_path_str,
+                &compute_managed_table_sha256(command, &legacy_args),
+            )
+            .unwrap();
+
+            let upgraded = apply_codex_mcp_setup(&req);
+            assert_eq!(upgraded.state, CodexSetupState::Registered);
+            assert!(upgraded.config_modified);
+            assert!(upgraded.restart_required);
+
+            let updated: DocumentMut = fs::read_to_string(&config_path).unwrap().parse().unwrap();
+            let args: Vec<&str> = updated["mcp_servers"]["threadlane"]["args"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|value| value.as_str().unwrap())
+                .collect();
+            assert_eq!(args[args.len() - 2], "--coworker-native-notices");
+            assert_eq!(args[args.len() - 1], "--auto-start-approved-hosts");
+            let receipt: CodexSetupReceipt =
+                serde_json::from_slice(&fs::read(&receipt_path).unwrap()).unwrap();
+            assert_eq!(
+                inspect_threadlane_table(&updated),
+                InspectedTableState::CandidateManaged {
+                    table_sha256: receipt.managed_table_sha256
+                }
+            );
+        }
+
+        // A receipt matching an unrecognized shape (auto-start without managed notices) still
+        // fails closed: receipts only authorize shapes that Threadlane actually emitted.
+        let mut unrecognized = base_args;
+        unrecognized.push("--auto-start-approved-hosts".to_string());
+        let mut doc = "".parse::<DocumentMut>().expect("empty TOML document");
+        apply_desired_table_to_document(&mut doc, command, &unrecognized).unwrap();
+        let original = doc.to_string();
+        fs::write(&config_path, &original).unwrap();
+        fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600)).unwrap();
+        write_receipt(
+            &req.management_dir,
+            config_path_str,
+            &compute_managed_table_sha256(command, &unrecognized),
+        )
+        .unwrap();
+
+        let conflict = apply_codex_mcp_setup(&req);
+        assert_eq!(conflict.state, CodexSetupState::Conflict);
+        assert_eq!(conflict.error_code.as_deref(), Some("manual_conflict"));
+        assert!(!conflict.config_modified);
+        assert_eq!(fs::read_to_string(&config_path).unwrap(), original);
     }
 
     #[test]

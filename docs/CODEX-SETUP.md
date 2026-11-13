@@ -5,10 +5,11 @@ Threadlane provides a focused Rust helper (`threadlane_native::codex_setup`), a 
 ## Boundary and Safety Invariants
 
 - **Direct surgical TOML edit**: Reads and edits only `mcp_servers.threadlane` in `${CODEX_HOME:-$HOME/.codex}/config.toml` using `toml_edit` (`0.25.17`). All other settings, tables, and comments are preserved. No `codex` subprocess is spawned to register the server, and no raw TOML or secret values are echoed to logs, receipts, or UI surfaces.
-- **Unbound paired MCP server only**: Registers only:
+- **Standard owned managed paired server only**: Registers only:
   - `command = "<canonical absolute threadlane-native-mcp path>"`
-  - `args = ["--state-dir", "<DIR>", "--pairing-dir", "<DIR>", "--registry-dir", "<DIR>", "--plans-dir", "<DIR>", "--authority-dir", "<DIR>", "--sessions-dir", "<DIR>"]`
-  - Never writes `--binding`, `--thread`, `--auto-start-approved-hosts`, `--host-executable`, notification flags, or `env`/credential overrides.
+  - `args = ["--state-dir", "<DIR>", "--pairing-dir", "<DIR>", "--registry-dir", "<DIR>", "--plans-dir", "<DIR>", "--authority-dir", "<DIR>", "--sessions-dir", "<DIR>", "--coworker-native-notices", "--auto-start-approved-hosts"]`
+  - The two trailing booleans are the managed desktop opt-in for fresh-only approved-host startup and verified managed native notices. They are not authority, binding, model, executable, or notification-target overrides. Raw `NativeMcpCli` and `PairedMcpServer` defaults remain off for legacy and manual callers.
+  - Never writes `--binding`, `--thread`, `--host-executable`, arbitrary notification flags/paths, or `env`/credential overrides. MCP arguments cannot select an executable, thread, socket, model or effort.
 - **Registration is not enrollment**: Every status report sets `pairing_required: true`. Registering `mcp_servers.threadlane` in `config.toml` never claims an active MCP connection, an enrolled conversation, a verified native thread UUID, an operator plan approval, or a model execution run.
 
 ## Ownership Receipt, Upgrade, and Conflict Rules
@@ -19,9 +20,31 @@ Threadlane stores a small private (`0600`) ownership receipt at `<management-dir
 2. **Exact matching table**: Returns `state: "unchanged"` (`registered: true`, `config_modified: false`, `restart_required: false`) without touching `config.toml` or its modification time. An optional boolean `enabled = true` is preserved. If a prior run renamed `config.toml` before writing the receipt, `apply` adopts the exact matching table into `codex-setup-receipt.json` without rewriting `config.toml`.
 3. **Post-commit receipt or sync warning**: If `config.toml` is renamed successfully and a subsequent directory sync or receipt write fails, the helper preserves a truthful post-commit report (`state: "registered"`, `registered: true`, `config_modified: true`, `restart_required: true`, `pairing_required: true`, `error_code: "receipt_persistence_failed"` or `"post_commit_sync_failed"`) rather than claiming `config.toml` was untouched.
 4. **Disabled table (`enabled = false`)**: Returns `state: "disabled"` (`registered: false`, `config_modified: false`) and leaves `config.toml` untouched, even if the entry was previously managed by Threadlane.
-5. **App / store path update on an untouched owned table**: If `mcp_servers.threadlane` differs from the current desired binary or store paths, Threadlane updates it in place **only** when a valid receipt exists whose `managed_table_sha256` matches the current canonical `command` and `args` in `config.toml`. An optional boolean `enabled = true` and its comments are preserved; it is excluded from the digest so existing ownership receipts remain valid. A missing or mismatched receipt never permits a path upgrade.
-6. **Unmanaged or manually edited table**: Any unmanaged entry, edited `command`/`args` that no longer match the receipt digest, non-boolean `enabled`, or table with manual/unknown keys (`env`, `cwd`, timeouts, etc.) returns `state: "conflict"` (`error_code: "manual_conflict"`) and is never overwritten.
+5. **Receipt-verified managed upgrade**: If `mcp_servers.threadlane` differs from the current desired binary, store paths or managed flags, Threadlane updates it in place **only** when a valid receipt exists whose `managed_table_sha256` matches the current canonical `command` and `args` in `config.toml`. The recognized historical shapes are the legacy 12-element store-only vector and the 13-element vector ending in `--coworker-native-notices`; the current 14-element vector adds `--auto-start-approved-hosts` after that exact prefix. An optional boolean `enabled = true` and its comments are preserved; it is excluded from the digest so existing ownership receipts remain valid. A missing or mismatched receipt never permits an upgrade.
+6. **Unmanaged or manually edited table**: Any unmanaged entry, edited `command`/`args` that no longer match the receipt digest, non-boolean `enabled`, table with manual/unknown keys (`env`, `cwd`, timeouts, etc.), or unrecognized argument shape (including auto-start without managed notices, reordered flags, values, or extra options) returns `state: "conflict"` (`error_code: "manual_conflict"`) and is never overwritten.
 7. **Lock contention, corrupt, read-only, symlink, or concurrent edits**: Non-blocking lock contention (`error_code: "setup_busy"`), malformed TOML, corrupt receipts, symlinks anywhere along `codex_home`/`config.toml`/store/management paths, read-only files or directories, overlapping store directories, or concurrent external edits return `state: "error"` (`config_modified: false`) with a fixed English message and no forced repair.
+
+### Managed startup behavior and restart boundary
+
+The standard owned registration combines fresh-only approved-host auto-start with the existing
+managed native-notices opt-in. When both are enabled on a verified managed Linux desktop session,
+an eligible initial `start_approved_task` may start one fresh host and attach a fixed native
+notification back to the exact enrolled chat, independently verified parent endpoint and frozen
+approval repository/thread. A notice only directs the Coworker to read actual approved task/event
+state; it is not approval, acceptance, human reading, or permission to dispatch, commit, merge or
+run another role.
+
+The notification context is created only for an eligible fresh launch, before process spawn, from
+the verified scope. Already-running hosts keep their recorded policy. Stopped, failed, orphaned,
+unknown, superseded or non-fresh sessions are never resurrected by this path. MCP JSON cannot supply
+socket, executable, model, effort or notification overrides.
+
+Upgrading an older owned registration changes `config.toml`, so `restart_required: true` means Codex
+must restart or refresh its MCP connection before the new flags take effect. The maintenance helper
+does not edit configuration outside the selected `CODEX_HOME`, does not enroll a chat, and does not
+start a host. Fixture coverage does not establish live native-chat delivery;
+installed desktop auto-start, restart recovery, busy-turn delivery and general multi-chat routing
+remain separate acceptance gates.
 
 ## CLI Usage (`threadlane-codex-setup`)
 

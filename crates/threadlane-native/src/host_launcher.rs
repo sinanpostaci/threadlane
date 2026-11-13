@@ -11,9 +11,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
 use rmcp::model::CallToolResult;
+use threadlane::native_endpoint::NativeReconnectConfig;
+use threadlane::native_tool_output::{NativeToolOutputConfig, MAX_NATIVE_TOOL_OUTPUT_CONFIG_BYTES};
 use threadlane_authority::{ApprovalRecord, AuthorityStore};
 use threadlane_core::Binding;
 use threadlane_host::{
+    ensure_no_symlink_components, ensure_private_dir,
     has_prepared_dependency_input_or_ledger_entry, is_host_lock_held,
     read_host_launch_intent_optional, read_host_manifest_optional, validate_approval_id,
     validate_canonical_thread_uuid, validate_identifier, validate_sessions_root,
@@ -31,7 +34,10 @@ use crate::approved_mcp::{
     open_host_stores_with_known_dirs, StartApprovedTaskParams,
 };
 use crate::error::{NativeError, NativeErrorCode};
-use crate::fs_safety::{ensure_platform_supported, sanitize_diagnostic_text, sanitize_io_error};
+use crate::fs_safety::{
+    constant_time_str_eq, ensure_platform_supported, read_private_file_bounded,
+    sanitize_diagnostic_text, sanitize_io_error, write_private_file_atomic,
+};
 use crate::mcp_pair::{open_workflow_stores, PairedMcpServer};
 use crate::pairing::PairingStore;
 use crate::rpc::is_process_alive;
@@ -53,6 +59,39 @@ const POST_TIMEOUT_INTENT_BOOKKEEPING_TIMEOUT: Duration = Duration::from_millis(
 
 /// Default binary name of the sibling approved-host executable.
 pub const DEFAULT_HOST_EXECUTABLE_NAME: &str = "threadlane-host";
+
+/// Private subdirectory under the operator authority store holding immutable, per-approval
+/// native notification context files. It is deliberately outside the fresh host session leaf so
+/// session ownership checks never see unexpected entries.
+const HOST_NATIVE_NOTICE_CONTEXT_SUBDIR: &str = ".host-native-notices";
+
+/// Per-request managed native notification scope derived from the enrolled binding, verified
+/// observation context, and verified managed parent endpoint.
+#[derive(Debug, Clone)]
+pub(crate) struct ManagedHostNoticeTarget {
+    pub(crate) reconnect: NativeReconnectConfig,
+    pub(crate) backend_pid: u32,
+    pub(crate) thread_uuid: String,
+    pub(crate) project_path: PathBuf,
+    pub(crate) verified_socket_path: Option<PathBuf>,
+}
+
+/// Request-scoped managed native notification decision for direct approved-task startup.
+#[derive(Debug, Clone)]
+pub(crate) enum ManagedHostNoticeRequest {
+    /// The caller did not opt into managed native notices or has no fresh-host launcher.
+    NotRequested,
+    /// The caller opted in, but no independently verified managed parent/observation target exists.
+    Unavailable,
+    /// A verified managed target that may be attached only to an eligible fresh host launch.
+    Verified(ManagedHostNoticeTarget),
+}
+
+#[derive(Debug, Clone)]
+struct PreparedHostNativeNotice {
+    context_path: PathBuf,
+    notify_executable: PathBuf,
+}
 
 /// Command-line interface for the `threadlane-native-mcp` paired stdio server.
 ///
@@ -134,7 +173,9 @@ pub struct NativeMcpCli {
 
     /// Explicit operator-only opt-in (disabled by default) allowing `consult_architect`,
     /// `request_technical_plan`, and `start_execution` to configure scoped native coworker
-    /// completion and milestone notices for the verified MCP parent session. Requires
+    /// completion and milestone notices for the verified MCP parent session. When combined with
+    /// `--auto-start-approved-hosts`, an eligible initial direct `start_approved_task` launch also
+    /// attaches the same fixed native notice transport before spawning its fresh host. Requires
     /// `--registry-dir`, `--plans-dir`, `--authority-dir`, and `--sessions-dir`.
     #[arg(
         long = "coworker-native-notices",
@@ -208,6 +249,17 @@ mod native_notice_cli_flag_tests {
                 .unwrap()
                 .coworker_native_notices
         );
+
+        let mut managed_args = base_args();
+        for (flag, value) in store_args() {
+            managed_args.push(flag);
+            managed_args.push(value);
+        }
+        managed_args.push("--coworker-native-notices");
+        managed_args.push("--auto-start-approved-hosts");
+        let managed = NativeMcpCli::try_parse_from(managed_args).unwrap();
+        assert!(managed.coworker_native_notices);
+        assert!(managed.auto_start_approved_hosts);
     }
 }
 
@@ -503,7 +555,9 @@ impl ApprovedHostLauncherPolicy {
     /// Builds the exact direct argument vector for launching a brand-new `threadlane-host`
     /// session (`serve --registry-dir ... --plans-dir ... --authority-dir ... --sessions-dir ... --approval-id ... --start-fresh-only`).
     ///
-    /// Never includes `--notify-codex`, `--notify-timeout-ms`, or `--restart-from-instance-id`.
+    /// The default vector never includes notification flags or `--restart-from-instance-id`.
+    /// Managed opt-in notification arguments are appended only after a verified fresh launch
+    /// permit is prepared.
     pub fn build_fresh_host_serve_args(
         registry_dir: &Path,
         plans_dir: &Path,
@@ -526,6 +580,212 @@ impl ApprovedHostLauncherPolicy {
             OsString::from("--start-fresh-only"),
         ]
     }
+}
+
+fn append_native_notice_args(args: &mut Vec<OsString>, notice: &PreparedHostNativeNotice) {
+    args.push(OsString::from("--notify-codex"));
+    args.push(notice.notify_executable.as_os_str().to_os_string());
+    // Keep the fixed software-owned MCP route and native context transport explicit. The host
+    // rejects any `operator-cli`/queue fallback when a native context is supplied.
+    args.push(OsString::from("--notify-route"));
+    args.push(OsString::from("mcp"));
+    args.push(OsString::from("--notify-tool-output-context"));
+    args.push(notice.context_path.as_os_str().to_os_string());
+}
+
+fn canonicalize_notice_project_root(path: &Path, label: &str) -> Result<PathBuf, HostError> {
+    let checked = ensure_no_symlink_components(path)?;
+    fs::canonicalize(&checked).map_err(|err| HostError::Validation {
+        field: "project_root".to_string(),
+        reason: format!(
+            "{label} could not be canonicalized: {}",
+            sanitize_io_error(&err)
+        ),
+    })
+}
+
+fn map_notice_context_native_error(err: NativeError) -> HostError {
+    match err.error_code() {
+        NativeErrorCode::SecurityViolation => HostError::SecurityViolation {
+            path: "host native notice context".to_string(),
+            reason: "private native notice context failed security validation".to_string(),
+        },
+        NativeErrorCode::OutputOverflow => HostError::Validation {
+            field: "native_notice_context".to_string(),
+            reason: "native notice context exceeds its bounded size".to_string(),
+        },
+        _ => HostError::Io {
+            operation: "host native notice context".to_string(),
+            reason: sanitize_diagnostic_text(err.message()),
+        },
+    }
+}
+
+fn persist_host_native_notice_context(
+    authority_dir: &Path,
+    filename: &str,
+    bytes: &[u8],
+) -> Result<PathBuf, HostError> {
+    let context_dir = ensure_private_dir(&authority_dir.join(HOST_NATIVE_NOTICE_CONTEXT_SUBDIR))?;
+    let context_path = context_dir.join(filename);
+    match read_private_file_bounded(
+        &context_path,
+        MAX_NATIVE_TOOL_OUTPUT_CONFIG_BYTES as usize,
+        "host native notice context",
+    )
+    .map_err(map_notice_context_native_error)?
+    {
+        Some(existing) => {
+            if existing.as_slice() != bytes {
+                return Err(HostError::SecurityViolation {
+                    path: "host native notice context".to_string(),
+                    reason:
+                        "immutable host native notice context conflicts with the verified target"
+                            .to_string(),
+                });
+            }
+        }
+        None => {
+            write_private_file_atomic(&context_dir, filename, bytes, "host native notice context")
+                .map_err(map_notice_context_native_error)?;
+        }
+    }
+    Ok(context_path)
+}
+
+fn map_notice_preparation_error(err: HostError) -> HostError {
+    match err {
+        // Deadline expiry before any launch intent or spawn is a known pre-effect refusal, not an
+        // uncertain host-start outcome.
+        HostError::HostNotReady { .. } => HostError::Validation {
+            field: "coworker_native_notices".to_string(),
+            reason: "managed native notice target verification timed out before host spawn"
+                .to_string(),
+        },
+        other => other,
+    }
+}
+
+async fn resolve_verified_notice_socket(
+    reconnect: NativeReconnectConfig,
+    backend_pid: u32,
+) -> Result<PathBuf, HostError> {
+    #[cfg(unix)]
+    {
+        let stream = reconnect
+            .connect_verified_stream_for_backend(Some(backend_pid))
+            .await
+            .map_err(HostError::from)?;
+        let peer = stream.peer_addr().map_err(|err| HostError::Io {
+            operation: "peer_addr(native notice endpoint)".to_string(),
+            reason: sanitize_io_error(&err),
+        })?;
+        let socket_path =
+            peer.as_pathname()
+                .map(Path::to_path_buf)
+                .ok_or_else(|| HostError::Validation {
+                    field: "socket_path".to_string(),
+                    reason: "verified native notice endpoint socket must have a pathname"
+                        .to_string(),
+                })?;
+        drop(stream);
+        Ok(socket_path)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (reconnect, backend_pid);
+        Err(HostError::Validation {
+            field: "coworker_native_notices".to_string(),
+            reason: "managed native notices are supported only on Unix".to_string(),
+        })
+    }
+}
+
+async fn prepare_host_native_notice_context(
+    startup_deadline: Instant,
+    authority_dir: &Path,
+    record: &ApprovalRecord,
+    target: &ManagedHostNoticeTarget,
+) -> Result<PreparedHostNativeNotice, HostError> {
+    if !constant_time_str_eq(&target.thread_uuid, &record.thread_uuid) {
+        return Err(HostError::ScopeMismatch {
+            field: "thread_uuid".to_string(),
+            expected: "<redacted>".to_string(),
+            actual: "<redacted>".to_string(),
+            reason: "native notice target thread_uuid does not match the frozen approval thread"
+                .to_string(),
+        });
+    }
+
+    let observed_project =
+        canonicalize_notice_project_root(&target.project_path, "native notice observed project")?;
+    let approved_repository =
+        canonicalize_notice_project_root(&record.repository_path, "approved repository_path")?;
+    if observed_project != approved_repository {
+        return Err(HostError::ScopeMismatch {
+            field: "repository_path".to_string(),
+            expected: "<redacted>".to_string(),
+            actual: "<redacted>".to_string(),
+            reason: "native notice observed project does not match the frozen approval repository"
+                .to_string(),
+        });
+    }
+
+    let socket_path = match target.verified_socket_path.as_ref() {
+        Some(path) => path.clone(),
+        None => {
+            let reconnect = target.reconnect.clone();
+            let backend_pid = target.backend_pid;
+            run_within_startup_deadline(
+                startup_deadline,
+                &record.approval_id,
+                None,
+                resolve_verified_notice_socket(reconnect, backend_pid),
+            )
+            .await?
+        }
+    };
+
+    let config = NativeToolOutputConfig::new_user_message_steer(
+        socket_path,
+        record.thread_uuid.clone(),
+        record.repository_path.clone(),
+    )
+    .with_reconnect(Some(target.reconnect.clone()));
+    config.validate().map_err(HostError::from)?;
+
+    let mut bytes = serde_json::to_vec_pretty(&config).map_err(|_| HostError::Validation {
+        field: "native_notice_context".to_string(),
+        reason: "failed to serialize native notice context".to_string(),
+    })?;
+    bytes.push(b'\n');
+    if bytes.len() as u64 > MAX_NATIVE_TOOL_OUTPUT_CONFIG_BYTES {
+        return Err(HostError::Validation {
+            field: "native_notice_context".to_string(),
+            reason: "native notice context exceeds its bounded size".to_string(),
+        });
+    }
+
+    let filename = format!("{}-{}.json", record.approval_id, config.digest());
+    let authority_dir = authority_dir.to_path_buf();
+    let approval_id = record.approval_id.clone();
+    let context_path =
+        run_within_startup_deadline(startup_deadline, &approval_id, None, async move {
+            tokio::task::spawn_blocking(move || {
+                persist_host_native_notice_context(&authority_dir, &filename, &bytes)
+            })
+            .await
+            .map_err(|err| HostError::Io {
+                operation: "spawn_blocking(persist_host_native_notice_context)".to_string(),
+                reason: err.to_string(),
+            })?
+        })
+        .await?;
+
+    Ok(PreparedHostNativeNotice {
+        context_path,
+        notify_executable: target.reconnect.backend_executable.clone(),
+    })
 }
 
 #[derive(Debug)]
@@ -1866,6 +2126,38 @@ where
         trusted_thread_uuid,
         params,
         launcher,
+        ManagedHostNoticeRequest::NotRequested,
+        None,
+        recheck_enrollment,
+        |()| Ok(()),
+    )
+    .await
+}
+
+/// Test-only wrapper that supplies an explicit request-scoped managed notice decision.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn execute_start_approved_task_with_launcher_and_notice<F>(
+    authority: Arc<AuthorityStore>,
+    sessions_dir: PathBuf,
+    trusted_binding_id: String,
+    trusted_thread_uuid: String,
+    params: StartApprovedTaskParams,
+    launcher: Option<Arc<ApprovedHostLauncher>>,
+    notice: ManagedHostNoticeRequest,
+    recheck_enrollment: F,
+) -> Result<CallToolResult, CallToolResult>
+where
+    F: Fn() -> Result<(), CallToolResult> + Send + Sync + 'static,
+{
+    execute_start_approved_task_with_launcher_until(
+        authority,
+        sessions_dir,
+        trusted_binding_id,
+        trusted_thread_uuid,
+        params,
+        launcher,
+        notice,
         None,
         recheck_enrollment,
         |()| Ok(()),
@@ -1875,6 +2167,10 @@ where
 
 /// Executes `start_approved_task` with optional initial fresh-only host auto-start bounded by
 /// `startup_deadline` (or `Instant::now() + launcher.policy().startup_timeout()` when `None`).
+///
+/// A request-scoped [`ManagedHostNoticeRequest`] is consulted only for a truly eligible initial
+/// fresh launch, after approval/conversation guards and before pending-intent persistence or
+/// process spawn. Already-running or refused sessions never consume or attach it.
 ///
 /// Offloads `blocking_recheck` onto `spawn_blocking` under `startup_deadline`, then executes
 /// `verify_on_task` directly on the caller's async task so task-local native chat identity
@@ -1887,6 +2183,7 @@ pub(crate) async fn execute_start_approved_task_with_launcher_until<T, B, V>(
     trusted_thread_uuid: String,
     params: StartApprovedTaskParams,
     launcher: Option<Arc<ApprovedHostLauncher>>,
+    managed_host_notice: ManagedHostNoticeRequest,
     startup_deadline: Option<Instant>,
     blocking_recheck: B,
     verify_on_task: V,
@@ -2159,7 +2456,7 @@ where
                             tracked_pid,
                         };
                     }
-                    TryPrepareFreshLaunch::ReadyToSpawn(permit) => {
+                    TryPrepareFreshLaunch::ReadyToSpawn(mut permit) => {
                         // 1. Re-verify `startup_deadline` and caller enrollment off the async
                         //    executor (bounded by `startup_deadline`) while the live request owns
                         //    `permit` without moving `permit` into the background task.
@@ -2184,7 +2481,45 @@ where
                             return Err(enroll_err);
                         }
 
-                        // 2. Persist the durable `Pending` launch intent off-thread bounded by
+                        // 2. This is a truly eligible initial fresh launch. Only now, before any
+                        //    pending intent or process spawn, attach the request-scoped managed
+                        //    native notice target. Failures are known pre-effect refusals; they
+                        //    never produce a launch intent or an `outcome_unknown` response.
+                        let prepared_notice = match &managed_host_notice {
+                            ManagedHostNoticeRequest::NotRequested => None,
+                            ManagedHostNoticeRequest::Unavailable => {
+                                drop(permit);
+                                return Err(format_start_host_error(
+                                    &trusted_binding_id,
+                                    &HostError::Validation {
+                                        field: "coworker_native_notices".to_string(),
+                                        reason:
+                                            "coworker native notices require a verified managed native MCP session"
+                                                .to_string(),
+                                    },
+                                ));
+                            }
+                            ManagedHostNoticeRequest::Verified(target) => Some(
+                                prepare_host_native_notice_context(
+                                    startup_deadline,
+                                    authority.dir(),
+                                    &record,
+                                    target,
+                                )
+                                .await
+                                .map_err(|err| {
+                                    format_start_host_error(
+                                        &trusted_binding_id,
+                                        &map_notice_preparation_error(err),
+                                    )
+                                })?,
+                            ),
+                        };
+                        if let Some(ref notice) = prepared_notice {
+                            append_native_notice_args(&mut permit.args, notice);
+                        }
+
+                        // 3. Persist the durable `Pending` launch intent off-thread bounded by
                         //    `startup_deadline` with zero process-spawn capability in the
                         //    background task, then revalidate deadline and enrollment on the live
                         //    request before `command.spawn()`.

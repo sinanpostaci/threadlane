@@ -10,6 +10,8 @@ use clap::{CommandFactory, Parser};
 use rmcp::handler::server::wrapper::Parameters;
 use serde_json::{json, Value};
 use tempfile::TempDir;
+#[cfg(target_os = "linux")]
+use threadlane::{NativeNotificationDelivery, NativeReconnectConfig, NativeToolOutputConfig};
 use threadlane::{
     ScopedClient, Supervisor, SupervisorClient, SupervisorConfig, SupervisorHandle,
     ThreadlaneMcpServer, DATABASE_FILENAME,
@@ -38,6 +40,11 @@ use threadlane_workflow::{
     ToolDefinition, WorkflowProfile, WorkflowRole, MAX_MCP_RESPONSE_BYTES,
 };
 
+#[cfg(target_os = "linux")]
+use crate::host_launcher::{
+    execute_start_approved_task_with_launcher_and_notice, ApprovedHostLauncher,
+    ManagedHostNoticeRequest, ManagedHostNoticeTarget,
+};
 use crate::{
     is_process_alive, open_host_stores, open_workflow_stores, validate_host_executable_path,
     ApprovalSummaryPage, ApprovedAckEventsParams, ApprovedActivityPage, ApprovedActivityParams,
@@ -669,6 +676,361 @@ fn read_invocation_count(path: &Path) -> u32 {
         Ok(s) => s.trim().parse::<u32>().unwrap_or(0),
         Err(_) => 0,
     }
+}
+
+#[cfg(target_os = "linux")]
+fn read_ppid(pid: u32) -> u32 {
+    let stat_path = format!("/proc/{pid}/stat");
+    let raw = fs::read_to_string(&stat_path).expect("read /proc/<pid>/stat");
+    let rparen = raw.rfind(')').expect("closing paren in /proc/<pid>/stat");
+    let after = &raw[rparen + 1..];
+    let mut fields = after.split_whitespace();
+    let _state = fields.next().expect("process state field");
+    fields
+        .next()
+        .expect("process ppid field")
+        .parse::<u32>()
+        .expect("numeric ppid")
+}
+
+#[cfg(target_os = "linux")]
+fn managed_notice_target_for_test(
+    fixture: &ApprovedMcpFixture,
+    thread_uuid: &str,
+    project_path: &Path,
+) -> (ManagedHostNoticeTarget, std::os::unix::net::UnixListener) {
+    let descriptor_root = fixture.root.join("native-notice-descriptor-root");
+    ensure_private_dir(&descriptor_root).expect("create native notice descriptor root");
+    let session_dir = descriptor_root.join("tl-codex-managed-notice");
+    ensure_private_dir(&session_dir).expect("create native notice session dir");
+    let socket_path = session_dir.join("codex.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket_path)
+        .expect("bind fake native notice endpoint");
+    fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))
+        .expect("chmod fake native notice socket");
+
+    let backend_pid = std::process::id();
+    let wrapper_pid = read_ppid(backend_pid);
+    let app_pid = if wrapper_pid > 1 {
+        read_ppid(wrapper_pid)
+    } else {
+        1
+    };
+    let backend_executable = fs::canonicalize("/proc/self/exe").expect("canonical backend");
+    let app_executable = fs::canonicalize(format!("/proc/{app_pid}/exe"));
+    let live_process_chain = wrapper_pid > 1 && app_pid > 1 && app_executable.is_ok();
+    let application_executable = app_executable.unwrap_or_else(|_| backend_executable.clone());
+    if live_process_chain {
+        let descriptor = json!({
+            "schema_version": 1,
+            "wrapper_pid": wrapper_pid,
+            "backend_pid": backend_pid,
+            "socket_path": socket_path.clone(),
+            "real_codex": backend_executable.clone(),
+            "transport": "unix_websocket",
+        });
+        let descriptor_path = session_dir.join("descriptor.json");
+        fs::write(
+            &descriptor_path,
+            serde_json::to_vec_pretty(&descriptor).expect("serialize native notice descriptor"),
+        )
+        .expect("write native notice descriptor");
+        fs::set_permissions(&descriptor_path, fs::Permissions::from_mode(0o600))
+            .expect("chmod native notice descriptor");
+    }
+
+    let reconnect = NativeReconnectConfig {
+        descriptor_root: fs::canonicalize(&descriptor_root).expect("canonical descriptor root"),
+        backend_executable,
+        application_executable,
+    };
+    (
+        ManagedHostNoticeTarget {
+            reconnect,
+            backend_pid,
+            thread_uuid: thread_uuid.to_string(),
+            project_path: project_path.to_path_buf(),
+            // Production leaves this absent so the launcher resolves and peer-validates the live
+            // managed endpoint under the startup deadline. Restricted CI parent chains that cannot
+            // expose a three-process ancestry use the already-bound fake socket instead.
+            verified_socket_path: (!live_process_chain).then_some(socket_path),
+        },
+        listener,
+    )
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn managed_native_notice_requires_exact_verified_fresh_worker_scope() {
+    let fixture = setup_approved_mcp_fixture().await;
+
+    let (rev, digest) = create_published_plan(
+        &fixture,
+        "plan-managed-native-notice",
+        &fixture.binding_a,
+        default_plan_tasks("Managed native notice scope test"),
+    );
+    let approval = approve_published_plan(
+        &fixture,
+        "plan-managed-native-notice",
+        rev,
+        &digest,
+        &fixture.binding_a,
+        THREAD_UUID_A,
+        vec!["task-root-agy".to_string()],
+        1_700_000_800_000,
+    );
+
+    let spy_exe = fixture.root.join("bin/spy-native-notice-host");
+    let spy_count = fixture.root.join("spy-native-notice-count.txt");
+    let spy_argv = fixture.root.join("spy-native-notice-argv.txt");
+    let spy_pid = fixture.root.join("spy-native-notice-pid.txt");
+    write_spy_host_script(&spy_exe, &spy_count, &spy_argv, &spy_pid, 0, None);
+
+    let policy = ApprovedHostLauncherPolicy::new(&spy_exe)
+        .expect("valid native notice host policy")
+        .with_startup_timeout(Duration::from_millis(300))
+        .expect("300ms startup timeout");
+    let launcher = Arc::new(ApprovedHostLauncher::new(policy));
+    let params = StartApprovedTaskParams {
+        approval_id: approval.approval_id.clone(),
+        task_id: "task-root-agy".to_string(),
+    };
+    let (target, _native_listener) =
+        managed_notice_target_for_test(&fixture, THREAD_UUID_A, &fixture.repo_dir);
+
+    let mut wrong_thread = target.clone();
+    wrong_thread.thread_uuid = THREAD_UUID_B.to_string();
+    let wrong_thread_err = execute_start_approved_task_with_launcher_and_notice(
+        Arc::clone(&fixture.authority),
+        fixture.sessions_dir.clone(),
+        fixture.binding_a.clone(),
+        THREAD_UUID_A.to_string(),
+        params.clone(),
+        Some(Arc::clone(&launcher)),
+        ManagedHostNoticeRequest::Verified(wrong_thread),
+        || Ok(()),
+    )
+    .await
+    .expect_err("wrong-thread native notice target must refuse before spawn");
+    assert_eq!(
+        wrong_thread_err.structured_content.unwrap()["error"]["code"],
+        "scope_mismatch"
+    );
+
+    let mut wrong_repository = target.clone();
+    wrong_repository.project_path = fixture.root.clone();
+    let wrong_repository_err = execute_start_approved_task_with_launcher_and_notice(
+        Arc::clone(&fixture.authority),
+        fixture.sessions_dir.clone(),
+        fixture.binding_a.clone(),
+        THREAD_UUID_A.to_string(),
+        params.clone(),
+        Some(Arc::clone(&launcher)),
+        ManagedHostNoticeRequest::Verified(wrong_repository),
+        || Ok(()),
+    )
+    .await
+    .expect_err("wrong-repository native notice target must refuse before spawn");
+    assert_eq!(
+        wrong_repository_err.structured_content.unwrap()["error"]["code"],
+        "scope_mismatch"
+    );
+
+    let unavailable_err = execute_start_approved_task_with_launcher_and_notice(
+        Arc::clone(&fixture.authority),
+        fixture.sessions_dir.clone(),
+        fixture.binding_a.clone(),
+        THREAD_UUID_A.to_string(),
+        params.clone(),
+        Some(Arc::clone(&launcher)),
+        ManagedHostNoticeRequest::Unavailable,
+        || Ok(()),
+    )
+    .await
+    .expect_err("opted-in notices without a verified managed parent must refuse before spawn");
+    assert_eq!(
+        unavailable_err.structured_content.unwrap()["error"]["code"],
+        "validation_failed"
+    );
+    assert_eq!(read_invocation_count(&spy_count), 0);
+    assert!(!fixture.authority_dir.join(".host-native-notices").exists());
+    let record = fixture
+        .authority
+        .get_for_operator(&approval.approval_id)
+        .expect("get native notice approval record");
+    assert!(
+        read_host_launch_intent_optional(&fixture.sessions_dir, &record)
+            .expect("read launch intent after notice-scope refusals")
+            .is_none(),
+        "known pre-effect notice refusals must not persist an Unknown launch intent"
+    );
+    assert!(
+        !fixture.sessions_dir.join(&approval.approval_id).exists(),
+        "known pre-effect notice refusals must not create the session directory"
+    );
+
+    let verified_err = execute_start_approved_task_with_launcher_and_notice(
+        Arc::clone(&fixture.authority),
+        fixture.sessions_dir.clone(),
+        fixture.binding_a.clone(),
+        THREAD_UUID_A.to_string(),
+        params.clone(),
+        Some(Arc::clone(&launcher)),
+        ManagedHostNoticeRequest::Verified(target.clone()),
+        || Ok(()),
+    )
+    .await
+    .expect_err("spy host exits without reaching Ready after the verified fresh launch");
+    assert_eq!(
+        verified_err.structured_content.unwrap()["error"]["code"],
+        "host_not_ready"
+    );
+    assert_eq!(read_invocation_count(&spy_count), 1);
+
+    let duplicate_err = execute_start_approved_task_with_launcher_and_notice(
+        Arc::clone(&fixture.authority),
+        fixture.sessions_dir.clone(),
+        fixture.binding_a.clone(),
+        THREAD_UUID_A.to_string(),
+        params,
+        Some(Arc::clone(&launcher)),
+        ManagedHostNoticeRequest::Verified(target.clone()),
+        || Ok(()),
+    )
+    .await
+    .expect_err("unknown first-launch outcome must not be replayed");
+    assert_eq!(
+        duplicate_err.structured_content.unwrap()["error"]["code"],
+        "host_not_ready"
+    );
+    assert_eq!(
+        read_invocation_count(&spy_count),
+        1,
+        "duplicate start must not spawn or replay another notice-bearing fresh host"
+    );
+
+    let recorded_args: Vec<String> = fs::read_to_string(&spy_argv)
+        .expect("read native notice host argv")
+        .lines()
+        .map(str::to_string)
+        .collect();
+    let notify_codex = recorded_args
+        .iter()
+        .position(|arg| arg == "--notify-codex")
+        .expect("--notify-codex must be attached to the eligible fresh host");
+    assert_eq!(
+        recorded_args[notify_codex + 1],
+        target.reconnect.backend_executable.display().to_string()
+    );
+    let notify_route = recorded_args
+        .iter()
+        .position(|arg| arg == "--notify-route")
+        .expect("--notify-route must be explicit");
+    assert_eq!(recorded_args[notify_route + 1], "mcp");
+    let context_arg = recorded_args
+        .iter()
+        .position(|arg| arg == "--notify-tool-output-context")
+        .expect("--notify-tool-output-context must be attached");
+    let context_path = PathBuf::from(&recorded_args[context_arg + 1]);
+    assert!(context_path.starts_with(&fixture.authority_dir));
+    assert!(
+        !context_path.starts_with(fixture.sessions_dir.join(&approval.approval_id)),
+        "native notice context must not pollute the fresh host session directory"
+    );
+    let context_dir = context_path.parent().expect("notice context parent");
+    assert_eq!(
+        fs::symlink_metadata(context_dir)
+            .expect("stat notice context dir")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    assert_eq!(
+        fs::symlink_metadata(&context_path)
+            .expect("stat notice context")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+
+    let context = NativeToolOutputConfig::load(&context_path).expect("load native notice context");
+    assert_eq!(
+        context.delivery,
+        NativeNotificationDelivery::UserMessageSteer
+    );
+    assert_eq!(context.thread_id, THREAD_UUID_A);
+    assert_eq!(
+        context.project_root,
+        fs::canonicalize(&fixture.repo_dir).expect("canonical repo")
+    );
+    assert_eq!(context.reconnect.as_ref(), Some(&target.reconnect));
+    assert!(context.model.is_empty());
+    assert!(context.effort.is_empty());
+}
+
+#[tokio::test]
+async fn managed_notice_opt_in_without_verified_parent_refuses_fresh_launch() {
+    let fixture = setup_approved_mcp_fixture().await;
+
+    let (rev, digest) = create_published_plan(
+        &fixture,
+        "plan-managed-notice-unverified-parent",
+        &fixture.binding_a,
+        default_plan_tasks("Managed notice unverified parent test"),
+    );
+    let approval = approve_published_plan(
+        &fixture,
+        "plan-managed-notice-unverified-parent",
+        rev,
+        &digest,
+        &fixture.binding_a,
+        THREAD_UUID_A,
+        vec!["task-root-agy".to_string()],
+        1_700_000_900_000,
+    );
+
+    let spy_exe = fixture.root.join("bin/spy-unverified-notice-host");
+    let spy_count = fixture.root.join("spy-unverified-notice-count.txt");
+    let spy_argv = fixture.root.join("spy-unverified-notice-argv.txt");
+    let spy_pid = fixture.root.join("spy-unverified-notice-pid.txt");
+    write_spy_host_script(&spy_exe, &spy_count, &spy_argv, &spy_pid, 0, None);
+
+    let policy = ApprovedHostLauncherPolicy::new(&spy_exe).expect("valid unverified notice policy");
+    let mcp = PairedMcpServer::new(&fixture.state_dir, fixture.pairing_store.clone())
+        .expect("create unverified notice MCP server")
+        .with_host_stores(Arc::clone(&fixture.authority), &fixture.sessions_dir)
+        .with_host_launcher_policy(policy)
+        .expect("attach unverified notice launcher policy")
+        .with_coworker_native_notices(true);
+    enroll_server(&fixture, &mcp, &fixture.binding_a, THREAD_UUID_A).await;
+
+    let err = mcp
+        .invoke_tool_json(
+            "start_approved_task",
+            json!({
+                "approval_id": approval.approval_id,
+                "task_id": "task-root-agy"
+            }),
+            None,
+        )
+        .await
+        .expect_err("managed notices without a verified managed parent must refuse fresh launch");
+    assert_eq!(
+        err.structured_content.unwrap()["error"]["code"],
+        "validation_failed"
+    );
+    assert_eq!(
+        read_invocation_count(&spy_count),
+        0,
+        "unverified managed notice scope must not spawn a host"
+    );
+    assert!(
+        !fixture.sessions_dir.join(&approval.approval_id).exists(),
+        "pre-effect notice refusal must not create a session directory"
+    );
 }
 
 #[tokio::test]
@@ -3860,6 +4222,8 @@ async fn codex_first_live_subprocess_auto_start_exact_argv_readiness_and_dispatc
                                 assert!(serve_args.restart_from_instance_id.is_none());
                                 assert!(serve_args.notify_codex.is_none());
                                 assert!(serve_args.notify_timeout_ms.is_none());
+                                assert!(serve_args.notify_route.is_none());
+                                assert!(serve_args.notify_tool_output_context.is_none());
                                 let cfg = serve_args
                                     .into_host_config()
                                     .expect("valid ApprovedHostConfig from spawned argv")
