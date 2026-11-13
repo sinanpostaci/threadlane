@@ -3406,6 +3406,10 @@ export function WorkspaceChatWorkSurface({
   const streamRef = useRef<HTMLDivElement | null>(null);
   const listRef = useRef<HTMLOListElement | null>(null);
   const backlogTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const programmaticScrollRef = useRef<{
+    chatKey: string;
+    targetTop: number;
+  } | null>(null);
   const lastLayoutSizeRef = useRef<{
     chatKey: string;
     clientHeight: number;
@@ -3486,9 +3490,42 @@ export function WorkspaceChatWorkSurface({
     setBacklogOpen(false);
   }, [chatKey]);
 
+  // Record every self-issued scroll target for the current chat. A matching
+  // delayed scroll event belongs to the programmatic assignment, even if a
+  // responsive layout changed the stream's metrics before the event fired. A
+  // real user scroll moves to a different offset, so it is never suppressed;
+  // the guard is consumed by one matching event and cleared by any other.
+  const applyStreamScrollTop = useCallback(
+    (scroller: HTMLDivElement, rawTargetTop: number) => {
+      const maxTop = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+      const targetTop = Math.min(maxTop, Math.max(0, rawTargetTop));
+      const pending = programmaticScrollRef.current;
+      if (Math.abs(scroller.scrollTop - targetTop) <= 0.5) {
+        if (
+          pending !== null &&
+          pending.chatKey === chatKey &&
+          Math.abs(pending.targetTop - targetTop) > 0.5
+        ) {
+          programmaticScrollRef.current = { chatKey, targetTop };
+        }
+        scroller.scrollTop = targetTop;
+        return;
+      }
+      programmaticScrollRef.current = { chatKey, targetTop };
+      scroller.scrollTop = targetTop;
+    },
+    [chatKey],
+  );
+
   // Reconcile appends, head trims, and chat switches before paint using the
   // shared message anchor reducer keyed by stable event ids.
   useLayoutEffect(() => {
+    if (
+      programmaticScrollRef.current !== null &&
+      programmaticScrollRef.current.chatKey !== chatKey
+    ) {
+      programmaticScrollRef.current = null;
+    }
     scrollStoreRef.current = switchMessageScrollChat(scrollStoreRef.current, chatKey);
     const currentState = getActiveChatScrollState(scrollStoreRef.current);
     const sync = syncChatWorkEventScroll(currentState, eventViews);
@@ -3504,7 +3541,10 @@ export function WorkspaceChatWorkSurface({
     }
 
     if (sync.action.kind === 'scroll_to_bottom') {
-      scroller.scrollTop = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+      applyStreamScrollTop(
+        scroller,
+        Math.max(0, scroller.scrollHeight - scroller.clientHeight),
+      );
     } else if (sync.action.kind === 'preserve_anchor') {
       const anchor = sync.action.anchor;
       const { metrics, items } = measureDomMessageViewport(
@@ -3513,14 +3553,17 @@ export function WorkspaceChatWorkSurface({
       );
       const found = items.find((entry) => entry.itemId === anchor.itemId);
       if (found) {
-        scroller.scrollTop = computeAnchorScrollTop(
-          metrics,
-          found.relativeTopPx,
-          anchor.offsetPx,
+        applyStreamScrollTop(
+          scroller,
+          computeAnchorScrollTop(
+            metrics,
+            found.relativeTopPx,
+            anchor.offsetPx,
+          ),
         );
       }
     } else if (eventViews.length === 0 && scroller.scrollTop !== 0) {
-      scroller.scrollTop = 0;
+      applyStreamScrollTop(scroller, 0);
     }
 
     lastLayoutSizeRef.current = {
@@ -3528,7 +3571,7 @@ export function WorkspaceChatWorkSurface({
       clientHeight: scroller.clientHeight,
       scrollHeight: scroller.scrollHeight,
     };
-  }, [chatKey, eventViews, syncUiScroll]);
+  }, [chatKey, eventViews, applyStreamScrollTop, syncUiScroll]);
 
   const reconcileStreamViewport = useCallback(() => {
     const scroller = streamRef.current;
@@ -3548,9 +3591,9 @@ export function WorkspaceChatWorkSurface({
     syncUiScroll(decision.state);
 
     if (decision.action.kind === 'scroll_to_bottom') {
-      scroller.scrollTop = decision.action.targetScrollTop;
+      applyStreamScrollTop(scroller, decision.action.targetScrollTop);
     } else if (decision.action.kind === 'restore_anchor') {
-      scroller.scrollTop = decision.action.targetScrollTop;
+      applyStreamScrollTop(scroller, decision.action.targetScrollTop);
     }
 
     lastLayoutSizeRef.current = {
@@ -3558,7 +3601,7 @@ export function WorkspaceChatWorkSurface({
       clientHeight: scroller.clientHeight,
       scrollHeight: scroller.scrollHeight,
     };
-  }, [chatKey, syncUiScroll]);
+  }, [chatKey, applyStreamScrollTop, syncUiScroll]);
 
   // Observe both the scrollport and the event list so text reflow above the
   // viewport restores the reading anchor instead of drifting or jumping.
@@ -3585,6 +3628,22 @@ export function WorkspaceChatWorkSurface({
     if (scroller.clientHeight === 0 && scroller.scrollHeight === 0) {
       return;
     }
+    const pendingScroll = programmaticScrollRef.current;
+    if (
+      pendingScroll !== null &&
+      pendingScroll.chatKey === chatKey &&
+      Math.abs(scroller.scrollTop - pendingScroll.targetTop) <= 2
+    ) {
+      programmaticScrollRef.current = null;
+      lastLayoutSizeRef.current = {
+        chatKey,
+        clientHeight: scroller.clientHeight,
+        scrollHeight: scroller.scrollHeight,
+      };
+      return;
+    }
+    programmaticScrollRef.current = null;
+
     const currentState = getChatScrollState(scrollStoreRef.current, chatKey);
     const maxTop = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
 
@@ -3631,9 +3690,12 @@ export function WorkspaceChatWorkSurface({
 
     const scroller = streamRef.current;
     if (scroller) {
-      scroller.scrollTop = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+      applyStreamScrollTop(
+        scroller,
+        Math.max(0, scroller.scrollHeight - scroller.clientHeight),
+      );
     }
-  }, [chatKey, syncUiScroll]);
+  }, [chatKey, applyStreamScrollTop, syncUiScroll]);
 
   return (
     <div className="tl-cw-root" data-chat-work-surface="true">

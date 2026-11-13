@@ -1,4 +1,4 @@
-import type { Page } from '@playwright/test';
+import { expect, type Locator, type Page } from '@playwright/test';
 import type { CodexSetupReport } from '../../src/codex-setup/types.ts';
 import type {
   ObservationActor,
@@ -24,6 +24,7 @@ import {
   parseWorkspaceSnapshot,
   regenerateWorkspaceSnapshotAt,
   validateWorkspaceChatIdentity,
+  workspaceChatIdentitiesEqual,
   WORKSPACE_CHAT_ARCHIVE_STORAGE_KEY,
   WORKSPACE_METADATA_TIMEOUT_MS,
   WORKSPACE_SAMPLE_STALE_THRESHOLD_MS,
@@ -32,6 +33,7 @@ import {
   type WorkspaceAcceptanceProof,
   type WorkspaceChatIdentity,
   type WorkspaceChatSummary,
+  type WorkspaceChatWork,
   type WorkspaceExternalResolution,
   type WorkspaceJobHistory,
   type WorkspaceMessageItem,
@@ -72,6 +74,30 @@ export const CHAT_ALPHA_KEY = formatWorkspaceChatIdentityKey(CHAT_ALPHA_IDENTITY
 export const CHAT_BETA_KEY = formatWorkspaceChatIdentityKey(CHAT_BETA_SAME_PROJECT_IDENTITY)!;
 export const CHAT_GAMMA_KEY = formatWorkspaceChatIdentityKey(CHAT_GAMMA_IDENTITY)!;
 
+export const FOUR_PART_COLLISION_SOURCE_ID = 'src_desktop_primary_shadow_02';
+export const FOUR_PART_COLLISION_BINDING_ID = 'bnd_alpha_shadow_02';
+export const FOUR_PART_COLLISION_PROJECT_SCOPE = FIXTURE_CANONICAL_PROJECT_LEGACY;
+
+/**
+ * Same-thread scope probes. Each identity differs from Alpha by exactly one of
+ * the four canonical parts while remaining a valid `WorkspaceChatIdentity`.
+ */
+export const FOUR_PART_SOURCE_ONLY_IDENTITY: WorkspaceChatIdentity =
+  validateWorkspaceChatIdentity({
+    ...CHAT_ALPHA_IDENTITY,
+    source_id: FOUR_PART_COLLISION_SOURCE_ID,
+  });
+export const FOUR_PART_BINDING_ONLY_IDENTITY: WorkspaceChatIdentity =
+  validateWorkspaceChatIdentity({
+    ...CHAT_ALPHA_IDENTITY,
+    binding_id: FOUR_PART_COLLISION_BINDING_ID,
+  });
+export const FOUR_PART_PROJECT_ONLY_IDENTITY: WorkspaceChatIdentity =
+  validateWorkspaceChatIdentity({
+    ...CHAT_ALPHA_IDENTITY,
+    canonical_project_scope: FOUR_PART_COLLISION_PROJECT_SCOPE,
+  });
+
 export const WRONG_SCOPE_UNALIGNED_THREAD_UUID = '550e8400-e29b-41d4-a716-446655449999';
 export const BETA_CHAT_ONLY_SENTINEL =
   'BETA_SCOPE_SENTINEL: Cross-chat release verification summary belongs strictly to bnd_beta_02.';
@@ -105,6 +131,59 @@ export const EXTERNAL_RESOLUTION_COVERED_TASK_REASON =
   'Covered task-level hold blocker remains in receipt history.';
 export const EXTERNAL_RESOLUTION_UNRELATED_QUESTION =
   'UNRELATED_QUESTION_SENTINEL: Keep this native question visible and unlinked from any receipt.';
+
+export const MINIMAL_CHAT_ALPHA_LIVE_EXECUTION_REF = 'exec_alpha_worker_live_01';
+export const MINIMAL_CHAT_ALPHA_FAILED_EXECUTION_REF = 'exec_alpha_worker_failed_01';
+export const MINIMAL_CHAT_ALPHA_DONE_ITEM_ID = 'blg_alpha_done_01';
+export const MINIMAL_CHAT_ALPHA_TODO_ITEM_ID = 'blg_alpha_todo_01';
+export const MINIMAL_CHAT_ALPHA_DOING_ITEM_ID = 'blg_alpha_doing_01';
+export const MINIMAL_CHAT_ALPHA_BLOCKED_ITEM_ID = 'blg_alpha_blocked_01';
+export const MINIMAL_CHAT_ALPHA_FAILED_ITEM_ID = 'blg_alpha_failed_01';
+export const MINIMAL_CHAT_ALPHA_PREPARING_ITEM_ID = 'blg_alpha_preparing_01';
+export const MINIMAL_CHAT_ALPHA_PREPARING_EXECUTION_REF = 'exec_alpha_worker_preparing_01';
+export const MINIMAL_CHAT_ALPHA_COWORKER_DOING_ITEM_ID = 'blg_alpha_coworker_doing_01';
+export const MINIMAL_CHAT_BETA_TODO_ITEM_ID = 'blg_beta_todo_01';
+export const MINIMAL_CHAT_BETA_DONE_ITEM_ID = 'blg_beta_done_01';
+export const MINIMAL_CHAT_GAMMA_TODO_ITEM_ID = 'blg_gamma_todo_01';
+
+export const MINIMAL_CHAT_DONE_TITLE = 'Verify conversation stream layout';
+export const MINIMAL_CHAT_TODO_TITLE = 'Draft scoped acceptance notes';
+export const MINIMAL_CHAT_DOING_TITLE = 'Implement stream projection';
+export const MINIMAL_CHAT_BLOCKED_TITLE = 'Investigate flaky browser harness';
+export const MINIMAL_CHAT_FAILED_TITLE = 'Attempted worker dispatch';
+export const MINIMAL_CHAT_PREPARING_TITLE = 'Prepare isolated worker launch';
+export const MINIMAL_CHAT_COWORKER_DOING_TITLE = 'Review conversation stream copy';
+export const MINIMAL_CHAT_BLOCKED_REASON =
+  'Blocked pending operator review of the failing browser harness.';
+export const MINIMAL_CHAT_BETA_BACKLOG_SENTINEL =
+  'BETA_BACKLOG_SENTINEL: This event belongs strictly to the Release Verification Gate chat.';
+export const MINIMAL_CHAT_AUTHORED_LANGUAGE_TITLE =
+  'Autorisierte Abnahme: Die Beta-Prüfung bleibt im Chat sichtbar.';
+export const MINIMAL_CHAT_AUTHORED_LANGUAGE_NOTE =
+  'Vom Operator verfasste Sprache bleibt unverändert.';
+export const MINIMAL_CHAT_GAMMA_BACKLOG_SENTINEL =
+  'GAMMA_BACKLOG_SENTINEL: Legacy migration audit follow-up.';
+export const MINIMAL_CHAT_LEGACY_MESSAGE_SENTINEL =
+  'LEGACY_MESSAGE_SENTINEL: A historical message field must not replace the chat event stream.';
+export const MINIMAL_CHAT_WRONG_SCOPE_WORK_SENTINEL =
+  'WRONG_SCOPE_WORK_SENTINEL: Unaligned chat_work must never enter a selected chat.';
+export const MINIMAL_CHAT_MALFORMED_WORK_SENTINEL =
+  'MALFORMED_WORK_SENTINEL: Malformed chat_work must be quarantined, never rendered.';
+export const MINIMAL_CHAT_DUPLICATE_EVENT_TITLE_SENTINEL =
+  'DUPLICATE_EVENT_TITLE_SENTINEL: Same durable event ID must deduplicate this row.';
+export const MINIMAL_CHAT_APPENDED_EVENT_TITLE =
+  'Appended acceptance event: browser stream follows the committed sequence.';
+export const MINIMAL_CHAT_READING_ANCHOR_TITLE = 'Committed Done: Verify conversation stream layout';
+export const FOUR_PART_SOURCE_ONLY_SENTINEL =
+  'FOUR_PART_SOURCE_ONLY_SENTINEL: Only source_id differs from the selected chat.';
+export const FOUR_PART_BINDING_ONLY_SENTINEL =
+  'FOUR_PART_BINDING_ONLY_SENTINEL: Only binding_id differs from the selected chat.';
+export const FOUR_PART_PROJECT_ONLY_SENTINEL =
+  'FOUR_PART_PROJECT_ONLY_SENTINEL: Only canonical_project_scope differs from the selected chat.';
+
+export type FixtureBacklogItem = WorkspaceChatWork['items'][number];
+export type FixtureBacklogEvent = WorkspaceChatWork['events'][number];
+export type FixtureBacklogWorkerPresence = WorkspaceChatWork['worker_presence'][number];
 
 const CODEX_COWORKER_ACTOR: ObservationActor = {
   label: 'Codex Coworker',
@@ -1275,13 +1354,26 @@ export function buildHistoricalFailureWorkspaceSnapshot(): WorkspaceSnapshot {
     ...base,
     chats: base.chats.map((chat) => {
       if (chat.identity.binding_id === CHAT_ALPHA_IDENTITY.binding_id) {
-        return { ...chat, active_job_count: 0, attention_count: 0 };
+        return {
+          ...chat,
+          activity: 'idle',
+          active_job_count: 0,
+          attention_count: 0,
+        };
       }
       if (chat.identity.binding_id === CHAT_BETA_SAME_PROJECT_IDENTITY.binding_id) {
         return { ...chat, active_job_count: 1, attention_count: 1 };
       }
       return chat;
     }),
+    // The compatibility fields below are job-only. Keep the controlled Alpha
+    // native sample idle with its original timestamps so the no-NeedsYou
+    // assertion isolates legacy job attention rather than a real open request.
+    native_samples: base.native_samples.map((sample) =>
+      workspaceChatIdentitiesEqual(sample.chat_identity, CHAT_ALPHA_IDENTITY)
+        ? { ...sample, activity: 'idle' }
+        : sample,
+    ),
     observation: {
       ...base.observation,
       jobs: [recoveredJob, activeAttentionJob],
@@ -1584,8 +1676,17 @@ export function buildPendingAcceptanceWorkspaceSnapshot(): WorkspaceSnapshot {
     ...base,
     chats: base.chats.map((chat) =>
       chat.identity.binding_id === CHAT_ALPHA_IDENTITY.binding_id
-        ? { ...chat, active_job_count: 1, attention_count: 1 }
+        ? { ...chat, activity: 'idle', active_job_count: 1, attention_count: 1 }
         : chat,
+    ),
+    // The legacy pending-acceptance fields are not an open human request. Keep
+    // the controlled Alpha sample idle with its original timestamps so the
+    // fixture cannot manufacture a NeedsYou through a fresh native waiting
+    // sample; the dedicated attention test exercises real native waiting.
+    native_samples: base.native_samples.map((sample) =>
+      workspaceChatIdentitiesEqual(sample.chat_identity, CHAT_ALPHA_IDENTITY)
+        ? { ...sample, activity: 'idle' }
+        : sample,
     ),
     observation: {
       ...base.observation,
@@ -2092,6 +2193,7 @@ export function buildExternalResolutionWorkspaceSnapshot(): WorkspaceSnapshot {
       {
         ...alphaChat,
         thread_label: 'External Resolution Chat',
+        activity: 'idle',
         active_job_count: 1,
         attention_count: 1,
         updated_at_ms: FIXTURE_BASE_NOW_MS - 1_000,
@@ -2109,6 +2211,1020 @@ export function buildExternalResolutionWorkspaceSnapshot(): WorkspaceSnapshot {
       ],
     },
   });
+}
+
+export interface BacklogItemFixtureParams {
+  identity: WorkspaceChatIdentity;
+  itemId: string;
+  title: string;
+  revision?: number;
+  kind?: FixtureBacklogItem['kind'];
+  status?: FixtureBacklogItem['status'];
+  acceptanceCondition?: string;
+  deliveryDescription?: string;
+  blockedReason?: string | null;
+  currentExecutionRef?: string | null;
+  completionNote?: string | null;
+  completionEvidence?: string | null;
+  completedAtMs?: number | null;
+  createdAtMs?: number;
+  updatedAtMs?: number;
+}
+
+/**
+ * Builds one exact core-serialized `BacklogItem` wire value. The builder keeps
+ * every durable field and never invents a status or completion attestation.
+ */
+export function createBacklogItem(params: BacklogItemFixtureParams): FixtureBacklogItem {
+  const {
+    identity,
+    itemId,
+    title,
+    revision = 1,
+    kind = 'worker',
+    status = 'todo',
+    acceptanceCondition = `Acceptance checked for ${title}.`,
+    deliveryDescription = `Bounded delivery for ${title}.`,
+    blockedReason = status === 'blocked' ? MINIMAL_CHAT_BLOCKED_REASON : null,
+    currentExecutionRef = null,
+    completionNote = status === 'done' ? `Completion attested for ${title}.` : null,
+    completionEvidence = status === 'done' ? `Evidence recorded for ${title}.` : null,
+    completedAtMs = status === 'done' ? FIXTURE_BASE_NOW_MS - 10_000 : null,
+    createdAtMs = FIXTURE_BASE_NOW_MS - 60_000,
+    updatedAtMs = FIXTURE_BASE_NOW_MS - 5_000,
+  } = params;
+
+  return {
+    item_id: itemId,
+    binding_id: identity.binding_id,
+    revision,
+    title,
+    acceptance_condition: acceptanceCondition,
+    delivery_description: deliveryDescription,
+    kind,
+    status,
+    blocked_reason: blockedReason,
+    current_execution_ref: currentExecutionRef,
+    completion_note: completionNote,
+    completion_evidence: completionEvidence,
+    completed_at_ms: completedAtMs,
+    created_at_ms: createdAtMs,
+    updated_at_ms: updatedAtMs,
+  };
+}
+
+export interface BacklogEventFixtureParams {
+  item: FixtureBacklogItem;
+  sequence: number;
+  eventId?: string;
+  revision?: number;
+  action?: string;
+  title?: string;
+  status?: FixtureBacklogItem['status'];
+  executionRef?: string | null;
+  outcome?: FixtureBacklogEvent['outcome'];
+  note?: string | null;
+  recordedAtMs?: number;
+}
+
+/**
+ * Builds one exact durable backlog history event. `event_id` defaults to the
+ * actual item revision identity and `sequence` is the caller-provided history
+ * row order; neither value is derived from display text.
+ */
+export function createBacklogEvent(params: BacklogEventFixtureParams): FixtureBacklogEvent {
+  const {
+    item,
+    sequence,
+    eventId,
+    revision = item.revision,
+    action = 'created',
+    title = `Backlog ${action}: ${item.title}`,
+    status = item.status,
+    executionRef = item.current_execution_ref,
+    outcome = null,
+    note = null,
+    recordedAtMs = FIXTURE_BASE_NOW_MS - 60_000 + sequence * 1_000,
+  } = params;
+
+  return {
+    event_id: eventId ?? `${item.item_id}:${revision}`,
+    sequence,
+    item_id: item.item_id,
+    revision,
+    action,
+    recorded_at_ms: recordedAtMs,
+    title,
+    status,
+    execution_ref: executionRef,
+    outcome,
+    note,
+  };
+}
+
+export interface BacklogWorkerPresenceFixtureParams {
+  itemId: string;
+  executionRef: string;
+  approvalId?: string;
+  taskId?: string;
+  runId?: string;
+  workerId?: string;
+  claimId?: string | null;
+  hostInstanceId?: string | null;
+  invocationId?: string | null;
+  sequence?: number | null;
+  availability?: FixtureBacklogWorkerPresence['availability'];
+  freshness?: FixtureBacklogWorkerPresence['freshness'];
+  live?: boolean;
+  sampledAtMs?: number | null;
+  sampleAgeMs?: number | null;
+  maxSampleAgeMs?: number;
+  expiresAtMs?: number | null;
+}
+
+/**
+ * Builds one exact host-adapter presence sample. The original sample timestamps
+ * are copied verbatim; no path, process, or provider prose is introduced.
+ */
+export function createBacklogWorkerPresence(
+  params: BacklogWorkerPresenceFixtureParams,
+): FixtureBacklogWorkerPresence {
+  const {
+    itemId,
+    executionRef,
+    approvalId = 'apr_alpha_worker_01',
+    taskId = 'task_alpha_worker_01',
+    runId = 'run_alpha_worker_01',
+    workerId = 'wrk_alpha_worker_01',
+    claimId = 'clm_alpha_worker_01',
+    hostInstanceId = 'host_alpha_01',
+    invocationId = 'inv_alpha_worker_01',
+    sequence = 12,
+    availability = 'live',
+    freshness = 'fresh',
+    live = availability === 'live' && freshness === 'fresh',
+    sampledAtMs = FIXTURE_BASE_NOW_MS - 1_000,
+    sampleAgeMs,
+    maxSampleAgeMs = 5_000,
+    expiresAtMs,
+  } = params;
+
+  // The host adapter accepts only a deadline derived from the original sample:
+  // `expires_at_ms <= sampled_at_ms + max_sample_age_ms`. A fixture deadline
+  // anchored to the fixture wall clock would violate that invariant whenever
+  // `sampled_at_ms` is older than the default sample.
+  const effectiveSampleAgeMs =
+    sampleAgeMs === undefined
+      ? availability === 'live' && sampledAtMs !== null
+        ? Math.max(0, FIXTURE_BASE_NOW_MS - sampledAtMs)
+        : null
+      : sampleAgeMs;
+  const effectiveExpiresAtMs =
+    expiresAtMs === undefined
+      ? availability === 'live' && sampledAtMs !== null
+        ? sampledAtMs + maxSampleAgeMs
+        : null
+      : expiresAtMs;
+  const effectiveLive =
+    live &&
+    availability === 'live' &&
+    sampledAtMs !== null &&
+    effectiveExpiresAtMs !== null;
+
+  return {
+    item_id: itemId,
+    execution_ref: executionRef,
+    approval_id: approvalId,
+    task_id: taskId,
+    run_id: runId,
+    worker_id: workerId,
+    claim_id: claimId,
+    host_instance_id: hostInstanceId,
+    invocation_id: invocationId,
+    sequence,
+    availability,
+    freshness,
+    live: effectiveLive,
+    sampled_at_ms: sampledAtMs,
+    sample_age_ms: effectiveSampleAgeMs,
+    max_sample_age_ms: maxSampleAgeMs,
+    expires_at_ms: effectiveExpiresAtMs,
+  };
+}
+
+export interface ChatWorkFixtureParams {
+  identity: WorkspaceChatIdentity;
+  availability?: WorkspaceChatWork['availability'];
+  items?: FixtureBacklogItem[];
+  events?: FixtureBacklogEvent[];
+  workerPresence?: FixtureBacklogWorkerPresence[];
+  bounds?: Partial<WorkspaceChatWork['bounds']>;
+}
+
+export function createChatWork(params: ChatWorkFixtureParams): WorkspaceChatWork {
+  const {
+    identity,
+    availability = 'available',
+    items = [],
+    events = [],
+    workerPresence = [],
+    bounds = {},
+  } = params;
+  return {
+    identity,
+    availability,
+    items,
+    events,
+    worker_presence: workerPresence,
+    bounds: {
+      items_omitted: bounds.items_omitted ?? 0,
+      events_omitted: bounds.events_omitted ?? 0,
+      presence_omitted: bounds.presence_omitted ?? 0,
+    },
+  };
+}
+
+/**
+ * Primary minimal-chat fixture: every visible chat is driven by `chat_work`,
+ * the selected chat has no jobs or job histories, and historical message fields
+ * remain present only as compatibility sentinels.
+ */
+export function buildMinimalChatWorkspaceSnapshot(): WorkspaceSnapshot {
+  const base = buildInteractiveWorkspaceSnapshot();
+
+  const doneItem = createBacklogItem({
+    identity: CHAT_ALPHA_IDENTITY,
+    itemId: MINIMAL_CHAT_ALPHA_DONE_ITEM_ID,
+    title: MINIMAL_CHAT_DONE_TITLE,
+    revision: 3,
+    kind: 'coworker',
+    status: 'done',
+    completionNote: 'Verified the single stream and read-only backlog drawer at both widths.',
+    completionEvidence: 'Browser acceptance against the production entry path.',
+    completedAtMs: FIXTURE_BASE_NOW_MS - 50_000,
+    createdAtMs: FIXTURE_BASE_NOW_MS - 60_000,
+    updatedAtMs: FIXTURE_BASE_NOW_MS - 50_000,
+  });
+  const todoItem = createBacklogItem({
+    identity: CHAT_ALPHA_IDENTITY,
+    itemId: MINIMAL_CHAT_ALPHA_TODO_ITEM_ID,
+    title: MINIMAL_CHAT_TODO_TITLE,
+    revision: 1,
+    kind: 'worker',
+    status: 'todo',
+    createdAtMs: FIXTURE_BASE_NOW_MS - 45_000,
+    updatedAtMs: FIXTURE_BASE_NOW_MS - 45_000,
+  });
+  const doingItem = createBacklogItem({
+    identity: CHAT_ALPHA_IDENTITY,
+    itemId: MINIMAL_CHAT_ALPHA_DOING_ITEM_ID,
+    title: MINIMAL_CHAT_DOING_TITLE,
+    revision: 4,
+    kind: 'worker',
+    status: 'doing',
+    currentExecutionRef: MINIMAL_CHAT_ALPHA_LIVE_EXECUTION_REF,
+    createdAtMs: FIXTURE_BASE_NOW_MS - 44_000,
+    updatedAtMs: FIXTURE_BASE_NOW_MS - 38_000,
+  });
+  const blockedItem = createBacklogItem({
+    identity: CHAT_ALPHA_IDENTITY,
+    itemId: MINIMAL_CHAT_ALPHA_BLOCKED_ITEM_ID,
+    title: MINIMAL_CHAT_BLOCKED_TITLE,
+    revision: 2,
+    kind: 'worker',
+    status: 'blocked',
+    blockedReason: MINIMAL_CHAT_BLOCKED_REASON,
+    createdAtMs: FIXTURE_BASE_NOW_MS - 35_000,
+    updatedAtMs: FIXTURE_BASE_NOW_MS - 34_000,
+  });
+  const failedItem = createBacklogItem({
+    identity: CHAT_ALPHA_IDENTITY,
+    itemId: MINIMAL_CHAT_ALPHA_FAILED_ITEM_ID,
+    title: MINIMAL_CHAT_FAILED_TITLE,
+    revision: 3,
+    kind: 'worker',
+    status: 'blocked',
+    blockedReason: 'Worker execution failed; no human response was requested.',
+    currentExecutionRef: MINIMAL_CHAT_ALPHA_FAILED_EXECUTION_REF,
+    createdAtMs: FIXTURE_BASE_NOW_MS - 30_000,
+    updatedAtMs: FIXTURE_BASE_NOW_MS - 24_000,
+  });
+  const preparingItem = createBacklogItem({
+    identity: CHAT_ALPHA_IDENTITY,
+    itemId: MINIMAL_CHAT_ALPHA_PREPARING_ITEM_ID,
+    title: MINIMAL_CHAT_PREPARING_TITLE,
+    revision: 2,
+    kind: 'worker',
+    status: 'doing',
+    currentExecutionRef: MINIMAL_CHAT_ALPHA_PREPARING_EXECUTION_REF,
+    createdAtMs: FIXTURE_BASE_NOW_MS - 20_000,
+    updatedAtMs: FIXTURE_BASE_NOW_MS - 19_000,
+  });
+  const coworkerDoingItem = createBacklogItem({
+    identity: CHAT_ALPHA_IDENTITY,
+    itemId: MINIMAL_CHAT_ALPHA_COWORKER_DOING_ITEM_ID,
+    title: MINIMAL_CHAT_COWORKER_DOING_TITLE,
+    revision: 2,
+    kind: 'coworker',
+    status: 'doing',
+    createdAtMs: FIXTURE_BASE_NOW_MS - 18_000,
+    updatedAtMs: FIXTURE_BASE_NOW_MS - 17_000,
+  });
+
+  const alphaEvents: FixtureBacklogEvent[] = [
+    createBacklogEvent({
+      item: doneItem,
+      sequence: 1,
+      revision: 1,
+      action: 'created',
+      status: 'todo',
+      title: `Backlog item created: ${doneItem.title}`,
+      recordedAtMs: FIXTURE_BASE_NOW_MS - 60_000,
+    }),
+    createBacklogEvent({
+      item: doneItem,
+      sequence: 2,
+      revision: 2,
+      action: 'started',
+      status: 'doing',
+      title: `Coworker started ${doneItem.title}`,
+      recordedAtMs: FIXTURE_BASE_NOW_MS - 55_000,
+    }),
+    createBacklogEvent({
+      item: doneItem,
+      sequence: 3,
+      revision: 3,
+      action: 'completed',
+      status: 'done',
+      title: MINIMAL_CHAT_READING_ANCHOR_TITLE,
+      note: doneItem.completion_note,
+      recordedAtMs: FIXTURE_BASE_NOW_MS - 50_000,
+    }),
+    createBacklogEvent({
+      item: todoItem,
+      sequence: 4,
+      revision: 1,
+      action: 'created',
+      status: 'todo',
+      title: `Backlog item created: ${todoItem.title}`,
+      recordedAtMs: FIXTURE_BASE_NOW_MS - 45_000,
+    }),
+    createBacklogEvent({
+      item: doingItem,
+      sequence: 5,
+      revision: 1,
+      action: 'created',
+      status: 'todo',
+      title: `Backlog item created: ${doingItem.title}`,
+      recordedAtMs: FIXTURE_BASE_NOW_MS - 44_000,
+    }),
+    createBacklogEvent({
+      item: doingItem,
+      sequence: 6,
+      revision: 2,
+      action: 'worker_reserved',
+      status: 'doing',
+      executionRef: MINIMAL_CHAT_ALPHA_LIVE_EXECUTION_REF,
+      title: `Preparing Worker execution for ${doingItem.title}`,
+      note: 'Reservation recorded; no process proof yet.',
+      recordedAtMs: FIXTURE_BASE_NOW_MS - 40_000,
+    }),
+    createBacklogEvent({
+      item: doingItem,
+      sequence: 7,
+      revision: 3,
+      action: 'worker_execution_attached',
+      status: 'doing',
+      executionRef: MINIMAL_CHAT_ALPHA_LIVE_EXECUTION_REF,
+      title: `Worker execution attached for ${doingItem.title}`,
+      recordedAtMs: FIXTURE_BASE_NOW_MS - 39_000,
+    }),
+    createBacklogEvent({
+      item: doingItem,
+      sequence: 8,
+      revision: 4,
+      action: 'worker_outcome_recorded',
+      status: 'doing',
+      executionRef: MINIMAL_CHAT_ALPHA_LIVE_EXECUTION_REF,
+      outcome: 'success',
+      title: `Worker result recorded: Awaiting check for ${doingItem.title}`,
+      note: 'Successful outcome is not committed Done.',
+      recordedAtMs: FIXTURE_BASE_NOW_MS - 38_000,
+    }),
+    createBacklogEvent({
+      item: blockedItem,
+      sequence: 9,
+      revision: 1,
+      action: 'created',
+      status: 'todo',
+      title: `Backlog item created: ${blockedItem.title}`,
+      recordedAtMs: FIXTURE_BASE_NOW_MS - 35_000,
+    }),
+    createBacklogEvent({
+      item: blockedItem,
+      sequence: 10,
+      revision: 2,
+      action: 'blocked',
+      status: 'blocked',
+      title: `Blocked: ${blockedItem.title}`,
+      note: MINIMAL_CHAT_BLOCKED_REASON,
+      recordedAtMs: FIXTURE_BASE_NOW_MS - 34_000,
+    }),
+    createBacklogEvent({
+      item: failedItem,
+      sequence: 11,
+      revision: 1,
+      action: 'created',
+      status: 'todo',
+      title: `Backlog item created: ${failedItem.title}`,
+      recordedAtMs: FIXTURE_BASE_NOW_MS - 30_000,
+    }),
+    createBacklogEvent({
+      item: failedItem,
+      sequence: 12,
+      revision: 2,
+      action: 'worker_reserved',
+      status: 'doing',
+      executionRef: MINIMAL_CHAT_ALPHA_FAILED_EXECUTION_REF,
+      title: `Preparing Worker execution for ${failedItem.title}`,
+      recordedAtMs: FIXTURE_BASE_NOW_MS - 25_000,
+    }),
+    createBacklogEvent({
+      item: failedItem,
+      sequence: 13,
+      revision: 3,
+      action: 'worker_outcome_recorded',
+      status: 'blocked',
+      executionRef: MINIMAL_CHAT_ALPHA_FAILED_EXECUTION_REF,
+      outcome: 'failure',
+      title: `Worker result recorded: Failed for ${failedItem.title}`,
+      note: 'Known failure blocks the item and is not a human request.',
+      recordedAtMs: FIXTURE_BASE_NOW_MS - 24_000,
+    }),
+    createBacklogEvent({
+      item: preparingItem,
+      sequence: 14,
+      revision: 1,
+      action: 'created',
+      status: 'todo',
+      title: `Backlog item created: ${preparingItem.title}`,
+      recordedAtMs: FIXTURE_BASE_NOW_MS - 20_000,
+    }),
+    createBacklogEvent({
+      item: preparingItem,
+      sequence: 15,
+      revision: 2,
+      action: 'worker_reserved',
+      status: 'doing',
+      executionRef: MINIMAL_CHAT_ALPHA_PREPARING_EXECUTION_REF,
+      title: `Preparing Worker execution for ${preparingItem.title}`,
+      note: 'Reservation recorded; no process proof yet.',
+      recordedAtMs: FIXTURE_BASE_NOW_MS - 19_000,
+    }),
+    createBacklogEvent({
+      item: coworkerDoingItem,
+      sequence: 16,
+      revision: 1,
+      action: 'created',
+      status: 'todo',
+      title: `Backlog item created: ${coworkerDoingItem.title}`,
+      recordedAtMs: FIXTURE_BASE_NOW_MS - 18_000,
+    }),
+    createBacklogEvent({
+      item: coworkerDoingItem,
+      sequence: 17,
+      revision: 2,
+      action: 'started',
+      status: 'doing',
+      title: `Coworker started ${coworkerDoingItem.title}`,
+      recordedAtMs: FIXTURE_BASE_NOW_MS - 17_000,
+    }),
+  ];
+
+  const alphaLivePresence = createBacklogWorkerPresence({
+    itemId: doingItem.item_id,
+    executionRef: MINIMAL_CHAT_ALPHA_LIVE_EXECUTION_REF,
+  });
+  const alphaNonLivePresence = createBacklogWorkerPresence({
+    itemId: failedItem.item_id,
+    executionRef: MINIMAL_CHAT_ALPHA_FAILED_EXECUTION_REF,
+    availability: 'non_live',
+    freshness: 'not_applicable',
+    live: false,
+    sampledAtMs: FIXTURE_BASE_NOW_MS - 7_000,
+    sampleAgeMs: null,
+    expiresAtMs: null,
+  });
+
+  const betaTodoItem = createBacklogItem({
+    identity: CHAT_BETA_SAME_PROJECT_IDENTITY,
+    itemId: MINIMAL_CHAT_BETA_TODO_ITEM_ID,
+    title: MINIMAL_CHAT_BETA_BACKLOG_SENTINEL,
+    revision: 2,
+    kind: 'coworker',
+    status: 'todo',
+    createdAtMs: FIXTURE_BASE_NOW_MS - 20_000,
+    updatedAtMs: FIXTURE_BASE_NOW_MS - 14_000,
+  });
+  const betaDoneItem = createBacklogItem({
+    identity: CHAT_BETA_SAME_PROJECT_IDENTITY,
+    itemId: MINIMAL_CHAT_BETA_DONE_ITEM_ID,
+    title: 'Beta committed delivery',
+    revision: 3,
+    kind: 'coworker',
+    status: 'done',
+    completionNote: 'Beta delivery committed in its own chat.',
+    completionEvidence: 'Beta-only acceptance evidence.',
+    completedAtMs: FIXTURE_BASE_NOW_MS - 15_000,
+    createdAtMs: FIXTURE_BASE_NOW_MS - 25_000,
+    updatedAtMs: FIXTURE_BASE_NOW_MS - 15_000,
+  });
+  const betaEvents: FixtureBacklogEvent[] = [
+    createBacklogEvent({
+      item: betaTodoItem,
+      sequence: 1,
+      revision: 1,
+      action: 'created',
+      status: 'todo',
+      title: `Backlog item created: ${betaTodoItem.title}`,
+      recordedAtMs: FIXTURE_BASE_NOW_MS - 20_000,
+    }),
+    createBacklogEvent({
+      item: betaDoneItem,
+      sequence: 2,
+      revision: 1,
+      action: 'created',
+      status: 'todo',
+      title: `Backlog item created: ${betaDoneItem.title}`,
+      recordedAtMs: FIXTURE_BASE_NOW_MS - 19_000,
+    }),
+    createBacklogEvent({
+      item: betaDoneItem,
+      sequence: 3,
+      revision: 2,
+      action: 'started',
+      status: 'doing',
+      title: `Coworker started ${betaDoneItem.title}`,
+      recordedAtMs: FIXTURE_BASE_NOW_MS - 18_000,
+    }),
+    createBacklogEvent({
+      item: betaDoneItem,
+      sequence: 4,
+      revision: 3,
+      action: 'completed',
+      status: 'done',
+      title: `Committed Done: ${betaDoneItem.title}`,
+      note: betaDoneItem.completion_note,
+      recordedAtMs: FIXTURE_BASE_NOW_MS - 15_000,
+    }),
+    createBacklogEvent({
+      item: betaTodoItem,
+      sequence: 5,
+      revision: 2,
+      action: 'edited',
+      status: 'todo',
+      title: MINIMAL_CHAT_AUTHORED_LANGUAGE_TITLE,
+      note: MINIMAL_CHAT_AUTHORED_LANGUAGE_NOTE,
+      recordedAtMs: FIXTURE_BASE_NOW_MS - 14_000,
+    }),
+  ];
+
+  const gammaTodoItem = createBacklogItem({
+    identity: CHAT_GAMMA_IDENTITY,
+    itemId: MINIMAL_CHAT_GAMMA_TODO_ITEM_ID,
+    title: MINIMAL_CHAT_GAMMA_BACKLOG_SENTINEL,
+    revision: 1,
+    kind: 'coworker',
+    status: 'todo',
+    createdAtMs: FIXTURE_BASE_NOW_MS - 120_000,
+    updatedAtMs: FIXTURE_BASE_NOW_MS - 120_000,
+  });
+  const gammaEvents: FixtureBacklogEvent[] = [
+    createBacklogEvent({
+      item: gammaTodoItem,
+      sequence: 1,
+      revision: 1,
+      action: 'created',
+      status: 'todo',
+      title: `Backlog item created: ${gammaTodoItem.title}`,
+      recordedAtMs: FIXTURE_BASE_NOW_MS - 120_000,
+    }),
+  ];
+
+  const wrongScopeIdentity = validateWorkspaceChatIdentity({
+    source_id: FIXTURE_SOURCE_ID,
+    binding_id: 'bnd_wrong_scope_99',
+    thread_uuid: '550e8400-e29b-41d4-a716-446655449998',
+    canonical_project_scope: FIXTURE_CANONICAL_PROJECT_ALPHA,
+  });
+  const wrongScopeWork = createChatWork({
+    identity: wrongScopeIdentity,
+    items: [
+      createBacklogItem({
+        identity: wrongScopeIdentity,
+        itemId: 'blg_wrong_scope_99',
+        title: MINIMAL_CHAT_WRONG_SCOPE_WORK_SENTINEL,
+        revision: 1,
+        kind: 'coworker',
+        status: 'todo',
+      }),
+    ],
+    events: [],
+    workerPresence: [],
+  });
+  const legacyAlphaMessage = createChatMessageItem({
+    identity: CHAT_ALPHA_IDENTITY,
+    seq: 1,
+    recordId: 'rec_legacy_alpha_msg_01',
+    sourceKind: 'task_result_summary',
+    actorRole: 'coder',
+    jobId: null,
+    summary: MINIMAL_CHAT_LEGACY_MESSAGE_SENTINEL,
+    recordedAtMs: FIXTURE_BASE_NOW_MS - 2_000,
+  });
+  const legacyBetaMessage = createChatMessageItem({
+    identity: CHAT_BETA_SAME_PROJECT_IDENTITY,
+    seq: 1,
+    recordId: 'rec_legacy_beta_msg_01',
+    sourceKind: 'task_result_summary',
+    actorRole: 'coder',
+    jobId: null,
+    summary: BETA_CHAT_ONLY_SENTINEL,
+    recordedAtMs: FIXTURE_BASE_NOW_MS - 3_000,
+  });
+  const wrongScopeMessage = createSafeWorkspaceMessageItem({
+    source_kind: 'journal_summary',
+    source_record_id: 'rec_minimal_wrong_scope_99',
+    source_order: {
+      recorded_at_ms: FIXTURE_BASE_NOW_MS - 1_000,
+      source_seq: 999,
+      sub_index: 0,
+    },
+    scope: {
+      source_id: FIXTURE_SOURCE_ID,
+      binding_id: null,
+      thread_uuid: WRONG_SCOPE_UNALIGNED_THREAD_UUID,
+      canonical_project_scope: FIXTURE_CANONICAL_PROJECT_ALPHA,
+      chat_identity: null,
+      job_id: null,
+    },
+    actor_role: 'coder',
+    raw_summary: WRONG_SCOPE_QUARANTINE_SENTINEL,
+    incomplete_reason: 'Missing binding_id prevented canonical chat scope alignment.',
+  });
+
+  const chats: WorkspaceChatSummary[] = base.chats.map((chat) => ({
+    ...chat,
+    availability: 'available',
+    activity: 'idle',
+    active_job_count: 0,
+    attention_count: 0,
+    updated_at_ms: FIXTURE_BASE_NOW_MS - 1_000,
+  }));
+
+  return parseWorkspaceSnapshot({
+    schema_version: WORKSPACE_SNAPSHOT_SCHEMA_VERSION,
+    generated_at_ms: FIXTURE_BASE_NOW_MS,
+    sampling_policy: {
+      interval_ms: WORKSPACE_SAMPLING_INTERVAL_MS,
+      metadata_timeout_ms: WORKSPACE_METADATA_TIMEOUT_MS,
+      stale_threshold_ms: WORKSPACE_SAMPLE_STALE_THRESHOLD_MS,
+      snapshot_resets_sample_age: false,
+    },
+    observation: {
+      schema_version: OBSERVATION_SCHEMA_VERSION,
+      generated_at_ms: FIXTURE_BASE_NOW_MS,
+      sources: [createBaseSource()],
+      jobs: [],
+      requests: [],
+      next_cursor: null,
+      has_more: false,
+      jobs_has_more: false,
+      warnings: [],
+      warning_contexts: [],
+    },
+    chats,
+    native_samples: [
+      createNativeSample({
+        identity: CHAT_ALPHA_IDENTITY,
+        sequence: 15,
+        observedAtMs: FIXTURE_BASE_NOW_MS - 1_200,
+        activity: 'idle',
+        selectedModel: 'gpt-5.4',
+        selectedEffort: 'xhigh',
+      }),
+      createNativeSample({
+        identity: CHAT_BETA_SAME_PROJECT_IDENTITY,
+        sequence: 9,
+        observedAtMs: FIXTURE_BASE_NOW_MS - 2_500,
+        activity: 'idle',
+        selectedModel: 'gpt-5.4',
+        selectedEffort: 'high',
+      }),
+      createNativeSample({
+        identity: CHAT_GAMMA_IDENTITY,
+        sequence: 4,
+        observedAtMs: FIXTURE_BASE_NOW_MS - 4_000,
+        activity: 'idle',
+        selectedModel: 'gpt-5.4',
+        selectedEffort: 'medium',
+      }),
+    ],
+    job_histories: [],
+    messages: {
+      availability: 'available',
+      items: [legacyAlphaMessage, legacyBetaMessage, wrongScopeMessage],
+      max_items: MAX_WORKSPACE_MESSAGES_WINDOW,
+      omitted_count: 0,
+      has_more: false,
+      truncated: false,
+      requires_transcript: false,
+      allows_synthetic_user_messages: false,
+    },
+    chat_work: [
+      createChatWork({
+        identity: CHAT_ALPHA_IDENTITY,
+        items: [
+          doneItem,
+          todoItem,
+          doingItem,
+          blockedItem,
+          failedItem,
+          preparingItem,
+          coworkerDoingItem,
+        ],
+        events: alphaEvents,
+        workerPresence: [alphaLivePresence, alphaNonLivePresence],
+      }),
+      createChatWork({
+        identity: CHAT_BETA_SAME_PROJECT_IDENTITY,
+        items: [betaTodoItem, betaDoneItem],
+        events: betaEvents,
+      }),
+      createChatWork({
+        identity: CHAT_GAMMA_IDENTITY,
+        items: [gammaTodoItem],
+        events: gammaEvents,
+      }),
+      wrongScopeWork,
+    ],
+    bounds: {
+      native_samples_omitted: 0,
+      job_histories_omitted: 0,
+      messages_omitted: 0,
+      requests_capped: false,
+      jobs_capped: false,
+    },
+  });
+}
+
+/**
+ * Adds one structurally invalid chat_work entry to the otherwise valid minimal
+ * fixture. The projection must quarantine it without hiding the selected chat.
+ */
+export function buildMinimalChatWorkspaceSnapshotWithMalformedWork(): WorkspaceSnapshot {
+  const base = buildMinimalChatWorkspaceSnapshot();
+  const works = (base as unknown as { chat_work?: WorkspaceChatWork[] }).chat_work ?? [];
+  const malformedWork = {
+    identity: CHAT_ALPHA_IDENTITY,
+    availability: 'available',
+    items: [
+      {
+        item_id: 'blg_malformed_01',
+        binding_id: CHAT_ALPHA_IDENTITY.binding_id,
+        title: MINIMAL_CHAT_MALFORMED_WORK_SENTINEL,
+        status: 'invented_status',
+      },
+    ],
+    events: [],
+    worker_presence: [],
+    bounds: { items_omitted: 0, events_omitted: 0, presence_omitted: 0 },
+  } as unknown as WorkspaceChatWork;
+  return parseWorkspaceSnapshot({
+    ...base,
+    chat_work: [...works, malformedWork],
+  });
+}
+
+/**
+ * Injects three valid, same-thread `chat_work` records that each differ from the
+ * selected Alpha chat by exactly one canonical identity part. Each record carries
+ * a backlog item, a stream event, a live Worker presence sample, and a fresh
+ * waiting native sample so partial-identity matching would leak visibly into the
+ * stream, drawer, live-agent list, or `NeedsYou` state.
+ */
+export function buildFourPartScopeCollisionWorkspaceSnapshot(): WorkspaceSnapshot {
+  const base = buildMinimalChatWorkspaceSnapshot();
+  const alphaSample = base.native_samples.find((sample) =>
+    workspaceChatIdentitiesEqual(sample.chat_identity, CHAT_ALPHA_IDENTITY),
+  );
+  if (!alphaSample) {
+    throw new Error('Expected the Alpha native sample in the minimal chat fixture.');
+  }
+
+  const collisionWork = (
+    identity: WorkspaceChatIdentity,
+    sentinel: string,
+    suffix: string,
+  ): WorkspaceChatWork => {
+    const executionRef = `exec_scope_collision_${suffix}`;
+    const item = createBacklogItem({
+      identity,
+      itemId: `blg_scope_collision_${suffix}`,
+      title: sentinel,
+      revision: 2,
+      kind: 'worker',
+      status: 'doing',
+      currentExecutionRef: executionRef,
+      createdAtMs: FIXTURE_BASE_NOW_MS - 9_000,
+      updatedAtMs: FIXTURE_BASE_NOW_MS - 8_000,
+    });
+    return createChatWork({
+      identity,
+      items: [item],
+      events: [
+        createBacklogEvent({
+          item,
+          sequence: 1,
+          revision: 1,
+          action: 'created',
+          status: 'todo',
+          title: `Backlog item created: ${sentinel}`,
+          recordedAtMs: FIXTURE_BASE_NOW_MS - 9_000,
+        }),
+        createBacklogEvent({
+          item,
+          sequence: 2,
+          revision: 2,
+          action: 'worker_execution_attached',
+          status: 'doing',
+          executionRef,
+          title: `Collision stream event: ${sentinel}`,
+          recordedAtMs: FIXTURE_BASE_NOW_MS - 8_000,
+        }),
+      ],
+      workerPresence: [
+        createBacklogWorkerPresence({
+          itemId: item.item_id,
+          executionRef,
+          sampledAtMs: FIXTURE_BASE_NOW_MS - 1_000,
+        }),
+      ],
+    });
+  };
+
+  const collisionSamples: WorkspaceNativeSample[] = [
+    {
+      ...alphaSample,
+      chat_identity: FOUR_PART_SOURCE_ONLY_IDENTITY,
+      sequence: alphaSample.sequence + 1,
+      activity: 'waiting_for_approval',
+    },
+    {
+      ...alphaSample,
+      chat_identity: FOUR_PART_BINDING_ONLY_IDENTITY,
+      sequence: alphaSample.sequence + 2,
+      activity: 'waiting_for_input',
+    },
+    {
+      ...alphaSample,
+      chat_identity: FOUR_PART_PROJECT_ONLY_IDENTITY,
+      sequence: alphaSample.sequence + 3,
+      activity: 'waiting_for_approval',
+    },
+  ];
+
+  const sourceRecord: ObservationSource = {
+    id: FOUR_PART_SOURCE_ONLY_IDENTITY.source_id,
+    label: 'Primary Desktop Store (scope-collision probe)',
+    project_path: FIXTURE_CANONICAL_PROJECT_ALPHA,
+    availability: 'available',
+    message: null,
+  };
+  const works =
+    (base as unknown as { chat_work?: WorkspaceChatWork[] }).chat_work ?? [];
+
+  // Do not add the probes to the fixture chat list. The production parser may
+  // materialize a chat for each waiting native sample; even then, the probe
+  // stream, backlog, live agent, and attention data must never leak into the
+  // explicitly selected Alpha chat.
+  return {
+    ...base,
+    observation: {
+      ...base.observation,
+      sources: [...base.observation.sources, sourceRecord],
+    },
+    native_samples: [...base.native_samples, ...collisionSamples],
+    chat_work: [
+      ...works,
+      collisionWork(FOUR_PART_SOURCE_ONLY_IDENTITY, FOUR_PART_SOURCE_ONLY_SENTINEL, 'source'),
+      collisionWork(
+        FOUR_PART_BINDING_ONLY_IDENTITY,
+        FOUR_PART_BINDING_ONLY_SENTINEL,
+        'binding',
+      ),
+      collisionWork(
+        FOUR_PART_PROJECT_ONLY_IDENTITY,
+        FOUR_PART_PROJECT_ONLY_SENTINEL,
+        'project',
+      ),
+    ],
+  } as WorkspaceSnapshot;
+}
+
+function readChatWork(
+  snapshot: WorkspaceSnapshot,
+  identity: WorkspaceChatIdentity,
+): WorkspaceChatWork {
+  const works = (snapshot as unknown as { chat_work?: WorkspaceChatWork[] }).chat_work ?? [];
+  const work = works.find((entry) => workspaceChatIdentitiesEqual(entry.identity, identity));
+  if (!work) {
+    throw new Error(`Missing chat_work fixture for binding ${identity.binding_id}.`);
+  }
+  return work;
+}
+
+export function getChatWorkFixture(
+  snapshot: WorkspaceSnapshot,
+  identity: WorkspaceChatIdentity,
+): WorkspaceChatWork {
+  return readChatWork(snapshot, identity);
+}
+
+/** Replaces one canonical chat's work while preserving every other chat entry. */
+export function updateChatWorkFixture(
+  snapshot: WorkspaceSnapshot,
+  identity: WorkspaceChatIdentity,
+  update: Partial<WorkspaceChatWork>,
+): WorkspaceSnapshot {
+  const works = (snapshot as unknown as { chat_work?: WorkspaceChatWork[] }).chat_work ?? [];
+  const current = readChatWork(snapshot, identity);
+  const nextWork: WorkspaceChatWork = { ...current, ...update, identity };
+  return parseWorkspaceSnapshot({
+    ...snapshot,
+    chat_work: [
+      ...works.filter((entry) => !workspaceChatIdentitiesEqual(entry.identity, identity)),
+      nextWork,
+    ],
+  });
+}
+
+/** Appends one already-built durable event to the selected chat's event window. */
+export function appendChatWorkEventFixture(
+  snapshot: WorkspaceSnapshot,
+  identity: WorkspaceChatIdentity,
+  event: FixtureBacklogEvent,
+): WorkspaceSnapshot {
+  const current = readChatWork(snapshot, identity);
+  return updateChatWorkFixture(snapshot, identity, {
+    items: current.items.map((item) =>
+      item.item_id === event.item_id
+        ? {
+            ...item,
+            revision: Math.max(item.revision, event.revision),
+            status: event.status,
+            current_execution_ref: event.execution_ref ?? item.current_execution_ref,
+            updated_at_ms: event.recorded_at_ms,
+          }
+        : item,
+    ),
+    events: [...current.events, event],
+  });
+}
+
+/** Replaces one canonical chat's worker-presence projection. */
+export function updateChatWorkPresenceFixture(
+  snapshot: WorkspaceSnapshot,
+  identity: WorkspaceChatIdentity,
+  workerPresence: FixtureBacklogWorkerPresence[],
+): WorkspaceSnapshot {
+  return updateChatWorkFixture(snapshot, identity, {
+    worker_presence: workerPresence,
+  });
+}
+
+/** Changes only the selected chat's native activity sample; timestamps are preserved. */
+export function updateNativeActivityFixture(
+  snapshot: WorkspaceSnapshot,
+  identity: WorkspaceChatIdentity,
+  activity: WorkspaceNativeSample['activity'],
+): WorkspaceSnapshot {
+  return parseWorkspaceSnapshot({
+    ...snapshot,
+    native_samples: snapshot.native_samples.map((sample) =>
+      workspaceChatIdentitiesEqual(sample.chat_identity, identity)
+        ? { ...sample, activity }
+        : sample,
+    ),
+  });
+}
+
+/** Advances the envelope while leaving every producer sample timestamp untouched. */
+export function advanceWorkspaceGeneratedAtFixture(
+  snapshot: WorkspaceSnapshot,
+  generatedAtMs: number,
+): WorkspaceSnapshot {
+  return regenerateWorkspaceSnapshotAt(snapshot, generatedAtMs);
 }
 
 export function buildDefaultRegistryFixture(): RegistrySnapshot {
@@ -2329,6 +3445,7 @@ interface BrowserHarnessWindow extends Window {
     getWorkspaceSnapshot: () => WorkspaceSnapshot;
     setWorkspaceSnapshot: (nextSnapshot: WorkspaceSnapshot) => void;
     stallNextWorkspaceSnapshotRead: () => void;
+    failNextWorkspaceSnapshotRead: () => void;
     getStalledWorkspaceSnapshotCount: () => number;
     releaseStalledWorkspaceSnapshotReads: () => void;
     appendMessageItem: (item: WorkspaceMessageItem) => number;
@@ -2342,6 +3459,7 @@ export interface WorkspaceTauriController {
   getWorkspaceSnapshot: () => Promise<WorkspaceSnapshot | null>;
   setWorkspaceSnapshot: (nextSnapshot: WorkspaceSnapshot) => Promise<void>;
   stallNextWorkspaceSnapshotRead: () => Promise<void>;
+  failNextWorkspaceSnapshotRead: () => Promise<void>;
   getStalledWorkspaceSnapshotCount: () => Promise<number>;
   releaseStalledWorkspaceSnapshotReads: () => Promise<void>;
   appendMessageItem: (item: WorkspaceMessageItem) => Promise<void>;
@@ -2406,6 +3524,7 @@ export async function installWorkspaceTauriFixture(
       let currentTrayPrefs: TrayPreferencesResponse = { ...seed.trayPrefs };
       const invocations: RecordedTauriInvocation[] = [];
       let stallNextWorkspaceRead = false;
+      let failNextWorkspaceRead = false;
       const stalledWorkspaceReadResolvers: Array<() => void> = [];
       let nextCallbackId = 1;
       let nextEventListenerId = 1;
@@ -2560,6 +3679,13 @@ export async function installWorkspaceTauriFixture(
 
           switch (cmd) {
             case 'desktop_workspace_snapshot': {
+              if (failNextWorkspaceRead) {
+                failNextWorkspaceRead = false;
+                throw {
+                  code: 'workspace_unavailable',
+                  message: 'Injected workspace refresh failure for live-presence clearing.',
+                };
+              }
               if (stallNextWorkspaceRead) {
                 stallNextWorkspaceRead = false;
                 return new Promise<unknown>((resolve) => {
@@ -2673,6 +3799,9 @@ export async function installWorkspaceTauriFixture(
         stallNextWorkspaceSnapshotRead: () => {
           stallNextWorkspaceRead = true;
         },
+        failNextWorkspaceSnapshotRead: () => {
+          failNextWorkspaceRead = true;
+        },
         getStalledWorkspaceSnapshotCount: () => stalledWorkspaceReadResolvers.length,
         releaseStalledWorkspaceSnapshotReads: () => {
           stallNextWorkspaceRead = false;
@@ -2742,6 +3871,12 @@ export async function installWorkspaceTauriFixture(
           window as unknown as BrowserHarnessWindow
         ).__THREADLANE_TEST_HARNESS__?.stallNextWorkspaceSnapshotRead();
       }),
+    failNextWorkspaceSnapshotRead: () =>
+      page.evaluate(() => {
+        (
+          window as unknown as BrowserHarnessWindow
+        ).__THREADLANE_TEST_HARNESS__?.failNextWorkspaceSnapshotRead();
+      }),
     getStalledWorkspaceSnapshotCount: () =>
       page.evaluate(
         () =>
@@ -2782,4 +3917,267 @@ export async function installWorkspaceTauriFixture(
         WORKSPACE_CHAT_ARCHIVE_STORAGE_KEY,
       ),
   };
+}
+
+// ---------------------------------------------------------------------------
+// Shared browser-acceptance selectors and probes
+// ---------------------------------------------------------------------------
+
+/**
+ * The workspace panel is the product surface. Tests deliberately avoid legacy
+ * tab/job selectors so the minimal chat contract cannot silently regress into
+ * the old multi-surface layout.
+ */
+export function workspaceSection(page: Page): Locator {
+  return page
+    .locator(
+      'section[aria-label="Projects workspace"], section[aria-label*="workspace" i]',
+    )
+    .first();
+}
+
+export function backlogButton(page: Page): Locator {
+  return page.getByRole('button', { name: /backlog/i }).first();
+}
+
+export function backlogDialog(page: Page): Locator {
+  return page.getByRole('dialog', { name: /backlog/i }).first();
+}
+
+export function streamScroller(page: Page): Locator {
+  // The minimal chat surface owns exactly one accessible log scroller. The
+  // legacy Messages scroller attribute is intentionally gone, so a stale
+  // selector must fail rather than silently match another surface.
+  return page
+    .locator('[data-chat-stream-scroller="true"][aria-label="Chat activity stream"]')
+    .first();
+}
+
+export function chatHeader(page: Page, threadLabel: string): Locator {
+  return page
+    .locator('header')
+    .filter({ has: page.getByRole('heading', { name: threadLabel }) })
+    .first();
+}
+
+export function sidebar(page: Page): Locator {
+  return page
+    .getByRole('complementary', { name: /projects sidebar/i })
+    .or(page.locator('aside[aria-label*="sidebar" i]'))
+    .first();
+}
+
+export async function openBacklog(page: Page): Promise<Locator> {
+  const trigger = backlogButton(page);
+  await expect(trigger).toBeVisible();
+  await trigger.click();
+  const dialog = backlogDialog(page);
+  await expect(dialog).toBeVisible();
+  return dialog;
+}
+
+export async function closeBacklogWithEscape(page: Page): Promise<void> {
+  await page.keyboard.press('Escape');
+  await expect(backlogDialog(page)).toHaveCount(0);
+}
+
+export function resolveBacklogItemRow(dialog: Locator, title: string): Locator {
+  return dialog
+    .locator(
+      '[data-backlog-item-id], [data-item-id], li, article, [role="listitem"], tr, [role="row"]',
+    )
+    .filter({ hasText: title })
+    .first();
+}
+
+export function resolveStreamEventRow(page: Page, title: string): Locator {
+  return streamScroller(page)
+    .locator(
+      '[data-chat-event-id], [data-event-id], [data-item-id], li, article, [role="listitem"], tr, [role="row"]',
+    )
+    .filter({ hasText: title })
+    .first();
+}
+
+export async function selectChat(page: Page, threadLabel: string): Promise<void> {
+  const target = sidebar(page).getByText(threadLabel, { exact: true }).first();
+  await expect(target).toBeVisible();
+  await target.click();
+}
+
+export async function triggerWorkspaceRefresh(page: Page): Promise<void> {
+  const refreshBtn = page.getByRole('button', { name: /refresh|reload/i }).first();
+  if ((await refreshBtn.count()) > 0 && (await refreshBtn.isVisible())) {
+    await refreshBtn.click();
+    return;
+  }
+  await page.evaluate(() => {
+    window.dispatchEvent(new Event('focus'));
+  });
+}
+
+export async function expectNoHorizontalOverflow(
+  page: Page,
+  label = 'page',
+): Promise<void> {
+  const metrics = await page.evaluate(() => ({
+    scrollWidth: document.documentElement.scrollWidth,
+    innerWidth: window.innerWidth,
+  }));
+  expect(
+    metrics.scrollWidth,
+    `${label} must not scroll horizontally (scrollWidth=${metrics.scrollWidth}, innerWidth=${metrics.innerWidth})`,
+  ).toBeLessThanOrEqual(metrics.innerWidth);
+}
+
+export async function scrollStreamToBottom(scroller: Locator): Promise<void> {
+  await scroller.evaluate((el) => {
+    el.scrollTop = el.scrollHeight;
+    el.dispatchEvent(new Event('scroll', { bubbles: true }));
+  });
+}
+
+export async function streamBottomDistance(scroller: Locator): Promise<number> {
+  return scroller.evaluate(
+    (el) => el.scrollHeight - el.scrollTop - el.clientHeight,
+  );
+}
+
+export async function expectStreamEventOrder(
+  page: Page,
+  titles: readonly string[],
+): Promise<void> {
+  await expect
+    .poll(async () => {
+      const text = await streamScroller(page).innerText();
+      let previousIndex = -1;
+      for (const title of titles) {
+        const index = text.indexOf(title);
+        if (index < 0 || index <= previousIndex) {
+          return false;
+        }
+        previousIndex = index;
+      }
+      return true;
+    })
+    .toBe(true);
+}
+
+async function visibleTextContents(locator: Locator): Promise<string[]> {
+  return locator.evaluateAll((nodes) => {
+    const visible = nodes.filter((node) => node.checkVisibility());
+    const outermost = visible.filter(
+      (node) => !visible.some((other) => other !== node && node.contains(other)),
+    );
+    return outermost
+      .map((node) => (node.textContent ?? '').trim())
+      .filter((text) => text.length > 0);
+  });
+}
+
+async function visibleAriaLabels(page: Page): Promise<string[]> {
+  return page.locator('[aria-label]').evaluateAll((nodes) =>
+    nodes
+      .filter((node) => node.checkVisibility())
+      .map((node) => node.getAttribute('aria-label') ?? '')
+      .filter((label) => label.length > 0),
+  );
+}
+
+export async function expectSingleNeedsYou(page: Page): Promise<void> {
+  const inventedCountPattern =
+    /\b\d+\s*(?:item|items|question|questions|need|needs|request|requests)\b|\b(?:item|items|question|questions|need|needs|request|requests)\s*[:#]?\s*\d+/i;
+  const workspace = workspaceSection(page);
+  let indicatorText = '';
+
+  await expect
+    .poll(async () => {
+      const workspaceWaiting = await visibleTextContents(
+        workspace.getByText(/waiting for you(?: in codex)?/i),
+      );
+      const waiting =
+        workspaceWaiting.length > 0
+          ? workspaceWaiting
+          : await visibleTextContents(
+              page.getByText(/waiting for you(?: in codex)?/i),
+            );
+      if (waiting.length > 0) {
+        indicatorText = waiting[0] ?? '';
+        return waiting.length;
+      }
+
+      const workspaceNeedsYou = await visibleTextContents(
+        workspace.getByText(/needs\s*you/i),
+      );
+      const needsYou =
+        workspaceNeedsYou.length > 0
+          ? workspaceNeedsYou
+          : await visibleTextContents(page.getByText(/needs\s*you/i));
+      if (needsYou.length > 0) {
+        indicatorText = needsYou[0] ?? '';
+        return needsYou.length;
+      }
+      return 0;
+    })
+    .toBe(1);
+
+  expect(indicatorText).not.toMatch(inventedCountPattern);
+
+  await expect
+    .poll(async () => {
+      const countTexts = await visibleTextContents(
+        page.getByText(
+          /\b\d+\s+(?:item|items|question|questions)\s+(?:needs?|need attention|need you)\b/i,
+        ),
+      );
+      const attentionTexts = await visibleTextContents(
+        page.getByText(/\b\d+\s+needs?\s+attention\b/i),
+      );
+      const questionIdTexts = await visibleTextContents(
+        page.getByText(/question\s*#?\s*\d+/i),
+      );
+      const questionCountTexts = await visibleTextContents(
+        page.getByText(/\b\d+\s+questions?\b/i),
+      );
+      const attentionLabels = (await visibleAriaLabels(page)).filter((label) =>
+        /\b\d+\s+(?:item|items|question|questions)?\s*needs?\s+attention/i.test(
+          label,
+        ),
+      );
+      return (
+        countTexts.length +
+        attentionTexts.length +
+        questionIdTexts.length +
+        questionCountTexts.length +
+        attentionLabels.length
+      );
+    })
+    .toBe(0);
+}
+
+export async function expectNoNeedsYou(page: Page): Promise<void> {
+  await expect
+    .poll(async () => {
+      const needsYouTexts = await visibleTextContents(
+        page.getByText(/waiting for you(?: in codex)?|needs\s*you/i),
+      );
+      const itemCountTexts = await visibleTextContents(
+        page.getByText(/\b\d+\s+(?:item|items)\s+needs?\s+attention/i),
+      );
+      const attentionTexts = await visibleTextContents(
+        page.getByText(/\b\d+\s+needs?\s+attention/i),
+      );
+      const attentionLabels = (await visibleAriaLabels(page)).filter((label) =>
+        /\b\d+\s+(?:item|items|question|questions)?\s*needs?\s+attention/i.test(
+          label,
+        ),
+      );
+      return (
+        needsYouTexts.length +
+        itemCountTexts.length +
+        attentionTexts.length +
+        attentionLabels.length
+      );
+    })
+    .toBe(0);
 }

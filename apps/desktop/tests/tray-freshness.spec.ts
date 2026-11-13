@@ -505,7 +505,13 @@ test.describe('System tray passive sample staleness', () => {
 
       const emptyStateBox = page.locator('.tl-tray-state-box');
       await expect(emptyStateBox).toBeVisible();
-      await expect(emptyStateBox).toContainText('Coworker stale (11s)');
+      await expect(emptyStateBox).toContainText('No active or recent work');
+      await expect(emptyStateBox).toContainText(
+        'Live chat indicators are withheld until a fresh sample arrives.'
+      );
+      await expect(page.locator('.tl-tray-shell')).not.toContainText(
+        'Coworker stale'
+      );
       await expect(page.locator('.tl-tray-shell')).not.toContainText(
         'Coworker working'
       );
@@ -646,15 +652,24 @@ test.describe('System tray passive sample staleness', () => {
       await expect(workingBadges).toHaveCount(0, { timeout: 1_500 });
       await expect(workingRows).toHaveCount(0);
       await expect(emptyStateBox).toBeVisible();
-      await expect(emptyStateBox).toContainText('Coworker stale (11s)');
+      await expect(emptyStateBox).toContainText('No active or recent work');
+      await expect(emptyStateBox).toContainText(
+        'Live chat indicators are withheld until a fresh sample arrives.'
+      );
 
-      // Advance Date again and emit tray reopen while snapshot read is still hung:
-      // TRAY_OPEN_EVENT must recompute stale age immediately without waiting for response.
+      // Advance Date again and emit tray reopen while the snapshot read is still hung:
+      // the minimal projection must retain the withheld stale state without waiting
+      // for a response or exposing a detailed stale-age label.
       await clock.advanceByMs(4_000);
       await tauri.emitTauriEvent(TRAY_OPEN_EVENT, null);
-      await expect(emptyStateBox).toContainText('Coworker stale (15s)', {
-        timeout: 1_500,
-      });
+      await expect(workingBadges).toHaveCount(0);
+      await expect(workingRows).toHaveCount(0);
+      await expect(emptyStateBox).toContainText(
+        'Live chat indicators are withheld until a fresh sample arrives.'
+      );
+      await expect(page.locator('.tl-tray-shell')).not.toContainText(
+        'Coworker stale'
+      );
 
       // Supply a fresh snapshot and release the hung request so queued reopen refresh settles.
       const recoveredNowMs = fixedNowMs + 16_000;
@@ -670,6 +685,136 @@ test.describe('System tray passive sample staleness', () => {
       await expect(
         page.locator('.tl-tray-row[data-category="working"] .tl-tray-row-status')
       ).toHaveText('Coworker working');
+      expect(pageErrors).toEqual([]);
+    } finally {
+      page.off('pageerror', onPageError);
+      if (stalledProbe !== null && !page.isClosed()) {
+        await runBoundedCleanup(() =>
+          stalledProbe!.releaseAndRestore(initialSnapshot)
+        );
+      }
+      if (visibility !== null && !page.isClosed()) {
+        await runBoundedCleanup(() => visibility!.restore());
+      }
+      if (!page.isClosed()) {
+        await runBoundedCleanup(() => page.close());
+      }
+    }
+  });
+
+  test('recomputes withheld stale state when a tray reopen crosses the producer stale boundary', async ({
+    page,
+  }) => {
+    test.setTimeout(15_000);
+
+    const initialSnapshot = buildSingleWorkingCoworkerTraySnapshot();
+    const fixedNowMs = initialSnapshot.generated_at_ms;
+    const nearExpiryAdvanceMs = WORKSPACE_SAMPLE_STALE_THRESHOLD_MS - 1;
+    const pageErrors: string[] = [];
+    const onPageError = (err: Error) => {
+      pageErrors.push(err.message);
+    };
+    page.on('pageerror', onPageError);
+
+    let stalledProbe: StalledSnapshotProbeHandle | null = null;
+    let visibility: {
+      setHidden: (hidden: boolean) => Promise<void>;
+      restore: () => Promise<void>;
+    } | null = null;
+
+    try {
+      const clock = await installControlledDateBeforeLoad(page, fixedNowMs);
+      const tauri = await installWorkspaceTauriFixture(page, {
+        workspaceSnapshot: initialSnapshot,
+        windowLabel: 'tray',
+      });
+
+      await page.goto('/?surface=tray');
+
+      const workingBadges = page.locator(
+        '.tl-tray-counts [data-tone="working"]'
+      );
+      const workingRows = page.locator('.tl-tray-row[data-category="working"]');
+      const emptyStateBox = page.locator('.tl-tray-state-box');
+      await expect(workingBadges).toHaveCount(1);
+      await expect(workingBadges).toHaveText('1 working');
+      await expect(workingRows).toHaveCount(1);
+      await expect(workingRows.locator('.tl-tray-row-status')).toHaveText(
+        'Coworker working'
+      );
+      await expect(emptyStateBox).toHaveCount(0);
+
+      visibility = await installVisibilityController(page);
+      await visibility.setHidden(true);
+
+      const nearExpiryNowMs = await clock.advanceByMs(nearExpiryAdvanceMs);
+      expect(nearExpiryNowMs).toBe(
+        fixedNowMs + WORKSPACE_SAMPLE_STALE_THRESHOLD_MS - 1
+      );
+
+      stalledProbe = await wrapSnapshotInvokeWithSingleHungRead(page);
+      await visibility.setHidden(false);
+
+      // First visibility recalculates just before the boundary from the original
+      // producer timestamp, so the fresh Working row must remain visible.
+      await expect(workingBadges).toHaveCount(1, { timeout: 1_500 });
+      await expect(workingRows).toHaveCount(1);
+      await expect(workingRows.locator('.tl-tray-row-status')).toHaveText(
+        'Coworker working'
+      );
+      await waitRealMs(1_200);
+      expect(await clock.readNowMs()).toBe(nearExpiryNowMs);
+      await expect(workingBadges).toHaveCount(1);
+      await expect(workingRows).toHaveCount(1);
+      await expect(emptyStateBox).toHaveCount(0);
+
+      const visibleStats = await stalledProbe.readStats();
+      expect(visibleStats.wrappedSnapshotCalls).toBe(1);
+      expect(visibleStats.pendingSnapshotReads).toBe(1);
+      expect(visibleStats.settledSnapshotReads).toBe(0);
+      expect(visibleStats.snapshotCallTimestampsMs).toEqual([
+        nearExpiryNowMs,
+      ]);
+
+      await visibility.setHidden(true);
+      const expiredNowMs = await clock.advanceByMs(2);
+      expect(expiredNowMs).toBe(
+        fixedNowMs + WORKSPACE_SAMPLE_STALE_THRESHOLD_MS + 1
+      );
+
+      // The hidden age clock stays suppressed while Date crosses the stale boundary:
+      // no producer response renewed the sample, so the UI must still show Working.
+      await waitRealMs(1_200);
+      expect(await clock.readNowMs()).toBe(expiredNowMs);
+      await expect(workingBadges).toHaveCount(1);
+      await expect(workingRows).toHaveCount(1);
+      await expect(emptyStateBox).toHaveCount(0);
+      await expect(page.locator('.tl-tray-shell')).not.toContainText(/stale/i);
+
+      // The explicit tray open recomputes from the original producer timestamp and
+      // crosses the stale boundary immediately, without waiting for the hung read.
+      await tauri.emitTauriEvent(TRAY_OPEN_EVENT, null);
+      await expect(workingBadges).toHaveCount(0, { timeout: 1_000 });
+      await expect(workingRows).toHaveCount(0);
+      await expect(emptyStateBox).toBeVisible();
+      await expect(emptyStateBox).toContainText('No active or recent work');
+      await expect(emptyStateBox).toContainText(
+        'Live chat indicators are withheld until a fresh sample arrives.'
+      );
+      await expect(page.locator('.tl-tray-shell')).not.toContainText(
+        'Coworker stale'
+      );
+
+      const statsAfterReopen = await stalledProbe.readStats();
+      expect(statsAfterReopen.wrappedSnapshotCalls).toBe(1);
+      expect(statsAfterReopen.pendingSnapshotReads).toBe(1);
+      expect(statsAfterReopen.settledSnapshotReads).toBe(0);
+      expect(statsAfterReopen.snapshotCallTimestampsMs).toEqual([
+        nearExpiryNowMs,
+      ]);
+
+      expect(await tauri.readArchivePreferencesRaw()).toBeNull();
+      await expect(page.locator('.tl-tray-error')).toHaveCount(0);
       expect(pageErrors).toEqual([]);
     } finally {
       page.off('pageerror', onPageError);

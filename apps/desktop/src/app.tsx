@@ -470,9 +470,6 @@ function SidebarContent({
                                   <span className="tl-chat-item-label">
                                     {chat.threadLabel}
                                   </span>
-                                  <span className="tl-chat-item-age">
-                                    {chat.ageLabel}
-                                  </span>
                                 </div>
 
                                 <div className="tl-chat-item-meta">
@@ -493,6 +490,11 @@ function SidebarContent({
                                       {configuredModelLabel}
                                     </span>
                                   ) : null}
+                                  {chat.updatedAtMs !== null ? (
+                                    <span className="tl-chat-item-age">
+                                      {chat.ageLabel}
+                                    </span>
+                                  ) : null}
                                 </div>
                               </button>
 
@@ -507,7 +509,6 @@ function SidebarContent({
                                   }
                                 >
                                   <Archive size={12} aria-hidden="true" />
-                                  <span>Archive</span>
                                 </button>
                               ) : chat.canRestore ? (
                                 <button
@@ -520,7 +521,6 @@ function SidebarContent({
                                   }
                                 >
                                   <RotateCcw size={12} aria-hidden="true" />
-                                  <span>Restore</span>
                                 </button>
                               ) : null}
                             </div>

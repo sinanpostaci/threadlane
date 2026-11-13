@@ -1,67 +1,534 @@
-import { expect, type Locator, type Page, test } from '@playwright/test';
+import { expect, test, type Locator, type Page } from '@playwright/test';
+
 import {
+  appendChatWorkEventFixture,
+  backlogButton,
   BETA_CHAT_ONLY_SENTINEL,
-  buildDisconnectedWorkspaceSnapshot,
   buildExternalResolutionWorkspaceSnapshot,
+  buildFourPartScopeCollisionWorkspaceSnapshot,
   buildHistoricalFailureWorkspaceSnapshot,
-  buildInteractiveWorkspaceSnapshot,
+  buildMinimalChatWorkspaceSnapshot,
+  buildMinimalChatWorkspaceSnapshotWithMalformedWork,
   buildPendingAcceptanceWorkspaceSnapshot,
-  buildStaleWorkspaceSnapshot,
   CHAT_ALPHA_IDENTITY,
   CHAT_BETA_SAME_PROJECT_IDENTITY,
   CHAT_GAMMA_IDENTITY,
   CHAT_GAMMA_KEY,
-  createChatMessageItem,
-  EXTERNAL_RESOLUTION_COVERED_JOB_REASON,
-  EXTERNAL_RESOLUTION_COVERED_TASK_REASON,
-  EXTERNAL_RESOLUTION_FULL_RECEIPT_ID,
+  chatHeader,
+  closeBacklogWithEscape,
+  createBacklogEvent,
+  createBacklogWorkerPresence,
   EXTERNAL_RESOLUTION_FULL_SUMMARY,
-  EXTERNAL_RESOLUTION_PARTIAL_RECEIPT_ID,
-  EXTERNAL_RESOLUTION_PARTIAL_SUMMARY,
-  EXTERNAL_RESOLUTION_STALE_RECEIPT_ID,
   EXTERNAL_RESOLUTION_UNRELATED_QUESTION,
-  EXTERNAL_RESOLUTION_UNVERIFIED_RECEIPT_ID,
+  expectNoHorizontalOverflow,
+  expectNoNeedsYou,
+  expectSingleNeedsYou,
+  expectStreamEventOrder,
   FIXTURE_BASE_NOW_MS,
-  HISTORICAL_FAILURE_REASON,
+  FOUR_PART_BINDING_ONLY_IDENTITY,
+  FOUR_PART_BINDING_ONLY_SENTINEL,
+  FOUR_PART_PROJECT_ONLY_IDENTITY,
+  FOUR_PART_PROJECT_ONLY_SENTINEL,
+  FOUR_PART_SOURCE_ONLY_IDENTITY,
+  FOUR_PART_SOURCE_ONLY_SENTINEL,
+  getChatWorkFixture,
   installWorkspaceTauriFixture,
-  PENDING_ACCEPTANCE_SUMMARY,
-  VERIFIED_ACCEPTED_SUMMARY,
+  MINIMAL_CHAT_ALPHA_DOING_ITEM_ID,
+  MINIMAL_CHAT_APPENDED_EVENT_TITLE,
+  MINIMAL_CHAT_AUTHORED_LANGUAGE_TITLE,
+  MINIMAL_CHAT_BETA_BACKLOG_SENTINEL,
+  MINIMAL_CHAT_BLOCKED_REASON,
+  MINIMAL_CHAT_BLOCKED_TITLE,
+  MINIMAL_CHAT_COWORKER_DOING_TITLE,
+  MINIMAL_CHAT_DOING_TITLE,
+  MINIMAL_CHAT_DONE_TITLE,
+  MINIMAL_CHAT_FAILED_TITLE,
+  MINIMAL_CHAT_GAMMA_BACKLOG_SENTINEL,
+  MINIMAL_CHAT_LEGACY_MESSAGE_SENTINEL,
+  MINIMAL_CHAT_MALFORMED_WORK_SENTINEL,
+  MINIMAL_CHAT_PREPARING_TITLE,
+  MINIMAL_CHAT_READING_ANCHOR_TITLE,
+  MINIMAL_CHAT_TODO_TITLE,
+  MINIMAL_CHAT_WRONG_SCOPE_WORK_SENTINEL,
+  openBacklog,
+  resolveBacklogItemRow,
+  resolveStreamEventRow,
+  scrollStreamToBottom,
+  selectChat,
+  sidebar,
+  streamBottomDistance,
+  streamScroller,
+  triggerWorkspaceRefresh,
+  updateChatWorkFixture,
+  updateChatWorkPresenceFixture,
+  updateNativeActivityFixture,
+  workspaceSection,
   WRONG_SCOPE_QUARANTINE_SENTINEL,
 } from './fixtures/workspace.ts';
 import {
   parseWorkspaceSnapshot,
   WORKSPACE_CHAT_ARCHIVE_STORAGE_KEY,
+  WORKSPACE_SAMPLE_STALE_THRESHOLD_MS,
+  workspaceChatIdentitiesEqual,
 } from '../src/workspace-contract.ts';
 
-const ACTIVITY_SPINNER_SELECTOR = '[data-activity-spinner="true"], .tl-wp-spinner, .tl-spin';
+// The minimal chat contract replaces ordinary Messages/Jobs/Activity tabs with
+// one event stream and a read-only backlog drawer. These browser checks adapt
+// the meaningful old isolation, archive, navigation, liveness, and safety
+// coverage to that product surface.
+const STALE_ADVANCE_MS = WORKSPACE_SAMPLE_STALE_THRESHOLD_MS + 1_001;
 
-function chatSurfaceTab(page: Page, tabName: 'Messages' | 'Jobs' | 'Activity'): Locator {
-  const pattern = new RegExp(`^${tabName}\\b`, 'i');
-  return page.getByRole('tab', { name: pattern }).first();
+const APPEARANCE_STORAGE_KEY = 'threadlane.desktop.appearance.v1';
+
+function minimalAppearanceStorage(theme: 'light' | 'dark'): string {
+  return JSON.stringify({
+    theme,
+    surface: 'glass',
+    opacity: 88,
+    accent: 'sage',
+    rememberStateDir: false,
+    savedStateDir: '',
+  });
 }
 
-function visibleJobsPanel(page: Page): Locator {
-  return page.locator('.tl-wp-tabpanel[role="tabpanel"]:not([hidden]) .tl-wp-jobs-panel').first();
+async function installMinimal(
+  page: Page,
+  viewport: { width: number; height: number } = { width: 1040, height: 760 },
+  options: { appearanceTheme?: 'light' | 'dark' } = {},
+) {
+  const controller = await installWorkspaceTauriFixture(page, {
+    workspaceSnapshot: buildMinimalChatWorkspaceSnapshot(),
+    ...(options.appearanceTheme
+      ? {
+          initialLocalStorage: {
+            [APPEARANCE_STORAGE_KEY]: minimalAppearanceStorage(options.appearanceTheme),
+          },
+        }
+      : {}),
+  });
+  // Select Alpha while the inline sidebar is available, then apply the
+  // requested viewport. At 760px and below the sidebar becomes a closed drawer.
+  await page.setViewportSize({ width: 1040, height: 760 });
+  await page.goto('/');
+  await expect(page.locator('#app .tl-app-shell, #app .tl-app').first()).toBeVisible();
+  // The workspace independently orders chats, so Alpha is not guaranteed to be
+  // selected merely because it appears first in the fixture chat list.
+  await selectChat(page, 'Workspace UI Contract');
+  await expect(chatHeader(page, 'Workspace UI Contract')).toBeVisible();
+  await page.setViewportSize(viewport);
+  return controller;
 }
 
-function visibleActivityPanel(page: Page): Locator {
-  return page
-    .locator('.tl-wp-tabpanel[role="tabpanel"]:not([hidden]) .tl-wp-activity-panel')
+type CommittedBacklogStatus = 'todo' | 'doing' | 'done' | 'blocked';
+
+const COMMITTED_BACKLOG_GROUP_LABEL: Record<CommittedBacklogStatus, string> = {
+  todo: 'Todo',
+  doing: 'Doing',
+  done: 'Done',
+  blocked: 'Blocked',
+};
+
+function backlogStatusGroup(dialog: Locator, status: CommittedBacklogStatus): Locator {
+  const labels =
+    status === 'todo'
+      ? ['Todo', 'To do', 'To Do']
+      : [COMMITTED_BACKLOG_GROUP_LABEL[status]];
+  return dialog
+    .locator(
+      labels
+        .map((label) => `section[aria-label="${label} backlog items" i]`)
+        .join(', '),
+    )
     .first();
 }
 
-async function ensureDetailsOpen(details: Locator): Promise<void> {
-  await expect(details).toBeVisible();
-  const isOpen = await details.evaluate((el) => (el as HTMLDetailsElement).open);
-  if (!isOpen) {
-    await details.locator('summary').first().click();
-  }
-  await expect(details).toHaveJSProperty('open', true);
+function backlogStatusGroupPattern(status: CommittedBacklogStatus): RegExp {
+  const label =
+    status === 'todo' ? 'to[ -]?do' : COMMITTED_BACKLOG_GROUP_LABEL[status];
+  return new RegExp(`^${label} backlog items$`, 'i');
 }
 
-async function expectUsableMessagesScroller(messagesPanel: Locator): Promise<Locator> {
-  const scroller = messagesPanel.locator('[data-messages-scroller="true"]').first();
+async function expectCommittedBacklogStatus(
+  dialog: Locator,
+  title: string,
+  status: CommittedBacklogStatus,
+): Promise<void> {
+  // The committed state is the enclosing named group plus the row's exact
+  // data-status. The row intentionally has no duplicated visible state text.
+  const group = backlogStatusGroup(dialog, status);
+  await expect(group).toBeVisible();
+  await expect(group).toHaveAttribute(
+    'aria-label',
+    backlogStatusGroupPattern(status),
+  );
+  const row = resolveBacklogItemRow(group, title);
+  await expect(row).toBeVisible();
+  await expect(row).toHaveAttribute('data-status', status);
+}
+
+async function expectNoInventedBacklogRowStatus(row: Locator): Promise<void> {
+  await expect(row).not.toHaveAttribute(
+    'data-status',
+    /^(?:working|preparing|awaiting check|failed)$/i,
+  );
+  await expect(row.getByText(/^(?:working|preparing|awaiting check|failed)$/i)).toHaveCount(0);
+}
+
+type LiveAgentRole = 'Worker' | 'Coworker';
+
+function liveAgentList(scope: Locator): Locator {
+  // Live agents is the accessible list itself, not a heading above the rows.
+  return scope.locator('ul[aria-label="Live agents"]').first();
+}
+
+function liveAgentRow(scope: Locator, agent: LiveAgentRole): Locator {
+  return liveAgentList(scope)
+    .locator('li[data-agent-role]')
+    .filter({ hasText: new RegExp(`^\\s*${agent}`, 'i') })
+    .first();
+}
+
+function liveAgentSpinner(row: Locator): Locator {
+  return row.locator(
+    '[data-activity-spinner="true"], [data-agent-spinner="true"], [class*="spinner" i]',
+  );
+}
+
+async function visibleCount(locator: Locator): Promise<number> {
+  return locator.evaluateAll(
+    (nodes) => nodes.filter((node) => node.checkVisibility()).length,
+  );
+}
+
+async function expectLiveAgentWorking(
+  scope: Locator,
+  agent: LiveAgentRole,
+): Promise<void> {
+  await expect(liveAgentList(scope)).toBeVisible();
+  const row = liveAgentRow(scope, agent);
+  await expect(row).toBeVisible();
+  await expect(row.getByText(new RegExp(`^${agent}$`, 'i')).first()).toBeVisible();
+  const detail = (await row.innerText())
+    .replace(new RegExp(`^\\s*${agent}`, 'i'), '')
+    .trim();
+  expect(detail, `${agent} live agent row must include its detail text`).not.toBe('');
+  await expect.poll(() => visibleCount(liveAgentSpinner(row))).toBeGreaterThan(0);
+}
+
+async function expectNoLiveAgentWorking(
+  scope: Locator,
+  agent: LiveAgentRole,
+): Promise<void> {
+  await expect
+    .poll(async () => {
+      const row = liveAgentRow(scope, agent);
+      if ((await row.count()) === 0) {
+        return 0;
+      }
+      const spinners = await visibleCount(liveAgentSpinner(row));
+      const workingDetails = await visibleCount(row.getByText(/\bworking\b/i));
+      return spinners + workingDetails;
+    })
+    .toBe(0);
+}
+
+async function streamEventOffset(scroller: Locator, row: Locator): Promise<number> {
+  const [scrollerBox, rowBox] = await Promise.all([
+    scroller.boundingBox(),
+    row.boundingBox(),
+  ]);
+  if (!scrollerBox || !rowBox) {
+    throw new Error('Expected both the stream scroller and event row to have geometry.');
+  }
+  return rowBox.y - scrollerBox.y;
+}
+
+async function positionStreamEvent(
+  scroller: Locator,
+  row: Locator,
+  offsetPx: number,
+): Promise<void> {
+  await row.scrollIntoViewIfNeeded();
+  const currentOffset = await streamEventOffset(scroller, row);
+  await scroller.evaluate((element, delta) => {
+    element.scrollTop = Math.max(0, element.scrollTop + delta);
+    element.dispatchEvent(new Event('scroll', { bubbles: true }));
+  }, currentOffset - offsetPx);
+  await expect
+    .poll(async () => Math.abs((await streamEventOffset(scroller, row)) - offsetPx))
+    .toBeLessThanOrEqual(1);
+}
+
+async function firstIntersectingStreamEventId(scroller: Locator): Promise<string | null> {
+  return scroller.evaluate((element) => {
+    const viewport = element.getBoundingClientRect();
+    const first = [...element.querySelectorAll('[data-chat-event-id]')].find((row) => {
+      const rect = row.getBoundingClientRect();
+      return rect.bottom > viewport.top && rect.top < viewport.bottom;
+    });
+    return first?.getAttribute('data-chat-event-id') ?? null;
+  });
+}
+
+async function waitForFiniteAnimations(scope: Locator): Promise<void> {
+  await scope.evaluate(async () => {
+    const finiteAnimations = document.getAnimations().filter((animation) => {
+      const timing = animation.effect?.getTiming();
+      return !timing || timing.iterations !== Infinity;
+    });
+    await Promise.race([
+      Promise.all(finiteAnimations.map((animation) => animation.finished.catch(() => undefined))),
+      new Promise<void>((resolve) => {
+        setTimeout(() => resolve(), 2_000);
+      }),
+    ]);
+    await new Promise<void>((resolve) => {
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => resolve());
+      });
+    });
+  });
+}
+
+async function expectReadableDrawerTitle(dialog: Locator, title: string): Promise<void> {
+  const titleElement = dialog.getByText(title, { exact: true }).first();
+  await expect(titleElement).toBeVisible();
+  const metrics = await titleElement.evaluate((element) => {
+    interface RgbaColor {
+      r: number;
+      g: number;
+      b: number;
+      a: number;
+    }
+
+    const parseColor = (value: string): RgbaColor => {
+      const match = value.match(
+        /rgba?\(\s*([\d.]+)[,\s]+([\d.]+)[,\s]+([\d.]+)(?:[,\s/]+([\d.]+))?\s*\)/i,
+      );
+      if (match) {
+        return {
+          r: Number(match[1]),
+          g: Number(match[2]),
+          b: Number(match[3]),
+          a: match[4] === undefined ? 1 : Number(match[4]),
+        };
+      }
+      if (value === 'transparent') {
+        return { r: 0, g: 0, b: 0, a: 0 };
+      }
+      const canvas = document.createElement('canvas');
+      canvas.width = 1;
+      canvas.height = 1;
+      const context = canvas.getContext('2d');
+      if (!context) {
+        return { r: 0, g: 0, b: 0, a: 0 };
+      }
+      context.clearRect(0, 0, 1, 1);
+      context.fillStyle = 'rgba(0, 0, 0, 0)';
+      context.fillStyle = value;
+      context.fillRect(0, 0, 1, 1);
+      const data = context.getImageData(0, 0, 1, 1).data;
+      return {
+        r: data[0] ?? 0,
+        g: data[1] ?? 0,
+        b: data[2] ?? 0,
+        a: (data[3] ?? 0) / 255,
+      };
+    };
+
+    const compositeOver = (foreground: RgbaColor, background: RgbaColor): RgbaColor => ({
+      r: foreground.r * foreground.a + background.r * (1 - foreground.a),
+      g: foreground.g * foreground.a + background.g * (1 - foreground.a),
+      b: foreground.b * foreground.a + background.b * (1 - foreground.a),
+      a: 1,
+    });
+
+    const linearChannel = (value: number): number => {
+      const normalized = Math.max(0, Math.min(255, value)) / 255;
+      return normalized <= 0.04045
+        ? normalized / 12.92
+        : ((normalized + 0.055) / 1.055) ** 2.4;
+    };
+
+    const luminance = (color: RgbaColor): number =>
+      0.2126 * linearChannel(color.r) +
+      0.7152 * linearChannel(color.g) +
+      0.0722 * linearChannel(color.b);
+
+    const style = getComputedStyle(element);
+    const resolvedTheme = document.documentElement.dataset.theme ?? 'light';
+    let background: RgbaColor =
+      resolvedTheme === 'dark'
+        ? { r: 0, g: 0, b: 0, a: 1 }
+        : { r: 255, g: 255, b: 255, a: 1 };
+    const ancestors: Element[] = [];
+    for (let node = element.parentElement; node !== null; node = node.parentElement) {
+      ancestors.push(node);
+    }
+    for (const ancestor of ancestors.reverse()) {
+      const ancestorStyle = getComputedStyle(ancestor);
+      const ancestorBackground = parseColor(ancestorStyle.backgroundColor);
+      const ancestorOpacity = Number(ancestorStyle.opacity);
+      const effectiveAlpha =
+        ancestorBackground.a *
+        (Number.isFinite(ancestorOpacity)
+          ? Math.max(0, Math.min(1, ancestorOpacity))
+          : 1);
+      if (effectiveAlpha > 0) {
+        background = compositeOver(
+          { ...ancestorBackground, a: effectiveAlpha },
+          background,
+        );
+      }
+    }
+    const ownBackground = parseColor(style.backgroundColor);
+    const ownOpacity = Number(style.opacity);
+    const ownAlpha =
+      ownBackground.a *
+      (Number.isFinite(ownOpacity) ? Math.max(0, Math.min(1, ownOpacity)) : 1);
+    if (ownAlpha > 0) {
+      background = compositeOver({ ...ownBackground, a: ownAlpha }, background);
+    }
+
+    let accumulatedOpacity = 1;
+    for (
+      let node: Element | null = element;
+      node !== null;
+      node = node.parentElement
+    ) {
+      const nodeOpacity = Number(getComputedStyle(node).opacity);
+      if (Number.isFinite(nodeOpacity)) {
+        accumulatedOpacity *= nodeOpacity;
+      }
+    }
+
+    const textColor = parseColor(style.color);
+    const compositedText = compositeOver(
+      {
+        ...textColor,
+        a: Math.max(0, Math.min(1, textColor.a * accumulatedOpacity)),
+      },
+      background,
+    );
+    const textLuminance = luminance(compositedText);
+    const backgroundLuminance = luminance(background);
+    const contrast =
+      (Math.max(textLuminance, backgroundLuminance) + 0.05) /
+      (Math.min(textLuminance, backgroundLuminance) + 0.05);
+    const rect = element.getBoundingClientRect();
+
+    return {
+      contrast,
+      fontSize: Number.parseFloat(style.fontSize),
+      fontWeight: Number.parseInt(style.fontWeight, 10),
+      color: style.color,
+      backgroundColor: `${background.r},${background.g},${background.b}`,
+      text: (element.textContent ?? '').replace(/\s+/g, ' ').trim(),
+      width: rect.width,
+      height: rect.height,
+      visible: element.checkVisibility(),
+      overflows:
+        element.clientWidth > 0 && element.scrollWidth > element.clientWidth + 1,
+    };
+  });
+
+  expect(metrics.visible, `${title} must be visible`).toBe(true);
+  expect(metrics.text, `${title} must render its complete title text`).toBe(title);
+  expect(metrics.width, `${title} must have a readable title box`).toBeGreaterThan(40);
+  expect(metrics.height, `${title} must have a readable title height`).toBeGreaterThanOrEqual(12);
+  expect(metrics.overflows, `${title} must not overflow horizontally`).toBe(false);
+  const minimumContrast =
+    metrics.fontSize >= 24 || (metrics.fontSize >= 18.66 && metrics.fontWeight >= 700)
+      ? 3
+      : 4.5;
+  expect(
+    metrics.contrast,
+    `${title} contrast ${metrics.contrast.toFixed(2)} (text ${metrics.color}, background rgb(${metrics.backgroundColor}))`,
+  ).toBeGreaterThanOrEqual(minimumContrast);
+}
+
+async function expectVisibleWorking(scope: Locator): Promise<void> {
+  await expect
+    .poll(async () =>
+      scope
+        .getByText(/working/i)
+        .evaluateAll((nodes) => nodes.filter((node) => node.checkVisibility()).length),
+    )
+    .toBeGreaterThan(0);
+}
+
+async function expectNoVisibleWorking(scope: Locator): Promise<void> {
+  await expect
+    .poll(async () =>
+      scope
+        .getByText(/working/i)
+        .evaluateAll((nodes) => nodes.filter((node) => node.checkVisibility()).length),
+    )
+    .toBe(0);
+}
+
+async function expectNoNeedsYouInScope(scope: Locator): Promise<void> {
+  await expect
+    .poll(async () => {
+      const visibleTexts = await scope
+        .getByText(/waiting for you(?: in codex)?|needs\s*you/i)
+        .evaluateAll((nodes) => nodes.filter((node) => node.checkVisibility()).length);
+      const visibleAttentionLabels = await scope
+        .locator('[aria-label]')
+        .evaluateAll(
+          (nodes) =>
+            nodes
+              .filter((node) => node.checkVisibility())
+              .map((node) => node.getAttribute('aria-label') ?? '')
+              .filter((label) => /\b\d+\s+(?:item|items|question|questions)?\s*needs?\s+attention/i.test(label))
+              .length,
+        );
+      return visibleTexts + visibleAttentionLabels;
+    })
+    .toBe(0);
+}
+
+function lifecycleFilterControl(page: Page, kind: 'active' | 'archived'): Locator {
+  const pattern = kind === 'active' ? /^active\b/i : /^archive\b/i;
+  return sidebar(page)
+    .getByRole('group', { name: 'Projects views' })
+    .getByRole('button', { name: pattern })
+    .first();
+}
+
+function matchesExactOpenCodexInvocation(
+  rawArgs: Record<string, unknown>,
+  expected: { source_id: string; thread_uuid: string; job_id?: string | null },
+): boolean {
+  const topKeys = Object.keys(rawArgs);
+  if (topKeys.length !== 1 || topKeys[0] !== 'request') {
+    return false;
+  }
+  const rawRequest = rawArgs.request;
+  if (!rawRequest || typeof rawRequest !== 'object' || Array.isArray(rawRequest)) {
+    return false;
+  }
+  const request = rawRequest as Record<string, unknown>;
+  const allowedKeys = new Set(['source_id', 'thread_uuid', 'job_id']);
+  for (const key of Object.keys(request)) {
+    if (!allowedKeys.has(key)) {
+      return false;
+    }
+  }
+  const expectedJobId = expected.job_id ?? null;
+  const actualJobId = request.job_id === undefined ? null : request.job_id;
+  return (
+    request.source_id === expected.source_id &&
+    request.thread_uuid === expected.thread_uuid &&
+    actualJobId === expectedJobId
+  );
+}
+
+async function expectUsableStream(page: Page): Promise<Locator> {
+  const scroller = streamScroller(page);
   await expect(scroller).toBeVisible();
+  await expect(scroller).toHaveAttribute('data-chat-stream-scroller', 'true');
+  await expect(scroller).toHaveAttribute('aria-label', 'Chat activity stream');
   await expect
     .poll(() => scroller.evaluate((el) => el.clientHeight))
     .toBeGreaterThanOrEqual(120);
@@ -97,130 +564,6 @@ async function expectInViewportWithinScroller(
       );
     })
     .toBe(true);
-  const [scrollerBox, targetBox] = await Promise.all([
-    scroller.boundingBox(),
-    target.boundingBox(),
-  ]);
-  expect(scrollerBox).not.toBeNull();
-  expect(targetBox).not.toBeNull();
-  expect(scrollerBox!.height).toBeGreaterThanOrEqual(120);
-  expect(targetBox!.height).toBeGreaterThan(0);
-  expect(targetBox!.y).toBeGreaterThanOrEqual(scrollerBox!.y - 1);
-  expect(targetBox!.y + targetBox!.height).toBeLessThanOrEqual(
-    scrollerBox!.y + scrollerBox!.height + 1,
-  );
-}
-
-function lifecycleFilterControl(page: Page, kind: 'active' | 'archived'): Locator {
-  const pattern = kind === 'active' ? /^active\b/i : /^archive\b/i;
-  return page
-    .locator('aside.tl-sidebar')
-    .first()
-    .getByRole('group', { name: 'Projects views' })
-    .getByRole('button', { name: pattern })
-    .first();
-}
-
-async function expandOtherActivityDetails(page: Page, activityPanel: Locator): Promise<Locator> {
-  const details = activityPanel
-    .locator('details')
-    .filter({ has: page.locator('summary', { hasText: /other activity/i }) })
-    .first();
-  if ((await details.count()) > 0) {
-    const isOpen = await details.evaluate((el) => (el as HTMLDetailsElement).open);
-    if (!isOpen) {
-      await details.locator('summary').first().click();
-    }
-    await expect(details).toHaveJSProperty('open', true);
-  }
-  return details;
-}
-
-function matchesExactOpenCodexInvocation(
-  rawArgs: Record<string, unknown>,
-  expected: { source_id: string; thread_uuid: string; job_id?: string | null },
-): boolean {
-  const topKeys = Object.keys(rawArgs);
-  if (topKeys.length !== 1 || topKeys[0] !== 'request') {
-    return false;
-  }
-  const rawRequest = rawArgs.request;
-  if (!rawRequest || typeof rawRequest !== 'object' || Array.isArray(rawRequest)) {
-    return false;
-  }
-  const request = rawRequest as Record<string, unknown>;
-  const allowedKeys = new Set(['source_id', 'thread_uuid', 'job_id']);
-  for (const key of Object.keys(request)) {
-    if (!allowedKeys.has(key)) {
-      return false;
-    }
-  }
-  const expectedJobId = expected.job_id ?? null;
-  const actualJobId = request.job_id === undefined ? null : request.job_id;
-  return (
-    request.source_id === expected.source_id &&
-    request.thread_uuid === expected.thread_uuid &&
-    actualJobId === expectedJobId
-  );
-}
-
-async function triggerWorkspaceRefresh(page: Page): Promise<void> {
-  const refreshBtn = page.getByRole('button', { name: /refresh|reload/i }).first();
-  if ((await refreshBtn.count()) > 0 && (await refreshBtn.isVisible())) {
-    await refreshBtn.click();
-    return;
-  }
-  await page.evaluate(() => {
-    window.dispatchEvent(new Event('focus'));
-  });
-}
-
-async function findScrollableMessagesViewport(
-  page: Page,
-  anchorText: string,
-): Promise<Locator> {
-  const handle = await page.evaluateHandle((needle) => {
-    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
-    let targetEl: HTMLElement | null = null;
-    while (walker.nextNode()) {
-      const node = walker.currentNode;
-      if (node.nodeValue && node.nodeValue.includes(needle)) {
-        targetEl = node.parentElement;
-        break;
-      }
-    }
-    let current: HTMLElement | null = targetEl;
-    while (current && current !== document.body) {
-      const style = window.getComputedStyle(current);
-      const overflowY = style.overflowY;
-      if (
-        (overflowY === 'auto' || overflowY === 'scroll' || overflowY === 'overlay') &&
-        current.scrollHeight > current.clientHeight + 40
-      ) {
-        return current;
-      }
-      current = current.parentElement;
-    }
-    return null;
-  }, anchorText);
-
-  try {
-    const element = handle.asElement();
-    expect(
-      element,
-      `Expected a scrollable Messages viewport ancestor containing "${anchorText}"`,
-    ).not.toBeNull();
-
-    await page.evaluate((el) => {
-      if (el) {
-        el.setAttribute('data-pw-messages-scroll-probe', 'true');
-      }
-    }, element);
-  } finally {
-    await handle.dispose();
-  }
-
-  return page.locator('[data-pw-messages-scroll-probe="true"]').first();
 }
 
 test.describe('Production entry path and Tauri IPC boundary', () => {
@@ -242,7 +585,7 @@ test.describe('Production entry path and Tauri IPC boundary', () => {
     await expect(
       page
         .getByText(
-          /not connected in this browser window|observation.*unavailable|runtime.*unavailable|unavailable|disconnected/i,
+          /not connected in this browser window|observation.*unavailable|runtime.*unavailable|not available|unavailable|disconnected|offline/i,
         )
         .first(),
     ).toBeVisible();
@@ -309,7 +652,7 @@ test.describe('Production entry path and Tauri IPC boundary', () => {
   });
 });
 
-test.describe('Responsive shell geometry: wide, 760px drawer boundary, and 360x500 minimum window', () => {
+test.describe('Responsive shell geometry: wide, 760px drawer boundary, and narrow stream', () => {
   test('toggles wide titlebar sidebar rail, switches at exact 760px drawer boundary, traps focus, and restores focus on Escape', async ({
     page,
   }) => {
@@ -320,7 +663,7 @@ test.describe('Responsive shell geometry: wide, 760px drawer boundary, and 360x5
     const titlebar = page.locator('header.tl-titlebar, [role="banner"]').first();
     await expect(titlebar).toBeVisible();
 
-    const inlineSidebar = page.locator('aside.tl-sidebar').first();
+    const inlineSidebar = sidebar(page);
     await expect(inlineSidebar).toBeVisible();
     const expandedBox = await inlineSidebar.boundingBox();
     expect(expandedBox).not.toBeNull();
@@ -337,7 +680,6 @@ test.describe('Responsive shell geometry: wide, 760px drawer boundary, and 360x5
       .getByRole('button', { name: /expand sidebar|show sidebar|toggle sidebar/i })
       .first();
     await expect(expandBtn).toBeVisible();
-    // Wait for the 140ms CSS width transition on `.tl-sidebar` to settle at <= 72px.
     await expect
       .poll(async () => {
         const collapsedBox = await inlineSidebar.boundingBox();
@@ -373,7 +715,6 @@ test.describe('Responsive shell geometry: wide, 760px drawer boundary, and 360x5
     await drawerTrigger.click();
     await expect(drawerDialog).toBeVisible();
 
-    // Focus must move inside the modal navigation drawer on open.
     await expect
       .poll(() =>
         page.evaluate(() => {
@@ -383,320 +724,578 @@ test.describe('Responsive shell geometry: wide, 760px drawer boundary, and 360x5
       )
       .toBe(true);
 
-    // Escape must dismiss the drawer and restore focus to the titlebar trigger button.
     await page.keyboard.press('Escape');
     await expect(drawerDialog).toHaveCount(0);
     await expect(drawerTrigger).toBeFocused();
   });
 
-  test('renders tabs, drawer navigation, and chat surfaces cleanly inside 360x500 narrow minimum window without horizontal overflow', async ({
+  test('renders one usable event stream and an accessible Backlog control inside 390x740 without horizontal overflow', async ({
     page,
   }) => {
-    await installWorkspaceTauriFixture(page);
-    await page.setViewportSize({ width: 360, height: 500 });
-    await page.goto('/');
-
+    await installMinimal(page, { width: 390, height: 740 });
     await expect(page.locator('#app .tl-app-shell, #app .tl-app').first()).toBeVisible();
+    await expect(chatHeader(page, 'Workspace UI Contract')).toBeVisible();
+    await expectUsableStream(page);
+    await expect(backlogButton(page)).toBeVisible();
+    await expectNoHorizontalOverflow(page, '390x740 stream');
 
-    const messagesTab = chatSurfaceTab(page, 'Messages');
-    const jobsTab = chatSurfaceTab(page, 'Jobs');
-    const activityTab = chatSurfaceTab(page, 'Activity');
-
-    await expect(messagesTab).toBeVisible();
-    await expect(messagesTab).toHaveAttribute('aria-selected', 'true');
-    await expect(jobsTab).toBeVisible();
-    await expect(activityTab).toBeVisible();
-
-    for (const tab of [messagesTab, jobsTab, activityTab]) {
-      const rect = await tab.boundingBox();
-      expect(rect).not.toBeNull();
-      expect(rect!.x).toBeGreaterThanOrEqual(0);
-      expect(rect!.x + rect!.width).toBeLessThanOrEqual(360);
-    }
-
-    const checkNoHorizontalOverflow = async () => {
-      const metrics = await page.evaluate(() => ({
-        scrollWidth: document.documentElement.scrollWidth,
-        innerWidth: window.innerWidth,
-      }));
-      expect(metrics.scrollWidth).toBeLessThanOrEqual(metrics.innerWidth);
-    };
-
-    await checkNoHorizontalOverflow();
-
-    await jobsTab.click();
-    await expect(jobsTab).toHaveAttribute('aria-selected', 'true');
+    const workspace = workspaceSection(page);
+    await expect(workspace.getByRole('tab')).toHaveCount(0);
+    await expect(workspace.locator('[role="tablist"]')).toHaveCount(0);
     await expect(
-      visibleJobsPanel(page).getByText('Workspace Contract Acceptance Slice').first(),
-    ).toBeVisible();
-    await checkNoHorizontalOverflow();
-
-    await activityTab.click();
-    await expect(activityTab).toHaveAttribute('aria-selected', 'true');
+      workspace.getByRole('tab', { name: /^(messages|jobs|activity)\b/i }),
+    ).toHaveCount(0);
     await expect(
-      visibleActivityPanel(page).getByText('Run isolated Worker implementation pass').first(),
-    ).toBeVisible();
-    await checkNoHorizontalOverflow();
+      workspace.getByRole('button', { name: /^(messages|jobs|activity)\b/i }),
+    ).toHaveCount(0);
+    await expect(workspace.getByText(/load older/i)).toHaveCount(0);
+    await expect(workspace.getByText(/filter/i)).toHaveCount(0);
+    await expect(workspace.getByRole('button', { name: /filter/i })).toHaveCount(0);
 
-    const drawerTrigger = page
-      .getByRole('button', { name: /open navigation drawer|navigation drawer/i })
-      .first();
-    await drawerTrigger.click();
-    const drawerDialog = page.getByRole('dialog', { name: /navigation|projects|workspace/i });
-    await expect(drawerDialog).toBeVisible();
-    const drawerRect = await drawerDialog.boundingBox();
-    expect(drawerRect).not.toBeNull();
-    expect(drawerRect!.width).toBeLessThanOrEqual(360);
-    await checkNoHorizontalOverflow();
-
-    await page.keyboard.press('Escape');
-    await expect(drawerDialog).toHaveCount(0);
+    const dialog = await openBacklog(page);
+    const dialogBox = await dialog.boundingBox();
+    expect(dialogBox).not.toBeNull();
+    expect(dialogBox!.width).toBeLessThanOrEqual(390);
+    await expectNoHorizontalOverflow(page, '390x740 backlog drawer');
+    await closeBacklogWithEscape(page);
+    await expect(backlogButton(page)).toBeFocused();
   });
 
-  test('narrow activity cards preserve readable titles', async ({ page }) => {
-    await installWorkspaceTauriFixture(page);
-    await page.setViewportSize({ width: 360, height: 500 });
-    await page.goto('/');
+  test('narrow event rows preserve readable titles and remain inside the stream viewport', async ({
+    page,
+  }) => {
+    await installMinimal(page, { width: 390, height: 740 });
+    const scroller = await expectUsableStream(page);
 
-    const activityTab = chatSurfaceTab(page, 'Activity');
-    await activityTab.click();
-    await expect(activityTab).toHaveAttribute('aria-selected', 'true');
-
-    const activityPanel = visibleActivityPanel(page);
-    await expect(activityPanel).toBeVisible();
-
-    const scroller = activityPanel.locator('.tl-wp-activity-scroller').first();
-    await expect(scroller).toBeVisible();
-
-    const cards = scroller.locator('article.tl-wp-activity-card');
-    await expect(cards).toHaveCount(3);
-
-    const expectedTitles = [
-      'Run isolated Worker implementation pass',
-      'Complete contract schema validation pass',
-      'Validate shared contract types',
+    const titles = [
+      MINIMAL_CHAT_READING_ANCHOR_TITLE,
+      `Preparing Worker execution for ${MINIMAL_CHAT_DOING_TITLE}`,
+      `Worker result recorded: Awaiting check for ${MINIMAL_CHAT_DOING_TITLE}`,
+      `Blocked: ${MINIMAL_CHAT_BLOCKED_TITLE}`,
     ];
-
-    const measureCardTitleGeometry = async (index: number) =>
-      cards.nth(index).evaluate((cardEl) => {
-        const titleEl = cardEl.querySelector('.tl-wp-activity-row-title');
-        const buttonEl = cardEl.querySelector('button.tl-wp-activity-row-btn');
-        const scrollerEl = cardEl.closest('.tl-wp-activity-scroller');
-        const panelEl = cardEl.closest('.tl-wp-activity-panel');
-        if (!titleEl || !buttonEl || !scrollerEl || !panelEl) {
-          return null;
-        }
-
-        const cardRect = cardEl.getBoundingClientRect();
-        const buttonRect = buttonEl.getBoundingClientRect();
-        const titleRect = titleEl.getBoundingClientRect();
-        const scrollerRect = scrollerEl.getBoundingClientRect();
-        const panelRect = panelEl.getBoundingClientRect();
-
-        const cardClipLeft = cardRect.left + cardEl.clientLeft;
-        const cardClipTop = cardRect.top + cardEl.clientTop;
-        const cardClipRight = cardClipLeft + cardEl.clientWidth;
-        const cardClipBottom = cardClipTop + cardEl.clientHeight;
-
-        const scrollerClipLeft = scrollerRect.left + scrollerEl.clientLeft;
-        const scrollerClipTop = scrollerRect.top + scrollerEl.clientTop;
-        const scrollerClipRight = scrollerClipLeft + scrollerEl.clientWidth;
-        const scrollerClipBottom = scrollerClipTop + scrollerEl.clientHeight;
-
-        const visibleLeft = Math.max(
-          0,
-          panelRect.left,
-          scrollerClipLeft,
-          cardClipLeft,
-          titleRect.left,
-        );
-        const visibleTop = Math.max(
-          0,
-          panelRect.top,
-          scrollerClipTop,
-          cardClipTop,
-          titleRect.top,
-        );
-        const visibleRight = Math.min(
-          window.innerWidth,
-          panelRect.right,
-          scrollerClipRight,
-          cardClipRight,
-          titleRect.right,
-        );
-        const visibleBottom = Math.min(
-          window.innerHeight,
-          panelRect.bottom,
-          scrollerClipBottom,
-          cardClipBottom,
-          titleRect.bottom,
-        );
-        const visibleWidth = Math.max(0, visibleRight - visibleLeft);
-        const visibleHeight = Math.max(0, visibleBottom - visibleTop);
-
-        const centerX = visibleLeft + visibleWidth / 2;
-        const centerY = visibleTop + visibleHeight / 2;
-        const hitEl =
-          visibleWidth > 0 && visibleHeight > 0
-            ? document.elementFromPoint(centerX, centerY)
-            : null;
-
-        return {
-          titleText: (titleEl.textContent ?? '').trim(),
-          titleWidth: titleRect.width,
-          titleHeight: titleRect.height,
-          titleWithinCard:
-            titleRect.left >= cardClipLeft - 1.5 &&
-            titleRect.right <= cardClipRight + 1.5 &&
-            titleRect.top >= cardClipTop - 1.5 &&
-            titleRect.bottom <= cardClipBottom + 1.5,
-          buttonWithinCard:
-            buttonRect.top >= cardClipTop - 1.5 && buttonRect.bottom <= cardClipBottom + 1.5,
-          visibleWidth,
-          visibleHeight,
-          hitWithinCard: Boolean(hitEl && cardEl.contains(hitEl)),
-        };
-      });
-
-    for (let idx = 0; idx < expectedTitles.length; idx += 1) {
-      const geometry = await measureCardTitleGeometry(idx);
-      expect(geometry).not.toBeNull();
-      expect(geometry!.titleText).toBe(expectedTitles[idx]);
-      expect(geometry!.titleWidth).toBeGreaterThan(80);
-      expect(geometry!.titleHeight).toBeGreaterThanOrEqual(14);
-      expect(geometry!.titleWithinCard).toBe(true);
-      expect(geometry!.buttonWithinCard).toBe(true);
+    for (const title of titles) {
+      const row = await resolveStreamEventRow(page, title);
+      await expect(row).toBeVisible();
+      await expectInViewportWithinScroller(scroller, row);
+      const box = await row.boundingBox();
+      expect(box).not.toBeNull();
+      expect(box!.width).toBeGreaterThan(80);
+      expect(box!.height).toBeGreaterThanOrEqual(14);
     }
 
-    const firstTitle = cards.nth(0).locator('.tl-wp-activity-row-title').first();
-    await expect(firstTitle).toHaveText(expectedTitles[0]!);
-    await expect(firstTitle).toBeInViewport({ ratio: 0.95 });
-
-    const firstGeometry = await measureCardTitleGeometry(0);
-    expect(firstGeometry).not.toBeNull();
-    expect(firstGeometry!.visibleWidth).toBeGreaterThanOrEqual(firstGeometry!.titleWidth - 1.5);
-    expect(firstGeometry!.visibleHeight).toBeGreaterThanOrEqual(firstGeometry!.titleHeight - 1.5);
-    expect(firstGeometry!.hitWithinCard).toBe(true);
-
-    const initialScroll = await scroller.evaluate((pane) => {
-      const paneRect = pane.getBoundingClientRect();
-      const cardNodes = pane.querySelectorAll('article.tl-wp-activity-card');
-      const lastCard = cardNodes[cardNodes.length - 1];
-      const lastRect = lastCard ? lastCard.getBoundingClientRect() : null;
-      return {
-        scrollTop: pane.scrollTop,
-        clientHeight: pane.clientHeight,
-        scrollHeight: pane.scrollHeight,
-        lastCardExtendsBelowPane: lastRect ? lastRect.bottom > paneRect.bottom + 4 : false,
-        docScrollWidth: document.documentElement.scrollWidth,
-        innerWidth: window.innerWidth,
-        windowScrollY: window.scrollY,
-      };
-    });
-    expect(initialScroll.scrollTop).toBe(0);
-    expect(initialScroll.scrollHeight).toBeGreaterThan(initialScroll.clientHeight + 20);
-    expect(initialScroll.lastCardExtendsBelowPane).toBe(true);
-    expect(initialScroll.docScrollWidth).toBeLessThanOrEqual(initialScroll.innerWidth);
-    expect(initialScroll.windowScrollY).toBe(0);
-
-    let previousScrollTop = initialScroll.scrollTop;
-    for (let idx = 1; idx < expectedTitles.length; idx += 1) {
-      const nextScrollTop = await scroller.evaluate((pane, cardIndex) => {
-        const cardEl = pane.querySelectorAll('article.tl-wp-activity-card')[cardIndex];
-        if (!cardEl) {
-          throw new Error(`Missing activity card at index ${cardIndex}`);
-        }
-        const paneRect = pane.getBoundingClientRect();
-        const cardRect = cardEl.getBoundingClientRect();
-        const desiredTop = pane.scrollTop + (cardRect.top - paneRect.top) - 8;
-        const maxScrollTop = Math.max(0, pane.scrollHeight - pane.clientHeight);
-        pane.scrollTop = Math.min(maxScrollTop, Math.max(0, desiredTop));
-        pane.dispatchEvent(new Event('scroll', { bubbles: true }));
-        return pane.scrollTop;
-      }, idx);
-
-      expect(nextScrollTop).toBeGreaterThan(0);
-      expect(nextScrollTop).toBeGreaterThanOrEqual(previousScrollTop);
-      previousScrollTop = nextScrollTop;
-      expect(await page.evaluate(() => window.scrollY)).toBe(0);
-
-      const cardTitle = cards.nth(idx).locator('.tl-wp-activity-row-title').first();
-      await expect(cardTitle).toHaveText(expectedTitles[idx]!);
-      await expect(cardTitle).toBeInViewport({ ratio: 0.95 });
-
-      const scrolledGeometry = await measureCardTitleGeometry(idx);
-      expect(scrolledGeometry).not.toBeNull();
-      expect(scrolledGeometry!.titleWithinCard).toBe(true);
-      expect(scrolledGeometry!.buttonWithinCard).toBe(true);
-      expect(scrolledGeometry!.visibleWidth).toBeGreaterThanOrEqual(
-        scrolledGeometry!.titleWidth - 1.5,
-      );
-      expect(scrolledGeometry!.visibleHeight).toBeGreaterThanOrEqual(
-        scrolledGeometry!.titleHeight - 1.5,
-      );
-      expect(scrolledGeometry!.hitWithinCard).toBe(true);
-    }
+    await expectNoHorizontalOverflow(page, 'narrow event rows');
   });
 });
 
-test.describe('Workspace chat tabs, Active/Archive lifecycle, scroll preservation, and Activity spinner geometry', () => {
-  test('separates Messages, Jobs, and Activity tabs with Messages selected by default', async ({
+test.describe('Minimal chat stream, archive, scroll, and read-only backlog drawer', () => {
+  test('renders a verified zero-job chat as one chronological event stream without legacy tabs at 1040x760 and 390x740', async ({
     page,
   }) => {
-    await installWorkspaceTauriFixture(page);
+    const controller = await installMinimal(page);
+    const snapshot = await controller.getWorkspaceSnapshot();
+    expect(snapshot).not.toBeNull();
+    expect(snapshot!.observation.jobs).toHaveLength(0);
+    expect(snapshot!.observation.requests).toHaveLength(0);
+    expect(snapshot!.job_histories).toHaveLength(0);
+
+    await expect(
+      sidebar(page).getByText('Workspace UI Contract', { exact: true }),
+    ).toBeVisible();
+    await expect(chatHeader(page, 'Workspace UI Contract')).toBeVisible();
+
+    const scroller = await expectUsableStream(page);
+    const workspace = workspaceSection(page);
+    await expect(workspace.getByRole('tab')).toHaveCount(0);
+    await expect(workspace.locator('[role="tablist"]')).toHaveCount(0);
+    await expect(
+      workspace.getByRole('tab', { name: /^(messages|jobs|activity)\b/i }),
+    ).toHaveCount(0);
+    await expect(
+      workspace.getByRole('button', { name: /^(messages|jobs|activity)\b/i }),
+    ).toHaveCount(0);
+    await expect(workspace.getByText(/load older/i)).toHaveCount(0);
+    await expect(workspace.getByText(/filter/i)).toHaveCount(0);
+    await expect(workspace.getByRole('button', { name: /filter/i })).toHaveCount(0);
+
+    await expectStreamEventOrder(page, [
+      MINIMAL_CHAT_READING_ANCHOR_TITLE,
+      `Backlog item created: ${MINIMAL_CHAT_TODO_TITLE}`,
+      `Preparing Worker execution for ${MINIMAL_CHAT_DOING_TITLE}`,
+      `Worker result recorded: Awaiting check for ${MINIMAL_CHAT_DOING_TITLE}`,
+    ]);
+
+    // Historical message fields and unaligned work never replace or leak into the stream.
+    await expect(workspace.getByText(MINIMAL_CHAT_LEGACY_MESSAGE_SENTINEL)).toHaveCount(0);
+    await expect(workspace.getByText(WRONG_SCOPE_QUARANTINE_SENTINEL)).toHaveCount(0);
+    await expect(workspace.getByText(MINIMAL_CHAT_WRONG_SCOPE_WORK_SENTINEL)).toHaveCount(0);
+    await expect(workspace.getByText(MINIMAL_CHAT_MALFORMED_WORK_SENTINEL)).toHaveCount(0);
+
+    await page.setViewportSize({ width: 390, height: 740 });
+    await expect(scroller).toBeVisible();
+    await expect(chatHeader(page, 'Workspace UI Contract')).toBeVisible();
+    await expect(backlogButton(page)).toBeVisible();
+    await expectNoHorizontalOverflow(page, 'narrow zero-job stream');
+  });
+
+  test('appends events chronologically, deduplicates stable event IDs, and follows only while near the bottom', async ({
+    page,
+  }) => {
+    const controller = await installMinimal(page);
+    const scroller = streamScroller(page);
+    await expect(
+      resolveStreamEventRow(page, MINIMAL_CHAT_READING_ANCHOR_TITLE),
+    ).toBeVisible();
+    await scrollStreamToBottom(scroller);
+
+    const baseSnapshot = await controller.getWorkspaceSnapshot();
+    expect(baseSnapshot).not.toBeNull();
+    const alphaWork = getChatWorkFixture(baseSnapshot!, CHAT_ALPHA_IDENTITY);
+    const lastEvent = alphaWork.events[alphaWork.events.length - 1]!;
+    const lastItem = alphaWork.items.find((item) => item.item_id === lastEvent.item_id);
+    expect(lastItem).toBeDefined();
+
+    const appendedEvent = createBacklogEvent({
+      item: lastItem!,
+      sequence: lastEvent.sequence + 1,
+      revision: lastEvent.revision + 1,
+      action: 'edited',
+      title: MINIMAL_CHAT_APPENDED_EVENT_TITLE,
+      recordedAtMs: FIXTURE_BASE_NOW_MS + 5_000,
+    });
+    const appendedSnapshot = appendChatWorkEventFixture(
+      baseSnapshot!,
+      CHAT_ALPHA_IDENTITY,
+      appendedEvent,
+    );
+    await controller.setWorkspaceSnapshot(appendedSnapshot);
+    await triggerWorkspaceRefresh(page);
+
+    const appendedRow = await resolveStreamEventRow(page, MINIMAL_CHAT_APPENDED_EVENT_TITLE);
+    await expect(appendedRow).toBeVisible();
+    await expect(appendedRow).toBeInViewport({ ratio: 0.5 });
+    const appendedText = await scroller.innerText();
+    expect(appendedText.indexOf(MINIMAL_CHAT_APPENDED_EVENT_TITLE)).toBeGreaterThan(
+      appendedText.indexOf(lastEvent.title),
+    );
+    await expect.poll(() => streamBottomDistance(scroller)).toBeLessThanOrEqual(64);
+
+    // A refresh repeating the same durable event ID must not add a second row.
+    const duplicateSnapshot = appendChatWorkEventFixture(
+      appendedSnapshot,
+      CHAT_ALPHA_IDENTITY,
+      {
+        ...appendedEvent,
+        note: 'Duplicate refresh payload for the same durable event ID.',
+      },
+    );
+    await controller.setWorkspaceSnapshot(duplicateSnapshot);
+    await triggerWorkspaceRefresh(page);
+    await expect(
+      workspaceSection(page).getByText(MINIMAL_CHAT_APPENDED_EVENT_TITLE, { exact: true }),
+    ).toHaveCount(1);
+
+    // Distinct durable event IDs may share display text; they must not be
+    // collapsed by title alone.
+    const sameTitle = 'Same display title, distinct durable event IDs.';
+    const sameTitleEvents = [1, 2].map((offset) =>
+      createBacklogEvent({
+        item: lastItem!,
+        sequence: appendedEvent.sequence + offset,
+        revision: appendedEvent.revision + offset,
+        eventId: `${lastItem!.item_id}:${appendedEvent.revision + offset}`,
+        action: 'edited',
+        title: sameTitle,
+        recordedAtMs: FIXTURE_BASE_NOW_MS + 5_000 + offset,
+      }),
+    );
+    let sameTitleSnapshot = duplicateSnapshot;
+    for (const sameTitleEvent of sameTitleEvents) {
+      sameTitleSnapshot = appendChatWorkEventFixture(
+        sameTitleSnapshot,
+        CHAT_ALPHA_IDENTITY,
+        sameTitleEvent,
+      );
+    }
+    await controller.setWorkspaceSnapshot(sameTitleSnapshot);
+    await triggerWorkspaceRefresh(page);
+    await expect(
+      workspaceSection(page).getByText(sameTitle, { exact: true }),
+    ).toHaveCount(2);
+
+    // Reading above the bottom must not be forced to follow the append.
+    await scroller.evaluate((el) => {
+      el.scrollTop = Math.min(96, Math.max(0, el.scrollHeight - el.clientHeight));
+      el.dispatchEvent(new Event('scroll', { bubbles: true }));
+    });
+    const anchor = await resolveStreamEventRow(page, MINIMAL_CHAT_READING_ANCHOR_TITLE);
+    const before = await scroller.evaluate((el) => ({
+      scrollTop: el.scrollTop,
+      distanceFromBottom: el.scrollHeight - el.scrollTop - el.clientHeight,
+    }));
+    expect(before.distanceFromBottom).toBeGreaterThan(80);
+    const beforeBox = await anchor.boundingBox();
+    expect(beforeBox).not.toBeNull();
+
+    const readingEvent = createBacklogEvent({
+      item: lastItem!,
+      sequence: appendedEvent.sequence + 3,
+      revision: appendedEvent.revision + 3,
+      action: 'edited',
+      title: 'Reading anchor append event: the viewport must stay on the anchor.',
+      recordedAtMs: FIXTURE_BASE_NOW_MS + 6_000,
+    });
+    const readingSnapshot = appendChatWorkEventFixture(
+      sameTitleSnapshot,
+      CHAT_ALPHA_IDENTITY,
+      readingEvent,
+    );
+    await controller.setWorkspaceSnapshot(readingSnapshot);
+    await triggerWorkspaceRefresh(page);
+
+    const newEventsButton = page
+      .getByRole('button', {
+        name: /new (?:event|events|message|messages|activity|update)|jump to latest|latest/i,
+      })
+      .first();
+    await expect(newEventsButton).toBeVisible();
+
+    const afterScrollTop = await scroller.evaluate((el) => el.scrollTop);
+    const afterBox = await anchor.boundingBox();
+    expect(afterBox).not.toBeNull();
+    expect(Math.abs(afterScrollTop - before.scrollTop)).toBeLessThanOrEqual(6);
+    expect(Math.abs(afterBox!.y - beforeBox!.y)).toBeLessThanOrEqual(6);
+
+    await newEventsButton.click();
+    await expect.poll(() => streamBottomDistance(scroller)).toBeLessThanOrEqual(64);
+    await expect(
+      resolveStreamEventRow(page, readingEvent.title),
+    ).toBeInViewport({ ratio: 0.5 });
+    await expect(newEventsButton).toHaveCount(0);
+  });
+
+  test('preserves the visible event and pixel offset when a refresh trims the stream head', async ({
+    page,
+  }) => {
+    const controller = await installMinimal(page);
+    const scroller = await expectUsableStream(page);
+    await expect
+      .poll(() => scroller.evaluate((el) => el.scrollHeight - el.clientHeight))
+      .toBeGreaterThan(160);
+
+    const anchorTitle = `Backlog item created: ${MINIMAL_CHAT_TODO_TITLE}`;
+    const anchor = await resolveStreamEventRow(page, anchorTitle);
+    await positionStreamEvent(scroller, anchor, 72);
+    const beforeOffset = await streamEventOffset(scroller, anchor);
+    const beforeScrollTop = await scroller.evaluate((el) => el.scrollTop);
+    expect(beforeScrollTop).toBeGreaterThan(0);
+
+    const baseSnapshot = await controller.getWorkspaceSnapshot();
+    expect(baseSnapshot).not.toBeNull();
+    const alphaWork = getChatWorkFixture(baseSnapshot!, CHAT_ALPHA_IDENTITY);
+    expect(alphaWork.events.length).toBeGreaterThan(6);
+    // Keep the first intersecting row (sequence 3). The named row below it is
+    // not itself the reading anchor; deleting that predecessor tests eviction.
+    const removedTitles = alphaWork.events.slice(0, 2).map((event) => event.title);
+    await expect(resolveStreamEventRow(page, removedTitles[0]!)).toHaveCount(1);
+    const trimmedSnapshot = updateChatWorkFixture(baseSnapshot!, CHAT_ALPHA_IDENTITY, {
+      events: alphaWork.events.slice(2),
+    });
+    await controller.setWorkspaceSnapshot(trimmedSnapshot);
+    await triggerWorkspaceRefresh(page);
+
+    await expect(resolveStreamEventRow(page, removedTitles[0]!)).toHaveCount(0);
+    await expect(anchor).toBeVisible();
+    await expect(anchor).toBeInViewport({ ratio: 0.4 });
+    await expect
+      .poll(async () => Math.abs((await streamEventOffset(scroller, anchor)) - beforeOffset))
+      .toBeLessThanOrEqual(2);
+    await expect
+      .poll(() => scroller.evaluate((el) => el.scrollTop))
+      .toBeLessThan(beforeScrollTop);
+  });
+
+  test('falls back to the nearest surviving event when the reading anchor is evicted without jumping to the end', async ({ page }) => {
+    const controller = await installMinimal(page);
+    const scroller = await expectUsableStream(page);
+    const survivor = resolveStreamEventRow(page, `Backlog item created: ${MINIMAL_CHAT_TODO_TITLE}`);
+    await positionStreamEvent(scroller, survivor, 72);
+    const previousAnchor = await firstIntersectingStreamEventId(scroller);
+    const base = (await controller.getWorkspaceSnapshot())!;
+    const work = getChatWorkFixture(base, CHAT_ALPHA_IDENTITY);
+    expect(work.events.slice(0, 3).map((event) => event.event_id)).toContain(previousAnchor);
+    await controller.setWorkspaceSnapshot(updateChatWorkFixture(base, CHAT_ALPHA_IDENTITY, {
+      events: work.events.slice(3),
+    }));
+    await triggerWorkspaceRefresh(page);
+    await expect.poll(() => firstIntersectingStreamEventId(scroller)).toBe(work.events[3]!.event_id);
+    await expect.poll(async () => Math.abs(await streamEventOffset(scroller, survivor))).toBeLessThanOrEqual(2);
+    await expect(page.getByRole('button', { name: 'Jump to latest', exact: true })).toBeVisible();
+    await expect.poll(() => streamBottomDistance(scroller)).toBeGreaterThan(64);
+  });
+
+  test('preserves reading position through text reflow and stays pinned to the end while following', async ({
+    page,
+  }) => {
+    await installMinimal(page);
+    const scroller = await expectUsableStream(page);
+    const anchorTitle = `Preparing Worker execution for ${MINIMAL_CHAT_DOING_TITLE}`;
+    const anchor = await resolveStreamEventRow(page, anchorTitle);
+    // Anchor the actual first intersecting row. A later row can move within
+    // the viewport when its predecessor wraps without losing reading state.
+    await positionStreamEvent(scroller, anchor, -12);
+    const anchorId = await anchor.getAttribute('data-chat-event-id');
+    expect(await firstIntersectingStreamEventId(scroller)).toBe(anchorId);
+    const beforeOffset = await streamEventOffset(scroller, anchor);
+    expect(await streamBottomDistance(scroller)).toBeGreaterThan(64);
+
+    await page.setViewportSize({ width: 390, height: 740 });
+    await expect(scroller).toBeVisible();
+    await expectNoHorizontalOverflow(page, 'reflowed stream while reading');
+    await expect
+      .poll(async () => Math.abs((await streamEventOffset(scroller, anchor)) - beforeOffset))
+      .toBeLessThanOrEqual(6);
+    await expect(anchor).toBeInViewport({ ratio: 0.4 });
+    expect(await firstIntersectingStreamEventId(scroller)).toBe(anchorId);
+    await expect.poll(() => streamBottomDistance(scroller)).toBeGreaterThan(64);
+
+    await scrollStreamToBottom(scroller);
+    await expect.poll(() => streamBottomDistance(scroller)).toBeLessThanOrEqual(32);
+    const latestEvent = await resolveStreamEventRow(
+      page,
+      `Coworker started ${MINIMAL_CHAT_COWORKER_DOING_TITLE}`,
+    );
+    await expect(latestEvent).toBeInViewport({ ratio: 0.5 });
+
+    await page.setViewportSize({ width: 1040, height: 620 });
+    await expect(scroller).toBeVisible();
+    await expectNoHorizontalOverflow(page, 'reflowed stream at the end');
+    await expect.poll(() => streamBottomDistance(scroller)).toBeLessThanOrEqual(64);
+    await expect(latestEvent).toBeInViewport({ ratio: 0.5 });
+  });
+
+  test('switching chats restores canonical event scope and each chat scroll position', async ({
+    page,
+  }) => {
+    await installMinimal(page);
+    const scroller = streamScroller(page);
+    await expect(
+      resolveStreamEventRow(page, MINIMAL_CHAT_READING_ANCHOR_TITLE),
+    ).toBeVisible();
+    await scrollStreamToBottom(scroller);
+    await scroller.evaluate((el) => {
+      el.scrollTop = 0;
+      el.dispatchEvent(new Event('scroll', { bubbles: true }));
+    });
+    await expect(
+      resolveStreamEventRow(page, MINIMAL_CHAT_READING_ANCHOR_TITLE),
+    ).toBeVisible();
+    const alphaScrollTop = await scroller.evaluate((el) => el.scrollTop);
+
+    await selectChat(page, 'Release Verification Gate');
+    await expect(chatHeader(page, 'Release Verification Gate')).toBeVisible();
+    await expect(
+      resolveStreamEventRow(page, MINIMAL_CHAT_BETA_BACKLOG_SENTINEL),
+    ).toBeVisible();
+    await expect(workspaceSection(page).getByText(BETA_CHAT_ONLY_SENTINEL)).toHaveCount(0);
+    // Authored event language is retained verbatim; the surrounding UI stays English.
+    await expect(
+      resolveStreamEventRow(page, MINIMAL_CHAT_AUTHORED_LANGUAGE_TITLE),
+    ).toBeVisible();
+    await expect(
+      workspaceSection(page).getByText(MINIMAL_CHAT_READING_ANCHOR_TITLE),
+    ).toHaveCount(0);
+    await expect(
+      workspaceSection(page).getByText(MINIMAL_CHAT_WRONG_SCOPE_WORK_SENTINEL),
+    ).toHaveCount(0);
+    await expect(workspaceSection(page).getByText(WRONG_SCOPE_QUARANTINE_SENTINEL)).toHaveCount(
+      0,
+    );
+
+    await selectChat(page, 'Workspace UI Contract');
+    await expect(
+      resolveStreamEventRow(page, MINIMAL_CHAT_READING_ANCHOR_TITLE),
+    ).toBeVisible();
+    await expect(
+      workspaceSection(page).getByText(MINIMAL_CHAT_BETA_BACKLOG_SENTINEL),
+    ).toHaveCount(0);
+    await expect
+      .poll(() => scroller.evaluate((el) => el.scrollTop))
+      .toBeLessThanOrEqual(alphaScrollTop + 8);
+  });
+
+  test('read-only backlog drawer exposes four committed states, blocked reason on demand, Escape focus restore, and no overflow', async ({
+    page,
+  }) => {
+    await installMinimal(page);
+    const trigger = backlogButton(page);
+    const dialog = await openBacklog(page);
+    await expect(dialog.getByText(MINIMAL_CHAT_WRONG_SCOPE_WORK_SENTINEL)).toHaveCount(0);
+    await expect(dialog.getByText(MINIMAL_CHAT_MALFORMED_WORK_SENTINEL)).toHaveCount(0);
+    await expect(dialog.getByText(MINIMAL_CHAT_BETA_BACKLOG_SENTINEL)).toHaveCount(0);
+    await expect(dialog.getByText('Beta committed delivery')).toHaveCount(0);
+    await expect(dialog.getByText(MINIMAL_CHAT_GAMMA_BACKLOG_SENTINEL)).toHaveCount(0);
+    await expect(dialog.getByText(WRONG_SCOPE_QUARANTINE_SENTINEL)).toHaveCount(0);
+    await expect(dialog.getByText(MINIMAL_CHAT_LEGACY_MESSAGE_SENTINEL)).toHaveCount(0);
+
+    const expectedStates: Array<[string, CommittedBacklogStatus]> = [
+      [MINIMAL_CHAT_TODO_TITLE, 'todo'],
+      [MINIMAL_CHAT_COWORKER_DOING_TITLE, 'doing'],
+      [MINIMAL_CHAT_DONE_TITLE, 'done'],
+      [MINIMAL_CHAT_BLOCKED_TITLE, 'blocked'],
+    ];
+    for (const [title, status] of expectedStates) {
+      await expectCommittedBacklogStatus(dialog, title, status);
+      await expectNoInventedBacklogRowStatus(await resolveBacklogItemRow(dialog, title));
+    }
+    const committedStatuses = await dialog.locator('[data-status]').evaluateAll((nodes) =>
+      Array.from(
+        new Set(
+          nodes
+            .map((node) => (node.getAttribute('data-status') ?? '').toLowerCase())
+            .filter((status) => status.length > 0),
+        ),
+      ).sort(),
+    );
+    expect(committedStatuses).toEqual(['blocked', 'doing', 'done', 'todo']);
+    await expect(
+      dialog.getByText(/^(?:working|preparing|awaiting check|failed)$/i),
+    ).toHaveCount(0);
+
+    await expect(
+      dialog.getByRole('button', {
+        name: /^(start|complete|edit|delete|block|unblock|mark done|create|add item)\b/i,
+      }),
+    ).toHaveCount(0);
+
+    const blockedRow = await resolveBacklogItemRow(dialog, MINIMAL_CHAT_BLOCKED_TITLE);
+    const reason = blockedRow.getByText(MINIMAL_CHAT_BLOCKED_REASON);
+    if ((await reason.count()) > 0) {
+      await expect(reason).toBeHidden();
+    }
+    const reasonSummary = blockedRow.locator('summary').first();
+    await expect(reasonSummary).toBeVisible();
+    await reasonSummary.click();
+    await expect(blockedRow.getByText(MINIMAL_CHAT_BLOCKED_REASON)).toBeVisible();
+
+    expect(await dialog.evaluate((el) => el.scrollWidth <= el.clientWidth + 1)).toBe(true);
+    await expectNoHorizontalOverflow(page, 'wide backlog drawer');
+
+    await page.keyboard.press('Escape');
+    await expect(dialog).toHaveCount(0);
+    await expect(trigger).toBeFocused();
+
+    await page.setViewportSize({ width: 390, height: 740 });
+    const narrowDialog = await openBacklog(page);
+    await expect(
+      resolveBacklogItemRow(narrowDialog, MINIMAL_CHAT_DONE_TITLE),
+    ).toBeVisible();
+    const narrowBox = await narrowDialog.boundingBox();
+    expect(narrowBox).not.toBeNull();
+    expect(narrowBox!.width).toBeLessThanOrEqual(390);
+    expect(await narrowDialog.evaluate((el) => el.scrollWidth <= el.clientWidth + 1)).toBe(
+      true,
+    );
+    await expectNoHorizontalOverflow(page, 'narrow backlog drawer');
+    await closeBacklogWithEscape(page);
+    await expect(backlogButton(page)).toBeFocused();
+  });
+
+  test('keeps drawer item titles readable in light and dark themes after finite animation, restores focus, and avoids overflow', async ({
+    page,
+  }) => {
+    const drawerTitles = [
+      MINIMAL_CHAT_TODO_TITLE,
+      MINIMAL_CHAT_COWORKER_DOING_TITLE,
+      MINIMAL_CHAT_DONE_TITLE,
+      MINIMAL_CHAT_BLOCKED_TITLE,
+    ];
+
+    await installMinimal(
+      page,
+      { width: 1040, height: 760 },
+      { appearanceTheme: 'light' },
+    );
+    await expect(page.locator('html')).toHaveAttribute('data-theme', 'light');
+    let trigger = backlogButton(page);
+    let dialog = await openBacklog(page);
+    await waitForFiniteAnimations(dialog);
+    for (const title of drawerTitles) {
+      await expectReadableDrawerTitle(dialog, title);
+    }
+    expect(await dialog.evaluate((el) => el.scrollWidth <= el.clientWidth + 1)).toBe(true);
+    await expectNoHorizontalOverflow(page, 'light theme backlog drawer');
+    await page.keyboard.press('Escape');
+    await expect(dialog).toHaveCount(0);
+    await expect(dialog).toBeHidden();
+    await expect(trigger).toBeFocused();
+
+    await page.evaluate(
+      ({ key, value }) => window.localStorage.setItem(key, value),
+      { key: APPEARANCE_STORAGE_KEY, value: minimalAppearanceStorage('dark') },
+    );
+    await page.reload();
+    await expect(page.locator('#app .tl-app-shell, #app .tl-app').first()).toBeVisible();
+    await selectChat(page, 'Workspace UI Contract');
+    await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark');
+
+    trigger = backlogButton(page);
+    dialog = await openBacklog(page);
+    await waitForFiniteAnimations(dialog);
+    for (const title of drawerTitles) {
+      await expectReadableDrawerTitle(dialog, title);
+    }
+    expect(await dialog.evaluate((el) => el.scrollWidth <= el.clientWidth + 1)).toBe(true);
+    await expectNoHorizontalOverflow(page, 'dark theme backlog drawer');
+    await page.keyboard.press('Escape');
+    await expect(dialog).toHaveCount(0);
+    await expect(dialog).toBeHidden();
+    await expect(trigger).toBeFocused();
+  });
+
+  test('resizes between wide and narrow while reading without forcing the bottom or horizontal overflow', async ({
+    page,
+  }) => {
+    await installMinimal(page);
+    const scroller = streamScroller(page);
+    await expect(
+      resolveStreamEventRow(page, MINIMAL_CHAT_READING_ANCHOR_TITLE),
+    ).toBeVisible();
+    const anchor = await resolveStreamEventRow(page, MINIMAL_CHAT_READING_ANCHOR_TITLE);
+    await positionStreamEvent(scroller, anchor, -12);
+    const anchorId = await anchor.getAttribute('data-chat-event-id');
+    expect(await firstIntersectingStreamEventId(scroller)).toBe(anchorId);
+    const beforeBox = await anchor.boundingBox();
+    const beforeOffset = await streamEventOffset(scroller, anchor);
+    expect(beforeBox).not.toBeNull();
+
+    await page.setViewportSize({ width: 390, height: 740 });
+    await expect(scroller).toBeVisible();
+    await expectNoHorizontalOverflow(page, 'resized narrow stream');
+    await expect(anchor).toBeVisible();
+    // Reflow may legitimately change scrollTop to keep the same event at the
+    // same pixel offset. Assert that anchor invariant instead of a frozen
+    // absolute scrollTop, and prove the resize did not force the bottom.
+    await expect
+      .poll(async () =>
+        Math.abs((await streamEventOffset(scroller, anchor)) - beforeOffset),
+      )
+      .toBeLessThanOrEqual(6);
+    await expect(anchor).toBeInViewport({ ratio: 0.5 });
+    expect(await firstIntersectingStreamEventId(scroller)).toBe(anchorId);
+    await expect.poll(() => streamBottomDistance(scroller)).toBeGreaterThan(64);
+
     await page.setViewportSize({ width: 1040, height: 760 });
-    await page.goto('/');
-
-    const messagesTab = chatSurfaceTab(page, 'Messages');
-    const jobsTab = chatSurfaceTab(page, 'Jobs');
-    const activityTab = chatSurfaceTab(page, 'Activity');
-    const messagesPanel = page.locator('.tl-wp-messages-panel').first();
-
-    await expect(messagesTab).toBeVisible();
-    await expect(messagesTab).toHaveAttribute('aria-selected', 'true');
-    await expect(jobsTab).toHaveAttribute('aria-selected', 'false');
-    await expect(activityTab).toHaveAttribute('aria-selected', 'false');
-
-    // All three chat tabpanels stay mounted to preserve scroll, with exactly one visible tabpanel.
-    await expect(page.locator('.tl-wp-tabpanel[role="tabpanel"]')).toHaveCount(3);
-    await expect(page.locator('.tl-wp-tabpanel[role="tabpanel"]:not([hidden])')).toHaveCount(1);
-    await expect(page.locator('[role="tabpanel"]:visible')).toHaveCount(1);
-    await expect(messagesPanel).toBeVisible();
-    await expect(page.getByText(/Alpha message #36/)).toBeVisible();
-    await expect(page.getByText(BETA_CHAT_ONLY_SENTINEL)).toHaveCount(0);
-    await expect(page.getByText(WRONG_SCOPE_QUARANTINE_SENTINEL)).toHaveCount(0);
-
-    await jobsTab.click();
-    await expect(jobsTab).toHaveAttribute('aria-selected', 'true');
-    await expect(messagesTab).toHaveAttribute('aria-selected', 'false');
-    await expect(page.locator('.tl-wp-tabpanel[role="tabpanel"]:not([hidden])')).toHaveCount(1);
-    await expect(page.locator('[role="tabpanel"]:visible')).toHaveCount(1);
-    await expect(messagesPanel).toHaveCount(1);
-    await expect(messagesPanel).toBeHidden();
-    await expect(page.getByText(/Alpha message #36/)).toBeHidden();
-    await expect(
-      visibleJobsPanel(page).getByText('Workspace Contract Acceptance Slice').first(),
-    ).toBeVisible();
-    await expect(page.getByText(BETA_CHAT_ONLY_SENTINEL)).toHaveCount(0);
-    await expect(page.getByText(WRONG_SCOPE_QUARANTINE_SENTINEL)).toHaveCount(0);
-
-    await activityTab.click();
-    await expect(activityTab).toHaveAttribute('aria-selected', 'true');
-    await expect(jobsTab).toHaveAttribute('aria-selected', 'false');
-    await expect(messagesTab).toHaveAttribute('aria-selected', 'false');
-    await expect(page.locator('.tl-wp-tabpanel[role="tabpanel"]:not([hidden])')).toHaveCount(1);
-    await expect(page.locator('[role="tabpanel"]:visible')).toHaveCount(1);
-    await expect(messagesPanel).toBeHidden();
-    await expect(page.getByText(/Alpha message #36/)).toBeHidden();
-
-    const activityPanel = visibleActivityPanel(page);
-    await expect(
-      activityPanel.getByText('Run isolated Worker implementation pass').first(),
-    ).toBeVisible();
-    await expandOtherActivityDetails(page, activityPanel);
-    await expect(activityPanel.getByText('Validate shared contract types').first()).toBeVisible();
-    await expect(page.getByText(BETA_CHAT_ONLY_SENTINEL)).toHaveCount(0);
-    await expect(page.getByText(WRONG_SCOPE_QUARANTINE_SENTINEL)).toHaveCount(0);
+    await expect(scroller).toBeVisible();
+    await expectNoHorizontalOverflow(page, 'resized wide stream');
+    await expect(anchor).toBeVisible();
+    await expect
+      .poll(async () =>
+        Math.abs((await streamEventOffset(scroller, anchor)) - beforeOffset),
+      )
+      .toBeLessThanOrEqual(6);
+    await expect(anchor).toBeInViewport({ ratio: 0.5 });
+    expect(await firstIntersectingStreamEventId(scroller)).toBe(anchorId);
+    await expect.poll(() => streamBottomDistance(scroller)).toBeGreaterThan(64);
   });
 
   test('archives and restores individual chats by canonical four-part WorkspaceChatIdentity and ignores forged keys', async ({
@@ -718,6 +1317,7 @@ test.describe('Workspace chat tabs, Active/Archive lifecycle, scroll preservatio
     });
 
     const controller = await installWorkspaceTauriFixture(page, {
+      workspaceSnapshot: buildMinimalChatWorkspaceSnapshot(),
       initialLocalStorage: {
         [WORKSPACE_CHAT_ARCHIVE_STORAGE_KEY]: forgedStoragePayload,
       },
@@ -725,27 +1325,37 @@ test.describe('Workspace chat tabs, Active/Archive lifecycle, scroll preservatio
     await page.setViewportSize({ width: 1040, height: 760 });
     await page.goto('/');
 
-    const sidebar = page.locator('aside.tl-sidebar').first();
-    await expect(sidebar).toBeVisible();
+    const sidebarEl = sidebar(page);
+    await expect(sidebarEl).toBeVisible();
 
     // Forged keys keyed by job_id or chat title must not archive the chat.
-    await expect(sidebar.getByText('Archived Migration Audit').first()).toBeVisible();
-    await expect(sidebar.getByText('Workspace UI Contract').first()).toBeVisible();
-    await expect(sidebar.getByText('Release Verification Gate').first()).toBeVisible();
+    await expect(sidebarEl.getByText('Archived Migration Audit').first()).toBeVisible();
+    await expect(sidebarEl.getByText('Workspace UI Contract').first()).toBeVisible();
+    await expect(sidebarEl.getByText('Release Verification Gate').first()).toBeVisible();
 
-    await sidebar.getByText('Archived Migration Audit').first().click();
+    await sidebarEl.getByText('Archived Migration Audit').first().click();
+    await expect(
+      resolveStreamEventRow(page, `Backlog item created: ${MINIMAL_CHAT_GAMMA_BACKLOG_SENTINEL}`),
+    ).toBeVisible();
 
-    const archiveActionBtn = sidebar.getByRole('button', {
+    const archiveActionBtn = sidebarEl.getByRole('button', {
       name: 'Archive Archived Migration Audit',
       exact: true,
     });
     await expect(archiveActionBtn).toBeVisible();
     await archiveActionBtn.click();
 
-    // Gamma leaves Active while Alpha and Beta remain in Active.
-    await expect(sidebar.getByText('Archived Migration Audit')).toHaveCount(0);
-    await expect(sidebar.getByText('Workspace UI Contract').first()).toBeVisible();
-    await expect(sidebar.getByText('Release Verification Gate').first()).toBeVisible();
+    // Gamma leaves Active while Alpha and Beta remain in Active. Archiving the
+    // selected chat may move selection, so require a real selected chat and
+    // explicitly select Alpha before continuing with lifecycle navigation.
+    await expect(sidebarEl.getByText('Archived Migration Audit')).toHaveCount(0);
+    await expect(sidebarEl.getByText('Workspace UI Contract').first()).toBeVisible();
+    await expect(sidebarEl.getByText('Release Verification Gate').first()).toBeVisible();
+    await selectChat(page, 'Workspace UI Contract');
+    await expect(chatHeader(page, 'Workspace UI Contract')).toBeVisible();
+    await expect(
+      resolveStreamEventRow(page, MINIMAL_CHAT_READING_ANCHOR_TITLE),
+    ).toBeVisible();
 
     const storedRaw = await controller.readArchivePreferencesRaw();
     expect(storedRaw).not.toBeNull();
@@ -757,309 +1367,555 @@ test.describe('Workspace chat tabs, Active/Archive lifecycle, scroll preservatio
     await expect(archiveFilter).toBeVisible();
     await archiveFilter.click();
 
-    await expect(sidebar.getByText('Archived Migration Audit').first()).toBeVisible();
-    await expect(sidebar.getByText('Workspace UI Contract')).toHaveCount(0);
+    await expect(sidebarEl.getByText('Archived Migration Audit').first()).toBeVisible();
+    await expect(sidebarEl.getByText('Workspace UI Contract')).toHaveCount(0);
 
-    await sidebar.getByText('Archived Migration Audit').first().click();
-    const restoreBtn = sidebar.getByRole('button', {
+    await sidebarEl.getByText('Archived Migration Audit').first().click();
+    const restoreBtn = sidebarEl.getByRole('button', {
       name: 'Restore Archived Migration Audit',
       exact: true,
     });
     await expect(restoreBtn).toBeVisible();
     await restoreBtn.click();
 
-    await expect(sidebar.getByText('Archived Migration Audit')).toHaveCount(0);
+    await expect(sidebarEl.getByText('Archived Migration Audit')).toHaveCount(0);
 
     const activeFilter = lifecycleFilterControl(page, 'active');
     await activeFilter.click();
-    await expect(sidebar.getByText('Archived Migration Audit').first()).toBeVisible();
+    await expect(sidebarEl.getByText('Archived Migration Audit').first()).toBeVisible();
 
     const restoredRaw = await controller.readArchivePreferencesRaw();
     const restoredMap = restoredRaw ? (JSON.parse(restoredRaw) as Record<string, unknown>) : {};
     expect(restoredMap[CHAT_GAMMA_KEY]).toBeUndefined();
-  });
 
-  test('appends messages at bottom when anchored, preserves viewport when reading older history, and jumps via new-events control', async ({
-    page,
-  }) => {
-    const controller = await installWorkspaceTauriFixture(page);
-    await page.setViewportSize({ width: 1040, height: 760 });
-    await page.goto('/');
-
-    await expect(chatSurfaceTab(page, 'Messages')).toHaveAttribute('aria-selected', 'true');
-    await expect(page.getByText(/Alpha message #36/)).toBeVisible();
-
-    const viewport = await findScrollableMessagesViewport(page, 'Alpha message #36');
-
-    // 1. Anchored at bottom -> appending message #37 keeps scroll anchored at bottom.
-    await viewport.evaluate((el) => {
-      el.scrollTop = el.scrollHeight;
-    });
-
-    await controller.appendMessageItem(
-      createChatMessageItem({
-        identity: CHAT_ALPHA_IDENTITY,
-        seq: 37,
-        recordId: 'rec_alpha_msg_37',
-        summary: 'Alpha message #37: Appended while anchored at bottom of viewport.',
-        recordedAtMs: FIXTURE_BASE_NOW_MS + 5_000,
-      }),
+    // Lifecycle navigation is allowed to change selection. Require an actual
+    // selected chat and prove Alpha still opens its canonical stream.
+    await selectChat(page, 'Workspace UI Contract');
+    await expect(chatHeader(page, 'Workspace UI Contract')).toBeVisible();
+    await expect(
+      resolveStreamEventRow(page, MINIMAL_CHAT_READING_ANCHOR_TITLE),
+    ).toBeVisible();
+    await expect(workspaceSection(page).getByText(MINIMAL_CHAT_GAMMA_BACKLOG_SENTINEL)).toHaveCount(
+      0,
     );
-    await triggerWorkspaceRefresh(page);
-
-    await expect(page.getByText(/Alpha message #37/)).toBeVisible();
-    const bottomDistanceAfterAnchoredAppend = await viewport.evaluate(
-      (el) => el.scrollHeight - el.scrollTop - el.clientHeight,
-    );
-    expect(bottomDistanceAfterAnchoredAppend).toBeLessThanOrEqual(36);
-
-    // 2. Scroll up to read older messages -> appending message #38 preserves viewport and shows new-events button.
-    await viewport.evaluate((el) => {
-      el.scrollTop = 96;
-      el.dispatchEvent(new Event('scroll', { bubbles: true }));
-    });
-
-    await expect(page.getByText(/Alpha message #05/)).toBeVisible();
-    const anchorMessage = page.getByText(/Alpha message #05/).first();
-
-    const beforeMetrics = await viewport.evaluate((el) => ({
-      scrollTop: el.scrollTop,
-      distanceFromBottom: el.scrollHeight - el.scrollTop - el.clientHeight,
-    }));
-    expect(beforeMetrics.distanceFromBottom).toBeGreaterThan(120);
-    const beforeAnchorBox = await anchorMessage.boundingBox();
-    expect(beforeAnchorBox).not.toBeNull();
-
-    await controller.appendMessageItem(
-      createChatMessageItem({
-        identity: CHAT_ALPHA_IDENTITY,
-        seq: 38,
-        recordId: 'rec_alpha_msg_38',
-        summary: 'Alpha message #38: Appended while operator reads older message history.',
-        recordedAtMs: FIXTURE_BASE_NOW_MS + 10_000,
-      }),
-    );
-    await triggerWorkspaceRefresh(page);
-
-    const newEventsButton = page
-      .locator('button, [role="button"]')
-      .filter({ hasText: /new (event|message|item|update)|jump to latest|latest/i })
-      .first();
-    await expect(newEventsButton).toBeVisible();
-
-    const afterScrollTop = await viewport.evaluate((el) => el.scrollTop);
-    const afterAnchorBox = await anchorMessage.boundingBox();
-    expect(afterAnchorBox).not.toBeNull();
-    expect(Math.abs(afterScrollTop - beforeMetrics.scrollTop)).toBeLessThanOrEqual(4);
-    expect(Math.abs(afterAnchorBox!.y - beforeAnchorBox!.y)).toBeLessThanOrEqual(4);
-
-    // 3. Clicking the new-events control jumps to bottom and clears the indicator.
-    await newEventsButton.click();
-    await expect(page.getByText(/Alpha message #38/)).toBeVisible();
-    await expect
-      .poll(() =>
-        viewport.evaluate((el) => el.scrollHeight - el.scrollTop - el.clientHeight <= 36),
-      )
-      .toBe(true);
-    await expect(newEventsButton).toHaveCount(0);
-  });
-
-  test('aligns Activity running spinner cleanly with status badge and omits spinners on completed or local MCP rows', async ({
-    page,
-  }) => {
-    await installWorkspaceTauriFixture(page);
-    await page.setViewportSize({ width: 1040, height: 760 });
-    await page.goto('/');
-
-    await chatSurfaceTab(page, 'Activity').click();
-    const activityPanel = visibleActivityPanel(page);
-
-    const runningWorkerCard = activityPanel
-      .locator('article.tl-wp-activity-card')
-      .filter({ hasText: 'Run isolated Worker implementation pass' })
-      .first();
-    await expect(runningWorkerCard).toBeVisible();
-
-    // Running Worker card must carry a single centered spinner aligned with its status badge.
-    const runningWorkerSpinners = runningWorkerCard.locator(ACTIVITY_SPINNER_SELECTOR);
-    await expect(runningWorkerSpinners).toHaveCount(1);
-    const runningSpinner = runningWorkerSpinners.first();
-    await expect(runningSpinner).toBeVisible();
-
-    const alignment = await runningSpinner.evaluate((spinEl) => {
-      const spinRect = spinEl.getBoundingClientRect();
-      const container = spinEl.parentElement ?? spinEl;
-      const containerRect = container.getBoundingClientRect();
-      const spinCenterX = spinRect.left + spinRect.width / 2;
-      const spinCenterY = spinRect.top + spinRect.height / 2;
-      const containerCenterY = containerRect.top + containerRect.height / 2;
-      const svg = spinEl.querySelector('svg');
-      const svgRect = svg ? svg.getBoundingClientRect() : spinRect;
-      const svgCenterX = svgRect.left + svgRect.width / 2;
-      const svgCenterY = svgRect.top + svgRect.height / 2;
-      return {
-        width: spinRect.width,
-        height: spinRect.height,
-        centerDeltaY: Math.abs(spinCenterY - containerCenterY),
-        svgCenterDeltaX: Math.abs(svgCenterX - spinCenterX),
-        svgCenterDeltaY: Math.abs(svgCenterY - spinCenterY),
-        withinHorizontalBounds:
-          spinRect.left >= containerRect.left - 1 && spinRect.right <= containerRect.right + 1,
-      };
-    });
-
-    expect(alignment.width).toBeGreaterThanOrEqual(8);
-    expect(alignment.height).toBeGreaterThanOrEqual(8);
-    expect(Math.abs(alignment.width - alignment.height)).toBeLessThanOrEqual(2);
-    expect(alignment.centerDeltaY).toBeLessThanOrEqual(3.5);
-    expect(alignment.svgCenterDeltaX).toBeLessThanOrEqual(2);
-    expect(alignment.svgCenterDeltaY).toBeLessThanOrEqual(2);
-    expect(alignment.withinHorizontalBounds).toBe(true);
-
-    // Completed Worker row must not render a running spinner.
-    const completedWorkerCard = activityPanel
-      .locator('article.tl-wp-activity-card')
-      .filter({ hasText: 'Complete contract schema validation pass' })
-      .first();
-    await expect(completedWorkerCard).toBeVisible();
-    await expect(completedWorkerCard.locator(ACTIVITY_SPINNER_SELECTOR)).toHaveCount(0);
-
-    // Local MCP content is grouped under collapsed "Other activity" details; expand first and verify zero spinners.
-    const otherActivityDetails = await expandOtherActivityDetails(page, activityPanel);
-    if ((await otherActivityDetails.count()) > 0) {
-      await expect(otherActivityDetails.locator(ACTIVITY_SPINNER_SELECTOR)).toHaveCount(0);
-    }
-
-    const localMcpRow = activityPanel
-      .locator('article, [role="listitem"], li, .tl-req-row')
-      .filter({ hasText: 'Validate shared contract types' })
-      .first();
-    await expect(localMcpRow).toBeVisible();
-    await expect(localMcpRow.locator(ACTIVITY_SPINNER_SELECTOR)).toHaveCount(0);
   });
 });
 
-test.describe('Workspace semantic contract fixtures', () => {
-  test('keeps live Coworker chat availability/selection separate from background Worker execution telemetry', async ({
+test.describe('Workspace liveness, attention, and committed completion', () => {
+  test('shows actual fresh Worker and Coworker Working in live agents, clears Worker on expiry and failed refresh, and keeps drawer rows committed', async ({
     page,
   }) => {
-    await installWorkspaceTauriFixture(page);
-    await page.setViewportSize({ width: 1040, height: 760 });
-    await page.goto('/');
+    const controller = await installMinimal(page);
+    const workspace = workspaceSection(page);
+    const baseSnapshot = await controller.getWorkspaceSnapshot();
+    expect(baseSnapshot).not.toBeNull();
+    const workingSnapshot = updateNativeActivityFixture(
+      baseSnapshot!,
+      CHAT_ALPHA_IDENTITY,
+      'working',
+    );
+    await controller.setWorkspaceSnapshot(workingSnapshot);
+    await triggerWorkspaceRefresh(page);
 
-    const chatHeader = page.locator('header.tl-wp-chat-header').first();
-    await expect(chatHeader).toBeVisible();
+    const header = chatHeader(page, 'Workspace UI Contract');
+    await expectVisibleWorking(header);
+    await expect(liveAgentList(workspace)).toBeVisible();
+    await expect(liveAgentList(workspace).locator('li[data-agent-role]')).toHaveCount(2);
+    await expectLiveAgentWorking(workspace, 'Worker');
+    await expectLiveAgentWorking(workspace, 'Coworker');
 
-    // Native Coworker header state is waiting for user input with configured GPT-5.4 (never Worker telemetry).
-    await expect(
-      chatHeader.getByText(/waiting for (?:user )?input|awaiting (?:user )?input/i).first(),
-    ).toBeVisible();
-    await expect(chatHeader.getByText(/gpt-5\.4/i).first()).toBeVisible();
-    await expect(chatHeader.getByText(/argon|antigravity/i)).toHaveCount(0);
+    let dialog = await openBacklog(page);
+    await expectCommittedBacklogStatus(dialog, MINIMAL_CHAT_DOING_TITLE, 'doing');
+    await expectCommittedBacklogStatus(dialog, MINIMAL_CHAT_PREPARING_TITLE, 'doing');
+    await expectCommittedBacklogStatus(dialog, MINIMAL_CHAT_FAILED_TITLE, 'blocked');
+    await expectCommittedBacklogStatus(
+      dialog,
+      MINIMAL_CHAT_COWORKER_DOING_TITLE,
+      'doing',
+    );
+    for (const title of [
+      MINIMAL_CHAT_DOING_TITLE,
+      MINIMAL_CHAT_PREPARING_TITLE,
+      MINIMAL_CHAT_FAILED_TITLE,
+      MINIMAL_CHAT_COWORKER_DOING_TITLE,
+    ]) {
+      await expectNoInventedBacklogRowStatus(await resolveBacklogItemRow(dialog, title));
+    }
+    await closeBacklogWithEscape(page);
 
-    // Meanwhile Worker execution on the same chat is Running with gemini-4-argon-high.
-    await chatSurfaceTab(page, 'Activity').click();
-    const activityPanel = visibleActivityPanel(page);
-    const runningWorkerCard = activityPanel
-      .locator('article.tl-wp-activity-card')
-      .filter({ hasText: 'Run isolated Worker implementation pass' })
-      .first();
-    await expect(runningWorkerCard).toBeVisible();
-    await expect(runningWorkerCard.getByText(/^running$/i).first()).toBeVisible();
-    await expect(runningWorkerCard.getByText(/argon/i).first()).toBeVisible();
+    // The fresh Worker presence expires at a frozen wall-clock instant. The
+    // owned UI age clock must clear Worker Working without manufacturing a read.
+    await page.clock.setFixedTime(FIXTURE_BASE_NOW_MS + 6_000);
+    await expectNoLiveAgentWorking(workspace, 'Worker');
+    await expectLiveAgentWorking(workspace, 'Coworker');
+    // The Coworker remains working because its native sample is still fresh.
+    await expectVisibleWorking(header);
 
-    await runningWorkerCard
-      .locator('button.tl-wp-activity-row-btn, button[aria-expanded]')
-      .first()
-      .click();
-    await expect(runningWorkerCard.getByText(/gemini-4-argon-high/i).first()).toBeVisible();
+    // Reset to a fresh Worker sample at the fixture instant, then fail the next
+    // refresh: the failed read must clear Worker live rather than retain proof.
+    await controller.setWorkspaceSnapshot(workingSnapshot);
+    await triggerWorkspaceRefresh(page);
+    await expectLiveAgentWorking(workspace, 'Worker');
+    const readsBeforeFailedRefresh = (await controller.getInvocations()).filter(
+      (call) => call.cmd === 'desktop_workspace_snapshot',
+    ).length;
+    await controller.failNextWorkspaceSnapshotRead();
+    await triggerWorkspaceRefresh(page);
+    await expect
+      .poll(async () => {
+        const calls = await controller.getInvocations();
+        return calls.filter((call) => call.cmd === 'desktop_workspace_snapshot').length;
+      })
+      .toBeGreaterThan(readsBeforeFailedRefresh);
+    await expectNoLiveAgentWorking(workspace, 'Worker');
 
-    // Native header continues reporting Coworker state and configured selection rather than Worker model.
-    await expect(
-      chatHeader.getByText(/waiting for (?:user )?input|awaiting (?:user )?input/i).first(),
-    ).toBeVisible();
-    await expect(chatHeader.getByText(/gpt-5\.4/i).first()).toBeVisible();
-    await expect(chatHeader.getByText(/argon|antigravity/i)).toHaveCount(0);
+    dialog = await openBacklog(page);
+    await expectCommittedBacklogStatus(dialog, MINIMAL_CHAT_DOING_TITLE, 'doing');
+    await closeBacklogWithEscape(page);
+    await expectNoNeedsYou(page);
   });
 
-  test('surfaces Stale and Disconnected native chat states without resetting sample age or hiding durable history', async ({
+  test('clears Worker live when a refresh omits the exact current execution presence', async ({
     page,
   }) => {
-    const staleSnapshot = buildStaleWorkspaceSnapshot();
-    const disconnectedSnapshot = buildDisconnectedWorkspaceSnapshot();
-
-    // Verify fixture envelope and monotonic sequence / preserved last_success_at_ms preconditions.
-    expect(staleSnapshot.generated_at_ms).toBe(FIXTURE_BASE_NOW_MS + 25_000);
-    expect(disconnectedSnapshot.generated_at_ms).toBeGreaterThan(staleSnapshot.generated_at_ms);
-
-    const staleAlphaSample = staleSnapshot.native_samples.find(
-      (sample) => sample.chat_identity.binding_id === CHAT_ALPHA_IDENTITY.binding_id,
+    const controller = await installMinimal(page);
+    const workspace = workspaceSection(page);
+    const header = chatHeader(page, 'Workspace UI Contract');
+    const baseSnapshot = await controller.getWorkspaceSnapshot();
+    expect(baseSnapshot).not.toBeNull();
+    const workingSnapshot = updateNativeActivityFixture(
+      baseSnapshot!,
+      CHAT_ALPHA_IDENTITY,
+      'working',
     );
-    const disconnectedAlphaSample = disconnectedSnapshot.native_samples.find(
-      (sample) => sample.chat_identity.binding_id === CHAT_ALPHA_IDENTITY.binding_id,
+    await controller.setWorkspaceSnapshot(workingSnapshot);
+    await triggerWorkspaceRefresh(page);
+
+    await expectVisibleWorking(header);
+    await expectLiveAgentWorking(workspace, 'Worker');
+    let dialog = await openBacklog(page);
+    await expectCommittedBacklogStatus(dialog, MINIMAL_CHAT_DOING_TITLE, 'doing');
+    await closeBacklogWithEscape(page);
+
+    // A fresh live sample for a different execution reference must not prove
+    // the current item execution is running.
+    const mismatchedPresence = updateChatWorkPresenceFixture(
+      workingSnapshot,
+      CHAT_ALPHA_IDENTITY,
+      [
+        createBacklogWorkerPresence({
+          itemId: MINIMAL_CHAT_ALPHA_DOING_ITEM_ID,
+          executionRef: 'exec_mismatched_current_99',
+        }),
+      ],
     );
-    expect(staleAlphaSample).toBeDefined();
-    expect(disconnectedAlphaSample).toBeDefined();
-    expect(disconnectedAlphaSample!.sequence).toBeGreaterThan(staleAlphaSample!.sequence);
-    expect(disconnectedAlphaSample!.last_success_at_ms).toBe(staleAlphaSample!.last_success_at_ms);
+    await controller.setWorkspaceSnapshot(mismatchedPresence);
+    await triggerWorkspaceRefresh(page);
+    await expectNoLiveAgentWorking(workspace, 'Worker');
+    await expectLiveAgentWorking(workspace, 'Coworker');
+    await expectVisibleWorking(header);
+    dialog = await openBacklog(page);
+    await expectCommittedBacklogStatus(dialog, MINIMAL_CHAT_DOING_TITLE, 'doing');
+    await closeBacklogWithEscape(page);
+
+    await controller.setWorkspaceSnapshot(workingSnapshot);
+    await triggerWorkspaceRefresh(page);
+    await expectLiveAgentWorking(workspace, 'Worker');
+    await expectVisibleWorking(header);
+    dialog = await openBacklog(page);
+    await expectCommittedBacklogStatus(dialog, MINIMAL_CHAT_DOING_TITLE, 'doing');
+    await closeBacklogWithEscape(page);
+
+    const unavailablePresence = updateChatWorkPresenceFixture(
+      workingSnapshot,
+      CHAT_ALPHA_IDENTITY,
+      [],
+    );
+    await controller.setWorkspaceSnapshot(unavailablePresence);
+    await triggerWorkspaceRefresh(page);
+    await expectNoLiveAgentWorking(workspace, 'Worker');
+    await expectLiveAgentWorking(workspace, 'Coworker');
+    await expectVisibleWorking(header);
+    dialog = await openBacklog(page);
+    await expectCommittedBacklogStatus(dialog, MINIMAL_CHAT_DOING_TITLE, 'doing');
+    await closeBacklogWithEscape(page);
+    await expectNoNeedsYou(page);
+  });
+
+  test('derives one NeedsYou only from actual native waiting and never from Blocked, Doing, failed, or awaiting-check work', async ({
+    page,
+  }) => {
+    const controller = await installMinimal(page);
+    await expect(chatHeader(page, 'Workspace UI Contract')).toBeVisible();
+    await expect(
+      resolveStreamEventRow(page, MINIMAL_CHAT_READING_ANCHOR_TITLE),
+    ).toBeVisible();
+    const initialDialog = await openBacklog(page);
+    await expect(
+      resolveBacklogItemRow(initialDialog, MINIMAL_CHAT_BLOCKED_TITLE),
+    ).toBeVisible();
+    await closeBacklogWithEscape(page);
+    await expectNoNeedsYou(page);
+
+    // Legacy attention counts are compatibility data, not an actual open request.
+    const baseSnapshot = await controller.getWorkspaceSnapshot();
+    expect(baseSnapshot).not.toBeNull();
+    const legacyAttentionSnapshot = parseWorkspaceSnapshot({
+      ...baseSnapshot!,
+      chats: baseSnapshot!.chats.map((chat) =>
+        workspaceChatIdentitiesEqual(chat.identity, CHAT_ALPHA_IDENTITY)
+          ? {
+              ...chat,
+              thread_label: 'Legacy Attention Compatibility Chat',
+              active_job_count: 3,
+              attention_count: 5,
+            }
+          : chat,
+      ),
+    });
+    await controller.setWorkspaceSnapshot(legacyAttentionSnapshot);
+    const readsBeforeLegacyAttentionRefresh = (await controller.getInvocations()).filter(
+      (call) => call.cmd === 'desktop_workspace_snapshot',
+    ).length;
+    await triggerWorkspaceRefresh(page);
+    await expect
+      .poll(async () => {
+        const calls = await controller.getInvocations();
+        return calls.filter((call) => call.cmd === 'desktop_workspace_snapshot').length;
+      })
+      .toBeGreaterThan(readsBeforeLegacyAttentionRefresh);
+    await expect(
+      chatHeader(page, 'Legacy Attention Compatibility Chat'),
+    ).toBeVisible();
+    await expectNoNeedsYou(page);
+    expect(
+      await page
+        .getByText(/needs attention/i)
+        .evaluateAll((nodes) => nodes.filter((node) => node.checkVisibility()).length),
+    ).toBe(0);
+
+    const waitingApproval = updateNativeActivityFixture(
+      baseSnapshot!,
+      CHAT_ALPHA_IDENTITY,
+      'waiting_for_approval',
+    );
+    await controller.setWorkspaceSnapshot(waitingApproval);
+    await triggerWorkspaceRefresh(page);
+    await expectSingleNeedsYou(page);
+    await expect(workspaceSection(page).getByText(/q_[A-Za-z0-9_]+/)).toHaveCount(0);
+
+    const waitingInput = updateNativeActivityFixture(
+      baseSnapshot!,
+      CHAT_ALPHA_IDENTITY,
+      'waiting_for_input',
+    );
+    await controller.setWorkspaceSnapshot(waitingInput);
+    await triggerWorkspaceRefresh(page);
+    await expectSingleNeedsYou(page);
+
+    // A stale native sample is not an actual current request.
+    await page.clock.setFixedTime(
+      FIXTURE_BASE_NOW_MS + WORKSPACE_SAMPLE_STALE_THRESHOLD_MS + 1_001,
+    );
+    await expect(chatHeader(page, 'Workspace UI Contract').locator('.tl-cw-status')).toHaveCount(0);
+    await expectNoLiveAgentWorking(workspaceSection(page), 'Coworker');
+    await expectNoNeedsYou(page);
+
+    const working = updateNativeActivityFixture(
+      baseSnapshot!,
+      CHAT_ALPHA_IDENTITY,
+      'working',
+    );
+    await controller.setWorkspaceSnapshot(working);
+    await triggerWorkspaceRefresh(page);
+    await expectVisibleWorking(chatHeader(page, 'Workspace UI Contract'));
+    await expectNoNeedsYou(page);
+  });
+
+  test('marks only actual committed Done while reservation is Preparing and successful outcome is Awaiting check', async ({
+    page,
+  }) => {
+    await installMinimal(page);
+    await expect(chatHeader(page, 'Workspace UI Contract')).toBeVisible();
+    // The live Worker presence makes the chat header and live-agent list Working,
+    // while the drawer below still shows only committed workflow states.
+    await expectVisibleWorking(chatHeader(page, 'Workspace UI Contract'));
+    await expectLiveAgentWorking(workspaceSection(page), 'Worker');
+    await expectNoLiveAgentWorking(workspaceSection(page), 'Coworker');
+    const dialog = await openBacklog(page);
+
+    await expectCommittedBacklogStatus(dialog, MINIMAL_CHAT_DONE_TITLE, 'done');
+    await expectCommittedBacklogStatus(dialog, MINIMAL_CHAT_TODO_TITLE, 'todo');
+    await expectCommittedBacklogStatus(
+      dialog,
+      MINIMAL_CHAT_COWORKER_DOING_TITLE,
+      'doing',
+    );
+    await expectCommittedBacklogStatus(dialog, MINIMAL_CHAT_DOING_TITLE, 'doing');
+    await expectCommittedBacklogStatus(dialog, MINIMAL_CHAT_PREPARING_TITLE, 'doing');
+    await expectCommittedBacklogStatus(dialog, MINIMAL_CHAT_FAILED_TITLE, 'blocked');
+    await expectCommittedBacklogStatus(dialog, MINIMAL_CHAT_BLOCKED_TITLE, 'blocked');
+
+    // Preparing, Awaiting check, and Failed are stream execution actions, never
+    // invented drawer row states. Only committed Todo/Doing/Done/Blocked appear.
+    for (const title of [
+      MINIMAL_CHAT_DOING_TITLE,
+      MINIMAL_CHAT_PREPARING_TITLE,
+      MINIMAL_CHAT_FAILED_TITLE,
+    ]) {
+      const row = await resolveBacklogItemRow(dialog, title);
+      await expectNoInventedBacklogRowStatus(row);
+      await expect(row.getByText(/^done$/i)).toHaveCount(0);
+    }
+    await expect(dialog.getByText(/^(?:working|preparing|awaiting check|failed)$/i)).toHaveCount(0);
+
+    await expect(
+      resolveStreamEventRow(
+        page,
+        `Preparing Worker execution for ${MINIMAL_CHAT_PREPARING_TITLE}`,
+      ),
+    ).toBeVisible();
+    await expect(
+      resolveStreamEventRow(
+        page,
+        `Worker result recorded: Awaiting check for ${MINIMAL_CHAT_DOING_TITLE}`,
+      ),
+    ).toBeVisible();
+    await expect(
+      resolveStreamEventRow(
+        page,
+        `Worker result recorded: Failed for ${MINIMAL_CHAT_FAILED_TITLE}`,
+      ),
+    ).toBeVisible();
+    await expect(
+      resolveStreamEventRow(page, MINIMAL_CHAT_READING_ANCHOR_TITLE),
+    ).toBeVisible();
+    await closeBacklogWithEscape(page);
+  });
+
+  test('withholds live native indicators for Stale and Disconnected samples without resetting sample age or hiding durable events', async ({
+    page,
+  }) => {
+    const base = buildMinimalChatWorkspaceSnapshot();
+    const staleSnapshot = parseWorkspaceSnapshot({
+      ...base,
+      generated_at_ms: base.generated_at_ms + WORKSPACE_SAMPLE_STALE_THRESHOLD_MS + 15_000,
+    });
+    const baseAlphaSample = base.native_samples.find((sample) =>
+      workspaceChatIdentitiesEqual(sample.chat_identity, CHAT_ALPHA_IDENTITY),
+    );
+    expect(baseAlphaSample).toBeDefined();
+    const disconnectedAtMs = staleSnapshot.generated_at_ms + 5_000;
+    const disconnectedSnapshot = parseWorkspaceSnapshot({
+      ...base,
+      generated_at_ms: disconnectedAtMs,
+      native_samples: base.native_samples.map((sample) =>
+        workspaceChatIdentitiesEqual(sample.chat_identity, CHAT_ALPHA_IDENTITY)
+          ? {
+              ...sample,
+              availability: 'disconnected',
+              activity: 'unknown',
+              connection: {
+                ...sample.connection,
+                state: 'disconnected',
+                freshness: 'stale',
+                diagnostic: 'Native Codex bridge socket closed; durable events remain readable.',
+              },
+              configured_selection: {
+                ...sample.configured_selection,
+                evidence: 'unavailable',
+              },
+            }
+          : sample,
+      ),
+    });
 
     const controller = await installWorkspaceTauriFixture(page, {
       workspaceSnapshot: staleSnapshot,
     });
     await page.setViewportSize({ width: 1040, height: 760 });
     await page.goto('/');
+    await selectChat(page, 'Workspace UI Contract');
 
     expect(await page.evaluate(() => Date.now())).toBe(staleSnapshot.generated_at_ms);
+    const header = chatHeader(page, 'Workspace UI Contract');
+    await expect(header.locator('.tl-cw-status')).toHaveCount(0);
+    await expectNoVisibleWorking(header);
+    await expectNoNeedsYou(page);
+    await expect(
+      resolveStreamEventRow(page, MINIMAL_CHAT_READING_ANCHOR_TITLE),
+    ).toBeVisible();
 
-    const chatHeader = page.locator('header.tl-wp-chat-header').first();
-    // Stale native sample must surface stale status and withhold configured model while durable messages remain readable.
-    await expect(chatHeader.getByText(/^stale$/i).first()).toBeVisible();
-    await expect(chatHeader.getByText(/Configured:\s*Unavailable/i)).toBeVisible();
-    await expect(page.getByText(/Alpha message #36/)).toBeVisible();
-
-    // Transition monotonically to Disconnected native bridge state without faking last_success_at_ms.
     await controller.setWorkspaceSnapshot(disconnectedSnapshot);
     await triggerWorkspaceRefresh(page);
 
-    await expect(chatHeader.getByText(/^disconnected$/i).first()).toBeVisible();
-    await expect(page.getByText(/Alpha message #36/)).toBeVisible();
+    await expect(header.locator('.tl-cw-status')).toHaveCount(0);
+    await expectNoVisibleWorking(header);
+    await expectNoNeedsYou(page);
+    await expect(
+      resolveStreamEventRow(page, MINIMAL_CHAT_READING_ANCHOR_TITLE),
+    ).toBeVisible();
 
     const storedAfterDisconnect = await controller.getWorkspaceSnapshot();
-    const storedAlphaSample = storedAfterDisconnect?.native_samples.find(
-      (sample) => sample.chat_identity.binding_id === CHAT_ALPHA_IDENTITY.binding_id,
+    const storedAlphaSample = storedAfterDisconnect?.native_samples.find((sample) =>
+      workspaceChatIdentitiesEqual(sample.chat_identity, CHAT_ALPHA_IDENTITY),
     );
-    expect(storedAlphaSample?.last_success_at_ms).toBe(staleAlphaSample!.last_success_at_ms);
+    expect(storedAlphaSample?.last_success_at_ms).toBe(baseAlphaSample!.last_success_at_ms);
 
-    await chatSurfaceTab(page, 'Jobs').click();
-    await expect(
-      visibleJobsPanel(page).getByText('Workspace Contract Acceptance Slice').first(),
-    ).toBeVisible();
+    const dialog = await openBacklog(page);
+    await expect(resolveBacklogItemRow(dialog, MINIMAL_CHAT_DONE_TITLE)).toBeVisible();
+    await closeBacklogWithEscape(page);
   });
 
-  test('enforces four-part WorkspaceChatIdentity scope isolation against same-project sibling chats and unaligned records', async ({
+  test('transitions a fresh native working chat to Stale via the owned 1s UI age clock when one snapshot poll stalls', async ({
     page,
   }) => {
-    const controller = await installWorkspaceTauriFixture(page);
-    await page.setViewportSize({ width: 1040, height: 760 });
-    await page.goto('/');
+    const workingSnapshot = updateNativeActivityFixture(
+      buildMinimalChatWorkspaceSnapshot(),
+      CHAT_ALPHA_IDENTITY,
+      'working',
+    );
+    const baseAlphaSample = workingSnapshot.native_samples.find((sample) =>
+      workspaceChatIdentitiesEqual(sample.chat_identity, CHAT_ALPHA_IDENTITY),
+    );
+    expect(baseAlphaSample).toBeDefined();
 
-    // Alpha is selected: neither Beta's sentinel nor the unaligned wrong-scope sentinel may exist anywhere in DOM.
-    await expect(page.getByText(/Alpha message #36/)).toBeVisible();
-    await expect(page.getByText(BETA_CHAT_ONLY_SENTINEL)).toHaveCount(0);
-    await expect(page.getByText(WRONG_SCOPE_QUARANTINE_SENTINEL)).toHaveCount(0);
+    const controller = await installWorkspaceTauriFixture(page, {
+      workspaceSnapshot: workingSnapshot,
+    });
 
-    await chatSurfaceTab(page, 'Jobs').click();
-    await expect(page.getByText(BETA_CHAT_ONLY_SENTINEL)).toHaveCount(0);
-    await expect(page.getByText(WRONG_SCOPE_QUARANTINE_SENTINEL)).toHaveCount(0);
+    try {
+      await page.setViewportSize({ width: 1040, height: 760 });
+      await page.goto('/');
+      await selectChat(page, 'Workspace UI Contract');
 
-    await chatSurfaceTab(page, 'Activity').click();
-    await expandOtherActivityDetails(page, visibleActivityPanel(page));
-    await expect(page.getByText(BETA_CHAT_ONLY_SENTINEL)).toHaveCount(0);
-    await expect(page.getByText(WRONG_SCOPE_QUARANTINE_SENTINEL)).toHaveCount(0);
+      const header = chatHeader(page, 'Workspace UI Contract');
+      await expect(header).toBeVisible();
+      await expectVisibleWorking(header);
 
-    // Open in Codex must pass exact { request: { source_id, thread_uuid, job_id? } } for Alpha with no URL/path/executable fields.
-    const chatHeader = page.locator('header.tl-wp-chat-header').first();
-    const openCodexBtn = chatHeader.getByRole('button', { name: /^open in codex$/i });
+      const initialSnapshotReads = (await controller.getInvocations()).filter(
+        (call) => call.cmd === 'desktop_workspace_snapshot',
+      ).length;
+      expect(initialSnapshotReads).toBe(1);
+
+      await controller.stallNextWorkspaceSnapshotRead();
+      await expect
+        .poll(() => controller.getStalledWorkspaceSnapshotCount(), { timeout: 5_000 })
+        .toBe(1);
+
+      const snapshotReadsAtStall = (await controller.getInvocations()).filter(
+        (call) => call.cmd === 'desktop_workspace_snapshot',
+      ).length;
+      expect(snapshotReadsAtStall).toBe(2);
+      await expect(page.locator('[role="alert"]')).toHaveCount(0);
+
+      await page.clock.setFixedTime(workingSnapshot.generated_at_ms + STALE_ADVANCE_MS);
+
+      await expect(header.locator('.tl-cw-status')).toHaveCount(0, { timeout: 4_000 });
+      await expectNoVisibleWorking(header);
+      await expect(
+        resolveStreamEventRow(page, MINIMAL_CHAT_READING_ANCHOR_TITLE),
+      ).toBeVisible();
+      await expect(page.locator('[role="alert"]')).toHaveCount(0);
+
+      expect(await controller.getStalledWorkspaceSnapshotCount()).toBe(1);
+      const invocationsAfterAgeOut = await controller.getInvocations();
+      expect(
+        invocationsAfterAgeOut.filter((call) => call.cmd === 'desktop_workspace_snapshot').length,
+      ).toBe(snapshotReadsAtStall);
+      expect(
+        invocationsAfterAgeOut.filter((call) => call.cmd === 'desktop_observation_snapshot').length,
+      ).toBe(0);
+
+      const storedAfterAgeOut = await controller.getWorkspaceSnapshot();
+      expect(storedAfterAgeOut?.generated_at_ms).toBe(workingSnapshot.generated_at_ms);
+      const storedAlphaSample = storedAfterAgeOut?.native_samples.find((sample) =>
+        workspaceChatIdentitiesEqual(sample.chat_identity, CHAT_ALPHA_IDENTITY),
+      );
+      expect(storedAlphaSample?.observed_at_ms).toBe(baseAlphaSample!.observed_at_ms);
+      expect(storedAlphaSample?.last_success_at_ms).toBe(baseAlphaSample!.last_success_at_ms);
+    } finally {
+      await controller.releaseStalledWorkspaceSnapshotReads().catch(() => {});
+    }
+  });
+
+  test('distinguishes historical failure, Blocked, Doing, and awaiting-check work from actual native waiting attention', async ({
+    page,
+  }) => {
+    const controller = await installMinimal(page);
+    await expect(chatHeader(page, 'Workspace UI Contract')).toBeVisible();
+    const baseSnapshot = await controller.getWorkspaceSnapshot();
+    expect(baseSnapshot).not.toBeNull();
+
+    const workspace = workspaceSection(page);
+    await expect(workspace.getByText(`Blocked: ${MINIMAL_CHAT_BLOCKED_TITLE}`)).toBeVisible();
+    await expect(
+      workspace.getByText(`Worker result recorded: Failed for ${MINIMAL_CHAT_FAILED_TITLE}`),
+    ).toBeVisible();
+    await expect(
+      workspace.getByText(`Worker result recorded: Awaiting check for ${MINIMAL_CHAT_DOING_TITLE}`),
+    ).toBeVisible();
+
+    const dialog = await openBacklog(page);
+    await expectCommittedBacklogStatus(dialog, MINIMAL_CHAT_FAILED_TITLE, 'blocked');
+    const failedRow = await resolveBacklogItemRow(dialog, MINIMAL_CHAT_FAILED_TITLE);
+    await expectNoInventedBacklogRowStatus(failedRow);
+    await expect(failedRow.getByText(/^done$/i)).toHaveCount(0);
+    await closeBacklogWithEscape(page);
+    await expectNoNeedsYou(page);
+
+    const betaWaiting = updateNativeActivityFixture(
+      baseSnapshot!,
+      CHAT_BETA_SAME_PROJECT_IDENTITY,
+      'waiting_for_approval',
+    );
+    await controller.setWorkspaceSnapshot(betaWaiting);
+    await triggerWorkspaceRefresh(page);
+    await selectChat(page, 'Release Verification Gate');
+    await expectSingleNeedsYou(page);
+  });
+
+  test('does not report legacy pending acceptance as Done and keeps actual committed Done separate', async ({
+    page,
+  }) => {
+    await installMinimal(page);
+    const workspace = workspaceSection(page);
+    await expect(workspace.getByText(/verified accepted/i)).toHaveCount(0);
+
+    const dialog = await openBacklog(page);
+    await expectCommittedBacklogStatus(dialog, MINIMAL_CHAT_DOING_TITLE, 'doing');
+    const doingRow = await resolveBacklogItemRow(dialog, MINIMAL_CHAT_DOING_TITLE);
+    await expectNoInventedBacklogRowStatus(doingRow);
+    await expect(doingRow.getByText(/^done$/i)).toHaveCount(0);
+    await expect(
+      resolveStreamEventRow(
+        page,
+        `Worker result recorded: Awaiting check for ${MINIMAL_CHAT_DOING_TITLE}`,
+      ),
+    ).toBeVisible();
+
+    await expectCommittedBacklogStatus(dialog, MINIMAL_CHAT_DONE_TITLE, 'done');
+    await closeBacklogWithEscape(page);
+  });
+});
+
+test.describe('Workspace identity isolation, navigation, and archive usability', () => {
+  test('enforces four-part WorkspaceChatIdentity scope isolation and passes exact Open in Codex targets', async ({
+    page,
+  }) => {
+    const controller = await installMinimal(page);
+
+    await expect(
+      resolveStreamEventRow(page, MINIMAL_CHAT_READING_ANCHOR_TITLE),
+    ).toBeVisible();
+    await expect(workspaceSection(page).getByText(BETA_CHAT_ONLY_SENTINEL)).toHaveCount(0);
+    await expect(workspaceSection(page).getByText(WRONG_SCOPE_QUARANTINE_SENTINEL)).toHaveCount(0);
+    await expect(
+      workspaceSection(page).getByText(MINIMAL_CHAT_WRONG_SCOPE_WORK_SENTINEL),
+    ).toHaveCount(0);
+
+    const header = chatHeader(page, 'Workspace UI Contract');
+    const openCodexBtn = header.getByRole('button', { name: /^open in codex$/i });
     await expect(openCodexBtn).toBeVisible();
     await expect(openCodexBtn).toBeEnabled();
 
@@ -1081,16 +1937,24 @@ test.describe('Workspace semantic contract fixtures', () => {
       .toBe(true);
     await expect(page.locator('[role="alert"]')).toHaveCount(0);
 
-    // Selecting same-project sibling Beta scopes DOM and Open in Codex strictly to Beta's thread_uuid while still quarantining unaligned records.
-    const sidebar = page.locator('aside.tl-sidebar').first();
-    await sidebar.getByText('Release Verification Gate').first().click();
-    await chatSurfaceTab(page, 'Messages').click();
-    await expect(page.getByText(BETA_CHAT_ONLY_SENTINEL).first()).toBeVisible();
-    await expect(page.getByText(/Alpha message #36/)).toHaveCount(0);
-    await expect(page.getByText(WRONG_SCOPE_QUARANTINE_SENTINEL)).toHaveCount(0);
+    await selectChat(page, 'Release Verification Gate');
+    await expect(
+      resolveStreamEventRow(page, MINIMAL_CHAT_BETA_BACKLOG_SENTINEL),
+    ).toBeVisible();
+    await expect(workspaceSection(page).getByText(BETA_CHAT_ONLY_SENTINEL)).toHaveCount(0);
+    // Authored event language is retained verbatim; the surrounding UI stays English.
+    await expect(
+      resolveStreamEventRow(page, MINIMAL_CHAT_AUTHORED_LANGUAGE_TITLE),
+    ).toBeVisible();
+    await expect(
+      workspaceSection(page).getByText(MINIMAL_CHAT_READING_ANCHOR_TITLE),
+    ).toHaveCount(0);
+    await expect(workspaceSection(page).getByText(WRONG_SCOPE_QUARANTINE_SENTINEL)).toHaveCount(0);
 
     await controller.clearInvocations();
-    await openCodexBtn.click();
+    await chatHeader(page, 'Release Verification Gate')
+      .getByRole('button', { name: /^open in codex$/i })
+      .click();
     await expect
       .poll(async () => {
         const calls = await controller.getInvocations();
@@ -1108,382 +1972,166 @@ test.describe('Workspace semantic contract fixtures', () => {
     await expect(page.locator('[role="alert"]')).toHaveCount(0);
   });
 
-  test('distinguishes superseded historical attempt failures from active human approval attention', async ({
-    page,
-  }) => {
-    const baseSnapshot = buildHistoricalFailureWorkspaceSnapshot();
-    const fixtureSourceId = baseSnapshot.job_histories[0]?.job.source_id ?? 'default';
-    const retiredPlanningHistory = {
-      job: {
-        source_id: fixtureSourceId,
-        job_id: 'job_retired_plan_draft_01',
-        binding_id: CHAT_BETA_SAME_PROJECT_IDENTITY.binding_id,
-        chat_identity: CHAT_BETA_SAME_PROJECT_IDENTITY,
-        title: 'Retired Initial Plan Draft',
-        job_revision: 2,
-        state: 'unknown' as const,
-        phase: 'held',
-        approval_status: 'superseded',
-        execution_status: 'not_started',
-        review_state: null,
-        created_at_ms: FIXTURE_BASE_NOW_MS - 90_000,
-        updated_at_ms: FIXTURE_BASE_NOW_MS - 45_000,
-        summary: 'Initial unstarted planning brief superseded before approval.',
-      },
-      tasks: [],
-      runs: [],
-      outbox: [],
-      combined_candidates: [],
-      result: null,
-      links: {
-        source_plan_id: 'plan_attn_01',
-        source_plan_revision: 1,
-        source_approval_id: null,
-        source_work_brief_id: 'brf_attn_01',
-        planning_grant_id: null,
-        planning_reservation_id: null,
-        supersedes_job_id: null,
-        superseded_by_job_id: 'job_active_attention_02',
-        parent_job_id: null,
-        follow_up_job_ids: ['job_active_attention_02'],
-        architect_advice_ids: [],
-        source_request_ids: [],
-      },
-      historical_failure: null,
-      current_attention: null,
-      acceptance_proof: {
-        status: 'unknown' as const,
-        accepted_candidate_id: null,
-        combined_candidate_id: null,
-        review_verdict_id: null,
-        review_receipt_id: null,
-        integration_receipt_id: null,
-        closure_reservation_id: null,
-        closure_verdict_id: null,
-        verified_at_ms: null,
-      },
-      truncation: {
-        tasks_omitted: 0,
-        attempts_omitted: 0,
-        candidates_omitted: 0,
-        runs_omitted: 0,
-        outbox_omitted: 0,
-        combined_candidates_omitted: 0,
-      },
-    };
-    const genuineFailedHistory = {
-      ...retiredPlanningHistory,
-      job: {
-        ...retiredPlanningHistory.job,
-        job_id: 'job_cancelled_legacy_03',
-        title: 'Cancelled Legacy Experiment',
-        state: 'failed' as const,
-        phase: 'cancelled',
-        approval_status: 'superseded',
-        execution_status: 'stopped',
-        updated_at_ms: FIXTURE_BASE_NOW_MS - 50_000,
-        summary: 'Explicitly cancelled job remains truthfully Failed.',
-      },
-    };
-    const augmentedSnapshot = parseWorkspaceSnapshot({
-      ...baseSnapshot,
-      job_histories: [
-        ...baseSnapshot.job_histories,
-        retiredPlanningHistory,
-        genuineFailedHistory,
-      ],
-    });
-
-    await installWorkspaceTauriFixture(page, {
-      workspaceSnapshot: augmentedSnapshot,
-    });
-    await page.setViewportSize({ width: 1040, height: 760 });
-    await page.goto('/');
-
-    const sidebar = page.locator('aside.tl-sidebar').first();
-    await expect(sidebar).toBeVisible();
-
-    // Historical fixture prioritizes Beta initially due to active attention; explicitly select Alpha first.
-    await sidebar.getByText('Workspace UI Contract').first().click();
-    await chatSurfaceTab(page, 'Jobs').click();
-
-    const jobsPanel = visibleJobsPanel(page);
-    const recoveredJobCard = jobsPanel
-      .locator('article.tl-wp-job-card')
-      .filter({ hasText: 'Recovered Retry Pipeline' })
-      .first();
-    await expect(recoveredJobCard).toBeVisible();
-    await expect(
-      recoveredJobCard.getByText(/awaiting.*approval|needs approval/i),
-    ).toHaveCount(0);
-
-    // Expand job detail to inspect superseded historical failure context without surfacing active approval blockers.
-    await recoveredJobCard
-      .locator('button.tl-wp-job-row-btn, button[aria-expanded]')
-      .first()
-      .click();
-    await expect(
-      recoveredJobCard.getByText(new RegExp(HISTORICAL_FAILURE_REASON, 'i')).first(),
-    ).toBeVisible();
-    await expect(recoveredJobCard.getByText(/superseded/i).first()).toBeVisible();
-    await expect(
-      recoveredJobCard.getByText(/awaiting.*approval|needs approval/i),
-    ).toHaveCount(0);
-
-    // Switch to sibling chat Beta where active approval attention is genuinely pending alongside a retired planning draft.
-    await sidebar.getByText('Release Verification Gate').first().click();
-    await chatSurfaceTab(page, 'Jobs').click();
-
-    const betaJobsPanel = visibleJobsPanel(page);
-    const retiredPlanCard = betaJobsPanel
-      .locator('article.tl-wp-job-card')
-      .filter({ hasText: 'Retired Initial Plan Draft' })
-      .first();
-    await expect(retiredPlanCard).toBeVisible();
-    await expect(
-      retiredPlanCard.locator('.tl-wp-pill[data-tone="neutral"] .tl-wp-pill-label', {
-        hasText: /^Superseded$/,
-      }),
-    ).toHaveCount(1);
-    await expect(
-      retiredPlanCard.locator('.tl-wp-pill .tl-wp-pill-label', {
-        hasText: /^(Failed|Unknown|Needs user|Needs approval|On hold)$/i,
-      }),
-    ).toHaveCount(0);
-
-    const genuineFailedCard = betaJobsPanel
-      .locator('article.tl-wp-job-card')
-      .filter({ hasText: 'Cancelled Legacy Experiment' })
-      .first();
-    await expect(genuineFailedCard).toBeVisible();
-    await expect(
-      genuineFailedCard.locator('.tl-wp-pill[data-tone="danger"] .tl-wp-pill-label', {
-        hasText: /^Failed$/,
-      }),
-    ).toHaveCount(1);
-
-    const approvalJobCard = betaJobsPanel
-      .locator('article.tl-wp-job-card')
-      .filter({ hasText: 'Plan Approval Gate' })
-      .first();
-    await expect(approvalJobCard).toBeVisible();
-    await expect(
-      approvalJobCard.getByText(/awaiting.*approval|needs approval/i).first(),
-    ).toBeVisible();
-  });
-
-  test('does not report completed Worker candidates as Accepted/Done while Closure acceptance is pending', async ({
+  test('quarantines same-thread work that differs by only source, binding, or project scope', async ({
     page,
   }) => {
     await installWorkspaceTauriFixture(page, {
-      workspaceSnapshot: buildPendingAcceptanceWorkspaceSnapshot(),
+      workspaceSnapshot: buildFourPartScopeCollisionWorkspaceSnapshot(),
     });
     await page.setViewportSize({ width: 1040, height: 760 });
     await page.goto('/');
-
-    await chatSurfaceTab(page, 'Jobs').click();
-    await expect(page.locator('.tl-wp-messages-panel').first()).toBeHidden();
-    await expect(page.locator('[role="tabpanel"]:visible')).toHaveCount(1);
-
-    const jobsPanel = visibleJobsPanel(page);
-    await expect(jobsPanel).toBeVisible();
-
-    const pendingJobCard = jobsPanel
-      .locator('article.tl-wp-job-card')
-      .filter({ hasText: 'Worker Finished Pending Acceptance Slice' })
-      .first();
-    await expect(pendingJobCard).toBeVisible();
-    await expect(pendingJobCard.getByText(PENDING_ACCEPTANCE_SUMMARY).first()).toBeVisible();
+    await selectChat(page, 'Workspace UI Contract');
+    await expect(chatHeader(page, 'Workspace UI Contract')).toBeVisible();
     await expect(
-      pendingJobCard
-        .getByText(
-          /ready for review|pending review|awaiting review|pending acceptance|requires review/i,
-        )
-        .first(),
+      resolveStreamEventRow(page, MINIMAL_CHAT_READING_ANCHOR_TITLE),
     ).toBeVisible();
-    await expect(pendingJobCard.getByText(/^verified accepted$|^accepted$|^done$/i)).toHaveCount(
-      0,
-    );
-    await expect(pendingJobCard.getByText(VERIFIED_ACCEPTED_SUMMARY)).toHaveCount(0);
 
-    // Expand pending job card and verify finished Worker candidate still never claims Accepted/Done.
-    await pendingJobCard
-      .locator('button.tl-wp-job-row-btn, button[aria-expanded]')
-      .first()
-      .click();
-    await expect(pendingJobCard.getByText('cand_pending_01').first()).toBeVisible();
-    await expect(pendingJobCard.getByText(PENDING_ACCEPTANCE_SUMMARY).first()).toBeVisible();
-    await expect(pendingJobCard.getByText(/^verified accepted$|^accepted$|^done$/i)).toHaveCount(
-      0,
+    // Prove the three probes are valid identities that vary exactly one part.
+    expect(FOUR_PART_SOURCE_ONLY_IDENTITY.source_id).not.toBe(
+      CHAT_ALPHA_IDENTITY.source_id,
+    );
+    expect(FOUR_PART_SOURCE_ONLY_IDENTITY.binding_id).toBe(CHAT_ALPHA_IDENTITY.binding_id);
+    expect(FOUR_PART_SOURCE_ONLY_IDENTITY.thread_uuid).toBe(CHAT_ALPHA_IDENTITY.thread_uuid);
+    expect(FOUR_PART_SOURCE_ONLY_IDENTITY.canonical_project_scope).toBe(
+      CHAT_ALPHA_IDENTITY.canonical_project_scope,
     );
 
-    const acceptedJobCard = jobsPanel
-      .locator('article.tl-wp-job-card')
-      .filter({ hasText: 'Closure Verified Package Slice' })
-      .first();
-    await expect(acceptedJobCard).toBeVisible();
-    await expect(acceptedJobCard.getByText(/^verified accepted$/i).first()).toBeVisible();
-    await expect(acceptedJobCard.getByText(VERIFIED_ACCEPTED_SUMMARY).first()).toBeVisible();
-    await expect(acceptedJobCard.getByText(PENDING_ACCEPTANCE_SUMMARY)).toHaveCount(0);
-  });
-
-  test('transitions fresh native working chat to Stale via owned 1s UI age clock when one snapshot poll stalls without manufacturing reads or timestamps', async ({
-    page,
-  }) => {
-    const base = buildInteractiveWorkspaceSnapshot();
-    const baseAlphaChat = base.chats.find(
-      (chat) => chat.identity.binding_id === CHAT_ALPHA_IDENTITY.binding_id,
-    )!;
-    const baseAlphaSample = base.native_samples.find(
-      (sample) => sample.chat_identity.binding_id === CHAT_ALPHA_IDENTITY.binding_id,
-    )!;
-
-    const workingSnapshot = parseWorkspaceSnapshot({
-      ...base,
-      observation: {
-        ...base.observation,
-        sources: base.observation.sources.map((src) => ({
-          ...src,
-          availability: 'available',
-          message: null,
-        })),
-        jobs: [],
-        requests: [],
-        next_cursor: null,
-        has_more: false,
-        jobs_has_more: false,
-        warnings: [],
-        warning_contexts: [],
-      },
-      chats: [
-        {
-          ...baseAlphaChat,
-          availability: 'available',
-          activity: 'working',
-          active_job_count: 0,
-          attention_count: 0,
-        },
-      ],
-      native_samples: [
-        {
-          ...baseAlphaSample,
-          availability: 'available',
-          activity: 'working',
-          connection: {
-            ...baseAlphaSample.connection,
-            state: 'connected',
-            freshness: 'fresh',
-          },
-        },
-      ],
-      job_histories: [],
-      messages: {
-        ...base.messages,
-        availability: 'available',
-        items: [],
-        omitted_count: 0,
-        has_more: false,
-        truncated: false,
-      },
-    });
-
-    // Producer timestamps must remain untouched from the base interactive snapshot.
-    expect(workingSnapshot.generated_at_ms).toBe(base.generated_at_ms);
-    expect(workingSnapshot.native_samples[0]!.observed_at_ms).toBe(baseAlphaSample.observed_at_ms);
-    expect(workingSnapshot.native_samples[0]!.last_success_at_ms).toBe(
-      baseAlphaSample.last_success_at_ms,
+    expect(FOUR_PART_BINDING_ONLY_IDENTITY.source_id).toBe(CHAT_ALPHA_IDENTITY.source_id);
+    expect(FOUR_PART_BINDING_ONLY_IDENTITY.binding_id).not.toBe(
+      CHAT_ALPHA_IDENTITY.binding_id,
+    );
+    expect(FOUR_PART_BINDING_ONLY_IDENTITY.thread_uuid).toBe(
+      CHAT_ALPHA_IDENTITY.thread_uuid,
+    );
+    expect(FOUR_PART_BINDING_ONLY_IDENTITY.canonical_project_scope).toBe(
+      CHAT_ALPHA_IDENTITY.canonical_project_scope,
     );
 
-    const controller = await installWorkspaceTauriFixture(page, {
-      workspaceSnapshot: workingSnapshot,
-    });
+    expect(FOUR_PART_PROJECT_ONLY_IDENTITY.source_id).toBe(CHAT_ALPHA_IDENTITY.source_id);
+    expect(FOUR_PART_PROJECT_ONLY_IDENTITY.binding_id).toBe(
+      CHAT_ALPHA_IDENTITY.binding_id,
+    );
+    expect(FOUR_PART_PROJECT_ONLY_IDENTITY.thread_uuid).toBe(
+      CHAT_ALPHA_IDENTITY.thread_uuid,
+    );
+    expect(FOUR_PART_PROJECT_ONLY_IDENTITY.canonical_project_scope).not.toBe(
+      CHAT_ALPHA_IDENTITY.canonical_project_scope,
+    );
 
-    try {
-      await page.setViewportSize({ width: 1040, height: 760 });
-      await page.goto('/');
-
-      const sidebar = page.locator('aside.tl-sidebar').first();
-      const chatHeader = page.locator('header.tl-wp-chat-header').first();
-      await expect(sidebar).toBeVisible();
-      await expect(chatHeader).toBeVisible();
-
-      // Initially fresh native working Alpha renders two sidebar working badges and header working pill.
-      await expect(sidebar.locator('.tl-mini-pill[data-tone="working"]')).toHaveCount(2);
-      await expect(chatHeader.locator('.tl-wp-pill[data-tone="working"]')).toHaveCount(1);
-      await expect(
-        chatHeader.locator('.tl-wp-pill[data-tone="working"]').getByText(/\bworking\b/i),
-      ).toBeVisible();
-      await expect(chatHeader.getByText(/Configured:\s*GPT-5\.4/i)).toBeVisible();
-      await expect(sidebar.getByText(/GPT-5\.4/i).first()).toBeVisible();
-
-      const initialSnapshotReads = (await controller.getInvocations()).filter(
-        (call) => call.cmd === 'desktop_workspace_snapshot',
-      ).length;
-      expect(initialSnapshotReads).toBe(1);
-
-      // Arm a single stalled desktop_workspace_snapshot read (pending without error or reply).
-      await controller.stallNextWorkspaceSnapshotRead();
-      await expect
-        .poll(() => controller.getStalledWorkspaceSnapshotCount(), { timeout: 5_000 })
-        .toBe(1);
-
-      const snapshotReadsAtStall = (await controller.getInvocations()).filter(
-        (call) => call.cmd === 'desktop_workspace_snapshot',
-      ).length;
-      expect(snapshotReadsAtStall).toBe(2);
-      await expect(page.locator('[role="alert"]')).toHaveCount(0);
-
-      // Advance controlled Date by 11,001ms while real browser interval timers continue running.
-      await page.clock.setFixedTime(workingSnapshot.generated_at_ms + 11_001);
-
-      // Owned 1s UI age clock must age out the native working sample to Stale with zero working badges.
-      await expect(chatHeader.getByText(/^stale$/i).first()).toBeVisible({ timeout: 4_000 });
-      await expect(chatHeader.getByText(/Configured:\s*Unavailable/i)).toBeVisible();
-      await expect(chatHeader.getByText(/GPT-5\.4/i)).toHaveCount(0);
-      await expect(chatHeader.locator('.tl-wp-pill[data-tone="working"]')).toHaveCount(0);
-      await expect(chatHeader.locator(ACTIVITY_SPINNER_SELECTOR)).toHaveCount(0);
-
-      await expect(sidebar.locator('.tl-mini-pill[data-tone="working"]')).toHaveCount(0);
-      await expect(
-        sidebar.getByText(/native state stale|coworker state stale|\bstale\b/i).first(),
-      ).toBeVisible();
-      await expect(sidebar.getByText(/GPT-5\.4/i)).toHaveCount(0);
-      // Hidden section slots (such as static Profiles override pills under hidden `.tl-panel-slot`)
-      // reuse `data-tone="working"` for accent styling rather than live status; assert zero visible working claims.
-      await expect(page.locator('[data-tone="working"]:visible')).toHaveCount(0);
-      expect(
-        await page
-          .locator('[data-tone="working"]')
-          .evaluateAll((nodes) => nodes.filter((node) => node.checkVisibility()).length),
-      ).toBe(0);
-      await expect(page.locator('[role="alert"]')).toHaveCount(0);
-
-      // Still stalled on that one pending read: zero additional backend reads or fresh producer timestamps manufactured.
-      expect(await controller.getStalledWorkspaceSnapshotCount()).toBe(1);
-      const invocationsAfterAgeOut = await controller.getInvocations();
-      expect(
-        invocationsAfterAgeOut.filter((call) => call.cmd === 'desktop_workspace_snapshot').length,
-      ).toBe(snapshotReadsAtStall);
-      expect(
-        invocationsAfterAgeOut.filter((call) => call.cmd === 'desktop_observation_snapshot').length,
-      ).toBe(0);
-
-      const storedAfterAgeOut = await controller.getWorkspaceSnapshot();
-      expect(storedAfterAgeOut?.generated_at_ms).toBe(workingSnapshot.generated_at_ms);
-      expect(storedAfterAgeOut?.native_samples[0]?.observed_at_ms).toBe(
-        baseAlphaSample.observed_at_ms,
-      );
-      expect(storedAfterAgeOut?.native_samples[0]?.last_success_at_ms).toBe(
-        baseAlphaSample.last_success_at_ms,
-      );
-    } finally {
-      await controller.releaseStalledWorkspaceSnapshotReads().catch(() => {});
+    const workspace = workspaceSection(page);
+    const sentinels = [
+      FOUR_PART_SOURCE_ONLY_SENTINEL,
+      FOUR_PART_BINDING_ONLY_SENTINEL,
+      FOUR_PART_PROJECT_ONLY_SENTINEL,
+    ];
+    for (const sentinel of sentinels) {
+      await expect(workspace.getByText(sentinel)).toHaveCount(0);
     }
+    await expectLiveAgentWorking(workspace, 'Worker');
+    await expectNoLiveAgentWorking(workspace, 'Coworker');
+    // Native waiting samples for valid one-part variants may normalize as their
+    // own chats, but none of that attention may leak into the Alpha selection.
+    await expectNoNeedsYouInScope(workspace);
+    await expectNoNeedsYouInScope(chatHeader(page, 'Workspace UI Contract'));
+
+    const dialog = await openBacklog(page);
+    for (const sentinel of sentinels) {
+      await expect(dialog.getByText(sentinel)).toHaveCount(0);
+    }
+    await closeBacklogWithEscape(page);
+
+    await selectChat(page, 'Release Verification Gate');
+    await expect(chatHeader(page, 'Release Verification Gate')).toBeVisible();
+    const betaWorkspace = workspaceSection(page);
+    for (const sentinel of sentinels) {
+      await expect(betaWorkspace.getByText(sentinel)).toHaveCount(0);
+    }
+    await expectNoLiveAgentWorking(betaWorkspace, 'Worker');
+    await expectNoLiveAgentWorking(betaWorkspace, 'Coworker');
+    await expectNoNeedsYouInScope(betaWorkspace);
+    await expectNoNeedsYouInScope(chatHeader(page, 'Release Verification Gate'));
+  });
+
+  test('keeps Active/Archive, sidebar collapse, settings/tools/profiles usable, and quarantines wrong-scope/malformed work', async ({
+    page,
+  }) => {
+    await installMinimal(page);
+    const workspace = workspaceSection(page);
+    await expect(workspace.getByText(MINIMAL_CHAT_WRONG_SCOPE_WORK_SENTINEL)).toHaveCount(0);
+    await expect(workspace.getByText(MINIMAL_CHAT_MALFORMED_WORK_SENTINEL)).toHaveCount(0);
+    await expect(workspace.getByText(WRONG_SCOPE_QUARANTINE_SENTINEL)).toHaveCount(0);
+
+    const sidebarEl = sidebar(page);
+    await sidebarEl
+      .getByRole('button', { name: 'Archive Release Verification Gate', exact: true })
+      .click();
+    await expect(sidebarEl.getByText('Release Verification Gate')).toHaveCount(0);
+
+    await lifecycleFilterControl(page, 'archived').click();
+    await expect(sidebarEl.getByText('Release Verification Gate').first()).toBeVisible();
+    await sidebarEl
+      .getByRole('button', { name: 'Restore Release Verification Gate', exact: true })
+      .click();
+    await lifecycleFilterControl(page, 'active').click();
+    await expect(sidebarEl.getByText('Release Verification Gate').first()).toBeVisible();
+
+    await page.getByRole('button', { name: /collapse sidebar/i }).first().click();
+    await expect
+      .poll(async () => (await sidebarEl.boundingBox())?.width ?? 0)
+      .toBeLessThanOrEqual(72);
+    await page.getByRole('button', { name: /expand sidebar/i }).first().click();
+    await expect
+      .poll(async () => (await sidebarEl.boundingBox())?.width ?? 0)
+      .toBeGreaterThanOrEqual(220);
+
+    for (const label of ['Settings', 'Tools', 'Profiles'] as const) {
+      await sidebarEl.getByRole('button', { name: label, exact: true }).click();
+      const sectionSelector =
+        label === 'Tools'
+          ? 'section[aria-label="Tools and models"], section[aria-label="Tools"]'
+          : `section[aria-label="${label}"]`;
+      await expect(page.locator(sectionSelector).first()).toBeVisible();
+    }
+    await sidebarEl.getByRole('button', { name: 'Projects', exact: true }).click();
+    // Returning from settings/tools/profiles does not promise which chat the
+    // lifecycle view left selected. Explicitly select Alpha and require its
+    // real stream and drawer control rather than assuming prior selection.
+    await selectChat(page, 'Workspace UI Contract');
+    await expect(chatHeader(page, 'Workspace UI Contract')).toBeVisible();
+    await expect(
+      resolveStreamEventRow(page, MINIMAL_CHAT_READING_ANCHOR_TITLE),
+    ).toBeVisible();
+    await expect(backlogButton(page)).toBeVisible();
   });
 });
 
-test.describe('Workspace external resolution receipts', () => {
-  test('renders full, partial, stale, unverified, covered attention, and receipt navigation in wide layout', async ({
+test.describe('Legacy compatibility safety', () => {
+  test('quarantines malformed chat_work without hiding the selected chat stream or drawer', async ({
+    page,
+  }) => {
+    await installWorkspaceTauriFixture(page, {
+      workspaceSnapshot: buildMinimalChatWorkspaceSnapshotWithMalformedWork(),
+    });
+    await page.setViewportSize({ width: 1040, height: 760 });
+    await page.goto('/');
+    await selectChat(page, 'Workspace UI Contract');
+    await expect(chatHeader(page, 'Workspace UI Contract')).toBeVisible();
+
+    await expect(
+      workspaceSection(page).getByText(MINIMAL_CHAT_MALFORMED_WORK_SENTINEL),
+    ).toHaveCount(0);
+    await expectNoNeedsYou(page);
+    await expect(
+      resolveStreamEventRow(page, MINIMAL_CHAT_READING_ANCHOR_TITLE),
+    ).toBeVisible();
+
+    const dialog = await openBacklog(page);
+    await expect(dialog.getByText(MINIMAL_CHAT_MALFORMED_WORK_SENTINEL)).toHaveCount(0);
+    await expect(resolveBacklogItemRow(dialog, MINIMAL_CHAT_DONE_TITLE)).toBeVisible();
+    await closeBacklogWithEscape(page);
+  });
+
+  test('legacy external resolution receipts do not create normal-chat events, backlog items, or NeedsYou', async ({
     page,
   }) => {
     await installWorkspaceTauriFixture(page, {
@@ -1491,644 +2139,93 @@ test.describe('Workspace external resolution receipts', () => {
     });
     await page.setViewportSize({ width: 1040, height: 760 });
     await page.goto('/');
+    await selectChat(page, 'External Resolution Chat');
+    await expect(chatHeader(page, 'External Resolution Chat')).toBeVisible();
 
-    const messagesPanel = page
-      .locator('.tl-wp-tabpanel[role="tabpanel"]:not([hidden]) .tl-wp-messages-panel')
-      .first();
-    await expect(messagesPanel).toBeVisible();
-    const messagesReceipts = messagesPanel.locator(
-      '[data-external-resolution-surface="messages"]',
-    );
-    await expect(messagesReceipts).toBeVisible();
-    const messagesScroller = await expectUsableMessagesScroller(messagesPanel);
-    const fullMessageReceiptButton = messagesPanel
-      .locator(`[data-message-receipt-id="${EXTERNAL_RESOLUTION_FULL_RECEIPT_ID}"]`)
-      .first();
-    await expectInViewportWithinScroller(messagesScroller, fullMessageReceiptButton);
-    const initialMessagesScrollerHeight = await messagesScroller.evaluate(
-      (el) => el.clientHeight,
-    );
+    const workspace = workspaceSection(page);
+    await expect(workspace.getByRole('tab')).toHaveCount(0);
+    await expect(workspace.locator('[role="tablist"]')).toHaveCount(0);
+    await expect(
+      workspace.getByRole('tab', { name: /^(messages|jobs|activity)\b/i }),
+    ).toHaveCount(0);
+    await expect(
+      workspace.getByRole('button', { name: /^(messages|jobs|activity)\b/i }),
+    ).toHaveCount(0);
+    await expect(workspace.getByText(EXTERNAL_RESOLUTION_FULL_SUMMARY)).toHaveCount(0);
+    await expect(workspace.getByText(EXTERNAL_RESOLUTION_UNRELATED_QUESTION)).toHaveCount(0);
+    await expect(workspace.getByText(/resolved externally/i)).toHaveCount(0);
+    await expect(workspace.getByText(/external resolution receipts/i)).toHaveCount(0);
+    await expectNoNeedsYou(page);
 
-    const fullReceipt = messagesReceipts.locator(
-      `[data-external-resolution-receipt-id="${EXTERNAL_RESOLUTION_FULL_RECEIPT_ID}"]`,
-    );
-    await expect(fullReceipt).toBeVisible();
-    await expect(fullReceipt.getByText('Resolved externally').first()).toBeVisible();
-    await expect(fullReceipt.getByText('Full job').first()).toBeVisible();
-    await expect(fullReceipt.getByText(EXTERNAL_RESOLUTION_FULL_SUMMARY).first()).toBeVisible();
-    await expect(
-      fullReceipt.locator('.tl-wp-state-desc').first(),
-    ).toHaveText('Externally Resolved Full Job');
-    await expect(fullReceipt.getByText('Job: job_ext_full_01').first()).toBeHidden();
-    await expect(fullReceipt.getByText('task_ext_full_01').first()).toBeHidden();
-    await expectUsableMessagesScroller(messagesPanel);
-    await expectInViewportWithinScroller(messagesScroller, fullMessageReceiptButton);
-    const fullReceiptDetails = fullReceipt
-      .locator('details[data-external-resolution-details]')
-      .first();
-    await ensureDetailsOpen(fullReceiptDetails);
-    await expect(
-      fullReceipt.getByText(`Receipt: ${EXTERNAL_RESOLUTION_FULL_RECEIPT_ID}`).first(),
-    ).toBeVisible();
-    await expect(
-      fullReceipt.getByText('Job: job_ext_full_01').first(),
-    ).toBeVisible();
-    await expect(fullReceipt.getByText('task_ext_full_01').first()).toBeVisible();
-    await expect(fullReceipt.getByText('ev_ext_fixture_full_01').first()).toBeVisible();
-    await expect(
-      fullReceipt.getByText(EXTERNAL_RESOLUTION_COVERED_JOB_REASON).first(),
-    ).toBeVisible();
-    await expect(
-      fullReceipt.getByText(EXTERNAL_RESOLUTION_COVERED_TASK_REASON).first(),
-    ).toBeVisible();
-
-    const partialReceipt = messagesReceipts.locator(
-      `[data-external-resolution-receipt-id="${EXTERNAL_RESOLUTION_PARTIAL_RECEIPT_ID}"]`,
-    );
-    await expect(partialReceipt).toBeVisible();
-    await expect(
-      partialReceipt.getByText('Partially resolved externally').first(),
-    ).toBeVisible();
-    await expect(partialReceipt.getByText('Partial · 1 task').first()).toBeVisible();
-    await expect(
-      partialReceipt.locator('.tl-wp-state-desc').first(),
-    ).toHaveText('Externally Resolved Partial Job');
-    await expect(partialReceipt.getByText('job_ext_partial_02').first()).toBeHidden();
-    await expect(partialReceipt.getByText('task_ext_partial_01').first()).toBeHidden();
-    await expectUsableMessagesScroller(messagesPanel);
-    await expectInViewportWithinScroller(messagesScroller, fullMessageReceiptButton);
-    await ensureDetailsOpen(
-      partialReceipt.locator('details[data-external-resolution-details]').first(),
-    );
-    await expect(
-      partialReceipt.getByText('job_ext_partial_02').first(),
-    ).toBeVisible();
-    await expect(
-      partialReceipt.getByText('task_ext_partial_01').first(),
-    ).toBeVisible();
-    await expectUsableMessagesScroller(messagesPanel);
-    await expectInViewportWithinScroller(messagesScroller, fullMessageReceiptButton);
-
-    const messagesHistory = messagesReceipts.locator(
-      '[data-external-resolution-surface="messages-history"]',
-    );
-    await ensureDetailsOpen(messagesHistory);
-    await expect(messagesHistory.getByText('Stale external receipt').first()).toBeVisible();
-    await expect(
-      messagesHistory.getByText('Unverified external receipt').first(),
-    ).toBeVisible();
-    const staleHistoryReceipt = messagesHistory
-      .locator(
-        `[data-external-resolution-receipt-id="${EXTERNAL_RESOLUTION_STALE_RECEIPT_ID}"]`,
-      )
-      .first();
-    await expect(staleHistoryReceipt).toBeVisible();
-    await expect(
-      staleHistoryReceipt.getByText('Partial · 1 task (stale)').first(),
-    ).toBeVisible();
-    await expect(
-      staleHistoryReceipt.locator('.tl-wp-state-desc').first(),
-    ).toHaveText('Blocked With Historical Receipts');
-    await expect(staleHistoryReceipt.getByText('job_ext_blocked_03').first()).toBeHidden();
-    await expect(staleHistoryReceipt.getByText('task_ext_blocked_03').first()).toBeHidden();
-    await ensureDetailsOpen(
-      staleHistoryReceipt.locator('details[data-external-resolution-details]').first(),
-    );
-    await expect(
-      staleHistoryReceipt.getByText('job_ext_blocked_03').first(),
-    ).toBeVisible();
-    await expect(
-      staleHistoryReceipt.getByText('task_ext_blocked_03').first(),
-    ).toBeVisible();
-
-    const unverifiedHistoryReceipt = messagesHistory
-      .locator(
-        `[data-external-resolution-receipt-id="${EXTERNAL_RESOLUTION_UNVERIFIED_RECEIPT_ID}"]`,
-      )
-      .first();
-    await expect(unverifiedHistoryReceipt).toBeVisible();
-    await expect(
-      unverifiedHistoryReceipt.getByText('Full job (unverified)').first(),
-    ).toBeVisible();
-    await expect(
-      unverifiedHistoryReceipt.getByText('job_ext_blocked_03').first(),
-    ).toBeHidden();
-    await ensureDetailsOpen(
-      unverifiedHistoryReceipt
-        .locator('details[data-external-resolution-details]')
-        .first(),
-    );
-    await expect(
-      unverifiedHistoryReceipt.getByText('job_ext_blocked_03').first(),
-    ).toBeVisible();
-    await expect(messagesHistory.getByText('External resolution history (2)')).toBeVisible();
-    await expect(
-      messagesPanel.getByText(EXTERNAL_RESOLUTION_UNRELATED_QUESTION).first(),
-    ).toBeVisible();
-    const unrelatedMessageItem = messagesPanel
-      .locator('[data-message-item-id]')
-      .filter({ hasText: EXTERNAL_RESOLUTION_UNRELATED_QUESTION })
-      .first();
-    await expect(unrelatedMessageItem).toBeVisible();
-    await expect(unrelatedMessageItem.locator('[data-message-receipt-id]')).toHaveCount(0);
-    expect(
-      await messagesScroller.evaluate((el) => el.clientHeight),
-    ).toBe(initialMessagesScrollerHeight);
-    await expectUsableMessagesScroller(messagesPanel);
-    await expectInViewportWithinScroller(messagesScroller, fullMessageReceiptButton);
-
-    await fullMessageReceiptButton.click();
-    await expect(chatSurfaceTab(page, 'Jobs')).toHaveAttribute('aria-selected', 'true');
-
-    const jobsPanel = visibleJobsPanel(page);
-    const fullJobCard = jobsPanel.locator(
-      'article.tl-wp-job-card[data-job-id="job_ext_full_01"]',
-    );
-    await expect(fullJobCard).toBeVisible();
-    await expect(fullJobCard).toHaveAttribute('data-expanded', 'true');
-    await expect(fullJobCard.getByText('Resolved externally').first()).toBeVisible();
-    await expect(fullJobCard.getByText(EXTERNAL_RESOLUTION_FULL_SUMMARY).first()).toBeVisible();
-    const jobFullReceipt = fullJobCard
-      .locator(
-        `[data-external-resolution-receipt-id="${EXTERNAL_RESOLUTION_FULL_RECEIPT_ID}"]`,
-      )
-      .first();
-    await expect(jobFullReceipt.getByText('Full job').first()).toBeVisible();
-    await expect(jobFullReceipt.getByText('Job: job_ext_full_01').first()).toBeHidden();
-    await expect(jobFullReceipt.getByText('task_ext_full_01').first()).toBeHidden();
-    await ensureDetailsOpen(
-      jobFullReceipt.locator('details[data-external-resolution-details]').first(),
-    );
-    await expect(
-      fullJobCard.getByText(`Receipt: ${EXTERNAL_RESOLUTION_FULL_RECEIPT_ID}`).first(),
-    ).toBeVisible();
-    await expect(jobFullReceipt.getByText('job_ext_full_01').first()).toBeVisible();
-    await expect(jobFullReceipt.getByText('task_ext_full_01').first()).toBeVisible();
-    await expect(
-      fullJobCard.getByText(/Phase:\s*external_resolution/).first(),
-    ).toBeVisible();
-    await expect(fullJobCard.getByText('Acceptance unverified').first()).toBeVisible();
-    await expect(fullJobCard.getByText('Status: completed').first()).toBeVisible();
-    await expect(
-      fullJobCard
-        .getByText('Real recorded job result remains visible alongside the external receipt.')
-        .first(),
-    ).toBeVisible();
-    await expect(
-      fullJobCard
-        .getByText(/Historical failure remains visible even after external resolution/)
-        .first(),
-    ).toBeVisible();
-    await expect(
-      fullJobCard.getByText(EXTERNAL_RESOLUTION_COVERED_JOB_REASON).first(),
-    ).toBeVisible();
-
-    const partialJobCard = jobsPanel.locator(
-      'article.tl-wp-job-card[data-job-id="job_ext_partial_02"]',
-    );
-    await expect(partialJobCard).toBeVisible();
-    await partialJobCard
-      .locator('button.tl-wp-job-row-btn, button[aria-expanded]')
-      .first()
-      .click();
-    await expect(
-      partialJobCard.getByText('Partially resolved externally').first(),
-    ).toBeVisible();
-    await expect(
-      partialJobCard.getByText(EXTERNAL_RESOLUTION_PARTIAL_SUMMARY).first(),
-    ).toBeVisible();
-    await expect(
-      partialJobCard.getByText('Unrelated task remains visible').first(),
-    ).toBeVisible();
-    const jobPartialReceipt = partialJobCard
-      .locator(
-        `[data-external-resolution-receipt-id="${EXTERNAL_RESOLUTION_PARTIAL_RECEIPT_ID}"]`,
-      )
-      .first();
-    await expect(jobPartialReceipt).toBeVisible();
-    await expect(jobPartialReceipt.getByText('Partial · 1 task').first()).toBeVisible();
-    await expect(jobPartialReceipt.getByText('job_ext_partial_02').first()).toBeHidden();
-    await expect(jobPartialReceipt.getByText('task_ext_partial_01').first()).toBeHidden();
-    await ensureDetailsOpen(
-      jobPartialReceipt.locator('details[data-external-resolution-details]').first(),
-    );
-    await expect(
-      jobPartialReceipt.getByText('job_ext_partial_02').first(),
-    ).toBeVisible();
-    await expect(
-      jobPartialReceipt.getByText('task_ext_partial_01').first(),
-    ).toBeVisible();
-
-    const blockedJobCard = jobsPanel.locator(
-      'article.tl-wp-job-card[data-job-id="job_ext_blocked_03"]',
-    );
-    await expect(blockedJobCard).toBeVisible();
-    await blockedJobCard
-      .locator('button.tl-wp-job-row-btn, button[aria-expanded]')
-      .first()
-      .click();
-    await expect(
-      blockedJobCard
-        .getByText('Uncovered job approval remains active while stale and unverified receipts exist.')
-        .first(),
-    ).toBeVisible();
-    const blockedHistory = blockedJobCard.locator(
-      '[data-external-resolution-surface="jobs-history"]',
-    );
-    await ensureDetailsOpen(blockedHistory);
-    await expect(blockedHistory.getByText('Stale external receipt').first()).toBeVisible();
-    await expect(
-      blockedHistory.getByText('Unverified external receipt').first(),
-    ).toBeVisible();
-    const blockedUnverifiedReceipt = blockedHistory
-      .locator(
-        `[data-external-resolution-receipt-id="${EXTERNAL_RESOLUTION_UNVERIFIED_RECEIPT_ID}"]`,
-      )
-      .first();
-    await ensureDetailsOpen(
-      blockedUnverifiedReceipt
-        .locator('details[data-external-resolution-details]')
-        .first(),
-    );
-    await expect(
-      blockedHistory.getByText(EXTERNAL_RESOLUTION_COVERED_JOB_REASON).first(),
-    ).toBeVisible();
-
-    const unknownJobCard = jobsPanel.locator(
-      'article.tl-wp-job-card[data-job-id="job_ext_unknown_04"]',
-    );
-    await expect(unknownJobCard).toBeVisible();
-    await unknownJobCard
-      .locator('button.tl-wp-job-row-btn, button[aria-expanded]')
-      .first()
-      .click();
-    await expect(
-      unknownJobCard.locator('.tl-wp-pill-label', { hasText: /^Unknown$/ }),
-    ).toHaveCount(1);
-    await expect(unknownJobCard.getByText('Resolved externally').first()).toBeVisible();
-
-    await chatSurfaceTab(page, 'Activity').click();
-    const activityPanel = visibleActivityPanel(page);
-    const activityReceipts = activityPanel.locator(
-      '[data-external-resolution-surface="activity"]',
-    );
-    await expect(activityReceipts).toBeVisible();
-    await expect(
-      activityReceipts.locator(
-        `[data-external-resolution-receipt-id="${EXTERNAL_RESOLUTION_FULL_RECEIPT_ID}"]`,
-      ),
-    ).toBeVisible();
-    const activityFullReceipt = activityReceipts
-      .locator(
-        `[data-external-resolution-receipt-id="${EXTERNAL_RESOLUTION_FULL_RECEIPT_ID}"]`,
-      )
-      .first();
-    await expect(activityFullReceipt).toBeVisible();
-    await expect(
-      activityFullReceipt.locator('.tl-wp-state-desc').first(),
-    ).toHaveText('Externally Resolved Full Job');
-    await expect(activityFullReceipt.getByText('Job: job_ext_full_01').first()).toBeHidden();
-    await expect(activityFullReceipt.getByText('task_ext_full_01').first()).toBeHidden();
-    await ensureDetailsOpen(
-      activityFullReceipt.locator('details[data-external-resolution-details]').first(),
-    );
-    await expect(
-      activityFullReceipt.getByText('Job: job_ext_full_01').first(),
-    ).toBeVisible();
-    await expect(activityFullReceipt.getByText('task_ext_full_01').first()).toBeVisible();
-
-    const activityPartialReceipt = activityReceipts
-      .locator(
-        `[data-external-resolution-receipt-id="${EXTERNAL_RESOLUTION_PARTIAL_RECEIPT_ID}"]`,
-      )
-      .first();
-    await expect(activityPartialReceipt).toBeVisible();
-    await expect(
-      activityPartialReceipt.getByText('Partial · 1 task').first(),
-    ).toBeVisible();
-    await expect(
-      activityPartialReceipt.locator('.tl-wp-state-desc').first(),
-    ).toHaveText('Externally Resolved Partial Job');
-    await expect(
-      activityPartialReceipt.getByText('job_ext_partial_02').first(),
-    ).toBeHidden();
-    await expect(
-      activityPartialReceipt.getByText('task_ext_partial_01').first(),
-    ).toBeHidden();
-    await ensureDetailsOpen(
-      activityPartialReceipt
-        .locator('details[data-external-resolution-details]')
-        .first(),
-    );
-    await expect(
-      activityPartialReceipt.getByText('job_ext_partial_02').first(),
-    ).toBeVisible();
-    await expect(
-      activityPartialReceipt.getByText('task_ext_partial_01').first(),
-    ).toBeVisible();
-    const activityHistory = activityPanel.locator(
-      '[data-external-resolution-surface="activity-history"]',
-    );
-    await ensureDetailsOpen(activityHistory);
-    await expect(activityHistory.getByText('Stale external receipt').first()).toBeVisible();
-    await expect(
-      activityHistory.getByText('Unverified external receipt').first(),
-    ).toBeVisible();
-    const activityStaleReceipt = activityHistory
-      .locator(
-        `[data-external-resolution-receipt-id="${EXTERNAL_RESOLUTION_STALE_RECEIPT_ID}"]`,
-      )
-      .first();
-    await expect(activityStaleReceipt).toBeVisible();
-    await expect(
-      activityStaleReceipt.getByText('Partial · 1 task (stale)').first(),
-    ).toBeVisible();
-    await expect(
-      activityStaleReceipt.locator('.tl-wp-state-desc').first(),
-    ).toHaveText('Blocked With Historical Receipts');
-    await expect(activityStaleReceipt.getByText('job_ext_blocked_03').first()).toBeHidden();
-    await expect(activityStaleReceipt.getByText('task_ext_blocked_03').first()).toBeHidden();
-    await ensureDetailsOpen(
-      activityStaleReceipt.locator('details[data-external-resolution-details]').first(),
-    );
-    await expect(
-      activityStaleReceipt.getByText('job_ext_blocked_03').first(),
-    ).toBeVisible();
-    await expect(
-      activityStaleReceipt.getByText('task_ext_blocked_03').first(),
-    ).toBeVisible();
-    await expect(activityPanel.locator('article.tl-wp-activity-card')).toHaveCount(0);
-    await expect(
-      activityPanel.getByText('External resolution receipts are recorded in job history.'),
-    ).toBeVisible();
-
-    await activityReceipts
-      .locator(
-        `[data-external-resolution-receipt-id="${EXTERNAL_RESOLUTION_FULL_RECEIPT_ID}"]`,
-      )
-      .getByRole('button', { name: 'Open in Jobs' })
-      .click();
-    await expect(chatSurfaceTab(page, 'Jobs')).toHaveAttribute('aria-selected', 'true');
-    await expect(
-      visibleJobsPanel(page).locator(
-        'article.tl-wp-job-card[data-job-id="job_ext_full_01"]',
-      ),
-    ).toHaveAttribute('data-focused', 'true');
+    const dialog = await openBacklog(page);
+    await expect(dialog.locator('[data-backlog-item-id], [data-item-id]')).toHaveCount(0);
+    await expect(dialog.getByText(/Externally Resolved Full Job/)).toHaveCount(0);
+    await expect(dialog.getByText(EXTERNAL_RESOLUTION_FULL_SUMMARY)).toHaveCount(0);
+    await expect(dialog.getByText(EXTERNAL_RESOLUTION_UNRELATED_QUESTION)).toHaveCount(0);
+    await closeBacklogWithEscape(page);
   });
 
-  test('renders the same receipt coverage, blocker history, and unknown boundary in narrow layout', async ({
+  test('legacy historical failure and job attention fields never become NeedsYou or Done', async ({
     page,
   }) => {
     await installWorkspaceTauriFixture(page, {
-      workspaceSnapshot: buildExternalResolutionWorkspaceSnapshot(),
+      workspaceSnapshot: buildHistoricalFailureWorkspaceSnapshot(),
     });
-    await page.setViewportSize({ width: 360, height: 500 });
+    await page.setViewportSize({ width: 1040, height: 760 });
     await page.goto('/');
+    await selectChat(page, 'Workspace UI Contract');
+    await expect(chatHeader(page, 'Workspace UI Contract')).toBeVisible();
 
-    const messagesPanel = page
-      .locator('.tl-wp-tabpanel[role="tabpanel"]:not([hidden]) .tl-wp-messages-panel')
-      .first();
-    await expect(messagesPanel).toBeVisible();
-    const messagesScroller = await expectUsableMessagesScroller(messagesPanel);
-    const fullMessageReceiptButton = messagesPanel
-      .locator(`[data-message-receipt-id="${EXTERNAL_RESOLUTION_FULL_RECEIPT_ID}"]`)
-      .first();
-    await expectInViewportWithinScroller(messagesScroller, fullMessageReceiptButton);
-    const initialMessagesScrollerHeight = await messagesScroller.evaluate(
-      (el) => el.clientHeight,
-    );
+    await expectNoNeedsYou(page);
+    await expect(workspaceSection(page).getByRole('tab')).toHaveCount(0);
+    await expect(workspaceSection(page).getByText(/^done$/i)).toHaveCount(0);
+    await expect(workspaceSection(page).getByText(/Alpha message #36/)).toHaveCount(0);
 
-    const messagesReceipts = messagesPanel.locator(
-      '[data-external-resolution-surface="messages"]',
-    );
-    await expect(messagesReceipts).toBeVisible();
-    await expect(messagesReceipts.getByText('Resolved externally').first()).toBeVisible();
-    await expect(
-      messagesReceipts.getByText('Partially resolved externally').first(),
-    ).toBeVisible();
-    const narrowFullReceipt = messagesReceipts
-      .locator(
-        `[data-external-resolution-receipt-id="${EXTERNAL_RESOLUTION_FULL_RECEIPT_ID}"]`,
-      )
-      .first();
-    await expect(narrowFullReceipt.getByText('Full job').first()).toBeVisible();
-    await expect(
-      narrowFullReceipt.locator('.tl-wp-state-desc').first(),
-    ).toHaveText('Externally Resolved Full Job');
-    await expect(narrowFullReceipt.getByText('Job: job_ext_full_01').first()).toBeHidden();
-    await expect(narrowFullReceipt.getByText('task_ext_full_01').first()).toBeHidden();
-    await expectUsableMessagesScroller(messagesPanel);
-    await expectInViewportWithinScroller(messagesScroller, fullMessageReceiptButton);
-    await ensureDetailsOpen(
-      narrowFullReceipt.locator('details[data-external-resolution-details]').first(),
-    );
-    await expect(
-      narrowFullReceipt.getByText('Job: job_ext_full_01').first(),
-    ).toBeVisible();
-    await expect(narrowFullReceipt.getByText('task_ext_full_01').first()).toBeVisible();
-    await expect(
-      messagesReceipts.getByText(EXTERNAL_RESOLUTION_COVERED_JOB_REASON).first(),
-    ).toBeVisible();
+    const dialog = await openBacklog(page);
+    await expect(dialog.locator('[data-backlog-item-id], [data-item-id]')).toHaveCount(0);
+    await expect(dialog.getByText(/Recovered Retry Pipeline|Plan Approval Gate/)).toHaveCount(0);
+    await closeBacklogWithEscape(page);
+  });
 
-    const narrowPartialReceipt = messagesReceipts
-      .locator(
-        `[data-external-resolution-receipt-id="${EXTERNAL_RESOLUTION_PARTIAL_RECEIPT_ID}"]`,
-      )
-      .first();
-    await expect(narrowPartialReceipt).toBeVisible();
-    await expect(
-      narrowPartialReceipt.getByText('Partial · 1 task').first(),
-    ).toBeVisible();
-    await expect(
-      narrowPartialReceipt.locator('.tl-wp-state-desc').first(),
-    ).toHaveText('Externally Resolved Partial Job');
-    await expect(narrowPartialReceipt.getByText('job_ext_partial_02').first()).toBeHidden();
-    await expect(narrowPartialReceipt.getByText('task_ext_partial_01').first()).toBeHidden();
-    await expectUsableMessagesScroller(messagesPanel);
-    await expectInViewportWithinScroller(messagesScroller, fullMessageReceiptButton);
-    await ensureDetailsOpen(
-      narrowPartialReceipt.locator('details[data-external-resolution-details]').first(),
-    );
-    await expect(
-      narrowPartialReceipt.getByText('job_ext_partial_02').first(),
-    ).toBeVisible();
-    await expect(
-      narrowPartialReceipt.getByText('task_ext_partial_01').first(),
-    ).toBeVisible();
-    await expectUsableMessagesScroller(messagesPanel);
-    await expectInViewportWithinScroller(messagesScroller, fullMessageReceiptButton);
-    const messagesHistory = messagesReceipts.locator(
-      '[data-external-resolution-surface="messages-history"]',
-    );
-    await ensureDetailsOpen(messagesHistory);
-    await expect(messagesHistory.getByText('Stale external receipt').first()).toBeVisible();
-    await expect(
-      messagesHistory.getByText('Unverified external receipt').first(),
-    ).toBeVisible();
-    await expect(
-      messagesPanel.getByText(EXTERNAL_RESOLUTION_UNRELATED_QUESTION).first(),
-    ).toBeVisible();
-    expect(
-      await messagesScroller.evaluate((el) => el.clientHeight),
-    ).toBe(initialMessagesScrollerHeight);
-    await expectUsableMessagesScroller(messagesPanel);
-    await expectInViewportWithinScroller(messagesScroller, fullMessageReceiptButton);
+  test('legacy pending acceptance fields never fabricate Done or a human request', async ({
+    page,
+  }) => {
+    const pendingSnapshot = buildPendingAcceptanceWorkspaceSnapshot();
+    const controller = await installWorkspaceTauriFixture(page, {
+      workspaceSnapshot: pendingSnapshot,
+    });
+    await page.setViewportSize({ width: 1040, height: 760 });
+    await page.goto('/');
+    await selectChat(page, 'Workspace UI Contract');
+    await expect(chatHeader(page, 'Workspace UI Contract')).toBeVisible();
 
-    await fullMessageReceiptButton.click();
-    await expect(chatSurfaceTab(page, 'Jobs')).toHaveAttribute('aria-selected', 'true');
+    await expectNoNeedsYou(page);
+    await expect(workspaceSection(page).getByRole('tab')).toHaveCount(0);
+    await expect(workspaceSection(page).getByText(/^done$/i)).toHaveCount(0);
+    await expect(workspaceSection(page).getByText(/verified accepted/i)).toHaveCount(0);
+    await expect(
+      workspaceSection(page).getByText(/awaiting review and Closure acceptance/i),
+    ).toHaveCount(0);
 
-    const jobsPanel = visibleJobsPanel(page);
-    const fullJobCard = jobsPanel.locator(
-      'article.tl-wp-job-card[data-job-id="job_ext_full_01"]',
-    );
-    await expect(fullJobCard).toHaveAttribute('data-expanded', 'true');
-    await expect(fullJobCard.getByText('Resolved externally').first()).toBeVisible();
-    const narrowJobFullReceipt = fullJobCard
-      .locator(
-        `[data-external-resolution-receipt-id="${EXTERNAL_RESOLUTION_FULL_RECEIPT_ID}"]`,
-      )
-      .first();
-    await expect(narrowJobFullReceipt.getByText('Full job').first()).toBeVisible();
-    await expect(narrowJobFullReceipt.getByText('Job: job_ext_full_01').first()).toBeHidden();
-    await expect(narrowJobFullReceipt.getByText('task_ext_full_01').first()).toBeHidden();
-    await ensureDetailsOpen(
-      narrowJobFullReceipt.locator('details[data-external-resolution-details]').first(),
-    );
+    const dialog = await openBacklog(page);
+    await expect(dialog.locator('[data-backlog-item-id], [data-item-id]')).toHaveCount(0);
     await expect(
-      narrowJobFullReceipt.getByText('job_ext_full_01').first(),
-    ).toBeVisible();
-    await expect(
-      narrowJobFullReceipt.getByText('task_ext_full_01').first(),
-    ).toBeVisible();
-    await expect(
-      fullJobCard.getByText(EXTERNAL_RESOLUTION_COVERED_TASK_REASON).first(),
-    ).toBeVisible();
+      dialog.getByText(/Worker Finished Pending Acceptance Slice|Closure Verified Package Slice/),
+    ).toHaveCount(0);
+    await closeBacklogWithEscape(page);
 
-    const blockedJobCard = jobsPanel.locator(
-      'article.tl-wp-job-card[data-job-id="job_ext_blocked_03"]',
+    // Positive control: actual native waiting on the same legacy snapshot does
+    // create exactly one real request, proving the no-NeedsYou result above
+    // came from the controlled idle sample rather than a broken detector.
+    const nativeWaiting = updateNativeActivityFixture(
+      pendingSnapshot,
+      CHAT_ALPHA_IDENTITY,
+      'waiting_for_input',
     );
-    await blockedJobCard
-      .locator('button.tl-wp-job-row-btn, button[aria-expanded]')
-      .first()
-      .click();
-    await expect(
-      blockedJobCard
-        .getByText('Uncovered job approval remains active while stale and unverified receipts exist.')
-        .first(),
-    ).toBeVisible();
-    const blockedHistory = blockedJobCard.locator(
-      '[data-external-resolution-surface="jobs-history"]',
-    );
-    await ensureDetailsOpen(blockedHistory);
-    await expect(blockedHistory.getByText('Stale external receipt').first()).toBeVisible();
-    await expect(
-      blockedHistory.getByText('Unverified external receipt').first(),
-    ).toBeVisible();
-    const narrowBlockedStaleReceipt = blockedHistory
-      .locator(
-        `[data-external-resolution-receipt-id="${EXTERNAL_RESOLUTION_STALE_RECEIPT_ID}"]`,
-      )
-      .first();
-    await expect(narrowBlockedStaleReceipt).toBeVisible();
-    await expect(
-      narrowBlockedStaleReceipt.getByText('Partial · 1 task (stale)').first(),
-    ).toBeVisible();
-    await expect(
-      narrowBlockedStaleReceipt
-        .locator('.tl-wp-callout-title')
-        .getByText('Stale external receipt', { exact: true })
-        .first(),
-    ).toBeVisible();
-    await expect(
-      blockedJobCard.locator('button.tl-wp-job-row-btn .tl-wp-job-title').first(),
-    ).toHaveText('Blocked With Historical Receipts');
-    await expect(
-      narrowBlockedStaleReceipt.getByText('job_ext_blocked_03').first(),
-    ).toBeHidden();
-    await expect(
-      narrowBlockedStaleReceipt.getByText('task_ext_blocked_03').first(),
-    ).toBeHidden();
-    await ensureDetailsOpen(
-      narrowBlockedStaleReceipt
-        .locator('details[data-external-resolution-details]')
-        .first(),
-    );
-    await expect(
-      narrowBlockedStaleReceipt.getByText('job_ext_blocked_03').first(),
-    ).toBeVisible();
-    await expect(
-      narrowBlockedStaleReceipt.getByText('task_ext_blocked_03').first(),
-    ).toBeVisible();
-
-    await chatSurfaceTab(page, 'Activity').click();
-    const activityPanel = visibleActivityPanel(page);
-    const narrowActivityReceipts = activityPanel.locator(
-      '[data-external-resolution-surface="activity"]',
-    );
-    await expect(narrowActivityReceipts).toBeVisible();
-    const narrowActivityFullReceipt = narrowActivityReceipts
-      .locator(
-        `[data-external-resolution-receipt-id="${EXTERNAL_RESOLUTION_FULL_RECEIPT_ID}"]`,
-      )
-      .first();
-    await expect(narrowActivityFullReceipt).toBeVisible();
-    await expect(
-      narrowActivityFullReceipt.locator('.tl-wp-state-desc').first(),
-    ).toHaveText('Externally Resolved Full Job');
-    await expect(
-      narrowActivityFullReceipt.getByText('Job: job_ext_full_01').first(),
-    ).toBeHidden();
-    await expect(
-      narrowActivityFullReceipt.getByText('task_ext_full_01').first(),
-    ).toBeHidden();
-    await ensureDetailsOpen(
-      narrowActivityFullReceipt
-        .locator('details[data-external-resolution-details]')
-        .first(),
-    );
-    await expect(
-      narrowActivityFullReceipt.getByText('Job: job_ext_full_01').first(),
-    ).toBeVisible();
-    await expect(
-      narrowActivityFullReceipt.getByText('task_ext_full_01').first(),
-    ).toBeVisible();
-    const narrowActivityPartialReceipt = narrowActivityReceipts
-      .locator(
-        `[data-external-resolution-receipt-id="${EXTERNAL_RESOLUTION_PARTIAL_RECEIPT_ID}"]`,
-      )
-      .first();
-    await expect(narrowActivityPartialReceipt).toBeVisible();
-    await expect(
-      narrowActivityPartialReceipt.getByText('Partial · 1 task').first(),
-    ).toBeVisible();
-    await expect(
-      narrowActivityPartialReceipt.locator('.tl-wp-state-desc').first(),
-    ).toHaveText('Externally Resolved Partial Job');
-    await expect(
-      narrowActivityPartialReceipt.getByText('job_ext_partial_02').first(),
-    ).toBeHidden();
-    await expect(
-      narrowActivityPartialReceipt.getByText('task_ext_partial_01').first(),
-    ).toBeHidden();
-    await ensureDetailsOpen(
-      narrowActivityPartialReceipt
-        .locator('details[data-external-resolution-details]')
-        .first(),
-    );
-    await expect(
-      narrowActivityPartialReceipt.getByText('job_ext_partial_02').first(),
-    ).toBeVisible();
-    await expect(
-      narrowActivityPartialReceipt.getByText('task_ext_partial_01').first(),
-    ).toBeVisible();
-    const activityHistory = activityPanel.locator(
-      '[data-external-resolution-surface="activity-history"]',
-    );
-    await ensureDetailsOpen(activityHistory);
-    await expect(activityHistory.getByText('Stale external receipt').first()).toBeVisible();
-    await expect(
-      activityHistory.getByText('Unverified external receipt').first(),
-    ).toBeVisible();
-    await expect(activityPanel.locator('article.tl-wp-activity-card')).toHaveCount(0);
+    await controller.setWorkspaceSnapshot(nativeWaiting);
+    await triggerWorkspaceRefresh(page);
+    await expectSingleNeedsYou(page);
+    await expect(workspaceSection(page).getByText(/^done$/i)).toHaveCount(0);
+    await expect(workspaceSection(page).getByText(/verified accepted/i)).toHaveCount(0);
   });
 });
