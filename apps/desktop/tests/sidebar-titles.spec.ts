@@ -18,6 +18,19 @@ const ALPHA_TITLE =
 const BETA_TITLE =
   'Verify archive restore keyboard and touch access without collapsing labels';
 
+const APPEARANCE_STORAGE_KEY = 'threadlane.desktop.appearance.v1';
+
+function minimalAppearanceStorage(theme: 'light' | 'dark'): string {
+  return JSON.stringify({
+    theme,
+    surface: 'glass',
+    opacity: 88,
+    accent: 'sage',
+    rememberStateDir: false,
+    savedStateDir: '',
+  });
+}
+
 /**
  * Alpha intentionally has no native sample, job history, or messages so its
  * updatedAtMs is genuinely unavailable. Beta keeps one real idle native sample
@@ -198,6 +211,99 @@ async function expectNoHorizontalOverflow(
   expect(containerMetrics.rowsFit).toBe(true);
 }
 
+async function waitForFiniteAnimations(scope: Locator): Promise<void> {
+  await scope.evaluate(async () => {
+    const finiteAnimations = document.getAnimations().filter((animation) => {
+      const timing = animation.effect?.getTiming();
+      return !timing || timing.iterations !== Infinity;
+    });
+    await Promise.race([
+      Promise.all(
+        finiteAnimations.map((animation) =>
+          animation.finished.catch(() => undefined)
+        )
+      ),
+      new Promise<void>((resolve) => setTimeout(() => resolve(), 2_000)),
+    ]);
+    await new Promise<void>((resolve) =>
+      requestAnimationFrame(() => requestAnimationFrame(() => resolve()))
+    );
+  });
+}
+
+async function expectOpaqueDrawerContrast(label: Locator): Promise<void> {
+  const metrics = await label.evaluate((labelEl) => {
+    const canvas = document.createElement('canvas');
+    canvas.width = 1;
+    canvas.height = 1;
+    const context = canvas.getContext('2d');
+    const parse = (value: string): number[] => {
+      if (!context) {
+        return [0, 0, 0, 0];
+      }
+      context.clearRect(0, 0, 1, 1);
+      context.fillStyle = 'rgba(0, 0, 0, 0)';
+      context.fillStyle = value;
+      context.fillRect(0, 0, 1, 1);
+      const data = context.getImageData(0, 0, 1, 1).data;
+      return [data[0], data[1], data[2], data[3] / 255];
+    };
+    const composite = (
+      foreground: number[],
+      background: number[]
+    ): number[] => [
+      foreground[0] * foreground[3] + background[0] * (1 - foreground[3]),
+      foreground[1] * foreground[3] + background[1] * (1 - foreground[3]),
+      foreground[2] * foreground[3] + background[2] * (1 - foreground[3]),
+      1,
+    ];
+    const channel = (value: number): number => {
+      const normalized = value / 255;
+      return normalized <= 0.04045
+        ? normalized / 12.92
+        : ((normalized + 0.055) / 1.055) ** 2.4;
+    };
+    const luminance = (color: number[]): number =>
+      0.2126 * channel(color[0]) +
+      0.7152 * channel(color[1]) +
+      0.0722 * channel(color[2]);
+
+    const dialog = labelEl.closest('.tl-drawer-dialog');
+    if (!dialog) {
+      throw new Error('Expected the navigation label inside .tl-drawer-dialog.');
+    }
+    const dialogBackground = parse(getComputedStyle(dialog).backgroundColor);
+    let background = dialogBackground;
+    const layers: Element[] = [];
+    for (
+      let node: Element | null = labelEl;
+      node !== null && node !== dialog;
+      node = node.parentElement
+    ) {
+      layers.push(node);
+    }
+    for (const node of layers.reverse()) {
+      const layer = parse(getComputedStyle(node).backgroundColor);
+      if (layer[3] > 0) {
+        background = composite(layer, background);
+      }
+    }
+
+    const text = composite(parse(getComputedStyle(labelEl).color), background);
+    const textLuminance = luminance(text);
+    const backgroundLuminance = luminance(background);
+    return {
+      backgroundAlpha: dialogBackground[3],
+      contrast:
+        (Math.max(textLuminance, backgroundLuminance) + 0.05) /
+        (Math.min(textLuminance, backgroundLuminance) + 0.05),
+    };
+  });
+
+  expect(metrics.backgroundAlpha).toBeGreaterThanOrEqual(0.99);
+  expect(metrics.contrast).toBeGreaterThanOrEqual(4.5);
+}
+
 test.describe('wide sidebar chat titles', () => {
   test('keeps long titles readable, places known age outside the title row, and preserves keyboard Archive/Restore', async ({
     page,
@@ -370,5 +476,60 @@ test.describe('narrow drawer chat titles', () => {
       .getByRole('button', { name: /^active\b/i })
       .tap();
     await expectReadableTitle(drawer, ALPHA_TITLE);
+  });
+
+  test('keeps the navigation drawer opaque and titles readable in light and dark themes', async ({
+    page,
+  }) => {
+    await installWorkspaceTauriFixture(page, {
+      workspaceSnapshot: buildSidebarTitleSnapshot(),
+      initialLocalStorage: {
+        [APPEARANCE_STORAGE_KEY]: minimalAppearanceStorage('light'),
+      },
+    });
+    await page.setViewportSize({ width: 390, height: 740 });
+    await page.goto('/');
+    await expect(
+      page.locator('#app .tl-app-shell, #app .tl-app').first()
+    ).toBeVisible();
+
+    for (const theme of ['light', 'dark'] as const) {
+      if (theme === 'dark') {
+        await page.evaluate(
+          ({ key, value }) => window.localStorage.setItem(key, value),
+          {
+            key: APPEARANCE_STORAGE_KEY,
+            value: minimalAppearanceStorage('dark'),
+          }
+        );
+        await page.reload();
+        await expect(
+          page.locator('#app .tl-app-shell, #app .tl-app').first()
+        ).toBeVisible();
+      }
+      await expect(page.locator('html')).toHaveAttribute('data-theme', theme);
+
+      const trigger = page
+        .getByRole('button', { name: /open navigation drawer/i })
+        .first();
+      await expect(trigger).toBeVisible();
+      await trigger.tap();
+
+      const drawer = page.getByRole('dialog', {
+        name: /navigation|projects|workspace/i,
+      });
+      await expect(drawer).toBeVisible();
+      await waitForFiniteAnimations(drawer);
+
+      const alphaLabel = await expectReadableTitle(drawer, ALPHA_TITLE);
+      const betaLabel = await expectReadableTitle(drawer, BETA_TITLE);
+      await expectOpaqueDrawerContrast(alphaLabel);
+      await expectOpaqueDrawerContrast(betaLabel);
+      await expectNoHorizontalOverflow(page, drawer);
+
+      await page.keyboard.press('Escape');
+      await expect(drawer).toHaveCount(0);
+      await expect(trigger).toBeFocused();
+    }
   });
 });
