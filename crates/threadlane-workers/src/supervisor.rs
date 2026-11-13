@@ -25,6 +25,10 @@ use crate::opencode_metadata::{
     OpenCodeMetadataDiagnostic, OpenCodeMetadataEvidence, OpenCodeMetadataStage,
     OwnedOpenCodeSession,
 };
+use crate::owned_process::{
+    OwnedProcessObserver, OwnedProcessPublisher, OwnedProcessUnknownReason,
+    DEFAULT_OWNED_PROCESS_HEARTBEAT_MS,
+};
 use crate::progress_watchdog::{ProgressWatchdog, ProgressWatchdogSnapshot};
 use crate::provider_health::{HealthPublisher, ProviderHealthObserver, ProviderHealthSnapshot};
 use crate::spec::{
@@ -993,6 +997,35 @@ pub async fn run_worker_with_health_observer(
     progress_tx: Option<mpsc::Sender<NormalizedWorkerEvent>>,
     health_observer: Option<ProviderHealthObserver>,
 ) -> Result<WorkerExecutionReport, WorkerError> {
+    run_worker_with_process_observer(
+        spec,
+        working_directory,
+        cancel_rx,
+        progress_tx,
+        health_observer,
+        None,
+    )
+    .await
+}
+
+/// Runs a [`WorkerSpec`] with the existing progress and cumulative health observers plus an
+/// optional runner-origin owned-process presence observer.
+///
+/// Presence snapshots are produced only by the supervisor for the child it actually spawned and
+/// are never parsed from provider stdout, stderr, tool messages, or model output. `Preparing`
+/// never means live; `Running` requires a real spawned child with validated process-group
+/// ownership; `Stopped` confirms only an observed exit/reap; `Unknown` records uncertain
+/// ownership, reaping, or a dropped observing future. Watch data grants no persistence, callback,
+/// result-acceptance, or work-success authority. Existing calls delegate here with no observer.
+/// Linux `/proc` start-time identity is best effort and not a portable process-identity claim.
+pub async fn run_worker_with_process_observer(
+    spec: &WorkerSpec,
+    working_directory: &Path,
+    cancel_rx: &mut watch::Receiver<bool>,
+    progress_tx: Option<mpsc::Sender<NormalizedWorkerEvent>>,
+    health_observer: Option<ProviderHealthObserver>,
+    process_observer: Option<OwnedProcessObserver>,
+) -> Result<WorkerExecutionReport, WorkerError> {
     ensure_platform_supported()?;
     let validation = spec.validate()?;
     let canonical_workdir =
@@ -1020,6 +1053,7 @@ pub async fn run_worker_with_health_observer(
         cancel_rx,
         progress_tx,
         health_observer,
+        process_observer,
     )
     .await?;
     Ok(report)
@@ -1100,6 +1134,7 @@ pub async fn run_advisory_worker_with_health_observer(
         cancel_rx,
         progress_tx,
         health_observer,
+        None,
     )
     .await?;
     Ok(report)
@@ -1193,6 +1228,7 @@ pub async fn run_advisory_worker_with_structured_result_and_health_observer(
         cancel_rx,
         progress_tx,
         health_observer,
+        None,
     )
     .await?;
 
@@ -1506,6 +1542,7 @@ async fn run_supervised_process_group<F>(
     cancel_rx: &mut watch::Receiver<bool>,
     progress_tx: Option<mpsc::Sender<NormalizedWorkerEvent>>,
     health_observer: Option<ProviderHealthObserver>,
+    process_observer: Option<OwnedProcessObserver>,
 ) -> Result<(WorkerExecutionReport, Option<AdvisoryResponseCollector>), WorkerError>
 where
     F: FnOnce(&str) -> Result<Vec<String>, WorkerError>,
@@ -1517,6 +1554,7 @@ where
         cancel_rx,
         progress_tx,
         health_observer,
+        process_observer,
         None,
         None,
     )
@@ -1532,6 +1570,7 @@ async fn run_supervised_process_group_for_test<F>(
     cancel_rx: &mut watch::Receiver<bool>,
     progress_tx: Option<mpsc::Sender<NormalizedWorkerEvent>>,
     health_observer: Option<ProviderHealthObserver>,
+    process_observer: Option<OwnedProcessObserver>,
     on_launch_setup: Option<LaunchSetupObserver<'_>>,
     on_spawn_error: &mut (dyn FnMut(u32, &std::io::Error) + Send),
 ) -> Result<(WorkerExecutionReport, Option<AdvisoryResponseCollector>), WorkerError>
@@ -1545,6 +1584,7 @@ where
         cancel_rx,
         progress_tx,
         health_observer,
+        process_observer,
         on_launch_setup,
         Some(on_spawn_error),
     )
@@ -1559,6 +1599,7 @@ async fn run_supervised_process_group_with_launch_observer<F>(
     cancel_rx: &mut watch::Receiver<bool>,
     progress_tx: Option<mpsc::Sender<NormalizedWorkerEvent>>,
     health_observer: Option<ProviderHealthObserver>,
+    process_observer: Option<OwnedProcessObserver>,
     on_launch_setup: Option<LaunchSetupObserver<'_>>,
     on_spawn_error: Option<SpawnErrorObserver<'_>>,
 ) -> Result<(WorkerExecutionReport, Option<AdvisoryResponseCollector>), WorkerError>
@@ -1577,6 +1618,8 @@ where
     } = inputs;
 
     let start_instant = Instant::now();
+    let owned_process_heartbeat_enabled = process_observer.is_some();
+    let mut owned_process = OwnedProcessPublisher::new(process_observer, start_instant);
     // None is the explicit legacy opt-out. Freeze this invocation-level choice before
     // capture setup: failed/unavailable capture and closed observers must not expose stderr.
     let health_requested = health_observer.is_some();
@@ -1809,6 +1852,7 @@ where
             return Err(err);
         }
     };
+    owned_process.note_child_created();
     let child_pid = child.id().ok_or_else(|| {
         WorkerError::Io(std::io::Error::other(
             "spawned worker child had no OS process ID",
@@ -1824,12 +1868,15 @@ where
     if pgid <= 1 || pgid == unix_pgroup::caller_pgid() {
         let _ = child.kill().await;
         let _ = child.wait().await;
+        owned_process.publish_unknown(OwnedProcessUnknownReason::OwnershipUnconfirmed);
         return Err(WorkerError::SecurityViolation(format!(
             "spawned worker child did not enter an isolated process group (pgid={pgid})"
         )));
     }
 
     let mut pgroup_guard = ProcessGroupGuard::new(pgid);
+    // Running requires a real spawned child and validated process-group ownership.
+    owned_process.publish_running(child_pid, pgid);
 
     let stdout_pipe = child.stdout.take().ok_or_else(|| {
         WorkerError::Io(std::io::Error::other(
@@ -1887,6 +1934,10 @@ where
     let mut recorded_overflow: Option<OutputOverflowKind> = None;
     let mut descendants_terminated_after_exit = false;
     let mut dropped_supervisor_events = 0usize;
+    let heartbeat_interval = Duration::from_millis(DEFAULT_OWNED_PROCESS_HEARTBEAT_MS);
+    // Without an observer there is no presence to refresh, so no periodic timer is scheduled.
+    let mut next_owned_process_heartbeat =
+        owned_process_heartbeat_enabled.then(|| tokio::time::Instant::now() + heartbeat_interval);
     let exit_status: Option<ExitStatus>;
 
     if *cancel_rx.borrow_and_update() {
@@ -1912,6 +1963,7 @@ where
                 start_instant + Duration::from_millis(next_soft_ms),
             ));
             tokio::pin!(soft_sleep);
+            let heartbeat_tick = next_owned_process_heartbeat;
             tokio::select! {
             biased;
             () = &mut timeout_sleep => {
@@ -1927,6 +1979,10 @@ where
             }
             wait_res = child.wait() => {
                 exit_status = wait_res.ok();
+                if exit_status.is_some() {
+                    // Clear live presence before descendant cleanup and later post-processing.
+                    owned_process.publish_stopped();
+                }
                 descendants_terminated_after_exit =
                     finish_or_terminate_surviving_descendants(
                         pgid,
@@ -1959,8 +2015,24 @@ where
                     }
                 }
             }
+            () = async move {
+                match heartbeat_tick {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                owned_process.heartbeat();
+                next_owned_process_heartbeat =
+                    Some(tokio::time::Instant::now() + heartbeat_interval);
+            }
             }
         }
+    }
+
+    if exit_status.is_some() {
+        owned_process.publish_stopped();
+    } else {
+        owned_process.publish_unknown(OwnedProcessUnknownReason::ExitUnconfirmed);
     }
 
     let pipe_drain_timed_out =
@@ -3546,6 +3618,7 @@ printf '%s\n' '{{"event":"result","result":{{"status":"SUCCESS","response":"{{\"
             None,
             Some(health_tx),
             None,
+            None,
             &mut on_spawn_error,
         )
         .await
@@ -3673,6 +3746,7 @@ printf '%s' '{}' > "$OUT"
             |_| Ok(Vec::new()),
             Some(AdvisoryResponseBudget::default()),
             &mut cancel_rx,
+            None,
             None,
             None,
             None,
@@ -4037,6 +4111,7 @@ printf '%s' '{}' > "$OUT"
                 &mut codex_cancel_rx,
                 None,
                 None,
+                None,
                 Some(&mut codex_launch_observer),
                 &mut codex_observer,
             )
@@ -4123,6 +4198,7 @@ printf '%s' '{}' > "$OUT"
                 &mut agy_cancel_rx,
                 None,
                 Some(health_tx),
+                None,
                 Some(&mut agy_launch_observer),
                 &mut agy_observer,
             )

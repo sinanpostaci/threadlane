@@ -21,6 +21,10 @@
 //!   `try_send` (`run_worker_with_observer`, `execute_worker_task_with_observer`, recording
 //!   undelivered live sends in [`WorkerExecutionReport::dropped_live_events`]), and rejects
 //!   exit-zero runs that lack model/effort/result evidence or report mismatches/errors/blocks.
+//! - **Runner-origin owned-process presence**: Optional watch observations distinguish `Preparing`,
+//!   actual spawned-owned-child `Running`, confirmed-exit `Stopped`, and uncertain `Unknown`.
+//!   They are produced by the supervisor, never parsed from provider output. Advisory APIs keep
+//!   their existing unobserved behavior.
 //! - **Unix process-group supervision**: Spawns workers in a dedicated process group (`process_group(0)`),
 //!   enforces timeouts, explicit cancellation, and output overflow limits, and terminates/reaps
 //!   the entire descendant group so lingering children holding pipes cannot hang supervision.
@@ -51,6 +55,8 @@ pub mod git;
 pub(crate) mod opencode_collector;
 /// Pure validation of explicitly supplied owned OpenCode metadata; performs no I/O.
 pub mod opencode_metadata;
+/// Runner-origin owned-process presence observations, independent of provider output.
+pub mod owned_process;
 /// Session-only provider file permission policies and Antigravity `--settings` builders.
 pub mod permissions;
 /// Advisory progress hints and soft deadlines within the existing hard runtime ceiling.
@@ -113,6 +119,11 @@ pub use opencode_metadata::{
     OpenCodeMetadataStage, OwnedOpenCodeSession, MAX_OPENCODE_EXPORT_BYTES,
     MAX_OPENCODE_INFO_BYTES, MAX_OPENCODE_MESSAGES,
 };
+pub use owned_process::{
+    OwnedProcessObserver, OwnedProcessOrigin, OwnedProcessSnapshot, OwnedProcessState,
+    OwnedProcessUnknownReason, DEFAULT_OWNED_PROCESS_HEARTBEAT_MS, MAX_OWNED_PROCESS_ELAPSED_MS,
+    MAX_OWNED_PROCESS_SEQUENCE, MIN_OWNED_PROCESS_HEARTBEAT_MS, OWNED_PROCESS_SCHEMA_VERSION,
+};
 pub use permissions::{
     build_antigravity_read_only_settings, build_antigravity_read_only_settings_json,
     build_antigravity_task_files_settings_json,
@@ -172,6 +183,6 @@ pub use supervisor::{
     run_advisory_worker_with_structured_result_and_cancel,
     run_advisory_worker_with_structured_result_and_health_observer,
     run_advisory_worker_with_structured_result_and_observer, run_worker, run_worker_with_cancel,
-    run_worker_with_health_observer, run_worker_with_observer, OutputOverflowKind,
-    WorkerExecutionReport, WorkerRunStatus, POST_EXIT_PIPE_DRAIN_TIMEOUT_MS,
+    run_worker_with_health_observer, run_worker_with_observer, run_worker_with_process_observer,
+    OutputOverflowKind, WorkerExecutionReport, WorkerRunStatus, POST_EXIT_PIPE_DRAIN_TIMEOUT_MS,
 };
