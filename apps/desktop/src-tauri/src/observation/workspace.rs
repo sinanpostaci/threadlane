@@ -1,28 +1,33 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
+use std::future::Future;
 use std::io::ErrorKind;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use threadlane_core::observation::{
     bound_workspace_job_histories, bound_workspace_native_samples_per_source,
-    project_safe_workspace_messages, read_core_state_readonly, reconcile_workspace_native_sample,
-    sanitize_observation_label, sanitize_observation_summary, validate_correlation_id,
+    current_observation_time_ms, project_safe_workspace_messages, project_workspace_chat_work,
+    read_core_state_readonly, reconcile_workspace_native_sample, sanitize_observation_label,
+    sanitize_observation_summary, validate_correlation_id, workspace_chat_work_presence_candidates,
     ObservationJob, ObservationJobState, ObservationRequest, ObservationSnapshotRequest,
     ReadonlyCoreStateSnapshot, WorkspaceAcceptanceProof, WorkspaceAcceptanceStatus,
     WorkspaceActivityState, WorkspaceAttentionKind, WorkspaceAttentionState,
-    WorkspaceAvailabilityState, WorkspaceChatIdentity, WorkspaceChatSummary,
+    WorkspaceAvailabilityState, WorkspaceBacklogPresenceAvailability,
+    WorkspaceBacklogPresenceFreshness, WorkspaceBacklogWorkerPresence, WorkspaceChatIdentity,
+    WorkspaceChatSummary, WorkspaceChatWork, WorkspaceChatWorkAvailability,
     WorkspaceConfiguredSelection, WorkspaceCoveredAttention, WorkspaceExternalResolutionScope,
     WorkspaceJobHistory, WorkspaceJobSummary, WorkspaceMessageCandidateInput, WorkspaceMessageItem,
     WorkspaceMessageScope, WorkspaceMessageSourceOrder, WorkspaceMessagesWindow,
     WorkspaceNativeSample, WorkspaceRecordLinks, WorkspaceSampleReconcileDecision,
     WorkspaceSamplingPolicy, WorkspaceSnapshot, WorkspaceSnapshotBounds, WorkspaceTaskHistory,
-    MAX_OBSERVATION_JOBS, MAX_WORKSPACE_NATIVE_SAMPLES_PER_SOURCE,
-    WORKSPACE_SNAPSHOT_SCHEMA_VERSION,
+    MAX_OBSERVATION_JOBS, MAX_WORKSPACE_CHAT_WORK_PRESENCE_TOTAL,
+    MAX_WORKSPACE_NATIVE_SAMPLES_PER_SOURCE, WORKSPACE_SNAPSHOT_SCHEMA_VERSION,
 };
 use threadlane_core::MAX_WORKER_PATH_BYTES;
+use threadlane_host::ApprovedHostClient;
 use threadlane_native::coworker_observation::{
     read_legacy_plan_external_resolutions_readonly, read_scoped_workspace_job_histories,
     LegacyPlanObservationScope, VerifiedLegacyPlanExternalResolutions, WorkspaceHistoryDiagnostic,
@@ -31,6 +36,8 @@ use threadlane_native::coworker_observation::{
 use threadlane_native::coworker_workflow::{CoworkerBindingLedger, CoworkerJobRecord};
 use threadlane_native::native_chat_observation::read_workspace_native_samples_readonly;
 use threadlane_plans::{PlanRevision, PlanStore};
+use tokio::task::JoinSet;
+use tokio::time::{timeout_at, Duration, Instant};
 
 use crate::AppError;
 
@@ -56,6 +63,42 @@ const WARN_NATIVE_SAMPLE_REGRESSED: &str =
     "Ignored stale or regressed native chat sample update in observation source.";
 const WARN_COWORKER_SCOPE_REJECTED: &str =
     "Rejected coworker job record whose scope did not match its binding ledger or project root.";
+
+/// Maximum number of host presence calls allowed in flight at once.
+const MAX_WORKSPACE_PRESENCE_REFRESH_CONCURRENCY: usize = 8;
+/// Per-call host presence timeout in milliseconds.
+const WORKSPACE_PRESENCE_REFRESH_PER_CALL_TIMEOUT_MS: u64 = 750;
+/// Total host presence refresh timeout in milliseconds.
+const WORKSPACE_PRESENCE_REFRESH_TOTAL_TIMEOUT_MS: u64 = 2_500;
+
+/// One internal presence refresh request for a current nonterminal Worker execution.
+#[derive(Debug, Clone)]
+pub(crate) struct WorkspacePresenceQuery {
+    pub(crate) chat_key: String,
+    pub(crate) item_id: String,
+    pub(crate) execution_ref: String,
+    pub(crate) approval_id: String,
+    pub(crate) task_id: String,
+    pub(crate) expected_session_binding_id: String,
+    pub(crate) expected_run_id: String,
+    pub(crate) expected_worker_id: String,
+    pub(crate) authority_dir: PathBuf,
+    pub(crate) sessions_dir: PathBuf,
+    pub(crate) binding_id: String,
+    pub(crate) thread_uuid: String,
+}
+
+/// Synchronous workspace projection plus the bounded host presence work that needs async refresh.
+pub(crate) struct WorkspaceSnapshotBundle {
+    pub(crate) snapshot: WorkspaceSnapshot,
+    pub(crate) presence_queries: Vec<WorkspacePresenceQuery>,
+}
+
+/// One actual host presence row keyed by the canonical chat that owns the execution.
+pub(crate) struct WorkspacePresenceResult {
+    pub(crate) chat_key: String,
+    pub(crate) presence: WorkspaceBacklogWorkerPresence,
+}
 
 const VERIFIED_PENDING_PLAN_ATTENTION_REASON: &str =
     "The latest recorded published plan referenced by this job has no approval linked to the job.";
@@ -186,6 +229,14 @@ impl ObservationService {
         &self,
         request: Option<ObservationSnapshotRequest>,
     ) -> Result<WorkspaceSnapshot, AppError> {
+        Ok(self.workspace_snapshot_bundle(request)?.snapshot)
+    }
+
+    /// Projects the synchronous workspace snapshot plus bounded presence work for async refresh.
+    pub(crate) fn workspace_snapshot_bundle(
+        &self,
+        request: Option<ObservationSnapshotRequest>,
+    ) -> Result<WorkspaceSnapshotBundle, AppError> {
         let query = validate_snapshot_request(request.as_ref())?;
         let mut observation = self.snapshot(request)?;
         let generated_at_ms = observation.generated_at_ms;
@@ -200,6 +251,8 @@ impl ObservationService {
         let mut all_native_samples: Vec<WorkspaceNativeSample> = Vec::new();
         let mut native_samples_omitted = 0usize;
         let mut all_chats: BTreeMap<String, WorkspaceChatSummary> = BTreeMap::new();
+        let mut all_chat_work: Vec<WorkspaceChatWork> = Vec::new();
+        let mut presence_queries: Vec<WorkspacePresenceQuery> = Vec::new();
         let mut all_job_histories: Vec<WorkspaceJobHistory> = Vec::new();
         let mut job_histories_omitted = 0usize;
         let mut message_candidates: Vec<WorkspaceMessageCandidateInput> = Vec::new();
@@ -253,6 +306,8 @@ impl ObservationService {
                 &mut all_native_samples,
                 &mut native_samples_omitted,
                 &mut all_chats,
+                &mut all_chat_work,
+                &mut presence_queries,
                 &mut all_job_histories,
                 &mut job_histories_omitted,
                 &mut message_candidates,
@@ -283,8 +338,9 @@ impl ObservationService {
             bound_workspace_job_histories(all_job_histories);
         job_histories_omitted = job_histories_omitted.saturating_add(extra_histories_omitted);
 
-        // If `query.job_id` is active, scope chats and native samples to the target job's verified chat.
-        let (retained_chats, retained_samples) = if query.job_id.is_some() {
+        // If `query.job_id` is active, scope chats, chat work, and native samples to the target job's
+        // verified chat.
+        let (retained_chats, mut retained_chat_work, retained_samples) = if query.job_id.is_some() {
             let allowed_chat_keys: BTreeSet<String> = bounded_histories
                 .iter()
                 .filter_map(|h| h.job.chat_identity.as_ref()?.canonical_key())
@@ -294,6 +350,14 @@ impl ObservationService {
                 .filter(|(k, _)| allowed_chat_keys.contains(k))
                 .map(|(_, v)| v)
                 .collect();
+            let chat_work = all_chat_work
+                .into_iter()
+                .filter(|work| {
+                    work.identity
+                        .canonical_key()
+                        .is_some_and(|key| allowed_chat_keys.contains(&key))
+                })
+                .collect();
             let samples = bounded_samples
                 .into_iter()
                 .filter(|s| {
@@ -302,9 +366,13 @@ impl ObservationService {
                         .is_some_and(|k| allowed_chat_keys.contains(&k))
                 })
                 .collect();
-            (chats, samples)
+            (chats, chat_work, samples)
         } else {
-            (all_chats.into_values().collect(), bounded_samples)
+            (
+                all_chats.into_values().collect(),
+                all_chat_work,
+                bounded_samples,
+            )
         };
 
         let messages = build_safe_messages_window(
@@ -312,6 +380,23 @@ impl ObservationService {
             &mut invalid_messages_omitted,
             &mut warning_collector,
         );
+
+        let retained_chat_keys: BTreeSet<String> = retained_chat_work
+            .iter()
+            .filter_map(|work| work.identity.canonical_key())
+            .collect();
+        presence_queries.retain(|query| retained_chat_keys.contains(&query.chat_key));
+        let prepared_presence = prepare_workspace_presence_queries(presence_queries);
+        for (chat_key, omitted) in &prepared_presence.omitted_by_chat {
+            if let Some(work) = retained_chat_work
+                .iter_mut()
+                .find(|work| work.identity.canonical_key().as_deref() == Some(chat_key.as_str()))
+            {
+                work.bounds.presence_omitted =
+                    work.bounds.presence_omitted.saturating_add(*omitted);
+            }
+        }
+        let presence_queries = prepared_presence.retained;
 
         let (warnings, warning_contexts) = warning_collector.finish();
         observation.warnings = warnings;
@@ -340,9 +425,13 @@ impl ObservationService {
                 jobs_capped,
             },
             messages,
+            chat_work: retained_chat_work,
         };
 
-        Ok(snapshot.normalized())
+        Ok(WorkspaceSnapshotBundle {
+            snapshot: snapshot.normalized(),
+            presence_queries,
+        })
     }
 }
 
@@ -358,6 +447,8 @@ fn project_single_source_workspace(
     all_native_samples: &mut Vec<WorkspaceNativeSample>,
     native_samples_omitted: &mut usize,
     all_chats: &mut BTreeMap<String, WorkspaceChatSummary>,
+    all_chat_work: &mut Vec<WorkspaceChatWork>,
+    presence_queries: &mut Vec<WorkspacePresenceQuery>,
     all_job_histories: &mut Vec<WorkspaceJobHistory>,
     job_histories_omitted: &mut usize,
     message_candidates: &mut Vec<WorkspaceMessageCandidateInput>,
@@ -617,9 +708,51 @@ fn project_single_source_workspace(
     }
 
     // 5. Assemble canonical WorkspaceChatSummary entries (including verified jobless native chats).
+    let mut binding_thread_counts: BTreeMap<(String, String), usize> = BTreeMap::new();
+    for identity in candidate_chats.values() {
+        *binding_thread_counts
+            .entry((identity.binding_id.clone(), identity.thread_uuid.clone()))
+            .or_default() += 1;
+    }
     for (chat_key, identity) in candidate_chats {
         let stats = chat_job_stats.remove(&chat_key).unwrap_or_default();
         let native_sample = samples_by_chat_key.get(&chat_key).copied();
+
+        let chat_work = if binding_thread_counts
+            .get(&(identity.binding_id.clone(), identity.thread_uuid.clone()))
+            .copied()
+            .unwrap_or(0)
+            == 1
+        {
+            project_workspace_chat_work(&identity, &core_states)
+        } else {
+            WorkspaceChatWork {
+                identity: identity.clone(),
+                availability: WorkspaceChatWorkAvailability::Unavailable,
+                ..WorkspaceChatWork::default()
+            }
+        };
+        if chat_work.availability == WorkspaceChatWorkAvailability::Available {
+            let presence_candidates =
+                workspace_chat_work_presence_candidates(&identity, &core_states, &chat_work.items);
+            for candidate in presence_candidates.candidates {
+                presence_queries.push(WorkspacePresenceQuery {
+                    chat_key: chat_key.clone(),
+                    item_id: candidate.item_id,
+                    execution_ref: candidate.execution_ref,
+                    approval_id: candidate.approval_id,
+                    task_id: candidate.task_id,
+                    expected_session_binding_id: candidate.session_binding_id,
+                    expected_run_id: candidate.run_id,
+                    expected_worker_id: candidate.worker_id,
+                    authority_dir: spec.authority_dir.clone(),
+                    sessions_dir: spec.sessions_dir.clone(),
+                    binding_id: identity.binding_id.clone(),
+                    thread_uuid: identity.thread_uuid.clone(),
+                });
+            }
+        }
+        all_chat_work.push(chat_work);
 
         let thread_label = resolve_verified_chat_thread_label(
             &identity,
@@ -1086,6 +1219,295 @@ fn load_plan_revisions_map_readonly(plans_dir: &Path) -> BTreeMap<(String, u64),
         .into_iter()
         .map(|rev| ((rev.plan_id.clone(), rev.revision), rev))
         .collect()
+}
+
+#[derive(Debug, Default)]
+struct PreparedWorkspacePresenceQueries {
+    retained: Vec<WorkspacePresenceQuery>,
+    omitted_by_chat: BTreeMap<String, usize>,
+}
+
+/// Deduplicates and globally bounds presence work before any host acquisition is prepared.
+///
+/// The retention key is the canonical four-part chat identity (`chat_key`) plus the exact
+/// execution and task. Duplicate rows are not omissions because the same execution remains
+/// represented; only candidates dropped by the global bound are counted per chat.
+fn prepare_workspace_presence_queries(
+    mut queries: Vec<WorkspacePresenceQuery>,
+) -> PreparedWorkspacePresenceQueries {
+    queries.sort_by(|left, right| {
+        left.chat_key
+            .cmp(&right.chat_key)
+            .then_with(|| left.execution_ref.cmp(&right.execution_ref))
+            .then_with(|| left.task_id.cmp(&right.task_id))
+            .then_with(|| left.item_id.cmp(&right.item_id))
+            .then_with(|| left.approval_id.cmp(&right.approval_id))
+            .then_with(|| left.binding_id.cmp(&right.binding_id))
+            .then_with(|| left.thread_uuid.cmp(&right.thread_uuid))
+            .then_with(|| {
+                left.expected_session_binding_id
+                    .cmp(&right.expected_session_binding_id)
+            })
+            .then_with(|| left.expected_run_id.cmp(&right.expected_run_id))
+            .then_with(|| left.expected_worker_id.cmp(&right.expected_worker_id))
+    });
+    queries.dedup_by(|left, right| {
+        left.chat_key == right.chat_key
+            && left.execution_ref == right.execution_ref
+            && left.task_id == right.task_id
+    });
+
+    if queries.len() <= MAX_WORKSPACE_CHAT_WORK_PRESENCE_TOTAL {
+        return PreparedWorkspacePresenceQueries {
+            retained: queries,
+            omitted_by_chat: BTreeMap::new(),
+        };
+    }
+
+    let dropped = queries.split_off(MAX_WORKSPACE_CHAT_WORK_PRESENCE_TOTAL);
+    let mut omitted_by_chat: BTreeMap<String, usize> = BTreeMap::new();
+    for query in dropped {
+        let count = omitted_by_chat.entry(query.chat_key).or_default();
+        *count = count.saturating_add(1);
+    }
+    PreparedWorkspacePresenceQueries {
+        retained: queries,
+        omitted_by_chat,
+    }
+}
+
+fn spawn_workspace_presence_acquisition<F, Fut>(
+    in_flight: &mut JoinSet<Option<WorkspacePresenceResult>>,
+    acquire: Arc<F>,
+    query: WorkspacePresenceQuery,
+    total_deadline: Instant,
+    per_call_timeout: Duration,
+) where
+    F: Fn(WorkspacePresenceQuery) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Option<WorkspacePresenceResult>> + Send + 'static,
+{
+    in_flight.spawn(async move {
+        let call_deadline = (Instant::now() + per_call_timeout).min(total_deadline);
+        timeout_at(call_deadline, (*acquire)(query))
+            .await
+            .ok()
+            .flatten()
+    });
+}
+
+/// Runs bounded presence acquisitions under one absolute deadline.
+///
+/// The caller computes the deadline before preparation. At most `max_concurrency` calls are
+/// active. Every call is independently cancelled at its per-call deadline or the total deadline,
+/// whichever comes first. Results already completed at the total deadline are retained, while
+/// pending join handles are aborted and drained so no detached acquisition survives the refresh.
+async fn collect_bounded_workspace_presence<F, Fut>(
+    queries: Vec<WorkspacePresenceQuery>,
+    total_deadline: Instant,
+    per_call_timeout: Duration,
+    max_concurrency: usize,
+    acquire: F,
+) -> Vec<WorkspacePresenceResult>
+where
+    F: Fn(WorkspacePresenceQuery) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Option<WorkspacePresenceResult>> + Send + 'static,
+{
+    let mut pending: VecDeque<WorkspacePresenceQuery> = queries.into();
+    let mut in_flight: JoinSet<Option<WorkspacePresenceResult>> = JoinSet::new();
+    let acquire = Arc::new(acquire);
+    let max_concurrency = max_concurrency.max(1);
+    let mut results = Vec::new();
+
+    while in_flight.len() < max_concurrency && Instant::now() < total_deadline {
+        let Some(query) = pending.pop_front() else {
+            break;
+        };
+        spawn_workspace_presence_acquisition(
+            &mut in_flight,
+            Arc::clone(&acquire),
+            query,
+            total_deadline,
+            per_call_timeout,
+        );
+    }
+
+    while !in_flight.is_empty() {
+        if Instant::now() >= total_deadline {
+            break;
+        }
+        match timeout_at(total_deadline, in_flight.join_next()).await {
+            Ok(Some(joined)) => {
+                if let Ok(Some(result)) = joined {
+                    results.push(result);
+                }
+                let next = if Instant::now() < total_deadline {
+                    pending.pop_front()
+                } else {
+                    None
+                };
+                if let Some(query) = next {
+                    spawn_workspace_presence_acquisition(
+                        &mut in_flight,
+                        Arc::clone(&acquire),
+                        query,
+                        total_deadline,
+                        per_call_timeout,
+                    );
+                }
+            }
+            Ok(None) => break,
+            Err(_) => break,
+        }
+    }
+
+    // A task may have finished at the deadline but not yet been joined. Preserve it before aborting.
+    while let Some(joined) = in_flight.try_join_next() {
+        if let Ok(Some(result)) = joined {
+            results.push(result);
+        }
+    }
+    in_flight.abort_all();
+    while let Some(joined) = in_flight.join_next().await {
+        if let Ok(Some(result)) = joined {
+            results.push(result);
+        }
+    }
+
+    results.sort_by(|left, right| {
+        left.chat_key
+            .cmp(&right.chat_key)
+            .then_with(|| left.presence.item_id.cmp(&right.presence.item_id))
+            .then_with(|| {
+                left.presence
+                    .execution_ref
+                    .cmp(&right.presence.execution_ref)
+            })
+            .then_with(|| left.presence.task_id.cmp(&right.presence.task_id))
+    });
+    results
+}
+
+/// Refreshes actual host presence for at most eight current Worker executions concurrently.
+///
+/// The total `2.5 s` deadline starts before candidate preparation. Each call is bounded to
+/// `750 ms`, and a timeout, missing store/session, scope mismatch, or failed call produces no
+/// presence row. The host is never started, and only the read-only static presence route is used.
+pub(crate) async fn refresh_workspace_backlog_presence(
+    queries: Vec<WorkspacePresenceQuery>,
+) -> Vec<WorkspacePresenceResult> {
+    let total_deadline =
+        Instant::now() + Duration::from_millis(WORKSPACE_PRESENCE_REFRESH_TOTAL_TIMEOUT_MS);
+    let prepared = prepare_workspace_presence_queries(queries);
+    if prepared.retained.is_empty() {
+        return Vec::new();
+    }
+
+    collect_bounded_workspace_presence(
+        prepared.retained,
+        total_deadline,
+        Duration::from_millis(WORKSPACE_PRESENCE_REFRESH_PER_CALL_TIMEOUT_MS),
+        MAX_WORKSPACE_PRESENCE_REFRESH_CONCURRENCY,
+        |query: WorkspacePresenceQuery| async move {
+            let presence = ApprovedHostClient::get_task_presence_readonly_at(
+                &query.authority_dir,
+                &query.sessions_dir,
+                &query.binding_id,
+                &query.thread_uuid,
+                &query.approval_id,
+                &query.task_id,
+            )
+            .await
+            .ok()
+            .flatten()?;
+
+            let owner = presence.owner.as_ref()?;
+            if owner.approval_id != query.approval_id
+                || owner.control_binding_id != query.binding_id
+                || owner.thread_uuid != query.thread_uuid
+                || owner.session_binding_id != query.expected_session_binding_id
+                || presence.binding_id != query.expected_session_binding_id
+                || presence.run_id != query.expected_run_id
+                || presence.worker_id != query.expected_worker_id
+            {
+                return None;
+            }
+
+            let availability_token = serde_json::to_value(presence.availability)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_string));
+            let freshness_token = serde_json::to_value(presence.freshness)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_string));
+            let availability = match availability_token.as_deref() {
+                Some("live") => WorkspaceBacklogPresenceAvailability::Live,
+                Some("non_live") => WorkspaceBacklogPresenceAvailability::NonLive,
+                _ => WorkspaceBacklogPresenceAvailability::Unavailable,
+            };
+            let freshness = match freshness_token.as_deref() {
+                Some("fresh") => WorkspaceBacklogPresenceFreshness::Fresh,
+                Some("stale") => WorkspaceBacklogPresenceFreshness::Stale,
+                _ => WorkspaceBacklogPresenceFreshness::NotApplicable,
+            };
+            // The current clock only evaluates expiry below; the original sample timestamps,
+            // measured age, and host-computed expiry are copied verbatim and never renewed.
+            let now_ms = current_observation_time_ms();
+            let process = presence.process.as_ref();
+            let live = presence.live
+                && availability == WorkspaceBacklogPresenceAvailability::Live
+                && freshness == WorkspaceBacklogPresenceFreshness::Fresh
+                && process.is_some()
+                && presence
+                    .expires_at_ms
+                    .is_some_and(|expires_at_ms| expires_at_ms > now_ms);
+
+            Some(WorkspacePresenceResult {
+                chat_key: query.chat_key.clone(),
+                presence: WorkspaceBacklogWorkerPresence {
+                    item_id: query.item_id.clone(),
+                    execution_ref: query.execution_ref.clone(),
+                    approval_id: query.approval_id.clone(),
+                    task_id: query.task_id.clone(),
+                    run_id: query.expected_run_id.clone(),
+                    worker_id: query.expected_worker_id.clone(),
+                    claim_id: presence.claim_id.clone(),
+                    host_instance_id: Some(owner.instance_id.clone()),
+                    invocation_id: process.map(|process| process.invocation_id.clone()),
+                    sequence: process.map(|process| process.sequence),
+                    availability,
+                    freshness,
+                    live,
+                    sampled_at_ms: presence.sampled_at_ms,
+                    sample_age_ms: presence.sample_age_ms,
+                    max_sample_age_ms: presence.max_sample_age_ms,
+                    expires_at_ms: presence.expires_at_ms,
+                },
+            })
+        },
+    )
+    .await
+}
+
+/// Applies actual host presence rows to the matching canonical chat work and re-normalizes bounds.
+pub(crate) fn apply_workspace_presence_results(
+    snapshot: &mut WorkspaceSnapshot,
+    results: Vec<WorkspacePresenceResult>,
+) -> WorkspaceSnapshot {
+    let mut by_chat: BTreeMap<String, Vec<WorkspaceBacklogWorkerPresence>> = BTreeMap::new();
+    for result in results {
+        by_chat
+            .entry(result.chat_key)
+            .or_default()
+            .push(result.presence);
+    }
+    for work in &mut snapshot.chat_work {
+        let Some(chat_key) = work.identity.canonical_key() else {
+            continue;
+        };
+        if let Some(rows) = by_chat.remove(&chat_key) {
+            work.worker_presence.extend(rows);
+        }
+    }
+    snapshot.normalized()
 }
 
 fn resolve_verified_chat_thread_label(

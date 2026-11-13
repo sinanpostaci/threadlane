@@ -1360,9 +1360,16 @@ async fn desktop_workspace_snapshot(
     state: State<'_, ObservationService>,
 ) -> Result<WorkspaceSnapshot, AppError> {
     let service = state.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || service.workspace_snapshot(request))
-        .await
-        .map_err(|_| AppError::internal_join_error())?
+    let mut bundle =
+        tauri::async_runtime::spawn_blocking(move || service.workspace_snapshot_bundle(request))
+            .await
+            .map_err(|_| AppError::internal_join_error())??;
+    let presence =
+        observation::workspace::refresh_workspace_backlog_presence(bundle.presence_queries).await;
+    Ok(observation::workspace::apply_workspace_presence_results(
+        &mut bundle.snapshot,
+        presence,
+    ))
 }
 
 #[tauri::command]

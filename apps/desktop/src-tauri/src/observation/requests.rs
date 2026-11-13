@@ -2575,6 +2575,7 @@ mod tests {
                 claimed_at_ms: Some(2_005),
                 resolved_at_ms: Some(2_006),
             }],
+            ..ReadonlyCoreStateSnapshot::default()
         };
 
         let projection = project_requests(SOURCE_ID, &[], &[sync_record], &[snapshot], &[]);

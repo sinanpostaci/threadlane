@@ -6,7 +6,8 @@ mod unix_workspace_tests {
     use std::io::Write;
     use std::os::unix::fs::{symlink, MetadataExt, OpenOptionsExt, PermissionsExt};
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use threadlane_authority::{
@@ -19,7 +20,9 @@ mod unix_workspace_tests {
         current_observation_time_ms, serialize_workspace_native_sample_sidecar, ObservationJob,
         ObservationJobState, ObservationSnapshotRequest, ObservationSourceAvailability,
         ObservationTask, WorkspaceAcceptanceStatus, WorkspaceActivityState, WorkspaceAttentionKind,
-        WorkspaceAvailabilityState, WorkspaceCapabilityState, WorkspaceChatIdentity,
+        WorkspaceAvailabilityState, WorkspaceBacklogPresenceAvailability,
+        WorkspaceBacklogPresenceFreshness, WorkspaceBacklogWorkerPresence,
+        WorkspaceCapabilityState, WorkspaceChatIdentity, WorkspaceChatWorkAvailability,
         WorkspaceConfiguredSelection, WorkspaceConnectionState,
         WorkspaceExternalResolutionApplicability, WorkspaceExternalResolutionScope,
         WorkspaceFreshnessState, WorkspaceMessageSourceKind, WorkspaceNativeCapabilities,
@@ -64,6 +67,12 @@ mod unix_workspace_tests {
     };
     use threadlane_workers::{resolve_model_target, WorkerFilePermissions, WorkerProvider};
 
+    use tokio::time::{Duration, Instant};
+
+    use super::super::{
+        collect_bounded_workspace_presence, prepare_workspace_presence_queries,
+        refresh_workspace_backlog_presence, WorkspacePresenceQuery, WorkspacePresenceResult,
+    };
     use crate::observation::{ObservationService, ObservationSourceConfig};
 
     static WORKSPACE_TEST_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -1197,6 +1206,71 @@ mod unix_workspace_tests {
             .expect("record legacy worker external resolution")
     }
 
+    fn test_presence_query(
+        chat_key: &str,
+        execution_ref: &str,
+        task_id: &str,
+        item_id: &str,
+    ) -> WorkspacePresenceQuery {
+        test_presence_query_with_dirs(
+            chat_key,
+            execution_ref,
+            task_id,
+            item_id,
+            Path::new("/nonexistent-threadlane-authority"),
+            Path::new("/nonexistent-threadlane-sessions"),
+        )
+    }
+
+    fn test_presence_query_with_dirs(
+        chat_key: &str,
+        execution_ref: &str,
+        task_id: &str,
+        item_id: &str,
+        authority_dir: &Path,
+        sessions_dir: &Path,
+    ) -> WorkspacePresenceQuery {
+        WorkspacePresenceQuery {
+            chat_key: chat_key.to_string(),
+            item_id: item_id.to_string(),
+            execution_ref: execution_ref.to_string(),
+            approval_id: "apr_00000000000000000000000000000001".to_string(),
+            task_id: task_id.to_string(),
+            expected_session_binding_id: "bnd_presence_session".to_string(),
+            expected_run_id: "run_presence_test".to_string(),
+            expected_worker_id: "wrk_presence_test".to_string(),
+            authority_dir: authority_dir.to_path_buf(),
+            sessions_dir: sessions_dir.to_path_buf(),
+            binding_id: "bnd_presence_control".to_string(),
+            thread_uuid: "0196ed00-0000-7000-8000-000000000901".to_string(),
+        }
+    }
+
+    fn test_presence_result(query: &WorkspacePresenceQuery) -> WorkspacePresenceResult {
+        WorkspacePresenceResult {
+            chat_key: query.chat_key.clone(),
+            presence: WorkspaceBacklogWorkerPresence {
+                item_id: query.item_id.clone(),
+                execution_ref: query.execution_ref.clone(),
+                approval_id: query.approval_id.clone(),
+                task_id: query.task_id.clone(),
+                run_id: query.expected_run_id.clone(),
+                worker_id: query.expected_worker_id.clone(),
+                claim_id: Some("clm_presence_test".to_string()),
+                host_instance_id: Some("hst_presence_test".to_string()),
+                invocation_id: Some("inv_presence_test".to_string()),
+                sequence: Some(7),
+                availability: WorkspaceBacklogPresenceAvailability::Live,
+                freshness: WorkspaceBacklogPresenceFreshness::Fresh,
+                live: true,
+                sampled_at_ms: Some(1_700_000_000_000),
+                sample_age_ms: Some(42),
+                max_sample_age_ms: 5_000,
+                expires_at_ms: Some(1_700_000_005_000),
+            },
+        }
+    }
+
     #[test]
     fn workspace_snapshot_is_readonly_preserves_sample_timestamps_and_projects_deterministic_safe_messages(
     ) {
@@ -1714,6 +1788,259 @@ mod unix_workspace_tests {
         assert_eq!(
             chat_fallback.configured_selection.evidence,
             WorkspaceSelectionEvidence::Unavailable
+        );
+    }
+
+    #[test]
+    fn workspace_snapshot_projects_durable_chat_backlog_and_keeps_failure_out_of_attention() {
+        let tree = TestTree::new("chat-work-backlog");
+        let stores = TestStores::new(&tree, "stores");
+        let app_data = tree.dir("app-data");
+        let project = tree.dir("repo-chat-work");
+        let thread_uuid = "0196ed00-0000-7000-8000-0000000005a1";
+        let done_result_digest = "1".repeat(64);
+        let done_delivery_digest = "2".repeat(64);
+
+        let mut core = Core::open(stores.state.join("state.db")).expect("open Core");
+        let binding = core
+            .create_binding(thread_uuid, "Backlog Chat")
+            .expect("create binding");
+        let done_item = core
+            .create_backlog_item(
+                &binding.binding_id,
+                "create-done-item",
+                threadlane_core::NewBacklogItem {
+                    title: "Ship the conversation stream".to_string(),
+                    acceptance_condition: "The stream is checked".to_string(),
+                    delivery_description: "Deliver the stream".to_string(),
+                    kind: threadlane_core::BacklogItemKind::Worker,
+                },
+                1_000,
+            )
+            .expect("create done item");
+        let done_execution = core
+            .reserve_worker_backlog_execution_operator_attested(
+                &binding.binding_id,
+                "reserve-done-item",
+                &done_item.item_id,
+                1,
+                threadlane_core::WorkerBacklogAuthority {
+                    approval_id: "apr_done_chat_work".to_string(),
+                    subject_digest: "a".repeat(64),
+                    task_id: "tsk_done_chat_work".to_string(),
+                    task_digest: "b".repeat(64),
+                },
+                1_010,
+            )
+            .expect("reserve done item");
+        core.attach_worker_backlog_dispatch_receipt_operator_attested(
+            &binding.binding_id,
+            "attach-done-item",
+            &done_item.item_id,
+            &done_execution.execution_ref,
+            2,
+            threadlane_core::WorkerBacklogDispatchReceipt {
+                session_binding_id: "sbx_done_chat_work".to_string(),
+                run_id: "run_done_chat_work".to_string(),
+                worker_id: "wrk_done_chat_work".to_string(),
+                profile_id: "profile_done_chat_work".to_string(),
+                execution_binding_digest: Some("c".repeat(64)),
+            },
+            1_020,
+        )
+        .expect("attach done receipt");
+        core.record_worker_backlog_outcome_operator_attested(
+            &binding.binding_id,
+            "outcome-done-item",
+            &done_item.item_id,
+            &done_execution.execution_ref,
+            3,
+            threadlane_core::WorkerBacklogOutcomeReport {
+                outcome: threadlane_core::WorkerBacklogOutcome::Success,
+                note: "Verified success".to_string(),
+                result_digest: Some(done_result_digest.clone()),
+            },
+            1_030,
+        )
+        .expect("record done success");
+        core.complete_worker_backlog_item_operator_attested(
+            &binding.binding_id,
+            "complete-done-item",
+            &done_item.item_id,
+            4,
+            threadlane_core::WorkerBacklogCompletion {
+                execution_ref: done_execution.execution_ref.clone(),
+                result_digest: done_result_digest,
+                acceptance_note: "Checked and accepted".to_string(),
+                acceptance_evidence: "Inspected the actual delivery".to_string(),
+                delivery_digest: done_delivery_digest,
+            },
+            1_040,
+        )
+        .expect("complete done item");
+
+        let failed_item = core
+            .create_backlog_item(
+                &binding.binding_id,
+                "create-failed-item",
+                threadlane_core::NewBacklogItem {
+                    title: "Run a bounded attempt".to_string(),
+                    acceptance_condition: "The attempt is reconciled".to_string(),
+                    delivery_description: "Deliver a bounded attempt".to_string(),
+                    kind: threadlane_core::BacklogItemKind::Worker,
+                },
+                1_100,
+            )
+            .expect("create failed item");
+        let failed_execution = core
+            .reserve_worker_backlog_execution_operator_attested(
+                &binding.binding_id,
+                "reserve-failed-item",
+                &failed_item.item_id,
+                1,
+                threadlane_core::WorkerBacklogAuthority {
+                    approval_id: "apr_failed_chat_work".to_string(),
+                    subject_digest: "d".repeat(64),
+                    task_id: "tsk_failed_chat_work".to_string(),
+                    task_digest: "e".repeat(64),
+                },
+                1_110,
+            )
+            .expect("reserve failed item");
+        core.attach_worker_backlog_dispatch_receipt_operator_attested(
+            &binding.binding_id,
+            "attach-failed-item",
+            &failed_item.item_id,
+            &failed_execution.execution_ref,
+            2,
+            threadlane_core::WorkerBacklogDispatchReceipt {
+                session_binding_id: "sbx_failed_chat_work".to_string(),
+                run_id: "run_failed_chat_work".to_string(),
+                worker_id: "wrk_failed_chat_work".to_string(),
+                profile_id: "profile_failed_chat_work".to_string(),
+                execution_binding_digest: Some("f".repeat(64)),
+            },
+            1_120,
+        )
+        .expect("attach failed receipt");
+        core.record_worker_backlog_outcome_operator_attested(
+            &binding.binding_id,
+            "outcome-failed-item",
+            &failed_item.item_id,
+            &failed_execution.execution_ref,
+            3,
+            threadlane_core::WorkerBacklogOutcomeReport {
+                outcome: threadlane_core::WorkerBacklogOutcome::Failure,
+                note: "The attempt failed".to_string(),
+                result_digest: Some("9".repeat(64)),
+            },
+            1_130,
+        )
+        .expect("record failed outcome");
+        drop(core);
+
+        let source_id = stores.canonical_source_id();
+        let identity = write_verified_chat_sample(
+            &stores,
+            &source_id,
+            &binding.binding_id,
+            thread_uuid,
+            &project,
+            "epoch_chat_work",
+        );
+        let service = ObservationService::new(stores.config(&app_data));
+        let snap = service
+            .workspace_snapshot(None)
+            .expect("workspace snapshot");
+        let work = snap
+            .chat_work
+            .iter()
+            .find(|work| work.identity == identity)
+            .expect("chat work projection");
+
+        assert_eq!(work.availability, WorkspaceChatWorkAvailability::Available);
+        assert_eq!(work.items.len(), 2);
+        let done = work
+            .items
+            .iter()
+            .find(|item| item.item_id == done_item.item_id)
+            .expect("done item");
+        assert_eq!(done.status, threadlane_core::BacklogStatus::Done);
+        assert!(
+            done.completion_note.is_some() && done.completion_evidence.is_some(),
+            "Done is a committed completion, not a successful Worker outcome"
+        );
+        let failed = work
+            .items
+            .iter()
+            .find(|item| item.item_id == failed_item.item_id)
+            .expect("failed item");
+        assert_eq!(failed.status, threadlane_core::BacklogStatus::Blocked);
+        assert!(
+            failed.current_execution_ref.is_some(),
+            "failure evidence remains correlated to the actual attempt"
+        );
+
+        let sequences: Vec<u64> = work.events.iter().map(|event| event.sequence).collect();
+        let mut sorted = sequences.clone();
+        sorted.sort_unstable();
+        assert_eq!(sequences, sorted);
+        let done_outcome = work
+            .events
+            .iter()
+            .find(|event| {
+                event.item_id == done_item.item_id && event.action == "worker_outcome_recorded"
+            })
+            .expect("done outcome event");
+        assert_eq!(
+            done_outcome.outcome,
+            Some(threadlane_core::WorkerBacklogOutcome::Success)
+        );
+        assert_eq!(done_outcome.status, threadlane_core::BacklogStatus::Doing);
+        let failed_outcome = work
+            .events
+            .iter()
+            .find(|event| {
+                event.item_id == failed_item.item_id && event.action == "worker_outcome_recorded"
+            })
+            .expect("failed outcome event");
+        assert_eq!(
+            failed_outcome.outcome,
+            Some(threadlane_core::WorkerBacklogOutcome::Failure)
+        );
+        assert!(
+            work.worker_presence.is_empty(),
+            "the synchronous snapshot never invents presence"
+        );
+
+        let chat = snap
+            .chats
+            .iter()
+            .find(|chat| chat.identity == identity)
+            .expect("verified chat summary");
+        assert_eq!(chat.activity, WorkspaceActivityState::Idle);
+        assert_eq!(
+            chat.attention_count, 0,
+            "a failed backlog item is not an attention request"
+        );
+
+        let regenerated = snap.regenerate_at(snap.generated_at_ms + 60_000);
+        assert_eq!(
+            regenerated.native_samples[0].observed_at_ms, snap.native_samples[0].observed_at_ms,
+            "projection must not renew native sample timestamps"
+        );
+        let regenerated_work = regenerated
+            .chat_work
+            .iter()
+            .find(|work| work.identity == identity)
+            .expect("regenerated chat work");
+        assert_eq!(
+            regenerated_work
+                .events
+                .first()
+                .map(|event| event.recorded_at_ms),
+            work.events.first().map(|event| event.recorded_at_ms),
+            "projection must not rewrite durable history timestamps"
         );
     }
 
@@ -4625,6 +4952,247 @@ mod unix_workspace_tests {
                 .summary
                 .contains("Do not leak this legacy instruction")),
             "approval must not introduce raw task instructions"
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_presence_preparation_caps_acquisition_at_64_with_truthful_chat_omissions() {
+        let mut queries = Vec::new();
+        for index in 0..40 {
+            queries.push(test_presence_query(
+                "chat-a",
+                &format!("exec-a-{index:02}"),
+                &format!("task-a-{index:02}"),
+                &format!("item-a-{index:02}"),
+            ));
+        }
+        for index in 0..40 {
+            queries.push(test_presence_query(
+                "chat-b",
+                &format!("exec-b-{index:02}"),
+                &format!("task-b-{index:02}"),
+                &format!("item-b-{index:02}"),
+            ));
+        }
+        queries.push(test_presence_query(
+            "chat-a",
+            "exec-a-00",
+            "task-a-00",
+            "item-a-duplicate",
+        ));
+
+        let prepared = prepare_workspace_presence_queries(queries);
+        assert_eq!(prepared.retained.len(), 64);
+        assert_eq!(
+            prepared
+                .retained
+                .iter()
+                .map(|query| (
+                    query.chat_key.clone(),
+                    query.execution_ref.clone(),
+                    query.task_id.clone()
+                ))
+                .collect::<BTreeSet<_>>()
+                .len(),
+            64,
+            "retained rows must remain unique by chat, execution, and task"
+        );
+        assert_eq!(
+            prepared.omitted_by_chat.values().copied().sum::<usize>(),
+            16
+        );
+        assert_eq!(prepared.omitted_by_chat.get("chat-b").copied(), Some(16));
+        assert!(
+            !prepared.omitted_by_chat.contains_key("chat-a"),
+            "the deterministic global bound must not claim omissions for retained chats"
+        );
+        assert!(prepared.retained.iter().any(|query| {
+            query.chat_key == "chat-a"
+                && query.execution_ref == "exec-a-00"
+                && query.task_id == "task-a-00"
+                && query.item_id == "item-a-00"
+        }));
+
+        let task_split = prepare_workspace_presence_queries(vec![
+            test_presence_query("chat-task-split", "exec-shared", "task-one", "item-one"),
+            test_presence_query("chat-task-split", "exec-shared", "task-two", "item-two"),
+        ]);
+        assert_eq!(
+            task_split.retained.len(),
+            2,
+            "the same execution under different tasks must not be deduplicated"
+        );
+        assert!(task_split.omitted_by_chat.is_empty());
+
+        let attempted = Arc::new(AtomicUsize::new(0));
+        let acquire = {
+            let attempted = Arc::clone(&attempted);
+            move |query: WorkspacePresenceQuery| {
+                let attempted = Arc::clone(&attempted);
+                async move {
+                    attempted.fetch_add(1, Ordering::SeqCst);
+                    Some(test_presence_result(&query))
+                }
+            }
+        };
+        let results = collect_bounded_workspace_presence(
+            prepared.retained,
+            Instant::now() + Duration::from_secs(2),
+            Duration::from_millis(750),
+            8,
+            acquire,
+        )
+        .await;
+        assert_eq!(results.len(), 64);
+        assert_eq!(
+            attempted.load(Ordering::SeqCst),
+            64,
+            "candidates dropped by the global bound must never reach host acquisition"
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_presence_refresh_preserves_completed_results_and_cancels_pending_at_deadline(
+    ) {
+        struct DropProbe(Arc<AtomicUsize>);
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let queries = vec![
+            test_presence_query("chat-fast", "exec-fast-1", "task-fast-1", "item-fast-1"),
+            test_presence_query("chat-fast", "exec-fast-2", "task-fast-2", "item-fast-2"),
+            test_presence_query("chat-slow", "exec-slow-1", "task-slow-1", "item-slow-1"),
+            test_presence_query("chat-slow", "exec-slow-2", "task-slow-2", "item-slow-2"),
+        ];
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let acquire = {
+            let dropped = Arc::clone(&dropped);
+            move |query: WorkspacePresenceQuery| {
+                let dropped = Arc::clone(&dropped);
+                async move {
+                    if query.execution_ref.starts_with("exec-fast-") {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        Some(test_presence_result(&query))
+                    } else {
+                        let _probe = DropProbe(dropped);
+                        tokio::time::sleep(Duration::from_secs(60)).await;
+                        Some(test_presence_result(&query))
+                    }
+                }
+            }
+        };
+        let started = Instant::now();
+        let results = collect_bounded_workspace_presence(
+            queries,
+            started + Duration::from_millis(200),
+            Duration::from_millis(750),
+            8,
+            acquire,
+        )
+        .await;
+        let elapsed = started.elapsed();
+        assert_eq!(results.len(), 2);
+        assert!(results
+            .iter()
+            .all(|result| result.presence.execution_ref.starts_with("exec-fast-")));
+        assert!(elapsed >= Duration::from_millis(150));
+        assert!(elapsed < Duration::from_secs(2));
+        assert_eq!(
+            dropped.load(Ordering::SeqCst),
+            2,
+            "pending acquisition futures must be dropped before refresh returns"
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_presence_refresh_never_exceeds_eight_active_acquisitions() {
+        let queries: Vec<WorkspacePresenceQuery> = (0..24)
+            .map(|index| {
+                test_presence_query(
+                    "chat-concurrency",
+                    &format!("exec-{index:02}"),
+                    &format!("task-{index:02}"),
+                    &format!("item-{index:02}"),
+                )
+            })
+            .collect();
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let acquire = {
+            let active = Arc::clone(&active);
+            let max_active = Arc::clone(&max_active);
+            move |query: WorkspacePresenceQuery| {
+                let active = Arc::clone(&active);
+                let max_active = Arc::clone(&max_active);
+                async move {
+                    let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_active.fetch_max(now, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    Some(test_presence_result(&query))
+                }
+            }
+        };
+        let results = collect_bounded_workspace_presence(
+            queries,
+            Instant::now() + Duration::from_secs(5),
+            Duration::from_millis(750),
+            8,
+            acquire,
+        )
+        .await;
+        assert_eq!(results.len(), 24);
+        assert_eq!(
+            max_active.load(Ordering::SeqCst),
+            8,
+            "presence acquisitions must stay within the eight-call concurrency bound"
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_presence_refresh_missing_stores_creates_nothing_and_preserves_permissions() {
+        let tree = TestTree::new("presence-missing-stores");
+        let existing = tree.dir("existing-store");
+        set_mode(&existing, 0o700);
+        let existing_file = tree.write_file("existing-store/marker.json", b"{}", 0o600);
+        let authority = tree.join("missing-authority");
+        let sessions = tree.join("missing-sessions");
+        let before = snapshot_tree_fingerprints(tree.path());
+        assert!(!authority.exists());
+        assert!(!sessions.exists());
+
+        let results = refresh_workspace_backlog_presence(vec![test_presence_query_with_dirs(
+            "chat-missing",
+            "exec-missing",
+            "task-missing",
+            "item-missing",
+            &authority,
+            &sessions,
+        )])
+        .await;
+
+        assert!(results.is_empty());
+        assert_eq!(snapshot_tree_fingerprints(tree.path()), before);
+        assert!(!authority.exists());
+        assert!(!sessions.exists());
+        assert_eq!(
+            fs::metadata(&existing_file)
+                .expect("existing marker metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(tree.path())
+                .expect("test root metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
         );
     }
 }

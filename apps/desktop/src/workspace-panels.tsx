@@ -1,5 +1,9 @@
 import './workspace-panels.css';
 
+// Workspace panels are retained for compatibility; the selected-chat surface
+// now renders the minimal chat-work stream and backlog drawer.
+
+import { Dialog, IconButton } from '@radix-ui/themes';
 import {
   AlertCircle,
   Blocks,
@@ -7,9 +11,11 @@ import {
   ExternalLink,
   FolderGit2,
   History,
+  Loader2,
   RefreshCw,
   SquareTerminal,
   Terminal,
+  X,
 } from 'lucide-react';
 import {
   useCallback,
@@ -43,12 +49,17 @@ import type {
   WorkspaceExternalResolutionView,
 } from './app-model.ts';
 import {
+  BACKLOG_STATUS_LABELS,
   DEFAULT_BOTTOM_FOLLOW_THRESHOLD_PX,
+  backlogStatusTone,
+  buildChatWorkBacklogGroups,
+  buildChatWorkEventViews,
   computeAnchorScrollTop,
   createMessageScrollStore,
   doesJobBelongToChat,
   doesMessageBelongToChat,
   doesObservationRequestMatchChat,
+  evaluateChatWorkLiveness,
   filterJobsForChat,
   filterMessagesForChat,
   filterObservationRequestsForActivity,
@@ -58,14 +69,18 @@ import {
   jumpToLatestMessages,
   measureDomMessageViewport,
   orderWorkspaceMessageItems,
+  readWorkspaceChatWork,
   resolveMessageScrollChatKey,
   resolveMessageViewportResize,
   resolveVerifiedChatJobIds,
+  selectWorkspaceChatWork,
   setChatScrollState,
   switchMessageScrollChat,
+  syncChatWorkEventScroll,
   syncMessageScrollItems,
 } from './message-scroll.ts';
 import type {
+  ChatWorkLiveness,
   MessageScrollMode,
   MessageScrollState,
   MessageScrollStore,
@@ -77,6 +92,7 @@ import type {
   ObservationJobState,
   ObservationSnapshot,
 } from './observation/types.ts';
+import { formatRelativeTimestamp } from './format.ts';
 import {
   describeDeliveryStage,
   formatActivityRunningCountLabel,
@@ -3319,6 +3335,598 @@ export function WorkspaceActivityPanel({
         )}
       </div>
     </section>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Minimal chat-work surface: one bottom-growing stream and a backlog drawer
+// ---------------------------------------------------------------------------
+
+export interface WorkspaceChatWorkSurfaceProps {
+  chat: WorkspaceChatSummary | null;
+  snapshot?: WorkspaceSnapshot | null;
+  nativeSample?: WorkspaceNativeSample | null;
+  nowMs?: number | null;
+  loading?: boolean;
+  error?: string | null;
+  isStale?: boolean;
+  onRefresh?: () => void;
+  onOpenCodex?: (target: CodexChatTarget) => void;
+  onOpenScopedCodex?: (target: WorkspaceScopedChatTarget) => void;
+  codexOpenInFlight?: boolean;
+}
+
+function ChatWorkStatusDot({ tone }: { tone: ChatWorkLiveness['statusTone'] }) {
+  return <span className="tl-cw-dot" data-tone={tone} aria-hidden="true" />;
+}
+
+function ChatWorkSpinner({ small = false }: { small?: boolean }) {
+  return (
+    <span
+      className={small ? 'tl-cw-spinner tl-cw-spinner--small' : 'tl-cw-spinner'}
+      data-activity-spinner="true"
+      aria-hidden="true"
+    />
+  );
+}
+
+function buildChatWorkCodexTargets(
+  identity: WorkspaceChatIdentity,
+): { legacy: CodexChatTarget; scoped: WorkspaceScopedChatTarget } | null {
+  if (!isValidWorkspaceChatIdentity(identity)) {
+    return null;
+  }
+  return {
+    legacy: {
+      source_id: identity.source_id,
+      thread_uuid: identity.thread_uuid,
+      job_id: null,
+    },
+    scoped: {
+      identity,
+      job_id: null,
+    },
+  };
+}
+
+export function WorkspaceChatWorkSurface({
+  chat,
+  snapshot = null,
+  nativeSample = null,
+  nowMs = null,
+  loading = false,
+  error = null,
+  isStale = false,
+  onRefresh,
+  onOpenCodex,
+  onOpenScopedCodex,
+  codexOpenInFlight = false,
+}: WorkspaceChatWorkSurfaceProps) {
+  const [backlogOpen, setBacklogOpen] = useState(false);
+  const streamRef = useRef<HTMLDivElement | null>(null);
+  const listRef = useRef<HTMLOListElement | null>(null);
+  const backlogTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const lastLayoutSizeRef = useRef<{
+    chatKey: string;
+    clientHeight: number;
+    scrollHeight: number;
+  } | null>(null);
+
+  const referenceNowMs =
+    typeof nowMs === 'number' && Number.isFinite(nowMs)
+      ? nowMs
+      : snapshot?.generated_at_ms ?? Date.now();
+
+  const chatWork = useMemo(() => readWorkspaceChatWork(snapshot), [snapshot]);
+  const selection = useMemo(
+    () => selectWorkspaceChatWork(chatWork, chat?.identity ?? null),
+    [chat, chatWork],
+  );
+  const liveness = useMemo(
+    () =>
+      evaluateChatWorkLiveness(selection, nativeSample, {
+        nowMs: referenceNowMs,
+        staleThresholdMs: snapshot?.sampling_policy.stale_threshold_ms,
+        isStale,
+        refreshFailed: error !== null,
+      }),
+    [error, isStale, nativeSample, referenceNowMs, selection, snapshot],
+  );
+  const eventViews = useMemo(
+    () => buildChatWorkEventViews(selection),
+    [selection],
+  );
+  const backlogGroups = useMemo(
+    () => buildChatWorkBacklogGroups(selection),
+    [selection],
+  );
+  const chatKey = selection.chatKey ?? '__none__';
+  const backlogCount = selection.items.length;
+  const codexTargets = chat ? buildChatWorkCodexTargets(chat.identity) : null;
+
+  const scrollStoreRef = useRef<MessageScrollStore>(createMessageScrollStore(chatKey));
+  const [scrollView, setScrollView] = useState<{
+    chatKey: string;
+    mode: MessageScrollMode;
+    pendingNewCount: number;
+  }>(() => ({
+    chatKey,
+    mode: 'follow',
+    pendingNewCount: 0,
+  }));
+
+  const syncUiScroll = useCallback((state: MessageScrollState) => {
+    setScrollView((previous) =>
+      previous.chatKey === state.chatKey &&
+      previous.mode === state.mode &&
+      previous.pendingNewCount === state.pendingNewCount
+        ? previous
+        : {
+            chatKey: state.chatKey,
+            mode: state.mode,
+            pendingNewCount: state.pendingNewCount,
+          },
+    );
+  }, []);
+
+  const activeScrollView = useMemo(() => {
+    if (scrollView.chatKey === chatKey) {
+      return scrollView;
+    }
+    const stored = getChatScrollState(scrollStoreRef.current, chatKey);
+    return {
+      chatKey,
+      mode: stored.mode,
+      pendingNewCount: stored.pendingNewCount,
+    };
+  }, [scrollView, chatKey]);
+  const showJumpToLatest = activeScrollView.mode === 'reading';
+
+  useEffect(() => {
+    setBacklogOpen(false);
+  }, [chatKey]);
+
+  // Reconcile appends, head trims, and chat switches before paint using the
+  // shared message anchor reducer keyed by stable event ids.
+  useLayoutEffect(() => {
+    scrollStoreRef.current = switchMessageScrollChat(scrollStoreRef.current, chatKey);
+    const currentState = getActiveChatScrollState(scrollStoreRef.current);
+    const sync = syncChatWorkEventScroll(currentState, eventViews);
+    scrollStoreRef.current = setChatScrollState(scrollStoreRef.current, sync.state);
+    syncUiScroll(sync.state);
+
+    const scroller = streamRef.current;
+    if (!scroller) {
+      return;
+    }
+    if (scroller.clientHeight === 0 && scroller.scrollHeight === 0) {
+      return;
+    }
+
+    if (sync.action.kind === 'scroll_to_bottom') {
+      scroller.scrollTop = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+    } else if (sync.action.kind === 'preserve_anchor') {
+      const anchor = sync.action.anchor;
+      const { metrics, items } = measureDomMessageViewport(
+        scroller,
+        '[data-chat-event-id]',
+      );
+      const found = items.find((entry) => entry.itemId === anchor.itemId);
+      if (found) {
+        scroller.scrollTop = computeAnchorScrollTop(
+          metrics,
+          found.relativeTopPx,
+          anchor.offsetPx,
+        );
+      }
+    } else if (eventViews.length === 0 && scroller.scrollTop !== 0) {
+      scroller.scrollTop = 0;
+    }
+
+    lastLayoutSizeRef.current = {
+      chatKey,
+      clientHeight: scroller.clientHeight,
+      scrollHeight: scroller.scrollHeight,
+    };
+  }, [chatKey, eventViews, syncUiScroll]);
+
+  const reconcileStreamViewport = useCallback(() => {
+    const scroller = streamRef.current;
+    if (!scroller) {
+      return;
+    }
+    if (scroller.clientHeight === 0 && scroller.scrollHeight === 0) {
+      return;
+    }
+    const currentState = getChatScrollState(scrollStoreRef.current, chatKey);
+    const { metrics, items } = measureDomMessageViewport(
+      scroller,
+      '[data-chat-event-id]',
+    );
+    const decision = resolveMessageViewportResize(currentState, metrics, items);
+    scrollStoreRef.current = setChatScrollState(scrollStoreRef.current, decision.state);
+    syncUiScroll(decision.state);
+
+    if (decision.action.kind === 'scroll_to_bottom') {
+      scroller.scrollTop = decision.action.targetScrollTop;
+    } else if (decision.action.kind === 'restore_anchor') {
+      scroller.scrollTop = decision.action.targetScrollTop;
+    }
+
+    lastLayoutSizeRef.current = {
+      chatKey,
+      clientHeight: scroller.clientHeight,
+      scrollHeight: scroller.scrollHeight,
+    };
+  }, [chatKey, syncUiScroll]);
+
+  // Observe both the scrollport and the event list so text reflow above the
+  // viewport restores the reading anchor instead of drifting or jumping.
+  useEffect(() => {
+    const scroller = streamRef.current;
+    if (!scroller || typeof ResizeObserver === 'undefined') {
+      return;
+    }
+    const observer = new ResizeObserver(() => {
+      reconcileStreamViewport();
+    });
+    observer.observe(scroller);
+    if (listRef.current) {
+      observer.observe(listRef.current);
+    }
+    return () => observer.disconnect();
+  }, [chatKey, eventViews.length, reconcileStreamViewport]);
+
+  const handleStreamScroll = useCallback(() => {
+    const scroller = streamRef.current;
+    if (!scroller) {
+      return;
+    }
+    if (scroller.clientHeight === 0 && scroller.scrollHeight === 0) {
+      return;
+    }
+    const currentState = getChatScrollState(scrollStoreRef.current, chatKey);
+    const maxTop = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+
+    // A layout shrink can clamp scrollTop before the resize observer runs.
+    // Restore the reading anchor instead of mistaking the clamp for a jump to
+    // the bottom.
+    const previousSize = lastLayoutSizeRef.current;
+    if (
+      currentState.mode === 'reading' &&
+      previousSize !== null &&
+      previousSize.chatKey === chatKey &&
+      (previousSize.clientHeight !== scroller.clientHeight ||
+        previousSize.scrollHeight !== scroller.scrollHeight) &&
+      scroller.scrollTop >= maxTop - 2
+    ) {
+      reconcileStreamViewport();
+      return;
+    }
+
+    const { metrics, items } = measureDomMessageViewport(
+      scroller,
+      '[data-chat-event-id]',
+    );
+    const nextState = handleMessageViewportScroll(
+      currentState,
+      metrics,
+      items,
+      DEFAULT_BOTTOM_FOLLOW_THRESHOLD_PX,
+    );
+    scrollStoreRef.current = setChatScrollState(scrollStoreRef.current, nextState);
+    syncUiScroll(nextState);
+    lastLayoutSizeRef.current = {
+      chatKey,
+      clientHeight: scroller.clientHeight,
+      scrollHeight: scroller.scrollHeight,
+    };
+  }, [chatKey, reconcileStreamViewport, syncUiScroll]);
+
+  const handleJumpToLatest = useCallback(() => {
+    const currentState = getChatScrollState(scrollStoreRef.current, chatKey);
+    const jumped = jumpToLatestMessages(currentState);
+    scrollStoreRef.current = setChatScrollState(scrollStoreRef.current, jumped.state);
+    syncUiScroll(jumped.state);
+
+    const scroller = streamRef.current;
+    if (scroller) {
+      scroller.scrollTop = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+    }
+  }, [chatKey, syncUiScroll]);
+
+  return (
+    <div className="tl-cw-root" data-chat-work-surface="true">
+      {chat ? (
+        <header className="tl-cw-header">
+          <div className="tl-cw-heading">
+            <div className="tl-cw-title-row">
+              <h2 className="tl-cw-title">{chat.thread_label}</h2>
+              {liveness.statusLabel !== null ? (
+                <span
+                  className="tl-cw-status"
+                  data-tone={liveness.statusTone}
+                  role="status"
+                >
+                  {liveness.isWorking ? <ChatWorkSpinner /> : null}
+                  <span>{liveness.statusLabel}</span>
+                </span>
+              ) : null}
+            </div>
+            <div className="tl-cw-subtitle">
+              <span className="tl-cw-meta-item">
+                <FolderGit2 size={13} aria-hidden="true" />
+                <span>{chat.project_label}</span>
+              </span>
+            </div>
+          </div>
+
+          <div className="tl-cw-actions">
+            {onRefresh ? (
+              <IconButton
+                size="2"
+                variant="ghost"
+                color="gray"
+                aria-label="Refresh workspace"
+                onClick={onRefresh}
+              >
+                <RefreshCw size={14} aria-hidden="true" />
+              </IconButton>
+            ) : null}
+            <button
+              ref={backlogTriggerRef}
+              type="button"
+              className="tl-cw-btn"
+              aria-haspopup="dialog"
+              aria-expanded={backlogOpen}
+              onClick={() => setBacklogOpen(true)}
+            >
+              <History size={14} aria-hidden="true" />
+              <span>Backlog</span>
+              <span className="tl-cw-count" aria-label={`${backlogCount} backlog items`}>
+                {backlogCount}
+              </span>
+            </button>
+            {codexTargets && (onOpenScopedCodex || onOpenCodex) ? (
+              <button
+                type="button"
+                className="tl-cw-btn tl-cw-btn--primary"
+                disabled={codexOpenInFlight}
+                onClick={() => {
+                  if (onOpenScopedCodex) {
+                    onOpenScopedCodex(codexTargets.scoped);
+                  } else if (onOpenCodex) {
+                    onOpenCodex(codexTargets.legacy);
+                  }
+                }}
+              >
+                <ExternalLink size={14} aria-hidden="true" />
+                <span>{codexOpenInFlight ? 'Opening Codex…' : 'Open in Codex'}</span>
+              </button>
+            ) : null}
+          </div>
+        </header>
+      ) : (
+        <header className="tl-cw-header">
+          <div className="tl-cw-heading">
+            <h2 className="tl-cw-title">Workspace</h2>
+            <div className="tl-cw-subtitle">
+              <span>Select a chat to view its activity stream.</span>
+            </div>
+          </div>
+        </header>
+      )}
+
+      {chat && liveness.agents.length > 0 ? (
+        <ul className="tl-cw-agents" aria-label="Live agents">
+          {liveness.agents.map((agent) => (
+            <li
+              key={agent.key}
+              className="tl-cw-agent"
+              data-agent-role={agent.role}
+            >
+              <ChatWorkStatusDot tone="working" />
+              <span className="tl-cw-agent-role">{agent.roleLabel}</span>
+              <span className="tl-cw-agent-detail">{agent.detail}</span>
+              <ChatWorkSpinner small />
+            </li>
+          ))}
+        </ul>
+      ) : null}
+
+      <div className="tl-cw-stage">
+        <div
+          ref={streamRef}
+          className="tl-cw-stream-scroller"
+          data-chat-stream-scroller="true"
+          aria-label="Chat activity stream"
+          role="log"
+          tabIndex={0}
+          onScroll={handleStreamScroll}
+        >
+          <ol ref={listRef} className="tl-cw-stream-list">
+            {eventViews.map((event) => {
+              const note =
+                event.note !== null && event.note.trim() !== event.title.trim()
+                  ? event.note
+                  : null;
+              return (
+                <li
+                  key={event.key}
+                  className="tl-cw-event"
+                  data-tone={event.tone}
+                  data-item-id={event.eventId}
+                  data-chat-event-key={event.key}
+                  data-chat-event-id={event.eventId}
+                  data-chat-event-sequence={event.sequence}
+                >
+                  <div className="tl-cw-event-meta">
+                    <ChatWorkStatusDot tone={event.tone} />
+                    <span className="tl-cw-event-action">{event.actionLabel}</span>
+                    <span className="tl-cw-event-time">
+                      {formatRelativeTimestamp(event.recordedAtMs, referenceNowMs)}
+                    </span>
+                  </div>
+                  <p className="tl-cw-event-title">
+                    {event.title.trim().length > 0 ? event.title : 'Untitled backlog item'}
+                  </p>
+                  {note !== null ? <p className="tl-cw-event-note">{note}</p> : null}
+                </li>
+              );
+            })}
+          </ol>
+
+          {eventViews.length === 0 ? (
+            <div className="tl-cw-empty" role="status">
+              {loading ? (
+                <>
+                  <Loader2 size={15} className="tl-spin" aria-hidden="true" />
+                  <span>Reading chat activity…</span>
+                </>
+              ) : error !== null ? (
+                <>
+                  <AlertCircle size={15} aria-hidden="true" />
+                  <span>Chat activity is unavailable until the next successful refresh.</span>
+                </>
+              ) : selection.availability === 'unavailable' ? (
+                <span>
+                  {selection.unavailableReason ?? 'Chat activity is unavailable.'}
+                </span>
+              ) : (
+                <span>No backlog activity is recorded for this chat yet.</span>
+              )}
+            </div>
+          ) : null}
+        </div>
+
+        {showJumpToLatest ? (
+          <button
+            type="button"
+            className="tl-cw-jump"
+            onClick={handleJumpToLatest}
+          >
+            Jump to latest
+          </button>
+        ) : null}
+      </div>
+
+      <Dialog.Root open={backlogOpen} onOpenChange={setBacklogOpen}>
+        <Dialog.Content
+          className="tl-cw-drawer-dialog"
+          aria-label="Backlog"
+          onCloseAutoFocus={(event) => {
+            event.preventDefault();
+            backlogTriggerRef.current?.focus();
+          }}
+        >
+          <header className="tl-cw-drawer-header">
+            <div>
+              <Dialog.Title className="tl-cw-drawer-title">Backlog</Dialog.Title>
+              <Dialog.Description className="tl-cw-drawer-description">
+                Read-only durable work for this chat.
+              </Dialog.Description>
+            </div>
+            <IconButton
+              size="2"
+              variant="ghost"
+              color="gray"
+              aria-label="Close backlog drawer"
+              onClick={() => setBacklogOpen(false)}
+            >
+              <X size={17} aria-hidden="true" />
+            </IconButton>
+          </header>
+
+          <div className="tl-cw-drawer-body">
+            {backlogGroups.map((group) => (
+              <section
+                key={group.status}
+                className="tl-cw-backlog-section"
+                aria-label={`${group.label} backlog items`}
+              >
+                <header className="tl-cw-backlog-heading">
+                  <ChatWorkStatusDot tone={backlogStatusTone(group.status)} />
+                  <h3>{BACKLOG_STATUS_LABELS[group.status]}</h3>
+                  <span className="tl-cw-backlog-count">{group.items.length}</span>
+                </header>
+
+                {group.items.length === 0 ? (
+                  <p className="tl-cw-backlog-empty">No {group.label.toLowerCase()} items.</p>
+                ) : (
+                  <div className="tl-cw-backlog-list">
+                    {group.items.map((item) => (
+                      <details
+                        key={item.key}
+                        className="tl-cw-backlog-item"
+                        data-backlog-item-id={item.itemId}
+                        data-status={item.status}
+                      >
+                        <summary className="tl-cw-backlog-summary">
+                          <ChatWorkStatusDot tone={item.statusTone} />
+                          <span className="tl-cw-backlog-title">{item.title}</span>
+                          <span className="tl-cw-backlog-kind">{item.kindLabel}</span>
+                        </summary>
+                        <div className="tl-cw-backlog-details">
+                          {item.status === 'blocked' ? (
+                            <p>
+                              <strong>Blocked reason</strong>
+                              <span>
+                                {item.blockedReason ??
+                                  'No blocked reason was recorded.'}
+                              </span>
+                            </p>
+                          ) : null}
+                          {item.acceptanceCondition !== null ? (
+                            <p>
+                              <strong>Acceptance</strong>
+                              <span>{item.acceptanceCondition}</span>
+                            </p>
+                          ) : null}
+                          {item.deliveryDescription !== null ? (
+                            <p>
+                              <strong>Delivery</strong>
+                              <span>{item.deliveryDescription}</span>
+                            </p>
+                          ) : null}
+                          {item.completionNote !== null ? (
+                            <p>
+                              <strong>Completion note</strong>
+                              <span>{item.completionNote}</span>
+                            </p>
+                          ) : null}
+                          {item.completionEvidence !== null ? (
+                            <p>
+                              <strong>Completion evidence</strong>
+                              <span>{item.completionEvidence}</span>
+                            </p>
+                          ) : null}
+                          {item.completedAtMs !== null ? (
+                            <p>
+                              <strong>Completed</strong>
+                              <span>
+                                {formatRelativeTimestamp(item.completedAtMs, referenceNowMs)}
+                              </span>
+                            </p>
+                          ) : null}
+                        </div>
+                      </details>
+                    ))}
+                  </div>
+                )}
+              </section>
+            ))}
+
+            {selection.notices.length > 0 ? (
+              <div className="tl-cw-bounds" role="status">
+                {selection.notices.map((notice) => (
+                  <p key={notice}>{notice}</p>
+                ))}
+              </div>
+            ) : null}
+          </div>
+        </Dialog.Content>
+      </Dialog.Root>
+    </div>
   );
 }
 

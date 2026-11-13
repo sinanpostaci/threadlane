@@ -5,6 +5,8 @@ import type {
 } from './observation/types.ts';
 import type { ActivityFeedScope } from './pages/activity-feed-model.ts';
 import {
+  WORKSPACE_SAMPLE_STALE_THRESHOLD_MS,
+  evaluateWorkspaceNativeSampleAt,
   formatWorkspaceChatIdentityKey,
   isValidWorkspaceChatIdentity,
   workspaceChatIdentitiesEqual,
@@ -12,13 +14,15 @@ import {
 import type {
   WorkspaceChatIdentity,
   WorkspaceChatSummary,
+  WorkspaceChatWork,
   WorkspaceJobHistory,
   WorkspaceMessageItem,
+  WorkspaceNativeSample,
 } from './workspace-contract.ts';
 
 /**
  * Pixel distance from the scrollport bottom within which the viewport is
- * considered pinned to the end (`follow` mode).
+ * considered pinned to the end (`follow` mode). Shared by the chat-work stream.
  */
 export const DEFAULT_BOTTOM_FOLLOW_THRESHOLD_PX = 32 as const;
 
@@ -30,6 +34,888 @@ export const MAX_TRACKED_SEEN_MESSAGE_IDS = 4_096 as const;
 
 const UTF8_ENCODER = new TextEncoder();
 const VISIBILITY_EPSILON_PX = 0.5;
+
+// ---------------------------------------------------------------------------
+// Minimal Chat Work: frozen `WorkspaceSnapshot.chat_work` consumption
+// ---------------------------------------------------------------------------
+
+/**
+ * UI-side bounds mirroring the frozen `WorkspaceSnapshot.chat_work` contract.
+ * The runtime projection owns authoritative truncation; these limits only keep
+ * malformed or unnormalized payloads from growing the desktop view past the
+ * agreed bounded windows.
+ */
+export const MAX_CHAT_WORK_ITEMS = 200 as const;
+export const MAX_CHAT_WORK_EVENTS = 500 as const;
+export const MAX_CHAT_WORK_PRESENCE = 32 as const;
+
+export type ChatWorkItem = WorkspaceChatWork['items'][number];
+export type ChatWorkEvent = WorkspaceChatWork['events'][number];
+export type ChatWorkPresence = WorkspaceChatWork['worker_presence'][number];
+export type ChatWorkStatus = ChatWorkItem['status'];
+export type ChatWorkKind = ChatWorkItem['kind'];
+export type ChatWorkEventOutcome = ChatWorkEvent['outcome'];
+export type ChatWorkTone =
+  | 'working'
+  | 'attention'
+  | 'danger'
+  | 'success'
+  | 'neutral';
+
+export const BACKLOG_STATUS_ORDER = ['todo', 'doing', 'done', 'blocked'] as const;
+
+export const BACKLOG_STATUS_LABELS: Readonly<Record<ChatWorkStatus, string>> = {
+  todo: 'Todo',
+  doing: 'Doing',
+  done: 'Done',
+  blocked: 'Blocked',
+};
+
+const BACKLOG_STATUS_TONES: Readonly<Record<ChatWorkStatus, ChatWorkTone>> = {
+  todo: 'neutral',
+  doing: 'working',
+  done: 'success',
+  blocked: 'danger',
+};
+
+const BACKLOG_KIND_LABELS: Readonly<Record<ChatWorkKind, string>> = {
+  worker: 'Worker',
+  coworker: 'Coworker',
+};
+
+const CHAT_WORK_ACTION_LABELS: Readonly<Record<string, string>> = {
+  created: 'Added',
+  edited: 'Updated',
+  started: 'Started',
+  blocked: 'Blocked',
+  completed: 'Done',
+  worker_reserved: 'Preparing',
+  worker_execution_attached: 'Worker dispatched',
+  worker_outcome_recorded: 'Result recorded',
+};
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+type ChatWorkCandidate = Record<string, unknown> & {
+  readonly identity: WorkspaceChatIdentity;
+};
+
+function isChatWorkCandidate(value: unknown): value is ChatWorkCandidate {
+  return isRecord(value) && isValidWorkspaceChatIdentity(value.identity);
+}
+
+function chatWorkCandidates(value: unknown): ChatWorkCandidate[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  const candidates: ChatWorkCandidate[] = [];
+  const values: readonly unknown[] = value;
+  for (const candidate of values) {
+    if (isChatWorkCandidate(candidate)) {
+      candidates.push(candidate);
+    }
+  }
+  return candidates;
+}
+
+function isNativeSampleCandidate(value: unknown): value is WorkspaceNativeSample {
+  // The canonical chat identity is the only trusted key here. Every remaining
+  // field is re-validated and normalized by evaluateWorkspaceNativeSampleAt.
+  return isRecord(value) && isValidWorkspaceChatIdentity(value.chat_identity);
+}
+
+function nativeSampleCandidates(value: unknown): WorkspaceNativeSample[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  const samples: WorkspaceNativeSample[] = [];
+  const values: readonly unknown[] = value;
+  for (const candidate of values) {
+    if (isNativeSampleCandidate(candidate)) {
+      samples.push(candidate);
+    }
+  }
+  return samples;
+}
+
+function cleanNonNegativeInt(value: unknown, fallback = 0): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    return fallback;
+  }
+  const truncated = Math.trunc(value);
+  return truncated >= 0 ? truncated : fallback;
+}
+
+function cleanOptionalTimestamp(value: unknown): number | null {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    return null;
+  }
+  const truncated = Math.trunc(value);
+  return truncated >= 0 ? truncated : null;
+}
+
+function cleanOptionalString(value: unknown): string | null {
+  if (typeof value !== 'string') {
+    return null;
+  }
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? value : null;
+}
+
+function isBacklogStatus(value: unknown): value is ChatWorkStatus {
+  return (
+    value === 'todo' || value === 'doing' || value === 'done' || value === 'blocked'
+  );
+}
+
+function isBacklogKind(value: unknown): value is ChatWorkKind {
+  return value === 'worker' || value === 'coworker';
+}
+
+function isUsableChatWorkItem(item: unknown): item is ChatWorkItem {
+  if (!isRecord(item)) {
+    return false;
+  }
+  return (
+    typeof item.item_id === 'string' &&
+    item.item_id.trim().length > 0 &&
+    typeof item.binding_id === 'string' &&
+    item.binding_id.trim().length > 0 &&
+    typeof item.title === 'string' &&
+    typeof item.revision === 'number' &&
+    Number.isFinite(item.revision) &&
+    isBacklogStatus(item.status) &&
+    isBacklogKind(item.kind)
+  );
+}
+
+function isUsableChatWorkEvent(event: unknown): event is ChatWorkEvent {
+  if (!isRecord(event)) {
+    return false;
+  }
+  return (
+    typeof event.event_id === 'string' &&
+    event.event_id.trim().length > 0 &&
+    typeof event.item_id === 'string' &&
+    event.item_id.trim().length > 0 &&
+    typeof event.sequence === 'number' &&
+    Number.isFinite(event.sequence) &&
+    Number.isInteger(event.sequence) &&
+    event.sequence >= 0 &&
+    typeof event.action === 'string' &&
+    event.action.trim().length > 0 &&
+    typeof event.revision === 'number' &&
+    Number.isFinite(event.revision) &&
+    typeof event.recorded_at_ms === 'number' &&
+    Number.isFinite(event.recorded_at_ms) &&
+    isBacklogStatus(event.status)
+  );
+}
+
+function isUsableChatWorkPresence(presence: unknown): presence is ChatWorkPresence {
+  if (!isRecord(presence)) {
+    return false;
+  }
+  return (
+    typeof presence.item_id === 'string' &&
+    presence.item_id.trim().length > 0 &&
+    typeof presence.execution_ref === 'string' &&
+    presence.execution_ref.trim().length > 0
+  );
+}
+
+function compareChatWorkEvents(left: ChatWorkEvent, right: ChatWorkEvent): number {
+  if (left.sequence !== right.sequence) {
+    return left.sequence - right.sequence;
+  }
+  const leftRecorded = cleanOptionalTimestamp(left.recorded_at_ms) ?? 0;
+  const rightRecorded = cleanOptionalTimestamp(right.recorded_at_ms) ?? 0;
+  if (leftRecorded !== rightRecorded) {
+    return leftRecorded - rightRecorded;
+  }
+  if (left.event_id !== right.event_id) {
+    return left.event_id < right.event_id ? -1 : 1;
+  }
+  return left.revision - right.revision;
+}
+
+function capChatWorkTail<T>(
+  items: readonly T[],
+  max: number,
+): { items: T[]; omitted: number } {
+  if (items.length <= max) {
+    return { items: Array.from(items), omitted: 0 };
+  }
+  const omitted = items.length - max;
+  return { items: Array.from(items.slice(omitted)), omitted };
+}
+
+function capChatWorkHead<T>(
+  items: readonly T[],
+  max: number,
+): { items: T[]; omitted: number } {
+  if (items.length <= max) {
+    return { items: Array.from(items), omitted: 0 };
+  }
+  return { items: Array.from(items.slice(0, max)), omitted: items.length - max };
+}
+
+export interface ChatWorkBoundsView {
+  itemsOmitted: number;
+  eventsOmitted: number;
+  presenceOmitted: number;
+}
+
+export interface WorkspaceChatWorkSelection {
+  chatKey: string | null;
+  identity: WorkspaceChatIdentity | null;
+  availability: 'available' | 'unavailable';
+  items: ChatWorkItem[];
+  events: ChatWorkEvent[];
+  presence: ChatWorkPresence[];
+  bounds: ChatWorkBoundsView;
+  notices: string[];
+  unavailableReason: string | null;
+}
+
+function emptyChatWorkSelection(
+  identity: WorkspaceChatIdentity | null,
+  reason: string | null,
+): WorkspaceChatWorkSelection {
+  return {
+    chatKey: identity !== null ? formatWorkspaceChatIdentityKey(identity) : null,
+    identity,
+    availability: 'unavailable',
+    items: [],
+    events: [],
+    presence: [],
+    bounds: { itemsOmitted: 0, eventsOmitted: 0, presenceOmitted: 0 },
+    notices: reason !== null ? [reason] : [],
+    unavailableReason: reason,
+  };
+}
+
+/**
+ * Reads the additive `WorkspaceSnapshot.chat_work` section without requiring the
+ * shared DTO integration to be present in this frontend worktree. Missing data
+ * is treated as unavailable, never as inferred legacy job/message state.
+ */
+export function readWorkspaceChatWork(snapshot: unknown): readonly ChatWorkCandidate[] {
+  if (!isRecord(snapshot)) {
+    return [];
+  }
+  return chatWorkCandidates(snapshot.chat_work);
+}
+
+function buildChatWorkSelectionFromWork(
+  identity: WorkspaceChatIdentity,
+  work: ChatWorkCandidate,
+): WorkspaceChatWorkSelection {
+  const chatKey = formatWorkspaceChatIdentityKey(identity);
+  const rawBounds: Record<string, unknown> = isRecord(work.bounds) ? work.bounds : {};
+  const availability: 'available' | 'unavailable' =
+    work.availability === 'available' ? 'available' : 'unavailable';
+
+  const rawItems: readonly unknown[] = Array.isArray(work.items) ? work.items : [];
+  const usableItems = rawItems.filter(isUsableChatWorkItem);
+  const itemCap = capChatWorkHead(usableItems, MAX_CHAT_WORK_ITEMS);
+
+  const rawEvents: readonly unknown[] = Array.isArray(work.events) ? work.events : [];
+  const usableEvents = rawEvents.filter(isUsableChatWorkEvent).sort(compareChatWorkEvents);
+  const dedupedEvents: ChatWorkEvent[] = [];
+  const seenEventIds = new Set<string>();
+  for (const event of usableEvents) {
+    if (seenEventIds.has(event.event_id)) {
+      continue;
+    }
+    seenEventIds.add(event.event_id);
+    dedupedEvents.push(event);
+  }
+  const eventCap = capChatWorkTail(dedupedEvents, MAX_CHAT_WORK_EVENTS);
+
+  const rawPresence: readonly unknown[] = Array.isArray(work.worker_presence)
+    ? work.worker_presence
+    : [];
+  const usablePresence = rawPresence
+    .filter(isUsableChatWorkPresence)
+    .sort((left, right) => {
+      const leftPriority =
+        (left.live === true ? 4 : 0) +
+        (left.freshness === 'fresh' ? 2 : 0) +
+        (left.availability === 'live' ? 1 : 0);
+      const rightPriority =
+        (right.live === true ? 4 : 0) +
+        (right.freshness === 'fresh' ? 2 : 0) +
+        (right.availability === 'live' ? 1 : 0);
+      if (leftPriority !== rightPriority) {
+        return rightPriority - leftPriority;
+      }
+      if (left.item_id !== right.item_id) {
+        return left.item_id < right.item_id ? -1 : 1;
+      }
+      return left.execution_ref < right.execution_ref ? -1 : 1;
+    });
+  const presenceCap = capChatWorkHead(usablePresence, MAX_CHAT_WORK_PRESENCE);
+
+  const itemsOmitted =
+    cleanNonNegativeInt(rawBounds.items_omitted) +
+    (rawItems.length - usableItems.length) +
+    itemCap.omitted;
+  const eventsOmitted =
+    cleanNonNegativeInt(rawBounds.events_omitted) +
+    (rawEvents.length - usableEvents.length) +
+    eventCap.omitted;
+  const presenceOmitted =
+    cleanNonNegativeInt(rawBounds.presence_omitted) +
+    (rawPresence.length - usablePresence.length) +
+    presenceCap.omitted;
+
+  const notices: string[] = [];
+  if (availability === 'unavailable') {
+    notices.push('Backlog data is currently unavailable for this chat.');
+  }
+  if (itemsOmitted > 0) {
+    notices.push(
+      `${itemsOmitted} older backlog ${itemsOmitted === 1 ? 'item is' : 'items are'} outside this bounded window.`,
+    );
+  }
+  if (eventsOmitted > 0) {
+    notices.push(
+      `${eventsOmitted} older stream ${eventsOmitted === 1 ? 'event is' : 'events are'} outside this bounded window.`,
+    );
+  }
+  if (presenceOmitted > 0) {
+    notices.push(
+      `${presenceOmitted} worker presence ${presenceOmitted === 1 ? 'record is' : 'records are'} outside this bounded window.`,
+    );
+  }
+
+  return {
+    chatKey,
+    identity,
+    availability,
+    items: itemCap.items,
+    events: eventCap.items,
+    presence: presenceCap.items,
+    bounds: { itemsOmitted, eventsOmitted, presenceOmitted },
+    notices,
+    unavailableReason:
+      availability === 'unavailable'
+        ? 'Backlog data is currently unavailable for this chat.'
+        : null,
+  };
+}
+
+/**
+ * Selects the exact canonical chat identity. Titles, project labels, binding
+ * suffixes, session ids, and job ids are never used as identity substitutes.
+ */
+export function selectWorkspaceChatWork(
+  chatWork: unknown,
+  identity: WorkspaceChatIdentity | null | undefined,
+): WorkspaceChatWorkSelection {
+  if (identity === null || identity === undefined || !isValidWorkspaceChatIdentity(identity)) {
+    return emptyChatWorkSelection(null, 'Chat identity is unavailable.');
+  }
+  for (const candidate of chatWorkCandidates(chatWork)) {
+    if (workspaceChatIdentitiesEqual(candidate.identity, identity)) {
+      return buildChatWorkSelectionFromWork(candidate.identity, candidate);
+    }
+  }
+  return emptyChatWorkSelection(identity, 'No backlog data is recorded for this chat yet.');
+}
+
+export interface ChatWorkEventView {
+  key: string;
+  eventId: string;
+  sequence: number;
+  itemId: string;
+  revision: number;
+  action: string;
+  actionLabel: string;
+  recordedAtMs: number;
+  title: string;
+  status: ChatWorkStatus;
+  statusLabel: string;
+  executionRef: string | null;
+  outcome: ChatWorkEventOutcome;
+  note: string | null;
+  tone: ChatWorkTone;
+}
+
+function humanizeChatWorkAction(action: string): string {
+  const words = action.replace(/[_-]+/g, ' ').trim();
+  if (words.length === 0) {
+    return 'Updated';
+  }
+  return `${words.charAt(0).toUpperCase()}${words.slice(1)}`;
+}
+
+function resolveChatWorkActionLabel(event: ChatWorkEvent): string {
+  if (event.action === 'worker_outcome_recorded') {
+    if (event.outcome === 'success') {
+      return 'Awaiting check';
+    }
+    if (event.outcome === 'failure') {
+      return 'Failed';
+    }
+    if (event.outcome === 'unknown') {
+      return 'Outcome unknown';
+    }
+    return 'Result recorded';
+  }
+  return CHAT_WORK_ACTION_LABELS[event.action] ?? humanizeChatWorkAction(event.action);
+}
+
+function resolveChatWorkEventTone(event: ChatWorkEvent): ChatWorkTone {
+  if (event.status === 'done' || event.action === 'completed') {
+    return 'success';
+  }
+  if (event.status === 'blocked' || event.action === 'blocked') {
+    return 'danger';
+  }
+  if (event.action === 'worker_outcome_recorded') {
+    if (event.outcome === 'success') {
+      return 'success';
+    }
+    if (event.outcome === 'failure') {
+      return 'danger';
+    }
+    return 'neutral';
+  }
+  // Reservations, Doing, edits, and dispatch receipts never use Working or
+  // attention tones; only actual live presence may do that elsewhere.
+  return 'neutral';
+}
+
+/**
+ * Builds the chronological stream oldest to newest. Only the actual
+ * `worker_outcome_recorded` event may carry an outcome; a later durable result
+ * is never projected backwards onto earlier reservation or completion events.
+ */
+export function buildChatWorkEventViews(
+  selection: WorkspaceChatWorkSelection,
+): ChatWorkEventView[] {
+  const chatKey = selection.chatKey ?? 'unscoped';
+  return selection.events.map((event) => {
+    const title = typeof event.title === 'string' ? event.title : '';
+    return {
+      key: `${chatKey}\u0000${event.event_id}\u0000${event.sequence}`,
+      eventId: event.event_id,
+      sequence: event.sequence,
+      itemId: event.item_id,
+      revision: event.revision,
+      action: event.action,
+      actionLabel: resolveChatWorkActionLabel(event),
+      recordedAtMs: cleanOptionalTimestamp(event.recorded_at_ms) ?? 0,
+      title,
+      status: event.status,
+      statusLabel: BACKLOG_STATUS_LABELS[event.status],
+      executionRef: cleanOptionalString(event.execution_ref),
+      outcome: event.action === 'worker_outcome_recorded' ? event.outcome : null,
+      note: cleanOptionalString(event.note),
+      tone: resolveChatWorkEventTone(event),
+    };
+  });
+}
+
+export interface ChatWorkBacklogItemView {
+  key: string;
+  itemId: string;
+  revision: number;
+  title: string;
+  kind: ChatWorkKind;
+  kindLabel: string;
+  status: ChatWorkStatus;
+  statusLabel: string;
+  statusTone: ChatWorkTone;
+  blockedReason: string | null;
+  acceptanceCondition: string | null;
+  deliveryDescription: string | null;
+  completionNote: string | null;
+  completionEvidence: string | null;
+  completedAtMs: number | null;
+  updatedAtMs: number | null;
+}
+
+export interface ChatWorkBacklogGroup {
+  status: ChatWorkStatus;
+  label: string;
+  items: ChatWorkBacklogItemView[];
+}
+
+function buildChatWorkBacklogItemView(
+  item: ChatWorkItem,
+  chatKey: string | null,
+): ChatWorkBacklogItemView {
+  return {
+    key: `${chatKey ?? 'unscoped'}\u0000${item.item_id}\u0000${item.revision}`,
+    itemId: item.item_id,
+    revision: item.revision,
+    title: typeof item.title === 'string' ? item.title : '',
+    kind: item.kind,
+    kindLabel: BACKLOG_KIND_LABELS[item.kind],
+    status: item.status,
+    statusLabel: BACKLOG_STATUS_LABELS[item.status],
+    statusTone: BACKLOG_STATUS_TONES[item.status],
+    blockedReason: cleanOptionalString(item.blocked_reason),
+    acceptanceCondition: cleanOptionalString(item.acceptance_condition),
+    deliveryDescription: cleanOptionalString(item.delivery_description),
+    completionNote: cleanOptionalString(item.completion_note),
+    completionEvidence: cleanOptionalString(item.completion_evidence),
+    completedAtMs: cleanOptionalTimestamp(item.completed_at_ms),
+    updatedAtMs: cleanOptionalTimestamp(item.updated_at_ms),
+  };
+}
+
+export function buildChatWorkBacklogGroups(
+  selection: WorkspaceChatWorkSelection,
+): ChatWorkBacklogGroup[] {
+  const items = selection.items.map((item) =>
+    buildChatWorkBacklogItemView(item, selection.chatKey),
+  );
+  return BACKLOG_STATUS_ORDER.map((status) => ({
+    status,
+    label: BACKLOG_STATUS_LABELS[status],
+    items: items.filter((item) => item.status === status),
+  }));
+}
+
+export function backlogStatusTone(status: ChatWorkStatus): ChatWorkTone {
+  return BACKLOG_STATUS_TONES[status];
+}
+
+export interface ChatWorkAgentView {
+  key: string;
+  role: 'coworker' | 'worker';
+  roleLabel: 'Coworker' | 'Worker';
+  detail: string;
+  itemId: string | null;
+  working: boolean;
+}
+
+export interface ChatWorkLiveness {
+  chatKey: string | null;
+  identity: WorkspaceChatIdentity | null;
+  workAvailable: boolean;
+  items: ChatWorkItem[];
+  events: ChatWorkEvent[];
+  presence: ChatWorkPresence[];
+  bounds: ChatWorkBoundsView;
+  notices: string[];
+  coworker: {
+    samplePresent: boolean;
+    availability: string;
+    activity: string;
+    freshness: string;
+    live: boolean;
+    waitingForHuman: boolean;
+  };
+  agents: ChatWorkAgentView[];
+  workingAgentCount: number;
+  isWorking: boolean;
+  waitingForHuman: boolean;
+  statusLabel: string | null;
+  statusTone: ChatWorkTone;
+}
+
+export interface ChatWorkLivenessOptions {
+  nowMs: number;
+  staleThresholdMs?: number;
+  isStale?: boolean;
+  refreshFailed?: boolean;
+}
+
+function isLiveChatWorkWorkerPresence(
+  presence: ChatWorkPresence,
+  item: ChatWorkItem,
+  nowMs: number,
+): boolean {
+  if (item.status !== 'doing' || item.current_execution_ref === null) {
+    return false;
+  }
+  if (presence.execution_ref !== item.current_execution_ref) {
+    return false;
+  }
+  if (presence.live !== true || presence.availability !== 'live') {
+    return false;
+  }
+  if (presence.freshness !== 'fresh') {
+    return false;
+  }
+  if (!Number.isFinite(nowMs)) {
+    return false;
+  }
+  const sampledAtMs = cleanOptionalTimestamp(presence.sampled_at_ms);
+  const sampleAgeMs = cleanOptionalTimestamp(presence.sample_age_ms);
+  const maxSampleAgeMs = cleanOptionalTimestamp(presence.max_sample_age_ms);
+  const expiresAtMs = cleanOptionalTimestamp(presence.expires_at_ms);
+  if (
+    sampledAtMs === null ||
+    sampledAtMs <= 0 ||
+    sampleAgeMs === null ||
+    maxSampleAgeMs === null ||
+    maxSampleAgeMs <= 0 ||
+    expiresAtMs === null ||
+    expiresAtMs <= 0
+  ) {
+    return false;
+  }
+
+  // Age the original wall-clock sample. A static `sample_age_ms` carried by an
+  // old snapshot (or a re-rendered/refreshed snapshot without a new sample) must
+  // never keep a Worker looking fresh.
+  const currentAgeMs = nowMs - sampledAtMs;
+  if (currentAgeMs < 0 || currentAgeMs > maxSampleAgeMs) {
+    return false;
+  }
+  if (sampleAgeMs > maxSampleAgeMs) {
+    return false;
+  }
+
+  // The deadline is mandatory and must be a real future instant that agrees
+  // with the sample and its freshness TTL. Missing, already-expired, or
+  // overlong/inconsistent deadlines fail closed.
+  if (expiresAtMs <= sampledAtMs || nowMs >= expiresAtMs) {
+    return false;
+  }
+  const latestConsistentDeadlineMs = sampledAtMs + maxSampleAgeMs;
+  if (
+    !Number.isFinite(latestConsistentDeadlineMs) ||
+    expiresAtMs > latestConsistentDeadlineMs
+  ) {
+    return false;
+  }
+  return true;
+}
+
+function collectLiveChatWorkWorkerAgents(
+  selection: WorkspaceChatWorkSelection,
+  nowMs: number,
+): ChatWorkAgentView[] {
+  if (selection.availability !== 'available' || selection.identity === null) {
+    return [];
+  }
+  const expectedBindingId = selection.identity.binding_id;
+  const itemsById = new Map<string, ChatWorkItem>();
+  for (const item of selection.items) {
+    itemsById.set(item.item_id, item);
+  }
+  const agents: ChatWorkAgentView[] = [];
+  const seen = new Set<string>();
+  for (const presence of selection.presence) {
+    const item = itemsById.get(presence.item_id);
+    if (
+      !item ||
+      item.binding_id !== expectedBindingId ||
+      !isLiveChatWorkWorkerPresence(presence, item, nowMs)
+    ) {
+      continue;
+    }
+    const key = `${selection.chatKey ?? 'unscoped'}\u0000worker\u0000${item.item_id}\u0000${item.current_execution_ref ?? ''}`;
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    agents.push({
+      key,
+      role: 'worker',
+      roleLabel: 'Worker',
+      detail: item.title,
+      itemId: item.item_id,
+      working: true,
+    });
+  }
+  return agents;
+}
+
+/**
+ * Derives liveness and `NeedsYou` only from actual fresh native samples and
+ * exactly correlated host-adapter worker presence. Durable backlog state such as
+ * Doing, Blocked, Done, a failure, or an awaiting-check outcome is never used as
+ * a liveness or human-request substitute.
+ */
+export function evaluateChatWorkLiveness(
+  selection: WorkspaceChatWorkSelection,
+  nativeSample: WorkspaceNativeSample | null | undefined,
+  options: ChatWorkLivenessOptions,
+): ChatWorkLiveness {
+  const nowMs = Number.isFinite(options.nowMs) ? Math.trunc(options.nowMs) : Date.now();
+  const staleThresholdMs =
+    typeof options.staleThresholdMs === 'number' && options.staleThresholdMs > 0
+      ? options.staleThresholdMs
+      : WORKSPACE_SAMPLE_STALE_THRESHOLD_MS;
+  const suppressed = Boolean(options.isStale || options.refreshFailed);
+
+  const evaluated =
+    nativeSample !== null && nativeSample !== undefined
+      ? evaluateWorkspaceNativeSampleAt(nativeSample, nowMs, staleThresholdMs)
+      : null;
+  const coworkerAvailability = evaluated?.effective_availability ?? 'unavailable';
+  const coworkerActivity = evaluated?.effective_activity ?? 'unknown';
+  const coworkerFreshness = evaluated?.freshness ?? 'unknown';
+  const coworkerLive =
+    !suppressed &&
+    coworkerAvailability === 'available' &&
+    coworkerActivity === 'working';
+  const coworkerWaiting =
+    !suppressed &&
+    coworkerAvailability === 'available' &&
+    coworkerFreshness === 'fresh' &&
+    (coworkerActivity === 'waiting_for_approval' ||
+      coworkerActivity === 'waiting_for_input');
+
+  const agents: ChatWorkAgentView[] = [];
+  if (coworkerLive) {
+    agents.push({
+      key: `${selection.chatKey ?? 'unscoped'}\u0000coworker`,
+      role: 'coworker',
+      roleLabel: 'Coworker',
+      detail: 'Working in Codex',
+      itemId: null,
+      working: true,
+    });
+  }
+  if (!suppressed) {
+    agents.push(...collectLiveChatWorkWorkerAgents(selection, nowMs));
+  }
+
+  const workingAgentCount = agents.filter((agent) => agent.working).length;
+  const isWorking = workingAgentCount > 0;
+  const waitingForHuman = coworkerWaiting;
+  const hasFreshNativeChat =
+    !suppressed &&
+    coworkerAvailability === 'available' &&
+    coworkerFreshness === 'fresh';
+  const statusLabel = waitingForHuman
+    ? 'Waiting for you in Codex'
+    : isWorking
+      ? 'Working'
+      : hasFreshNativeChat
+        ? 'Codex chat'
+        : null;
+  const statusTone: ChatWorkTone = waitingForHuman
+    ? 'attention'
+    : isWorking
+      ? 'working'
+      : 'neutral';
+
+  return {
+    chatKey: selection.chatKey,
+    identity: selection.identity,
+    workAvailable: selection.availability === 'available',
+    items: selection.items,
+    events: selection.events,
+    presence: selection.presence,
+    bounds: selection.bounds,
+    notices: selection.notices,
+    coworker: {
+      samplePresent: nativeSample !== null && nativeSample !== undefined,
+      availability: coworkerAvailability,
+      activity: coworkerActivity,
+      freshness: coworkerFreshness,
+      live: coworkerLive,
+      waitingForHuman: coworkerWaiting,
+    },
+    agents,
+    workingAgentCount,
+    isWorking,
+    waitingForHuman,
+    statusLabel,
+    statusTone,
+  };
+}
+
+/**
+ * Builds one exact-identity liveness entry per discovered chat. Native samples
+ * without a chat_work entry remain visible as Coworker state; chat_work without
+ * a native sample keeps durable backlog but no inferred Working/NeedsYou.
+ */
+export function buildChatWorkLivenessIndex(
+  chatWork: unknown,
+  nativeSamples: unknown,
+  options: ChatWorkLivenessOptions,
+): Map<string, ChatWorkLiveness> {
+  const workByKey = new Map<string, ChatWorkCandidate>();
+  for (const work of chatWorkCandidates(chatWork)) {
+    const key = formatWorkspaceChatIdentityKey(work.identity);
+    if (key !== null && !workByKey.has(key)) {
+      workByKey.set(key, work);
+    }
+  }
+
+  const sampleByKey = new Map<string, WorkspaceNativeSample>();
+  for (const sample of nativeSampleCandidates(nativeSamples)) {
+    const key = formatWorkspaceChatIdentityKey(sample.chat_identity);
+    if (key !== null && !sampleByKey.has(key)) {
+      sampleByKey.set(key, sample);
+    }
+  }
+
+  const identities = new Map<string, WorkspaceChatIdentity>();
+  for (const [key, work] of workByKey) {
+    identities.set(key, work.identity);
+  }
+  for (const [key, sample] of sampleByKey) {
+    if (!identities.has(key)) {
+      identities.set(key, sample.chat_identity);
+    }
+  }
+
+  const index = new Map<string, ChatWorkLiveness>();
+  const orderedKeys = Array.from(identities.keys()).sort();
+  for (const key of orderedKeys) {
+    const identity = identities.get(key);
+    if (!identity) {
+      continue;
+    }
+    const work = workByKey.get(key);
+    const selection =
+      work !== undefined
+        ? buildChatWorkSelectionFromWork(identity, work)
+        : emptyChatWorkSelection(
+            identity,
+            'No backlog data is recorded for this chat yet.',
+          );
+    index.set(
+      key,
+      evaluateChatWorkLiveness(selection, sampleByKey.get(key) ?? null, options),
+    );
+  }
+  return index;
+}
+
+export interface ChatWorkLivenessSummary {
+  workingAgentCount: number;
+  workingChatCount: number;
+  waitingChatCount: number;
+}
+
+export function summarizeChatWorkLiveness(
+  index: ReadonlyMap<string, ChatWorkLiveness>,
+  chatKeys?: readonly string[],
+): ChatWorkLivenessSummary {
+  const keys = chatKeys !== undefined ? chatKeys : Array.from(index.keys());
+  let workingAgentCount = 0;
+  let workingChatCount = 0;
+  let waitingChatCount = 0;
+  for (const key of keys) {
+    const entry = index.get(key);
+    if (!entry) {
+      continue;
+    }
+    workingAgentCount += entry.workingAgentCount;
+    if (entry.isWorking) {
+      workingChatCount += 1;
+    }
+    if (entry.waitingForHuman) {
+      waitingChatCount += 1;
+    }
+  }
+  return { workingAgentCount, workingChatCount, waitingChatCount };
+}
 
 function compareStringsUtf8(left: string, right: string): number {
   if (left === right) {
@@ -423,23 +1309,20 @@ function resolveSurvivingAnchor(
   };
 }
 
+interface OrderedScrollSyncResult {
+  readonly state: MessageScrollState;
+  readonly action: MessageScrollAction;
+}
+
 /**
- * Reconciles incoming `WorkspaceMessageItem` records with the chat's current
- * scroll state:
- * - Orders items deterministically and deduplicates by `item_id`.
- * - In `follow` mode (including initial chat load), keeps viewport pinned to
- *   the bottom and marks all items as seen (`pendingNewCount === 0`).
- * - In `reading` mode, preserves the active anchor (falling back cleanly if
- *   head-trimming evicted the anchored item) and counts ONLY genuinely unseen
- *   `item_id`s toward `pendingNewCount`. Updating an already-known `item_id`
- *   never triggers `new-events`.
+ * Shared anchor-preserving reducer for an already-ordered stable item-id list.
+ * Message records and chat-work event views both use this implementation so
+ * append, head-trimming, follow/reading, and new-event behavior stay identical.
  */
-export function syncMessageScrollItems(
+function syncOrderedScrollItemIds(
   state: MessageScrollState,
-  items: readonly WorkspaceMessageItem[],
-): MessageScrollSyncResult {
-  const orderedItems = orderWorkspaceMessageItems(items);
-  const nextOrderedIds = orderedItems.map((item) => item.item_id);
+  nextOrderedIds: readonly string[],
+): OrderedScrollSyncResult {
   const nextIdSet = new Set(nextOrderedIds);
 
   if (!state.initialized || state.mode === 'follow') {
@@ -463,8 +1346,7 @@ export function syncMessageScrollItems(
     };
     return {
       state: nextState,
-      orderedItems,
-      action: orderedItems.length > 0 ? { kind: 'scroll_to_bottom' } : { kind: 'none' },
+      action: nextOrderedIds.length > 0 ? { kind: 'scroll_to_bottom' } : { kind: 'none' },
     };
   }
 
@@ -502,7 +1384,6 @@ export function syncMessageScrollItems(
 
   return {
     state: nextState,
-    orderedItems,
     action:
       resolvedAnchor !== null
         ? {
@@ -512,6 +1393,60 @@ export function syncMessageScrollItems(
           }
         : { kind: 'none' },
   };
+}
+
+/**
+ * Reconciles incoming `WorkspaceMessageItem` records with the chat's current
+ * scroll state:
+ * - Orders items deterministically and deduplicates by `item_id`.
+ * - In `follow` mode (including initial chat load), keeps viewport pinned to
+ *   the bottom and marks all items as seen (`pendingNewCount === 0`).
+ * - In `reading` mode, preserves the active anchor (falling back cleanly if
+ *   head-trimming evicted the anchored item) and counts ONLY genuinely unseen
+ *   `item_id`s toward `pendingNewCount`. Updating an already-known `item_id`
+ *   never triggers `new-events`.
+ */
+export function syncMessageScrollItems(
+  state: MessageScrollState,
+  items: readonly WorkspaceMessageItem[],
+): MessageScrollSyncResult {
+  const orderedItems = orderWorkspaceMessageItems(items);
+  const sync = syncOrderedScrollItemIds(
+    state,
+    orderedItems.map((item) => item.item_id),
+  );
+  return {
+    state: sync.state,
+    orderedItems,
+    action: sync.action,
+  };
+}
+
+export interface ChatWorkEventScrollSyncResult {
+  readonly state: MessageScrollState;
+  readonly action: MessageScrollAction;
+}
+
+/**
+ * Reconciles the minimal chat-work stream's chronological event views with the
+ * same tested message anchor reducer. `eventId` is the stable visible identity;
+ * appends and head-trimming never replace it with a viewport `scrollTop`.
+ */
+export function syncChatWorkEventScroll(
+  state: MessageScrollState,
+  events: readonly Pick<ChatWorkEventView, 'eventId'>[],
+): ChatWorkEventScrollSyncResult {
+  const seenIds = new Set<string>();
+  const orderedEventIds: string[] = [];
+  for (const event of events) {
+    const eventId = event.eventId;
+    if (typeof eventId !== 'string' || eventId.trim().length === 0 || seenIds.has(eventId)) {
+      continue;
+    }
+    seenIds.add(eventId);
+    orderedEventIds.push(eventId);
+  }
+  return syncOrderedScrollItemIds(state, orderedEventIds);
 }
 
 /**

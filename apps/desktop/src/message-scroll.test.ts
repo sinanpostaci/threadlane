@@ -3,6 +3,9 @@ import test from 'node:test';
 
 import {
   DEFAULT_BOTTOM_FOLLOW_THRESHOLD_PX,
+  buildChatWorkBacklogGroups,
+  buildChatWorkEventViews,
+  buildChatWorkLivenessIndex,
   captureFirstVisibleMessageAnchor,
   compareWorkspaceMessageItems,
   computeAnchorScrollTop,
@@ -12,6 +15,7 @@ import {
   doesJobBelongToChat,
   doesMessageBelongToChat,
   doesObservationRequestMatchChat,
+  evaluateChatWorkLiveness,
   filterJobsForChat,
   filterMessagesForChat,
   filterObservationRequestsForActivity,
@@ -22,14 +26,24 @@ import {
   jumpToLatestMessages,
   measureItemsFromContentOffsets,
   orderWorkspaceMessageItems,
+  readWorkspaceChatWork,
   resolveMessageScrollChatKey,
   resolveMessageViewportResize,
   resolveVerifiedChatJobIds,
+  selectWorkspaceChatWork,
   setChatScrollState,
+  summarizeChatWorkLiveness,
   switchMessageScrollChat,
+  syncChatWorkEventScroll,
   syncMessageScrollItems,
 } from './message-scroll.ts';
-import type { ContentOffsetMessageItem, MessageViewportMetrics } from './message-scroll.ts';
+import type {
+  ChatWorkEvent,
+  ChatWorkItem,
+  ChatWorkPresence,
+  ContentOffsetMessageItem,
+  MessageViewportMetrics,
+} from './message-scroll.ts';
 import type {
   ObservationJob,
   ObservationRequest,
@@ -40,13 +54,16 @@ import {
   createSafeWorkspaceMessageItem,
   normalizeWorkspaceChatSummary,
   normalizeWorkspaceJobHistory,
+  normalizeWorkspaceNativeSample,
   projectSafeWorkspaceMessages,
   validateWorkspaceChatIdentity,
 } from './workspace-contract.ts';
 import type {
   WorkspaceChatIdentity,
   WorkspaceChatSummary,
+  WorkspaceChatWork,
   WorkspaceMessageItem,
+  WorkspaceNativeSample,
   WorkspaceSafeMessageSourceKind,
 } from './workspace-contract.ts';
 
@@ -127,7 +144,7 @@ function makeMessage(options: {
 }
 
 function buildSimulatedLayout(
-  items: readonly WorkspaceMessageItem[],
+  items: readonly { item_id: string }[],
   heightsById: ReadonlyMap<string, number>,
   defaultHeightPx = 60,
   gapPx = 8,
@@ -1180,4 +1197,743 @@ test('doesObservationRequestMatchChat and filterObservationRequestsForActivity e
     }).map((req) => req.id),
     ['req_beta_job'],
   );
+});
+
+// ---------------------------------------------------------------------------
+// Minimal chat-work stream and backlog drawer contract
+// ---------------------------------------------------------------------------
+
+function makeChatWork(
+  identity: WorkspaceChatIdentity,
+  overrides: Partial<WorkspaceChatWork> = {},
+): WorkspaceChatWork {
+  return {
+    identity,
+    availability: 'available',
+    items: [],
+    events: [],
+    worker_presence: [],
+    bounds: { items_omitted: 0, events_omitted: 0, presence_omitted: 0 },
+    ...overrides,
+  } as unknown as WorkspaceChatWork;
+}
+
+function makeBacklogItem(overrides: Partial<ChatWorkItem> = {}): ChatWorkItem {
+  return {
+    item_id: 'blg_alpha',
+    binding_id: 'bnd_alpha',
+    revision: 1,
+    title: 'Implement the approved slice',
+    acceptance_condition: 'The approved slice is checked.',
+    delivery_description: 'A small reviewed change.',
+    kind: 'coworker',
+    status: 'todo',
+    blocked_reason: null,
+    current_execution_ref: null,
+    completion_note: null,
+    completion_evidence: null,
+    completed_at_ms: null,
+    created_at_ms: 1_000,
+    updated_at_ms: 1_000,
+    ...overrides,
+  } as ChatWorkItem;
+}
+
+function makeBacklogEvent(overrides: Partial<ChatWorkEvent> = {}): ChatWorkEvent {
+  return {
+    event_id: 'blg_alpha:1',
+    sequence: 1,
+    item_id: 'blg_alpha',
+    revision: 1,
+    action: 'created',
+    recorded_at_ms: 1_000,
+    title: 'Implement the approved slice',
+    status: 'todo',
+    execution_ref: null,
+    outcome: null,
+    note: null,
+    ...overrides,
+  } as ChatWorkEvent;
+}
+
+type ChatWorkPresenceFixtureOverrides = {
+  readonly [Key in keyof ChatWorkPresence]?: ChatWorkPresence[Key] | null;
+};
+
+function makePresence(
+  overrides: ChatWorkPresenceFixtureOverrides = {},
+): ChatWorkPresence {
+  const presence = {
+    item_id: 'blg_alpha',
+    execution_ref: 'exec-1',
+    approval_id: 'approval-1',
+    task_id: 'task-1',
+    run_id: 'run-1',
+    worker_id: 'worker-1',
+    claim_id: 'claim-1',
+    host_instance_id: 'host-1',
+    invocation_id: 'invocation-1',
+    sequence: 4,
+    availability: 'live',
+    freshness: 'fresh',
+    live: true,
+    sampled_at_ms: 10_000,
+    sample_age_ms: 100,
+    max_sample_age_ms: 5_000,
+    ...overrides,
+  } as ChatWorkPresence;
+  const sampledAtMs =
+    typeof presence.sampled_at_ms === 'number' ? presence.sampled_at_ms : 0;
+  const maxSampleAgeMs =
+    typeof presence.max_sample_age_ms === 'number' ? presence.max_sample_age_ms : 0;
+  return {
+    ...presence,
+    expires_at_ms:
+      overrides.expires_at_ms === undefined
+        ? sampledAtMs + maxSampleAgeMs
+        : overrides.expires_at_ms,
+  } as ChatWorkPresence;
+}
+
+function makeNativeSample(
+  identity: WorkspaceChatIdentity,
+  activity: 'working' | 'waiting_for_approval' | 'waiting_for_input' | 'idle',
+  observedAtMs = 10_000,
+  availability: 'available' | 'stale' | 'disconnected' | 'unavailable' = 'available',
+): WorkspaceNativeSample {
+  return normalizeWorkspaceNativeSample({
+    chat_identity: identity,
+    producer_epoch: 'epoch-test-1',
+    backend_process_instance: null,
+    sequence: 2,
+    observed_at_ms: observedAtMs,
+    last_success_at_ms: observedAtMs,
+    availability,
+    activity,
+    connection: {
+      state: 'connected',
+      freshness: 'fresh',
+      route: 'native-test',
+      diagnostic: null,
+    },
+    capabilities: {
+      exact_thread_read: 'supported',
+      activity_detail: 'supported',
+      configured_selection: 'supported',
+      wakeup_delivery: 'supported',
+      per_call_identity: 'supported',
+    },
+    configured_selection: {
+      selected_model: 'gpt-6-astra',
+      selected_effort: 'high',
+      evidence: 'verified_configuration',
+      counts_as_runtime_telemetry: false,
+    },
+  });
+}
+
+const CHAT_WORK_NOW_MS = 10_500;
+
+test('chat_work selection uses exact canonical identity and never falls back to legacy jobs or messages', () => {
+  const alphaIdentity = makeIdentity('bnd_alpha_chat_work', UUID_ALPHA);
+  const betaIdentity = makeIdentity('bnd_beta_chat_work', UUID_BETA);
+  const betaWork = makeChatWork(betaIdentity, {
+    items: [makeBacklogItem({ item_id: 'blg_beta' })],
+  });
+
+  const legacyShapedSnapshot = {
+    schema_version: 1,
+    generated_at_ms: CHAT_WORK_NOW_MS,
+    chats: [{ identity: alphaIdentity, thread_label: 'Alpha' }],
+    job_histories: [{ job: { job_id: 'job_legacy_alpha', title: 'Legacy job' } }],
+    messages: { items: [{ item_id: 'msg_legacy_alpha' }] },
+  };
+
+  assert.deepEqual(readWorkspaceChatWork(legacyShapedSnapshot), []);
+  const fallbackSelection = selectWorkspaceChatWork(
+    readWorkspaceChatWork(legacyShapedSnapshot),
+    alphaIdentity,
+  );
+  assert.equal(fallbackSelection.chatKey, resolveMessageScrollChatKey(alphaIdentity));
+  assert.equal(fallbackSelection.availability, 'unavailable');
+  assert.deepEqual(fallbackSelection.items, []);
+  assert.deepEqual(fallbackSelection.events, []);
+  assert.equal(fallbackSelection.unavailableReason, 'No backlog data is recorded for this chat yet.');
+
+  const isolated = selectWorkspaceChatWork([betaWork], alphaIdentity);
+  assert.equal(isolated.availability, 'unavailable');
+  assert.deepEqual(isolated.items, []);
+
+  const exact = selectWorkspaceChatWork([betaWork], betaIdentity);
+  assert.equal(exact.availability, 'available');
+  assert.deepEqual(exact.items.map((item) => item.item_id), ['blg_beta']);
+
+  const legacyLiveness = evaluateChatWorkLiveness(
+    fallbackSelection,
+    makeNativeSample(alphaIdentity, 'idle'),
+    { nowMs: CHAT_WORK_NOW_MS },
+  );
+  assert.equal(legacyLiveness.isWorking, false);
+  assert.equal(legacyLiveness.waitingForHuman, false);
+  assert.notEqual(
+    resolveMessageScrollChatKey({ ...alphaIdentity, binding_id: '' }),
+    resolveMessageScrollChatKey(alphaIdentity),
+  );
+});
+
+test('chat_work events order by actual history sequence, keep stable scoped keys, and only record actual outcomes once', () => {
+  const identity = makeIdentity('bnd_alpha_events', UUID_ALPHA);
+  const work = makeChatWork(identity, {
+    events: [
+      makeBacklogEvent({
+        event_id: 'blg_alpha:5',
+        sequence: 15,
+        revision: 5,
+        action: 'completed',
+        status: 'done',
+        recorded_at_ms: 1_500,
+        outcome: 'success',
+      }),
+      makeBacklogEvent({
+        event_id: 'blg_alpha:2',
+        sequence: 12,
+        revision: 2,
+        action: 'worker_reserved',
+        status: 'doing',
+        execution_ref: 'exec-1',
+        recorded_at_ms: 1_200,
+      }),
+      makeBacklogEvent({
+        event_id: 'blg_alpha:3',
+        sequence: 13,
+        revision: 3,
+        action: 'worker_outcome_recorded',
+        status: 'doing',
+        execution_ref: 'exec-1',
+        outcome: 'success',
+        recorded_at_ms: 1_300,
+        note: 'The Worker reported a successful result.',
+      }),
+      makeBacklogEvent({
+        event_id: 'blg_alpha:2',
+        sequence: 12,
+        revision: 2,
+        action: 'worker_reserved',
+        status: 'doing',
+        recorded_at_ms: 1_200,
+      }),
+      makeBacklogEvent({
+        event_id: 'blg_alpha:4',
+        sequence: 14,
+        revision: 4,
+        action: 'worker_outcome_recorded',
+        status: 'doing',
+        execution_ref: 'exec-1',
+        outcome: 'failure',
+        recorded_at_ms: 1_400,
+      }),
+    ],
+  });
+
+  const selection = selectWorkspaceChatWork([work], identity);
+  const views = buildChatWorkEventViews(selection);
+  assert.deepEqual(views.map((event) => event.sequence), [12, 13, 14, 15]);
+  assert.deepEqual(
+    views.map((event) => event.actionLabel),
+    ['Preparing', 'Awaiting check', 'Failed', 'Done'],
+  );
+  assert.equal(views[0]!.title, 'Implement the approved slice');
+  assert.equal(views[1]!.outcome, 'success');
+  assert.equal(views[3]!.outcome, null);
+  assert.equal(new Set(views.map((event) => event.key)).size, views.length);
+  assert.ok(views.every((event) => event.key.startsWith(`${resolveMessageScrollChatKey(identity)}\u0000`)));
+});
+
+test('chat_work liveness requires exact fresh worker presence and never uses Doing, Blocked, failure, or awaiting-check as Working/NeedsYou', () => {
+  const identity = makeIdentity('bnd_alpha_presence', UUID_ALPHA);
+  const doingItem = makeBacklogItem({
+    item_id: 'blg_worker',
+    binding_id: identity.binding_id,
+    kind: 'worker',
+    status: 'doing',
+    current_execution_ref: 'exec-1',
+    title: 'Run the isolated implementation pass',
+  });
+  const doneItem = makeBacklogItem({
+    item_id: 'blg_done',
+    binding_id: identity.binding_id,
+    kind: 'worker',
+    status: 'done',
+    current_execution_ref: 'exec-1',
+  });
+  const selection = selectWorkspaceChatWork(
+    [
+      makeChatWork(identity, {
+        items: [doingItem, doneItem],
+        worker_presence: [makePresence({ item_id: 'blg_worker' })],
+      }),
+    ],
+    identity,
+  );
+
+  const live = evaluateChatWorkLiveness(selection, null, { nowMs: CHAT_WORK_NOW_MS });
+  assert.equal(live.isWorking, true);
+  assert.equal(live.workingAgentCount, 1);
+  assert.equal(live.statusLabel, 'Working');
+  assert.equal(live.waitingForHuman, false);
+  assert.deepEqual(live.agents.map((agent) => agent.role), ['worker']);
+  assert.equal(live.agents[0]!.detail, 'Run the isolated implementation pass');
+
+  const noPresence = evaluateChatWorkLiveness(
+    selectWorkspaceChatWork([makeChatWork(identity, { items: [doingItem] })], identity),
+    null,
+    { nowMs: CHAT_WORK_NOW_MS },
+  );
+  assert.equal(noPresence.isWorking, false);
+  assert.equal(noPresence.waitingForHuman, false);
+  assert.equal(noPresence.statusLabel, null);
+
+  const mismatchedExecution = selectWorkspaceChatWork(
+    [
+      makeChatWork(identity, {
+        items: [doingItem],
+        worker_presence: [
+          makePresence({ item_id: 'blg_worker', execution_ref: 'exec-other' }),
+        ],
+      }),
+    ],
+    identity,
+  );
+  assert.equal(
+    evaluateChatWorkLiveness(mismatchedExecution, null, { nowMs: CHAT_WORK_NOW_MS }).isWorking,
+    false,
+  );
+
+  const wrongBinding = selectWorkspaceChatWork(
+    [
+      makeChatWork(identity, {
+        items: [{ ...doingItem, binding_id: 'bnd_other' }],
+        worker_presence: [makePresence({ item_id: 'blg_worker' })],
+      }),
+    ],
+    identity,
+  );
+  assert.equal(
+    evaluateChatWorkLiveness(wrongBinding, null, { nowMs: CHAT_WORK_NOW_MS }).isWorking,
+    false,
+  );
+
+  const stalePresence = selectWorkspaceChatWork(
+    [
+      makeChatWork(identity, {
+        items: [doingItem],
+        worker_presence: [makePresence({ item_id: 'blg_worker', freshness: 'stale' })],
+      }),
+    ],
+    identity,
+  );
+  assert.equal(
+    evaluateChatWorkLiveness(stalePresence, null, { nowMs: CHAT_WORK_NOW_MS }).isWorking,
+    false,
+  );
+
+  const expiredPresence = selectWorkspaceChatWork(
+    [
+      makeChatWork(identity, {
+        items: [doingItem],
+        worker_presence: [
+          makePresence({ item_id: 'blg_worker', expires_at_ms: CHAT_WORK_NOW_MS - 1 }),
+        ],
+      }),
+    ],
+    identity,
+  );
+  assert.equal(
+    evaluateChatWorkLiveness(expiredPresence, null, { nowMs: CHAT_WORK_NOW_MS }).isWorking,
+    false,
+  );
+
+  const failedRefresh = evaluateChatWorkLiveness(selection, null, {
+    nowMs: CHAT_WORK_NOW_MS,
+    isStale: true,
+  });
+  assert.equal(failedRefresh.isWorking, false);
+  assert.equal(failedRefresh.waitingForHuman, false);
+  // Durable backlog remains present after the live claim is cleared.
+  assert.deepEqual(failedRefresh.items.map((item) => item.item_id), ['blg_worker', 'blg_done']);
+});
+
+test('chat_work worker presence fails closed on missing, future, inconsistent, or aged samples', () => {
+  const identity = makeIdentity('bnd_alpha_presence_validation', UUID_ALPHA);
+  const doingItem = makeBacklogItem({
+    item_id: 'blg_worker',
+    binding_id: identity.binding_id,
+    kind: 'worker',
+    status: 'doing',
+    current_execution_ref: 'exec-1',
+  });
+  const livenessAt = (
+    overrides: ChatWorkPresenceFixtureOverrides,
+    nowMs: number = CHAT_WORK_NOW_MS,
+  ) => {
+    const selection = selectWorkspaceChatWork(
+      [
+        makeChatWork(identity, {
+          items: [doingItem],
+          worker_presence: [makePresence({ item_id: 'blg_worker', ...overrides })],
+        }),
+      ],
+      identity,
+    );
+    return evaluateChatWorkLiveness(selection, null, { nowMs });
+  };
+
+  assert.equal(livenessAt({}).isWorking, true);
+  assert.equal(livenessAt({ expires_at_ms: 10_501 }).isWorking, true);
+  assert.equal(livenessAt({ expires_at_ms: null }).isWorking, false);
+  assert.equal(livenessAt({ expires_at_ms: 9_999 }).isWorking, false);
+  assert.equal(livenessAt({ expires_at_ms: 15_001 }).isWorking, false);
+  assert.equal(livenessAt({ sampled_at_ms: null }).isWorking, false);
+  assert.equal(livenessAt({ sampled_at_ms: CHAT_WORK_NOW_MS + 1 }).isWorking, false);
+  assert.equal(livenessAt({ sample_age_ms: null }).isWorking, false);
+  assert.equal(livenessAt({ sample_age_ms: 5_001 }).isWorking, false);
+  assert.equal(livenessAt({ max_sample_age_ms: 0 }).isWorking, false);
+  assert.equal(livenessAt({ max_sample_age_ms: null }).isWorking, false);
+
+  // The original sample ages even when the static sample_age_ms stays small.
+  assert.equal(livenessAt({}, 10_000 + 5_000 + 1).isWorking, false);
+  assert.equal(livenessAt({ expires_at_ms: 20_000 }, 10_000 + 5_000 + 1).isWorking, false);
+});
+
+test('chat_work event stream preserves the visible event id and offset across appends and head trimming', () => {
+  const chatKey = 'wchat:event-anchor';
+  const eventIds = Array.from({ length: 15 }, (_, index) => `evt_${index}`);
+  const asEvents = (ids: readonly string[]) => ids.map((eventId) => ({ eventId }));
+  const asLayoutItems = (ids: readonly string[]) => ids.map((item_id) => ({ item_id }));
+
+  let state = createMessageScrollState(chatKey);
+  const initialSync = syncChatWorkEventScroll(state, asEvents(eventIds));
+  state = initialSync.state;
+  assert.equal(initialSync.action.kind, 'scroll_to_bottom');
+  assert.equal(state.mode, 'follow');
+
+  const clientHeight = 260;
+  const initialLayout = buildSimulatedLayout(asLayoutItems(eventIds), new Map(), 60, 8, 12, 12);
+  const readingScrollTop = 234;
+  state = handleMessageViewportScroll(
+    state,
+    {
+      scrollTop: readingScrollTop,
+      clientHeight,
+      scrollHeight: initialLayout.scrollHeight,
+    },
+    measureItemsFromContentOffsets(initialLayout.layoutItems, readingScrollTop),
+  );
+  assert.equal(state.mode, 'reading');
+  assert.deepEqual(state.anchor, { itemId: 'evt_3', offsetPx: -18 });
+
+  const appendedIds = [...eventIds, 'evt_15', 'evt_16'];
+  const appendSync = syncChatWorkEventScroll(state, asEvents(appendedIds));
+  state = appendSync.state;
+  assert.equal(appendSync.action.kind, 'preserve_anchor');
+  if (appendSync.action.kind === 'preserve_anchor') {
+    assert.equal(appendSync.action.anchorWasTrimmed, false);
+    assert.deepEqual(appendSync.action.anchor, { itemId: 'evt_3', offsetPx: -18 });
+  }
+  assert.equal(state.pendingNewCount, 2);
+
+  // Remove two events from the head while the anchor survives: the reducer
+  // must compensate the shifted content, not merely restore the old scrollTop.
+  const trimmedIds = appendedIds.slice(2);
+  const trimSync = syncChatWorkEventScroll(state, asEvents(trimmedIds));
+  state = trimSync.state;
+  assert.equal(trimSync.action.kind, 'preserve_anchor');
+  if (trimSync.action.kind === 'preserve_anchor') {
+    assert.equal(trimSync.action.anchorWasTrimmed, false);
+    assert.deepEqual(trimSync.action.anchor, { itemId: 'evt_3', offsetPx: -18 });
+  }
+
+  const trimmedLayout = buildSimulatedLayout(asLayoutItems(trimmedIds), new Map(), 60, 8, 12, 12);
+  const measuredBeforeCompensation = measureItemsFromContentOffsets(
+    trimmedLayout.layoutItems,
+    readingScrollTop,
+  );
+  const anchorBeforeCompensation = measuredBeforeCompensation.find(
+    (entry) => entry.itemId === 'evt_3',
+  )!;
+  const compensatedScrollTop = computeAnchorScrollTop(
+    {
+      scrollTop: readingScrollTop,
+      clientHeight,
+      scrollHeight: trimmedLayout.scrollHeight,
+    },
+    anchorBeforeCompensation.relativeTopPx,
+    state.anchor!.offsetPx,
+  );
+  assert.equal(compensatedScrollTop, readingScrollTop - 2 * 68);
+  const verifiedAfterTrim = measureItemsFromContentOffsets(
+    trimmedLayout.layoutItems,
+    compensatedScrollTop,
+  ).find((entry) => entry.itemId === 'evt_3')!;
+  assert.equal(verifiedAfterTrim.relativeTopPx, -18);
+
+  // If head trimming evicts the anchored event itself, fall back to the next
+  // surviving event with a zero offset.
+  const evictedIds = trimmedIds.slice(3);
+  const evictedSync = syncChatWorkEventScroll(state, asEvents(evictedIds));
+  assert.equal(evictedSync.state.mode, 'reading');
+  assert.equal(evictedSync.action.kind, 'preserve_anchor');
+  if (evictedSync.action.kind === 'preserve_anchor') {
+    assert.equal(evictedSync.action.anchorWasTrimmed, true);
+    assert.deepEqual(evictedSync.action.anchor, { itemId: 'evt_5', offsetPx: 0 });
+  }
+});
+
+test('chat_work event stream keeps per-chat anchors across chat switching', () => {
+  const alphaEvents = Array.from({ length: 8 }, (_, index) => ({
+    eventId: `alpha_${index}`,
+  }));
+  const betaEvents = [{ eventId: 'beta_0' }, { eventId: 'beta_1' }];
+  let store = createMessageScrollStore('wchat:alpha');
+
+  let alphaState = syncChatWorkEventScroll(
+    getActiveChatScrollState(store),
+    alphaEvents,
+  ).state;
+  const layout = buildSimulatedLayout(
+    alphaEvents.map((event) => ({ item_id: event.eventId })),
+    new Map(),
+    60,
+    8,
+    12,
+    12,
+  );
+  const readingScrollTop = 142;
+  alphaState = handleMessageViewportScroll(
+    alphaState,
+    { scrollTop: readingScrollTop, clientHeight: 200, scrollHeight: layout.scrollHeight },
+    measureItemsFromContentOffsets(layout.layoutItems, readingScrollTop),
+  );
+  assert.equal(alphaState.mode, 'reading');
+  store = setChatScrollState(store, alphaState);
+
+  store = switchMessageScrollChat(store, 'wchat:beta');
+  const betaState = syncChatWorkEventScroll(
+    getActiveChatScrollState(store),
+    betaEvents,
+  ).state;
+  store = setChatScrollState(store, betaState);
+  assert.equal(getActiveChatScrollState(store).mode, 'follow');
+  assert.equal(getActiveChatScrollState(store).anchor, null);
+
+  store = switchMessageScrollChat(store, 'wchat:alpha');
+  const restored = getActiveChatScrollState(store);
+  assert.equal(restored.mode, 'reading');
+  assert.deepEqual(restored.anchor, alphaState.anchor);
+  assert.equal(
+    syncChatWorkEventScroll(restored, alphaEvents).action.kind,
+    'preserve_anchor',
+  );
+});
+
+test('chat_work event stream restores the reading anchor when content reflows above the viewport', () => {
+  const eventIds = Array.from({ length: 12 }, (_, index) => `evt_${index}`);
+  const asEvents = (ids: readonly string[]) => ids.map((eventId) => ({ eventId }));
+  const asLayoutItems = (ids: readonly string[]) => ids.map((item_id) => ({ item_id }));
+
+  let state = syncChatWorkEventScroll(
+    createMessageScrollState('wchat:event-reflow'),
+    asEvents(eventIds),
+  ).state;
+  const baseLayout = buildSimulatedLayout(asLayoutItems(eventIds), new Map(), 60, 8, 12, 12);
+  const initialScrollTop = baseLayout.layoutItems[4]!.offsetTopPx + 22;
+  state = handleMessageViewportScroll(
+    state,
+    {
+      scrollTop: initialScrollTop,
+      clientHeight: 220,
+      scrollHeight: baseLayout.scrollHeight,
+    },
+    measureItemsFromContentOffsets(baseLayout.layoutItems, initialScrollTop),
+  );
+  assert.deepEqual(state.anchor, { itemId: 'evt_4', offsetPx: -22 });
+
+  // Narrowing the viewport wraps every event, growing content above the anchor.
+  const wrappedLayout = buildSimulatedLayout(asLayoutItems(eventIds), new Map(), 84, 8, 12, 12);
+  const decision = resolveMessageViewportResize(
+    state,
+    {
+      scrollTop: initialScrollTop,
+      clientHeight: 260,
+      scrollHeight: wrappedLayout.scrollHeight,
+    },
+    measureItemsFromContentOffsets(wrappedLayout.layoutItems, initialScrollTop),
+  );
+  assert.equal(decision.action.kind, 'restore_anchor');
+  if (decision.action.kind === 'restore_anchor') {
+    const afterReflow = measureItemsFromContentOffsets(
+      wrappedLayout.layoutItems,
+      decision.action.targetScrollTop,
+    ).find((entry) => entry.itemId === 'evt_4')!;
+    assert.equal(afterReflow.relativeTopPx, -22);
+  }
+  assert.equal(decision.state.anchor?.offsetPx, -22);
+});
+
+test('chat_work NeedsYou comes only from fresh native waiting flags with a single clear label', () => {
+  const identity = makeIdentity('bnd_alpha_native_waiting', UUID_ALPHA);
+  const selection = selectWorkspaceChatWork(
+    [
+      makeChatWork(identity, {
+        items: [
+          makeBacklogItem({ status: 'blocked', blocked_reason: 'Waiting on a dependency.' }),
+          makeBacklogItem({ item_id: 'blg_doing', status: 'doing' }),
+        ],
+        events: [
+          makeBacklogEvent({
+            event_id: 'blg_outcome:3',
+            sequence: 3,
+            item_id: 'blg_doing',
+            revision: 3,
+            action: 'worker_outcome_recorded',
+            status: 'doing',
+            outcome: 'success',
+          }),
+        ],
+      }),
+    ],
+    identity,
+  );
+
+  const waiting = evaluateChatWorkLiveness(
+    selection,
+    makeNativeSample(identity, 'waiting_for_approval'),
+    { nowMs: CHAT_WORK_NOW_MS },
+  );
+  assert.equal(waiting.waitingForHuman, true);
+  assert.equal(waiting.isWorking, false);
+  assert.equal(waiting.statusLabel, 'Waiting for you in Codex');
+  assert.deepEqual(waiting.agents, []);
+  assert.equal(buildChatWorkEventViews(selection)[0]!.actionLabel, 'Awaiting check');
+
+  const waitingForInput = evaluateChatWorkLiveness(
+    selection,
+    makeNativeSample(identity, 'waiting_for_input'),
+    { nowMs: CHAT_WORK_NOW_MS },
+  );
+  assert.equal(waitingForInput.waitingForHuman, true);
+
+  const staleWaiting = evaluateChatWorkLiveness(
+    selection,
+    makeNativeSample(identity, 'waiting_for_approval'),
+    { nowMs: CHAT_WORK_NOW_MS + 60_000 },
+  );
+  assert.equal(staleWaiting.waitingForHuman, false);
+  assert.equal(staleWaiting.statusLabel, null);
+
+  const working = evaluateChatWorkLiveness(
+    selection,
+    makeNativeSample(identity, 'working'),
+    { nowMs: CHAT_WORK_NOW_MS },
+  );
+  assert.equal(working.isWorking, true);
+  assert.equal(working.waitingForHuman, false);
+  assert.equal(working.statusLabel, 'Working');
+
+  const failedRefresh = evaluateChatWorkLiveness(
+    selection,
+    makeNativeSample(identity, 'waiting_for_approval'),
+    { nowMs: CHAT_WORK_NOW_MS, refreshFailed: true },
+  );
+  assert.equal(failedRefresh.waitingForHuman, false);
+  assert.equal(failedRefresh.isWorking, false);
+});
+
+test('chat_work backlog groups stay honest and bounded with truthful omitted counts', () => {
+  const identity = makeIdentity('bnd_alpha_bounds', UUID_ALPHA);
+  const statuses = ['todo', 'doing', 'done', 'blocked'] as const;
+  const items = Array.from({ length: 205 }, (_, index) =>
+    makeBacklogItem({
+      item_id: `blg_${index}`,
+      revision: index + 1,
+      title: `Item ${index}`,
+      status: statuses[index % statuses.length]!,
+      blocked_reason: index % statuses.length === 3 ? `Reason ${index}` : null,
+      completion_note: index % statuses.length === 2 ? `Checked ${index}` : null,
+      completion_evidence: index % statuses.length === 2 ? `Evidence ${index}` : null,
+      completed_at_ms: index % statuses.length === 2 ? 2_000 + index : null,
+    }),
+  );
+  const events = Array.from({ length: 505 }, (_, index) =>
+    makeBacklogEvent({
+      event_id: `blg_${index}:${index + 1}`,
+      sequence: 1_000 + index,
+      item_id: `blg_${index}`,
+      revision: index + 1,
+    }),
+  );
+  const presence = Array.from({ length: 33 }, (_, index) =>
+    makePresence({
+      item_id: `blg_${index}`,
+      execution_ref: `exec-${index}`,
+    }),
+  );
+  const selection = selectWorkspaceChatWork(
+    [
+      makeChatWork(identity, {
+        items,
+        events,
+        worker_presence: presence,
+        bounds: { items_omitted: 7, events_omitted: 9, presence_omitted: 11 },
+      }),
+    ],
+    identity,
+  );
+
+  assert.equal(selection.items.length, 200);
+  assert.equal(selection.events.length, 500);
+  assert.equal(selection.presence.length, 32);
+  assert.equal(selection.bounds.itemsOmitted, 12);
+  assert.equal(selection.bounds.eventsOmitted, 14);
+  assert.equal(selection.bounds.presenceOmitted, 12);
+  assert.ok(selection.notices.some((notice) => notice.includes('older backlog items')));
+  assert.ok(selection.notices.some((notice) => notice.includes('older stream events')));
+  assert.ok(selection.notices.some((notice) => notice.includes('worker presence records')));
+
+  const groups = buildChatWorkBacklogGroups(selection);
+  assert.deepEqual(groups.map((group) => group.status), ['todo', 'doing', 'done', 'blocked']);
+  assert.ok(groups.every((group) => group.items.every((item) => item.status === group.status)));
+  const blocked = groups.find((group) => group.status === 'blocked')!.items[0]!;
+  assert.ok(blocked.blockedReason !== null);
+  const done = groups.find((group) => group.status === 'done')!.items[0]!;
+  assert.ok(done.completionNote !== null);
+  assert.ok(done.completionEvidence !== null);
+});
+
+test('chat_work liveness index keeps native-sample state visible without inventing legacy backlog liveness', () => {
+  const alphaIdentity = makeIdentity('bnd_alpha_index', UUID_ALPHA);
+  const betaIdentity = makeIdentity('bnd_beta_index', UUID_BETA);
+  const alphaWork = makeChatWork(alphaIdentity, {
+    items: [makeBacklogItem({ status: 'doing' })],
+  });
+  const index = buildChatWorkLivenessIndex(
+    [alphaWork],
+    [makeNativeSample(alphaIdentity, 'working'), makeNativeSample(betaIdentity, 'waiting_for_input')],
+    { nowMs: CHAT_WORK_NOW_MS },
+  );
+
+  const alpha = index.get(resolveMessageScrollChatKey(alphaIdentity))!;
+  assert.equal(alpha.isWorking, true);
+  assert.equal(alpha.waitingForHuman, false);
+
+  const beta = index.get(resolveMessageScrollChatKey(betaIdentity))!;
+  assert.equal(beta.waitingForHuman, true);
+  assert.equal(beta.isWorking, false);
+  assert.equal(beta.workAvailable, false);
+  assert.deepEqual(beta.items, []);
+
+  const summary = summarizeChatWorkLiveness(index);
+  assert.equal(summary.workingAgentCount, 1);
+  assert.equal(summary.waitingChatCount, 1);
+  assert.equal(summary.workingChatCount, 1);
 });
