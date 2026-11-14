@@ -8,9 +8,17 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use threadlane::descriptor::{
     RuntimeDescriptor, DATABASE_FILENAME, DESCRIPTOR_FILENAME, LOCK_FILENAME, MAX_DESCRIPTOR_BYTES,
+};
+use threadlane::protocol::{
+    ControlRuntimeBusyCounts, ControlRuntimeInfoResponse, ControlRuntimeRetireRequest,
+    ControlRuntimeRetireState, ControlRuntimeRole, ControlRuntimeRuntimeState,
+    CONTROL_RUNTIME_IDLE_RETIRE_MIN_PROTOCOL_VERSION, CONTROL_RUNTIME_PROTOCOL_VERSION,
+    SUPERVISOR_RETIRING_MESSAGE,
 };
 use threadlane::{Error as ThreadlaneError, ErrorCode as ThreadlaneErrorCode, SupervisorClient};
 use tokio::process::{Child, Command};
@@ -60,15 +68,20 @@ pub enum ControlRuntimeEnsureStatus {
     /// `<executable> serve --state-dir <dir>` process was started and verified via
     /// authenticated readiness.
     Started,
+    /// An incompatible but provably idle baseline runtime was retired through its authenticated
+    /// atomic idle-retire contract, released `supervisor.lock` within the bounded deadline, and a
+    /// current canonical `<executable> serve --state-dir <dir>` process was started in its place.
+    Upgraded,
 }
 
 impl ControlRuntimeEnsureStatus {
-    /// Stable snake_case identifier for this status (`already_running` or `started`).
+    /// Stable snake_case identifier for this status (`already_running`, `started`, or `upgraded`).
     #[must_use]
     pub const fn as_str(&self) -> &'static str {
         match self {
             Self::AlreadyRunning => "already_running",
             Self::Started => "started",
+            Self::Upgraded => "upgraded",
         }
     }
 }
@@ -79,14 +92,32 @@ impl fmt::Display for ControlRuntimeEnsureStatus {
     }
 }
 
+/// Redacted summary of a live runtime that was cleanly retired during a bounded upgrade.
+///
+/// Contains only public identity and bounded version/role data; never a bearer token or secret.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ControlRuntimeRetiredRuntime {
+    /// OS process identifier of the retired supervisor.
+    pub pid: u32,
+    /// Control-runtime protocol version advertised by the retired supervisor.
+    pub protocol_version: u32,
+    /// Informational package version advertised by the retired supervisor.
+    pub package_version: String,
+    /// Per-process public instance identifier of the retired supervisor.
+    pub instance_id: String,
+    /// Role advertised by the retired supervisor.
+    pub role: ControlRuntimeRole,
+}
+
 /// Structured outcome returned by [`ensure_control_runtime`].
 ///
 /// Uses owned wire-safe fields so it can be deserialized from arbitrary temporary buffers, and
 /// never contains bearer tokens or secret material.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ControlRuntimeEnsureOutcome {
-    /// Whether an existing authenticated supervisor was reused (`already_running`) or a new
-    /// supervisor process was launched (`started`).
+    /// Whether an existing authenticated supervisor was reused (`already_running`), a new
+    /// supervisor process was launched (`started`), or an incompatible idle baseline runtime was
+    /// safely retired and replaced (`upgraded`).
     pub status: ControlRuntimeEnsureStatus,
     /// Canonical private runtime state directory (`0700`).
     pub state_dir: PathBuf,
@@ -100,16 +131,24 @@ pub struct ControlRuntimeEnsureOutcome {
     /// was present before startup and was replaced through normal locked `Supervisor` startup
     /// without deleting `supervisor.json`, `state.db`, or `supervisor.lock`.
     pub stale_descriptor_recovered: bool,
-    /// `Some(false)` when this call launched the supervisor (`started`, which omits `--codex` and
-    /// `--notify-binding`); `None` when reusing an existing supervisor (`already_running`) whose
-    /// startup flags were not verified by `GET /v1/bindings`.
+    /// `Some(...)` when this runtime advertised authenticated control info; `None` only for an
+    /// older runtime whose configured notification bridge could not be verified.
     pub notifications_enabled: Option<bool>,
-    /// `Some(false)` when this call launched the supervisor (`started`, which omits
-    /// `--workers-config`); `None` when reusing an existing supervisor (`already_running`) whose
-    /// worker configuration was not verified by `GET /v1/bindings`.
+    /// `Some(...)` when this runtime advertised authenticated control info; `None` only for an
+    /// older runtime whose worker configuration could not be verified.
     pub workers_enabled: Option<bool>,
     /// Always `false`: approved per-session hosts are never started or auto-resumed by this helper.
     pub approved_hosts_resumed: bool,
+    /// Live control-runtime protocol version advertised by the returned supervisor.
+    pub runtime_protocol_version: u32,
+    /// Informational package version advertised by the returned supervisor.
+    pub runtime_package_version: String,
+    /// Live runtime role advertised by the returned supervisor.
+    pub runtime_role: ControlRuntimeRole,
+    /// Per-process public instance identifier of the returned supervisor (not a secret).
+    pub runtime_instance_id: String,
+    /// Exact baseline-runtime instance that was safely retired by this call, if any.
+    pub retired_runtime: Option<ControlRuntimeRetiredRuntime>,
     /// Explicit statement of how normal `Supervisor` startup handles old in-flight worker runs.
     pub in_flight_runs_recovery_policy: String,
     /// Explicit statement of the started control process's observed background lifetime and limits.
@@ -123,20 +162,18 @@ impl ControlRuntimeEnsureOutcome {
         port: u16,
         bindings_count: usize,
         stale_descriptor_recovered: bool,
+        info: &ControlRuntimeInfoResponse,
     ) -> Self {
-        Self {
-            status: ControlRuntimeEnsureStatus::AlreadyRunning,
+        Self::from_runtime(
+            ControlRuntimeEnsureStatus::AlreadyRunning,
             state_dir,
             pid,
             port,
             bindings_count,
             stale_descriptor_recovered,
-            notifications_enabled: None,
-            workers_enabled: None,
-            approved_hosts_resumed: false,
-            in_flight_runs_recovery_policy: CONTROL_RUNTIME_IN_FLIGHT_RECOVERY_POLICY.to_string(),
-            process_lifetime_policy: CONTROL_RUNTIME_LIFETIME_POLICY.to_string(),
-        }
+            info,
+            None,
+        )
     }
 
     fn started(
@@ -145,20 +182,65 @@ impl ControlRuntimeEnsureOutcome {
         port: u16,
         bindings_count: usize,
         stale_descriptor_recovered: bool,
+        info: &ControlRuntimeInfoResponse,
+        retired_runtime: Option<ControlRuntimeRetiredRuntime>,
     ) -> Self {
-        Self {
-            status: ControlRuntimeEnsureStatus::Started,
+        let status = if retired_runtime.is_some() {
+            ControlRuntimeEnsureStatus::Upgraded
+        } else {
+            ControlRuntimeEnsureStatus::Started
+        };
+        Self::from_runtime(
+            status,
             state_dir,
             pid,
             port,
             bindings_count,
             stale_descriptor_recovered,
-            notifications_enabled: Some(false),
-            workers_enabled: Some(false),
+            info,
+            retired_runtime,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_runtime(
+        status: ControlRuntimeEnsureStatus,
+        state_dir: PathBuf,
+        pid: u32,
+        port: u16,
+        bindings_count: usize,
+        stale_descriptor_recovered: bool,
+        info: &ControlRuntimeInfoResponse,
+        retired_runtime: Option<ControlRuntimeRetiredRuntime>,
+    ) -> Self {
+        Self {
+            status,
+            state_dir,
+            pid,
+            port,
+            bindings_count,
+            stale_descriptor_recovered,
+            notifications_enabled: Some(info.notifications_configured),
+            workers_enabled: Some(info.workers_configured),
             approved_hosts_resumed: false,
+            runtime_protocol_version: info.protocol_version,
+            runtime_package_version: info.package_version.clone(),
+            runtime_role: info.role,
+            runtime_instance_id: info.instance_id.clone(),
+            retired_runtime,
             in_flight_runs_recovery_policy: CONTROL_RUNTIME_IN_FLIGHT_RECOVERY_POLICY.to_string(),
             process_lifetime_policy: CONTROL_RUNTIME_LIFETIME_POLICY.to_string(),
         }
+    }
+}
+
+fn retired_runtime_summary(info: &ControlRuntimeInfoResponse) -> ControlRuntimeRetiredRuntime {
+    ControlRuntimeRetiredRuntime {
+        pid: info.pid,
+        protocol_version: info.protocol_version,
+        package_version: info.package_version.clone(),
+        instance_id: info.instance_id.clone(),
+        role: info.role,
     }
 }
 
@@ -179,7 +261,8 @@ pub enum ControlRuntimeErrorCode {
     /// A live supervisor rejected the bearer token in `supervisor.json` with `401 Unauthorized`.
     UnauthorizedSupervisor,
     /// `supervisor.lock` is held by another process that did not publish a verified ready
-    /// supervisor within the caller's timeout.
+    /// supervisor within the caller's timeout, or the bounded cross-process startup guard stayed
+    /// held past the caller's deadline.
     LockBusy,
     /// `supervisor.json` references a live process that does not hold `supervisor.lock` or
     /// did not pass authenticated readiness verification; takeover is refused.
@@ -194,6 +277,19 @@ pub enum ControlRuntimeErrorCode {
     StartupProcessExited,
     /// The caller timeout expired before a spawned supervisor published a verified ready endpoint.
     StartupTimedOut,
+    /// The live runtime advertised an incompatible role, protocol, or required operation contract.
+    IncompatibleRuntime,
+    /// A legacy runtime lacks the authenticated control-info/idle-retire handshake and must be
+    /// stopped manually while idle before the current package can start.
+    UpgradeRequired,
+    /// The live runtime refused safe idle retirement because active runs, workers, tasks, or
+    /// wake-up notices remain.
+    RuntimeBusy,
+    /// A safe idle retirement was accepted but the owned lock was not released within the caller
+    /// deadline; no replacement was started and no process was force-killed.
+    RetireTimedOut,
+    /// The live runtime returned malformed or contradictory authenticated control-runtime data.
+    ProtocolError,
     /// An underlying filesystem or I/O operation failed.
     IoError,
 }
@@ -214,6 +310,11 @@ impl ControlRuntimeErrorCode {
             Self::SpawnFailed => "spawn_failed",
             Self::StartupProcessExited => "startup_process_exited",
             Self::StartupTimedOut => "startup_timed_out",
+            Self::IncompatibleRuntime => "incompatible_runtime",
+            Self::UpgradeRequired => "upgrade_required",
+            Self::RuntimeBusy => "runtime_busy",
+            Self::RetireTimedOut => "retire_timed_out",
+            Self::ProtocolError => "protocol_error",
             Self::IoError => "io_error",
         }
     }
@@ -292,10 +393,19 @@ impl From<ControlRuntimeError> for NativeError {
             | ControlRuntimeErrorCode::StartupProcessExited => {
                 NativeErrorCode::TransportUnavailable
             }
-            ControlRuntimeErrorCode::StartupTimedOut => NativeErrorCode::TimedOut,
+            ControlRuntimeErrorCode::StartupTimedOut | ControlRuntimeErrorCode::RetireTimedOut => {
+                NativeErrorCode::TimedOut
+            }
+            ControlRuntimeErrorCode::IncompatibleRuntime
+            | ControlRuntimeErrorCode::UpgradeRequired
+            | ControlRuntimeErrorCode::RuntimeBusy => NativeErrorCode::UnsupportedCapability,
+            ControlRuntimeErrorCode::ProtocolError => NativeErrorCode::ProtocolError,
             ControlRuntimeErrorCode::IoError => NativeErrorCode::IoError,
         };
-        Self::new(mapped, format!("control runtime error ({})", err.code()))
+        Self::new(
+            mapped,
+            format!("control runtime error ({}): {}", err.code(), err.message()),
+        )
     }
 }
 
@@ -923,20 +1033,33 @@ pub fn build_control_runtime_serve_args(state_dir: &Path) -> Vec<OsString> {
 
 /// Ensures a single dedicated Threadlane control-plane supervisor is running for `state_dir`.
 ///
-/// - Reuses an existing healthy authenticated supervisor (`already_running`) without spawning
-///   another process; reports `notifications_enabled: None` and `workers_enabled: None` because
-///   `GET /v1/bindings` does not verify how a pre-existing process was configured.
+/// - Reuses an existing healthy authenticated supervisor only when its bounded authenticated
+///   control-runtime advertisement proves the required baseline operation contract
+///   (`bindings`, `scoped_backlog`, `event_pull_ack`, and `guarded_worker_backlog`). Package
+///   version differences alone never force a restart.
+/// - Serializes bootstrap in this process and across cooperating processes with a bounded private
+///   advisory guard derived from the canonical state path and kept outside `state_dir`; the guard
+///   never unlinks while another caller may hold it and never signals a runtime.
 /// - Launches only `<threadlane_executable> serve --state-dir <state_dir>` on Linux with
 ///   `process_group(0)`, `kill_on_drop(false)`, `Stdio::null()`, and a cleared environment
-///   (`env_clear()`) so ambient provider credentials are never inherited (`started`, reporting
-///   `notifications_enabled: Some(false)` and `workers_enabled: Some(false)`).
+///   (`env_clear()`) so ambient provider credentials are never inherited.
+/// - When a baseline runtime advertises the authenticated atomic idle-retire capability but lacks
+///   required operations, retires that exact idle instance through its own clean-shutdown latch,
+///   waits boundedly for the owned `supervisor.lock` release, and starts the current canonical
+///   executable (`upgraded`). Active, foreign, approved-host, configured-notification/worker,
+///   newer-protocol, malformed, token-rejected, and ambiguous runtimes are never stopped.
+/// - A validated authenticated approved-host or newer-protocol refusal is final before any
+///   bindings readiness read; an independently stopping runtime cannot turn that observation into
+///   an automatic baseline spawn.
 /// - Recovers from a provably stale `supervisor.json` (dead PID and unlocked `supervisor.lock`)
 ///   exclusively through normal locked `Supervisor` startup without deleting `supervisor.json`,
 ///   `state.db`, or `supervisor.lock`.
 /// - Fails closed on unsupported platforms, untrusted writable ancestors, invalid/insecure
 ///   permissions or symlinks, malformed descriptors, `401 Unauthorized`, ambiguous live processes,
 ///   occupied locks that do not become ready within `timeout`, changed directory/executable/descriptor
-///   identity, or startup failure/timeout.
+///   identity, or startup/retire failure or timeout. A legacy runtime without the authenticated
+///   control-info/idle-retire handshake fails with [`ControlRuntimeErrorCode::UpgradeRequired`]
+///   and is never emulated with an unsafe check-then-kill sequence.
 pub async fn ensure_control_runtime(
     state_dir: impl AsRef<Path>,
     threadlane_executable: impl AsRef<Path>,
@@ -965,6 +1088,8 @@ pub async fn ensure_control_runtime(
         }
     };
 
+    let _cross_process_guard = acquire_startup_guard(&policy.state_dir, deadline).await?;
+
     ensure_control_runtime_locked(&policy, deadline).await
 }
 
@@ -978,6 +1103,267 @@ fn state_dir_coordinator_mutex(canonical_state_dir: &Path) -> Arc<tokio::sync::M
             .entry(canonical_state_dir.to_path_buf())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
     )
+}
+
+/// Prefix for the persistent cross-process startup guard kept beside (never inside) `state_dir`.
+const STARTUP_GUARD_FILE_PREFIX: &str = ".threadlane-control-runtime-startup-";
+
+/// Owned cross-process startup guard. Dropping it releases the `fs2` lock but never unlinks the
+/// guard file, because another process may already have the same file open and waiting.
+struct StartupGuard {
+    file: File,
+}
+
+impl Drop for StartupGuard {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.file);
+    }
+}
+
+async fn acquire_startup_guard(
+    canonical_state_dir: &Path,
+    deadline: Instant,
+) -> Result<StartupGuard, ControlRuntimeError> {
+    let guard_path = startup_guard_path(canonical_state_dir)?;
+    let file = open_startup_guard_file(&guard_path)?;
+
+    loop {
+        match file.try_lock_exclusive() {
+            Ok(()) => {
+                verify_startup_guard_identity(&guard_path, &file)?;
+                return Ok(StartupGuard { file });
+            }
+            Err(err) if startup_guard_lock_contended(&err) => {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(ControlRuntimeError::new(
+                        ControlRuntimeErrorCode::LockBusy,
+                        format!(
+                            "timed out waiting for the bounded cross-process control runtime startup guard `{}`",
+                            guard_path.display()
+                        ),
+                    ));
+                }
+                let sleep_dur =
+                    CONTROL_RUNTIME_POLL_INTERVAL.min(deadline.saturating_duration_since(now));
+                tokio::time::sleep(sleep_dur).await;
+            }
+            Err(err) => {
+                return Err(ControlRuntimeError::new(
+                    ControlRuntimeErrorCode::IoError,
+                    format!(
+                        "failed to acquire control runtime startup guard `{}`: {err}",
+                        guard_path.display()
+                    ),
+                ));
+            }
+        }
+    }
+}
+
+fn startup_guard_path(canonical_state_dir: &Path) -> Result<PathBuf, ControlRuntimeError> {
+    let parent = canonical_state_dir.parent().ok_or_else(|| {
+        ControlRuntimeError::new(
+            ControlRuntimeErrorCode::InvalidConfig,
+            format!(
+                "control runtime state_dir `{}` has no parent directory for startup coordination",
+                canonical_state_dir.display()
+            ),
+        )
+    })?;
+
+    let mut hasher = Sha256::new();
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        hasher.update(canonical_state_dir.as_os_str().as_bytes());
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        hasher.update(canonical_state_dir.to_string_lossy().as_bytes());
+    }
+    let digest = hasher.finalize();
+
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut file_name =
+        String::with_capacity(STARTUP_GUARD_FILE_PREFIX.len() + digest.len() * 2 + 5);
+    file_name.push_str(STARTUP_GUARD_FILE_PREFIX);
+    for byte in digest {
+        file_name.push(char::from(HEX[usize::from(byte >> 4)]));
+        file_name.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    file_name.push_str(".lock");
+    Ok(parent.join(file_name))
+}
+
+fn open_startup_guard_file(path: &Path) -> Result<File, ControlRuntimeError> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+        let mut options = fs::OpenOptions::new();
+        options
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        let file = options.open(path).map_err(|err| {
+            let code = if matches!(err.raw_os_error(), Some(libc::ELOOP) | Some(libc::EISDIR)) {
+                ControlRuntimeErrorCode::SecurityViolation
+            } else {
+                ControlRuntimeErrorCode::IoError
+            };
+            ControlRuntimeError::new(
+                code,
+                format!(
+                    "failed to open control runtime startup guard `{}`: {err}",
+                    path.display()
+                ),
+            )
+        })?;
+
+        let meta = file.metadata().map_err(|err| {
+            ControlRuntimeError::new(
+                ControlRuntimeErrorCode::IoError,
+                format!(
+                    "failed to stat control runtime startup guard `{}`: {err}",
+                    path.display()
+                ),
+            )
+        })?;
+        if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+            return Err(ControlRuntimeError::new(
+                ControlRuntimeErrorCode::SecurityViolation,
+                format!(
+                    "control runtime startup guard `{}` must be a non-symlink regular file",
+                    path.display()
+                ),
+            ));
+        }
+        if meta.len() != 0 {
+            return Err(ControlRuntimeError::new(
+                ControlRuntimeErrorCode::SecurityViolation,
+                format!(
+                    "control runtime startup guard `{}` must be empty (0 bytes), found {} bytes",
+                    path.display(),
+                    meta.len()
+                ),
+            ));
+        }
+        if meta.uid() != current_euid() {
+            return Err(ControlRuntimeError::new(
+                ControlRuntimeErrorCode::SecurityViolation,
+                format!(
+                    "control runtime startup guard `{}` is owned by uid {} (expected {})",
+                    path.display(),
+                    meta.uid(),
+                    current_euid()
+                ),
+            ));
+        }
+        let mode = meta.permissions().mode() & 0o777;
+        if mode & 0o177 != 0 {
+            return Err(ControlRuntimeError::new(
+                ControlRuntimeErrorCode::SecurityViolation,
+                format!(
+                    "control runtime startup guard `{}` has insecure permissions {:04o} (expected private 0600)",
+                    path.display(),
+                    mode
+                ),
+            ));
+        }
+
+        let path_meta = fs::symlink_metadata(path).map_err(|err| {
+            ControlRuntimeError::new(
+                ControlRuntimeErrorCode::IoError,
+                format!(
+                    "failed to symlink-stat control runtime startup guard `{}`: {err}",
+                    path.display()
+                ),
+            )
+        })?;
+        if path_meta.file_type().is_symlink() || !path_meta.file_type().is_file() {
+            return Err(ControlRuntimeError::new(
+                ControlRuntimeErrorCode::SecurityViolation,
+                format!(
+                    "control runtime startup guard `{}` must be a non-symlink regular file",
+                    path.display()
+                ),
+            ));
+        }
+        if path_meta.dev() != meta.dev() || path_meta.ino() != meta.ino() {
+            return Err(ControlRuntimeError::new(
+                ControlRuntimeErrorCode::StateChanged,
+                format!(
+                    "control runtime startup guard `{}` changed while opening",
+                    path.display()
+                ),
+            ));
+        }
+
+        Ok(file)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = path;
+        ensure_linux_supported()?;
+        unreachable!()
+    }
+}
+
+fn verify_startup_guard_identity(path: &Path, file: &File) -> Result<(), ControlRuntimeError> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        let held_meta = file.metadata().map_err(|err| {
+            ControlRuntimeError::new(
+                ControlRuntimeErrorCode::IoError,
+                format!(
+                    "failed to stat held control runtime startup guard `{}`: {err}",
+                    path.display()
+                ),
+            )
+        })?;
+        let path_meta = fs::symlink_metadata(path).map_err(|err| {
+            ControlRuntimeError::new(
+                ControlRuntimeErrorCode::IoError,
+                format!(
+                    "failed to recheck control runtime startup guard `{}`: {err}",
+                    path.display()
+                ),
+            )
+        })?;
+        if path_meta.file_type().is_symlink()
+            || !path_meta.file_type().is_file()
+            || held_meta.dev() != path_meta.dev()
+            || held_meta.ino() != path_meta.ino()
+        {
+            return Err(ControlRuntimeError::new(
+                ControlRuntimeErrorCode::StateChanged,
+                format!(
+                    "control runtime startup guard `{}` changed while held",
+                    path.display()
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (path, file);
+        ensure_linux_supported()?;
+        unreachable!()
+    }
+}
+
+fn startup_guard_lock_contended(err: &std::io::Error) -> bool {
+    err.kind() == std::io::ErrorKind::WouldBlock
+        || err.raw_os_error() == fs2::lock_contended_error().raw_os_error()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1019,6 +1405,34 @@ enum ProbeFailure {
     Unauthorized,
     TimedOut,
     Transport(String),
+    Retiring,
+    InvalidResponse(String),
+}
+
+struct VerifiedLiveRuntime {
+    bindings_count: usize,
+    info: ControlRuntimeInfoResponse,
+}
+
+enum RuntimeProbe {
+    Verified(VerifiedLiveRuntime),
+    /// A validated authenticated advertisement that local role/protocol/capability policy already
+    /// refuses. Retained before the bindings readiness read so a concurrent independent shutdown
+    /// cannot erase the refusal and lead to an unauthorized replacement.
+    Rejected {
+        info: ControlRuntimeInfoResponse,
+        reason: String,
+    },
+    Legacy {
+        bindings_count: usize,
+    },
+}
+
+enum RuntimeCompatibility {
+    Compatible,
+    Retiring,
+    Upgradeable { missing: Vec<&'static str> },
+    Incompatible(String),
 }
 
 async fn ensure_control_runtime_locked(
@@ -1035,8 +1449,9 @@ async fn ensure_control_runtime_locked(
     match initial_state.descriptor {
         Some(ref snap) if is_process_alive(snap.descriptor.pid) => {
             return handle_existing_live_descriptor(
-                state_dir,
+                policy,
                 initial_dir_identity,
+                initial_exe_identity,
                 snap,
                 initial_state.lock_holder,
                 deadline,
@@ -1058,6 +1473,7 @@ async fn ensure_control_runtime_locked(
                 initial_dir_identity,
                 initial_exe_identity,
                 Some(stale_snap.clone()),
+                None,
                 deadline,
             )
             .await
@@ -1072,6 +1488,7 @@ async fn ensure_control_runtime_locked(
                 initial_dir_identity,
                 initial_exe_identity,
                 None,
+                None,
                 deadline,
             )
             .await
@@ -1080,12 +1497,14 @@ async fn ensure_control_runtime_locked(
 }
 
 async fn handle_existing_live_descriptor(
-    state_dir: &Path,
+    policy: &ControlRuntimePolicy,
     initial_dir_identity: FileIdentity,
+    initial_exe_identity: FileIdentity,
     snap: &DescriptorSnapshot,
     lock_holder: Option<LockHolderInfo>,
     deadline: Instant,
 ) -> Result<ControlRuntimeEnsureOutcome, ControlRuntimeError> {
+    let state_dir = policy.state_dir.as_path();
     let Some(holder) = lock_holder else {
         return Err(ControlRuntimeError::new(
             ControlRuntimeErrorCode::AmbiguousLiveSupervisor,
@@ -1112,38 +1531,55 @@ async fn handle_existing_live_descriptor(
         ));
     }
 
-    match probe_authenticated_supervisor(&snap.descriptor, deadline).await {
-        Ok(bindings_count) => {
-            let post_state = inspect_runtime_state(state_dir, initial_dir_identity)?;
-            let Some(post_snap) = post_state.descriptor else {
-                return Err(ControlRuntimeError::new(
-                    ControlRuntimeErrorCode::StateChanged,
-                    format!(
-                        "supervisor.json in `{}` disappeared during authenticated readiness verification",
-                        state_dir.display()
-                    ),
-                ));
-            };
-            if !post_snap.same_instance(snap)
-                || post_state.lock_holder != Some(LockHolderInfo { pid: snap.descriptor.pid })
-                || !is_process_alive(snap.descriptor.pid)
-            {
-                return Err(ControlRuntimeError::new(
-                    ControlRuntimeErrorCode::StateChanged,
-                    format!(
-                        "supervisor state in `{}` changed during authenticated readiness verification",
-                        state_dir.display()
-                    ),
-                ));
-            }
-            Ok(ControlRuntimeEnsureOutcome::already_running(
-                state_dir.to_path_buf(),
-                snap.descriptor.pid,
-                snap.descriptor.port,
-                bindings_count,
-                false,
-            ))
+    match probe_live_runtime(&snap.descriptor, deadline).await {
+        Ok(RuntimeProbe::Rejected { info, reason }) => {
+            Err(incompatible_runtime_error(snap, &info, &reason))
         }
+        Ok(RuntimeProbe::Legacy { bindings_count }) => Err(legacy_runtime_upgrade_required(
+            state_dir,
+            snap,
+            bindings_count,
+        )),
+        Ok(RuntimeProbe::Verified(live)) => match evaluate_compatibility(&live.info) {
+            RuntimeCompatibility::Compatible => {
+                verify_live_snapshot(state_dir, initial_dir_identity, snap)?;
+                Ok(ControlRuntimeEnsureOutcome::already_running(
+                    state_dir.to_path_buf(),
+                    snap.descriptor.pid,
+                    snap.descriptor.port,
+                    live.bindings_count,
+                    false,
+                    &live.info,
+                ))
+            }
+            RuntimeCompatibility::Retiring => {
+                await_retirement_and_start(
+                    policy,
+                    initial_dir_identity,
+                    initial_exe_identity,
+                    snap,
+                    Some(live.info),
+                    deadline,
+                )
+                .await
+            }
+            RuntimeCompatibility::Upgradeable { .. } => {
+                verify_live_snapshot(state_dir, initial_dir_identity, snap)?;
+                request_idle_retirement(&snap.descriptor, &live.info, deadline).await?;
+                await_retirement_and_start(
+                    policy,
+                    initial_dir_identity,
+                    initial_exe_identity,
+                    snap,
+                    Some(live.info),
+                    deadline,
+                )
+                .await
+            }
+            RuntimeCompatibility::Incompatible(reason) => {
+                Err(incompatible_runtime_error(snap, &live.info, &reason))
+            }
+        },
         Err(ProbeFailure::Unauthorized) => Err(ControlRuntimeError::new(
             ControlRuntimeErrorCode::UnauthorizedSupervisor,
             format!(
@@ -1155,6 +1591,18 @@ async fn handle_existing_live_descriptor(
         )),
         Err(ProbeFailure::TimedOut) => {
             let _ = verify_state_dir_identity(state_dir, Some(initial_dir_identity))?;
+            let post_state = inspect_runtime_state(state_dir, initial_dir_identity)?;
+            if runtime_ownership_released_or_replaced(&post_state, snap) {
+                return await_retirement_and_start(
+                    policy,
+                    initial_dir_identity,
+                    initial_exe_identity,
+                    snap,
+                    None,
+                    deadline,
+                )
+                .await;
+            }
             Err(ControlRuntimeError::new(
                 ControlRuntimeErrorCode::AmbiguousLiveSupervisor,
                 format!(
@@ -1165,8 +1613,31 @@ async fn handle_existing_live_descriptor(
                 ),
             ))
         }
+        Err(ProbeFailure::Retiring) => {
+            await_retirement_and_start(
+                policy,
+                initial_dir_identity,
+                initial_exe_identity,
+                snap,
+                None,
+                deadline,
+            )
+            .await
+        }
         Err(ProbeFailure::Transport(reason)) => {
             let _ = verify_state_dir_identity(state_dir, Some(initial_dir_identity))?;
+            let post_state = inspect_runtime_state(state_dir, initial_dir_identity)?;
+            if runtime_ownership_released_or_replaced(&post_state, snap) {
+                return await_retirement_and_start(
+                    policy,
+                    initial_dir_identity,
+                    initial_exe_identity,
+                    snap,
+                    None,
+                    deadline,
+                )
+                .await;
+            }
             if is_process_alive(snap.descriptor.pid) {
                 Err(ControlRuntimeError::new(
                     ControlRuntimeErrorCode::AmbiguousLiveSupervisor,
@@ -1189,7 +1660,101 @@ async fn handle_existing_live_descriptor(
                 ))
             }
         }
+        Err(ProbeFailure::InvalidResponse(reason)) => Err(ControlRuntimeError::new(
+            ControlRuntimeErrorCode::ProtocolError,
+            format!(
+                "live supervisor (pid {}, port {}) in `{}` returned malformed authenticated control-runtime information ({reason}); refusing reuse, retirement, and takeover",
+                snap.descriptor.pid,
+                snap.descriptor.port,
+                state_dir.display()
+            ),
+        )),
     }
+}
+
+fn verify_live_snapshot(
+    state_dir: &Path,
+    initial_dir_identity: FileIdentity,
+    snap: &DescriptorSnapshot,
+) -> Result<(), ControlRuntimeError> {
+    let post_state = inspect_runtime_state(state_dir, initial_dir_identity)?;
+    let Some(post_snap) = post_state.descriptor else {
+        return Err(ControlRuntimeError::new(
+            ControlRuntimeErrorCode::StateChanged,
+            format!(
+                "supervisor.json in `{}` disappeared during authenticated readiness verification",
+                state_dir.display()
+            ),
+        ));
+    };
+    if !post_snap.same_instance(snap)
+        || post_state.lock_holder
+            != Some(LockHolderInfo {
+                pid: snap.descriptor.pid,
+            })
+        || !is_process_alive(snap.descriptor.pid)
+    {
+        return Err(ControlRuntimeError::new(
+            ControlRuntimeErrorCode::StateChanged,
+            format!(
+                "supervisor state in `{}` changed during authenticated readiness verification",
+                state_dir.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn runtime_ownership_released_or_replaced(
+    inspection: &RuntimeStateInspection,
+    snap: &DescriptorSnapshot,
+) -> bool {
+    match inspection.lock_holder {
+        None => true,
+        Some(holder) if holder.pid != snap.descriptor.pid => true,
+        Some(_) => match inspection.descriptor.as_ref() {
+            Some(current) => !current.same_instance(snap),
+            // A live lock holder without a descriptor is either cleaning up after retirement or
+            // ambiguous. Wait boundedly for release; never spawn or signal while it holds the lock.
+            None => true,
+        },
+    }
+}
+
+fn legacy_runtime_upgrade_required(
+    state_dir: &Path,
+    snap: &DescriptorSnapshot,
+    bindings_count: usize,
+) -> ControlRuntimeError {
+    ControlRuntimeError::new(
+        ControlRuntimeErrorCode::UpgradeRequired,
+        format!(
+            "Stop the legacy control runtime while it is idle through the normal process manager, then retry: pid {}, port {} in `{}` only answered authenticated binding reads ({bindings_count} bindings) and exposes no authenticated control-info/idle-retire handshake. This build cannot prove scoped backlog compatibility or retire it safely; refusing to reuse it, signal it, or start a second supervisor.",
+            snap.descriptor.pid,
+            snap.descriptor.port,
+            state_dir.display()
+        ),
+    )
+}
+
+/// Builds the bounded incompatible-runtime diagnostic. The refusal reason comes first so the
+/// fixed diagnostic length limit never truncates it; compact public identity metadata follows.
+fn incompatible_runtime_error(
+    snap: &DescriptorSnapshot,
+    info: &ControlRuntimeInfoResponse,
+    reason: &str,
+) -> ControlRuntimeError {
+    ControlRuntimeError::new(
+        ControlRuntimeErrorCode::IncompatibleRuntime,
+        format!(
+            "{reason}; pid {}, port {} reports protocol {} package `{}` role `{:?}`",
+            snap.descriptor.pid,
+            snap.descriptor.port,
+            info.protocol_version,
+            info.package_version,
+            info.role
+        ),
+    )
 }
 
 async fn wait_for_running_winner(
@@ -1226,32 +1791,46 @@ async fn wait_for_running_winner(
                         ),
                     ));
                 }
-                match probe_authenticated_supervisor(&snap.descriptor, deadline).await {
-                    Ok(bindings_count) => {
-                        let post_state = inspect_runtime_state(state_dir, initial_dir_identity)?;
-                        if let Some(post_snap) = post_state.descriptor {
-                            if post_snap.same_instance(snap)
-                                && post_state.lock_holder
-                                    == Some(LockHolderInfo {
-                                        pid: snap.descriptor.pid,
-                                    })
-                                && is_process_alive(snap.descriptor.pid)
-                            {
-                                return Ok(ControlRuntimeEnsureOutcome::already_running(
-                                    state_dir.to_path_buf(),
-                                    snap.descriptor.pid,
-                                    snap.descriptor.port,
-                                    bindings_count,
-                                    stale_before.is_some(),
-                                ));
-                            }
+                match probe_live_runtime(&snap.descriptor, deadline).await {
+                    Ok(RuntimeProbe::Verified(live)) => match evaluate_compatibility(&live.info) {
+                        RuntimeCompatibility::Compatible => {
+                            verify_live_snapshot(state_dir, initial_dir_identity, snap)?;
+                            return Ok(ControlRuntimeEnsureOutcome::already_running(
+                                state_dir.to_path_buf(),
+                                snap.descriptor.pid,
+                                snap.descriptor.port,
+                                live.bindings_count,
+                                stale_before.is_some(),
+                                &live.info,
+                            ));
                         }
-                        return Err(ControlRuntimeError::new(
-                            ControlRuntimeErrorCode::StateChanged,
-                            format!(
-                                "concurrent winner in `{}` changed state during readiness verification",
-                                state_dir.display()
-                            ),
+                        RuntimeCompatibility::Retiring => {}
+                        RuntimeCompatibility::Upgradeable { missing } => {
+                            return Err(ControlRuntimeError::new(
+                                    ControlRuntimeErrorCode::IncompatibleRuntime,
+                                    format!(
+                                        "concurrent control runtime (pid {}, port {}) in `{}` reports protocol {} package `{}` but lacks required capabilities [{}]; this caller will not retire a runtime it did not start. Stop it while idle or use the matching package.",
+                                        snap.descriptor.pid,
+                                        snap.descriptor.port,
+                                        state_dir.display(),
+                                        live.info.protocol_version,
+                                        live.info.package_version,
+                                        missing.join(", ")
+                                    ),
+                                ));
+                        }
+                        RuntimeCompatibility::Incompatible(reason) => {
+                            return Err(incompatible_runtime_error(snap, &live.info, &reason));
+                        }
+                    },
+                    Ok(RuntimeProbe::Rejected { info, reason }) => {
+                        return Err(incompatible_runtime_error(snap, &info, &reason));
+                    }
+                    Ok(RuntimeProbe::Legacy { bindings_count }) => {
+                        return Err(legacy_runtime_upgrade_required(
+                            state_dir,
+                            snap,
+                            bindings_count,
                         ));
                     }
                     Err(ProbeFailure::Unauthorized) => {
@@ -1265,7 +1844,22 @@ async fn wait_for_running_winner(
                             ),
                         ));
                     }
-                    Err(ProbeFailure::TimedOut | ProbeFailure::Transport(_)) => {}
+                    Err(ProbeFailure::InvalidResponse(reason)) => {
+                        return Err(ControlRuntimeError::new(
+                            ControlRuntimeErrorCode::ProtocolError,
+                            format!(
+                                "concurrent supervisor (pid {}, port {}) in `{}` returned malformed authenticated control-runtime information ({reason}); refusing reuse",
+                                snap.descriptor.pid,
+                                snap.descriptor.port,
+                                state_dir.display()
+                            ),
+                        ));
+                    }
+                    Err(
+                        ProbeFailure::TimedOut
+                        | ProbeFailure::Transport(_)
+                        | ProbeFailure::Retiring,
+                    ) => {}
                 }
             }
         }
@@ -1583,6 +2177,7 @@ async fn spawn_and_await_control_runtime(
     initial_dir_identity: FileIdentity,
     initial_exe_identity: FileIdentity,
     stale_before: Option<DescriptorSnapshot>,
+    retired_runtime: Option<ControlRuntimeRetiredRuntime>,
     deadline: Instant,
 ) -> Result<ControlRuntimeEnsureOutcome, ControlRuntimeError> {
     if Instant::now() >= deadline {
@@ -1600,6 +2195,36 @@ async fn spawn_and_await_control_runtime(
         &policy.threadlane_executable,
         Some(initial_exe_identity),
     )?;
+
+    // Re-check ownership immediately before creating a process. This closes most of the
+    // cross-process race where another caller has already acquired the lock or published a
+    // different live descriptor since the caller's initial inspection.
+    let pre_spawn_state = inspect_runtime_state(&policy.state_dir, initial_dir_identity)?;
+    if pre_spawn_state.lock_holder.is_some() {
+        return wait_for_running_winner(
+            &policy.state_dir,
+            initial_dir_identity,
+            stale_before.as_ref(),
+            deadline,
+        )
+        .await;
+    }
+    if let Some(ref snap) = pre_spawn_state.descriptor {
+        let is_stale = stale_before
+            .as_ref()
+            .is_some_and(|stale| snap.same_instance(stale));
+        if !is_stale && is_process_alive(snap.descriptor.pid) {
+            return Err(ControlRuntimeError::new(
+                ControlRuntimeErrorCode::AmbiguousLiveSupervisor,
+                format!(
+                    "refusing to spawn for `{}`: a live unlocked supervisor.json for pid {} on port {} is present",
+                    policy.state_dir.display(),
+                    snap.descriptor.pid,
+                    snap.descriptor.port
+                ),
+            ));
+        }
+    }
 
     let serve_args = policy.serve_args();
     let mut cmd = Command::new(&policy.threadlane_executable);
@@ -1708,55 +2333,102 @@ async fn spawn_and_await_control_runtime(
                         .with_cleanup_outcome(&cleanup));
                     }
 
-                    match probe_authenticated_supervisor(&snap.descriptor, deadline).await {
-                        Ok(bindings_count) => {
-                            let post_state = match inspect_runtime_state(
-                                &policy.state_dir,
-                                initial_dir_identity,
-                            ) {
-                                Ok(s) => s,
-                                Err(err) => {
+                    match probe_live_runtime(&snap.descriptor, deadline).await {
+                        Ok(RuntimeProbe::Verified(live)) => {
+                            match evaluate_compatibility(&live.info) {
+                                RuntimeCompatibility::Compatible => {
+                                    let post_state = match inspect_runtime_state(
+                                        &policy.state_dir,
+                                        initial_dir_identity,
+                                    ) {
+                                        Ok(s) => s,
+                                        Err(err) => {
+                                            let cleanup = guard.terminate_and_reap().await;
+                                            return Err(err.with_cleanup_outcome(&cleanup));
+                                        }
+                                    };
+                                    let Some(post_snap) = post_state.descriptor else {
+                                        let cleanup = guard.terminate_and_reap().await;
+                                        return Err(ControlRuntimeError::new(
+                                            ControlRuntimeErrorCode::StateChanged,
+                                            format!(
+                                                "supervisor.json in `{}` disappeared immediately after startup readiness probe",
+                                                policy.state_dir.display()
+                                            ),
+                                        )
+                                        .with_cleanup_outcome(&cleanup));
+                                    };
+                                    if !post_snap.same_instance(snap)
+                                        || post_state.lock_holder
+                                            != Some(LockHolderInfo {
+                                                pid: snap.descriptor.pid,
+                                            })
+                                        || !is_process_alive(snap.descriptor.pid)
+                                    {
+                                        let cleanup = guard.terminate_and_reap().await;
+                                        return Err(ControlRuntimeError::new(
+                                            ControlRuntimeErrorCode::StateChanged,
+                                            format!(
+                                                "supervisor state in `{}` changed immediately after startup readiness probe",
+                                                policy.state_dir.display()
+                                            ),
+                                        )
+                                        .with_cleanup_outcome(&cleanup));
+                                    }
+
+                                    guard.disarm_and_reap_in_background();
+                                    return Ok(ControlRuntimeEnsureOutcome::started(
+                                        policy.state_dir.clone(),
+                                        snap.descriptor.pid,
+                                        snap.descriptor.port,
+                                        live.bindings_count,
+                                        stale_before.is_some(),
+                                        &live.info,
+                                        retired_runtime,
+                                    ));
+                                }
+                                RuntimeCompatibility::Retiring => {}
+                                RuntimeCompatibility::Upgradeable { missing } => {
                                     let cleanup = guard.terminate_and_reap().await;
+                                    return Err(ControlRuntimeError::new(
+                                        ControlRuntimeErrorCode::IncompatibleRuntime,
+                                        format!(
+                                            "spawned control runtime (pid {}, port {}) in `{}` reports protocol {} package `{}` but lacks required capabilities [{}]; refusing to accept an incompatible executable",
+                                            snap.descriptor.pid,
+                                            snap.descriptor.port,
+                                            policy.state_dir.display(),
+                                            live.info.protocol_version,
+                                            live.info.package_version,
+                                            missing.join(", ")
+                                        ),
+                                    )
+                                    .with_cleanup_outcome(&cleanup));
+                                }
+                                RuntimeCompatibility::Incompatible(reason) => {
+                                    let cleanup = guard.terminate_and_reap().await;
+                                    let err = incompatible_runtime_error(snap, &live.info, &reason);
                                     return Err(err.with_cleanup_outcome(&cleanup));
                                 }
-                            };
-                            let Some(post_snap) = post_state.descriptor else {
-                                let cleanup = guard.terminate_and_reap().await;
-                                return Err(ControlRuntimeError::new(
-                                    ControlRuntimeErrorCode::StateChanged,
-                                    format!(
-                                        "supervisor.json in `{}` disappeared immediately after startup readiness probe",
-                                        policy.state_dir.display()
-                                    ),
-                                )
-                                .with_cleanup_outcome(&cleanup));
-                            };
-                            if !post_snap.same_instance(snap)
-                                || post_state.lock_holder
-                                    != Some(LockHolderInfo {
-                                        pid: snap.descriptor.pid,
-                                    })
-                                || !is_process_alive(snap.descriptor.pid)
-                            {
-                                let cleanup = guard.terminate_and_reap().await;
-                                return Err(ControlRuntimeError::new(
-                                    ControlRuntimeErrorCode::StateChanged,
-                                    format!(
-                                        "supervisor state in `{}` changed immediately after startup readiness probe",
-                                        policy.state_dir.display()
-                                    ),
-                                )
-                                .with_cleanup_outcome(&cleanup));
                             }
-
-                            guard.disarm_and_reap_in_background();
-                            return Ok(ControlRuntimeEnsureOutcome::started(
-                                policy.state_dir.clone(),
-                                snap.descriptor.pid,
-                                snap.descriptor.port,
-                                bindings_count,
-                                stale_before.is_some(),
-                            ));
+                        }
+                        Ok(RuntimeProbe::Rejected { info, reason }) => {
+                            let cleanup = guard.terminate_and_reap().await;
+                            let err = incompatible_runtime_error(snap, &info, &reason);
+                            return Err(err.with_cleanup_outcome(&cleanup));
+                        }
+                        Ok(RuntimeProbe::Legacy { bindings_count }) => {
+                            let cleanup = guard.terminate_and_reap().await;
+                            return Err(ControlRuntimeError::new(
+                                ControlRuntimeErrorCode::UpgradeRequired,
+                                format!(
+                                    "spawned executable `{}` started a legacy control runtime (pid {}, port {}) in `{}` that answered authenticated binding reads ({bindings_count} bindings) but has no authenticated control-info/idle-retire protocol. Install the current package instead of silently accepting an old runtime.",
+                                    policy.threadlane_executable.display(),
+                                    snap.descriptor.pid,
+                                    snap.descriptor.port,
+                                    policy.state_dir.display()
+                                ),
+                            )
+                            .with_cleanup_outcome(&cleanup));
                         }
                         Err(ProbeFailure::Unauthorized) => {
                             let cleanup = guard.terminate_and_reap().await;
@@ -1771,7 +2443,24 @@ async fn spawn_and_await_control_runtime(
                             )
                             .with_cleanup_outcome(&cleanup));
                         }
-                        Err(ProbeFailure::TimedOut | ProbeFailure::Transport(_)) => {}
+                        Err(ProbeFailure::InvalidResponse(reason)) => {
+                            let cleanup = guard.terminate_and_reap().await;
+                            return Err(ControlRuntimeError::new(
+                                ControlRuntimeErrorCode::ProtocolError,
+                                format!(
+                                    "spawned supervisor (pid {}, port {}) in `{}` returned malformed authenticated control-runtime information ({reason})",
+                                    snap.descriptor.pid,
+                                    snap.descriptor.port,
+                                    policy.state_dir.display()
+                                ),
+                            )
+                            .with_cleanup_outcome(&cleanup));
+                        }
+                        Err(
+                            ProbeFailure::TimedOut
+                            | ProbeFailure::Transport(_)
+                            | ProbeFailure::Retiring,
+                        ) => {}
                     }
                 } else {
                     let cleanup = guard.terminate_and_reap().await;
@@ -1854,18 +2543,66 @@ async fn spawn_and_await_control_runtime(
     }
 }
 
-async fn probe_authenticated_supervisor(
-    descriptor: &RuntimeDescriptor,
-    deadline: Instant,
-) -> Result<usize, ProbeFailure> {
+fn probe_budget(deadline: Instant) -> Result<Duration, ProbeFailure> {
     let now = Instant::now();
     if now >= deadline {
         return Err(ProbeFailure::TimedOut);
     }
-    let budget = deadline
+    Ok(deadline
         .saturating_duration_since(now)
-        .min(MAX_SINGLE_PROBE_TIMEOUT);
+        .min(MAX_SINGLE_PROBE_TIMEOUT))
+}
 
+fn is_endpoint_not_found(api_err: &threadlane::ApiError) -> bool {
+    api_err.code == ThreadlaneErrorCode::InvalidRequest && api_err.message == "endpoint not found"
+}
+
+fn is_supervisor_retiring_error(api_err: &threadlane::ApiError) -> bool {
+    api_err.code == ThreadlaneErrorCode::InternalError
+        && api_err.message == SUPERVISOR_RETIRING_MESSAGE
+}
+
+async fn probe_control_runtime_info(
+    descriptor: &RuntimeDescriptor,
+    deadline: Instant,
+) -> Result<Option<ControlRuntimeInfoResponse>, ProbeFailure> {
+    let budget = probe_budget(deadline)?;
+    let client = SupervisorClient::from_descriptor(descriptor.clone())
+        .map_err(|err| ProbeFailure::Transport(sanitize_diagnostic_text(&err.to_string())))?;
+
+    match tokio::time::timeout(budget, client.control_runtime_info()).await {
+        Ok(Ok(info)) => {
+            info.validate()
+                .map_err(|reason| ProbeFailure::InvalidResponse(reason.to_string()))?;
+            if info.pid != descriptor.pid {
+                return Err(ProbeFailure::InvalidResponse(format!(
+                    "reported pid {} does not match descriptor pid {}",
+                    info.pid, descriptor.pid
+                )));
+            }
+            Ok(Some(info))
+        }
+        Ok(Err(ThreadlaneError::Remote(api_err)))
+            if api_err.code == ThreadlaneErrorCode::Unauthorized =>
+        {
+            Err(ProbeFailure::Unauthorized)
+        }
+        Ok(Err(ThreadlaneError::Remote(api_err))) if is_endpoint_not_found(&api_err) => Ok(None),
+        Ok(Err(ThreadlaneError::Remote(api_err))) if is_supervisor_retiring_error(&api_err) => {
+            Err(ProbeFailure::Retiring)
+        }
+        Ok(Err(err)) => Err(ProbeFailure::Transport(sanitize_diagnostic_text(
+            &err.to_string(),
+        ))),
+        Err(_) => Err(ProbeFailure::TimedOut),
+    }
+}
+
+async fn probe_bindings_count(
+    descriptor: &RuntimeDescriptor,
+    deadline: Instant,
+) -> Result<usize, ProbeFailure> {
+    let budget = probe_budget(deadline)?;
     let client = SupervisorClient::from_descriptor(descriptor.clone())
         .map_err(|err| ProbeFailure::Transport(sanitize_diagnostic_text(&err.to_string())))?;
 
@@ -1876,11 +2613,402 @@ async fn probe_authenticated_supervisor(
         {
             Err(ProbeFailure::Unauthorized)
         }
+        Ok(Err(ThreadlaneError::Remote(api_err))) if is_supervisor_retiring_error(&api_err) => {
+            Err(ProbeFailure::Retiring)
+        }
         Ok(Err(err)) => Err(ProbeFailure::Transport(sanitize_diagnostic_text(
             &err.to_string(),
         ))),
         Err(_) => Err(ProbeFailure::TimedOut),
     }
+}
+
+async fn probe_live_runtime(
+    descriptor: &RuntimeDescriptor,
+    deadline: Instant,
+) -> Result<RuntimeProbe, ProbeFailure> {
+    match probe_control_runtime_info(descriptor, deadline).await {
+        Ok(Some(info)) => {
+            // Classify forbidden role/protocol/capability advertisements from the validated
+            // authenticated info before any best-effort bindings readiness read. A runtime that
+            // independently stops or begins retiring must not erase a refusal already observed.
+            if let RuntimeCompatibility::Incompatible(reason) = evaluate_compatibility(&info) {
+                return Ok(RuntimeProbe::Rejected { info, reason });
+            }
+            let bindings_count = probe_bindings_count(descriptor, deadline).await?;
+            Ok(RuntimeProbe::Verified(VerifiedLiveRuntime {
+                bindings_count,
+                info,
+            }))
+        }
+        Ok(None) => {
+            // A legacy runtime without the authenticated control-info endpoint can prove only
+            // authenticated binding listing. That is not the scoped backlog/event contract and
+            // exposes no safe idle-retire handshake, so the caller must fail with explicit
+            // upgrade guidance rather than reuse it or attempt a check-then-kill sequence.
+            match probe_bindings_count(descriptor, deadline).await {
+                Ok(bindings_count) => Ok(RuntimeProbe::Legacy { bindings_count }),
+                Err(ProbeFailure::Retiring) => Err(ProbeFailure::Transport(
+                    "legacy runtime began shutting down during authenticated readiness verification; retry after it exits"
+                        .to_string(),
+                )),
+                Err(err) => Err(err),
+            }
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn missing_required_capabilities(
+    capabilities: &threadlane::protocol::ControlRuntimeCapabilities,
+) -> Vec<&'static str> {
+    let mut missing = Vec::new();
+    if !capabilities.bindings {
+        missing.push("bindings");
+    }
+    if !capabilities.scoped_backlog {
+        missing.push("scoped_backlog");
+    }
+    if !capabilities.event_pull_ack {
+        missing.push("event_pull_ack");
+    }
+    if !capabilities.guarded_worker_backlog {
+        missing.push("guarded_worker_backlog");
+    }
+    missing
+}
+
+fn evaluate_compatibility(info: &ControlRuntimeInfoResponse) -> RuntimeCompatibility {
+    if info.protocol_version > CONTROL_RUNTIME_PROTOCOL_VERSION {
+        return RuntimeCompatibility::Incompatible(format!(
+            "protocol version {} is newer than this caller's supported version {}; refusing downgrade or restart ping-pong",
+            info.protocol_version, CONTROL_RUNTIME_PROTOCOL_VERSION
+        ));
+    }
+
+    match info.role {
+        ControlRuntimeRole::Baseline => {}
+        ControlRuntimeRole::ApprovedHost => {
+            return RuntimeCompatibility::Incompatible(
+                "runtime role is approved_host, not baseline; use the approved host control route"
+                    .to_string(),
+            );
+        }
+        ControlRuntimeRole::Unknown => {
+            return RuntimeCompatibility::Incompatible(
+                "runtime role is unrecognized by this caller".to_string(),
+            );
+        }
+    }
+
+    if info.role == ControlRuntimeRole::Baseline && info.capabilities.approved_host_control {
+        return RuntimeCompatibility::Incompatible(
+            "runtime advertises a baseline role together with approved host control".to_string(),
+        );
+    }
+
+    match info.state {
+        ControlRuntimeRuntimeState::Ready => {}
+        ControlRuntimeRuntimeState::Retiring => return RuntimeCompatibility::Retiring,
+        ControlRuntimeRuntimeState::Unknown => {
+            return RuntimeCompatibility::Incompatible(
+                "runtime lifecycle state is unrecognized by this caller".to_string(),
+            );
+        }
+    }
+
+    let missing = missing_required_capabilities(&info.capabilities);
+    if missing.is_empty() {
+        return RuntimeCompatibility::Compatible;
+    }
+
+    if info.capabilities.idle_retire
+        && info.protocol_version >= CONTROL_RUNTIME_IDLE_RETIRE_MIN_PROTOCOL_VERSION
+        && !info.notifications_configured
+        && !info.workers_configured
+        && !info.capabilities.approved_host_control
+    {
+        RuntimeCompatibility::Upgradeable { missing }
+    } else {
+        RuntimeCompatibility::Incompatible(format!(
+            "runtime lacks required capabilities [{}] and does not advertise the safe baseline idle-retire handshake (protocol >= {}, notifications_configured={}, workers_configured={})",
+            missing.join(", "),
+            CONTROL_RUNTIME_IDLE_RETIRE_MIN_PROTOCOL_VERSION,
+            info.notifications_configured,
+            info.workers_configured
+        ))
+    }
+}
+
+async fn request_idle_retirement(
+    descriptor: &RuntimeDescriptor,
+    info: &ControlRuntimeInfoResponse,
+    deadline: Instant,
+) -> Result<(), ControlRuntimeError> {
+    let request = ControlRuntimeRetireRequest {
+        expected_protocol_version: info.protocol_version,
+        expected_instance_id: info.instance_id.clone(),
+        expected_pid: info.pid,
+    };
+
+    let budget = match probe_budget(deadline) {
+        Ok(budget) => budget,
+        Err(_) => {
+            return Err(ControlRuntimeError::new(
+                ControlRuntimeErrorCode::RetireTimedOut,
+                format!(
+                    "control runtime startup deadline expired before requesting safe idle retire of pid {} instance `{}` on port {}; no process was stopped and no replacement was started",
+                    info.pid,
+                    info.instance_id,
+                    descriptor.port
+                ),
+            ));
+        }
+    };
+
+    let client = SupervisorClient::from_descriptor(descriptor.clone()).map_err(|err| {
+        ControlRuntimeError::new(
+            ControlRuntimeErrorCode::ProtocolError,
+            format!(
+                "failed to construct authenticated control runtime retire client: {}",
+                sanitize_diagnostic_text(&err.to_string())
+            ),
+        )
+    })?;
+
+    match tokio::time::timeout(budget, client.retire_idle_control_runtime(&request)).await {
+        Ok(Ok(response)) => {
+            response.validate().map_err(|reason| {
+                ControlRuntimeError::new(
+                    ControlRuntimeErrorCode::ProtocolError,
+                    format!("control runtime returned a malformed retire response: {reason}"),
+                )
+            })?;
+            if response.instance_id != info.instance_id
+                || response.protocol_version != info.protocol_version
+            {
+                return Err(ControlRuntimeError::new(
+                    ControlRuntimeErrorCode::StateChanged,
+                    format!(
+                        "control runtime retire response identified instance `{}` protocol {}, but the observed runtime was instance `{}` protocol {}; no replacement was started",
+                        response.instance_id,
+                        response.protocol_version,
+                        info.instance_id,
+                        info.protocol_version
+                    ),
+                ));
+            }
+            if response.state != ControlRuntimeRetireState::Retiring {
+                return Err(ControlRuntimeError::new(
+                    ControlRuntimeErrorCode::ProtocolError,
+                    "control runtime retire response did not report a retiring state".to_string(),
+                ));
+            }
+            Ok(())
+        }
+        Ok(Err(err)) => map_retire_api_error(err, info),
+        // A transport failure or timeout after the request may have left an unknown outcome.
+        // The only safe reconciliation is to wait boundedly for the owned lock release; this
+        // function never spawns, signals, or assumes the retirement succeeded.
+        Err(_) => Ok(()),
+    }
+}
+
+fn map_retire_api_error(
+    err: ThreadlaneError,
+    info: &ControlRuntimeInfoResponse,
+) -> Result<(), ControlRuntimeError> {
+    let ThreadlaneError::Remote(api_err) = err else {
+        // The request may not have reached the runtime. Waiting for lock release is safe and
+        // bounded by the caller; do not treat a transport error as proof of retirement.
+        return Ok(());
+    };
+
+    if api_err.code == ThreadlaneErrorCode::HostNotIdle {
+        let counts = api_err
+            .details
+            .as_ref()
+            .and_then(|value| {
+                serde_json::from_value::<ControlRuntimeBusyCounts>(value.clone()).ok()
+            })
+            .map(|busy| {
+                format!(
+                    "non_terminal_runs={}, non_terminal_workers={}, live_worker_tasks={}, in_flight_wakeups={}, pending_wakeups={}",
+                    busy.non_terminal_runs,
+                    busy.non_terminal_workers,
+                    busy.live_worker_tasks,
+                    busy.in_flight_wakeups,
+                    busy.pending_wakeups
+                )
+            })
+            .unwrap_or_else(|| "bounded busy counters unavailable".to_string());
+        return Err(ControlRuntimeError::new(
+            ControlRuntimeErrorCode::RuntimeBusy,
+            format!(
+                "control runtime (pid {}, instance `{}`) refused safe idle retire because activity won the race ({counts}); no process was stopped and no replacement was started. Finish or cancel that work, then retry.",
+                info.pid, info.instance_id
+            ),
+        ));
+    }
+
+    if api_err.code == ThreadlaneErrorCode::HostInstanceMismatch {
+        return Err(ControlRuntimeError::new(
+            ControlRuntimeErrorCode::StateChanged,
+            format!(
+                "control runtime (pid {}, instance `{}`) refused safe idle retire because the expected instance no longer matches a live replacement; no process was stopped and no replacement was started",
+                info.pid, info.instance_id
+            ),
+        ));
+    }
+
+    if api_err.code == ThreadlaneErrorCode::Unauthorized {
+        return Err(ControlRuntimeError::new(
+            ControlRuntimeErrorCode::UnauthorizedSupervisor,
+            "control runtime rejected bearer token authentication during safe idle retire; refusing takeover"
+                .to_string(),
+        ));
+    }
+
+    if is_endpoint_not_found(&api_err) {
+        return Err(ControlRuntimeError::new(
+            ControlRuntimeErrorCode::UpgradeRequired,
+            "Stop the legacy runtime while it is idle through the normal process manager, then retry: it disappeared or does not expose the authenticated idle-retire endpoint; no process was stopped."
+                .to_string(),
+        ));
+    }
+
+    if is_supervisor_retiring_error(&api_err) {
+        return Ok(());
+    }
+
+    if api_err.code == ThreadlaneErrorCode::InvalidConfig {
+        if api_err
+            .message
+            .starts_with("control runtime protocol mismatch")
+        {
+            return Err(ControlRuntimeError::new(
+                ControlRuntimeErrorCode::StateChanged,
+                format!(
+                    "control runtime protocol changed between discovery and safe idle retire ({}); no process was stopped and no replacement was started",
+                    sanitize_diagnostic_text(&api_err.message)
+                ),
+            ));
+        }
+        return Err(ControlRuntimeError::new(
+            ControlRuntimeErrorCode::IncompatibleRuntime,
+            format!(
+                "control runtime refused safe idle retire: {}; the runtime remains active",
+                sanitize_diagnostic_text(&api_err.message)
+            ),
+        ));
+    }
+
+    Err(ControlRuntimeError::new(
+        ControlRuntimeErrorCode::ProtocolError,
+        format!(
+            "control runtime returned an unexpected authenticated retire error ({:?}): {}",
+            api_err.code,
+            sanitize_diagnostic_text(&api_err.message)
+        ),
+    ))
+}
+
+async fn await_retirement_and_start(
+    policy: &ControlRuntimePolicy,
+    initial_dir_identity: FileIdentity,
+    initial_exe_identity: FileIdentity,
+    retired_snap: &DescriptorSnapshot,
+    retired_info: Option<ControlRuntimeInfoResponse>,
+    deadline: Instant,
+) -> Result<ControlRuntimeEnsureOutcome, ControlRuntimeError> {
+    let retired_summary = retired_info.as_ref().map(retired_runtime_summary);
+    let retired_instance = retired_info
+        .as_ref()
+        .map(|info| info.instance_id.as_str())
+        .unwrap_or("unknown");
+
+    let final_descriptor = loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(ControlRuntimeError::new(
+                ControlRuntimeErrorCode::RetireTimedOut,
+                format!(
+                    "control runtime (pid {}, instance `{}`) did not release `{}/{}` within the remaining timeout after authenticated control-runtime verification or a safe idle-retire request; no replacement was started and no process was force-killed. Retry after it exits.",
+                    retired_snap.descriptor.pid,
+                    retired_instance,
+                    policy.state_dir.display(),
+                    LOCK_FILENAME
+                ),
+            ));
+        }
+
+        let state = inspect_runtime_state(&policy.state_dir, initial_dir_identity)?;
+        match state.lock_holder {
+            Some(holder) if holder.pid == retired_snap.descriptor.pid => {
+                if let Some(current) = state.descriptor.as_ref() {
+                    if !current.same_instance(retired_snap) {
+                        return Err(ControlRuntimeError::new(
+                            ControlRuntimeErrorCode::StateChanged,
+                            format!(
+                                "supervisor.json in `{}` changed while awaiting owned retirement; refusing to start a replacement",
+                                policy.state_dir.display()
+                            ),
+                        ));
+                    }
+                }
+            }
+            Some(_) => {
+                // Another process owns the lock, likely a concurrent successor. Wait for a
+                // verified compatible winner instead of spawning a second supervisor.
+                return wait_for_running_winner(
+                    &policy.state_dir,
+                    initial_dir_identity,
+                    Some(retired_snap),
+                    deadline,
+                )
+                .await;
+            }
+            None => match state.descriptor.as_ref() {
+                Some(current) if current.same_instance(retired_snap) => {
+                    if !is_process_alive(current.descriptor.pid) {
+                        break Some(current.clone());
+                    }
+                    // The owned process released the lock but may still be cleaning up.
+                }
+                Some(current) => {
+                    if is_process_alive(current.descriptor.pid) {
+                        return Err(ControlRuntimeError::new(
+                            ControlRuntimeErrorCode::AmbiguousLiveSupervisor,
+                            format!(
+                                "control runtime state in `{}` published a different live descriptor (pid {}, port {}) without holding `{}/{}`; refusing to start a replacement",
+                                policy.state_dir.display(),
+                                current.descriptor.pid,
+                                current.descriptor.port,
+                                policy.state_dir.display(),
+                                LOCK_FILENAME
+                            ),
+                        ));
+                    }
+                    break Some(current.clone());
+                }
+                None => break None,
+            },
+        }
+
+        let sleep_dur =
+            CONTROL_RUNTIME_POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now()));
+        tokio::time::sleep(sleep_dur).await;
+    };
+
+    spawn_and_await_control_runtime(
+        policy,
+        initial_dir_identity,
+        initial_exe_identity,
+        final_descriptor,
+        retired_summary,
+        deadline,
+    )
+    .await
 }
 
 fn inspect_runtime_state(

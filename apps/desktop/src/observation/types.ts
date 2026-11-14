@@ -317,6 +317,8 @@ export interface WorkspaceNativeSample {
   sequence: number;
   observed_at_ms: number | null;
   last_success_at_ms: number | null;
+  /** Display-only sanitized title from a verified exact-thread native read; never part of identity. */
+  thread_title?: string | null;
   availability: WorkspaceAvailabilityState;
   activity: WorkspaceActivityState;
   connection: WorkspaceSampleConnection;

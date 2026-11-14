@@ -357,6 +357,7 @@ mod unix_workspace_tests {
             sequence: timing.sequence,
             observed_at_ms: Some(timing.observed_at_ms),
             last_success_at_ms: Some(timing.last_success_at_ms),
+            thread_title: None,
             availability,
             activity,
             connection: WorkspaceSampleConnection {
@@ -1851,6 +1852,643 @@ mod unix_workspace_tests {
             chat_fallback.configured_selection.evidence,
             WorkspaceSelectionEvidence::Unavailable
         );
+    }
+
+    #[test]
+    fn workspace_snapshot_prefers_verified_native_title_and_keeps_repeated_renames_isolated() {
+        let tree = TestTree::new("native-title-cache");
+        let stores = TestStores::new(&tree, "stores");
+        let app_data = tree.dir("app-data");
+        let project = tree.dir("repo-title-cache");
+        let foreign_project = tree.dir("repo-title-foreign");
+        let source_id = stores.canonical_source_id();
+        let thread_uuid = "0196ed00-0000-7000-8000-0000000002a1";
+        let foreign_thread_uuid = "0196ed00-0000-7000-8000-0000000002a2";
+
+        let mut core = Core::open(stores.state.join("state.db")).expect("open Core");
+        let binding = core
+            .create_binding(thread_uuid, "Threadlane development")
+            .expect("create stale-alias binding");
+        let foreign_binding = core
+            .create_binding(foreign_thread_uuid, "Foreign Chat Alias")
+            .expect("create foreign binding");
+        let item = core
+            .create_backlog_item(
+                &binding.binding_id,
+                "create-title-item",
+                threadlane_core::NewBacklogItem {
+                    title: "Stable backlog item".to_string(),
+                    acceptance_condition: "Title renames leave this item Done".to_string(),
+                    delivery_description: "Keep the durable backlog item stable".to_string(),
+                    kind: threadlane_core::BacklogItemKind::Coworker,
+                },
+                1_000,
+            )
+            .expect("create stable backlog item");
+        let started = core
+            .start_backlog_item(
+                &binding.binding_id,
+                "start-title-item",
+                &item.item_id,
+                item.revision,
+                1_010,
+            )
+            .expect("start stable backlog item");
+        let done = core
+            .complete_backlog_item(
+                &binding.binding_id,
+                "complete-title-item",
+                &item.item_id,
+                started.revision,
+                "Checked the stable item",
+                "Verified it remains Done",
+                1_020,
+            )
+            .expect("complete stable backlog item");
+        assert_eq!(done.status, threadlane_core::BacklogStatus::Done);
+        drop(core);
+
+        let identity = WorkspaceChatIdentity::new(
+            &source_id,
+            &binding.binding_id,
+            thread_uuid,
+            &path_text(&project),
+        )
+        .expect("chat identity");
+        let foreign_identity = WorkspaceChatIdentity::new(
+            &source_id,
+            &foreign_binding.binding_id,
+            foreign_thread_uuid,
+            &path_text(&foreign_project),
+        )
+        .expect("foreign chat identity");
+
+        let now_ms = current_observation_time_ms();
+        let mut initial = make_native_sample(
+            identity.clone(),
+            "epoch_title_1",
+            SampleTiming {
+                sequence: 1,
+                observed_at_ms: now_ms - 600,
+                last_success_at_ms: now_ms - 600,
+            },
+            WorkspaceAvailabilityState::Available,
+            WorkspaceActivityState::Working,
+            WorkspaceConfiguredSelection::verified(Some("gpt-6-astra"), Some("high")),
+            Some("Diagnostic text must not become a title"),
+        );
+        initial.thread_title = Some("Mainlane".to_string());
+        let initial_write =
+            write_workspace_native_sample_sidecar(&stores.state, &initial).expect("write initial");
+
+        let mut foreign = make_native_sample(
+            foreign_identity.clone(),
+            "epoch_foreign_1",
+            SampleTiming {
+                sequence: 1,
+                observed_at_ms: now_ms - 550,
+                last_success_at_ms: now_ms - 550,
+            },
+            WorkspaceAvailabilityState::Available,
+            WorkspaceActivityState::Idle,
+            WorkspaceConfiguredSelection::verified(Some("gpt-6-astra"), Some("high")),
+            None,
+        );
+        foreign.thread_title = Some("Foreign Chat Title".to_string());
+        write_workspace_native_sample_sidecar(&stores.state, &foreign)
+            .expect("write foreign-title sample");
+
+        // A sample under a different observation source must never contribute a title to this
+        // source's exact chat, even if binding/thread/project happen to match.
+        let foreign_source_identity = WorkspaceChatIdentity::new(
+            "src_9999999999999999999999999999999999999999999999999999999999999999",
+            &binding.binding_id,
+            thread_uuid,
+            &path_text(&project),
+        )
+        .expect("foreign-source chat identity");
+        let mut foreign_source = make_native_sample(
+            foreign_source_identity,
+            "epoch_foreign_source_1",
+            SampleTiming {
+                sequence: 1,
+                observed_at_ms: now_ms - 525,
+                last_success_at_ms: now_ms - 525,
+            },
+            WorkspaceAvailabilityState::Available,
+            WorkspaceActivityState::Working,
+            WorkspaceConfiguredSelection::unavailable(),
+            None,
+        );
+        foreign_source.thread_title = Some("Foreign Source Title".to_string());
+        write_workspace_native_sample_sidecar(&stores.state, &foreign_source)
+            .expect("write foreign-source-title sample");
+
+        let service = ObservationService::new(stores.config(&app_data));
+        let snap_initial = service.workspace_snapshot(None).expect("initial snapshot");
+        let chat_initial = snap_initial
+            .chats
+            .iter()
+            .find(|chat| chat.identity == identity)
+            .expect("initial chat");
+        assert_eq!(
+            chat_initial.thread_label, "Mainlane",
+            "a verified native title must win over the stale Core binding alias"
+        );
+        let sample_initial = snap_initial
+            .native_samples
+            .iter()
+            .find(|sample| sample.chat_identity == identity)
+            .expect("initial native sample");
+        assert_eq!(sample_initial.thread_title.as_deref(), Some("Mainlane"));
+        let foreign_chat = snap_initial
+            .chats
+            .iter()
+            .find(|chat| chat.identity == foreign_identity)
+            .expect("foreign chat");
+        assert_eq!(foreign_chat.thread_label, "Foreign Chat Title");
+        assert_ne!(chat_initial.thread_label, foreign_chat.thread_label);
+        assert_eq!(snap_initial.chats.len(), 2);
+        assert!(snap_initial
+            .chats
+            .iter()
+            .all(|chat| chat.thread_label != "Foreign Source Title"));
+        let canonical_key = identity.canonical_key();
+        assert!(canonical_key.is_some());
+        let chat_work = snap_initial
+            .chat_work
+            .iter()
+            .find(|work| work.identity == identity)
+            .expect("chat work");
+        assert_eq!(chat_work.items.len(), 1);
+        assert_eq!(chat_work.items[0].item_id, item.item_id);
+        assert_eq!(
+            chat_work.items[0].status,
+            threadlane_core::BacklogStatus::Done
+        );
+
+        // A second verified rename on the same chat identity updates the label without changing
+        // identity, backlog item IDs, or the durable Done status.
+        let mut renamed = make_native_sample(
+            identity.clone(),
+            "epoch_title_1",
+            SampleTiming {
+                sequence: 2,
+                observed_at_ms: now_ms - 400,
+                last_success_at_ms: now_ms - 400,
+            },
+            WorkspaceAvailabilityState::Available,
+            WorkspaceActivityState::Idle,
+            WorkspaceConfiguredSelection::verified(Some("gpt-6-astra"), Some("high")),
+            None,
+        );
+        renamed.thread_title = Some("Mainlane Renamed".to_string());
+        write_workspace_native_sample_sidecar(&stores.state, &renamed).expect("write rename");
+        let snap_renamed = service.workspace_snapshot(None).expect("renamed snapshot");
+        let chat_renamed = snap_renamed
+            .chats
+            .iter()
+            .find(|chat| chat.identity == identity)
+            .expect("renamed chat");
+        assert_eq!(chat_renamed.thread_label, "Mainlane Renamed");
+        assert_eq!(chat_renamed.identity.canonical_key(), canonical_key);
+        let work_renamed = snap_renamed
+            .chat_work
+            .iter()
+            .find(|work| work.identity == identity)
+            .expect("renamed chat work");
+        assert_eq!(work_renamed.items.len(), 1);
+        assert_eq!(work_renamed.items[0].item_id, item.item_id);
+        assert_eq!(
+            work_renamed.items[0].status,
+            threadlane_core::BacklogStatus::Done
+        );
+
+        // A transient disconnected observation keeps the last verified display title while
+        // live availability and activity degrade exactly as before.
+        let disconnected = make_native_sample(
+            identity.clone(),
+            "epoch_title_1",
+            SampleTiming {
+                sequence: 3,
+                observed_at_ms: now_ms - 200,
+                last_success_at_ms: now_ms - 200,
+            },
+            WorkspaceAvailabilityState::Disconnected,
+            WorkspaceActivityState::Working,
+            WorkspaceConfiguredSelection::verified(Some("gpt-6-astra"), Some("high")),
+            Some("Disconnected transport"),
+        );
+        assert_eq!(disconnected.thread_title, None);
+        write_workspace_native_sample_sidecar(&stores.state, &disconnected)
+            .expect("write disconnected sample");
+        let snap_disconnected = service
+            .workspace_snapshot(None)
+            .expect("disconnected snapshot");
+        let chat_disconnected = snap_disconnected
+            .chats
+            .iter()
+            .find(|chat| chat.identity == identity)
+            .expect("disconnected chat");
+        assert_eq!(chat_disconnected.thread_label, "Mainlane Renamed");
+        assert_eq!(
+            chat_disconnected.availability,
+            WorkspaceAvailabilityState::Disconnected
+        );
+        assert_eq!(chat_disconnected.activity, WorkspaceActivityState::Unknown);
+        let work_disconnected = snap_disconnected
+            .chat_work
+            .iter()
+            .find(|work| work.identity == identity)
+            .expect("disconnected chat work");
+        assert_eq!(work_disconnected.items[0].item_id, item.item_id);
+        assert_eq!(
+            work_disconnected.items[0].status,
+            threadlane_core::BacklogStatus::Done
+        );
+
+        // Out-of-order same-epoch and older-epoch samples must never resurrect the old alias.
+        let mut regressed = make_native_sample(
+            identity.clone(),
+            "epoch_title_1",
+            SampleTiming {
+                sequence: 1,
+                observed_at_ms: now_ms - 100,
+                last_success_at_ms: now_ms - 100,
+            },
+            WorkspaceAvailabilityState::Available,
+            WorkspaceActivityState::Working,
+            WorkspaceConfiguredSelection::unavailable(),
+            None,
+        );
+        regressed.thread_title = Some("Threadlane development".to_string());
+        let regressed_bytes =
+            serialize_workspace_native_sample_sidecar(&regressed).expect("serialize regressed");
+        fs::write(&initial_write.path, &regressed_bytes).expect("overwrite with regressed sample");
+        set_mode(&initial_write.path, 0o600);
+
+        let snap_regressed = service
+            .workspace_snapshot(None)
+            .expect("regressed snapshot");
+        let chat_regressed = snap_regressed
+            .chats
+            .iter()
+            .find(|chat| chat.identity == identity)
+            .expect("regressed chat");
+        assert_eq!(chat_regressed.thread_label, "Mainlane Renamed");
+        let retained_regressed = snap_regressed
+            .native_samples
+            .iter()
+            .find(|sample| sample.chat_identity == identity)
+            .expect("retained sample");
+        assert_eq!(retained_regressed.sequence, 3);
+        assert!(snap_regressed
+            .observation
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("regressed native chat sample")));
+
+        let mut stale_epoch = make_native_sample(
+            identity.clone(),
+            "epoch_title_0",
+            SampleTiming {
+                sequence: 9,
+                observed_at_ms: now_ms - 2_000,
+                last_success_at_ms: now_ms - 2_000,
+            },
+            WorkspaceAvailabilityState::Available,
+            WorkspaceActivityState::Working,
+            WorkspaceConfiguredSelection::unavailable(),
+            None,
+        );
+        stale_epoch.thread_title = Some("Original Local".to_string());
+        let stale_epoch_bytes =
+            serialize_workspace_native_sample_sidecar(&stale_epoch).expect("serialize old epoch");
+        fs::write(&initial_write.path, &stale_epoch_bytes).expect("overwrite with old epoch");
+        set_mode(&initial_write.path, 0o600);
+
+        let snap_old_epoch = service
+            .workspace_snapshot(None)
+            .expect("old epoch snapshot");
+        let chat_old_epoch = snap_old_epoch
+            .chats
+            .iter()
+            .find(|chat| chat.identity == identity)
+            .expect("old-epoch chat");
+        assert_eq!(chat_old_epoch.thread_label, "Mainlane Renamed");
+        assert_eq!(
+            snap_old_epoch
+                .native_samples
+                .iter()
+                .find(|sample| sample.chat_identity == identity)
+                .expect("retained old-epoch sample")
+                .producer_epoch,
+            "epoch_title_1"
+        );
+    }
+
+    #[test]
+    fn workspace_snapshot_orders_verified_titles_by_accepted_fresh_samples() {
+        let tree = TestTree::new("native-title-ordering");
+        let stores = TestStores::new(&tree, "stores");
+        let app_data = tree.dir("app-data");
+        let project = tree.dir("repo-title-ordering");
+        let aged_project = tree.dir("repo-title-aged");
+        let source_id = stores.canonical_source_id();
+        let thread_uuid = "0196ed00-0000-7000-8000-0000000002b1";
+
+        let mut core = Core::open(stores.state.join("state.db")).expect("open Core");
+        let binding = core
+            .create_binding(thread_uuid, "Stored Alias")
+            .expect("create binding");
+        drop(core);
+
+        let identity = WorkspaceChatIdentity::new(
+            &source_id,
+            &binding.binding_id,
+            thread_uuid,
+            &path_text(&project),
+        )
+        .expect("ordered chat identity");
+        let aged_identity = WorkspaceChatIdentity::new(
+            &source_id,
+            "bnd_title_aged",
+            "0196ed00-0000-7000-8000-0000000002b2",
+            &path_text(&aged_project),
+        )
+        .expect("aged chat identity");
+
+        let now_ms = current_observation_time_ms();
+        let initial_observed_at_ms = now_ms - 900;
+        let mut initial = make_native_sample(
+            identity.clone(),
+            "epoch_title_b",
+            SampleTiming {
+                sequence: 1,
+                observed_at_ms: initial_observed_at_ms,
+                last_success_at_ms: initial_observed_at_ms,
+            },
+            WorkspaceAvailabilityState::Available,
+            WorkspaceActivityState::Working,
+            WorkspaceConfiguredSelection::verified(Some("gpt-6-astra"), Some("high")),
+            None,
+        );
+        initial.thread_title = Some("Title B".to_string());
+        let sample_path = write_workspace_native_sample_sidecar(&stores.state, &initial)
+            .expect("write initial title");
+
+        let aged_observed_at_ms = now_ms - 25_000;
+        let mut aged = make_native_sample(
+            aged_identity.clone(),
+            "epoch_title_aged",
+            SampleTiming {
+                sequence: 1,
+                observed_at_ms: aged_observed_at_ms,
+                last_success_at_ms: aged_observed_at_ms,
+            },
+            WorkspaceAvailabilityState::Available,
+            WorkspaceActivityState::Working,
+            WorkspaceConfiguredSelection::verified(Some("gpt-6-astra"), Some("high")),
+            None,
+        );
+        aged.thread_title = Some("Aged Title".to_string());
+        write_workspace_native_sample_sidecar(&stores.state, &aged).expect("write aged title");
+
+        let service = ObservationService::new(stores.config(&app_data));
+
+        let snap_initial = service.workspace_snapshot(None).expect("initial snapshot");
+        let chat_initial = snap_initial
+            .chats
+            .iter()
+            .find(|chat| chat.identity == identity)
+            .expect("initial ordered chat");
+        assert_eq!(chat_initial.thread_label, "Title B");
+        assert_eq!(
+            chat_initial.availability,
+            WorkspaceAvailabilityState::Available
+        );
+        assert_eq!(chat_initial.activity, WorkspaceActivityState::Working);
+        let aged_chat = snap_initial
+            .chats
+            .iter()
+            .find(|chat| chat.identity == aged_identity)
+            .expect("aged chat");
+        assert_eq!(
+            aged_chat.thread_label, "Codex chat",
+            "a raw `available` sample older than the staleness threshold must not become a title"
+        );
+        assert_eq!(aged_chat.availability, WorkspaceAvailabilityState::Stale);
+        assert_eq!(aged_chat.activity, WorkspaceActivityState::Unknown);
+
+        let overwrite = |sample: &WorkspaceNativeSample| {
+            let bytes =
+                serialize_workspace_native_sample_sidecar(sample).expect("serialize title sample");
+            fs::write(&sample_path.path, &bytes).expect("overwrite title sidecar");
+            set_mode(&sample_path.path, 0o600);
+        };
+
+        // Core accepts an equal-time new producer epoch, but the title-order guard requires a
+        // strictly newer observation time across epochs and must keep the accepted title.
+        let mut equal_time_new_epoch = make_native_sample(
+            identity.clone(),
+            "epoch_title_a",
+            SampleTiming {
+                sequence: 1,
+                observed_at_ms: initial_observed_at_ms,
+                last_success_at_ms: initial_observed_at_ms,
+            },
+            WorkspaceAvailabilityState::Available,
+            WorkspaceActivityState::Idle,
+            WorkspaceConfiguredSelection::unavailable(),
+            None,
+        );
+        equal_time_new_epoch.thread_title = Some("Title A".to_string());
+        overwrite(&equal_time_new_epoch);
+        let snap_equal_time_a = service
+            .workspace_snapshot(None)
+            .expect("equal-time new-epoch snapshot");
+        let equal_time_sample = snap_equal_time_a
+            .native_samples
+            .iter()
+            .find(|sample| sample.chat_identity == identity)
+            .expect("accepted equal-time sample");
+        assert_eq!(
+            equal_time_sample.producer_epoch, "epoch_title_a",
+            "the sample cache must accept the equal-time new epoch before the title guard rejects it"
+        );
+        assert_eq!(equal_time_sample.thread_title.as_deref(), Some("Title A"));
+        let chat_equal_time_a = snap_equal_time_a
+            .chats
+            .iter()
+            .find(|chat| chat.identity == identity)
+            .expect("equal-time title chat");
+        assert_eq!(chat_equal_time_a.thread_label, "Title B");
+        assert_ne!(chat_equal_time_a.thread_label, "Title A");
+
+        // An equal-time new-epoch blank title must not erase the ordered accepted title.
+        let equal_time_blank = make_native_sample(
+            identity.clone(),
+            "epoch_title_blank_equal",
+            SampleTiming {
+                sequence: 1,
+                observed_at_ms: initial_observed_at_ms,
+                last_success_at_ms: initial_observed_at_ms,
+            },
+            WorkspaceAvailabilityState::Available,
+            WorkspaceActivityState::Idle,
+            WorkspaceConfiguredSelection::unavailable(),
+            None,
+        );
+        overwrite(&equal_time_blank);
+        let snap_equal_time_blank = service
+            .workspace_snapshot(None)
+            .expect("equal-time blank snapshot");
+        assert_eq!(
+            snap_equal_time_blank
+                .native_samples
+                .iter()
+                .find(|sample| sample.chat_identity == identity)
+                .expect("accepted equal-time blank sample")
+                .producer_epoch,
+            "epoch_title_blank_equal"
+        );
+        let chat_equal_time_blank = snap_equal_time_blank
+            .chats
+            .iter()
+            .find(|chat| chat.identity == identity)
+            .expect("equal-time blank chat");
+        assert_eq!(chat_equal_time_blank.thread_label, "Title B");
+
+        // A previously accepted title survives a stale observation while activity degrades and
+        // the stale sample's own raw title is never displayed.
+        let stale_observed_at_ms = initial_observed_at_ms + 100;
+        let mut stale = make_native_sample(
+            identity.clone(),
+            "epoch_title_stale",
+            SampleTiming {
+                sequence: 1,
+                observed_at_ms: stale_observed_at_ms,
+                last_success_at_ms: now_ms - 25_000,
+            },
+            WorkspaceAvailabilityState::Available,
+            WorkspaceActivityState::Working,
+            WorkspaceConfiguredSelection::verified(Some("gpt-6-astra"), Some("high")),
+            None,
+        );
+        stale.thread_title = Some("Stale Rename".to_string());
+        overwrite(&stale);
+        let snap_stale = service.workspace_snapshot(None).expect("stale snapshot");
+        let stale_chat = snap_stale
+            .chats
+            .iter()
+            .find(|chat| chat.identity == identity)
+            .expect("stale ordered chat");
+        assert_eq!(stale_chat.thread_label, "Title B");
+        assert_eq!(stale_chat.availability, WorkspaceAvailabilityState::Stale);
+        assert_eq!(stale_chat.activity, WorkspaceActivityState::Unknown);
+        assert_eq!(
+            snap_stale
+                .native_samples
+                .iter()
+                .find(|sample| sample.chat_identity == identity)
+                .expect("stale raw sample")
+                .thread_title
+                .as_deref(),
+            Some("Stale Rename"),
+            "the raw stale title is present but must not be the display authority"
+        );
+
+        // A genuinely newer fresh observation is admitted and renames the chat.
+        let rename_observed_at_ms = initial_observed_at_ms + 200;
+        let mut renamed = make_native_sample(
+            identity.clone(),
+            "epoch_title_rename",
+            SampleTiming {
+                sequence: 1,
+                observed_at_ms: rename_observed_at_ms,
+                last_success_at_ms: rename_observed_at_ms,
+            },
+            WorkspaceAvailabilityState::Available,
+            WorkspaceActivityState::Idle,
+            WorkspaceConfiguredSelection::verified(Some("gpt-6-astra"), Some("high")),
+            None,
+        );
+        renamed.thread_title = Some("Fresh Rename".to_string());
+        overwrite(&renamed);
+        let snap_renamed = service.workspace_snapshot(None).expect("rename snapshot");
+        let chat_renamed = snap_renamed
+            .chats
+            .iter()
+            .find(|chat| chat.identity == identity)
+            .expect("renamed ordered chat");
+        assert_eq!(chat_renamed.thread_label, "Fresh Rename");
+        assert_eq!(
+            chat_renamed.availability,
+            WorkspaceAvailabilityState::Available
+        );
+        assert_eq!(chat_renamed.activity, WorkspaceActivityState::Idle);
+
+        // A newer fresh blank title supersedes the rename and clears display to the stable legacy
+        // fallback, leaving an ordered tombstone for older producers.
+        let blank_observed_at_ms = initial_observed_at_ms + 300;
+        let blank = make_native_sample(
+            identity.clone(),
+            "epoch_title_blank_newer",
+            SampleTiming {
+                sequence: 1,
+                observed_at_ms: blank_observed_at_ms,
+                last_success_at_ms: blank_observed_at_ms,
+            },
+            WorkspaceAvailabilityState::Available,
+            WorkspaceActivityState::Working,
+            WorkspaceConfiguredSelection::unavailable(),
+            None,
+        );
+        overwrite(&blank);
+        let snap_blank = service.workspace_snapshot(None).expect("blank snapshot");
+        let chat_blank = snap_blank
+            .chats
+            .iter()
+            .find(|chat| chat.identity == identity)
+            .expect("blank ordered chat");
+        assert_eq!(chat_blank.thread_label, "Stored Alias");
+        assert_ne!(chat_blank.thread_label, "Fresh Rename");
+
+        // An equal-time old producer reintroducing the previous title must not resurrect it.
+        let mut resurrect = make_native_sample(
+            identity.clone(),
+            "epoch_title_resurrect",
+            SampleTiming {
+                sequence: 1,
+                observed_at_ms: blank_observed_at_ms,
+                last_success_at_ms: blank_observed_at_ms,
+            },
+            WorkspaceAvailabilityState::Available,
+            WorkspaceActivityState::Idle,
+            WorkspaceConfiguredSelection::unavailable(),
+            None,
+        );
+        resurrect.thread_title = Some("Title B".to_string());
+        overwrite(&resurrect);
+        let snap_resurrect = service
+            .workspace_snapshot(None)
+            .expect("resurrection snapshot");
+        assert_eq!(
+            snap_resurrect
+                .native_samples
+                .iter()
+                .find(|sample| sample.chat_identity == identity)
+                .expect("accepted equal-time resurrection sample")
+                .producer_epoch,
+            "epoch_title_resurrect"
+        );
+        let chat_resurrect = snap_resurrect
+            .chats
+            .iter()
+            .find(|chat| chat.identity == identity)
+            .expect("resurrection chat");
+        assert_eq!(chat_resurrect.thread_label, "Stored Alias");
+        assert_ne!(chat_resurrect.thread_label, "Title B");
     }
 
     #[test]

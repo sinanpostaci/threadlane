@@ -552,6 +552,14 @@ export function sanitizeWorkspaceLabel(raw: unknown, fallback: string): string {
   return trimmed.length === 0 ? fallback : trimmed;
 }
 
+function cleanOptionalWorkspaceLabel(raw: unknown): string | null {
+  if (typeof raw !== 'string') {
+    return null;
+  }
+  const clean = sanitizeWorkspaceLabel(raw, '');
+  return clean.length > 0 ? clean : null;
+}
+
 export function sanitizeWorkspaceSelectionToken(raw: unknown): string | null {
   if (typeof raw !== 'string') {
     return null;
@@ -1164,6 +1172,12 @@ export function normalizeWorkspaceNativeSample(raw: unknown): WorkspaceNativeSam
       ? normalizeWorkspaceConfiguredSelection(obj.configured_selection)
       : createUnavailableConfiguredSelection();
 
+  const capabilities = normalizeNativeCapabilities(obj.capabilities);
+  const threadTitle =
+    availability === 'available' && capabilities.exact_thread_read === 'supported'
+      ? cleanOptionalWorkspaceLabel(obj.thread_title)
+      : null;
+
   const rawConn = isRecord(obj.connection) ? obj.connection : {};
   let connState = parseConnectionState(rawConn.state);
   if (availability === 'disconnected') {
@@ -1179,6 +1193,7 @@ export function normalizeWorkspaceNativeSample(raw: unknown): WorkspaceNativeSam
     sequence: cleanNonNegativeInt(obj.sequence, 0),
     observed_at_ms: observedAtMs,
     last_success_at_ms: timestampsConsistent ? rawLastSuccessMs : null,
+    thread_title: threadTitle,
     availability,
     activity,
     connection: {
@@ -1187,7 +1202,7 @@ export function normalizeWorkspaceNativeSample(raw: unknown): WorkspaceNativeSam
       route: validateCorrelationId(rawConn.route),
       diagnostic: cleanOptionalSummary(rawConn.diagnostic),
     },
-    capabilities: normalizeNativeCapabilities(obj.capabilities),
+    capabilities,
     configured_selection: configuredSelection,
   };
 }

@@ -39,11 +39,15 @@ use crate::presence::{
     WorkerPresenceSnapshot, WorkerPresenceUnavailableReason,
 };
 use crate::protocol::{
-    BindingListResponse, CreateBindingRequest, GetOrCreateBindingRequest,
-    GetOrCreateBindingResponse, HostControlBusyCounts, HostControlConfig, HostControlInfoRequest,
-    HostControlOwnerScope, HostControlRuntimeState, HostControlStatusResponse,
-    RearmHostWakeupRequest, RearmHostWakeupResponse, RetryWakeupRequest, ScopedRequest,
-    ScopedResponse, StatusResponse, StopIdleHostRequest,
+    BindingListResponse, ControlRuntimeBusyCounts, ControlRuntimeCapabilities,
+    ControlRuntimeInfoResponse, ControlRuntimeRetireRequest, ControlRuntimeRetireResponse,
+    ControlRuntimeRetireState, ControlRuntimeRole, ControlRuntimeRuntimeState,
+    CreateBindingRequest, GetOrCreateBindingRequest, GetOrCreateBindingResponse,
+    HostControlBusyCounts, HostControlConfig, HostControlInfoRequest, HostControlOwnerScope,
+    HostControlRuntimeState, HostControlStatusResponse, RearmHostWakeupRequest,
+    RearmHostWakeupResponse, RetryWakeupRequest, ScopedRequest, ScopedResponse, StatusResponse,
+    StopIdleHostRequest, CONTROL_RUNTIME_INFO_PATH, CONTROL_RUNTIME_PROTOCOL_VERSION,
+    CONTROL_RUNTIME_RETIRE_PATH, SUPERVISOR_RETIRING_MESSAGE,
 };
 use crate::workers::{
     build_completion_record, build_pre_spawn_cancelled_completion, execute_claimed_worker,
@@ -160,6 +164,7 @@ struct SharedState {
     fatal_error: std::sync::Mutex<Option<ApiError>>,
     fatal_tx: watch::Sender<Option<ApiError>>,
     token: SecretToken,
+    control_runtime_instance_id: String,
     tick_interval: Duration,
     codex: Option<CodexWakeupConfig>,
     workers: Option<ValidatedWorkersConfig>,
@@ -482,6 +487,81 @@ impl SharedState {
         }
         Ok(())
     }
+
+    fn control_runtime_info(&self) -> ControlRuntimeInfoResponse {
+        let role = if self.host_control.is_some() {
+            ControlRuntimeRole::ApprovedHost
+        } else {
+            ControlRuntimeRole::Baseline
+        };
+        let notifications_configured = self.codex.is_some();
+        let workers_configured = self.workers.is_some();
+        let idle_retire = role == ControlRuntimeRole::Baseline
+            && !notifications_configured
+            && !workers_configured;
+        ControlRuntimeInfoResponse {
+            protocol_version: CONTROL_RUNTIME_PROTOCOL_VERSION,
+            package_version: env!("CARGO_PKG_VERSION").to_string(),
+            role,
+            state: if self.retired.load(Ordering::SeqCst) || self.stopping.load(Ordering::SeqCst) {
+                ControlRuntimeRuntimeState::Retiring
+            } else {
+                ControlRuntimeRuntimeState::Ready
+            },
+            instance_id: self.control_runtime_instance_id.clone(),
+            pid: std::process::id(),
+            notifications_configured,
+            workers_configured,
+            capabilities: ControlRuntimeCapabilities {
+                bindings: true,
+                scoped_backlog: true,
+                event_pull_ack: true,
+                guarded_worker_backlog: true,
+                idle_retire,
+                approved_host_control: role == ControlRuntimeRole::ApprovedHost,
+            },
+        }
+    }
+
+    fn verify_control_runtime_retire_identity(
+        &self,
+        req: &ControlRuntimeRetireRequest,
+    ) -> Result<(), (StatusCode, Json<ApiError>)> {
+        let info = self.control_runtime_info();
+        if req.expected_pid != info.pid || req.expected_instance_id != info.instance_id {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(ApiError::with_details(
+                    ErrorCode::HostInstanceMismatch,
+                    format!(
+                        "control runtime instance mismatch: live runtime is pid {} / instance `{}`; refusing to retire a replacement",
+                        info.pid, info.instance_id
+                    ),
+                    serde_json::json!({
+                        "actual_pid": info.pid,
+                        "actual_instance_id": info.instance_id.clone(),
+                    }),
+                )),
+            ));
+        }
+        if req.expected_protocol_version != info.protocol_version {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(ApiError::with_details(
+                    ErrorCode::InvalidConfig,
+                    format!(
+                        "control runtime protocol mismatch: expected protocol {}, live runtime protocol {}",
+                        req.expected_protocol_version, info.protocol_version
+                    ),
+                    serde_json::json!({
+                        "expected_protocol_version": req.expected_protocol_version,
+                        "actual_protocol_version": info.protocol_version,
+                    }),
+                )),
+            ));
+        }
+        Ok(())
+    }
 }
 
 fn new_process_presence_channel() -> (
@@ -497,7 +577,7 @@ fn retired_response() -> (StatusCode, Json<ApiError>) {
         StatusCode::SERVICE_UNAVAILABLE,
         Json(ApiError::new(
             ErrorCode::InternalError,
-            "supervisor is shutting down and no longer accepting requests",
+            SUPERVISOR_RETIRING_MESSAGE,
         )),
     )
 }
@@ -561,16 +641,19 @@ impl SupervisorHandle {
     }
 
     /// Waits until the supervisor records a fatal persistence or runtime error and returns it.
+    ///
+    /// This future resolves only for an actual fatal error. Clean shutdown requests (including
+    /// authenticated baseline idle retirement and approved host idle stop) never resolve it and are
+    /// observed through [`SupervisorHandle::wait_for_stop_request`] instead. After a clean stop
+    /// request, [`SupervisorHandle::fatal_error`] and [`SupervisorHandle::shutdown_and_take_fatal`]
+    /// remain `None`.
     pub async fn wait_for_fatal(&self) -> ApiError {
-        let mut rx = self.shared.fatal_tx.subscribe();
-        if let Some(err) = self.fatal_error() {
-            return err;
-        }
+        let mut fatal_rx = self.shared.fatal_tx.subscribe();
         loop {
-            if let Some(err) = rx.borrow_and_update().clone() {
+            if let Some(err) = fatal_rx.borrow_and_update().clone() {
                 return err;
             }
-            if rx.changed().await.is_err() {
+            if fatal_rx.changed().await.is_err() {
                 if let Some(err) = self.fatal_error() {
                     return err;
                 }
@@ -579,14 +662,11 @@ impl SupervisorHandle {
         }
     }
 
-    /// Waits until an authenticated, owner-scoped idle stop request is latched on this supervisor.
+    /// Waits until an authenticated host idle-stop or baseline idle-retire request is latched.
     ///
-    /// If host control is not configured on this supervisor, this future remains pending indefinitely.
+    /// A baseline retire sets the same atomic `stopping` latch and stop channel used by approved
+    /// host idle-stop. If no stop is requested, this future remains pending indefinitely.
     pub async fn wait_for_stop_request(&self) {
-        if self.shared.host_control.is_none() {
-            std::future::pending::<()>().await;
-            return;
-        }
         let mut rx = self.shared.stop_tx.subscribe();
         loop {
             if *rx.borrow_and_update() || self.shared.stopping.load(Ordering::SeqCst) {
@@ -751,6 +831,7 @@ impl Supervisor {
 
         let (fatal_tx, _fatal_rx) = watch::channel(None);
         let (stop_tx, _stop_rx) = watch::channel(false);
+        let control_runtime_instance_id = uuid::Uuid::new_v4().simple().to_string();
 
         let shared = Arc::new(SharedState {
             state_dir: config.state_dir.clone(),
@@ -762,6 +843,7 @@ impl Supervisor {
             fatal_error: std::sync::Mutex::new(None),
             fatal_tx,
             token,
+            control_runtime_instance_id,
             tick_interval: config.tick_interval,
             codex: config.codex,
             workers: validated_workers,
@@ -880,6 +962,11 @@ fn build_router(state: Arc<SharedState>) -> Router {
         .route(
             "/v1/host-control/rearm-wakeup",
             post(handle_rearm_host_wakeup),
+        )
+        .route(CONTROL_RUNTIME_INFO_PATH, get(handle_control_runtime_info))
+        .route(
+            CONTROL_RUNTIME_RETIRE_PATH,
+            post(handle_retire_idle_control_runtime),
         )
         .route(
             OPERATOR_WORKER_BACKLOG_PATH,
@@ -1663,6 +1750,121 @@ async fn handle_stop_idle_host(
         HostControlRuntimeState::Stopping,
         busy,
     )))
+}
+
+fn inspect_control_runtime_busy(
+    state: &SharedState,
+    access: &mut CoreAccessGuard<'_>,
+) -> Result<ControlRuntimeBusyCounts, (StatusCode, Json<ApiError>)> {
+    let inspection = access
+        .core_mut()
+        .inspect_runtime_idle()
+        .map_err(|err| map_core_error(state, "inspect_runtime_idle for retire failed", err))?;
+    let live_worker_tasks = state
+        .active_workers
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .len();
+    Ok(ControlRuntimeBusyCounts {
+        non_terminal_runs: inspection.non_terminal_runs,
+        non_terminal_workers: inspection.non_terminal_workers,
+        live_worker_tasks,
+        in_flight_wakeups: inspection.in_flight_wakeups,
+        pending_wakeups: inspection.pending_wakeups,
+    })
+}
+
+fn control_runtime_retire_response(
+    info: &ControlRuntimeInfoResponse,
+) -> ControlRuntimeRetireResponse {
+    ControlRuntimeRetireResponse {
+        protocol_version: info.protocol_version,
+        instance_id: info.instance_id.clone(),
+        state: ControlRuntimeRetireState::Retiring,
+    }
+}
+
+async fn handle_control_runtime_info(
+    State(state): State<Arc<SharedState>>,
+    headers: HeaderMap,
+) -> Result<Json<ControlRuntimeInfoResponse>, (StatusCode, Json<ApiError>)> {
+    verify_bearer_auth(&headers, &state.token)?;
+    if let Some(fatal) = state.fatal_error() {
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(fatal)));
+    }
+    Ok(Json(state.control_runtime_info()))
+}
+
+async fn handle_retire_idle_control_runtime(
+    State(state): State<Arc<SharedState>>,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> Result<Json<ControlRuntimeRetireResponse>, (StatusCode, Json<ApiError>)> {
+    verify_bearer_auth(&headers, &state.token)?;
+    let req: ControlRuntimeRetireRequest = parse_json_body(body)?;
+    if let Some(fatal) = state.fatal_error() {
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(fatal)));
+    }
+    state.verify_control_runtime_retire_identity(&req)?;
+
+    let info = state.control_runtime_info();
+    if info.role != ControlRuntimeRole::Baseline
+        || info.notifications_configured
+        || info.workers_configured
+        || info.capabilities.approved_host_control
+        || !info.capabilities.idle_retire
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(ApiError::with_details(
+                ErrorCode::InvalidConfig,
+                "safe idle retirement is only available on a baseline control runtime without Codex notifications, workers, or approved host control",
+                serde_json::json!({
+                    "role": info.role,
+                    "notifications_configured": info.notifications_configured,
+                    "workers_configured": info.workers_configured,
+                    "approved_host_control": info.capabilities.approved_host_control,
+                }),
+            )),
+        ));
+    }
+
+    if state.retired.load(Ordering::SeqCst) || state.stopping.load(Ordering::SeqCst) {
+        return Ok(Json(control_runtime_retire_response(&info)));
+    }
+
+    let mut access = state.acquire_for_request().await?;
+    if let Some(fatal) = state.fatal_error() {
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(fatal)));
+    }
+    if state.stopping.load(Ordering::SeqCst) || state.retired.load(Ordering::SeqCst) {
+        return Ok(Json(control_runtime_retire_response(&info)));
+    }
+
+    let busy = inspect_control_runtime_busy(&state, &mut access)?;
+    if !busy.is_idle() {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(ApiError::with_details(
+                ErrorCode::HostNotIdle,
+                format!(
+                    "control runtime is not idle (non_terminal_runs={}, non_terminal_workers={}, live_worker_tasks={}, in_flight_wakeups={}, pending_wakeups={}); refusing idle retirement without forcing active or pending work",
+                    busy.non_terminal_runs,
+                    busy.non_terminal_workers,
+                    busy.live_worker_tasks,
+                    busy.in_flight_wakeups,
+                    busy.pending_wakeups,
+                ),
+                serde_json::to_value(busy).unwrap_or_default(),
+            )),
+        ));
+    }
+
+    state.stopping.store(true, Ordering::SeqCst);
+    let _ = state.stop_tx.send_replace(true);
+    state.wake_notify.notify_waiters();
+
+    Ok(Json(control_runtime_retire_response(&info)))
 }
 
 async fn handle_rearm_host_wakeup(
@@ -2620,7 +2822,7 @@ mod tests {
             other => panic!("unexpected error: {other:?}"),
         }
 
-        // wait_for_stop_request remains pending when host control is disabled
+        // wait_for_stop_request remains pending until a host stop or baseline retire is latched
         let wait_res =
             tokio::time::timeout(Duration::from_millis(40), handle.wait_for_stop_request()).await;
         assert!(wait_res.is_err());

@@ -716,6 +716,11 @@ async fn sampler_requires_verified_connect_current_chat_and_deduplicates_repeat_
     );
     assert_eq!(initial_sample.activity, WorkspaceActivityState::Idle);
     assert_eq!(
+        initial_sample.thread_title.as_deref(),
+        Some("Primary Chat"),
+        "a verified exact-thread read carries the current native title"
+    );
+    assert_eq!(
         initial_sample
             .configured_selection
             .selected_model
@@ -789,6 +794,139 @@ async fn sampler_requires_verified_connect_current_chat_and_deduplicates_repeat_
     assert_eq!(after_repeat.producer_epoch, first_epoch);
     assert!(!harness.saw_include_turns_true());
 
+    server.stop_native_chat_sampler();
+}
+
+#[tokio::test]
+async fn sampler_tracks_verified_thread_title_renames_and_sanitizes_invalid_titles() {
+    let harness = ObservationTestHarness::new().await;
+    let server = harness.build_full_mcp_server(
+        ManagedParentConnectionConfig::new(
+            harness.reconnect_config(),
+            harness.backend_pid,
+            &harness.project_root,
+        )
+        .with_sampling_policy(WorkspaceSamplingPolicy {
+            interval_ms: 120,
+            metadata_timeout_ms: WORKSPACE_METADATA_TIMEOUT_MS,
+            stale_threshold_ms: WORKSPACE_SAMPLE_STALE_THRESHOLD_MS,
+            snapshot_resets_sample_age: false,
+        }),
+    );
+
+    harness.register_thread(
+        THREAD_A,
+        MockThreadState {
+            reported_id: THREAD_A.to_string(),
+            project_id: Some("proj_title".to_string()),
+            title: "Mainlane".to_string(),
+            cwd: harness.project_root.to_string_lossy().into_owned(),
+            status_json: json!({ "type": "idle" }),
+            model: Some("gpt-5.4".to_string()),
+            effort: Some("high".to_string()),
+            artificial_delay: Duration::ZERO,
+            disconnect_immediately: false,
+        },
+        &server,
+    );
+
+    let binding_id = server
+        .invoke_tool_json(
+            "connect_current_chat",
+            json!({}),
+            Some(json!({ "threadId": THREAD_A })),
+        )
+        .await
+        .expect("connect")
+        .structured_content
+        .unwrap()["data"]["binding_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let source_id = compute_observation_source_id(
+        &harness.plans_dir,
+        &harness.authority_dir,
+        &harness.sessions_dir,
+    )
+    .expect("source_id");
+    let identity = WorkspaceChatIdentity::new(
+        &source_id,
+        &binding_id,
+        THREAD_A,
+        harness.project_root.to_str().expect("utf8 root"),
+    )
+    .expect("chat identity");
+
+    let initial = wait_for_sample(&harness.state_dir, &identity, Duration::from_secs(2), |s| {
+        s.thread_title.as_deref() == Some("Mainlane")
+    })
+    .await;
+    assert_eq!(initial.availability, WorkspaceAvailabilityState::Available);
+    assert_eq!(initial.activity, WorkspaceActivityState::Idle);
+
+    // A rename on the same verified chat must reach the next tick without any new MCP call.
+    harness.update_thread(THREAD_A, |st| {
+        st.title = "Mainlane Renamed".to_string();
+    });
+    let renamed = wait_for_sample(&harness.state_dir, &identity, Duration::from_secs(2), |s| {
+        s.sequence > initial.sequence && s.thread_title.as_deref() == Some("Mainlane Renamed")
+    })
+    .await;
+    assert_eq!(renamed.chat_identity, identity);
+    assert_eq!(renamed.activity, WorkspaceActivityState::Idle);
+
+    // Control characters are stripped and overlong titles are bounded.
+    harness.update_thread(THREAD_A, |st| {
+        st.title = "Main\u{0007}lane\tTwo".to_string();
+    });
+    let controlled = wait_for_sample(&harness.state_dir, &identity, Duration::from_secs(2), |s| {
+        s.sequence > renamed.sequence && s.thread_title.as_deref() == Some("Main lane Two")
+    })
+    .await;
+    assert!(!controlled
+        .thread_title
+        .as_deref()
+        .unwrap_or_default()
+        .chars()
+        .any(char::is_control));
+
+    harness.update_thread(THREAD_A, |st| {
+        st.title = "X".repeat(200);
+    });
+    let expected_bounded = "X".repeat(128);
+    let bounded = wait_for_sample(&harness.state_dir, &identity, Duration::from_secs(2), |s| {
+        s.sequence > controlled.sequence
+            && s.thread_title.as_deref() == Some(expected_bounded.as_str())
+    })
+    .await;
+    assert_eq!(
+        bounded.thread_title.as_deref(),
+        Some(expected_bounded.as_str())
+    );
+
+    // A blank title falls back to no title rather than a fabricated value.
+    harness.update_thread(THREAD_A, |st| {
+        st.title = " \u{0007} ".to_string();
+    });
+    let blank = wait_for_sample(&harness.state_dir, &identity, Duration::from_secs(2), |s| {
+        s.sequence > bounded.sequence && s.thread_title.is_none()
+    })
+    .await;
+    assert_eq!(blank.availability, WorkspaceAvailabilityState::Available);
+
+    // A fresh read that fails exact project verification must not supply a title.
+    harness.update_thread(THREAD_A, |st| {
+        st.title = "Foreign Project Title".to_string();
+        st.project_id = Some("proj_intruder".to_string());
+    });
+    let mismatch = wait_for_sample(&harness.state_dir, &identity, Duration::from_secs(2), |s| {
+        s.sequence > blank.sequence && s.availability == WorkspaceAvailabilityState::Unavailable
+    })
+    .await;
+    assert_eq!(mismatch.thread_title, None);
+
+    assert!(!harness.saw_include_turns_true());
     server.stop_native_chat_sampler();
 }
 
@@ -1071,6 +1209,10 @@ async fn wrong_thread_or_project_scope_marks_unavailable_and_suppresses_stale_mo
         .await;
     assert_eq!(mismatch_proj.activity, WorkspaceActivityState::Unknown);
     assert_eq!(
+        mismatch_proj.thread_title, None,
+        "foreign project metadata must not supply a title"
+    );
+    assert_eq!(
         mismatch_proj.configured_selection,
         WorkspaceConfiguredSelection::unavailable()
     );
@@ -1092,6 +1234,10 @@ async fn wrong_thread_or_project_scope_marks_unavailable_and_suppresses_stale_mo
     );
     assert_eq!(mismatch_cwd.activity, WorkspaceActivityState::Unknown);
     assert_eq!(mismatch_cwd.configured_selection.selected_model, None);
+    assert_eq!(
+        mismatch_cwd.thread_title, None,
+        "foreign cwd metadata must not supply a title"
+    );
 
     // 3. Wrong `reported_id` (`ThreadNotFound` mismatch in `NativeClient::thread_metadata`) also degrades cleanly.
     harness.update_thread(THREAD_A, |st| {
@@ -1109,6 +1255,10 @@ async fn wrong_thread_or_project_scope_marks_unavailable_and_suppresses_stale_mo
     );
     assert_eq!(mismatch_thread.activity, WorkspaceActivityState::Unknown);
     assert_eq!(mismatch_thread.configured_selection.selected_model, None);
+    assert_eq!(
+        mismatch_thread.thread_title, None,
+        "foreign thread metadata must not supply a title"
+    );
 
     server.stop_native_chat_sampler();
 }
@@ -1213,6 +1363,10 @@ async fn metadata_timeout_750ms_disconnect_and_10000ms_staleness_clear_activity_
     );
     assert_eq!(timed_out.activity, WorkspaceActivityState::Unknown);
     assert_eq!(
+        timed_out.thread_title, None,
+        "a timed-out metadata read must not fabricate a current title"
+    );
+    assert_eq!(
         timed_out.configured_selection,
         WorkspaceConfiguredSelection::unavailable()
     );
@@ -1275,6 +1429,10 @@ async fn metadata_timeout_750ms_disconnect_and_10000ms_staleness_clear_activity_
         })
         .await;
     assert_eq!(disconnected.activity, WorkspaceActivityState::Unknown);
+    assert_eq!(
+        disconnected.thread_title, None,
+        "a disconnected observation must not fabricate a current title"
+    );
     assert_eq!(
         disconnected.configured_selection,
         WorkspaceConfiguredSelection::unavailable()
@@ -1476,6 +1634,7 @@ async fn quarantine_pid_reuse_epoch_restart_and_drop_invalidate_old_producer() {
         sequence: pid_reused_sample.sequence + 10,
         observed_at_ms: pid_reused_sample.observed_at_ms.map(|t| t + 50),
         last_success_at_ms: pid_reused_sample.observed_at_ms.map(|t| t + 50),
+        thread_title: None,
         availability: WorkspaceAvailabilityState::Available,
         activity: WorkspaceActivityState::Working,
         connection: WorkspaceSampleConnection {
@@ -1614,6 +1773,7 @@ fn sample_sidecar_enforces_reconciliation_repo_disjointness_64kib_and_128_per_so
             sequence: seq,
             observed_at_ms: Some(at_ms),
             last_success_at_ms: Some(at_ms),
+            thread_title: None,
             availability: WorkspaceAvailabilityState::Available,
             activity: WorkspaceActivityState::Working,
             connection: WorkspaceSampleConnection {

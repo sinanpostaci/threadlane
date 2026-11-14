@@ -70,9 +70,9 @@ pub enum ErrorCode {
     InternalError,
     /// Host session control is not configured on this supervisor instance.
     HostControlNotConfigured,
-    /// Host session is not idle (active runs, workers, tasks, or wake-ups remain).
+    /// Host session or baseline control runtime is not idle (active runs, workers, tasks, or wake-ups remain).
     HostNotIdle,
-    /// Expected host instance ID did not match the live supervisor's instance ID.
+    /// Expected host or control-runtime instance ID did not match the live supervisor's instance ID.
     HostInstanceMismatch,
     /// Owner scope fields did not match the live supervisor's frozen host control scope.
     HostScopeMismatch,

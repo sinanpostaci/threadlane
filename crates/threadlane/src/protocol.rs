@@ -695,6 +695,225 @@ pub struct HostControlStatusResponse {
     pub busy: HostControlBusyCounts,
 }
 
+/// Current authenticated baseline control-runtime capability protocol version.
+///
+/// This is the authoritative compatibility contract for control-runtime discovery, readiness,
+/// and safe idle retirement. It is deliberately independent of the reported package version:
+/// package version changes alone must not trigger a restart.
+pub const CONTROL_RUNTIME_PROTOCOL_VERSION: u32 = 1;
+
+/// Oldest control-runtime protocol that may be asked to idle-retire through this API.
+///
+/// Runtimes advertising an older protocol do not share the atomic retire request shape and
+/// must never be retired by a newer caller through an emulated check-then-kill sequence.
+pub const CONTROL_RUNTIME_IDLE_RETIRE_MIN_PROTOCOL_VERSION: u32 = 1;
+
+/// Exact lowercase hexadecimal length of a live control-runtime instance identifier.
+pub const CONTROL_RUNTIME_INSTANCE_ID_HEX_LEN: usize = 32;
+
+/// Maximum accepted byte length for the informational package version string.
+pub const MAX_CONTROL_RUNTIME_PACKAGE_VERSION_BYTES: usize = 64;
+
+/// Authenticated endpoint path returning bounded control-runtime identity, role, and capabilities.
+pub const CONTROL_RUNTIME_INFO_PATH: &str = "/v1/control-runtime/info";
+
+/// Authenticated endpoint path requesting atomic idle retirement of a baseline control runtime.
+pub const CONTROL_RUNTIME_RETIRE_PATH: &str = "/v1/control-runtime/retire";
+
+/// Exact API error message returned after a supervisor has retired its Core and is shutting down.
+pub const SUPERVISOR_RETIRING_MESSAGE: &str =
+    "supervisor is shutting down and no longer accepting requests";
+
+/// Role of a live control-plane supervisor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlRuntimeRole {
+    /// Dedicated baseline control-plane supervisor for ordinary scoped chats.
+    Baseline,
+    /// Approved per-session host supervisor carrying frozen host-control authority.
+    ApprovedHost,
+    /// Unrecognized future role. Callers must not reuse or retire it through the baseline API.
+    #[serde(other)]
+    Unknown,
+}
+
+/// Lifecycle state of a live control-plane supervisor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlRuntimeRuntimeState {
+    /// Supervisor is ready and accepting requests.
+    Ready,
+    /// Supervisor has latched a stop or idle-retire request and is draining.
+    Retiring,
+    /// Unrecognized future state. Callers must not mutate or retire this runtime automatically.
+    #[serde(other)]
+    Unknown,
+}
+
+/// Bounded operation capabilities advertised by a live control-plane supervisor.
+///
+/// Individual capability flags default to `false` when an older peer omits them, so a newer
+/// caller can safely request an idle upgrade instead of failing to parse the advertisement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ControlRuntimeCapabilities {
+    /// Authenticated binding listing is available.
+    #[serde(default)]
+    pub bindings: bool,
+    /// Binding-scoped backlog reads and mutations are available.
+    #[serde(default)]
+    pub scoped_backlog: bool,
+    /// Bounded event pull and ACK are available.
+    #[serde(default)]
+    pub event_pull_ack: bool,
+    /// Trusted-local guarded Worker backlog reservation and reconciliation are available.
+    #[serde(default)]
+    pub guarded_worker_backlog: bool,
+    /// Atomic authenticated idle retirement is available for this exact runtime role.
+    #[serde(default)]
+    pub idle_retire: bool,
+    /// Approved per-session host-control endpoints are installed on this runtime.
+    #[serde(default)]
+    pub approved_host_control: bool,
+}
+
+/// Authenticated bounded identity, role, and capability advertisement for a live supervisor.
+///
+/// Unknown fields are ignored so an older caller can parse the protocol version first and
+/// reject a newer runtime without accidentally treating it as compatible.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ControlRuntimeInfoResponse {
+    /// Control-runtime capability protocol version implemented by the sender.
+    pub protocol_version: u32,
+    /// Informational package version reported by the sender (never a compatibility gate alone).
+    pub package_version: String,
+    /// Live runtime role (`baseline` or `approved_host`).
+    pub role: ControlRuntimeRole,
+    /// Live runtime lifecycle state (`ready` or `retiring`).
+    pub state: ControlRuntimeRuntimeState,
+    /// Per-process random public instance identifier (32 lowercase hex characters, not a secret).
+    pub instance_id: String,
+    /// OS process identifier of the live supervisor.
+    pub pid: u32,
+    /// Whether the Codex wake-up notification bridge is configured on this runtime.
+    pub notifications_configured: bool,
+    /// Whether worker profiles and dispatch are configured on this runtime.
+    pub workers_configured: bool,
+    /// Bounded operation capabilities implemented by the sender.
+    pub capabilities: ControlRuntimeCapabilities,
+}
+
+impl ControlRuntimeInfoResponse {
+    /// Validates bounded identity and informational strings without trusting the sender.
+    ///
+    /// Returns a static reason string on failure; the response must never cause unbounded
+    /// allocation, control-character injection, or secret material to enter diagnostics.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.instance_id.len() != CONTROL_RUNTIME_INSTANCE_ID_HEX_LEN
+            || !self
+                .instance_id
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err("control runtime instance_id must be 32 lowercase hex characters");
+        }
+        if self.package_version.is_empty()
+            || self.package_version.len() > MAX_CONTROL_RUNTIME_PACKAGE_VERSION_BYTES
+            || !self
+                .package_version
+                .chars()
+                .all(|ch| ch.is_ascii_graphic() || ch == ' ')
+        {
+            return Err("control runtime package_version must be bounded printable ASCII");
+        }
+        if self.pid == 0 {
+            return Err("control runtime pid must be non-zero");
+        }
+        Ok(())
+    }
+}
+
+/// Runtime-wide bounded busy counters consulted before an atomic baseline idle retirement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ControlRuntimeBusyCounts {
+    /// Count of non-terminal runs across all bindings.
+    pub non_terminal_runs: usize,
+    /// Count of non-terminal workers across all bindings.
+    pub non_terminal_workers: usize,
+    /// Count of live spawned worker tasks tracked by the supervisor.
+    pub live_worker_tasks: usize,
+    /// Count of wake-up notices across all bindings currently in `WakeupStatus::InFlight`.
+    pub in_flight_wakeups: usize,
+    /// Count of wake-up notices across all bindings currently in `WakeupStatus::Pending`.
+    pub pending_wakeups: usize,
+}
+
+impl ControlRuntimeBusyCounts {
+    /// Returns `true` when every bounded activity counter is zero.
+    pub const fn is_idle(&self) -> bool {
+        self.non_terminal_runs == 0
+            && self.non_terminal_workers == 0
+            && self.live_worker_tasks == 0
+            && self.in_flight_wakeups == 0
+            && self.pending_wakeups == 0
+    }
+}
+
+/// Authenticated request for atomic idle retirement of an exact live baseline control runtime.
+///
+/// The expected instance, protocol, and PID prevent a stale caller from retiring a replacement
+/// runtime that reused the same state directory or loopback port.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ControlRuntimeRetireRequest {
+    /// Exact control-runtime protocol version observed from `ControlRuntimeInfoResponse`.
+    pub expected_protocol_version: u32,
+    /// Exact per-process public instance identifier observed from `ControlRuntimeInfoResponse`.
+    pub expected_instance_id: String,
+    /// Exact OS process identifier observed from `ControlRuntimeInfoResponse`.
+    pub expected_pid: u32,
+}
+
+/// Retirement state reported by [`ControlRuntimeRetireResponse`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlRuntimeRetireState {
+    /// The supervisor latched the retirement request and is draining.
+    Retiring,
+    /// Unrecognized future state. Callers must treat the retirement outcome as uncertain.
+    #[serde(other)]
+    Unknown,
+}
+
+/// Authenticated response returned by atomic baseline idle retirement.
+///
+/// Unknown fields are ignored for forward compatibility; the exact protocol and instance
+/// fields are still verified against the request that produced this response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ControlRuntimeRetireResponse {
+    /// Control-runtime protocol version of the supervisor that accepted the request.
+    pub protocol_version: u32,
+    /// Per-process public instance identifier of the supervisor that accepted the request.
+    pub instance_id: String,
+    /// Retirement lifecycle state.
+    pub state: ControlRuntimeRetireState,
+}
+
+impl ControlRuntimeRetireResponse {
+    /// Validates bounded identity fields in a retire response.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.instance_id.len() != CONTROL_RUNTIME_INSTANCE_ID_HEX_LEN
+            || !self
+                .instance_id
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err("control runtime retire instance_id must be 32 lowercase hex characters");
+        }
+        Ok(())
+    }
+}
+
 trait IntoWorkerSnapshot {
     fn into_worker_snapshot(self) -> WorkerSnapshot;
 }

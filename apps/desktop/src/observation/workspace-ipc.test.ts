@@ -7,6 +7,7 @@ import {
   createVerifiedConfiguredSelection,
   evaluateWorkspaceNativeSampleAt,
   formatWorkspaceChatIdentityKey,
+  normalizeWorkspaceNativeSample,
   parseWorkspaceSnapshot,
   upgradeLegacyObservationSnapshot,
   validateWorkspaceChatIdentity,
@@ -718,6 +719,57 @@ test('ipcWorkspaceSnapshot preserves stale sample evaluation, degrades unknown v
   assert.equal(upgradedViaIpc.job_histories.length, 2);
   assert.equal(upgradedViaIpc.job_histories[0]!.acceptance_proof.status, 'unknown');
   assert.equal(upgradedViaIpc.job_histories[1]!.acceptance_proof.status, 'unknown');
+});
+
+test('normalizeWorkspaceNativeSample keeps optional thread_title sanitized and only from available exact-thread reads', () => {
+  const identity = alphaIdentity();
+  const base = createLiveSample(identity, 50_000);
+
+  // Legacy payloads without the optional title field normalize without inventing one.
+  const legacy = normalizeWorkspaceNativeSample(base);
+  assert.equal(legacy.thread_title, null);
+
+  const titled = normalizeWorkspaceNativeSample({
+    ...base,
+    thread_title: '  Main\u0007lane  ',
+  });
+  assert.equal(titled.thread_title, 'Mainlane');
+
+  for (const blank of ['', '   ', '\u0007\u0000', '\r\n\t']) {
+    const normalized = normalizeWorkspaceNativeSample({ ...base, thread_title: blank });
+    assert.equal(normalized.thread_title, null);
+  }
+
+  const overlong = normalizeWorkspaceNativeSample({
+    ...base,
+    thread_title: 'é'.repeat(200),
+  });
+  assert.ok(overlong.thread_title);
+  assert.ok(new TextEncoder().encode(overlong.thread_title!).byteLength <= 128);
+  assert.ok(Array.from(overlong.thread_title!).every((ch) => ch === 'é'));
+
+  // A disconnected sample and a sample without proven exact-thread support never expose a title.
+  const disconnected = normalizeWorkspaceNativeSample({
+    ...base,
+    thread_title: 'Must not leak',
+    availability: 'disconnected',
+  });
+  assert.equal(disconnected.thread_title, null);
+
+  const unprovenRead = normalizeWorkspaceNativeSample({
+    ...base,
+    thread_title: 'Must not leak',
+    capabilities: { ...base.capabilities, exact_thread_read: 'unknown' },
+  });
+  assert.equal(unprovenRead.thread_title, null);
+
+  // A verified available exact-thread sample preserves its sanitized title in normalized payloads.
+  const verified = normalizeWorkspaceNativeSample({
+    ...base,
+    capabilities: { ...base.capabilities, exact_thread_read: 'supported' },
+    thread_title: 'Mainlane',
+  });
+  assert.equal(verified.thread_title, 'Mainlane');
 });
 
 test('ipcWorkspaceSnapshot rejects with bridge_disconnected before invoke when native Tauri runtime is unavailable and restores globals on failure', async () => {

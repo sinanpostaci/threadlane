@@ -12,12 +12,12 @@ use threadlane_core::observation::{
     current_observation_time_ms, project_safe_workspace_messages, project_workspace_chat_work,
     read_core_state_readonly, reconcile_workspace_native_sample, sanitize_observation_label,
     sanitize_observation_summary, validate_correlation_id, workspace_chat_work_presence_candidates,
-    ObservationJob, ObservationJobState, ObservationRequest, ObservationSnapshotRequest,
-    ReadonlyCoreStateSnapshot, WorkspaceAcceptanceProof, WorkspaceAcceptanceStatus,
-    WorkspaceActivityState, WorkspaceAttentionKind, WorkspaceAttentionState,
-    WorkspaceAvailabilityState, WorkspaceBacklogPresenceAvailability,
-    WorkspaceBacklogPresenceFreshness, WorkspaceBacklogWorkerPresence, WorkspaceChatIdentity,
-    WorkspaceChatSummary, WorkspaceChatWork, WorkspaceChatWorkAvailability,
+    ObservationJob, ObservationJobState, ObservationProcessInstance, ObservationRequest,
+    ObservationSnapshotRequest, ReadonlyCoreStateSnapshot, WorkspaceAcceptanceProof,
+    WorkspaceAcceptanceStatus, WorkspaceActivityState, WorkspaceAttentionKind,
+    WorkspaceAttentionState, WorkspaceAvailabilityState, WorkspaceBacklogPresenceAvailability,
+    WorkspaceBacklogPresenceFreshness, WorkspaceBacklogWorkerPresence, WorkspaceCapabilityState,
+    WorkspaceChatIdentity, WorkspaceChatSummary, WorkspaceChatWork, WorkspaceChatWorkAvailability,
     WorkspaceConfiguredSelection, WorkspaceCoveredAttention, WorkspaceExternalResolutionScope,
     WorkspaceJobHistory, WorkspaceJobSummary, WorkspaceMessageCandidateInput, WorkspaceMessageItem,
     WorkspaceMessageScope, WorkspaceMessageSourceOrder, WorkspaceMessagesWindow,
@@ -105,13 +105,178 @@ const VERIFIED_PENDING_PLAN_ATTENTION_REASON: &str =
 const PENDING_PLAN_ATTENTION_NEXT_STEP: &str =
     "Inspect the current plan and approval evidence before deciding whether approval or a revised plan is needed.";
 
-/// Bounded in-memory native sample reconciliation cache attached to [`ObservationService`].
+/// Bounded in-memory native sample and verified-title reconciliation cache attached to
+/// [`ObservationService`].
 ///
 /// Preserves monotonic `(producer_epoch, backend_process_instance, sequence)` ordering across
 /// snapshot refreshes without ever writing files, acquiring locks, or mutating sample timestamps.
+/// A separately bounded accepted display title (or clearing tombstone) is retained across transient
+/// failed or disconnected observations but never across out-of-order or stale producer updates.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct BoundedSampleCache {
-    inner: Arc<Mutex<BTreeMap<String, WorkspaceNativeSample>>>,
+    inner: Arc<Mutex<BoundedSampleCacheState>>,
+}
+
+#[derive(Debug, Default)]
+struct BoundedSampleCacheState {
+    samples: BTreeMap<String, WorkspaceNativeSample>,
+    verified_titles: BTreeMap<String, VerifiedNativeThreadTitle>,
+}
+
+/// Last verified exact-chat native title with the producer ordering that proved it.
+///
+/// A `None` title is an ordered tombstone: a fresh exact-thread read proved that the current title
+/// is unknown, so older or equal-time observations must not resurrect it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VerifiedNativeThreadTitle {
+    title: Option<String>,
+    producer_epoch: String,
+    backend_process_instance: Option<ObservationProcessInstance>,
+    sequence: u64,
+    observed_at_ms: Option<i64>,
+}
+
+impl BoundedSampleCacheState {
+    fn observe_verified_title(
+        &mut self,
+        chat_key: &str,
+        sample: &WorkspaceNativeSample,
+        reference_now_ms: i64,
+    ) {
+        let evaluated = sample.evaluate_at(
+            reference_now_ms,
+            WorkspaceSamplingPolicy::default().stale_threshold_ms,
+        );
+        if evaluated.effective_availability != WorkspaceAvailabilityState::Available
+            || sample.capabilities.exact_thread_read != WorkspaceCapabilityState::Supported
+        {
+            // Stale, failed, disconnected, or unverified observations never replace a previously
+            // verified title and never make unknown data authoritative.
+            return;
+        }
+
+        let title = sample
+            .thread_title
+            .as_deref()
+            .map(|raw| sanitize_observation_label(raw, ""))
+            .filter(|clean| !clean.is_empty());
+        let incoming = VerifiedNativeThreadTitle {
+            title,
+            producer_epoch: sample.producer_epoch.clone(),
+            backend_process_instance: sample.backend_process_instance.clone(),
+            sequence: sample.sequence,
+            observed_at_ms: sample.observed_at_ms,
+        };
+        let supersedes = self
+            .verified_titles
+            .get(chat_key)
+            .is_none_or(|cached| verified_title_supersedes(cached, &incoming));
+        if supersedes {
+            // Insert even an unusable title as a tombstone; only ordering metadata that actually
+            // supersedes may clear the accepted display title.
+            self.verified_titles.insert(chat_key.to_string(), incoming);
+        }
+    }
+
+    fn verified_title(&self, chat_key: &str) -> Option<String> {
+        self.verified_titles
+            .get(chat_key)
+            .and_then(|verified| verified.title.clone())
+    }
+}
+
+/// Returns `true` only when `incoming` is newer than the title already proven for this exact chat.
+///
+/// Within one producer epoch, sequence must strictly increase and the backend process instance must
+/// match. Across an epoch rotation, the new observation must carry a strictly newer wall-clock
+/// observation time. This rejects out-of-order old-name resurrection after a restart.
+fn verified_title_supersedes(
+    cached: &VerifiedNativeThreadTitle,
+    incoming: &VerifiedNativeThreadTitle,
+) -> bool {
+    if cached.producer_epoch == incoming.producer_epoch {
+        cached.backend_process_instance == incoming.backend_process_instance
+            && incoming.sequence > cached.sequence
+    } else {
+        match (cached.observed_at_ms, incoming.observed_at_ms) {
+            (Some(cached_observed), Some(incoming_observed)) => incoming_observed > cached_observed,
+            (None, Some(_)) => true,
+            _ => false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod verified_title_order_tests {
+    use super::{verified_title_supersedes, VerifiedNativeThreadTitle};
+    use threadlane_core::observation::ObservationProcessInstance;
+
+    fn title(
+        epoch: &str,
+        process: Option<ObservationProcessInstance>,
+        sequence: u64,
+        observed_at_ms: Option<i64>,
+    ) -> VerifiedNativeThreadTitle {
+        VerifiedNativeThreadTitle {
+            title: Some("Verified title".to_string()),
+            producer_epoch: epoch.to_string(),
+            backend_process_instance: process,
+            sequence,
+            observed_at_ms,
+        }
+    }
+
+    #[test]
+    fn out_of_order_epoch_and_sequence_never_supersede_a_newer_verified_title() {
+        let process_one = Some(ObservationProcessInstance {
+            pid: 4242,
+            boot_id: "boot-title-1".to_string(),
+            start_ticks: 101,
+        });
+        let process_two = Some(ObservationProcessInstance {
+            pid: 5151,
+            boot_id: "boot-title-1".to_string(),
+            start_ticks: 202,
+        });
+        let cached = title("epoch_two", process_one.clone(), 4, Some(2_000));
+
+        assert!(verified_title_supersedes(
+            &cached,
+            &title("epoch_two", process_one.clone(), 5, Some(2_001))
+        ));
+        assert!(!verified_title_supersedes(
+            &cached,
+            &title("epoch_two", process_one.clone(), 4, Some(2_001))
+        ));
+        assert!(!verified_title_supersedes(
+            &cached,
+            &title("epoch_two", process_one.clone(), 3, Some(2_001))
+        ));
+        assert!(!verified_title_supersedes(
+            &cached,
+            &title("epoch_two", process_two, 5, Some(2_001))
+        ));
+        assert!(verified_title_supersedes(
+            &cached,
+            &title("epoch_three", None, 1, Some(2_001))
+        ));
+        assert!(!verified_title_supersedes(
+            &cached,
+            &title("epoch_three", None, 1, Some(2_000))
+        ));
+        assert!(!verified_title_supersedes(
+            &cached,
+            &title("epoch_three", None, 1, Some(1_999))
+        ));
+        assert!(!verified_title_supersedes(
+            &cached,
+            &title("epoch_three", None, 1, None)
+        ));
+        assert!(verified_title_supersedes(
+            &title("epoch_three", None, 1, None),
+            &title("epoch_four", None, 1, Some(1))
+        ));
+    }
 }
 
 impl BoundedSampleCache {
@@ -122,24 +287,25 @@ impl BoundedSampleCache {
     fn reconcile_source_samples(
         &self,
         source_id: &str,
+        reference_now_ms: i64,
         disk_samples_by_key: BTreeMap<String, WorkspaceNativeSample>,
         warnings: &mut Vec<String>,
     ) -> Vec<WorkspaceNativeSample> {
-        let mut guard = self
+        let mut state = self
             .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         // Prune cached entries for this source whose sidecar is no longer present on disk.
-        guard.retain(|key, existing| {
+        state.samples.retain(|key, existing| {
             existing.chat_identity.source_id != source_id || disk_samples_by_key.contains_key(key)
         });
 
         let mut reconciled = Vec::with_capacity(disk_samples_by_key.len());
         for (chat_key, candidate) in disk_samples_by_key {
-            let chosen = match guard.get(&chat_key) {
+            let chosen = match state.samples.get(&chat_key) {
                 None => {
-                    guard.insert(chat_key.clone(), candidate.clone());
+                    state.samples.insert(chat_key.clone(), candidate.clone());
                     candidate
                 }
                 Some(existing) => {
@@ -147,7 +313,7 @@ impl BoundedSampleCache {
                         WorkspaceSampleReconcileDecision::AcceptedInitial
                         | WorkspaceSampleReconcileDecision::AcceptedNextSequence
                         | WorkspaceSampleReconcileDecision::AcceptedNewEpoch => {
-                            guard.insert(chat_key.clone(), candidate.clone());
+                            state.samples.insert(chat_key.clone(), candidate.clone());
                             candidate
                         }
                         WorkspaceSampleReconcileDecision::RejectedDuplicateSequence => {
@@ -167,11 +333,30 @@ impl BoundedSampleCache {
                     }
                 }
             };
+            state.observe_verified_title(&chat_key, &chosen, reference_now_ms);
             reconciled.push(chosen);
         }
 
-        enforce_cache_bounds(&mut guard);
+        enforce_cache_bounds(&mut state.samples);
+        // Drop tombstones/titles whose bounded sample entry no longer exists. Snapshot the stale
+        // keys first so the mutable removal never also borrows `samples`.
+        let stale_title_keys: Vec<String> = state
+            .verified_titles
+            .keys()
+            .filter(|key| !state.samples.contains_key(*key))
+            .cloned()
+            .collect();
+        for key in stale_title_keys {
+            state.verified_titles.remove(&key);
+        }
         reconciled
+    }
+
+    fn verified_title(&self, chat_key: &str) -> Option<String> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .verified_title(chat_key)
     }
 }
 
@@ -756,6 +941,7 @@ fn project_single_source_workspace(
 
         let thread_label = resolve_verified_chat_thread_label(
             &identity,
+            sample_cache,
             &core_states,
             projected_jobs,
             projected_requests,
@@ -995,8 +1181,12 @@ fn read_and_reconcile_source_native_samples(
         }
     }
 
-    let reconciled =
-        sample_cache.reconcile_source_samples(&spec.source.id, disk_samples_by_key, &mut warnings);
+    let reconciled = sample_cache.reconcile_source_samples(
+        &spec.source.id,
+        generated_at_ms,
+        disk_samples_by_key,
+        &mut warnings,
+    );
     let (bounded, cap_omitted) = bound_workspace_native_samples_per_source(reconciled);
     (bounded, omitted.saturating_add(cap_omitted), warnings)
 }
@@ -1510,12 +1700,28 @@ pub(crate) fn apply_workspace_presence_results(
     snapshot.normalized()
 }
 
+/// Returns the sanitized display title from the accepted ordered title cache for this exact chat.
+///
+/// The cache is the single display authority: an incoming raw sample can never jump ahead of the
+/// ordering metadata that was actually accepted, and a `None` cached title is an ordered tombstone
+/// that clears display back to the legacy fallbacks below. Failed or unverified samples never
+/// contribute a title.
 fn resolve_verified_chat_thread_label(
     identity: &WorkspaceChatIdentity,
+    sample_cache: &BoundedSampleCache,
     core_states: &[ReadonlyCoreStateSnapshot],
     projected_jobs: &[ObservationJob],
     projected_requests: &[ObservationRequest],
 ) -> String {
+    // A title accepted for this exact verified chat is authoritative for display and replaces a
+    // stale Core binding alias. A last verified title is retained for the same chat across
+    // transient failed/disconnected observations without extending Working freshness.
+    if let Some(key) = identity.canonical_key() {
+        if let Some(title) = sample_cache.verified_title(&key) {
+            return title;
+        }
+    }
+
     if let Some(label) = resolve_thread_label(
         &identity.binding_id,
         &identity.thread_uuid,

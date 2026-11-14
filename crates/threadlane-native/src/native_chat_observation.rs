@@ -19,6 +19,9 @@
 //!   `disconnected`, `stale`, or `unavailable`, activity is `unknown` and configured model/effort
 //!   selection is cleared (`unavailable`). Configured selection is always classified as
 //!   `verified_configuration` (`counts_as_runtime_telemetry == false`).
+//! - **Verified display title only**: `thread_title` is populated only from a successful
+//!   exact-thread/project/enrollment/parent-verified read. Failed, timed-out, disconnected,
+//!   scope-mismatched, and otherwise unverified samples never carry one.
 //! - **Canonical source identity**: Derives `source_id` (`src_<64hex>`) from canonical validated
 //!   `(plans_dir, authority_dir, sessions_dir)` paths using the exact
 //!   `threadlane-observation-source-v1\0` SHA-256 framing used by desktop observation source
@@ -43,13 +46,14 @@ use threadlane::NativeReconnectConfig;
 use threadlane_core::observation::{
     bound_workspace_native_samples_per_source, current_observation_time_ms,
     parse_workspace_native_sample_sidecar, reconcile_workspace_native_sample,
-    serialize_workspace_native_sample_sidecar, ObservationProcessInstance, WorkspaceActivityState,
-    WorkspaceAvailabilityState, WorkspaceCapabilityState, WorkspaceChatIdentity,
-    WorkspaceConfiguredSelection, WorkspaceConnectionState, WorkspaceContractError,
-    WorkspaceEvaluatedNativeSample, WorkspaceFreshnessState, WorkspaceNativeCapabilities,
-    WorkspaceNativeSample, WorkspaceSampleConnection, WorkspaceSampleReconcileDecision,
-    WorkspaceSamplingPolicy, MAX_WORKSPACE_NATIVE_SAMPLES_PER_SOURCE,
-    MAX_WORKSPACE_NATIVE_SAMPLE_SIDECAR_BYTES, WORKSPACE_SAMPLE_STALE_THRESHOLD_MS,
+    sanitize_observation_label, serialize_workspace_native_sample_sidecar,
+    ObservationProcessInstance, WorkspaceActivityState, WorkspaceAvailabilityState,
+    WorkspaceCapabilityState, WorkspaceChatIdentity, WorkspaceConfiguredSelection,
+    WorkspaceConnectionState, WorkspaceContractError, WorkspaceEvaluatedNativeSample,
+    WorkspaceFreshnessState, WorkspaceNativeCapabilities, WorkspaceNativeSample,
+    WorkspaceSampleConnection, WorkspaceSampleReconcileDecision, WorkspaceSamplingPolicy,
+    MAX_WORKSPACE_NATIVE_SAMPLES_PER_SOURCE, MAX_WORKSPACE_NATIVE_SAMPLE_SIDECAR_BYTES,
+    WORKSPACE_SAMPLE_STALE_THRESHOLD_MS,
 };
 use tokio::sync::{watch, Mutex as AsyncMutex};
 use tokio::task::JoinHandle;
@@ -1484,6 +1488,7 @@ async fn execute_single_sampler_tick(ctx: &BackgroundSamplerContext) -> TickDisp
                 sequence: state_guard.sequence,
                 observed_at_ms: Some(now_ms),
                 last_success_at_ms: state_guard.last_success_at_ms,
+                thread_title: None,
                 availability: WorkspaceAvailabilityState::Disconnected,
                 activity: WorkspaceActivityState::Unknown,
                 connection: WorkspaceSampleConnection {
@@ -1536,6 +1541,7 @@ async fn execute_single_sampler_tick(ctx: &BackgroundSamplerContext) -> TickDisp
                 sequence: state_guard.sequence,
                 observed_at_ms: Some(now_ms),
                 last_success_at_ms: state_guard.last_success_at_ms,
+                thread_title: None,
                 availability,
                 activity: WorkspaceActivityState::Unknown,
                 connection: WorkspaceSampleConnection {
@@ -1705,6 +1711,7 @@ fn build_sample_from_verified_metadata(
             sequence: state.sequence,
             observed_at_ms: Some(now_ms),
             last_success_at_ms: state.last_success_at_ms,
+            thread_title: None,
             availability: WorkspaceAvailabilityState::Unavailable,
             activity: WorkspaceActivityState::Unknown,
             connection: WorkspaceSampleConnection {
@@ -1736,6 +1743,14 @@ fn build_sample_from_verified_metadata(
             } else {
                 WorkspaceCapabilityState::Unknown
             };
+            // Populated only from this independently verified exact-thread read. Failed,
+            // disconnected, timeout, and scope-mismatch samples above never carry a title.
+            let thread_title = metadata
+                .thread
+                .title
+                .as_deref()
+                .map(|raw| sanitize_observation_label(raw, ""))
+                .filter(|clean| !clean.is_empty());
             WorkspaceNativeSample {
                 chat_identity: chat_identity.clone(),
                 producer_epoch: producer_epoch.to_string(),
@@ -1743,6 +1758,7 @@ fn build_sample_from_verified_metadata(
                 sequence: state.sequence,
                 observed_at_ms: Some(now_ms),
                 last_success_at_ms: Some(now_ms),
+                thread_title,
                 availability: WorkspaceAvailabilityState::Available,
                 activity,
                 connection: WorkspaceSampleConnection {
@@ -1774,6 +1790,7 @@ fn build_sample_from_verified_metadata(
                 sequence: state.sequence,
                 observed_at_ms: Some(now_ms),
                 last_success_at_ms: state.last_success_at_ms,
+                thread_title: None,
                 availability: WorkspaceAvailabilityState::Unavailable,
                 activity: WorkspaceActivityState::Unknown,
                 connection: WorkspaceSampleConnection {
@@ -1818,6 +1835,7 @@ fn build_timeout_sample(
         sequence: state.sequence,
         observed_at_ms: Some(now_ms),
         last_success_at_ms: state.last_success_at_ms,
+        thread_title: None,
         availability,
         activity: WorkspaceActivityState::Unknown,
         connection: WorkspaceSampleConnection {
@@ -1852,6 +1870,7 @@ fn build_terminal_invalidation_sample(
         sequence: state.sequence,
         observed_at_ms: Some(now_ms),
         last_success_at_ms: state.last_success_at_ms,
+        thread_title: None,
         availability,
         activity: WorkspaceActivityState::Unknown,
         connection: WorkspaceSampleConnection {
@@ -2390,6 +2409,7 @@ mod tests {
             sequence,
             observed_at_ms: Some(observed_at_ms),
             last_success_at_ms: Some(observed_at_ms),
+            thread_title: None,
             availability: WorkspaceAvailabilityState::Available,
             activity: WorkspaceActivityState::Idle,
             connection: WorkspaceSampleConnection {

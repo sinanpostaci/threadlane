@@ -5,12 +5,13 @@
 
 use std::fs::{self, File};
 use std::io::Write;
-use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{symlink, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
+use fs2::FileExt;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
@@ -18,15 +19,21 @@ use threadlane::cli::{
     build_supervisor_config_with_workers, Cli, Subcommands as ThreadlaneCliSubcommands,
 };
 use threadlane::descriptor::{
-    RuntimeDescriptor, SecretToken, StateLock, DATABASE_FILENAME, DESCRIPTOR_FILENAME,
-    LOCK_FILENAME,
+    remove_owned_descriptor, write_descriptor_atomic, RuntimeDescriptor, SecretToken, StateLock,
+    DATABASE_FILENAME, DESCRIPTOR_FILENAME, LOCK_FILENAME,
+};
+use threadlane::protocol::{
+    ControlRuntimeCapabilities, ControlRuntimeInfoResponse, ControlRuntimeRetireRequest,
+    ControlRuntimeRetireState, ControlRuntimeRole, ControlRuntimeRuntimeState,
+    CONTROL_RUNTIME_PROTOCOL_VERSION,
 };
 use threadlane::{
-    ScopedClient, Supervisor, SupervisorClient, SupervisorConfig, DEFAULT_CODEX_TIMEOUT_MS,
-    DEFAULT_TICK_INTERVAL_MS,
+    ApiError, ErrorCode as ThreadlaneErrorCode, ScopedClient, Supervisor, SupervisorClient,
+    SupervisorConfig, DEFAULT_CODEX_TIMEOUT_MS, DEFAULT_TICK_INTERVAL_MS,
 };
 use threadlane_core::{
-    Command as CoreCommand, CommandOutput, Core, RunStatus, WorkerExecutionBinding, WorkerStatus,
+    BacklogItemKind, BacklogStatus, Command as CoreCommand, CommandOutput, Core, Run, RunStatus,
+    WorkerExecutionBinding, WorkerStatus,
 };
 use threadlane_native::{
     build_control_runtime_serve_args, ensure_control_runtime, is_process_alive,
@@ -51,6 +58,120 @@ const CHILD_IGNORE_SIGTERM_ENV: &str = "THREADLANE_TEST_IGNORE_SIGTERM";
 
 const TEST_THREAD_UUID_A: &str = "018f1a2b-3c4d-7e00-8000-000000000101";
 const TEST_THREAD_UUID_B: &str = "018f1a2b-3c4d-7e00-8000-000000000102";
+
+const DEMO_COMPLETION_TIMEOUT: Duration = Duration::from_secs(5);
+const EVENT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Answers every active demo question at the run's current revision and waits for completion
+/// within a bounded deadline. Demo runs pause at `WaitingInput` even with a zero step delay, so
+/// polling alone can never reach `Completed`.
+async fn complete_demo_run(scoped: &ScopedClient, started: Run, label: &str) -> Run {
+    let deadline = Instant::now() + DEMO_COMPLETION_TIMEOUT;
+    let mut run = started;
+    let mut answer_index = 0usize;
+
+    loop {
+        match run.status {
+            RunStatus::Completed => return run,
+            RunStatus::WaitingInput => {
+                let question_id = run.active_question_id.clone().unwrap_or_else(|| {
+                    panic!(
+                        "{label}: waiting demo run {} has no active question",
+                        run.run_id
+                    )
+                });
+                let run_id = run.run_id.clone();
+                let command_key = format!("{label}-answer-{answer_index}");
+                answer_index += 1;
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                assert!(
+                    !remaining.is_zero(),
+                    "{label}: demo run {run_id} did not complete before the deadline"
+                );
+                run = tokio::time::timeout(
+                    remaining,
+                    scoped.answer(
+                        command_key,
+                        run_id.clone(),
+                        question_id,
+                        run.revision,
+                        format!("{label} answer {answer_index}"),
+                    ),
+                )
+                .await
+                .unwrap_or_else(|_| panic!("{label}: timed out answering demo run {run_id}"))
+                .unwrap_or_else(|err| panic!("{label}: failed to answer demo run {run_id}: {err}"));
+                continue;
+            }
+            RunStatus::Failed | RunStatus::Cancelled | RunStatus::TimedOut | RunStatus::Unknown => {
+                panic!(
+                    "{label}: demo run {} entered terminal status {:?}",
+                    run.run_id, run.status
+                );
+            }
+            _ => {}
+        }
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "{label}: demo run {} did not complete before the deadline",
+            run.run_id
+        );
+        tokio::time::sleep(Duration::from_millis(10).min(remaining)).await;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "{label}: demo run {} did not complete before the deadline",
+            run.run_id
+        );
+        let run_id = run.run_id.clone();
+        run = tokio::time::timeout(remaining, scoped.get_run(run_id.clone()))
+            .await
+            .unwrap_or_else(|_| panic!("{label}: timed out polling demo run {run_id}"))
+            .unwrap_or_else(|err| panic!("{label}: failed to poll demo run {run_id}: {err}"));
+    }
+}
+
+/// Pulls and acknowledges every returned event batch within a bounded deadline so the seeded
+/// runtime is genuinely idle before an upgrade assertion.
+async fn drain_and_ack_events(scoped: &ScopedClient, label: &str) -> usize {
+    let deadline = Instant::now() + EVENT_DRAIN_TIMEOUT;
+    let mut acked_events = 0usize;
+    let mut round = 0usize;
+
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "{label}: timed out draining event batches"
+        );
+        let batch = tokio::time::timeout(remaining, scoped.pull_events(None, Some(50)))
+            .await
+            .unwrap_or_else(|_| panic!("{label}: timed out pulling event batch {round}"))
+            .unwrap_or_else(|err| panic!("{label}: failed to pull event batch {round}: {err}"));
+
+        let is_empty = batch.events.is_empty();
+        acked_events += batch.events.len();
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "{label}: timed out acknowledging event batch {round}"
+        );
+        tokio::time::timeout(
+            remaining,
+            scoped.ack_events(format!("{label}-ack-{round}"), batch.batch_id),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{label}: timed out acknowledging event batch {round}"))
+        .unwrap_or_else(|err| panic!("{label}: failed to acknowledge event batch {round}: {err}"));
+
+        if is_empty {
+            return acked_events;
+        }
+        round += 1;
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 enum CallerChildResult {
@@ -222,9 +343,14 @@ fn synthetic_control_runtime_child_entrypoint() {
                         std::process::exit(1);
                     }
                 };
-                let safety_deadline = Instant::now() + Duration::from_secs(25);
-                while Instant::now() < safety_deadline && keep_alive_file.exists() {
-                    tokio::time::sleep(Duration::from_millis(25)).await;
+                tokio::select! {
+                    _ = handle.wait_for_stop_request() => {}
+                    _ = async {
+                        let safety_deadline = Instant::now() + Duration::from_secs(25);
+                        while Instant::now() < safety_deadline && keep_alive_file.exists() {
+                            tokio::time::sleep(Duration::from_millis(25)).await;
+                        }
+                    } => {}
                 }
                 handle.shutdown().await;
             });
@@ -317,11 +443,12 @@ impl ControlRuntimeTestFixture {
         }
     }
 
-    /// Writes a synthetic `threadlane` executable script in `self.bin_dir` that records its
-    /// invocation count, PID, and exact argv using only POSIX `/bin/sh` builtins (compatible with
-    /// `cmd.env_clear()` on NixOS), and then `exec`s this test binary's
-    /// `synthetic_control_runtime_child_entrypoint` in `"real_serve"` mode so the child process
-    /// keeps the exact spawned PID and PGID and runs a real `Supervisor::start`.
+    /// Writes a synthetic `threadlane` executable script in `self.bin_dir` that records each
+    /// invocation with an atomic append, records that invocation's exact argv in a PID-scoped file,
+    /// and then `exec`s this test binary's `synthetic_control_runtime_child_entrypoint` in
+    /// `"real_serve"` mode so the child process keeps the exact spawned PID and PGID and runs a
+    /// real `Supervisor::start`. PID-scoped argv files live under the fixture `TempDir` and are
+    /// removed with it, so cleanup stays bounded and owned.
     fn write_real_serve_wrapper(
         &self,
         name: &str,
@@ -351,20 +478,19 @@ fi
 set -eu
 COUNT_FILE="{count_file}"
 ARGV_FILE="{argv_file}"
+ARGV_INDEX_FILE="${{ARGV_FILE}}.index"
 PIDS_FILE="{pids_file}"
-c=0
-if [ -f "$COUNT_FILE" ]; then
-    read -r c < "$COUNT_FILE" || c=0
-fi
-c=$((c + 1))
-printf "%s\n" "$c" > "$COUNT_FILE"
+umask 077
+printf "launch\n" >> "$COUNT_FILE"
 printf "%s\n" "$$" >> "$PIDS_FILE"
-: > "$ARGV_FILE"
+invocation_argv="${{ARGV_FILE}}.$$"
+printf "%s\n" "$invocation_argv" >> "$ARGV_INDEX_FILE"
+: > "$invocation_argv"
 for arg in "$@"; do
-    printf "%s\n" "$arg" >> "$ARGV_FILE"
+    printf "%s\n" "$arg" >> "$invocation_argv"
 done
 {stale_assertion}export {mode_env}="real_serve"
-export {argv_env}="$ARGV_FILE"
+export {argv_env}="$invocation_argv"
 export {keep_env}="{keep_alive}"
 export {delay_env}="{delay_ms}"
 exec "{test_bin}" --exact synthetic_control_runtime_child_entrypoint --nocapture >/dev/null 2>&1
@@ -457,9 +583,29 @@ fn write_executable_script(path: &Path, body: &str) {
 
 fn read_invocation_count(path: &Path) -> usize {
     match fs::read_to_string(path) {
-        Ok(s) => s.trim().parse::<usize>().unwrap_or(0),
+        Ok(contents) => contents
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .count(),
         Err(_) => 0,
     }
+}
+
+/// Reads the exact recorded argv of the most recent synthetic wrapper invocation.
+fn read_recorded_argv(argv_file: &Path) -> Vec<String> {
+    let mut index_os = argv_file.as_os_str().to_os_string();
+    index_os.push(".index");
+    let index_path = PathBuf::from(index_os);
+    let index = fs::read_to_string(&index_path)
+        .unwrap_or_else(|err| panic!("read argv index `{}`: {err}", index_path.display()));
+    let latest = index
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or_else(|| panic!("argv index `{}` is empty", index_path.display()));
+    let recorded = fs::read_to_string(latest)
+        .unwrap_or_else(|err| panic!("read recorded child argv `{latest}`: {err}"));
+    recorded.lines().map(str::to_string).collect()
 }
 
 #[allow(unsafe_code)]
@@ -500,8 +646,405 @@ fn process_pgid(pid: u32) -> i32 {
     unsafe { libc::getpgid(pid_i32) }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct FakeInfoSpec {
+    protocol_version: u32,
+    package_version: &'static str,
+    role: ControlRuntimeRole,
+    notifications_configured: bool,
+    workers_configured: bool,
+    idle_retire: bool,
+    scoped_backlog: bool,
+    malformed_instance_id: bool,
+}
+
+impl FakeInfoSpec {
+    fn compatible() -> Self {
+        Self {
+            protocol_version: CONTROL_RUNTIME_PROTOCOL_VERSION,
+            package_version: env!("CARGO_PKG_VERSION"),
+            role: ControlRuntimeRole::Baseline,
+            notifications_configured: false,
+            workers_configured: false,
+            idle_retire: true,
+            scoped_backlog: true,
+            malformed_instance_id: false,
+        }
+    }
+
+    fn incompatible_missing_backlog() -> Self {
+        Self {
+            scoped_backlog: false,
+            package_version: "0.0.9-old",
+            ..Self::compatible()
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FakeRetireMode {
+    Clean,
+    Busy,
+    Hang,
+}
+
+struct FakeControlRuntime {
+    descriptor: RuntimeDescriptor,
+    info: ControlRuntimeInfoResponse,
+    stop_tx: tokio::sync::watch::Sender<bool>,
+    task: tokio::task::JoinHandle<()>,
+    retire_requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl FakeControlRuntime {
+    async fn start(
+        state_dir: &Path,
+        spec: FakeInfoSpec,
+        retire_mode: FakeRetireMode,
+        include_info_endpoint: bool,
+    ) -> Self {
+        use tokio::net::TcpListener;
+
+        let lock = StateLock::acquire(state_dir).expect("acquire synthetic runtime lock");
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind synthetic runtime listener");
+        let port = listener.local_addr().expect("synthetic local_addr").port();
+        let token = SecretToken::generate();
+        let descriptor = RuntimeDescriptor {
+            version: 1,
+            host: "127.0.0.1".to_string(),
+            port,
+            pid: std::process::id(),
+            token,
+        };
+        write_descriptor_atomic(state_dir, &descriptor).expect("write synthetic descriptor");
+
+        let info = ControlRuntimeInfoResponse {
+            protocol_version: spec.protocol_version,
+            package_version: spec.package_version.to_string(),
+            role: spec.role,
+            state: ControlRuntimeRuntimeState::Ready,
+            instance_id: if spec.malformed_instance_id {
+                "not-a-valid-instance".to_string()
+            } else {
+                uuid::Uuid::new_v4().simple().to_string()
+            },
+            pid: std::process::id(),
+            notifications_configured: spec.notifications_configured,
+            workers_configured: spec.workers_configured,
+            capabilities: ControlRuntimeCapabilities {
+                bindings: true,
+                scoped_backlog: spec.scoped_backlog,
+                event_pull_ack: true,
+                guarded_worker_backlog: true,
+                idle_retire: spec.idle_retire,
+                approved_host_control: spec.role == ControlRuntimeRole::ApprovedHost,
+            },
+        };
+
+        let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
+        let retire_requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let task_retire_requests = std::sync::Arc::clone(&retire_requests);
+        let task_info = info.clone();
+        let task_token = descriptor.token.clone();
+        let task_descriptor = descriptor.clone();
+        let task_state_dir = state_dir.to_path_buf();
+        let task_stop_tx = stop_tx.clone();
+        let task = tokio::spawn(async move {
+            let _guard = FakeRuntimeGuard {
+                state_dir: task_state_dir,
+                descriptor: task_descriptor,
+                _lock: lock,
+            };
+            loop {
+                tokio::select! {
+                    changed = stop_rx.changed() => {
+                        if changed.is_err() || *stop_rx.borrow() {
+                            break;
+                        }
+                    }
+                    accepted = listener.accept() => {
+                        let Ok((mut socket, _)) = accepted else { break; };
+                        let info = task_info.clone();
+                        let token = task_token.clone();
+                        let stop_tx = task_stop_tx.clone();
+                        let retire_requests = std::sync::Arc::clone(&task_retire_requests);
+                        tokio::spawn(async move {
+                            handle_fake_control_connection(
+                                &mut socket,
+                                &info,
+                                &token,
+                                include_info_endpoint,
+                                retire_mode,
+                                &stop_tx,
+                                &retire_requests,
+                            )
+                            .await;
+                        });
+                    }
+                }
+            }
+        });
+
+        Self {
+            descriptor,
+            info,
+            stop_tx,
+            task,
+            retire_requests,
+        }
+    }
+
+    fn info(&self) -> &ControlRuntimeInfoResponse {
+        &self.info
+    }
+
+    fn retire_requests(&self) -> usize {
+        self.retire_requests
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    async fn is_serving(&self) -> bool {
+        let client = SupervisorClient::from_descriptor(self.descriptor.clone())
+            .expect("synthetic runtime descriptor");
+        tokio::time::timeout(Duration::from_millis(300), client.list_bindings())
+            .await
+            .is_ok_and(|result| result.is_ok())
+    }
+}
+
+impl Drop for FakeControlRuntime {
+    fn drop(&mut self) {
+        let _ = self.stop_tx.send(true);
+        self.task.abort();
+    }
+}
+
+struct FakeRuntimeGuard {
+    state_dir: PathBuf,
+    descriptor: RuntimeDescriptor,
+    _lock: StateLock,
+}
+
+impl Drop for FakeRuntimeGuard {
+    fn drop(&mut self) {
+        remove_owned_descriptor(&self.state_dir, &self.descriptor);
+    }
+}
+
+async fn handle_fake_control_connection(
+    socket: &mut tokio::net::TcpStream,
+    info: &ControlRuntimeInfoResponse,
+    token: &SecretToken,
+    include_info_endpoint: bool,
+    retire_mode: FakeRetireMode,
+    stop_tx: &tokio::sync::watch::Sender<bool>,
+    retire_requests: &std::sync::atomic::AtomicUsize,
+) {
+    use tokio::io::AsyncReadExt;
+
+    let mut buffer = Vec::new();
+    let mut chunk = [0u8; 1024];
+    let header_end = loop {
+        let read = match socket.read(&mut chunk).await {
+            Ok(read) => read,
+            Err(_) => return,
+        };
+        if read == 0 {
+            return;
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+        if let Some(pos) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+            break pos + 4;
+        }
+        if buffer.len() > 16 * 1024 {
+            return;
+        }
+    };
+
+    let header_text = String::from_utf8_lossy(&buffer[..header_end]).into_owned();
+    let mut lines = header_text.split("\r\n");
+    let Some(request_line) = lines.next() else {
+        return;
+    };
+    let mut request_parts = request_line.split_whitespace();
+    let Some(method) = request_parts.next() else {
+        return;
+    };
+    let Some(path) = request_parts.next() else {
+        return;
+    };
+
+    let mut authorization = None;
+    let mut content_length = 0usize;
+    for line in lines {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let name = name.trim();
+        let value = value.trim();
+        if name.eq_ignore_ascii_case("authorization") {
+            authorization = Some(value.to_string());
+        } else if name.eq_ignore_ascii_case("content-length") {
+            content_length = value.parse().unwrap_or(0);
+        }
+    }
+
+    let mut body = buffer[header_end..].to_vec();
+    while body.len() < content_length {
+        match socket.read(&mut chunk).await {
+            Ok(0) => break,
+            Ok(read) => body.extend_from_slice(&chunk[..read]),
+            Err(_) => return,
+        }
+    }
+    body.truncate(content_length);
+
+    let expected_auth = format!("Bearer {}", token.as_str());
+    if authorization.as_deref() != Some(expected_auth.as_str()) {
+        write_fake_json(
+            socket,
+            "401 Unauthorized",
+            &ApiError::new(ThreadlaneErrorCode::Unauthorized, "invalid bearer token"),
+        )
+        .await;
+        return;
+    }
+
+    match (method, path) {
+        ("GET", "/v1/bindings") => {
+            write_fake_json(
+                socket,
+                "200 OK",
+                &threadlane::protocol::BindingListResponse {
+                    bindings: Vec::new(),
+                },
+            )
+            .await;
+        }
+        ("GET", "/v1/control-runtime/info") if include_info_endpoint => {
+            write_fake_json(socket, "200 OK", info).await;
+        }
+        ("POST", "/v1/control-runtime/retire") if include_info_endpoint => {
+            retire_requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let request: ControlRuntimeRetireRequest = match serde_json::from_slice(&body) {
+                Ok(request) => request,
+                Err(err) => {
+                    write_fake_json(
+                        socket,
+                        "400 Bad Request",
+                        &ApiError::new(
+                            ThreadlaneErrorCode::InvalidRequest,
+                            format!("invalid retire request: {err}"),
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+            };
+            if request.expected_pid != info.pid || request.expected_instance_id != info.instance_id
+            {
+                write_fake_json(
+                    socket,
+                    "409 Conflict",
+                    &ApiError::with_details(
+                        ThreadlaneErrorCode::HostInstanceMismatch,
+                        "synthetic instance mismatch",
+                        serde_json::json!({ "expected_instance_id": request.expected_instance_id.clone() }),
+                    ),
+                )
+                .await;
+                return;
+            }
+            if request.expected_protocol_version != info.protocol_version {
+                write_fake_json(
+                    socket,
+                    "409 Conflict",
+                    &ApiError::new(
+                        ThreadlaneErrorCode::InvalidConfig,
+                        "control runtime protocol mismatch: synthetic",
+                    ),
+                )
+                .await;
+                return;
+            }
+            match retire_mode {
+                FakeRetireMode::Busy => {
+                    write_fake_json(
+                        socket,
+                        "409 Conflict",
+                        &ApiError::with_details(
+                            ThreadlaneErrorCode::HostNotIdle,
+                            "synthetic runtime is busy",
+                            serde_json::json!({
+                                "non_terminal_runs": 1,
+                                "non_terminal_workers": 1,
+                                "live_worker_tasks": 1,
+                                "in_flight_wakeups": 0,
+                                "pending_wakeups": 1,
+                            }),
+                        ),
+                    )
+                    .await;
+                }
+                FakeRetireMode::Hang => {
+                    write_fake_json(
+                        socket,
+                        "200 OK",
+                        &threadlane::protocol::ControlRuntimeRetireResponse {
+                            protocol_version: info.protocol_version,
+                            instance_id: info.instance_id.clone(),
+                            state: ControlRuntimeRetireState::Retiring,
+                        },
+                    )
+                    .await;
+                }
+                FakeRetireMode::Clean => {
+                    write_fake_json(
+                        socket,
+                        "200 OK",
+                        &threadlane::protocol::ControlRuntimeRetireResponse {
+                            protocol_version: info.protocol_version,
+                            instance_id: info.instance_id.clone(),
+                            state: ControlRuntimeRetireState::Retiring,
+                        },
+                    )
+                    .await;
+                    let _ = stop_tx.send(true);
+                }
+            }
+        }
+        _ => {
+            write_fake_json(
+                socket,
+                "404 Not Found",
+                &ApiError::new(ThreadlaneErrorCode::InvalidRequest, "endpoint not found"),
+            )
+            .await;
+        }
+    }
+}
+
+async fn write_fake_json<T: Serialize>(
+    socket: &mut tokio::net::TcpStream,
+    status: &str,
+    value: &T,
+) {
+    use tokio::io::AsyncWriteExt;
+
+    let body = serde_json::to_vec(value).expect("serialize synthetic response");
+    let header = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    let _ = socket.write_all(header.as_bytes()).await;
+    let _ = socket.write_all(&body).await;
+    let _ = socket.shutdown().await;
+}
+
 /// 1. Existing healthy authenticated supervisor is reused without spawning another process, and
-///    reports `None` (unverified) for `notifications_enabled` and `workers_enabled`.
+///    its authenticated control advertisement reports truthful configuration and role.
 #[tokio::test]
 async fn existing_healthy_supervisor_reused_without_spawning_and_preserves_state() {
     let fixture = ControlRuntimeTestFixture::new();
@@ -539,13 +1082,24 @@ async fn existing_healthy_supervisor_reused_without_spawning_and_preserves_state
     assert_eq!(outcome.bindings_count, 2);
     assert!(!outcome.stale_descriptor_recovered);
     assert_eq!(
-        outcome.notifications_enabled, None,
-        "reused existing supervisor must report None (unverified) for notifications_enabled"
+        outcome.notifications_enabled,
+        Some(false),
+        "verified reuse must truthfully report notifications disabled"
     );
     assert_eq!(
-        outcome.workers_enabled, None,
-        "reused existing supervisor must report None (unverified) for workers_enabled"
+        outcome.workers_enabled,
+        Some(false),
+        "verified reuse must truthfully report workers disabled"
     );
+    assert_eq!(
+        outcome.runtime_protocol_version,
+        threadlane::CONTROL_RUNTIME_PROTOCOL_VERSION
+    );
+    assert_eq!(
+        outcome.runtime_role,
+        threadlane::ControlRuntimeRole::Baseline
+    );
+    assert_eq!(outcome.runtime_instance_id.len(), 32);
     assert!(!outcome.approved_hosts_resumed);
     assert_eq!(
         outcome.in_flight_runs_recovery_policy,
@@ -602,11 +1156,7 @@ async fn fresh_start_exact_serve_scope_env_scrubbing_and_background_survival() {
     assert!(!started.approved_hosts_resumed);
     assert_eq!(read_invocation_count(&count_file), 1);
 
-    let recorded_args: Vec<String> = fs::read_to_string(&argv_file)
-        .expect("read recorded argv")
-        .lines()
-        .map(str::to_string)
-        .collect();
+    let recorded_args = read_recorded_argv(&argv_file);
     assert_eq!(
         recorded_args,
         vec![
@@ -659,8 +1209,8 @@ async fn fresh_start_exact_serve_scope_env_scrubbing_and_background_survival() {
     assert_eq!(reused.pid, started.pid);
     assert_eq!(reused.port, started.port);
     assert_eq!(reused.bindings_count, 1);
-    assert_eq!(reused.notifications_enabled, None);
-    assert_eq!(reused.workers_enabled, None);
+    assert_eq!(reused.notifications_enabled, Some(false));
+    assert_eq!(reused.workers_enabled, Some(false));
     assert_eq!(read_invocation_count(&count_file), 1);
 }
 
@@ -891,16 +1441,16 @@ async fn concurrent_ensure_callers_in_process_cross_process_and_first_use_missin
         reused_count, 4,
         "remaining callers must report AlreadyRunning"
     );
+    assert_eq!(
+        read_invocation_count(&count_a),
+        1,
+        "cross-process startup coordination must launch exactly one supervisor"
+    );
     for o in &outcomes {
         assert_eq!(o.pid, winner_pid);
         assert_eq!(o.port, winner_port);
-        if o.status == ControlRuntimeEnsureStatus::Started {
-            assert_eq!(o.notifications_enabled, Some(false));
-            assert_eq!(o.workers_enabled, Some(false));
-        } else {
-            assert_eq!(o.notifications_enabled, None);
-            assert_eq!(o.workers_enabled, None);
-        }
+        assert_eq!(o.notifications_enabled, Some(false));
+        assert_eq!(o.workers_enabled, Some(false));
     }
 
     // Part B: Direct OS thread race on `validate_control_runtime_state_dir` for a missing directory.
@@ -1521,6 +2071,431 @@ async fn startup_timeout_failed_spawn_premature_exit_and_cancellation_cleanup_pr
     );
 }
 
+/// 9. A baseline runtime whose package version differs but whose authenticated capability
+///    contract covers every required operation is reused truthfully without a restart.
+#[tokio::test]
+async fn compatible_older_package_runtime_is_reused_by_capability_not_version() {
+    let fixture = ControlRuntimeTestFixture::new();
+    let count_file = fixture.root.join("compat-count.txt");
+    let argv_file = fixture.root.join("compat-argv.txt");
+    let spy_exe = fixture.write_real_serve_wrapper("threadlane", &count_file, &argv_file, 0, false);
+
+    let mut spec = FakeInfoSpec::compatible();
+    spec.package_version = "0.0.9-old";
+    let fake =
+        FakeControlRuntime::start(&fixture.state_dir, spec, FakeRetireMode::Clean, true).await;
+
+    let outcome = ensure_control_runtime(&fixture.state_dir, &spy_exe, Duration::from_secs(3))
+        .await
+        .expect("compatible capability contract must be reused");
+
+    assert_eq!(outcome.status, ControlRuntimeEnsureStatus::AlreadyRunning);
+    assert_eq!(outcome.pid, std::process::id());
+    assert_eq!(
+        outcome.runtime_protocol_version,
+        CONTROL_RUNTIME_PROTOCOL_VERSION
+    );
+    assert_eq!(outcome.runtime_package_version, "0.0.9-old");
+    assert_eq!(outcome.runtime_instance_id, fake.info().instance_id);
+    assert_eq!(outcome.runtime_role, ControlRuntimeRole::Baseline);
+    assert_eq!(outcome.notifications_enabled, Some(false));
+    assert_eq!(outcome.workers_enabled, Some(false));
+    assert_eq!(outcome.retired_runtime, None);
+    assert_eq!(
+        read_invocation_count(&count_file),
+        0,
+        "package version difference alone must never spawn a replacement"
+    );
+    assert_eq!(fake.retire_requests(), 0);
+    assert!(fake.is_serving().await);
+}
+
+/// 10. A legacy authenticated runtime without the control-info/idle-retire handshake fails early
+///     with precise upgrade guidance, never spawns, and is never signalled or reused.
+#[tokio::test]
+async fn unsupported_legacy_runtime_fails_early_without_spawn_or_signal() {
+    let fixture = ControlRuntimeTestFixture::new();
+    let count_file = fixture.root.join("legacy-count.txt");
+    let argv_file = fixture.root.join("legacy-argv.txt");
+    let spy_exe = fixture.write_real_serve_wrapper("threadlane", &count_file, &argv_file, 0, false);
+
+    let fake = FakeControlRuntime::start(
+        &fixture.state_dir,
+        FakeInfoSpec::compatible(),
+        FakeRetireMode::Clean,
+        false,
+    )
+    .await;
+
+    let err = ensure_control_runtime(&fixture.state_dir, &spy_exe, Duration::from_secs(2))
+        .await
+        .expect_err("legacy runtime must fail early");
+    assert_eq!(err.error_code(), ControlRuntimeErrorCode::UpgradeRequired);
+    assert!(
+        err.message().contains("legacy") && err.message().contains("Stop"),
+        "upgrade guidance must be actionable: {}",
+        err.message()
+    );
+    assert_eq!(read_invocation_count(&count_file), 0);
+    assert_eq!(fake.retire_requests(), 0);
+    assert!(
+        fake.is_serving().await,
+        "legacy runtime must remain untouched and alive"
+    );
+}
+
+/// 11. An incompatible idle baseline that advertises safe retirement is atomically retired and
+///     replaced by the current executable with bindings, backlog Done state, and run history
+///     preserved. Startup records no replay.
+#[tokio::test]
+async fn inactive_incompatible_baseline_upgrades_preserving_data_without_replay() {
+    let mut fixture = ControlRuntimeTestFixture::new();
+
+    let (binding_id, backlog_item_id, run_id, activity_count_before) = {
+        let handle = Supervisor::start(SupervisorConfig::new(&fixture.state_dir))
+            .await
+            .expect("seed supervisor");
+        let client = SupervisorClient::from_state_dir(&fixture.state_dir).expect("seed client");
+        let binding = client
+            .create_binding(TEST_THREAD_UUID_A, "upgrade-preserve")
+            .await
+            .expect("seed binding");
+        let scoped = ScopedClient::from_state_dir(&fixture.state_dir, &binding.binding_id)
+            .expect("seed scoped client");
+
+        let item = scoped
+            .create_backlog_item(
+                "seed-item-create".to_string(),
+                "Preserve Done item".to_string(),
+                "Item survives idle runtime upgrade".to_string(),
+                "Durable backlog state".to_string(),
+                BacklogItemKind::Coworker,
+            )
+            .await
+            .expect("seed backlog item");
+        let item = scoped
+            .start_backlog_item(
+                "seed-item-start".to_string(),
+                item.item_id.clone(),
+                item.revision,
+            )
+            .await
+            .expect("start backlog item");
+        let item = scoped
+            .complete_backlog_item(
+                "seed-item-complete".to_string(),
+                item.item_id.clone(),
+                item.revision,
+                "Coworker delivery checked".to_string(),
+                "fixture evidence".to_string(),
+            )
+            .await
+            .expect("complete backlog item");
+        assert_eq!(item.status, BacklogStatus::Done);
+
+        let run = scoped
+            .start_demo(
+                "seed-demo-run".to_string(),
+                "Durable completed run".to_string(),
+                Some(0),
+            )
+            .await
+            .expect("seed demo run");
+        let run = complete_demo_run(&scoped, run, "seed-demo-run").await;
+        let acked_events = drain_and_ack_events(&scoped, "seed-demo").await;
+        assert!(acked_events > 0, "seeded run must emit events");
+        let activity = scoped
+            .list_activity(None, None, Some(50), None, None)
+            .await
+            .expect("seed activity");
+        let activity_count = activity.events.len();
+        assert!(activity_count > 0);
+
+        handle.shutdown().await;
+        (binding.binding_id, item.item_id, run.run_id, activity_count)
+    };
+
+    let count_file = fixture.root.join("upgrade-count.txt");
+    let argv_file = fixture.root.join("upgrade-argv.txt");
+    let spy_exe = fixture.write_real_serve_wrapper("threadlane", &count_file, &argv_file, 0, false);
+    let fake = FakeControlRuntime::start(
+        &fixture.state_dir,
+        FakeInfoSpec::incompatible_missing_backlog(),
+        FakeRetireMode::Clean,
+        true,
+    )
+    .await;
+    let fake_instance = fake.info().instance_id.clone();
+    let fake_package = fake.info().package_version.clone();
+
+    let outcome = ensure_control_runtime(&fixture.state_dir, &spy_exe, Duration::from_secs(8))
+        .await
+        .expect("idle incompatible baseline must upgrade safely");
+    fixture.track_pid(outcome.pid);
+
+    assert_eq!(outcome.status, ControlRuntimeEnsureStatus::Upgraded);
+    assert_ne!(outcome.pid, std::process::id());
+    assert_eq!(outcome.bindings_count, 1);
+    let retired = outcome
+        .retired_runtime
+        .as_ref()
+        .expect("upgrade must report the retired runtime");
+    assert_eq!(retired.pid, std::process::id());
+    assert_eq!(retired.instance_id, fake_instance);
+    assert_eq!(retired.package_version, fake_package);
+    assert_eq!(read_invocation_count(&count_file), 1);
+
+    let client = SupervisorClient::from_state_dir(&fixture.state_dir).expect("successor client");
+    let bindings = client
+        .list_bindings()
+        .await
+        .expect("list successor bindings");
+    assert_eq!(bindings.len(), 1);
+    assert_eq!(bindings[0].binding_id, binding_id);
+    let scoped =
+        ScopedClient::from_state_dir(&fixture.state_dir, &binding_id).expect("successor scoped");
+    let item = scoped
+        .get_backlog_item(backlog_item_id)
+        .await
+        .expect("Done item preserved");
+    assert_eq!(item.status, BacklogStatus::Done);
+    assert_eq!(
+        item.completion_note.as_deref(),
+        Some("Coworker delivery checked")
+    );
+
+    let run = scoped.get_run(run_id.clone()).await.expect("run preserved");
+    assert_eq!(run.status, RunStatus::Completed);
+    let runs = scoped
+        .list_runs(None, Some(50))
+        .await
+        .expect("runs preserved");
+    assert_eq!(runs.runs.len(), 1, "startup must not replay or create runs");
+    assert_eq!(runs.runs[0].run_id, run_id);
+    let activity = scoped
+        .list_activity(None, None, Some(50), None, None)
+        .await
+        .expect("activity preserved");
+    assert_eq!(
+        activity.events.len(),
+        activity_count_before,
+        "startup must not replay or fabricate events"
+    );
+}
+
+/// 12. An incompatible runtime whose atomic retire is refused because activity won the race
+///     surfaces a precise busy error, starts no replacement, and leaves the runtime serving.
+#[tokio::test]
+async fn incompatible_busy_runtime_refuses_upgrade_without_side_effects() {
+    let fixture = ControlRuntimeTestFixture::new();
+    let count_file = fixture.root.join("busy-count.txt");
+    let argv_file = fixture.root.join("busy-argv.txt");
+    let spy_exe = fixture.write_real_serve_wrapper("threadlane", &count_file, &argv_file, 0, false);
+    let fake = FakeControlRuntime::start(
+        &fixture.state_dir,
+        FakeInfoSpec::incompatible_missing_backlog(),
+        FakeRetireMode::Busy,
+        true,
+    )
+    .await;
+
+    let err = ensure_control_runtime(&fixture.state_dir, &spy_exe, Duration::from_secs(3))
+        .await
+        .expect_err("busy runtime must refuse upgrade");
+    assert_eq!(err.error_code(), ControlRuntimeErrorCode::RuntimeBusy);
+    assert!(
+        err.message().contains("non_terminal_runs=1")
+            && err.message().contains("pending_wakeups=1"),
+        "busy refusal must report bounded counters: {}",
+        err.message()
+    );
+    assert_eq!(read_invocation_count(&count_file), 0);
+    assert_eq!(fake.retire_requests(), 1);
+    assert!(fake.is_serving().await);
+}
+
+/// 13. Two independent cross-process ensure callers racing against one incompatible idle
+///     baseline converge on exactly one successor without a second retirement or spawn.
+#[tokio::test]
+async fn concurrent_cross_process_ensures_produce_one_successor() {
+    let mut fixture = ControlRuntimeTestFixture::new();
+    let count_file = fixture.root.join("race-count.txt");
+    let argv_file = fixture.root.join("race-argv.txt");
+    let spy_exe =
+        fixture.write_real_serve_wrapper("threadlane", &count_file, &argv_file, 120, false);
+    let fake = FakeControlRuntime::start(
+        &fixture.state_dir,
+        FakeInfoSpec::incompatible_missing_backlog(),
+        FakeRetireMode::Clean,
+        true,
+    )
+    .await;
+
+    let test_bin = fs::canonicalize(std::env::current_exe().expect("current_exe"))
+        .expect("canonicalize current_exe");
+    let out_a = fixture.root.join("race-a.json");
+    let out_b = fixture.root.join("race-b.json");
+
+    let spawn_caller = |out_file: PathBuf| {
+        tokio::process::Command::new(&test_bin)
+            .args([
+                "--exact",
+                "synthetic_control_runtime_child_entrypoint",
+                "--nocapture",
+            ])
+            .env(CHILD_MODE_ENV, "ensure_caller")
+            .env(CHILD_CALLER_STATE_DIR_ENV, &fixture.state_dir)
+            .env(CHILD_CALLER_EXE_ENV, &spy_exe)
+            .env(CHILD_CALLER_TIMEOUT_MS_ENV, "8000")
+            .env(CHILD_CALLER_OUT_FILE_ENV, out_file)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn race ensure caller")
+    };
+
+    let mut caller_a = spawn_caller(out_a.clone());
+    let mut caller_b = spawn_caller(out_b.clone());
+    let (exit_a, exit_b) = tokio::join!(caller_a.wait(), caller_b.wait());
+    assert!(exit_a.expect("wait caller A").success());
+    assert!(exit_b.expect("wait caller B").success());
+
+    let result_a: CallerChildResult =
+        serde_json::from_slice(&fs::read(&out_a).expect("read race A")).expect("parse race A");
+    let result_b: CallerChildResult =
+        serde_json::from_slice(&fs::read(&out_b).expect("read race B")).expect("parse race B");
+    let CallerChildResult::Ok(outcome_a) = result_a else {
+        panic!("race caller A failed: {result_a:?}");
+    };
+    let CallerChildResult::Ok(outcome_b) = result_b else {
+        panic!("race caller B failed: {result_b:?}");
+    };
+
+    assert_eq!(
+        read_invocation_count(&count_file),
+        1,
+        "bounded cross-process startup coordination must launch exactly one successor"
+    );
+    // The surviving process/port and the one-launched/one-reused outcomes prove a single
+    // successor; the truthful invocation count must match that launch count.
+    assert_eq!(outcome_a.pid, outcome_b.pid, "one successor pid");
+    assert_eq!(outcome_a.port, outcome_b.port, "one successor port");
+    let launched = [&outcome_a, &outcome_b]
+        .iter()
+        .filter(|outcome| {
+            matches!(
+                outcome.status,
+                ControlRuntimeEnsureStatus::Upgraded | ControlRuntimeEnsureStatus::Started
+            )
+        })
+        .count();
+    let reused = [&outcome_a, &outcome_b]
+        .iter()
+        .filter(|outcome| outcome.status == ControlRuntimeEnsureStatus::AlreadyRunning)
+        .count();
+    assert_eq!(launched, 1, "exactly one caller must launch the successor");
+    assert_eq!(reused, 1, "the other caller must reuse the successor");
+    assert_eq!(
+        read_invocation_count(&count_file),
+        launched,
+        "launch invocation count must match exactly one successful successor launch"
+    );
+    fixture.track_pid(outcome_a.pid);
+    assert!(is_process_alive(outcome_a.pid));
+    assert!(!fake.is_serving().await, "retired fake must stop serving");
+}
+
+/// 14. A runtime that accepts retirement but never releases its owned lock causes a bounded
+///     retire timeout with no forced kill and no replacement spawn.
+#[tokio::test]
+async fn retire_timeout_does_not_force_kill_or_spawn_duplicate() {
+    let fixture = ControlRuntimeTestFixture::new();
+    let count_file = fixture.root.join("retire-timeout-count.txt");
+    let argv_file = fixture.root.join("retire-timeout-argv.txt");
+    let spy_exe = fixture.write_real_serve_wrapper("threadlane", &count_file, &argv_file, 0, false);
+    let fake = FakeControlRuntime::start(
+        &fixture.state_dir,
+        FakeInfoSpec::incompatible_missing_backlog(),
+        FakeRetireMode::Hang,
+        true,
+    )
+    .await;
+
+    let started = Instant::now();
+    let err = ensure_control_runtime(&fixture.state_dir, &spy_exe, Duration::from_millis(400))
+        .await
+        .expect_err("retirement timeout must fail closed");
+    let elapsed = started.elapsed();
+    assert_eq!(err.error_code(), ControlRuntimeErrorCode::RetireTimedOut);
+    assert!(elapsed < Duration::from_millis(2_000));
+    assert_eq!(read_invocation_count(&count_file), 0);
+    assert_eq!(fake.retire_requests(), 1);
+    assert!(
+        fake.is_serving().await,
+        "retire timeout must not signal or kill the runtime"
+    );
+}
+
+/// 15. Approved host roles and newer/unknown protocols are never retired or downgraded by the
+///     baseline ensure helper.
+#[tokio::test]
+async fn approved_host_and_newer_protocol_refuse_automatic_upgrade() {
+    for spec in [
+        FakeInfoSpec {
+            role: ControlRuntimeRole::ApprovedHost,
+            idle_retire: false,
+            ..FakeInfoSpec::compatible()
+        },
+        FakeInfoSpec {
+            protocol_version: CONTROL_RUNTIME_PROTOCOL_VERSION + 99,
+            idle_retire: true,
+            ..FakeInfoSpec::compatible()
+        },
+    ] {
+        let fixture = ControlRuntimeTestFixture::new();
+        let count_file = fixture.root.join("foreign-count.txt");
+        let argv_file = fixture.root.join("foreign-argv.txt");
+        let spy_exe =
+            fixture.write_real_serve_wrapper("threadlane", &count_file, &argv_file, 0, false);
+        let fake =
+            FakeControlRuntime::start(&fixture.state_dir, spec, FakeRetireMode::Clean, true).await;
+
+        let err = ensure_control_runtime(&fixture.state_dir, &spy_exe, Duration::from_secs(2))
+            .await
+            .expect_err("foreign or newer runtime must be refused");
+        assert_eq!(
+            err.error_code(),
+            ControlRuntimeErrorCode::IncompatibleRuntime
+        );
+        assert_eq!(read_invocation_count(&count_file), 0);
+        assert_eq!(fake.retire_requests(), 0);
+        assert!(fake.is_serving().await);
+    }
+}
+
+/// 16. Malformed authenticated control-runtime identity is never reused, retired, or replaced.
+#[tokio::test]
+async fn malformed_control_info_refuses_reuse_and_retirement() {
+    let fixture = ControlRuntimeTestFixture::new();
+    let count_file = fixture.root.join("malformed-count.txt");
+    let argv_file = fixture.root.join("malformed-argv.txt");
+    let spy_exe = fixture.write_real_serve_wrapper("threadlane", &count_file, &argv_file, 0, false);
+    let mut spec = FakeInfoSpec::compatible();
+    spec.malformed_instance_id = true;
+    let fake =
+        FakeControlRuntime::start(&fixture.state_dir, spec, FakeRetireMode::Clean, true).await;
+
+    let err = ensure_control_runtime(&fixture.state_dir, &spy_exe, Duration::from_secs(2))
+        .await
+        .expect_err("malformed control info must fail closed");
+    assert_eq!(err.error_code(), ControlRuntimeErrorCode::ProtocolError);
+    assert_eq!(read_invocation_count(&count_file), 0);
+    assert_eq!(fake.retire_requests(), 0);
+    assert!(fake.is_serving().await);
+}
+
 /// 8. Deterministic caller-exit survival: a dedicated control supervisor started by a separate
 ///    caller OS process survives after that caller OS process exits, remains in its own process
 ///    group, and continues serving authenticated requests.
@@ -1599,7 +2574,615 @@ async fn started_control_supervisor_survives_caller_process_exit() {
     assert_eq!(reused.pid, started.pid);
     assert_eq!(reused.port, started.port);
     assert_eq!(reused.bindings_count, 1);
-    assert_eq!(reused.notifications_enabled, None);
-    assert_eq!(reused.workers_enabled, None);
+    assert_eq!(reused.notifications_enabled, Some(false));
+    assert_eq!(reused.workers_enabled, Some(false));
     assert_eq!(read_invocation_count(&count_file), 1);
+}
+
+/// Prefix of the persistent cross-process startup guard kept beside `state_dir`.
+///
+/// Tests discover the single guard produced by production code by this prefix instead of
+/// recomputing the production filename hash.
+const STARTUP_GUARD_PREFIX: &str = ".threadlane-control-runtime-startup-";
+
+fn discover_startup_guard_path(fixture_root: &Path) -> PathBuf {
+    let mut found = Vec::new();
+    for entry in fs::read_dir(fixture_root).expect("read fixture root for startup guard") {
+        let entry = entry.expect("read fixture root entry");
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if name.starts_with(STARTUP_GUARD_PREFIX) && name.ends_with(".lock") {
+            found.push(entry.path());
+        }
+    }
+    assert_eq!(
+        found.len(),
+        1,
+        "expected exactly one persistent startup guard beside state_dir, found {found:?}"
+    );
+    found.pop().expect("single discovered startup guard")
+}
+
+fn assert_private_empty_guard_file(path: &Path) {
+    let meta = fs::symlink_metadata(path)
+        .unwrap_or_else(|err| panic!("stat startup guard `{}`: {err}", path.display()));
+    assert!(
+        meta.file_type().is_file(),
+        "startup guard `{}` must be a regular file",
+        path.display()
+    );
+    assert_eq!(
+        meta.len(),
+        0,
+        "startup guard `{}` must be empty",
+        path.display()
+    );
+    assert_eq!(
+        meta.mode() & 0o777,
+        0o600,
+        "startup guard `{}` must stay private 0600",
+        path.display()
+    );
+}
+
+fn hold_startup_guard(path: &Path) -> File {
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .unwrap_or_else(|err| panic!("open startup guard `{}` for locking: {err}", path.display()));
+    FileExt::lock_exclusive(&file)
+        .unwrap_or_else(|err| panic!("flock startup guard `{}`: {err}", path.display()));
+    file
+}
+
+fn create_private_empty_file(path: &Path) {
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .unwrap_or_else(|err| panic!("create private empty file `{}`: {err}", path.display()));
+    file.sync_all()
+        .unwrap_or_else(|err| panic!("sync private empty file `{}`: {err}", path.display()));
+}
+
+fn open_fd_count_for_inode(dev: u64, ino: u64) -> usize {
+    fs::read_dir("/proc/self/fd")
+        .expect("read /proc/self/fd")
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            fs::metadata(entry.path()).is_ok_and(|meta| meta.dev() == dev && meta.ino() == ino)
+        })
+        .count()
+}
+
+async fn wait_for_guard_fd_count(guard_path: &Path, expected: usize, label: &str) {
+    let meta = fs::symlink_metadata(guard_path).unwrap_or_else(|err| {
+        panic!(
+            "{label}: stat startup guard `{}`: {err}",
+            guard_path.display()
+        )
+    });
+    let (dev, ino) = (meta.dev(), meta.ino());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let observed = open_fd_count_for_inode(dev, ino);
+        if observed == expected {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{label}: expected {expected} open descriptor(s) for startup guard inode ({dev}, {ino}), observed {observed}"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+async fn create_valid_startup_guard_against_fake(
+    fixture: &ControlRuntimeTestFixture,
+    fake: &FakeControlRuntime,
+    spy_exe: &Path,
+    count_file: &Path,
+) -> PathBuf {
+    let outcome = ensure_control_runtime(&fixture.state_dir, spy_exe, Duration::from_secs(3))
+        .await
+        .expect("create valid startup guard against compatible fake runtime");
+    assert_eq!(outcome.status, ControlRuntimeEnsureStatus::AlreadyRunning);
+    assert_eq!(outcome.pid, std::process::id());
+    assert_eq!(outcome.bindings_count, 0);
+    assert_eq!(outcome.runtime_instance_id, fake.info().instance_id);
+    assert_eq!(
+        read_invocation_count(count_file),
+        0,
+        "creating the startup guard must reuse the compatible owned runtime without spawning"
+    );
+    assert_eq!(fake.retire_requests(), 0);
+    assert!(fake.is_serving().await);
+
+    let guard_path = discover_startup_guard_path(&fixture.root);
+    assert_private_empty_guard_file(&guard_path);
+    guard_path
+}
+
+async fn assert_invalid_startup_guard_rejected(
+    fixture: &ControlRuntimeTestFixture,
+    spy_exe: &Path,
+    case: &str,
+) {
+    let outcome = ensure_control_runtime(&fixture.state_dir, spy_exe, Duration::from_secs(1)).await;
+    let err = match outcome {
+        Ok(outcome) => panic!("{case}: expected startup guard rejection, got {outcome:?}"),
+        Err(err) => err,
+    };
+    assert_eq!(
+        err.error_code(),
+        ControlRuntimeErrorCode::SecurityViolation,
+        "{case}: {}",
+        err.message()
+    );
+}
+
+/// 17. A held cross-process startup guard bounds an ensure call with `LockBusy` without startup,
+///     retirement, descriptor change, or runtime signalling; releasing it lets the next ensure
+///     reuse the same compatible runtime without spawning.
+#[tokio::test]
+async fn held_startup_guard_bounds_ensure_with_lock_busy_and_release_reuses_runtime() {
+    let fixture = ControlRuntimeTestFixture::new();
+    let count_file = fixture.root.join("guard-busy-count.txt");
+    let argv_file = fixture.root.join("guard-busy-argv.txt");
+    let spy_exe = fixture.write_real_serve_wrapper("threadlane", &count_file, &argv_file, 0, false);
+    let fake = FakeControlRuntime::start(
+        &fixture.state_dir,
+        FakeInfoSpec::compatible(),
+        FakeRetireMode::Clean,
+        true,
+    )
+    .await;
+    let guard_path =
+        create_valid_startup_guard_against_fake(&fixture, &fake, &spy_exe, &count_file).await;
+
+    let descriptor_path = fixture.state_dir.join(DESCRIPTOR_FILENAME);
+    let descriptor_before =
+        fs::read(&descriptor_path).expect("read fake descriptor before refusal");
+    let descriptor_meta_before =
+        fs::symlink_metadata(&descriptor_path).expect("stat fake descriptor before refusal");
+    let guard_meta_before =
+        fs::symlink_metadata(&guard_path).expect("stat startup guard before hold");
+    let held = hold_startup_guard(&guard_path);
+
+    let started = Instant::now();
+    let err = ensure_control_runtime(&fixture.state_dir, &spy_exe, Duration::from_millis(200))
+        .await
+        .expect_err("held startup guard must time out with LockBusy");
+    let elapsed = started.elapsed();
+
+    assert_eq!(err.error_code(), ControlRuntimeErrorCode::LockBusy);
+    assert!(
+        err.message().contains("startup guard"),
+        "LockBusy must identify the startup guard: {}",
+        err.message()
+    );
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "held startup guard must bound the wait (elapsed: {elapsed:?})"
+    );
+    assert_eq!(
+        read_invocation_count(&count_file),
+        0,
+        "guard contention must never start a supervisor"
+    );
+    assert_eq!(
+        fake.retire_requests(),
+        0,
+        "guard contention must never retire the runtime"
+    );
+    assert!(
+        fake.is_serving().await,
+        "guard contention must not stop the runtime"
+    );
+
+    let descriptor_after = fs::read(&descriptor_path).expect("read fake descriptor after refusal");
+    let descriptor_meta_after =
+        fs::symlink_metadata(&descriptor_path).expect("stat fake descriptor after refusal");
+    assert_eq!(
+        descriptor_after, descriptor_before,
+        "guard contention must not rewrite supervisor.json"
+    );
+    assert_eq!(
+        (descriptor_meta_after.dev(), descriptor_meta_after.ino()),
+        (descriptor_meta_before.dev(), descriptor_meta_before.ino()),
+        "guard contention must not replace supervisor.json"
+    );
+    assert_private_empty_guard_file(&guard_path);
+    let guard_meta_after =
+        fs::symlink_metadata(&guard_path).expect("stat startup guard after refusal");
+    assert_eq!(
+        (guard_meta_after.dev(), guard_meta_after.ino()),
+        (guard_meta_before.dev(), guard_meta_before.ino()),
+        "a contended startup guard must remain the same persistent file"
+    );
+
+    FileExt::unlock(&held).expect("release startup guard flock");
+    drop(held);
+
+    let reused = ensure_control_runtime(&fixture.state_dir, &spy_exe, Duration::from_secs(3))
+        .await
+        .expect("released startup guard must allow legitimate reuse");
+    assert_eq!(reused.status, ControlRuntimeEnsureStatus::AlreadyRunning);
+    assert_eq!(reused.pid, std::process::id());
+    assert_eq!(reused.port, fake.descriptor.port);
+    assert_eq!(reused.runtime_instance_id, fake.info().instance_id);
+    assert_eq!(reused.bindings_count, 0);
+    assert_eq!(
+        read_invocation_count(&count_file),
+        0,
+        "legitimate reuse after guard release must not spawn"
+    );
+    assert_eq!(fake.retire_requests(), 0);
+    assert!(fake.is_serving().await);
+    assert_private_empty_guard_file(&guard_path);
+    let guard_meta_reused =
+        fs::symlink_metadata(&guard_path).expect("stat startup guard after reuse");
+    assert_eq!(
+        (guard_meta_reused.dev(), guard_meta_reused.ino()),
+        (guard_meta_before.dev(), guard_meta_before.ino()),
+        "reuse must keep the same persistent startup guard inode"
+    );
+}
+
+/// 18. Cancelling a genuinely blocked ensure future releases its opened startup guard descriptor
+///     without unlinking the persistent guard or stopping the runtime; a later ensure succeeds.
+#[tokio::test]
+async fn cancelled_blocked_ensure_releases_guard_descriptor_without_unlinking_runtime() {
+    let fixture = ControlRuntimeTestFixture::new();
+    let count_file = fixture.root.join("guard-cancel-count.txt");
+    let argv_file = fixture.root.join("guard-cancel-argv.txt");
+    let spy_exe = fixture.write_real_serve_wrapper("threadlane", &count_file, &argv_file, 0, false);
+    let fake = FakeControlRuntime::start(
+        &fixture.state_dir,
+        FakeInfoSpec::compatible(),
+        FakeRetireMode::Clean,
+        true,
+    )
+    .await;
+    let guard_path =
+        create_valid_startup_guard_against_fake(&fixture, &fake, &spy_exe, &count_file).await;
+
+    let descriptor_path = fixture.state_dir.join(DESCRIPTOR_FILENAME);
+    let descriptor_before =
+        fs::read(&descriptor_path).expect("read fake descriptor before cancellation");
+    let descriptor_meta_before =
+        fs::symlink_metadata(&descriptor_path).expect("stat fake descriptor before cancellation");
+    let guard_meta_before =
+        fs::symlink_metadata(&guard_path).expect("stat startup guard before hold");
+    let held = hold_startup_guard(&guard_path);
+
+    let mut ensure_future = Box::pin(ensure_control_runtime(
+        &fixture.state_dir,
+        &spy_exe,
+        Duration::from_secs(5),
+    ));
+    let pending = tokio::time::timeout(Duration::from_millis(500), &mut ensure_future).await;
+    assert!(
+        pending.is_err(),
+        "the ensure future must remain pending while the startup guard is held"
+    );
+    wait_for_guard_fd_count(&guard_path, 2, "blocked ensure").await;
+    drop(ensure_future);
+    wait_for_guard_fd_count(&guard_path, 1, "cancelled ensure").await;
+
+    assert_private_empty_guard_file(&guard_path);
+    let guard_meta_after =
+        fs::symlink_metadata(&guard_path).expect("stat startup guard after cancellation");
+    assert_eq!(
+        (guard_meta_after.dev(), guard_meta_after.ino()),
+        (guard_meta_before.dev(), guard_meta_before.ino()),
+        "cancellation must not unlink or replace the persistent startup guard"
+    );
+    assert_eq!(
+        read_invocation_count(&count_file),
+        0,
+        "cancellation during guard contention must not start a supervisor"
+    );
+    assert_eq!(fake.retire_requests(), 0);
+    assert!(
+        fake.is_serving().await,
+        "cancellation must not stop the runtime"
+    );
+    let descriptor_after =
+        fs::read(&descriptor_path).expect("read fake descriptor after cancellation");
+    let descriptor_meta_after =
+        fs::symlink_metadata(&descriptor_path).expect("stat fake descriptor after cancellation");
+    assert_eq!(descriptor_after, descriptor_before);
+    assert_eq!(
+        (descriptor_meta_after.dev(), descriptor_meta_after.ino()),
+        (descriptor_meta_before.dev(), descriptor_meta_before.ino())
+    );
+
+    FileExt::unlock(&held).expect("release startup guard flock");
+    drop(held);
+
+    let reused = ensure_control_runtime(&fixture.state_dir, &spy_exe, Duration::from_secs(3))
+        .await
+        .expect("subsequent ensure after cancellation must succeed");
+    assert_eq!(reused.status, ControlRuntimeEnsureStatus::AlreadyRunning);
+    assert_eq!(reused.pid, std::process::id());
+    assert_eq!(reused.port, fake.descriptor.port);
+    assert_eq!(reused.runtime_instance_id, fake.info().instance_id);
+    assert_eq!(read_invocation_count(&count_file), 0);
+    assert_eq!(fake.retire_requests(), 0);
+    assert!(fake.is_serving().await);
+}
+
+/// 19. Symlink, world-readable `0644`, nonempty, and directory startup guard forms are rejected
+///     without modifying the target, descriptor, or owned runtime and without any spawn/retire.
+#[tokio::test]
+async fn invalid_startup_guard_forms_are_rejected_without_touching_runtime_or_descriptor() {
+    let fixture = ControlRuntimeTestFixture::new();
+    let count_file = fixture.root.join("guard-invalid-count.txt");
+    let argv_file = fixture.root.join("guard-invalid-argv.txt");
+    let spy_exe = fixture.write_real_serve_wrapper("threadlane", &count_file, &argv_file, 0, false);
+    let fake = FakeControlRuntime::start(
+        &fixture.state_dir,
+        FakeInfoSpec::compatible(),
+        FakeRetireMode::Clean,
+        true,
+    )
+    .await;
+    let guard_path =
+        create_valid_startup_guard_against_fake(&fixture, &fake, &spy_exe, &count_file).await;
+
+    let descriptor_path = fixture.state_dir.join(DESCRIPTOR_FILENAME);
+    let descriptor_before =
+        fs::read(&descriptor_path).expect("read fake descriptor before invalid guards");
+    let descriptor_meta_before =
+        fs::symlink_metadata(&descriptor_path).expect("stat fake descriptor before invalid guards");
+
+    // 19a. Symlink guard must be rejected without touching its owned target.
+    fs::remove_file(&guard_path).expect("remove valid guard before symlink case");
+    let symlink_target = fixture.root.join("startup-guard-symlink-target");
+    let symlink_target_bytes: &[u8] = b"owned startup guard symlink target\n";
+    fs::write(&symlink_target, symlink_target_bytes).expect("write symlink target");
+    fs::set_permissions(&symlink_target, fs::Permissions::from_mode(0o600))
+        .expect("chmod 0600 symlink target");
+    let symlink_target_meta_before =
+        fs::symlink_metadata(&symlink_target).expect("stat symlink target before");
+    symlink(&symlink_target, &guard_path).expect("create symlink startup guard");
+    assert_invalid_startup_guard_rejected(&fixture, &spy_exe, "symlink guard").await;
+    assert_eq!(
+        fs::read(&symlink_target)
+            .expect("read symlink target after")
+            .as_slice(),
+        symlink_target_bytes,
+        "symlink guard rejection must not modify the target"
+    );
+    let symlink_target_meta_after =
+        fs::symlink_metadata(&symlink_target).expect("stat symlink target after");
+    assert_eq!(
+        (
+            symlink_target_meta_after.dev(),
+            symlink_target_meta_after.ino()
+        ),
+        (
+            symlink_target_meta_before.dev(),
+            symlink_target_meta_before.ino()
+        ),
+        "symlink guard rejection must not replace the target"
+    );
+    assert!(
+        fs::symlink_metadata(&guard_path)
+            .expect("stat symlink guard")
+            .file_type()
+            .is_symlink(),
+        "symlink guard must remain a symlink"
+    );
+    fs::remove_file(&guard_path).expect("remove symlink guard");
+
+    // 19b. World-readable empty `0644` guard must be rejected without rewriting it.
+    fs::write(&guard_path, b"").expect("create world-readable empty guard");
+    fs::set_permissions(&guard_path, fs::Permissions::from_mode(0o644))
+        .expect("chmod 0644 startup guard");
+    let world_readable_meta_before =
+        fs::symlink_metadata(&guard_path).expect("stat world-readable guard before");
+    assert_invalid_startup_guard_rejected(&fixture, &spy_exe, "world-readable guard").await;
+    let world_readable_meta_after =
+        fs::symlink_metadata(&guard_path).expect("stat world-readable guard after");
+    assert_eq!(
+        (
+            world_readable_meta_after.dev(),
+            world_readable_meta_after.ino()
+        ),
+        (
+            world_readable_meta_before.dev(),
+            world_readable_meta_before.ino()
+        ),
+        "world-readable guard rejection must not replace the file"
+    );
+    assert_eq!(world_readable_meta_after.mode() & 0o777, 0o644);
+    assert_eq!(world_readable_meta_after.len(), 0);
+    assert!(
+        fs::read(&guard_path)
+            .expect("read world-readable guard after")
+            .is_empty(),
+        "world-readable guard rejection must not write contents"
+    );
+    fs::remove_file(&guard_path).expect("remove world-readable guard");
+
+    // 19c. Nonempty `0600` guard must be rejected without truncating or rewriting it.
+    let nonempty_bytes: &[u8] = b"not a valid startup guard\n";
+    fs::write(&guard_path, nonempty_bytes).expect("create nonempty guard");
+    fs::set_permissions(&guard_path, fs::Permissions::from_mode(0o600))
+        .expect("chmod 0600 nonempty guard");
+    let nonempty_meta_before =
+        fs::symlink_metadata(&guard_path).expect("stat nonempty guard before");
+    assert_invalid_startup_guard_rejected(&fixture, &spy_exe, "nonempty guard").await;
+    let nonempty_meta_after = fs::symlink_metadata(&guard_path).expect("stat nonempty guard after");
+    assert_eq!(
+        (nonempty_meta_after.dev(), nonempty_meta_after.ino()),
+        (nonempty_meta_before.dev(), nonempty_meta_before.ino()),
+        "nonempty guard rejection must not replace the file"
+    );
+    assert_eq!(nonempty_meta_after.mode() & 0o777, 0o600);
+    assert_eq!(
+        fs::read(&guard_path)
+            .expect("read nonempty guard after")
+            .as_slice(),
+        nonempty_bytes,
+        "nonempty guard rejection must preserve contents"
+    );
+    fs::remove_file(&guard_path).expect("remove nonempty guard");
+
+    // 19d. Directory guard must be rejected without replacing or modifying it.
+    fs::create_dir(&guard_path).expect("create directory guard");
+    fs::set_permissions(&guard_path, fs::Permissions::from_mode(0o700))
+        .expect("chmod 0700 directory guard");
+    let directory_meta_before =
+        fs::symlink_metadata(&guard_path).expect("stat directory guard before");
+    assert_invalid_startup_guard_rejected(&fixture, &spy_exe, "directory guard").await;
+    let directory_meta_after =
+        fs::symlink_metadata(&guard_path).expect("stat directory guard after");
+    assert_eq!(
+        (directory_meta_after.dev(), directory_meta_after.ino()),
+        (directory_meta_before.dev(), directory_meta_before.ino()),
+        "directory guard rejection must not replace the directory"
+    );
+    assert!(directory_meta_after.file_type().is_dir());
+    assert_eq!(directory_meta_after.mode() & 0o777, 0o700);
+    fs::remove_dir(&guard_path).expect("remove directory guard");
+
+    assert_eq!(
+        read_invocation_count(&count_file),
+        0,
+        "invalid startup guard forms must never start a supervisor"
+    );
+    assert_eq!(
+        fake.retire_requests(),
+        0,
+        "invalid startup guard forms must never retire the runtime"
+    );
+    assert!(
+        fake.is_serving().await,
+        "invalid startup guard forms must not stop the runtime"
+    );
+    let descriptor_after =
+        fs::read(&descriptor_path).expect("read fake descriptor after invalid guards");
+    let descriptor_meta_after =
+        fs::symlink_metadata(&descriptor_path).expect("stat fake descriptor after invalid guards");
+    assert_eq!(descriptor_after, descriptor_before);
+    assert_eq!(
+        (descriptor_meta_after.dev(), descriptor_meta_after.ino()),
+        (descriptor_meta_before.dev(), descriptor_meta_before.ino()),
+        "invalid startup guards must not replace supervisor.json"
+    );
+}
+
+/// 20. Replacing the guard pathname while a future waits on the original inode must fail that
+///     same future with `StateChanged` after the original lock is released, never enter startup,
+///     and keep both owned files intact.
+#[tokio::test]
+async fn replaced_startup_guard_path_fails_waiting_ensure_with_state_changed() {
+    let fixture = ControlRuntimeTestFixture::new();
+    let count_file = fixture.root.join("guard-replace-count.txt");
+    let argv_file = fixture.root.join("guard-replace-argv.txt");
+    let spy_exe = fixture.write_real_serve_wrapper("threadlane", &count_file, &argv_file, 0, false);
+    let fake = FakeControlRuntime::start(
+        &fixture.state_dir,
+        FakeInfoSpec::compatible(),
+        FakeRetireMode::Clean,
+        true,
+    )
+    .await;
+    let guard_path =
+        create_valid_startup_guard_against_fake(&fixture, &fake, &spy_exe, &count_file).await;
+
+    let descriptor_path = fixture.state_dir.join(DESCRIPTOR_FILENAME);
+    let descriptor_before =
+        fs::read(&descriptor_path).expect("read fake descriptor before replacement");
+    let descriptor_meta_before =
+        fs::symlink_metadata(&descriptor_path).expect("stat fake descriptor before replacement");
+    let original_meta_before =
+        fs::symlink_metadata(&guard_path).expect("stat original startup guard");
+    let original = hold_startup_guard(&guard_path);
+
+    let mut ensure_future = Box::pin(ensure_control_runtime(
+        &fixture.state_dir,
+        &spy_exe,
+        Duration::from_secs(5),
+    ));
+    let pending = tokio::time::timeout(Duration::from_millis(500), &mut ensure_future).await;
+    assert!(
+        pending.is_err(),
+        "ensure must remain pending on the original guard inode"
+    );
+    wait_for_guard_fd_count(&guard_path, 2, "ensure waiting on original guard").await;
+
+    let replacement_path = fixture.root.join("startup-guard-replacement");
+    create_private_empty_file(&replacement_path);
+    fs::rename(&replacement_path, &guard_path).expect("atomically replace startup guard pathname");
+    let replacement_meta_before =
+        fs::symlink_metadata(&guard_path).expect("stat replacement startup guard");
+    assert_ne!(
+        (replacement_meta_before.dev(), replacement_meta_before.ino()),
+        (original_meta_before.dev(), original_meta_before.ino()),
+        "replacement guard must be a different inode"
+    );
+    assert_private_empty_guard_file(&guard_path);
+
+    FileExt::unlock(&original).expect("release original startup guard after replacement");
+    // Keep `original` open through the assertions so its inode remains an owned file.
+
+    let resumed = tokio::time::timeout(Duration::from_secs(5), &mut ensure_future)
+        .await
+        .expect("waiting ensure must complete after guard replacement and unlock");
+    let err =
+        resumed.expect_err("replaced startup guard must fail StateChanged, not start a runtime");
+    assert_eq!(err.error_code(), ControlRuntimeErrorCode::StateChanged);
+    assert!(
+        err.message().contains("changed"),
+        "StateChanged must explain the startup guard identity change: {}",
+        err.message()
+    );
+    assert_eq!(
+        read_invocation_count(&count_file),
+        0,
+        "a replaced startup guard must never enter startup"
+    );
+    assert_eq!(fake.retire_requests(), 0);
+    assert!(
+        fake.is_serving().await,
+        "guard replacement must not stop the runtime"
+    );
+
+    let descriptor_after =
+        fs::read(&descriptor_path).expect("read fake descriptor after replacement");
+    let descriptor_meta_after =
+        fs::symlink_metadata(&descriptor_path).expect("stat fake descriptor after replacement");
+    assert_eq!(descriptor_after, descriptor_before);
+    assert_eq!(
+        (descriptor_meta_after.dev(), descriptor_meta_after.ino()),
+        (descriptor_meta_before.dev(), descriptor_meta_before.ino())
+    );
+
+    let replacement_meta_after =
+        fs::symlink_metadata(&guard_path).expect("stat replacement startup guard after resume");
+    assert_eq!(
+        (replacement_meta_after.dev(), replacement_meta_after.ino()),
+        (replacement_meta_before.dev(), replacement_meta_before.ino()),
+        "the replacement guard must remain at the pathname"
+    );
+    assert_private_empty_guard_file(&guard_path);
+    let original_meta_after = original
+        .metadata()
+        .expect("stat held original startup guard");
+    assert_eq!(
+        (original_meta_after.dev(), original_meta_after.ino()),
+        (original_meta_before.dev(), original_meta_before.ino()),
+        "the original inode must remain the same held owned file"
+    );
+    assert_eq!(original_meta_after.len(), 0);
+    assert_eq!(original_meta_after.mode() & 0o777, 0o600);
+    drop(original);
 }

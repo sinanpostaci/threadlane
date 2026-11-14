@@ -232,6 +232,7 @@ pub async fn run_cli(cli: Cli) -> Result<(), Error> {
             let handle = Supervisor::start(config).await?;
             tokio::select! {
                 _ = wait_for_shutdown_signal() => {}
+                _ = handle.wait_for_stop_request() => {}
                 _ = handle.wait_for_fatal() => {}
             }
             if let Some(api_err) = handle.shutdown_and_take_fatal().await {

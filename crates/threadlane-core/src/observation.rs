@@ -4625,6 +4625,12 @@ pub struct WorkspaceNativeSample {
     /// Timestamp (ms since Unix epoch) of the most recent successful native read.
     #[serde(default, alias = "last_success_at")]
     pub last_success_at_ms: Option<i64>,
+    /// Display-only sanitized title from a verified exact-thread native metadata read.
+    ///
+    /// Never part of chat identity and never fabricated for a failed, disconnected, or
+    /// unverified observation. Legacy samples without this field parse unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_title: Option<String>,
     /// Availability state (`available`, `disconnected`, `stale`, `unavailable`).
     #[serde(default, deserialize_with = "deserialize_null_default")]
     pub availability: WorkspaceAvailabilityState,
@@ -4747,6 +4753,19 @@ impl WorkspaceNativeSample {
             connection.state = WorkspaceConnectionState::Unavailable;
         }
 
+        // A title is display-only metadata from a verified exact-thread read. It is never
+        // retained for a failed, disconnected, or otherwise non-available observation.
+        let thread_title = if availability == WorkspaceAvailabilityState::Available
+            && self.capabilities.exact_thread_read == WorkspaceCapabilityState::Supported
+        {
+            self.thread_title
+                .as_deref()
+                .map(|raw| sanitize_observation_label(raw, ""))
+                .filter(|clean| !clean.is_empty())
+        } else {
+            None
+        };
+
         Self {
             chat_identity: self.chat_identity.clone(),
             producer_epoch: valid_epoch,
@@ -4758,6 +4777,7 @@ impl WorkspaceNativeSample {
             } else {
                 None
             },
+            thread_title,
             availability,
             activity,
             connection,

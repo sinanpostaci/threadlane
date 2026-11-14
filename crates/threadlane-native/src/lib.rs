@@ -135,9 +135,10 @@ pub use control_runtime::{
     validate_control_runtime_executable_path, validate_control_runtime_state_dir,
     validate_control_runtime_timeout, ControlRuntimeEnsureOutcome, ControlRuntimeEnsureStatus,
     ControlRuntimeError, ControlRuntimeErrorCode, ControlRuntimePolicy,
-    CONTROL_RUNTIME_IN_FLIGHT_RECOVERY_POLICY, CONTROL_RUNTIME_LIFETIME_POLICY,
-    CONTROL_RUNTIME_POLL_INTERVAL, DEFAULT_CONTROL_RUNTIME_STARTUP_TIMEOUT,
-    MAX_CONTROL_RUNTIME_STARTUP_TIMEOUT, MIN_CONTROL_RUNTIME_STARTUP_TIMEOUT,
+    ControlRuntimeRetiredRuntime, CONTROL_RUNTIME_IN_FLIGHT_RECOVERY_POLICY,
+    CONTROL_RUNTIME_LIFETIME_POLICY, CONTROL_RUNTIME_POLL_INTERVAL,
+    DEFAULT_CONTROL_RUNTIME_STARTUP_TIMEOUT, MAX_CONTROL_RUNTIME_STARTUP_TIMEOUT,
+    MIN_CONTROL_RUNTIME_STARTUP_TIMEOUT,
 };
 pub use conversation_change::{
     acquire_conversation_advancement_guard, inspect_unresolved_blocking_changes,

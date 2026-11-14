@@ -12,15 +12,17 @@ use threadlane_core::{
 };
 
 use crate::descriptor::{read_and_validate_descriptor, validate_lazy_state_dir, RuntimeDescriptor};
-use crate::error::{ApiError, Error};
+use crate::error::{ApiError, Error, ErrorCode};
 use crate::operator_backlog::{
     OperatorWorkerBacklogRequest, OperatorWorkerBacklogResponse, OPERATOR_WORKER_BACKLOG_PATH,
 };
 use crate::protocol::{
-    BindingListResponse, CreateBindingRequest, GetOrCreateBindingRequest,
+    BindingListResponse, ControlRuntimeInfoResponse, ControlRuntimeRetireRequest,
+    ControlRuntimeRetireResponse, CreateBindingRequest, GetOrCreateBindingRequest,
     GetOrCreateBindingResponse, HostControlInfoRequest, HostControlStatusResponse,
     RearmHostWakeupRequest, RearmHostWakeupResponse, RetryWakeupRequest, ScopedRequest,
     ScopedResponse, StatusResponse, StopIdleHostRequest, WorkerPresenceSnapshot,
+    CONTROL_RUNTIME_INFO_PATH, CONTROL_RUNTIME_RETIRE_PATH,
 };
 
 /// Maximum response body size accepted by [`SupervisorClient`] (2 MiB).
@@ -251,6 +253,30 @@ impl SupervisorClient {
             .await
     }
 
+    /// Fetches bounded authenticated identity, role, lifecycle state, and operation capabilities
+    /// from a live control-plane supervisor.
+    ///
+    /// A legacy supervisor without this endpoint returns a structured `invalid_request`
+    /// `endpoint not found` error; callers must treat that as an unsupported legacy runtime rather
+    /// than proof of scoped-operation compatibility.
+    pub async fn control_runtime_info(&self) -> Result<ControlRuntimeInfoResponse, Error> {
+        self.send_json::<(), _>(Method::GET, CONTROL_RUNTIME_INFO_PATH, None)
+            .await
+    }
+
+    /// Requests atomic idle retirement of the exact live baseline control runtime identified by
+    /// `expected_protocol_version`, `expected_instance_id`, and `expected_pid`.
+    ///
+    /// The supervisor re-verifies the exact instance under the same Core mutex and busy latch used
+    /// by approved host idle-stop. This method never sends a signal and never starts a replacement.
+    pub async fn retire_idle_control_runtime(
+        &self,
+        request: &ControlRuntimeRetireRequest,
+    ) -> Result<ControlRuntimeRetireResponse, Error> {
+        self.send_json(Method::POST, CONTROL_RUNTIME_RETIRE_PATH, Some(request))
+            .await
+    }
+
     fn resolve_descriptor(&self) -> Result<RuntimeDescriptor, Error> {
         match &self.source {
             DescriptorSource::StateDir(dir) => read_and_validate_descriptor(dir),
@@ -320,6 +346,12 @@ impl SupervisorClient {
         if !status.is_success() {
             if let Ok(api_err) = serde_json::from_slice::<ApiError>(&bytes) {
                 return Err(Error::Remote(api_err));
+            }
+            if status == reqwest::StatusCode::NOT_FOUND {
+                return Err(Error::Remote(ApiError::new(
+                    ErrorCode::InvalidRequest,
+                    "endpoint not found",
+                )));
             }
             return Err(Error::Transport(format!(
                 "supervisor returned HTTP {}",

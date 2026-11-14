@@ -37,6 +37,7 @@ fn sample_native_live(
         sequence,
         observed_at_ms: Some(observed_at_ms),
         last_success_at_ms: Some(observed_at_ms),
+        thread_title: None,
         availability: WorkspaceAvailabilityState::Available,
         activity: WorkspaceActivityState::Working,
         connection: WorkspaceSampleConnection {
@@ -593,6 +594,81 @@ fn native_sample_separates_activity_from_availability_and_labels_selection_as_co
     assert_eq!(actor.selected_model.as_deref(), Some("gpt-5.4"));
     assert_eq!(actor.selected_effort.as_deref(), Some("high"));
     assert_eq!(actor.evidence, ObservationActorEvidence::Configured);
+}
+
+#[test]
+fn native_thread_title_is_optional_legacy_compatible_sanitized_and_never_used_from_unverified_samples(
+) {
+    let id = sample_identity();
+    let mut sample = sample_native_live(
+        id.clone(),
+        "epoch_title",
+        Some(sample_process_instance(4242, 900_001)),
+        1,
+        20_000,
+    );
+
+    // Legacy JSON without the optional title field still parses and never invents a title.
+    let legacy_json =
+        serde_json::to_string(&sample).expect("serialize legacy native sample without title");
+    assert!(!legacy_json.contains("thread_title"));
+    let legacy_parsed =
+        parse_workspace_native_sample_sidecar(legacy_json.as_bytes()).expect("parse legacy sample");
+    assert_eq!(legacy_parsed.thread_title, None);
+
+    // Control characters are stripped and surrounding whitespace is trimmed.
+    sample.thread_title = Some("  Main\u{0007}lane  ".to_string());
+    let normalized = sample.normalized();
+    assert_eq!(normalized.thread_title.as_deref(), Some("Mainlane"));
+    assert_eq!(normalized.chat_identity, id);
+    assert_eq!(
+        normalized.chat_identity.canonical_key(),
+        sample.chat_identity.canonical_key(),
+        "a display title rename must never alter canonical chat identity"
+    );
+
+    // Missing or blank titles fall back to no title rather than a fabricated label.
+    for blank in ["", "   ", "\u{0007}\u{0000}", "\r\n\t"] {
+        sample.thread_title = Some(blank.to_string());
+        assert_eq!(
+            sample.normalized().thread_title,
+            None,
+            "blank or control-only title must not become durable: {blank:?}"
+        );
+    }
+
+    // Overlong UTF-8 titles are bounded to MAX_LABEL_LEN bytes without splitting a scalar.
+    sample.thread_title = Some("é".repeat(200));
+    let bounded = sample
+        .normalized()
+        .thread_title
+        .expect("bounded native thread title");
+    assert!(bounded.len() <= threadlane_core::MAX_LABEL_LEN);
+    assert!(bounded.chars().all(|ch| ch == 'é'));
+
+    // Failed, disconnected, stale-state, or unverified observations never carry a current title.
+    sample.thread_title = Some("Must not leak".to_string());
+    for availability in [
+        WorkspaceAvailabilityState::Disconnected,
+        WorkspaceAvailabilityState::Stale,
+        WorkspaceAvailabilityState::Unavailable,
+    ] {
+        let mut degraded = sample.clone();
+        degraded.availability = availability;
+        assert_eq!(degraded.normalized().thread_title, None);
+    }
+    let mut unproven_read = sample.clone();
+    unproven_read.capabilities.exact_thread_read = WorkspaceCapabilityState::Unknown;
+    assert_eq!(unproven_read.normalized().thread_title, None);
+
+    // A verified available exact-thread sample round-trips its sanitized title through a sidecar.
+    sample.availability = WorkspaceAvailabilityState::Available;
+    sample.capabilities.exact_thread_read = WorkspaceCapabilityState::Supported;
+    sample.thread_title = Some("Mainlane".to_string());
+    let bytes =
+        serialize_workspace_native_sample_sidecar(&sample).expect("serialize titled sample");
+    let parsed = parse_workspace_native_sample_sidecar(&bytes).expect("parse titled sample");
+    assert_eq!(parsed.thread_title.as_deref(), Some("Mainlane"));
 }
 
 #[test]
