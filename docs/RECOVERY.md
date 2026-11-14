@@ -43,6 +43,46 @@ silently restore notification flags or create a new execution approval. Use
 actual event batches. Use [native operator commands](NATIVE-OPERATOR.md) for
 the host/session lifecycle and [profile flow](PROFILE-FLOW.md) for role receipts.
 
+## Stale Ready manifests after interruption
+
+A reboot, interrupted host start, or killed host process can leave
+`host-manifest.json` at `ready` with its old PID and instance after both
+process-lifetime locks were released. The guarded host client may read the
+original terminal result through `approved_task`/`backlog_worker_result` from
+that state only when the existing exclusive `host.lock` can be acquired,
+`supervisor.lock` is demonstrably released, and the exact
+manifest/instance/PID/gates/session binding, original sealed
+task/run/worker receipt, and complete terminal worker evidence revalidate before
+and after the read.
+
+For this orphaned `Ready` case only, the client uses the existing bounded
+`threadlane_core::observation::read_core_state_readonly` snapshot reader so
+committed `state.db-wal`/`state.db-shm` frames left by the interrupted host are
+respected instead of being ignored. The snapshot must contain exactly one
+binding/thread matching the manifest, exactly one sealed run and worker, a
+terminal run status/revision matching the complete `WorkerSnapshot`, and the
+original receipt identity. Missing or inconsistent sidecar pairs, SQLite read
+errors, and missing, duplicate, malformed, mismatched, or incomplete selected
+binding/run/worker evidence are refused. This is not an independent integrity
+check of every WAL/SHM byte: SQLite may ignore recoverable or uncommitted crash
+tails and WAL content already checkpointed into the main database. The
+missing-SHM and corrupt-WAL fixtures cover refusal when required terminal
+evidence cannot be read, not every possible sidecar corruption. The reader may
+update SQLite shared-memory read
+marks in `-shm`; durable `state.db`, `-wal`, manifest, receipts, cursors, backlog
+state, and event batches remain unchanged.
+
+This orphan fallback is strictly read-only. It does not rewrite the manifest or
+receipts, mark the session stopped, open a writable core, run migrations or
+recovery, create directories or sidecars, checkpoint or delete WAL/SHM frames,
+dispatch a Worker, send or ACK notifications, or restart the host. A held lock, a
+live or foreign supervisor, a missing PID or instance identity on its own, a
+changed receipt, or a missing, nonterminal, or `unknown` worker record is refused
+rather than promoted. `unknown` and `failed` never become `success` or `Done`.
+Clean `stopped` history keeps its strict immutable no-sidecar read behavior. A
+controlled fixture process kill is not power-loss proof, and installed-reboot
+behavior remains a separate operator/live gate.
+
 ## Current limits
 
 This restores durable workflow state; it does not resume an interrupted LLM
@@ -55,6 +95,10 @@ snapshots and reports bounded coverage. It does not enumerate every approval
 or restore interrupted hosts. Guided continuation remains explicit operator work.
 
 There is no implicitly installed OS service that restarts all approved hosts after reboot.
+
+The stale `ready` orphan read is a bounded read-only recovery path. It does not
+restore or restart the interrupted host, and installed-reboot behavior remains a
+separate operator/live gate.
 
 Reopen/restart fixtures verify preserved completed state, unknown in-flight
 state and absence of automatic retries. Atomic-writer fault-injection tests

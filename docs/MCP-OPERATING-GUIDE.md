@@ -487,9 +487,36 @@ guarded Worker facade above.
   `cursor`, `after_seq`, `limit`, or `kind`) to inspect bounded read-only history
   from the stopped host without restarting it. Stopped history is strictly
   read-only and cannot be ACKed; `approved_pull_events`, `approved_ack_events`, and
-  task dispatch still require a live authenticated ready host. Residual SQLite WAL/SHM
-  sidecars make the clean immutable snapshot unavailable; this route rejects the read
-  without checkpointing, recovering, deleting sidecars, or starting a host.
+  task dispatch still require a live authenticated ready host. For a clean
+  `stopped` session, residual SQLite WAL/SHM sidecars make the immutable snapshot
+  unavailable; that route rejects the read without checkpointing, recovering,
+  deleting sidecars, or starting a host.
+- An interrupted start, reboot, or killed host process can leave
+  `host-manifest.json` at `ready` with its old PID and instance even though both
+  process locks were released. That stale manifest is not a live host. On the
+  guarded Worker route, `approved_task` and the result/completion/rejection checks
+  may read its original terminal history only when the client can take the
+  existing exclusive `host.lock`, observes both `host.lock` and `supervisor.lock`
+  released, and revalidates the exact manifest/instance/PID/gates/session binding,
+  the original sealed task/run/worker receipt, and complete terminal worker
+  evidence before and after the read. For this orphaned `Ready` case only, the
+  bounded read-only snapshot reader respects committed `state.db-wal`/`state.db-shm`
+  frames and requires exactly one matching binding/thread, one sealed run and
+  worker, and a terminal run status/revision matching the complete
+  `WorkerSnapshot`. It may update SQLite shared-memory read marks in `-shm`, but
+  durable `state.db`, `-wal`, manifest, receipts, cursors, backlog state, and event
+  batches stay unchanged. Missing or inconsistent sidecar pairs, SQLite read
+  errors, and missing, duplicate, malformed, mismatched, or incomplete selected
+  binding/run/worker evidence are refused. This is SQLite's consistent committed
+  snapshot, not an independent integrity check of every WAL/SHM byte: SQLite may
+  ignore recoverable or uncommitted crash tails and WAL content already
+  checkpointed into the main database. `unknown` and `failed` never become
+  `success` or `done`. The fallback does not rewrite the manifest or receipts, mark
+  the session stopped, start Core/migrations/recovery, checkpoint or delete
+  WAL/SHM frames, dispatch a Worker, send or ACK notifications, or infer orphan
+  status from a missing PID or instance alone. A held lock or live/foreign
+  supervisor remains a refusal. Clean `stopped` reads keep their strict
+  no-sidecar behavior.
 
 ## Read execution callbacks
 
@@ -536,9 +563,13 @@ An ordinary approved-task callback carries only `approval_id` and directs you to
    response schema. ACK is independent of completion or rejection and is not
    human acceptance; an ACK alone leaves the item in `Doing`.
 7. On a stopped host, read original task evidence with `approved_task` or
-   `approved_activity`, then use `backlog_worker_result` for guarded backlog
+   `approved_activity`; on the verifiably stale `ready` manifest described in the
+   host-history rules above, use `approved_task` (bounded activity history still
+   requires live readiness). Then use `backlog_worker_result` for guarded backlog
    reconciliation. No legacy job or `execution_status` call is required. Do not
    ACK history, restart a host solely to force a callback, or invent a result.
+   A stale-manifest read never promotes an incomplete or `unknown` record to
+   success or `Done`.
    This procedure is intended for busy or idle turns, but source and fixtures do
    not establish live native-chat delivery qualification in either state.
 

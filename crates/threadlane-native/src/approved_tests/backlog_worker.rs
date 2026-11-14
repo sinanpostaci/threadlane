@@ -7,7 +7,10 @@
 //! same-length delivery refusal, durable completion replay after checkout removal, recoverable
 //! pre-effect reservation, unresolved durable dispatch intent refusal without redispatch, and
 //! checked acceptance rejection with physical tamper refusal, stable rejected-result rereads,
-//! completion refusal, durable rejection replay, and a newer authorized attempt.
+//! completion refusal, durable rejection replay, and a newer authorized attempt. A stale `Ready`
+//! manifest left after both host locks were released is read as orphaned terminal history without
+//! rewriting the manifest, receipts, or host database; changed-file, changed-digest, and stale
+//! revision refusals still prevent `Done`.
 //! The recovery cases drop actual serialized `rmcp`/Tokio duplex start, result, and Done replies
 //! after their durable effects and then reconnect through fresh enrolled server epochs. They also
 //! cover an interrupted state after real host admission/spawn but before the backlog dispatch
@@ -33,8 +36,9 @@ use threadlane_core::{
     WorkerBacklogOutcome,
 };
 use threadlane_host::{
-    record_task_dispatch_intent, ApprovedHost, ApprovedHostClient, ApprovedHostConfig,
-    ApprovedHostHandle, TaskDispatchIntent, TaskExecutionStatus, TaskStateSnapshot,
+    is_host_lock_held, record_task_dispatch_intent, ApprovedHost, ApprovedHostClient,
+    ApprovedHostConfig, ApprovedHostHandle, TaskDispatchIntent, TaskExecutionStatus,
+    TaskStateSnapshot, TASK_RECEIPTS_FILENAME,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -225,6 +229,51 @@ async fn assert_worker_state_unchanged(
         history, *expected_history,
         "a refused Worker operation must not append history or change the current reference"
     );
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct HostHistoryFingerprint {
+    manifest: Option<Vec<u8>>,
+    receipts: Option<Vec<u8>>,
+    database: Option<Vec<u8>>,
+    wal: Option<Vec<u8>>,
+    shm: Option<Vec<u8>>,
+}
+
+fn read_optional_fixture_bytes(path: &Path) -> Option<Vec<u8>> {
+    match fs::read(path) {
+        Ok(bytes) => Some(bytes),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => panic!("read fixture file `{}`: {err}", path.display()),
+    }
+}
+
+fn capture_host_history(fixture: &ApprovedMcpFixture, approval_id: &str) -> HostHistoryFingerprint {
+    let session_dir = fixture.sessions_dir.join(approval_id);
+    let runtime_state_dir = session_dir.join(threadlane_host::RUNTIME_STATE_SUBDIR);
+    HostHistoryFingerprint {
+        manifest: read_optional_fixture_bytes(
+            &session_dir.join(threadlane_host::HOST_MANIFEST_FILENAME),
+        ),
+        receipts: read_optional_fixture_bytes(&session_dir.join(TASK_RECEIPTS_FILENAME)),
+        database: read_optional_fixture_bytes(&runtime_state_dir.join("state.db")),
+        wal: read_optional_fixture_bytes(&runtime_state_dir.join("state.db-wal")),
+        shm: read_optional_fixture_bytes(&runtime_state_dir.join("state.db-shm")),
+    }
+}
+
+fn restore_stale_ready_manifest(
+    fixture: &ApprovedMcpFixture,
+    approval_id: &str,
+    ready_manifest: &[u8],
+) {
+    let manifest_path = fixture
+        .sessions_dir
+        .join(approval_id)
+        .join(threadlane_host::HOST_MANIFEST_FILENAME);
+    fs::write(&manifest_path, ready_manifest).expect("restore stale Ready manifest bytes");
+    fs::set_permissions(&manifest_path, fs::Permissions::from_mode(0o600))
+        .expect("keep stale Ready manifest private");
 }
 
 async fn write_json_rpc_line<W>(writer: &mut W, message: &Value)
@@ -1815,8 +1864,33 @@ async fn guarded_worker_backlog_pre_effect_refusal_preserves_exact_reservation()
         serde_json::from_value(retried.structured_content.unwrap()["data"]["execution"].clone())
             .expect("resumed execution");
     assert_eq!(resumed.execution_ref, execution_ref);
-    assert!(resumed.dispatch_receipt.is_some());
+    let resumed_receipt = resumed
+        .dispatch_receipt
+        .clone()
+        .expect("resumed dispatch receipt");
+    // The dispatch receipt is durable before the child process has necessarily started. Wait for
+    // the original real fake-provider invocation instead of assuming the child already launched.
+    wait_for_invocation_count(&fixture.agy_count_file, 1).await;
     assert_eq!(read_invocation_count(&fixture.agy_count_file), 1);
+
+    let reread = mcp
+        .invoke_tool_json(
+            "backlog_worker_result",
+            json!({ "item_id": item_id, "execution_ref": execution_ref }),
+            None,
+        )
+        .await
+        .expect("reread the original invocation receipt");
+    let reread: WorkerBacklogExecution =
+        serde_json::from_value(reread.structured_content.unwrap()["data"]["execution"].clone())
+            .expect("reread execution");
+    assert_eq!(reread.execution_ref, execution_ref);
+    assert_eq!(reread.dispatch_receipt, Some(resumed_receipt));
+    assert_eq!(
+        read_invocation_count(&fixture.agy_count_file),
+        1,
+        "resuming the original reservation must not duplicate the provider invocation"
+    );
 
     host.shutdown().await.expect("stop fixture host");
 }
@@ -3164,4 +3238,309 @@ async fn guarded_worker_backlog_spawn_before_receipt_resumes_exact_original_invo
     assert_eq!(read_invocation_count(&fixture.agy_count_file), 1);
 
     host.shutdown().await.expect("stop fixture host");
+}
+
+#[tokio::test]
+async fn guarded_worker_backlog_stale_ready_orphan_result_and_done_are_read_only() {
+    let fixture = setup_approved_mcp_fixture().await;
+    let (plan_revision, plan_digest) = create_published_plan(
+        &fixture,
+        "plan-worker-backlog-orphan-ready",
+        &fixture.binding_a,
+        default_plan_tasks("Guarded Worker backlog orphan Ready"),
+    );
+    let approval = approve_published_plan(
+        &fixture,
+        "plan-worker-backlog-orphan-ready",
+        plan_revision,
+        &plan_digest,
+        &fixture.binding_a,
+        THREAD_UUID_A,
+        vec!["task-root-agy".to_string()],
+        1_700_003_100_000,
+    );
+    let host = start_fixture_host(&fixture, &approval.approval_id).await;
+    let mcp = live_mcp(&fixture);
+    enroll_server(&fixture, &mcp, &fixture.binding_a, THREAD_UUID_A).await;
+    let (item_id, revision) = create_worker_item(
+        &mcp,
+        "create-orphan-ready",
+        "Stale Ready orphan Worker item",
+    )
+    .await;
+
+    let start = mcp
+        .invoke_tool_json(
+            "backlog_worker_start",
+            json!({
+                "item_id": item_id,
+                "expected_revision": revision,
+                "command_key": "start-orphan-ready",
+                "approval_id": approval.approval_id,
+                "task_id": "task-root-agy"
+            }),
+            None,
+        )
+        .await
+        .expect("start Worker before stale Ready recovery");
+    let execution: WorkerBacklogExecution = serde_json::from_value(
+        start.structured_content.expect("start data")["data"]["execution"].clone(),
+    )
+    .expect("decode orphan-ready execution");
+    let execution_ref = execution.execution_ref.clone();
+    let dispatch_receipt = execution.dispatch_receipt.clone();
+    assert!(dispatch_receipt.is_some());
+
+    let terminal = wait_for_terminal_task(&mcp, &approval.approval_id, "task-root-agy").await;
+    assert_eq!(terminal.status, TaskExecutionStatus::ReadyForReview);
+    assert_eq!(read_invocation_count(&fixture.agy_count_file), 1);
+
+    let result = mcp
+        .invoke_tool_json(
+            "backlog_worker_result",
+            json!({
+                "item_id": item_id,
+                "execution_ref": execution_ref.clone()
+            }),
+            None,
+        )
+        .await
+        .expect("record terminal Worker result while the host is live");
+    let result_data = result.structured_content.expect("result data")["data"].clone();
+    let executed: WorkerBacklogExecution =
+        serde_json::from_value(result_data["execution"].clone()).expect("decode result execution");
+    let outcome = executed.outcome.as_ref().expect("successful outcome");
+    assert_eq!(outcome.outcome, WorkerBacklogOutcome::Success);
+    let result_digest = outcome
+        .result_digest
+        .clone()
+        .expect("successful result digest");
+    let delivery = result_data["delivery"]
+        .as_object()
+        .expect("path-free delivery inspection");
+    let delivery_digest = delivery["delivery_digest"]
+        .as_str()
+        .expect("delivery digest")
+        .to_string();
+    let worktree_id = delivery["worktree_id"]
+        .as_str()
+        .expect("worktree identity")
+        .to_string();
+    let item_after_result = get_item(&mcp, &item_id).await;
+    assert_eq!(item_after_result.status, BacklogStatus::Doing);
+
+    let session_dir = fixture.sessions_dir.join(&approval.approval_id);
+    let ready_manifest = fs::read(session_dir.join(threadlane_host::HOST_MANIFEST_FILENAME))
+        .expect("read live Ready manifest fixture");
+    let ready_manifest_json: Value =
+        serde_json::from_slice(&ready_manifest).expect("parse live Ready manifest fixture");
+    assert_eq!(ready_manifest_json["phase"], "ready");
+    assert!(ready_manifest_json["pid"].as_u64().is_some());
+    assert!(ready_manifest_json["instance_id"].as_str().is_some());
+
+    // Simulate the reboot boundary: the host stops cleanly and releases both locks, then the
+    // last Ready manifest with its old PID and instance is restored as a stale crash remnant.
+    host.shutdown().await.expect("stop fixture host");
+    restore_stale_ready_manifest(&fixture, &approval.approval_id, &ready_manifest);
+    assert!(
+        !is_host_lock_held(&session_dir).expect("probe stale Ready host.lock"),
+        "stale Ready recovery requires the original host.lock to be released"
+    );
+
+    drop(mcp);
+    let reopened = reopened_mcp(&fixture);
+    enroll_server(&fixture, &reopened, &fixture.binding_a, THREAD_UUID_A).await;
+    let item_before_orphan = get_item(&reopened, &item_id).await;
+    assert_eq!(item_before_orphan, item_after_result);
+    let history_before_orphan = get_history(&reopened, &item_id).await;
+    let host_fingerprint_before = capture_host_history(&fixture, &approval.approval_id);
+    assert!(
+        host_fingerprint_before.wal.is_none() && host_fingerprint_before.shm.is_none(),
+        "stale Ready fixture must remain a clean checkpointed database"
+    );
+    let event_batches_before = event_batch_row_count(&fixture.state_dir, &fixture.binding_a);
+
+    let orphan_result = reopened
+        .invoke_tool_json(
+            "backlog_worker_result",
+            json!({
+                "item_id": item_id,
+                "execution_ref": execution_ref.clone()
+            }),
+            None,
+        )
+        .await
+        .expect("read the original result through stale Ready orphan history");
+    let orphan_data = orphan_result
+        .structured_content
+        .expect("orphan result data")["data"]
+        .clone();
+    let orphan_execution: WorkerBacklogExecution =
+        serde_json::from_value(orphan_data["execution"].clone())
+            .expect("decode orphan result execution");
+    assert_eq!(orphan_execution.execution_ref, execution_ref);
+
+    assert_eq!(orphan_execution.dispatch_receipt, dispatch_receipt);
+    assert!(orphan_execution.completion.is_none());
+    assert_eq!(
+        orphan_execution
+            .outcome
+            .as_ref()
+            .and_then(|outcome| outcome.result_digest.as_deref()),
+        Some(result_digest.as_str())
+    );
+    let orphan_delivery = orphan_data["delivery"]
+        .as_object()
+        .expect("orphan path-free delivery inspection");
+    assert_eq!(
+        orphan_delivery["delivery_digest"].as_str(),
+        Some(delivery_digest.as_str())
+    );
+    assert_eq!(get_item(&reopened, &item_id).await, item_before_orphan);
+    assert_eq!(
+        get_history(&reopened, &item_id).await,
+        history_before_orphan
+    );
+    assert_eq!(
+        capture_host_history(&fixture, &approval.approval_id),
+        host_fingerprint_before,
+        "orphan result reconciliation must not change manifest, receipts, host DB, or sidecars"
+    );
+    assert_eq!(
+        event_batch_row_count(&fixture.state_dir, &fixture.binding_a),
+        event_batches_before,
+        "orphan result reconciliation must not create an event delivery batch"
+    );
+    assert_eq!(read_invocation_count(&fixture.agy_count_file), 1);
+
+    let complete_params = json!({
+        "item_id": item_id,
+        "execution_ref": execution_ref,
+        "command_key": "complete-orphan-ready",
+        "expected_revision": item_before_orphan.revision,
+        "expected_result_digest": result_digest,
+        "expected_delivery_digest": delivery_digest,
+        "acceptance_note": "Accepted the recovered orphan terminal delivery.",
+        "acceptance_evidence": "Rechecked the original receipt, result, and physical delivery digests."
+    });
+
+    // A changed expected result digest never reaches a Done mutation.
+    let mut wrong_result_digest = complete_params.clone();
+    wrong_result_digest["expected_result_digest"] = json!("f".repeat(64));
+    let wrong_result_err = reopened
+        .invoke_tool_json("backlog_worker_complete", wrong_result_digest, None)
+        .await
+        .expect_err("changed orphan result digest must refuse Done");
+    assert_eq!(
+        wrong_result_err.structured_content.unwrap()["error"]["code"],
+        "result_digest_mismatch"
+    );
+    assert_worker_state_unchanged(
+        &reopened,
+        &item_id,
+        &item_before_orphan,
+        &history_before_orphan,
+    )
+    .await;
+
+    // Actual changed physical bytes with the same length are refused even through orphan history.
+    let work_area_root = session_dir.join(WORK_AREA_SUBDIR);
+    let checkout = threadlane_workers::load_and_verify_manifest(&work_area_root, &worktree_id)
+        .expect("load verified orphan task worktree manifest")
+        .checkout_path;
+    let delivered_file = checkout.join("src/lib.rs");
+    let original_bytes = fs::read(&delivered_file).expect("read orphan delivered file");
+    let mut changed_bytes = original_bytes.clone();
+    changed_bytes[0] = if changed_bytes[0] == b'/' { b'#' } else { b'/' };
+    assert_eq!(changed_bytes.len(), original_bytes.len());
+    fs::write(&delivered_file, &changed_bytes).expect("write changed orphan delivery");
+    let changed_delivery_err = reopened
+        .invoke_tool_json("backlog_worker_complete", complete_params.clone(), None)
+        .await
+        .expect_err("changed orphan physical delivery must refuse Done");
+    assert_eq!(
+        changed_delivery_err.structured_content.unwrap()["error"]["code"],
+        "delivery_digest_mismatch"
+    );
+    assert_worker_state_unchanged(
+        &reopened,
+        &item_id,
+        &item_before_orphan,
+        &history_before_orphan,
+    )
+    .await;
+    fs::write(&delivered_file, &original_bytes).expect("restore exact orphan delivered bytes");
+
+    // A stale completion revision is refused by the durable core check without Done.
+    let mut stale_revision = complete_params.clone();
+    stale_revision["expected_revision"] = json!(item_before_orphan.revision + 1);
+    let stale_err = reopened
+        .invoke_tool_json("backlog_worker_complete", stale_revision, None)
+        .await
+        .expect_err("stale orphan completion revision must refuse Done");
+    assert_eq!(
+        stale_err.structured_content.unwrap()["error"]["code"],
+        "stale_revision"
+    );
+    assert_worker_state_unchanged(
+        &reopened,
+        &item_id,
+        &item_before_orphan,
+        &history_before_orphan,
+    )
+    .await;
+
+    let completed = reopened
+        .invoke_tool_json("backlog_worker_complete", complete_params.clone(), None)
+        .await
+        .expect("complete the recovered orphan terminal delivery");
+    let completed_data = completed.structured_content.expect("completion data")["data"].clone();
+    assert_eq!(
+        completed_data["completion"]["item"]["status"],
+        Value::String("done".to_string())
+    );
+    let completed_at_ms =
+        completed_data["completion"]["execution"]["completion"]["completed_at_ms"].clone();
+    assert!(!completed_at_ms.is_null());
+    let item_after_complete = get_item(&reopened, &item_id).await;
+    assert_eq!(item_after_complete.status, BacklogStatus::Done);
+    assert_eq!(
+        item_after_complete.revision,
+        item_before_orphan.revision + 1
+    );
+    let history_after_complete = get_history(&reopened, &item_id).await;
+    assert_eq!(
+        history_after_complete
+            .entries
+            .iter()
+            .filter(|entry| entry.action == BacklogHistoryAction::Completed)
+            .count(),
+        1
+    );
+    assert_eq!(
+        capture_host_history(&fixture, &approval.approval_id),
+        host_fingerprint_before,
+        "orphan Done must not rewrite the original host manifest, receipts, or host DB"
+    );
+    assert_eq!(read_invocation_count(&fixture.agy_count_file), 1);
+
+    let duplicate = reopened
+        .invoke_tool_json("backlog_worker_complete", complete_params.clone(), None)
+        .await
+        .expect("exact duplicate orphan Done replay");
+    let duplicate_data = duplicate.structured_content.expect("duplicate data")["data"].clone();
+    assert_eq!(
+        duplicate_data["completion"]["execution"]["completion"]["completed_at_ms"],
+        completed_at_ms
+    );
+    assert_eq!(get_item(&reopened, &item_id).await, item_after_complete);
+    assert_eq!(
+        get_history(&reopened, &item_id).await,
+        history_after_complete
+    );
+    assert_eq!(
+        read_invocation_count(&fixture.agy_count_file),
+        1,
+        "orphan result, refusals, Done, and duplicate Done must not launch the provider"
+    );
 }

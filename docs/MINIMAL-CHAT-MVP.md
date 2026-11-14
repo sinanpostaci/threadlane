@@ -285,6 +285,40 @@ clean host stop and authority reopen, checks delivery, and records Done. Negativ
 result/completion requests leave item, history, and host state unchanged. These
 fixtures do not themselves prove live native callback delivery.
 
+### Orphaned Ready terminal-history recovery (source contract)
+
+An interrupted host start, reboot, or killed host process can leave a `Ready`
+manifest with its old PID and instance after both `host.lock` and
+`supervisor.lock` were released. The guarded host client may read the original
+terminal result from that state only while holding the existing exclusive
+`host.lock`, with `supervisor.lock` demonstrably released, and after revalidating
+the exact manifest/instance/PID/gates/session binding, original sealed
+task/run/worker receipt, and complete terminal worker evidence before and after
+the read.
+
+For that orphaned `Ready` case only, the read uses the existing bounded
+`threadlane_core::observation::read_core_state_readonly` snapshot reader so
+committed `state.db-wal`/`state.db-shm` sidecars left by the interrupted host are
+respected rather than ignored. The snapshot must contain exactly one
+binding/thread matching the manifest, exactly one sealed run and worker, a
+terminal run status/revision matching the complete `WorkerSnapshot`, and the
+original receipt identity. Missing or inconsistent sidecar pairs, SQLite read
+errors, and missing, duplicate, malformed, mismatched, or incomplete selected
+binding/run/worker evidence are refused. The reader uses SQLite's consistent
+committed snapshot; it does not independently validate every WAL/SHM byte.
+SQLite may ignore recoverable or uncommitted crash tails and WAL content already
+checkpointed into the main database. The reader may update SQLite shared
+memory read marks in `-shm`; durable `state.db`, `-wal`, manifest, receipts,
+cursors, backlog state, and event batches remain unchanged. It refuses missing,
+partial, changed, or nonterminal history, never promotes `Unknown` or `Failed`
+to `Success`/`Done`, does not mark the session `Stopped`, rewrite manifest or
+receipts, open a writable core, run migrations or recovery, checkpoint, delete
+sidecars, dispatch a Worker, send or ACK notifications, or restart the host.
+Clean `Stopped` history keeps its strict no-sidecar immutable reader. This is a
+source-level read fallback; installed-reboot, live foreign-supervisor, and
+non-Linux behavior remain separate unqualified gates, and a controlled fixture
+crash is not power-loss proof.
+
 ### Desktop stream and read-only liveness (validated)
 
 Ordinary Projects chats render one bottom-growing durable event stream and a

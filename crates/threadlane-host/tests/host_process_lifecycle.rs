@@ -7,9 +7,15 @@
 //! verifies the real child exits naturally with status 0, and then performs an
 //! explicit stopped-session restart. It also verifies that one completed root
 //! worker result remains readable after a clean stop with unchanged durable files
-//! and no provider relaunch. In-process `run_serve` calls cannot prove process
-//! ownership or `host.lock` release, so the assertions here are tied to the
-//! spawned `std::process::Child` and durable session state.
+//! and no provider relaunch. A stale `Ready` manifest left after both process locks
+//! were released is also read as orphaned terminal history without rewriting durable
+//! files or bypassing a still-held lock. A host killed only after its fake provider
+//! child completed is read through residual WAL/SHM with the same no-rewrite and
+//! no-relaunch guarantees. Missing-SHM and corrupt-WAL fixtures refuse snapshots
+//! without required terminal evidence; they do not validate every WAL byte. In-process
+//! `run_serve` calls cannot prove process ownership or `host.lock` release, so the
+//! assertions here are tied to the spawned `std::process::Child` and durable session
+//! state.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
@@ -1004,6 +1010,13 @@ fn read_optional_bytes(path: &Path) -> Option<Vec<u8>> {
     }
 }
 
+fn write_private_fixture_file(path: &Path, bytes: &[u8]) {
+    fs::write(path, bytes)
+        .unwrap_or_else(|err| panic!("write fixture file `{}`: {err}", path.display()));
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        .unwrap_or_else(|err| panic!("chmod fixture file `{}`: {err}", path.display()));
+}
+
 fn capture_stopped_read_fingerprint(fixture: &HostProcessFixture) -> StoppedReadFingerprint {
     let session_dir = fixture.session_dir();
     let runtime_state_dir = session_dir.join(RUNTIME_STATE_SUBDIR);
@@ -1435,6 +1448,636 @@ async fn completed_task_result_is_readable_live_and_after_real_cli_idle_stop_wit
         fixture.provider_invocation_count(),
         completed_provider_invocations,
         "rejection probes and final stopped read must not launch the provider"
+    );
+}
+
+#[tokio::test]
+async fn stale_ready_orphan_terminal_history_is_read_only_and_refuses_unproven_history() {
+    let fixture = setup_host_process_fixture();
+    fixture.assert_no_provider_invocation();
+
+    let client = ApprovedHostClient::open(
+        &fixture.registry_dir,
+        &fixture.plans_dir,
+        &fixture.authority_dir,
+        &fixture.sessions_dir,
+        CONTROL_BINDING_ID,
+        THREAD_UUID,
+    )
+    .expect("open authoritative approved host client");
+
+    let mut host = spawn_host_process(&fixture, "orphan", None);
+    let status =
+        wait_for_authenticated_ready(&client, &fixture.approval_id, &mut host, |_| true).await;
+    assert_live_ready(&fixture, &client, &mut host, &status);
+
+    client
+        .dispatch_task(&fixture.approval_id, TASK_ID)
+        .await
+        .expect("dispatch approved root task");
+    let live_result = wait_for_task_ready(&client, &fixture.approval_id, TASK_ID, &mut host).await;
+    let live_worker = live_result
+        .worker
+        .clone()
+        .expect("live terminal worker snapshot");
+    assert_eq!(live_worker.attempt_count, 1);
+    let idle = wait_for_host_idle(&client, &fixture.approval_id, &mut host).await;
+    let live_delivery = client
+        .inspect_task_delivery(&fixture.approval_id, TASK_ID)
+        .await
+        .expect("inspect live terminal delivery");
+    let completed_provider_invocations = fixture.provider_invocation_count();
+    assert!(completed_provider_invocations >= 1);
+
+    let manifest_path = fixture.session_dir().join("host-manifest.json");
+    let ready_manifest = fs::read(&manifest_path).expect("read live Ready manifest");
+    let ready_manifest_json: serde_json::Value =
+        serde_json::from_slice(&ready_manifest).expect("parse live Ready manifest");
+    assert_eq!(ready_manifest_json["phase"], "ready");
+    assert!(ready_manifest_json["pid"].as_u64().is_some());
+    assert!(ready_manifest_json["instance_id"].as_str().is_some());
+
+    let instance_id = idle.instance_id.clone();
+    let session_binding_id = idle.session_binding_id.clone();
+    let stopped = client
+        .stop_idle_session(&fixture.approval_id, &instance_id)
+        .await
+        .expect("authenticated idle stop before orphan recovery");
+    let exit = host.wait_for_exit(EXIT_TIMEOUT).await;
+    assert_eq!(
+        exit.code(),
+        Some(0),
+        "host process must exit naturally before stale-Ready recovery"
+    );
+    assert_durable_stopped(&fixture, &instance_id, &session_binding_id, &stopped);
+
+    // Simulate a reboot/interruption that leaves the last Ready manifest with its old PID and
+    // instance while both process-lifetime locks are already released.
+    fs::write(&manifest_path, &ready_manifest).expect("restore stale Ready manifest bytes");
+    fs::set_permissions(&manifest_path, fs::Permissions::from_mode(0o600))
+        .expect("keep stale Ready manifest private");
+    let stale = read_host_manifest_optional(&fixture.session_dir(), &fixture.approval_record())
+        .expect("read restored stale Ready manifest")
+        .expect("stale Ready manifest exists");
+    assert_eq!(stale.phase, HostPhase::Ready);
+    assert!(stale.gates.supervisor_authenticated_ready);
+    assert_eq!(stale.instance_id.as_deref(), Some(instance_id.as_str()));
+    assert_eq!(
+        stale.session_binding_id.as_deref(),
+        Some(session_binding_id.as_str())
+    );
+    assert!(stale.pid.is_some());
+    assert!(
+        !is_host_lock_held(&fixture.session_dir()).expect("probe stale host.lock"),
+        "orphan recovery requires a released host.lock"
+    );
+
+    // The stale Ready result is the same exact terminal result and remains strictly read-only.
+    let fingerprint_before = capture_stopped_read_fingerprint(&fixture);
+    let orphan_result = client
+        .get_task_live_or_stopped(&fixture.approval_id, TASK_ID)
+        .await
+        .expect("read stale Ready orphan terminal result");
+    let fingerprint_after = capture_stopped_read_fingerprint(&fixture);
+    assert_eq!(
+        orphan_result, live_result,
+        "orphan recovery must preserve the exact live task, run, worker, and result identities"
+    );
+    assert_eq!(
+        fingerprint_before, fingerprint_after,
+        "orphan result read must not change manifest, receipts, DB bytes, cursors, or sidecars"
+    );
+    assert!(
+        fingerprint_after.wal.is_none() && fingerprint_after.shm.is_none(),
+        "orphan result read must not gain WAL/SHM sidecars"
+    );
+    assert_eq!(
+        fixture.provider_invocation_count(),
+        completed_provider_invocations,
+        "orphan result read must not launch the provider"
+    );
+    assert!(
+        !is_host_lock_held(&fixture.session_dir()).expect("probe orphan host.lock"),
+        "orphan result read must release the exclusive host.lock"
+    );
+
+    let orphan_delivery = client
+        .inspect_task_delivery(&fixture.approval_id, TASK_ID)
+        .await
+        .expect("inspect orphan terminal delivery");
+    assert_eq!(
+        orphan_delivery, live_delivery,
+        "orphan delivery inspection must preserve result and artifact identity"
+    );
+    client
+        .recheck_task_delivery(&fixture.approval_id, TASK_ID, &orphan_delivery)
+        .await
+        .expect("recheck orphan terminal delivery");
+    assert_eq!(
+        capture_stopped_read_fingerprint(&fixture),
+        fingerprint_after,
+        "orphan delivery inspection and recheck must remain read-only"
+    );
+    assert_eq!(
+        fixture.provider_invocation_count(),
+        completed_provider_invocations,
+        "orphan delivery inspection must not launch the provider"
+    );
+
+    // Actual changed artifact bytes are refused even when the stored result identity is unchanged.
+    let checkout = fixture
+        .session_dir()
+        .join(WORK_AREA_SUBDIR)
+        .join(CHECKOUTS_SUBDIR)
+        .join("tasks")
+        .join(&orphan_delivery.worktree_id);
+    let delivered_file = checkout.join("src/lib.rs");
+    let original_bytes = fs::read(&delivered_file).expect("read orphan delivered file");
+    let mut changed_bytes = original_bytes.clone();
+    changed_bytes[0] = if changed_bytes[0] == b'/' { b'#' } else { b'/' };
+    assert_eq!(changed_bytes.len(), original_bytes.len());
+    fs::write(&delivered_file, &changed_bytes).expect("write changed orphan delivery");
+    let changed_delivery = client
+        .inspect_task_delivery(&fixture.approval_id, TASK_ID)
+        .await
+        .expect("changed orphan delivery remains inspectable");
+    assert_eq!(
+        changed_delivery.result_digest, orphan_delivery.result_digest,
+        "artifact mutation must not rewrite the terminal result identity"
+    );
+    assert_ne!(
+        changed_delivery.delivery_digest,
+        orphan_delivery.delivery_digest
+    );
+    let changed_recheck = client
+        .recheck_task_delivery(&fixture.approval_id, TASK_ID, &orphan_delivery)
+        .await
+        .expect_err("changed orphan artifact must refuse delivery recheck");
+    assert_eq!(changed_recheck.code(), "security_violation");
+    fs::write(&delivered_file, &original_bytes).expect("restore exact orphan delivered bytes");
+
+    // A still-held host.lock is never bypassed by the orphan fallback.
+    let host_lock = OpenOptions::new()
+        .read(true)
+        .open(fixture.session_dir().join("host.lock"))
+        .expect("open orphan host.lock");
+    host_lock
+        .lock_exclusive()
+        .expect("hold orphan host.lock for rejection test");
+    let locked_err = client
+        .get_task_live_or_stopped(&fixture.approval_id, TASK_ID)
+        .await
+        .expect_err("held host.lock must refuse orphan result");
+    assert_eq!(locked_err.code(), "host_not_ready");
+    host_lock.unlock().expect("release orphan host.lock");
+
+    // A surviving supervisor lock is not an orphaned host even when host.lock is free.
+    let supervisor_lock_path = fixture
+        .session_dir()
+        .join(RUNTIME_STATE_SUBDIR)
+        .join("supervisor.lock");
+    let supervisor_lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(&supervisor_lock_path)
+        .expect("open orphan supervisor.lock");
+    supervisor_lock
+        .set_permissions(fs::Permissions::from_mode(0o600))
+        .expect("keep orphan supervisor.lock private");
+    assert_eq!(
+        fs::metadata(&supervisor_lock_path)
+            .expect("stat orphan supervisor.lock")
+            .len(),
+        0,
+        "supervisor.lock fixture must remain an empty lock file"
+    );
+    supervisor_lock
+        .lock_exclusive()
+        .expect("hold orphan supervisor.lock for rejection test");
+    let supervisor_err = client
+        .get_task_live_or_stopped(&fixture.approval_id, TASK_ID)
+        .await
+        .expect_err("held supervisor.lock must refuse orphan result");
+    assert_eq!(supervisor_err.code(), "host_not_ready");
+    supervisor_lock
+        .unlock()
+        .expect("release orphan supervisor.lock");
+
+    // Caller scope remains authoritative for orphan reads.
+    let wrong_binding = ApprovedHostClient::open(
+        &fixture.registry_dir,
+        &fixture.plans_dir,
+        &fixture.authority_dir,
+        &fixture.sessions_dir,
+        "bnd_wrong_orphan_scope",
+        THREAD_UUID,
+    )
+    .expect("open wrong-binding orphan client");
+    assert_scope_error(
+        wrong_binding
+            .get_task_live_or_stopped(&fixture.approval_id, TASK_ID)
+            .await,
+        "control_binding_id",
+    );
+    let other_thread_uuid = "660e8400-e29b-41d4-a716-446655440001";
+    let wrong_thread = ApprovedHostClient::open(
+        &fixture.registry_dir,
+        &fixture.plans_dir,
+        &fixture.authority_dir,
+        &fixture.sessions_dir,
+        CONTROL_BINDING_ID,
+        other_thread_uuid,
+    )
+    .expect("open wrong-thread orphan client");
+    assert_scope_error(
+        wrong_thread
+            .get_task_live_or_stopped(&fixture.approval_id, TASK_ID)
+            .await,
+        "thread_uuid",
+    );
+
+    // Missing original receipt or a changed receipt identity is not terminal history.
+    let receipts_path = fixture.session_dir().join(TASK_RECEIPTS_FILENAME);
+    let original_receipts = fs::read(&receipts_path).expect("read orphan receipts fixture");
+    let missing_receipts_path =
+        stopped_read_backup_path(&fixture, "orphan-task-receipts.json.missing");
+    fs::rename(&receipts_path, &missing_receipts_path).expect("move orphan receipts ledger");
+    let missing_err = client
+        .get_task_live_or_stopped(&fixture.approval_id, TASK_ID)
+        .await
+        .expect_err("missing orphan receipt must refuse terminal history");
+    assert_eq!(missing_err.code(), "host_not_ready");
+    fs::rename(&missing_receipts_path, &receipts_path).expect("restore orphan receipts ledger");
+
+    let mut tampered_ledger: serde_json::Value =
+        serde_json::from_slice(&original_receipts).expect("parse orphan receipts fixture");
+    let tampered_entry = tampered_ledger["receipts"]
+        .as_array_mut()
+        .expect("orphan receipts array")
+        .first_mut()
+        .expect("orphan sealed receipt entry");
+    tampered_entry["worker_id"] =
+        serde_json::Value::String("wrk_ffffffffffffffffffffffffffffffff".to_string());
+    fs::write(
+        &receipts_path,
+        serde_json::to_vec_pretty(&tampered_ledger).expect("serialize tampered orphan receipts"),
+    )
+    .expect("write tampered orphan receipts fixture");
+    fs::set_permissions(&receipts_path, fs::Permissions::from_mode(0o600))
+        .expect("keep tampered orphan receipts private");
+    let tampered_err = client
+        .get_task_live_or_stopped(&fixture.approval_id, TASK_ID)
+        .await
+        .expect_err("tampered orphan receipt must refuse terminal history");
+    assert!(
+        matches!(
+            &tampered_err,
+            HostError::CorruptReceipts { .. } | HostError::CorruptSessionState { .. }
+        ),
+        "unexpected tampered orphan receipt error: {tampered_err:?}"
+    );
+    fs::write(&receipts_path, &original_receipts).expect("restore orphan receipts fixture");
+    fs::set_permissions(&receipts_path, fs::Permissions::from_mode(0o600))
+        .expect("restore orphan receipts permissions");
+
+    // Missing PID or instance identity alone never authorizes an orphan read.
+    let ready_manifest_json: serde_json::Value =
+        serde_json::from_slice(&ready_manifest).expect("parse Ready manifest fixture");
+    for (field, label) in [("pid", "pid"), ("instance_id", "instance")] {
+        let mut missing_identity = ready_manifest_json.clone();
+        missing_identity[field] = serde_json::Value::Null;
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&missing_identity).expect("serialize missing identity"),
+        )
+        .expect("write missing identity manifest");
+        fs::set_permissions(&manifest_path, fs::Permissions::from_mode(0o600))
+            .expect("keep missing identity manifest private");
+        let missing_identity_err = client
+            .get_task_live_or_stopped(&fixture.approval_id, TASK_ID)
+            .await
+            .expect_err("missing orphan identity must refuse terminal history");
+        assert_eq!(
+            missing_identity_err.code(),
+            "host_not_ready",
+            "missing orphan {label} must refuse terminal history"
+        );
+    }
+    fs::write(&manifest_path, &ready_manifest).expect("restore stale Ready manifest fixture");
+    fs::set_permissions(&manifest_path, fs::Permissions::from_mode(0o600))
+        .expect("restore stale Ready manifest permissions");
+
+    // A real nonterminal worker record behind the original receipt is not a terminal result.
+    let database_path = fixture
+        .session_dir()
+        .join(RUNTIME_STATE_SUBDIR)
+        .join(threadlane::DATABASE_FILENAME);
+    let mut core = threadlane_core::Core::open(&database_path).expect("open stopped runtime core");
+    let queued_output = core
+        .execute(
+            &session_binding_id,
+            threadlane_core::Command::StartWorker {
+                command_key: "orphan-nonterminal-probe".to_string(),
+                profile_id: live_worker.profile_id.clone(),
+                profile_digest: live_worker.profile_digest.clone(),
+                provider: live_worker.provider.clone(),
+                requested_model: live_worker.requested_model.clone(),
+                requested_effort: live_worker.requested_effort.clone(),
+                base_commit: live_worker.worktree.base_commit.clone(),
+                execution_binding: live_worker.execution_binding.clone(),
+                instruction: live_worker.instruction.clone(),
+                now_ms: 1_700_000_009_000,
+            },
+        )
+        .expect("queue a real nonterminal worker fixture");
+    let queued_worker = match queued_output {
+        threadlane_core::CommandOutput::Worker(worker) => *worker,
+        other => panic!("expected queued worker fixture, got {other:?}"),
+    };
+    drop(core);
+    let runtime_state_dir = fixture.session_dir().join(RUNTIME_STATE_SUBDIR);
+    assert!(
+        !runtime_state_dir.join("state.db-wal").exists()
+            && !runtime_state_dir.join("state.db-shm").exists(),
+        "nonterminal fixture setup must leave a clean checkpointed database"
+    );
+
+    let mut nonterminal_ledger: serde_json::Value =
+        serde_json::from_slice(&original_receipts).expect("parse nonterminal receipts fixture");
+    let nonterminal_entry = nonterminal_ledger["receipts"]
+        .as_array_mut()
+        .expect("nonterminal receipts array")
+        .first_mut()
+        .expect("nonterminal sealed receipt entry");
+    nonterminal_entry["run_id"] = serde_json::Value::String(queued_worker.run_id);
+    nonterminal_entry["worker_id"] = serde_json::Value::String(queued_worker.worker_id);
+    fs::write(
+        &receipts_path,
+        serde_json::to_vec_pretty(&nonterminal_ledger)
+            .expect("serialize nonterminal receipts fixture"),
+    )
+    .expect("write nonterminal receipts fixture");
+    fs::set_permissions(&receipts_path, fs::Permissions::from_mode(0o600))
+        .expect("keep nonterminal receipts private");
+    let nonterminal_err = client
+        .get_task_live_or_stopped(&fixture.approval_id, TASK_ID)
+        .await
+        .expect_err("nonterminal orphan evidence must refuse terminal history");
+    assert_eq!(nonterminal_err.code(), "host_not_ready");
+
+    // Reopening the stopped database promotes that queued record to `Unknown`. Unknown is never
+    // terminal evidence and must still refuse instead of becoming success or completion.
+    let reopened_core =
+        threadlane_core::Core::open(&database_path).expect("reopen stopped runtime core");
+    drop(reopened_core);
+    assert!(
+        !runtime_state_dir.join("state.db-wal").exists()
+            && !runtime_state_dir.join("state.db-shm").exists(),
+        "unknown fixture setup must leave a clean checkpointed database"
+    );
+    let unknown_err = client
+        .get_task_live_or_stopped(&fixture.approval_id, TASK_ID)
+        .await
+        .expect_err("unknown orphan evidence must refuse terminal history");
+    assert_eq!(unknown_err.code(), "host_not_ready");
+
+    assert_eq!(
+        fixture.provider_invocation_count(),
+        completed_provider_invocations,
+        "orphan refusal probes must not launch the provider"
+    );
+    assert!(
+        !is_host_lock_held(&fixture.session_dir()).expect("probe orphan host.lock after refusals"),
+        "orphan refusal probes must not hold host.lock"
+    );
+}
+
+#[tokio::test]
+async fn stale_ready_killed_host_reads_terminal_result_from_residual_wal_without_mutation() {
+    let fixture = setup_host_process_fixture();
+    fixture.assert_no_provider_invocation();
+
+    let client = ApprovedHostClient::open(
+        &fixture.registry_dir,
+        &fixture.plans_dir,
+        &fixture.authority_dir,
+        &fixture.sessions_dir,
+        CONTROL_BINDING_ID,
+        THREAD_UUID,
+    )
+    .expect("open authoritative approved host client");
+
+    let mut host = spawn_host_process(&fixture, "orphan-wal", None);
+    let status =
+        wait_for_authenticated_ready(&client, &fixture.approval_id, &mut host, |_| true).await;
+    assert_live_ready(&fixture, &client, &mut host, &status);
+
+    client
+        .dispatch_task(&fixture.approval_id, TASK_ID)
+        .await
+        .expect("dispatch approved root task");
+    let live_result = wait_for_task_ready(&client, &fixture.approval_id, TASK_ID, &mut host).await;
+    let live_worker = live_result
+        .worker
+        .clone()
+        .expect("live terminal worker snapshot");
+    assert_eq!(live_worker.attempt_count, 1);
+    let idle = wait_for_host_idle(&client, &fixture.approval_id, &mut host).await;
+    let live_delivery = client
+        .inspect_task_delivery(&fixture.approval_id, TASK_ID)
+        .await
+        .expect("inspect live terminal delivery");
+    let completed_provider_invocations = fixture.provider_invocation_count();
+    assert!(completed_provider_invocations >= 1);
+
+    let instance_id = idle.instance_id.clone();
+    let session_binding_id = idle.session_binding_id.clone();
+    let host_pid = host.pid();
+    let runtime_state_dir = fixture.session_dir().join(RUNTIME_STATE_SUBDIR);
+    let database_path = runtime_state_dir.join(threadlane::DATABASE_FILENAME);
+    let wal_path = runtime_state_dir.join("state.db-wal");
+    let shm_path = runtime_state_dir.join("state.db-shm");
+    let wal_after_completion = fs::read(&wal_path).expect("read committed residual WAL");
+    let shm_after_completion = fs::read(&shm_path).expect("read residual SHM");
+    assert!(
+        !wal_after_completion.is_empty(),
+        "completed live host must leave committed WAL frames"
+    );
+    assert!(
+        !shm_after_completion.is_empty(),
+        "completed live host must leave an active shared-memory index"
+    );
+    assert!(
+        wal_after_completion
+            .windows(live_worker.worker_id.len())
+            .any(|window| window == live_worker.worker_id.as_bytes()),
+        "residual WAL must contain the committed worker identity"
+    );
+
+    // The fake provider child has already completed and the host is idle. Kill only the owning
+    // host process so the session keeps its last Ready manifest and committed WAL frames. This is
+    // a controlled crash fixture, not power-loss proof.
+    host.child.kill().expect("kill completed host process");
+    let killed = host.wait_for_exit(EXIT_TIMEOUT).await;
+    assert_eq!(
+        killed.code(),
+        None,
+        "killed host must not report a normal successful exit"
+    );
+    assert!(
+        !is_host_lock_held(&fixture.session_dir()).expect("probe killed host.lock"),
+        "killed host must release host.lock"
+    );
+
+    let stale = read_host_manifest_optional(&fixture.session_dir(), &fixture.approval_record())
+        .expect("read killed Ready manifest")
+        .expect("killed Ready manifest exists");
+    assert_eq!(stale.phase, HostPhase::Ready);
+    assert!(stale.gates.supervisor_authenticated_ready);
+    assert_eq!(stale.instance_id.as_deref(), Some(instance_id.as_str()));
+    assert_eq!(
+        stale.session_binding_id.as_deref(),
+        Some(session_binding_id.as_str())
+    );
+    assert_eq!(stale.pid, Some(host_pid));
+
+    let wal_after_kill = fs::read(&wal_path).expect("read residual WAL after kill");
+    let shm_after_kill = fs::read(&shm_path).expect("read residual SHM after kill");
+    assert!(!wal_after_kill.is_empty());
+    assert!(!shm_after_kill.is_empty());
+
+    // The clean stopped reader refuses residual sidecars. Orphan recovery must use the existing
+    // bounded WAL-capable reader rather than a main-database-only or checkpointing fallback.
+    let clean_stopped_error = threadlane_core::Core::get_worker_readonly(
+        &database_path,
+        &session_binding_id,
+        THREAD_UUID,
+        &live_worker.run_id,
+    )
+    .expect_err("clean stopped reader must refuse residual WAL");
+    assert!(
+        matches!(
+            &clean_stopped_error,
+            threadlane_core::observation::ReadonlySqliteError::SnapshotUnavailable(_)
+        ),
+        "unexpected clean stopped residual-WAL error: {clean_stopped_error:?}"
+    );
+
+    let fingerprint_before = capture_stopped_read_fingerprint(&fixture);
+    assert_eq!(fingerprint_before.wal.as_ref(), Some(&wal_after_kill));
+    assert_eq!(fingerprint_before.shm.as_ref(), Some(&shm_after_kill));
+
+    let orphan_result = client
+        .get_task_live_or_stopped(&fixture.approval_id, TASK_ID)
+        .await
+        .expect("read killed-host terminal result from residual WAL");
+    let fingerprint_after = capture_stopped_read_fingerprint(&fixture);
+    assert_eq!(
+        orphan_result, live_result,
+        "residual-WAL orphan recovery must preserve the exact live task, run, worker, and result identities"
+    );
+    assert_eq!(
+        &fingerprint_before.manifest, &fingerprint_after.manifest,
+        "residual-WAL orphan read must not rewrite the stale Ready manifest"
+    );
+    assert_eq!(
+        &fingerprint_before.receipts, &fingerprint_after.receipts,
+        "residual-WAL orphan read must not rewrite sealed receipts"
+    );
+    assert_eq!(
+        &fingerprint_before.database, &fingerprint_after.database,
+        "residual-WAL orphan read must not rewrite the durable database"
+    );
+    assert_eq!(
+        &fingerprint_before.wal, &fingerprint_after.wal,
+        "residual-WAL orphan read must not rewrite or checkpoint the WAL"
+    );
+    assert!(
+        fingerprint_after.wal.is_some() && fingerprint_after.shm.is_some(),
+        "residual-WAL orphan read must not delete durable sidecars"
+    );
+
+    let orphan_delivery = client
+        .inspect_task_delivery(&fixture.approval_id, TASK_ID)
+        .await
+        .expect("inspect killed-host terminal delivery");
+    assert_eq!(
+        orphan_delivery, live_delivery,
+        "residual-WAL delivery inspection must preserve result and artifact identity"
+    );
+    client
+        .recheck_task_delivery(&fixture.approval_id, TASK_ID, &orphan_delivery)
+        .await
+        .expect("recheck killed-host terminal delivery");
+    let fingerprint_after_delivery = capture_stopped_read_fingerprint(&fixture);
+    assert_eq!(
+        &fingerprint_after_delivery.manifest, &fingerprint_after.manifest,
+        "residual-WAL delivery recheck must not rewrite the stale Ready manifest"
+    );
+    assert_eq!(
+        &fingerprint_after_delivery.receipts, &fingerprint_after.receipts,
+        "residual-WAL delivery recheck must not rewrite sealed receipts"
+    );
+    assert_eq!(
+        &fingerprint_after_delivery.database, &fingerprint_after.database,
+        "residual-WAL delivery recheck must not rewrite the durable database"
+    );
+    assert_eq!(
+        &fingerprint_after_delivery.wal, &fingerprint_after.wal,
+        "residual-WAL delivery recheck must not rewrite or checkpoint the WAL"
+    );
+    assert_eq!(
+        fixture.provider_invocation_count(),
+        completed_provider_invocations,
+        "residual-WAL result and delivery reads must not launch the provider"
+    );
+
+    // Restore the current sidecars, then prove a mismatched pair and corrupt WAL fail closed
+    // when this fixture's required terminal evidence is available only through the WAL.
+    let current_wal = fs::read(&wal_path).expect("read current residual WAL");
+    let current_shm = fs::read(&shm_path).expect("read current residual SHM");
+
+    fs::remove_file(&shm_path).expect("remove state.db-shm for sidecar mismatch probe");
+    let missing_shm_error = client
+        .get_task_live_or_stopped(&fixture.approval_id, TASK_ID)
+        .await
+        .expect_err("residual WAL without SHM must refuse terminal history");
+    assert_eq!(
+        missing_shm_error.code(),
+        "corrupt_session_state",
+        "unexpected missing-SHM error: {missing_shm_error:?}"
+    );
+    write_private_fixture_file(&shm_path, &current_shm);
+
+    write_private_fixture_file(&wal_path, b"corrupt-wal-frames");
+    let corrupt_wal_error = client
+        .get_task_live_or_stopped(&fixture.approval_id, TASK_ID)
+        .await
+        .expect_err("corrupt residual WAL must refuse terminal history");
+    assert_eq!(
+        corrupt_wal_error.code(),
+        "corrupt_session_state",
+        "unexpected corrupt-WAL error: {corrupt_wal_error:?}"
+    );
+    write_private_fixture_file(&wal_path, &current_wal);
+    write_private_fixture_file(&shm_path, &current_shm);
+
+    let restored_result = client
+        .get_task_live_or_stopped(&fixture.approval_id, TASK_ID)
+        .await
+        .expect("restored residual-WAL fixture remains readable");
+    assert_eq!(restored_result, live_result);
+    assert_eq!(
+        fixture.provider_invocation_count(),
+        completed_provider_invocations,
+        "sidecar refusal probes and restored read must not launch the provider"
+    );
+    assert!(
+        !is_host_lock_held(&fixture.session_dir()).expect("probe killed host.lock after probes"),
+        "residual-WAL refusal probes must not hold host.lock"
     );
 }
 
