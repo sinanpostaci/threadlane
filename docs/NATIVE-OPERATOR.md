@@ -246,7 +246,7 @@ manual task dispatch and its review/integration limits, distinct from the comple
 automatic job route above.
 
 Start `threadlane-host serve` explicitly for the recorded approval with the same
-stores. Session reads never launch a host. For raw and manual callers,
+stores. Session and task-history reads never launch or restart a host. For raw and manual callers,
 notifications remain a separate, default-off
 [startup policy](APPROVED-NOTIFICATIONS.md). The standard owned
 managed MCP registration opts into fresh-only approved-host auto-start and managed
@@ -279,9 +279,25 @@ hold the guard until the dispatch receipt is sealed. Low-level `threadlane-host`
 CLI commands (`serve`, `prepare-dependencies`) and raw `ApprovedHostClient::dispatch_task`
 live in `threadlane-host` below `threadlane-native` and are not gated by the
 native conversation-change ledger directly (to avoid crate dependency cycles and
-reentrant lock deadlocks with `role_flow`). `session --approval-id ...` reads the host; `task --approval-id ...
---task-id ...` reads one task. Completion means `ready_for_review`, with
-`accepted: false`. Check the patch, tests and model/effort evidence before
+reentrant lock deadlocks with `role_flow`). `session --approval-id ...` reports
+the host session summary and current authenticated readiness (plus notification
+delivery where available); a stopped summary is durable state, not current
+readiness. `task --approval-id ... --task-id ...` reads one task's durable
+history: a live authenticated `Ready` host through the strict read-only task
+view, or a clean authenticated `Stopped` checkpoint (including a failed or
+cancelled terminal result) through the guarded result reader without restarting
+the host. A released `Ready` manifest may expose only bounded terminal history
+under the existing orphan guards (released `host.lock` and `supervisor.lock`,
+exact manifest/instance/PID/gates, sealed receipt, and complete terminal worker
+evidence); missing, partial, locked, foreign, or otherwise unproven orphan
+history is refused. On a clean `Stopped` session, a missing sealed receipt
+remains an explicit `NotStarted` (or `Unknown` with a pending intent) and never
+invents a run or result. Task history availability is not current
+session readiness and never starts a host or provider; dispatch, cancel, stop,
+pull, ack and rearm-notification remain live-only mutations. Completion means
+`ready_for_review`, with `accepted: false`; that is distinct from guarded
+backlog `Done`, which requires the separate evidence and completion step.
+Check the patch, tests and model/effort evidence before
 [review/integration](OPERATOR-WORKFLOW.md). Prepare
 [reviewed dependency inputs](DEPENDENCIES.md) before explicitly dispatching a child.
 The desktop's separate [lifecycle projection](TASK-LIFECYCLE.md) shows validated

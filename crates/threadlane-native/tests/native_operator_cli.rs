@@ -4,11 +4,11 @@
 //! Every test uses a real disposable `Supervisor`, private registry/plan/authority/session stores,
 //! a disposable Git repository, and a fake worker executable that records any invocation. The
 //! workflow CLI is exercised through the actual `threadlane-workflow` subprocess; the session CLI
-//! is exercised through the actual `threadlane-session` subprocess for static, binding, store, and
-//! no-auto-host refusals. No test makes a paid provider call, and no test fabricates a successful
-//! host session.
+//! is exercised through the actual `threadlane-session` subprocess for static, binding, store,
+//! stopped terminal-history, and no-auto-host refusals. No test makes a paid provider call, and no
+//! test fabricates a successful host session.
 
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Output;
@@ -18,10 +18,15 @@ use std::time::Duration;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+
+use fs2::FileExt;
 use tempfile::TempDir;
 use threadlane::{Supervisor, SupervisorClient, SupervisorConfig, SupervisorHandle};
 use threadlane_authority::{ApprovalSummary, AuthorityStore, OperatorApprovalRequest};
-use threadlane_host::{ApprovedHost, ApprovedHostConfig, HostPhase, HostSessionSummary};
+use threadlane_host::{
+    ApprovedHost, ApprovedHostClient, ApprovedHostConfig, HostControlRuntimeState, HostPhase,
+    HostSessionSummary, TaskExecutionStatus, TaskStateSnapshot,
+};
 use threadlane_native::{
     CatalogPage, PlanPage, PlanStore, PlanSummary, PlanSummaryPage, PublishedPlanView,
     RegistryStore, SavePlanDraft,
@@ -567,13 +572,22 @@ fn run_git(dir: &Path, args: &[&str]) -> String {
 }
 
 fn write_fake_worker(path: &Path, marker: &Path) {
+    // Append so read-only history tests can prove that no path relaunches the worker.
     let script = format!(
-        "#!/bin/sh\nset -eu\nprintf 'invoked\\n' > '{}'\nexit 97\n",
+        "#!/bin/sh\nset -eu\nprintf 'invoked\\n' >> '{}'\nexit 97\n",
         marker.display()
     );
     fs::write(path, script).expect("write fake worker executable");
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))
         .expect("chmod fake worker executable 0700");
+}
+
+fn worker_invocation_count(marker: &Path) -> usize {
+    match fs::read_to_string(marker) {
+        Ok(text) => text.lines().count(),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(err) => panic!("read fake worker invocation marker: {err}"),
+    }
 }
 
 fn create_private_dir(path: &Path) {
@@ -759,6 +773,76 @@ fn different_digest(actual: &str) -> String {
         "1".repeat(64)
     } else {
         "0".repeat(64)
+    }
+}
+
+fn capture_session_files(session_dir: &Path) -> Vec<(&'static str, Option<Vec<u8>>)> {
+    [
+        "host.lock",
+        "host-manifest.json",
+        "task-receipts.json",
+        "task-receipts.lock",
+        "runtime-state/state.db",
+        "runtime-state/state.db-wal",
+        "runtime-state/state.db-shm",
+    ]
+    .into_iter()
+    .map(|relative| {
+        let path = session_dir.join(relative);
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => Some(bytes),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(err) => panic!("read durable session file `{}`: {err}", path.display()),
+        };
+        (relative, bytes)
+    })
+    .collect()
+}
+
+async fn wait_for_operator_task_status(
+    client: &ApprovedHostClient,
+    approval_id: &str,
+    task_id: &str,
+    expected: TaskExecutionStatus,
+) -> TaskStateSnapshot {
+    let deadline = tokio::time::Instant::now() + COMMAND_TIMEOUT;
+    loop {
+        let snapshot = client
+            .get_task_live_or_stopped(approval_id, task_id)
+            .await
+            .expect("read live approved task while waiting for its terminal state");
+        if snapshot.status == expected {
+            return snapshot;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "approved task `{task_id}` did not reach {expected:?} within {COMMAND_TIMEOUT:?}; last status: {:?}",
+            snapshot.status
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+async fn wait_for_operator_host_idle(client: &ApprovedHostClient, approval_id: &str) {
+    let deadline = tokio::time::Instant::now() + COMMAND_TIMEOUT;
+    loop {
+        if let Some(status) = client
+            .host_control_status(approval_id)
+            .await
+            .expect("read approved host control status")
+        {
+            if status.state == HostControlRuntimeState::Ready
+                && status.idle
+                && status.busy.is_idle()
+            {
+                return;
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "approved host did not become idle within {COMMAND_TIMEOUT:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
     }
 }
 
@@ -2166,6 +2250,251 @@ async fn session_cli_reports_ready_stopped_and_restarted_host_lifecycle_truthful
         !fx.worker_marker.exists(),
         "fixture control shutdown must not invoke a worker"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_task_reads_failed_stopped_terminal_history_without_mutation_or_restart() {
+    let mut fx = OperatorFixture::start().await;
+    let approval_id = fx.approval.approval_id.clone();
+    let task_args = || {
+        fx.session_args(
+            "task",
+            &[
+                "--approval-id".to_string(),
+                approval_id.clone(),
+                "--task-id".to_string(),
+                SESSION_TASK_ID.to_string(),
+            ],
+        )
+    };
+    let summary_args = || {
+        fx.session_args(
+            "session",
+            &["--approval-id".to_string(), approval_id.clone()],
+        )
+    };
+
+    let missing_session = run_session(&task_args()).await;
+    expect_failure_code(
+        &missing_session,
+        "task read before any host session exists",
+        "host_not_ready",
+    );
+    assert!(
+        !fx.sessions_dir.join(&approval_id).exists(),
+        "task history read must not create a host session automatically"
+    );
+    fx.assert_sessions_empty();
+
+    let config = ApprovedHostConfig::new(
+        &fx.registry_dir,
+        &fx.plans_dir,
+        &fx.authority_dir,
+        &fx.sessions_dir,
+        &approval_id,
+    );
+    let host = ApprovedHost::start(config)
+        .await
+        .expect("start approved host for stopped task history test");
+    let client = ApprovedHostClient::open(
+        &fx.registry_dir,
+        &fx.plans_dir,
+        &fx.authority_dir,
+        &fx.sessions_dir,
+        fx.binding_id.as_str(),
+        THREAD_UUID,
+    )
+    .expect("open approved host client for stopped task history test");
+
+    let ready: HostSessionSummary = parse_envelope(
+        &run_session(&summary_args()).await,
+        "ready approved session before the failed terminal task",
+        &fx.binding_id,
+    );
+    assert_eq!(ready.phase, HostPhase::Ready);
+    assert!(ready.gates.supervisor_authenticated_ready);
+    let instance_id = ready
+        .instance_id
+        .clone()
+        .expect("Ready session must expose an instance_id");
+
+    client
+        .dispatch_task(&approval_id, SESSION_TASK_ID)
+        .await
+        .expect("dispatch the approved failing fixture task");
+    let live_result = wait_for_operator_task_status(
+        &client,
+        &approval_id,
+        SESSION_TASK_ID,
+        TaskExecutionStatus::Failed,
+    )
+    .await;
+    assert_eq!(live_result.status, TaskExecutionStatus::Failed);
+    assert!(!live_result.accepted);
+    assert_eq!(live_result.binding_id, fx.binding_id);
+    assert_eq!(live_result.thread_uuid, THREAD_UUID);
+    let invocations_after_failure = worker_invocation_count(&fx.worker_marker);
+    assert!(
+        invocations_after_failure >= 1,
+        "the dispatched fake worker must have been invoked for the real terminal result"
+    );
+    let live_cli_result: TaskStateSnapshot = parse_envelope(
+        &run_session(&task_args()).await,
+        "live failed task history before stop",
+        &fx.binding_id,
+    );
+    assert_eq!(
+        live_cli_result, live_result,
+        "live task history must expose the exact authenticated result"
+    );
+
+    wait_for_operator_host_idle(&client, &approval_id).await;
+    let owner = tokio::spawn(async move {
+        host.wait_for_stop_request().await;
+        host.shutdown().await
+    });
+    let stopped = client
+        .stop_idle_session(&approval_id, &instance_id)
+        .await
+        .expect("authenticated idle stop after the failed terminal result");
+    assert_eq!(stopped.phase, HostPhase::Stopped);
+    owner
+        .await
+        .expect("host owner task must join")
+        .expect("host owner must shut down cleanly");
+
+    let stopped_summary: HostSessionSummary = parse_envelope(
+        &run_session(&summary_args()).await,
+        "stopped approved session summary beside durable task history",
+        &fx.binding_id,
+    );
+    assert_eq!(stopped_summary.phase, HostPhase::Stopped);
+    assert!(!stopped_summary.gates.supervisor_authenticated_ready);
+    assert_eq!(
+        stopped_summary.instance_id.as_deref(),
+        Some(instance_id.as_str())
+    );
+
+    let session_dir = fx.sessions_dir.join(&approval_id);
+    let fingerprint_before = capture_session_files(&session_dir);
+    let stopped_result: TaskStateSnapshot = parse_envelope(
+        &run_session(&task_args()).await,
+        "stopped failed task history",
+        &fx.binding_id,
+    );
+    let fingerprint_after = capture_session_files(&session_dir);
+    assert_eq!(
+        stopped_result, live_result,
+        "stopped task history must preserve the exact live terminal task, run, worker, and result identities"
+    );
+    assert_eq!(stopped_result.status, TaskExecutionStatus::Failed);
+    assert!(!stopped_result.accepted);
+    assert_eq!(
+        fingerprint_before, fingerprint_after,
+        "stopped task history read must not change the manifest, receipts, DB, locks, or sidecars"
+    );
+    assert_eq!(
+        worker_invocation_count(&fx.worker_marker),
+        invocations_after_failure,
+        "stopped task history read must not launch the fake worker"
+    );
+
+    let missing_task = run_session(&fx.session_args(
+        "task",
+        &[
+            "--approval-id".to_string(),
+            approval_id.clone(),
+            "--task-id".to_string(),
+            "task-not-approved".to_string(),
+        ],
+    ))
+    .await;
+    expect_failure_code(
+        &missing_task,
+        "task history read for an unapproved task",
+        "unknown_task",
+    );
+
+    let foreign_dirs = fx.session_dirs();
+    let foreign_binding = run_session(&session_arguments(
+        &foreign_dirs,
+        &fx.foreign_binding_id,
+        FOREIGN_THREAD_UUID,
+        "task",
+        &[
+            "--approval-id".to_string(),
+            approval_id.clone(),
+            "--task-id".to_string(),
+            SESSION_TASK_ID.to_string(),
+        ],
+    ))
+    .await;
+    let foreign_binding_failure = expect_failure(
+        &foreign_binding,
+        "task history read through a foreign binding",
+    );
+    assert!(
+        foreign_binding_failure.code == "approval_not_found"
+            || foreign_binding_failure.code.ends_with("mismatch"),
+        "foreign binding must fail with a static not-found or scope-mismatch code, got `{}`",
+        foreign_binding_failure.code
+    );
+
+    let foreign_thread = run_session(&session_arguments(
+        &foreign_dirs,
+        &fx.binding_id,
+        OTHER_THREAD_UUID,
+        "task",
+        &[
+            "--approval-id".to_string(),
+            approval_id.clone(),
+            "--task-id".to_string(),
+            SESSION_TASK_ID.to_string(),
+        ],
+    ))
+    .await;
+    expect_failure_code(
+        &foreign_thread,
+        "task history read through a foreign thread",
+        "thread_uuid_mismatch",
+    );
+
+    let host_lock = OpenOptions::new()
+        .read(true)
+        .open(session_dir.join("host.lock"))
+        .expect("open stopped host.lock for unsafe-history refusal");
+    host_lock
+        .lock_exclusive()
+        .expect("hold stopped host.lock for unsafe-history refusal");
+    let locked = run_session(&task_args()).await;
+    expect_failure_code(
+        &locked,
+        "task history read while the stopped host.lock is still held",
+        "host_not_ready",
+    );
+    drop(host_lock);
+
+    let recovered: TaskStateSnapshot = parse_envelope(
+        &run_session(&task_args()).await,
+        "task history after the unsafe-history refusal",
+        &fx.binding_id,
+    );
+    assert_eq!(
+        recovered, live_result,
+        "read-only task history probes must preserve the exact stopped terminal result"
+    );
+    assert_eq!(
+        capture_session_files(&session_dir),
+        fingerprint_before,
+        "all read-only task history probes must leave durable session data unchanged"
+    );
+    assert_eq!(
+        worker_invocation_count(&fx.worker_marker),
+        invocations_after_failure,
+        "read-only task history probes must not launch the fake worker again"
+    );
+
+    fx.shutdown().await;
 }
 
 fn assert_help_or_version_success(output: &Output, context: &str, expected_fragments: &[&str]) {

@@ -569,7 +569,7 @@ async fn run(cli: Cli) -> Result<(), OperatorCliError> {
             )?;
 
             let snapshot = client
-                .get_task(&approval_id, &task_id)
+                .get_task_live_or_stopped(&approval_id, &task_id)
                 .await
                 .map_err(|err| map_host_error(&err))?;
             if snapshot.binding_id != globals.binding || snapshot.thread_uuid != globals.thread {
