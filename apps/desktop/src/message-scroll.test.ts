@@ -2158,6 +2158,99 @@ test('worker execution footers join exact item/binding attempts and render only 
   assert.equal(views[1]!.outcome, 'success');
 });
 
+test('worker execution summaries keep the Flash 4.1 label separate from Max and prefer observed identity', () => {
+  const identity = makeIdentity('bnd_alpha_execution_model_labels', UUID_ALPHA);
+  const requestedItem = makeBacklogItem({
+    item_id: 'blg_flash_requested',
+    binding_id: identity.binding_id,
+    kind: 'worker',
+    status: 'doing',
+    current_execution_ref: 'exec-requested',
+  });
+  const observedItem = makeBacklogItem({
+    item_id: 'blg_flash_observed',
+    binding_id: identity.binding_id,
+    kind: 'worker',
+    status: 'doing',
+    current_execution_ref: 'exec-observed',
+  });
+  const missingItem = makeBacklogItem({
+    item_id: 'blg_model_missing',
+    binding_id: identity.binding_id,
+    kind: 'worker',
+    status: 'doing',
+    current_execution_ref: 'exec-missing',
+  });
+
+  const selection = selectWorkspaceChatWork(
+    [
+      makeChatWork(identity, {
+        items: [requestedItem, observedItem, missingItem],
+        worker_executions: [
+          makeExecution(identity.binding_id, {
+            item_id: requestedItem.item_id,
+            execution_ref: 'exec-requested',
+            provider: 'opencode',
+            requested_model: 'deepseek-v4.1-flash',
+            observed_model: null,
+            requested_effort: 'max',
+            observed_effort: null,
+          }),
+          makeExecution(identity.binding_id, {
+            item_id: observedItem.item_id,
+            execution_ref: 'exec-observed',
+            provider: 'opencode',
+            requested_model: 'deepseek-v4.1-flash',
+            observed_model: 'deepseek-v4.1-flash-pro',
+            requested_effort: 'max',
+            observed_effort: null,
+          }),
+          makeExecution(identity.binding_id, {
+            item_id: missingItem.item_id,
+            execution_ref: 'exec-missing',
+            provider: 'opencode-go',
+            requested_model: null,
+            observed_model: null,
+            requested_effort: null,
+            observed_effort: null,
+          }),
+        ],
+      }),
+    ],
+    identity,
+  );
+
+  const summaries = buildChatWorkExecutionSummaries(selection);
+  const byRef = new Map(
+    summaries.map((summary) => [summary.executionRef, summary] as const),
+  );
+  assert.equal(summaries.length, 3);
+
+  const requested = byRef.get('exec-requested');
+  assert.ok(requested);
+  assert.equal(requested.provider, 'opencode');
+  assert.equal(requested.modelRaw, 'deepseek-v4.1-flash');
+  assert.equal(requested.model, 'DeepSeek Flash 4.1');
+  assert.equal(requested.effort, 'Max');
+
+  const observed = byRef.get('exec-observed');
+  assert.ok(observed);
+  assert.equal(observed.provider, 'opencode');
+  assert.equal(observed.modelRaw, 'deepseek-v4.1-flash-pro');
+  assert.equal(observed.model, 'DeepSeek · deepseek-v4.1-flash-pro');
+  assert.notEqual(observed.model, 'DeepSeek Flash 4.1');
+  // The observed model wins independently of effort. Preserve the existing
+  // requested-effort fallback when no observed effort was recorded.
+  assert.equal(observed.effort, 'Max');
+
+  const missing = byRef.get('exec-missing');
+  assert.ok(missing);
+  assert.equal(missing.provider, 'opencode-go');
+  assert.equal(missing.modelRaw, null);
+  assert.equal(missing.model, null);
+  assert.equal(missing.effort, null);
+});
+
 test('worker execution status keeps dispatch, checking, guarded Done, rejection, cancellation, failure, timeout, and unknown distinct', () => {
   const identity = makeIdentity('bnd_alpha_execution_status', UUID_ALPHA);
 

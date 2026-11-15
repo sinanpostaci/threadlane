@@ -918,10 +918,20 @@ function capitalizeLabel(value: string): string {
   return value.charAt(0).toUpperCase() + value.slice(1);
 }
 
+// Only these exact model IDs are DeepSeek Flash 4.1. Variants such as Pro,
+// unversioned Flash, V4.2 or dated suffixes keep their recorded identity.
+const DEEPSEEK_FLASH_4_1_MODEL_IDS: ReadonlySet<string> = new Set([
+  'deepseek-v4.1-flash',
+  'deepseek-4.1-flash',
+]);
+
 /** Display names shorten familiar model identifiers; exact receipts stay in detail. */
 export function formatFriendlyModel(value: string): string {
-  const model = value.trim().split('/').at(-1) ?? value.trim();
-  if (/^deepseek(?:-|$)/i.test(model)) return 'DeepSeek';
+  const model = (value.trim().split('/').at(-1) ?? value.trim()).trim();
+  const normalized = model.toLowerCase();
+  if (DEEPSEEK_FLASH_4_1_MODEL_IDS.has(normalized)) return 'DeepSeek Flash 4.1';
+  if (normalized === 'deepseek') return 'DeepSeek';
+  if (/^deepseek(?:-|$)/i.test(model)) return `DeepSeek · ${model}`;
   if (/(?:^|-)argon(?:-|$)/i.test(model)) return 'Argon';
   if (/(?:^|-)sol(?:-|$)/i.test(model)) return 'Sol';
   if (/(?:^|-)astra(?:-|$)/i.test(model)) return 'Astra';

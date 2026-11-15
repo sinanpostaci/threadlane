@@ -33,6 +33,7 @@ import {
   formatExecutorIdentity,
   formatExecutorRoleLabel,
   formatFeedTimestamp,
+  formatFriendlyModel,
   formatFriendlyTool,
   formatLifecycleLabel,
   formatLatestProvenReturnStage,
@@ -1633,6 +1634,55 @@ describe('activity feed request projection', () => {
     assert.equal(formatRelativeTime(null, NOW_MS), 'Time not reported');
   });
 
+  it('recognizes only exact DeepSeek Flash 4.1 IDs and keeps variant identity distinct', () => {
+    assert.equal(
+      formatFriendlyModel('opencode-go/deepseek-v4.1-flash'),
+      'DeepSeek Flash 4.1'
+    );
+    assert.equal(formatFriendlyModel('deepseek-v4.1-flash'), 'DeepSeek Flash 4.1');
+    assert.equal(formatFriendlyModel('deepseek-4.1-flash'), 'DeepSeek Flash 4.1');
+    assert.equal(
+      formatFriendlyModel('  OpenCode-Go / DeepSeek-V4.1-Flash  '),
+      'DeepSeek Flash 4.1'
+    );
+    assert.equal(formatFriendlyModel('deepseek'), 'DeepSeek');
+    assert.equal(formatFriendlyModel('opencode-go/deepseek'), 'DeepSeek');
+
+    // Bounded exact IDs: Pro, unversioned/other Flash, dated suffixes and
+    // unknown variants keep their distinguishing identity.
+    assert.equal(
+      formatFriendlyModel('deepseek-v4.1-flash-pro'),
+      'DeepSeek · deepseek-v4.1-flash-pro'
+    );
+    assert.equal(
+      formatFriendlyModel('opencode-go/deepseek-v4-flash'),
+      'DeepSeek · deepseek-v4-flash'
+    );
+    assert.equal(
+      formatFriendlyModel('deepseek-v4.2-flash'),
+      'DeepSeek · deepseek-v4.2-flash'
+    );
+    assert.equal(
+      formatFriendlyModel('deepseek-v4.1-flash-2026'),
+      'DeepSeek · deepseek-v4.1-flash-2026'
+    );
+    // A model-ID suffix is not effort evidence.
+    assert.equal(
+      formatFriendlyModel('deepseek-v4.1-flash-max'),
+      'DeepSeek · deepseek-v4.1-flash-max'
+    );
+    assert.doesNotMatch(formatFriendlyModel('deepseek-v4.1-flash-max'), /Max/);
+
+    // Non-DeepSeek presentation remains unchanged.
+    assert.equal(formatFriendlyModel('gemini-4-argon-high'), 'Argon');
+    assert.equal(formatFriendlyModel('gpt-6-sol'), 'Sol');
+    assert.equal(formatFriendlyModel('gpt-6-astra'), 'Astra');
+    assert.equal(formatFriendlyModel('gpt-6'), 'GPT-6');
+    assert.equal(formatFriendlyModel('gemini-3-pro'), 'Gemini 3-pro');
+    assert.equal(formatFriendlyModel('jev-latest'), 'Jev · jev-latest');
+    assert.equal(formatFriendlyModel('custom-model'), 'custom-model');
+  });
+
   it('uses one model receipt for compact copy while retaining requested and observed evidence', () => {
     const observed = projectExecutorDisplay(makeExecutor({
       role: 'reviewer',
@@ -1652,8 +1702,35 @@ describe('activity feed request projection', () => {
       requested_effort: 'max',
       observed_effort: null,
     }));
-    assert.equal(requested.model, 'DeepSeek · Max');
+    assert.equal(requested.model, 'DeepSeek Flash 4.1 · Max');
     assert.match(requested.detail, /observed Not reported/);
+
+    const observedPreferred = projectExecutorDisplay(makeExecutor({
+      requested_model: 'deepseek-v4.1-flash-pro',
+      observed_model: 'opencode-go/deepseek-4.1-flash',
+      requested_effort: 'max',
+      observed_effort: 'max',
+    }));
+    assert.equal(observedPreferred.model, 'DeepSeek Flash 4.1 · Max');
+    assert.match(
+      observedPreferred.detail,
+      /requested deepseek-v4\.1-flash-pro · observed opencode-go\/deepseek-4\.1-flash/
+    );
+
+    // A missing observed effort is not backfilled from the requested effort.
+    const missingObservedEffort = projectExecutorDisplay(makeExecutor({
+      requested_model: 'opencode-go/deepseek-v4.1-flash',
+      observed_model: 'deepseek-v4.1-flash',
+      requested_effort: 'max',
+      observed_effort: null,
+    }));
+    assert.equal(missingObservedEffort.model, 'DeepSeek Flash 4.1');
+    assert.doesNotMatch(missingObservedEffort.model ?? '', /Max/);
+    assert.match(
+      missingObservedEffort.detail,
+      /Effort requested max · observed Not reported/
+    );
+
     assert.equal(projectExecutorDisplay(null).model, 'Model not reported');
   });
 
@@ -1669,7 +1746,7 @@ describe('activity feed request projection', () => {
     }));
     const display = projectRequestExecutorDisplay(view);
     assert.equal(display.role, 'Called Worker');
-    assert.equal(display.model, 'DeepSeek · Max');
+    assert.equal(display.model, 'DeepSeek Flash 4.1 · Max');
     assert.equal(view.executorRoleLabel, 'Role not reported');
     assert.equal(view.observedModel, 'Not reported');
     assert.match(display.detail, /Child call/);
@@ -1925,7 +2002,7 @@ describe('activity feed request projection', () => {
     assert.ok(withWorker.calledExecutor);
     const withWorkerDisplay = projectRequestExecutorDisplay(withWorker);
     assert.equal(withWorkerDisplay.role, 'Called Worker');
-    assert.equal(withWorkerDisplay.model, 'DeepSeek · Max');
+    assert.equal(withWorkerDisplay.model, 'DeepSeek Flash 4.1 · Max');
     assert.equal(withWorker.usage.summary, 'Usage not reported');
     assert.equal(formatCompactUsage(withWorker.usage).value, 'Usage not reported');
 

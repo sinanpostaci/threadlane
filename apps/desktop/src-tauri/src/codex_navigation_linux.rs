@@ -22,9 +22,10 @@ pub(crate) const QUALIFIED_OWL_RUNTIME_PLATFORM: &str = "linux";
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) const QUALIFIED_OWL_RUNTIME_ARCH: &str = "x64";
 
-/// Exact qualified Owl/Chromium shell runtime version (`electron = chrome = 157.0.8103.39`).
+/// Exact measured Owl/Chromium shell runtime versions qualified for navigation
+/// (`electron = chrome = 157.0.8103.39` and `157.0.8103.78`).
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-pub(crate) const QUALIFIED_OWL_RUNTIME_VERSION: &str = "157.0.8103.39";
+pub(crate) const QUALIFIED_OWL_RUNTIME_VERSIONS: &[&str] = &["157.0.8103.39", "157.0.8103.78"];
 
 /// Expected `package.json` `name` inside the installed Codex `app.asar`.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -251,13 +252,15 @@ pub(crate) fn build_owl_singleton_frame(
     Ok(frame)
 }
 
-/// Validates `owl-shell-runtime.json` bytes (and optional sibling `version` file contents)
-/// against the exact qualified Linux x64 Owl shell `157.0.8103.39` runtime identity.
+/// Resolves the exact observed runtime version from `owl-shell-runtime.json` bytes and optional
+/// sibling `version` file contents. When both the marker JSON version and the sibling version
+/// file are present, they must agree exactly, and the resolved version must be one of the
+/// qualified Linux x64 Owl shell runtime identities.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-pub(crate) fn verify_owl_runtime_marker_bytes(
+fn resolve_owl_runtime_marker_version(
     marker_bytes: &[u8],
     sibling_version: Option<&str>,
-) -> Result<(), AppError> {
+) -> Result<String, AppError> {
     let unsupported = || {
         AppError::new(
             "codex_runtime_unsupported",
@@ -278,27 +281,36 @@ pub(crate) fn verify_owl_runtime_marker_bytes(
         return Err(unsupported());
     }
 
-    let mut saw_verified_version = false;
-    if let Some(ref json_version) = marker.version {
-        if json_version != QUALIFIED_OWL_RUNTIME_VERSION {
-            return Err(unsupported());
+    let observed_version = match (marker.version.as_deref(), sibling_version.map(str::trim)) {
+        (Some(json_version), Some(file_version)) => {
+            // Both sources must name the same exact runtime version; two independently
+            // allowlisted values are not sufficient agreement.
+            if json_version != file_version {
+                return Err(unsupported());
+            }
+            json_version
         }
-        saw_verified_version = true;
-    }
+        (Some(json_version), None) => json_version,
+        (None, Some(file_version)) => file_version,
+        (None, None) => return Err(unsupported()),
+    };
 
-    if let Some(file_version) = sibling_version {
-        let trimmed = file_version.trim();
-        if trimmed != QUALIFIED_OWL_RUNTIME_VERSION {
-            return Err(unsupported());
-        }
-        saw_verified_version = true;
-    }
-
-    if !saw_verified_version {
+    if !QUALIFIED_OWL_RUNTIME_VERSIONS.contains(&observed_version) {
         return Err(unsupported());
     }
 
-    Ok(())
+    Ok(observed_version.to_string())
+}
+
+/// Validates `owl-shell-runtime.json` bytes (and optional sibling `version` file contents)
+/// against the exact qualified Linux x64 Owl shell runtime identities.
+#[cfg(test)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn verify_owl_runtime_marker_bytes(
+    marker_bytes: &[u8],
+    sibling_version: Option<&str>,
+) -> Result<(), AppError> {
+    resolve_owl_runtime_marker_version(marker_bytes, sibling_version).map(|_| ())
 }
 
 /// Parses only the bounded Chromium Pickle header and root `package.json` slice from an ASAR
@@ -553,7 +565,7 @@ pub(crate) fn parse_hyprland_clients_for_pid(
     validate_hyprland_hex_address(raw_addr)
 }
 
-/// Verifies a Hyprland `dispatch focuswindow address:<hex>` reply (`"ok"`).
+/// Verifies a Hyprland focus-dispatch reply (`"ok"`) for the selected protocol.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn verify_hyprland_dispatch_ok(reply_bytes: &[u8]) -> Result<(), AppError> {
     if reply_bytes.is_empty() || reply_bytes.len() >= MAX_COMPOSITOR_RESPONSE_LIMIT_BYTES {
@@ -564,6 +576,62 @@ pub(crate) fn verify_hyprland_dispatch_ok(reply_bytes: &[u8]) -> Result<(), AppE
         return Err(focus_unavailable_protocol_error());
     }
     Ok(())
+}
+
+/// Hyprland focus dispatch protocol selected from bounded read-only capability evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+enum HyprlandFocusProtocol {
+    /// Legacy config: `dispatch focuswindow address:<hex>`.
+    Legacy,
+    /// Lua config: `dispatch hl.dsp.focus({window="address:<hex>"})`.
+    Lua,
+}
+
+/// Builds the fixed read-only Hyprland Lua capability/constructor probe for one strictly
+/// validated window address. The pure constructor captures the selector without dispatching it.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn build_hyprland_lua_constructor_probe(hex_address: &str) -> Result<String, AppError> {
+    let validated = validate_hyprland_hex_address(hex_address)?;
+    Ok(format!(
+        "eval local d=hl.dsp.focus({{window=\"address:{validated}\"}}); assert(d ~= nil)"
+    ))
+}
+
+/// Selects the Hyprland focus dispatch protocol from exact bounded capability evidence.
+///
+/// The constructor probe itself is read-only. An exact `ok` proves Lua config plus dispatcher
+/// construction. The exact 0.56 non-Lua reply or the older unknown-command reply selects legacy.
+/// Empty, malformed, oversized, ambiguous, error, denied, or timed-out evidence fails closed.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn select_hyprland_focus_protocol(reply_bytes: &[u8]) -> Result<HyprlandFocusProtocol, AppError> {
+    if reply_bytes.is_empty() || reply_bytes.len() >= MAX_COMPOSITOR_RESPONSE_LIMIT_BYTES {
+        return Err(focus_unavailable_protocol_error());
+    }
+    let reply = std::str::from_utf8(reply_bytes).map_err(|_| focus_unavailable_protocol_error())?;
+    match reply.trim() {
+        "ok" => Ok(HyprlandFocusProtocol::Lua),
+        "eval is only supported with the lua config manager" | "unknown request" => {
+            Ok(HyprlandFocusProtocol::Legacy)
+        }
+        _ => Err(focus_unavailable_protocol_error()),
+    }
+}
+
+/// Builds the exact single Hyprland focus command for the selected protocol using only the
+/// strictly validated lowercase hex address.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn build_hyprland_focus_command(
+    protocol: HyprlandFocusProtocol,
+    hex_address: &str,
+) -> Result<String, AppError> {
+    let validated = validate_hyprland_hex_address(hex_address)?;
+    match protocol {
+        HyprlandFocusProtocol::Legacy => Ok(format!("dispatch focuswindow address:{validated}")),
+        HyprlandFocusProtocol::Lua => Ok(format!(
+            "dispatch hl.dsp.focus({{window=\"address:{validated}\"}})"
+        )),
+    }
 }
 
 /// Parses Hyprland `j/activewindow` JSON (`< 1 MiB`) and confirms the active window matches
@@ -752,6 +820,7 @@ mod linux_imp {
     use std::hint::black_box;
     use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
     use std::time::Instant;
+    use threadlane_connectors::THREADLANE_CLI_XDG_CONFIG_HOME;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::UnixStream;
 
@@ -771,12 +840,14 @@ mod linux_imp {
 
     #[derive(Debug, Clone)]
     pub(crate) enum LinuxProfileSource {
-        /// Derives the profile strictly from trusted process `XDG_CONFIG_HOME` / `HOME`.
+        /// Derives the profile from trusted process state: the native launcher's captured
+        /// original `XDG_CONFIG_HOME` marker when present, otherwise `XDG_CONFIG_HOME` / `HOME`.
         NativeEnv,
         #[cfg(test)]
         /// Test-only isolated environment without mutating process-global environment variables.
         ExplicitEnv {
             xdg_config_home: Option<OsString>,
+            captured_xdg_config_home: Option<OsString>,
             home: Option<OsString>,
             extra_candidates: Vec<PathBuf>,
         },
@@ -832,11 +903,12 @@ mod linux_imp {
     /// Qualified Linux Owl-shell existing-instance Codex chat activator.
     ///
     /// Preflights a unique eligible window in the supported existing Wayland compositor
-    /// (`Hyprland` or `Sway`), sends the exact Owl `START` frame to the verified same-UID Codex
-    /// singleton socket, awaits `ACK`, dispatches a single bounded compositor window-focus command
-    /// for that exact PID/window, and confirms active focus. Never launches a process, kills an
-    /// unresponsive process, overrides compositor focus policy, falls back to OS URL openers, or
-    /// mutates desktop/user configuration.
+    /// (`Hyprland` or `Sway`), selects the Hyprland legacy or Lua focus dispatch protocol from
+    /// fixed read-only capability evidence, sends the exact Owl `START` frame to the verified
+    /// same-UID Codex singleton socket, awaits `ACK`, dispatches exactly one bounded compositor
+    /// window-focus command for that exact PID/window, and confirms active focus. Never launches a
+    /// process, kills an unresponsive process, overrides compositor focus policy, falls back to OS
+    /// URL openers, or mutates desktop/user configuration.
     #[derive(Clone, Default)]
     pub(crate) struct LinuxOwlCodexActivator {
         config: LinuxOwlActivatorConfig,
@@ -1077,8 +1149,13 @@ mod linux_imp {
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     enum CompositorFocusTarget {
-        Hyprland { hex_address: String },
-        Sway { con_id: u64 },
+        Hyprland {
+            hex_address: String,
+            protocol: HyprlandFocusProtocol,
+        },
+        Sway {
+            con_id: u64,
+        },
     }
 
     #[derive(Debug, Clone)]
@@ -1305,29 +1382,32 @@ mod linux_imp {
         Ok(())
     }
 
-    fn discover_codex_profile_dir(
-        source: &LinuxProfileSource,
-        expected_uid: u32,
-    ) -> Result<(PathBuf, u64, u64), AppError> {
-        let (xdg_raw, home_raw, extra_candidates) = match source {
-            LinuxProfileSource::NativeEnv => (
-                std::env::var_os("XDG_CONFIG_HOME"),
-                std::env::var_os("HOME"),
-                Vec::<PathBuf>::new(),
-            ),
-            #[cfg(test)]
-            LinuxProfileSource::ExplicitEnv {
-                xdg_config_home,
-                home,
-                extra_candidates,
-            } => (
-                xdg_config_home.clone(),
-                home.clone(),
-                extra_candidates.clone(),
-            ),
-        };
+    fn resolve_home_config_codex(home_raw: Option<OsString>) -> Result<PathBuf, AppError> {
+        let home_os = home_raw.ok_or_else(app_unavailable_error)?;
+        let home_dir = parse_required_clean_env_dir_with(home_os, app_unavailable_error)?;
+        Ok(home_dir.join(".config").join("Codex"))
+    }
 
-        let selected_profile = match xdg_raw {
+    fn resolve_codex_profile_root(
+        xdg_raw: Option<OsString>,
+        captured_xdg_raw: Option<OsString>,
+        home_raw: Option<OsString>,
+    ) -> Result<PathBuf, AppError> {
+        if let Some(captured_xdg) = captured_xdg_raw {
+            // The native launcher captured the caller's original config root before replacing
+            // `XDG_CONFIG_HOME` with the private desktop root. A present marker is authoritative:
+            // a present-empty capture means the original `XDG_CONFIG_HOME` was unset, so the
+            // normal user default applies; a non-empty capture is validated exactly with no
+            // fallback to either the private value or `$HOME`.
+            if captured_xdg.is_empty() {
+                return resolve_home_config_codex(home_raw);
+            }
+            let original_root =
+                parse_required_clean_env_dir_with(captured_xdg, app_unavailable_error)?;
+            return Ok(original_root.join("Codex"));
+        }
+
+        match xdg_raw {
             Some(explicit_xdg) => {
                 // Explicit trusted `XDG_CONFIG_HOME` defines the authoritative config root.
                 // A stale `$HOME/.config/Codex` shadow directory is ignored, and an invalid,
@@ -1335,14 +1415,38 @@ mod linux_imp {
                 // falling back to `HOME`.
                 let xdg_dir =
                     parse_required_clean_env_dir_with(explicit_xdg, app_unavailable_error)?;
-                xdg_dir.join("Codex")
+                Ok(xdg_dir.join("Codex"))
             }
-            None => {
-                let home_os = home_raw.ok_or_else(app_unavailable_error)?;
-                let home_dir = parse_required_clean_env_dir_with(home_os, app_unavailable_error)?;
-                home_dir.join(".config").join("Codex")
-            }
+            None => resolve_home_config_codex(home_raw),
+        }
+    }
+
+    fn discover_codex_profile_dir(
+        source: &LinuxProfileSource,
+        expected_uid: u32,
+    ) -> Result<(PathBuf, u64, u64), AppError> {
+        let (xdg_raw, captured_xdg_raw, home_raw, extra_candidates) = match source {
+            LinuxProfileSource::NativeEnv => (
+                std::env::var_os("XDG_CONFIG_HOME"),
+                std::env::var_os(THREADLANE_CLI_XDG_CONFIG_HOME),
+                std::env::var_os("HOME"),
+                Vec::<PathBuf>::new(),
+            ),
+            #[cfg(test)]
+            LinuxProfileSource::ExplicitEnv {
+                xdg_config_home,
+                captured_xdg_config_home,
+                home,
+                extra_candidates,
+            } => (
+                xdg_config_home.clone(),
+                captured_xdg_config_home.clone(),
+                home.clone(),
+                extra_candidates.clone(),
+            ),
         };
+
+        let selected_profile = resolve_codex_profile_root(xdg_raw, captured_xdg_raw, home_raw)?;
 
         if !extra_candidates.is_empty() {
             let mut distinct_existing = std::collections::BTreeSet::new();
@@ -1873,6 +1977,7 @@ mod linux_imp {
         };
 
         let mut verified_markers = 0usize;
+        let mut resolved_runtime_version: Option<String> = None;
         let mut seen_marker_inodes = std::collections::BTreeSet::new();
         for dir in &candidate_marker_dirs {
             let candidate_marker = dir.join(OWL_RUNTIME_MARKER_FILENAME);
@@ -1914,7 +2019,18 @@ mod linux_imp {
                 exe_sibling_version.clone()
             };
 
-            verify_owl_runtime_marker_bytes(&marker_bytes, local_version.as_deref())?;
+            let marker_version =
+                resolve_owl_runtime_marker_version(&marker_bytes, local_version.as_deref())?;
+            if resolved_runtime_version
+                .as_deref()
+                .is_some_and(|resolved| resolved != marker_version.as_str())
+            {
+                // Every distinct marker/version source discovered in the runtime tree must
+                // resolve to the same qualified version; independently allowlisted values
+                // are not sufficient agreement.
+                return Err(runtime_unsupported_error());
+            }
+            resolved_runtime_version.get_or_insert(marker_version);
             verified_markers += 1;
         }
 
@@ -2646,9 +2762,27 @@ mod linux_imp {
                 )
                 .await?;
                 let hex_address = parse_hyprland_clients_for_pid(&clients_json, pre.expected_pid)?;
+                // Select the focus protocol strictly before any singleton URI write. The
+                // constructor probe only builds a dispatcher for the already-validated address;
+                // it does not invoke it. Only exact `ok` (Lua) or the verified non-Lua/older
+                // unknown-command capability replies (legacy) are accepted.
+                let probe = build_hyprland_lua_constructor_probe(&hex_address)?;
+                let (peer_after_probe, probe_reply) = execute_hyprland_command(
+                    config,
+                    pre,
+                    socket_path,
+                    &probe,
+                    Some(&peer),
+                    deadline_at,
+                )
+                .await?;
+                let protocol = select_hyprland_focus_protocol(&probe_reply)?;
                 Ok(PreflightFocusPlan {
-                    peer,
-                    target: CompositorFocusTarget::Hyprland { hex_address },
+                    peer: peer_after_probe,
+                    target: CompositorFocusTarget::Hyprland {
+                        hex_address,
+                        protocol,
+                    },
                 })
             }
             QualifiedCompositorEndpoint::Sway { socket_path, .. } => {
@@ -2682,10 +2816,14 @@ mod linux_imp {
         match (&pre.compositor, &plan.target) {
             (
                 QualifiedCompositorEndpoint::Hyprland { socket_path, .. },
-                CompositorFocusTarget::Hyprland { hex_address },
+                CompositorFocusTarget::Hyprland {
+                    hex_address,
+                    protocol,
+                },
             ) => {
-                let validated_hex = validate_hyprland_hex_address(hex_address)?;
-                let dispatch_cmd = format!("dispatch focuswindow address:{validated_hex}");
+                // Exactly one focus dispatch for the pre-selected protocol. No legacy/Lua
+                // fallback or retry is attempted after the singleton write may have taken effect.
+                let dispatch_cmd = build_hyprland_focus_command(*protocol, hex_address)?;
                 let (_peer_after_focus, dispatch_reply) = execute_hyprland_command(
                     config,
                     pre,
@@ -2706,7 +2844,7 @@ mod linux_imp {
                     deadline_at,
                 )
                 .await?;
-                verify_hyprland_active_window(&active_json, pre.expected_pid, &validated_hex)
+                verify_hyprland_active_window(&active_json, pre.expected_pid, hex_address)
             }
             (
                 QualifiedCompositorEndpoint::Sway { socket_path, .. },
@@ -2955,7 +3093,7 @@ mod tests {
     }
 
     #[test]
-    fn owl_runtime_marker_accepts_only_qualified_linux_x64_157_0_8103_39() {
+    fn owl_runtime_marker_accepts_qualified_linux_x64_39_and_rejects_unqualified_identities() {
         let valid_with_json_version = br#"{
             "schemaVersion": 1,
             "platform": "linux",
@@ -3008,6 +3146,73 @@ mod tests {
                 "codex_runtime_unsupported"
             );
         }
+    }
+
+    #[test]
+    fn owl_runtime_marker_accepts_measured_78_and_rejects_mixed_or_unmeasured_versions() {
+        let marker_78 = br#"{
+            "schemaVersion": 1,
+            "platform": "linux",
+            "arch": "x64",
+            "version": "157.0.8103.78"
+        }"#;
+        let marker_39 = br#"{
+            "schemaVersion": 1,
+            "platform": "linux",
+            "arch": "x64",
+            "version": "157.0.8103.39"
+        }"#;
+        let marker_without_version = br#"{
+            "schemaVersion": 1,
+            "platform": "linux",
+            "arch": "x64"
+        }"#;
+
+        verify_owl_runtime_marker_bytes(marker_78, None)
+            .expect("measured 78 JSON version should pass");
+        verify_owl_runtime_marker_bytes(marker_78, Some("157.0.8103.78\n"))
+            .expect("matching 78 JSON and sibling versions should pass");
+        verify_owl_runtime_marker_bytes(marker_without_version, Some("157.0.8103.78\n"))
+            .expect("sibling-only 78 version should pass");
+
+        // Individually allowlisted marker/sibling values must still agree exactly.
+        for (marker, sibling) in [
+            (marker_78.as_slice(), Some("157.0.8103.39\n")),
+            (marker_39.as_slice(), Some("157.0.8103.78\n")),
+        ] {
+            assert_eq!(
+                verify_owl_runtime_marker_bytes(marker, sibling)
+                    .expect_err("mixed allowlisted versions must fail")
+                    .code,
+                "codex_runtime_unsupported"
+            );
+        }
+
+        // Adjacent, truncated, and prefixed versions must never be accepted by range or prefix.
+        for unmeasured in [
+            br#"{"schemaVersion":1,"platform":"linux","arch":"x64","version":"157.0.8103.40"}"#
+                .as_slice(),
+            br#"{"schemaVersion":1,"platform":"linux","arch":"x64","version":"157.0.8103.780"}"#
+                .as_slice(),
+            br#"{"schemaVersion":1,"platform":"linux","arch":"x64","version":"157.0.8103"}"#
+                .as_slice(),
+            br#"{"schemaVersion":1,"platform":"linux","arch":"x64","version":"v157.0.8103.78"}"#
+                .as_slice(),
+        ] {
+            assert_eq!(
+                verify_owl_runtime_marker_bytes(unmeasured, None)
+                    .expect_err("unmeasured marker must fail")
+                    .code,
+                "codex_runtime_unsupported"
+            );
+        }
+
+        assert_eq!(
+            verify_owl_runtime_marker_bytes(marker_78, Some("157.0.8103.78-extra\n"))
+                .expect_err("suffixed sibling version must fail")
+                .code,
+            "codex_runtime_unsupported"
+        );
     }
 
     #[test]
@@ -3312,6 +3517,20 @@ mod tests {
 
         static COMPOSITOR_SPEC_SEQ: AtomicU64 = AtomicU64::new(1);
 
+        fn hypr_lua_probe_event(hex_address: &str) -> String {
+            format!(
+                "COMP:HYPR:eval local d=hl.dsp.focus({{window=\"address:{hex_address}\"}}); assert(d ~= nil)"
+            )
+        }
+
+        fn hypr_lua_focus_event(hex_address: &str) -> String {
+            format!("COMP:HYPR:dispatch hl.dsp.focus({{window=\"address:{hex_address}\"}})")
+        }
+
+        fn hypr_legacy_focus_event(hex_address: &str) -> String {
+            format!("COMP:HYPR:dispatch focuswindow address:{hex_address}")
+        }
+
         #[derive(Debug, Clone, Serialize, Deserialize)]
         struct FakeHyprWindow {
             address: String,
@@ -3338,12 +3557,25 @@ mod tests {
             HangMs(u64),
         }
 
+        /// Inline fixture config style for the verified Hyprland dispatch protocol.
+        ///
+        /// A Lua-config fixture accepts the fixed read-only constructor probe, rejects legacy
+        /// `dispatch focuswindow` syntax, and only effects focus for the Lua dispatcher command.
+        /// A legacy fixture answers with the exact 0.56 non-Lua capability reply and only
+        /// effects focus for the legacy dispatch command.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+        enum FakeHyprlandConfigStyle {
+            Legacy,
+            Lua,
+        }
+
         #[derive(Debug, Clone, Serialize, Deserialize)]
         enum FakeCompositorFlavor {
             Hyprland {
                 clients: Vec<FakeHyprWindow>,
                 initial_active: Option<FakeHyprWindow>,
                 dispatch_behavior: FakeDispatchBehavior,
+                config_style: FakeHyprlandConfigStyle,
             },
             Sway {
                 windows: Vec<FakeSwayWindow>,
@@ -3481,6 +3713,35 @@ mod tests {
             .expect("serialize fake Sway tree")
         }
 
+        fn lua_constructor_probe_address(cmd: &str) -> Option<&str> {
+            cmd.strip_prefix("eval local d=hl.dsp.focus({window=\"address:")
+                .and_then(|rest| rest.strip_suffix("\"}); assert(d ~= nil)"))
+        }
+
+        fn lua_focus_dispatch_address(cmd: &str) -> Option<&str> {
+            cmd.strip_prefix("dispatch hl.dsp.focus({window=\"address:")
+                .and_then(|rest| rest.strip_suffix("\"})"))
+        }
+
+        fn fake_hyprland_dispatch_result(
+            clients: &[FakeHyprWindow],
+            dispatch_behavior: &FakeDispatchBehavior,
+            addr: &str,
+        ) -> Result<(Option<FakeHyprWindow>, Vec<u8>), u64> {
+            match dispatch_behavior {
+                FakeDispatchBehavior::FocusTargetAndReplyOk => {
+                    let matched = clients
+                        .iter()
+                        .find(|c| c.address == addr && c.mapped && !c.hidden)
+                        .cloned();
+                    Ok((matched, b"ok".to_vec()))
+                }
+                FakeDispatchBehavior::KeepUnfocusedAndReplyOk => Ok((None, b"ok".to_vec())),
+                FakeDispatchBehavior::ReplyError => Ok((None, b"unknown request".to_vec())),
+                FakeDispatchBehavior::HangMs(ms) => Err(*ms),
+            }
+        }
+
         async fn handle_fake_compositor_client(
             mut stream: UnixStream,
             state: Arc<Mutex<FakeCompositorRuntimeState>>,
@@ -3526,33 +3787,69 @@ mod tests {
                         FakeCompositorFlavor::Hyprland {
                             clients,
                             dispatch_behavior,
+                            config_style,
                             ..
                         } => {
                             if cmd == "j/clients" {
                                 HyprAction::Reply(
                                     serde_json::to_vec(clients).expect("serialize clients"),
                                 )
+                            } else if lua_constructor_probe_address(&cmd).is_some() {
+                                match config_style {
+                                    FakeHyprlandConfigStyle::Lua => {
+                                        // The pure constructor returns a dispatcher object without
+                                        // invoking it.
+                                        HyprAction::Reply(b"ok".to_vec())
+                                    }
+                                    FakeHyprlandConfigStyle::Legacy => {
+                                        // Exact non-Lua capability reply for the fixed probe.
+                                        HyprAction::Reply(
+                                            b"eval is only supported with the lua config manager"
+                                                .to_vec(),
+                                        )
+                                    }
+                                }
                             } else if let Some(addr) =
                                 cmd.strip_prefix("dispatch focuswindow address:")
                             {
-                                match dispatch_behavior {
-                                    FakeDispatchBehavior::FocusTargetAndReplyOk => {
-                                        let matched = clients
-                                            .iter()
-                                            .find(|c| c.address == addr && c.mapped && !c.hidden)
-                                            .cloned();
-                                        if let Some(win) = matched {
-                                            guard.hypr_active = Some(win);
+                                if *config_style == FakeHyprlandConfigStyle::Lua {
+                                    // Lua config cannot compile the former dispatcher input.
+                                    HyprAction::Reply(
+                                        b"error: syntax error near 'focuswindow'".to_vec(),
+                                    )
+                                } else {
+                                    match fake_hyprland_dispatch_result(
+                                        clients,
+                                        dispatch_behavior,
+                                        addr,
+                                    ) {
+                                        Ok((matched, reply)) => {
+                                            if let Some(win) = matched {
+                                                guard.hypr_active = Some(win);
+                                            }
+                                            HyprAction::Reply(reply)
                                         }
-                                        HyprAction::Reply(b"ok".to_vec())
+                                        Err(ms) => HyprAction::Hang(ms),
                                     }
-                                    FakeDispatchBehavior::KeepUnfocusedAndReplyOk => {
-                                        HyprAction::Reply(b"ok".to_vec())
+                                }
+                            } else if let Some(addr) = lua_focus_dispatch_address(&cmd) {
+                                if *config_style == FakeHyprlandConfigStyle::Legacy {
+                                    // Legacy config does not understand the Lua dispatcher form.
+                                    HyprAction::Reply(b"unknown request".to_vec())
+                                } else {
+                                    match fake_hyprland_dispatch_result(
+                                        clients,
+                                        dispatch_behavior,
+                                        addr,
+                                    ) {
+                                        Ok((matched, reply)) => {
+                                            if let Some(win) = matched {
+                                                guard.hypr_active = Some(win);
+                                            }
+                                            HyprAction::Reply(reply)
+                                        }
+                                        Err(ms) => HyprAction::Hang(ms),
                                     }
-                                    FakeDispatchBehavior::ReplyError => {
-                                        HyprAction::Reply(b"unknown request".to_vec())
-                                    }
-                                    FakeDispatchBehavior::HangMs(ms) => HyprAction::Hang(*ms),
                                 }
                             } else if cmd == "j/activewindow" {
                                 let bytes = match hypr_active {
@@ -3947,12 +4244,20 @@ mod tests {
                 Self::new_with_flavor(Self::default_hyprland_flavor(self_pid))
             }
 
+            fn new_hyprland_legacy() -> Self {
+                let self_pid = std::process::id();
+                Self::new_with_flavor(Self::legacy_hyprland_flavor(self_pid))
+            }
+
             fn new_sway() -> Self {
                 let self_pid = std::process::id();
                 Self::new_with_flavor(Self::default_sway_flavor(self_pid))
             }
 
-            fn default_hyprland_flavor(codex_pid: u32) -> FakeCompositorFlavor {
+            fn hyprland_flavor(
+                codex_pid: u32,
+                config_style: FakeHyprlandConfigStyle,
+            ) -> FakeCompositorFlavor {
                 let other_win = FakeHyprWindow {
                     address: "0x1000a0".to_string(),
                     mapped: true,
@@ -3972,7 +4277,17 @@ mod tests {
                     // Start unfocused so URI ACK alone cannot pass active-window verification.
                     initial_active: Some(other_win),
                     dispatch_behavior: FakeDispatchBehavior::FocusTargetAndReplyOk,
+                    config_style,
                 }
+            }
+
+            fn default_hyprland_flavor(codex_pid: u32) -> FakeCompositorFlavor {
+                // Current inline fixtures model the installed Lua-config Hyprland behavior.
+                Self::hyprland_flavor(codex_pid, FakeHyprlandConfigStyle::Lua)
+            }
+
+            fn legacy_hyprland_flavor(codex_pid: u32) -> FakeCompositorFlavor {
+                Self::hyprland_flavor(codex_pid, FakeHyprlandConfigStyle::Legacy)
             }
 
             fn default_sway_flavor(codex_pid: u32) -> FakeCompositorFlavor {
@@ -4226,6 +4541,72 @@ mod tests {
                 listener
             }
 
+            fn create_codex_profile_dir(&self, codex_dir: &Path) {
+                DirBuilder::new()
+                    .mode(0o700)
+                    .recursive(true)
+                    .create(codex_dir)
+                    .expect("create Codex profile dir");
+                fs::set_permissions(codex_dir, fs::Permissions::from_mode(0o700))
+                    .expect("chmod Codex profile dir");
+            }
+
+            fn install_live_profile(&self, codex_dir: &Path) {
+                self.create_codex_profile_dir(codex_dir);
+                symlink(
+                    format!("nixos-host-{}", self.self_pid),
+                    codex_dir.join(SINGLETON_LOCK_FILENAME),
+                )
+                .expect("symlink SingletonLock");
+                symlink(SECRET_COOKIE, codex_dir.join(SINGLETON_COOKIE_FILENAME))
+                    .expect("symlink profile SingletonCookie");
+                symlink(&self.socket_path, codex_dir.join(SINGLETON_SOCKET_FILENAME))
+                    .expect("symlink SingletonSocket");
+            }
+
+            fn install_stale_profile(&self, codex_dir: &Path) {
+                self.create_codex_profile_dir(codex_dir);
+                symlink("dead-host-999999", codex_dir.join(SINGLETON_LOCK_FILENAME))
+                    .expect("symlink stale SingletonLock");
+                symlink(
+                    "stale_cookie_value",
+                    codex_dir.join(SINGLETON_COOKIE_FILENAME),
+                )
+                .expect("symlink stale SingletonCookie");
+            }
+
+            fn write_runtime_marker_version(
+                &self,
+                marker_version: Option<&str>,
+                sibling_version: Option<&str>,
+            ) {
+                fs::set_permissions(&self.runtime_dir, fs::Permissions::from_mode(0o755))
+                    .expect("make runtime dir writable for fixture rewrite");
+                let marker_path = self.runtime_dir.join(OWL_RUNTIME_MARKER_FILENAME);
+                let version_path = self.runtime_dir.join(OWL_RUNTIME_VERSION_FILENAME);
+                let _ = fs::remove_file(&marker_path);
+                let _ = fs::remove_file(&version_path);
+
+                let marker_json = match marker_version {
+                    Some(version) => format!(
+                        r#"{{"schemaVersion":1,"platform":"linux","arch":"x64","version":"{version}"}}"#
+                    ),
+                    None => r#"{"schemaVersion":1,"platform":"linux","arch":"x64"}"#.to_string(),
+                };
+                fs::write(&marker_path, marker_json).expect("write runtime marker");
+                fs::set_permissions(&marker_path, fs::Permissions::from_mode(0o444))
+                    .expect("chmod runtime marker");
+
+                if let Some(version) = sibling_version {
+                    fs::write(&version_path, format!("{version}\n")).expect("write version file");
+                    fs::set_permissions(&version_path, fs::Permissions::from_mode(0o444))
+                        .expect("chmod version file");
+                }
+
+                fs::set_permissions(&self.runtime_dir, fs::Permissions::from_mode(0o555))
+                    .expect("seal runtime dir");
+            }
+
             fn wire_events(&self) -> Vec<String> {
                 match fs::read_to_string(&self.event_log_path) {
                     Ok(raw) => raw.lines().map(str::to_string).collect(),
@@ -4265,6 +4646,7 @@ mod tests {
                     proc_root: self.proc_root.clone(),
                     profile_source: LinuxProfileSource::ExplicitEnv {
                         xdg_config_home: Some(self.xdg_dir.clone().into_os_string()),
+                        captured_xdg_config_home: None,
                         home: None,
                         extra_candidates: Vec::new(),
                     },
@@ -4319,6 +4701,42 @@ mod tests {
             incoming
         }
 
+        fn spawn_singleton_ack_server(
+            listener: UnixListener,
+            event_log_path: PathBuf,
+        ) -> tokio::task::JoinHandle<()> {
+            tokio::spawn(async move {
+                let (mut stream, _) =
+                    tokio::time::timeout(Duration::from_secs(3), listener.accept())
+                        .await
+                        .expect("accept timeout")
+                        .expect("accept");
+                let _incoming = read_singleton_frame_bounded(&mut stream).await;
+                append_wire_event(&event_log_path, "OWL_SINGLETON:START");
+                stream.write_all(b"ACK").await.expect("write ACK");
+                stream.shutdown().await.expect("shutdown");
+            })
+        }
+
+        async fn assert_no_singleton_bytes(listener: &UnixListener, label: &str) {
+            match tokio::time::timeout(Duration::from_millis(250), listener.accept()).await {
+                Err(_) => {}
+                Ok(Ok((mut stream, _))) => {
+                    let mut received = Vec::new();
+                    let _ = tokio::time::timeout(
+                        Duration::from_millis(150),
+                        stream.read_to_end(&mut received),
+                    )
+                    .await;
+                    assert!(
+                        received.is_empty(),
+                        "{label}: pre-send rejection still wrote URI bytes"
+                    );
+                }
+                Ok(Err(err)) => panic!("{label}: singleton listener failed: {err}"),
+            }
+        }
+
         #[tokio::test]
         async fn hyprland_happy_path_preflights_sends_exact_owl_frame_once_focuses_and_confirms() {
             let harness = DisposableOwlHarness::new();
@@ -4346,6 +4764,8 @@ mod tests {
             let outcome = activator
                 .activate(&DisposableOwlHarness::sample_request())
                 .await;
+            // The Lua fixture rejects `dispatch focuswindow ...`; success proves the fixed
+            // constructor probe selected and dispatched the Lua form exactly once.
             assert_eq!(outcome, ActivationPortOutcome::Submitted);
 
             join_bounded(server, "hyprland singleton server").await;
@@ -4357,16 +4777,349 @@ mod tests {
                 captured.lock().expect("lock").as_slice(),
                 expected_frame.as_bytes()
             );
-            let expected_focus =
-                format!("COMP:HYPR:dispatch focuswindow address:{DEFAULT_HYPR_WINDOW_ADDR}");
+            let expected_probe = hypr_lua_probe_event(DEFAULT_HYPR_WINDOW_ADDR);
+            let expected_focus = hypr_lua_focus_event(DEFAULT_HYPR_WINDOW_ADDR);
             assert_eq!(
                 harness.wire_events(),
                 vec![
                     "COMP:HYPR:j/clients",
+                    expected_probe.as_str(),
                     "OWL_SINGLETON:START",
                     expected_focus.as_str(),
                     "COMP:HYPR:j/activewindow",
                 ]
+            );
+        }
+
+        #[tokio::test]
+        async fn hyprland_legacy_happy_path_selects_legacy_capability_and_focuses_once() {
+            for legacy_reply in [
+                b"eval is only supported with the lua config manager".as_slice(),
+                b"unknown request".as_slice(),
+            ] {
+                let mut harness = DisposableOwlHarness::new_hyprland_legacy();
+                let mut flavor = DisposableOwlHarness::default_hyprland_flavor(harness.self_pid);
+                if let FakeCompositorFlavor::Hyprland { config_style, .. } = &mut flavor {
+                    *config_style = FakeHyprlandConfigStyle::Legacy;
+                }
+                harness.restart_compositor(
+                    flavor,
+                    vec![
+                        None,
+                        Some(ScriptedCompositorReply::RawBytes(legacy_reply.to_vec())),
+                    ],
+                    0o600,
+                );
+                assert_ne!(harness.compositor_pid(), harness.self_pid);
+                let listener = harness.bind_singleton_listener();
+
+                let captured = Arc::new(Mutex::new(Vec::<u8>::new()));
+                let captured_server = Arc::clone(&captured);
+                let event_log = harness.event_log_path.clone();
+
+                let server = tokio::spawn(async move {
+                    let (mut stream, _) =
+                        tokio::time::timeout(Duration::from_secs(3), listener.accept())
+                            .await
+                            .expect("accept timeout")
+                            .expect("accept client");
+                    let incoming = read_singleton_frame_bounded(&mut stream).await;
+                    append_wire_event(&event_log, "OWL_SINGLETON:START");
+                    *captured_server.lock().expect("lock captured") = incoming;
+                    stream.write_all(b"ACK").await.expect("write ACK");
+                    stream.shutdown().await.expect("shutdown server");
+                });
+
+                let activator = LinuxOwlCodexActivator::with_config(harness.config());
+                let outcome = activator
+                    .activate(&DisposableOwlHarness::sample_request())
+                    .await;
+                assert_eq!(outcome, ActivationPortOutcome::Submitted);
+
+                join_bounded(server, "legacy hyprland singleton server").await;
+                let expected_frame = format!(
+                    "START\0/workspace/project-alpha\0{}\0codex://threads/{TEST_UUID}",
+                    harness.exe_path.to_str().expect("utf8 exe")
+                );
+                assert_eq!(
+                    captured.lock().expect("lock").as_slice(),
+                    expected_frame.as_bytes()
+                );
+                let expected_probe = hypr_lua_probe_event(DEFAULT_HYPR_WINDOW_ADDR);
+                let expected_focus = hypr_legacy_focus_event(DEFAULT_HYPR_WINDOW_ADDR);
+                assert_eq!(
+                    harness.wire_events(),
+                    vec![
+                        "COMP:HYPR:j/clients",
+                        expected_probe.as_str(),
+                        "OWL_SINGLETON:START",
+                        expected_focus.as_str(),
+                        "COMP:HYPR:j/activewindow",
+                    ]
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn hyprland_capability_ambiguity_error_and_timeout_reject_before_singleton_bytes() {
+            let cases = [
+                (
+                    ScriptedCompositorReply::RawBytes(b"unsupported".to_vec()),
+                    "unverified unsupported token",
+                    Duration::from_millis(1_200),
+                    Duration::from_millis(450),
+                ),
+                (
+                    ScriptedCompositorReply::RawBytes(b"ok\nunsupported".to_vec()),
+                    "ambiguous capability",
+                    Duration::from_millis(1_200),
+                    Duration::from_millis(450),
+                ),
+                (
+                    ScriptedCompositorReply::RawBytes(b"error: capability denied".to_vec()),
+                    "error capability",
+                    Duration::from_millis(1_200),
+                    Duration::from_millis(450),
+                ),
+                (
+                    ScriptedCompositorReply::RawBytes(b"unsupported extra".to_vec()),
+                    "non-exact unsupported capability",
+                    Duration::from_millis(1_200),
+                    Duration::from_millis(450),
+                ),
+                (
+                    ScriptedCompositorReply::RepeatedByte {
+                        byte: b' ',
+                        count: MAX_COMPOSITOR_RESPONSE_LIMIT_BYTES,
+                    },
+                    "oversized capability",
+                    Duration::from_millis(1_200),
+                    Duration::from_millis(450),
+                ),
+                (
+                    ScriptedCompositorReply::CloseImmediately,
+                    "empty capability",
+                    Duration::from_millis(1_200),
+                    Duration::from_millis(450),
+                ),
+                (
+                    ScriptedCompositorReply::HangMs(500),
+                    "capability timeout",
+                    Duration::from_millis(1_200),
+                    Duration::from_millis(100),
+                ),
+            ];
+
+            for (reply, label, deadline, step_timeout) in cases {
+                let mut harness = DisposableOwlHarness::new();
+                let listener = harness.bind_singleton_listener();
+                harness.restart_compositor(
+                    DisposableOwlHarness::default_hyprland_flavor(harness.self_pid),
+                    vec![None, Some(reply)],
+                    0o600,
+                );
+
+                let mut cfg = harness.config();
+                cfg.deadline = deadline;
+                cfg.step_timeout = step_timeout;
+                match LinuxOwlCodexActivator::with_config(cfg)
+                    .activate(&DisposableOwlHarness::sample_request())
+                    .await
+                {
+                    ActivationPortOutcome::RejectedBeforeSend(err) => {
+                        assert_eq!(err.code, "codex_focus_unavailable", "{label}");
+                    }
+                    other => panic!("expected pre-send refusal for {label}, got {other:?}"),
+                }
+
+                assert_no_singleton_bytes(&listener, label).await;
+                let expected_probe = hypr_lua_probe_event(DEFAULT_HYPR_WINDOW_ADDR);
+                assert_eq!(
+                    harness.wire_events(),
+                    vec!["COMP:HYPR:j/clients", expected_probe.as_str()],
+                    "{label} must not dispatch or reach the singleton socket"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn hyprland_hostile_window_address_is_rejected_before_lua_probe_or_singleton_bytes() {
+            let mut harness = DisposableOwlHarness::new();
+            let listener = harness.bind_singleton_listener();
+
+            for hostile_address in [
+                "0x55a1\"}); assert(false); --",
+                "0x55a1b2c3d4e0\nreturn 1",
+                "0x55A1B2C3D4E0",
+            ] {
+                harness.clear_wire_events();
+                harness.restart_compositor(
+                    FakeCompositorFlavor::Hyprland {
+                        clients: vec![FakeHyprWindow {
+                            address: hostile_address.to_string(),
+                            mapped: true,
+                            hidden: false,
+                            class: "Codex".to_string(),
+                            pid: i64::from(harness.self_pid),
+                        }],
+                        initial_active: None,
+                        dispatch_behavior: FakeDispatchBehavior::FocusTargetAndReplyOk,
+                        config_style: FakeHyprlandConfigStyle::Lua,
+                    },
+                    Vec::new(),
+                    0o600,
+                );
+
+                match LinuxOwlCodexActivator::with_config(harness.config())
+                    .activate(&DisposableOwlHarness::sample_request())
+                    .await
+                {
+                    ActivationPortOutcome::RejectedBeforeSend(err) => {
+                        assert_eq!(err.code, "codex_focus_unavailable");
+                    }
+                    other => panic!(
+                        "expected hostile address {hostile_address:?} to fail before send, got {other:?}"
+                    ),
+                }
+
+                assert_no_singleton_bytes(&listener, "hostile address").await;
+                assert_eq!(
+                    harness.wire_events(),
+                    vec!["COMP:HYPR:j/clients"],
+                    "hostile address must never enter the Lua probe or dispatch"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn hyprland_dispatch_failure_after_send_is_unknown_without_protocol_fallback() {
+            for (config_style, label) in [
+                (FakeHyprlandConfigStyle::Lua, "lua"),
+                (FakeHyprlandConfigStyle::Legacy, "legacy"),
+            ] {
+                let self_pid = std::process::id();
+                let mut flavor = DisposableOwlHarness::default_hyprland_flavor(self_pid);
+                let FakeCompositorFlavor::Hyprland {
+                    dispatch_behavior,
+                    config_style: flavor_style,
+                    ..
+                } = &mut flavor
+                else {
+                    panic!("expected Hyprland fixture");
+                };
+                *dispatch_behavior = FakeDispatchBehavior::ReplyError;
+                *flavor_style = config_style;
+
+                let harness = DisposableOwlHarness::new_with_flavor(flavor);
+                let listener = harness.bind_singleton_listener();
+                let server = spawn_singleton_ack_server(listener, harness.event_log_path.clone());
+
+                match LinuxOwlCodexActivator::with_config(harness.config())
+                    .activate(&DisposableOwlHarness::sample_request())
+                    .await
+                {
+                    ActivationPortOutcome::UnknownAfterPossibleSend(err) => {
+                        assert_eq!(err.code, "codex_activation_unknown", "{label}");
+                    }
+                    other => panic!(
+                        "expected UnknownAfterPossibleSend for {label} dispatch failure, got {other:?}"
+                    ),
+                }
+                join_bounded(server, "dispatch failure singleton server").await;
+
+                let expected_probe = hypr_lua_probe_event(DEFAULT_HYPR_WINDOW_ADDR);
+                let expected_focus = match config_style {
+                    FakeHyprlandConfigStyle::Lua => hypr_lua_focus_event(DEFAULT_HYPR_WINDOW_ADDR),
+                    FakeHyprlandConfigStyle::Legacy => {
+                        hypr_legacy_focus_event(DEFAULT_HYPR_WINDOW_ADDR)
+                    }
+                };
+                let opposing_focus = match config_style {
+                    FakeHyprlandConfigStyle::Lua => {
+                        hypr_legacy_focus_event(DEFAULT_HYPR_WINDOW_ADDR)
+                    }
+                    FakeHyprlandConfigStyle::Legacy => {
+                        hypr_lua_focus_event(DEFAULT_HYPR_WINDOW_ADDR)
+                    }
+                };
+                let events = harness.wire_events();
+                assert_eq!(
+                    events,
+                    vec![
+                        "COMP:HYPR:j/clients",
+                        expected_probe.as_str(),
+                        "OWL_SINGLETON:START",
+                        expected_focus.as_str(),
+                    ],
+                    "{label} must dispatch exactly once and never confirm focus"
+                );
+                assert!(
+                    !events.iter().any(|event| event == &opposing_focus),
+                    "{label} must never fall back to the other Hyprland protocol"
+                );
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|event| event.contains(":dispatch "))
+                        .count(),
+                    1,
+                    "{label} must send exactly one focus dispatch after the URI"
+                );
+                assert!(
+                    !events
+                        .iter()
+                        .any(|event| event == "COMP:HYPR:j/activewindow"),
+                    "{label} must not confirm focus after a rejected dispatch"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn hyprland_legacy_ineffective_focus_is_unknown_without_lua_fallback() {
+            let self_pid = std::process::id();
+            let mut flavor = DisposableOwlHarness::legacy_hyprland_flavor(self_pid);
+            let FakeCompositorFlavor::Hyprland {
+                dispatch_behavior, ..
+            } = &mut flavor
+            else {
+                panic!("expected legacy Hyprland fixture");
+            };
+            *dispatch_behavior = FakeDispatchBehavior::KeepUnfocusedAndReplyOk;
+
+            let harness = DisposableOwlHarness::new_with_flavor(flavor);
+            let listener = harness.bind_singleton_listener();
+            let server = spawn_singleton_ack_server(listener, harness.event_log_path.clone());
+
+            match LinuxOwlCodexActivator::with_config(harness.config())
+                .activate(&DisposableOwlHarness::sample_request())
+                .await
+            {
+                ActivationPortOutcome::UnknownAfterPossibleSend(err) => {
+                    assert_eq!(err.code, "codex_activation_unknown");
+                }
+                other => panic!(
+                    "expected UnknownAfterPossibleSend for ineffective legacy focus, got {other:?}"
+                ),
+            }
+            join_bounded(server, "legacy ineffective focus singleton server").await;
+
+            let expected_probe = hypr_lua_probe_event(DEFAULT_HYPR_WINDOW_ADDR);
+            let expected_focus = hypr_legacy_focus_event(DEFAULT_HYPR_WINDOW_ADDR);
+            let opposing_focus = hypr_lua_focus_event(DEFAULT_HYPR_WINDOW_ADDR);
+            let events = harness.wire_events();
+            assert_eq!(
+                events,
+                vec![
+                    "COMP:HYPR:j/clients",
+                    expected_probe.as_str(),
+                    "OWL_SINGLETON:START",
+                    expected_focus.as_str(),
+                    "COMP:HYPR:j/activewindow",
+                ]
+            );
+            assert!(
+                !events.iter().any(|event| event == &opposing_focus),
+                "ineffective legacy focus must never fall back to the Lua protocol"
             );
         }
 
@@ -4418,6 +5171,149 @@ mod tests {
                     "COMP:SWAY:4:",
                 ]
             );
+        }
+
+        #[tokio::test]
+        async fn measured_78_and_legacy_39_runtimes_are_qualified_while_mixed_or_unmeasured_versions_fail(
+        ) {
+            // 1. Measured current marker and sibling version 157.0.8103.78 agree -> Submitted.
+            //    Legacy 157.0.8103.39 and sibling-only 78 remain qualified as well.
+            for (marker_version, sibling_version, label) in [
+                (Some("157.0.8103.78"), Some("157.0.8103.78"), "measured 78"),
+                (Some("157.0.8103.39"), Some("157.0.8103.39"), "legacy 39"),
+                (None, Some("157.0.8103.78"), "sibling-only 78"),
+            ] {
+                let harness = DisposableOwlHarness::new();
+                harness.write_runtime_marker_version(marker_version, sibling_version);
+                let listener = harness.bind_singleton_listener();
+                let server = spawn_singleton_ack_server(listener, harness.event_log_path.clone());
+
+                assert_eq!(
+                    LinuxOwlCodexActivator::with_config(harness.config())
+                        .activate(&DisposableOwlHarness::sample_request())
+                        .await,
+                    ActivationPortOutcome::Submitted,
+                    "{label} runtime must remain qualified"
+                );
+                join_bounded(server, "qualified runtime singleton server").await;
+            }
+
+            // 2. Marker/sibling pairs that are individually allowlisted but disagree fail pre-send.
+            for (marker_version, sibling_version, label) in [
+                (
+                    Some("157.0.8103.78"),
+                    Some("157.0.8103.39"),
+                    "78 marker with 39 sibling",
+                ),
+                (
+                    Some("157.0.8103.39"),
+                    Some("157.0.8103.78"),
+                    "39 marker with 78 sibling",
+                ),
+            ] {
+                let harness = DisposableOwlHarness::new();
+                harness.write_runtime_marker_version(marker_version, sibling_version);
+                let listener = harness.bind_singleton_listener();
+
+                match LinuxOwlCodexActivator::with_config(harness.config())
+                    .activate(&DisposableOwlHarness::sample_request())
+                    .await
+                {
+                    ActivationPortOutcome::RejectedBeforeSend(err) => {
+                        assert_eq!(err.code, "codex_runtime_unsupported", "{label}");
+                    }
+                    other => panic!("expected {label} to fail closed, got {other:?}"),
+                }
+                assert_no_singleton_bytes(&listener, label).await;
+            }
+
+            // 3. Unmeasured adjacent versions fail closed even when marker and sibling agree.
+            for unmeasured in ["157.0.8103.40", "157.0.8103.780", "157.0.8103"] {
+                let harness = DisposableOwlHarness::new();
+                harness.write_runtime_marker_version(Some(unmeasured), Some(unmeasured));
+                let listener = harness.bind_singleton_listener();
+
+                match LinuxOwlCodexActivator::with_config(harness.config())
+                    .activate(&DisposableOwlHarness::sample_request())
+                    .await
+                {
+                    ActivationPortOutcome::RejectedBeforeSend(err) => {
+                        assert_eq!(err.code, "codex_runtime_unsupported");
+                    }
+                    other => panic!("expected unmeasured {unmeasured} to fail, got {other:?}"),
+                }
+                assert_no_singleton_bytes(&listener, "unmeasured runtime version").await;
+            }
+        }
+
+        #[tokio::test]
+        async fn all_distinct_runtime_markers_must_resolve_to_one_version_before_send() {
+            for (root_version, resources_version, resources_sibling, agrees) in [
+                (
+                    "157.0.8103.39",
+                    "157.0.8103.78",
+                    Some("157.0.8103.78"),
+                    false,
+                ),
+                ("157.0.8103.39", "157.0.8103.78", None, false),
+                ("157.0.8103.78", "157.0.8103.39", None, false),
+                ("157.0.8103.39", "157.0.8103.39", None, true),
+                (
+                    "157.0.8103.78",
+                    "157.0.8103.78",
+                    Some("157.0.8103.78"),
+                    true,
+                ),
+            ] {
+                let harness = DisposableOwlHarness::new();
+                // No executable-side version file: each marker independently supplies evidence.
+                harness.write_runtime_marker_version(Some(root_version), None);
+                let resources = harness.runtime_dir.join("resources");
+                fs::set_permissions(&resources, fs::Permissions::from_mode(0o755))
+                    .expect("unseal resources fixture");
+                let marker = resources.join(OWL_RUNTIME_MARKER_FILENAME);
+                fs::write(
+                    &marker,
+                    format!(r#"{{"schemaVersion":1,"platform":"linux","arch":"x64","version":"{resources_version}"}}"#),
+                )
+                .expect("write distinct resources marker");
+                fs::set_permissions(&marker, fs::Permissions::from_mode(0o444))
+                    .expect("seal resources marker");
+                if let Some(version) = resources_sibling {
+                    let sibling = resources.join(OWL_RUNTIME_VERSION_FILENAME);
+                    fs::write(&sibling, format!("{version}\n")).expect("write resources version");
+                    fs::set_permissions(&sibling, fs::Permissions::from_mode(0o444))
+                        .expect("seal resources version");
+                }
+                fs::set_permissions(&resources, fs::Permissions::from_mode(0o555))
+                    .expect("seal resources fixture");
+                let listener = harness.bind_singleton_listener();
+                if agrees {
+                    let server =
+                        spawn_singleton_ack_server(listener, harness.event_log_path.clone());
+                    assert_eq!(
+                        LinuxOwlCodexActivator::with_config(harness.config())
+                            .activate(&DisposableOwlHarness::sample_request())
+                            .await,
+                        ActivationPortOutcome::Submitted,
+                    );
+                    join_bounded(server, "matching runtime markers singleton server").await;
+                } else {
+                    match LinuxOwlCodexActivator::with_config(harness.config())
+                        .activate(&DisposableOwlHarness::sample_request())
+                        .await
+                    {
+                        ActivationPortOutcome::RejectedBeforeSend(err) => {
+                            assert_eq!(err.code, "codex_runtime_unsupported");
+                        }
+                        other => {
+                            panic!("conflicting runtime markers must fail before send: {other:?}")
+                        }
+                    }
+                    assert_no_singleton_bytes(&listener, "conflicting distinct markers").await;
+                    assert!(harness.wire_events().is_empty(), "no compositor mutation");
+                }
+            }
         }
 
         #[tokio::test]
@@ -4622,6 +5518,7 @@ mod tests {
             let mut xdg_precedence_cfg = harness.config();
             xdg_precedence_cfg.profile_source = LinuxProfileSource::ExplicitEnv {
                 xdg_config_home: Some(harness.xdg_dir.clone().into_os_string()),
+                captured_xdg_config_home: None,
                 home: Some(stale_home.clone().into_os_string()),
                 extra_candidates: Vec::new(),
             };
@@ -4641,6 +5538,7 @@ mod tests {
                 let mut no_fallback_cfg = harness.config();
                 no_fallback_cfg.profile_source = LinuxProfileSource::ExplicitEnv {
                     xdg_config_home: Some(bad_explicit_xdg),
+                    captured_xdg_config_home: None,
                     home: Some(stale_home.clone().into_os_string()),
                     extra_candidates: Vec::new(),
                 };
@@ -4659,6 +5557,7 @@ mod tests {
             let mut ambig_cfg = harness.config();
             ambig_cfg.profile_source = LinuxProfileSource::ExplicitEnv {
                 xdg_config_home: Some(harness.xdg_dir.clone().into_os_string()),
+                captured_xdg_config_home: None,
                 home: None,
                 extra_candidates: vec![stale_codex],
             };
@@ -4670,6 +5569,163 @@ mod tests {
                     assert_eq!(err.code, "codex_profile_ambiguous");
                 }
                 other => panic!("expected codex_profile_ambiguous, got {other:?}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn captured_original_config_root_is_authoritative_and_fails_closed_without_fallback()
+        {
+            let harness = DisposableOwlHarness::new();
+
+            let stale_private_root = harness.base_dir.join("private-xdg");
+            harness.install_stale_profile(&stale_private_root.join("Codex"));
+
+            let stale_home_root = harness.base_dir.join("stale-home");
+            harness.install_stale_profile(&stale_home_root.join(".config").join("Codex"));
+
+            let captured_live_root = harness.base_dir.join("captured-original");
+            harness.install_live_profile(&captured_live_root.join("Codex"));
+
+            let live_home_root = harness.base_dir.join("live-home");
+            harness.install_live_profile(&live_home_root.join(".config").join("Codex"));
+
+            let captured_stale_root = harness.base_dir.join("captured-stale");
+            harness.install_stale_profile(&captured_stale_root.join("Codex"));
+
+            // 1. A present non-empty captured original root wins over a stale private XDG root.
+            {
+                let listener = harness.bind_singleton_listener();
+                let server = spawn_singleton_ack_server(listener, harness.event_log_path.clone());
+                let mut cfg = harness.config();
+                cfg.profile_source = LinuxProfileSource::ExplicitEnv {
+                    xdg_config_home: Some(stale_private_root.clone().into_os_string()),
+                    captured_xdg_config_home: Some(captured_live_root.clone().into_os_string()),
+                    home: Some(stale_home_root.clone().into_os_string()),
+                    extra_candidates: Vec::new(),
+                };
+                assert_eq!(
+                    LinuxOwlCodexActivator::with_config(cfg)
+                        .activate(&DisposableOwlHarness::sample_request())
+                        .await,
+                    ActivationPortOutcome::Submitted
+                );
+                join_bounded(server, "captured original singleton server").await;
+            }
+
+            // 2. Invalid non-empty captures fail closed without falling back to the live private XDG.
+            {
+                let listener = harness.bind_singleton_listener();
+                for invalid_capture in [
+                    PathBuf::from("relative/config-root"),
+                    PathBuf::from("/tmp/../escape-root"),
+                    harness.base_dir.join("missing-captured-root"),
+                ] {
+                    let mut cfg = harness.config();
+                    cfg.profile_source = LinuxProfileSource::ExplicitEnv {
+                        xdg_config_home: Some(harness.xdg_dir.clone().into_os_string()),
+                        captured_xdg_config_home: Some(invalid_capture.into_os_string()),
+                        home: Some(stale_home_root.clone().into_os_string()),
+                        extra_candidates: Vec::new(),
+                    };
+                    match LinuxOwlCodexActivator::with_config(cfg)
+                        .activate(&DisposableOwlHarness::sample_request())
+                        .await
+                    {
+                        ActivationPortOutcome::RejectedBeforeSend(err) => {
+                            assert_eq!(err.code, "codex_app_unavailable");
+                        }
+                        other => {
+                            panic!("expected invalid captured root to fail closed, got {other:?}")
+                        }
+                    }
+                }
+                assert_no_singleton_bytes(&listener, "invalid captured root").await;
+            }
+
+            // 3. Present-empty capture means the original XDG was unset: use HOME, never private XDG.
+            {
+                let listener = harness.bind_singleton_listener();
+                let server = spawn_singleton_ack_server(listener, harness.event_log_path.clone());
+                let mut cfg = harness.config();
+                cfg.profile_source = LinuxProfileSource::ExplicitEnv {
+                    xdg_config_home: Some(stale_private_root.clone().into_os_string()),
+                    captured_xdg_config_home: Some(std::ffi::OsString::new()),
+                    home: Some(live_home_root.clone().into_os_string()),
+                    extra_candidates: Vec::new(),
+                };
+                assert_eq!(
+                    LinuxOwlCodexActivator::with_config(cfg)
+                        .activate(&DisposableOwlHarness::sample_request())
+                        .await,
+                    ActivationPortOutcome::Submitted
+                );
+                join_bounded(server, "captured-unset home singleton server").await;
+            }
+
+            // 4. An absent capture preserves the existing explicit XDG precedence over HOME.
+            {
+                let listener = harness.bind_singleton_listener();
+                let server = spawn_singleton_ack_server(listener, harness.event_log_path.clone());
+                let mut cfg = harness.config();
+                cfg.profile_source = LinuxProfileSource::ExplicitEnv {
+                    xdg_config_home: Some(harness.xdg_dir.clone().into_os_string()),
+                    captured_xdg_config_home: None,
+                    home: Some(stale_home_root.clone().into_os_string()),
+                    extra_candidates: Vec::new(),
+                };
+                assert_eq!(
+                    LinuxOwlCodexActivator::with_config(cfg)
+                        .activate(&DisposableOwlHarness::sample_request())
+                        .await,
+                    ActivationPortOutcome::Submitted
+                );
+                join_bounded(server, "absent capture singleton server").await;
+            }
+
+            // 5. A stale captured original profile fails closed without using a live private XDG.
+            {
+                let listener = harness.bind_singleton_listener();
+                let mut cfg = harness.config();
+                cfg.profile_source = LinuxProfileSource::ExplicitEnv {
+                    xdg_config_home: Some(harness.xdg_dir.clone().into_os_string()),
+                    captured_xdg_config_home: Some(captured_stale_root.clone().into_os_string()),
+                    home: Some(live_home_root.clone().into_os_string()),
+                    extra_candidates: Vec::new(),
+                };
+                match LinuxOwlCodexActivator::with_config(cfg)
+                    .activate(&DisposableOwlHarness::sample_request())
+                    .await
+                {
+                    ActivationPortOutcome::RejectedBeforeSend(err) => {
+                        assert_eq!(err.code, "codex_app_unavailable");
+                    }
+                    other => {
+                        panic!("expected stale captured profile to fail closed, got {other:?}")
+                    }
+                }
+                assert_no_singleton_bytes(&listener, "stale captured profile").await;
+            }
+
+            // 6. Present-empty capture with no HOME fails closed instead of using the private XDG.
+            {
+                let listener = harness.bind_singleton_listener();
+                let mut cfg = harness.config();
+                cfg.profile_source = LinuxProfileSource::ExplicitEnv {
+                    xdg_config_home: Some(harness.xdg_dir.clone().into_os_string()),
+                    captured_xdg_config_home: Some(std::ffi::OsString::new()),
+                    home: None,
+                    extra_candidates: Vec::new(),
+                };
+                match LinuxOwlCodexActivator::with_config(cfg)
+                    .activate(&DisposableOwlHarness::sample_request())
+                    .await
+                {
+                    ActivationPortOutcome::RejectedBeforeSend(err) => {
+                        assert_eq!(err.code, "codex_app_unavailable");
+                    }
+                    other => panic!("expected missing HOME to fail closed, got {other:?}"),
+                }
+                assert_no_singleton_bytes(&listener, "captured-unset without HOME").await;
             }
         }
 
@@ -4734,6 +5790,7 @@ mod tests {
                     }],
                     initial_active: None,
                     dispatch_behavior: FakeDispatchBehavior::FocusTargetAndReplyOk,
+                    config_style: FakeHyprlandConfigStyle::Lua,
                 },
                 Vec::new(),
                 0o600,
@@ -4773,6 +5830,7 @@ mod tests {
                     ],
                     initial_active: None,
                     dispatch_behavior: FakeDispatchBehavior::FocusTargetAndReplyOk,
+                    config_style: FakeHyprlandConfigStyle::Lua,
                 },
                 Vec::new(),
                 0o600,
@@ -5136,7 +6194,7 @@ mod tests {
                 });
 
                 let mut cfg = harness.config();
-                cfg.deadline = Duration::from_millis(140);
+                cfg.deadline = Duration::from_millis(1_200);
                 cfg.step_timeout = Duration::from_millis(120);
                 let activator = LinuxOwlCodexActivator::with_config(cfg);
                 match activator
@@ -5227,8 +6285,9 @@ mod tests {
                             class: "Threadlane".to_string(),
                             pid: i64::from(harness.self_pid) + 500,
                         }),
-                        // Returns `"ok"` on `dispatch focuswindow`, but active window remains `0x1000a0`!
+                        // Returns `"ok"` on the Lua focus dispatch, but active window remains `0x1000a0`!
                         dispatch_behavior: FakeDispatchBehavior::KeepUnfocusedAndReplyOk,
+                        config_style: FakeHyprlandConfigStyle::Lua,
                     },
                     Vec::new(),
                     0o600,
@@ -5282,12 +6341,13 @@ mod tests {
                 join_bounded(server, "unfocused hyprland singleton server").await;
 
                 let events_after_first = harness.wire_events();
-                let expected_focus =
-                    format!("COMP:HYPR:dispatch focuswindow address:{DEFAULT_HYPR_WINDOW_ADDR}");
+                let expected_probe = hypr_lua_probe_event(DEFAULT_HYPR_WINDOW_ADDR);
+                let expected_focus = hypr_lua_focus_event(DEFAULT_HYPR_WINDOW_ADDR);
                 assert_eq!(
                     events_after_first,
                     vec![
                         "COMP:HYPR:j/clients",
+                        expected_probe.as_str(),
                         "OWL_SINGLETON:START",
                         expected_focus.as_str(),
                         "COMP:HYPR:j/activewindow",
@@ -5435,7 +6495,8 @@ mod tests {
                             pid: i64::from(harness.self_pid),
                         }],
                         initial_active: None,
-                        dispatch_behavior: FakeDispatchBehavior::HangMs(350),
+                        dispatch_behavior: FakeDispatchBehavior::HangMs(1_500),
+                        config_style: FakeHyprlandConfigStyle::Lua,
                     },
                     Vec::new(),
                     0o600,
@@ -5453,8 +6514,8 @@ mod tests {
                 });
 
                 let mut cfg = harness.config();
-                cfg.deadline = Duration::from_millis(200);
-                cfg.step_timeout = Duration::from_millis(120);
+                cfg.deadline = Duration::from_millis(1_200);
+                cfg.step_timeout = Duration::from_millis(150);
                 let activator = LinuxOwlCodexActivator::with_config(cfg);
                 match activator
                     .activate(&DisposableOwlHarness::sample_request())

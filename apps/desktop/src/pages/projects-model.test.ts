@@ -987,7 +987,7 @@ test('missing usage stays Usage unknown, requested model is not faked as observe
   const call = projection.projects[0]?.sessions[0]?.calls[0];
   assert.ok(call);
   assert.equal(call.usageLabel, 'Usage unknown');
-  assert.equal(call.model, 'DeepSeek');
+  assert.equal(call.model, 'DeepSeek Flash 4.1');
   assert.equal(call.effort, 'max');
   assert.equal(call.brand, 'opencode');
   assert.match(
@@ -996,6 +996,48 @@ test('missing usage stays Usage unknown, requested model is not faked as observe
   );
   assert.match(call.detail, /Effort: requested max · observed Not reported\./);
   assert.doesNotMatch(call.detail, /1,000/);
+});
+
+test('requested Flash and observed Pro variants keep distinct labels and raw evidence', () => {
+  const child = makeCall({
+    id: 'call-flash-pro',
+    title: 'Check variant evidence',
+    executor: makeExecutor({
+      requested_model: 'opencode-go/deepseek-v4.1-flash',
+      observed_model: 'deepseek-v4.1-flash-pro',
+      requested_effort: 'max',
+      observed_effort: 'max',
+      tool: 'opencode-go',
+      provider: 'opencode-go',
+    }),
+    usage: null,
+  });
+
+  const snapshot = makeSnapshot({
+    requests: [
+      makeRequest({
+        id: 'req-flash-pro',
+        children: [child],
+        children_count: 1,
+      }),
+    ],
+  });
+
+  const projection = projectProjects(snapshot, { nowMs: NOW_MS });
+  const call = projection.projects[0]?.sessions[0]?.calls[0];
+  assert.ok(call);
+  assert.equal(
+    call.model,
+    'req DeepSeek Flash 4.1 · obs DeepSeek · deepseek-v4.1-flash-pro'
+  );
+  assert.notEqual(call.model, 'DeepSeek Flash 4.1');
+  assert.equal(call.effort, 'max');
+  assert.equal(call.brand, 'opencode');
+  assert.match(
+    call.detail,
+    /Model: requested opencode-go\/deepseek-v4\.1-flash · observed deepseek-v4\.1-flash-pro\./
+  );
+  assert.match(call.detail, /Effort: requested max · observed max\./);
 });
 
 test('partial source coverage and bounded snapshot flags surface unavailable counts and warnings', () => {
