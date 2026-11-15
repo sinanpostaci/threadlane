@@ -4,6 +4,18 @@ Codex can drive Threadlane through trusted local commands when the desktop's
 public app-server control socket is unavailable. Planning, approval and steering
 stay in Codex. The desktop is an optional view of the same stores.
 
+Native Codex is the Coworker; desktop/UI automation is optional observation.
+Missing windows, screenshots, browser tools or computer-control access alone must
+not block an otherwise authorized ordinary Worker. Explicit task-specific UI acceptance still applies. Genuine human observation
+is sufficient only when it meets that condition; it does not replace
+explicitly required instrumented evidence. Do not invent an extra UI visit or
+repeated approval.
+
+Human-facing progress, questions, and summaries follow the active human conversation
+language, not tool/provider output language; software labels, code, comments,
+identifiers, and documentation remain English unless the human explicitly asks
+otherwise. Do not translate protocol IDs or add locale configuration.
+
 `--binding` and `--thread` confirm the selected target against Threadlane's
 authenticated supervisor. They do not authenticate the native caller or prove
 human approval. Results report `route: "trusted_local_operator"` and
@@ -16,7 +28,7 @@ Run `threadlane guide` to print the canonical versioned operating guide
 ([`docs/MCP-OPERATING-GUIDE.md`](MCP-OPERATING-GUIDE.md)) offline without network
 or supervisor access. When connected over MCP (`threadlane mcp` or enrolled
 `threadlane-native-mcp`), call the read-only `operating_guide` (`{}`) tool to
-fetch the same shared guide and version (`2026-11-13.v1`).
+fetch the same shared guide and version (`2026-11-15.v1`).
 
 Compaction detection and memory retention are not automatic. On initial
 connection, session resume, context uncertainty, or before external effects when
@@ -43,6 +55,17 @@ repository, base, or task identity needs a fresh concrete preview. Real Worker
 execution still requires a frozen execution profile and registry revision plus
 exact model/effort/canonical pins in the authority; a Coworker-only backlog item
 has no execution profile. Only the multi-role stages are optional.
+
+The ordinary Worker sequence is one exact human scope approval, refresh required
+live identity/revisions, guarded start exactly once, wait for an actual callback
+without MCP polling loops, pull/ACK the real batch, recover the original
+item/execution mapping, read the durable result, inspect real physical delivery,
+then guarded complete or truthful reject. Missing notice or reply uses the
+original receipt/result; possible effects or `Unknown` never permit redispatch.
+Preserve legitimate startup, authority, binding, readiness, revision, and digest
+refusals; UI availability replaces none of them, and supported host startup is
+still required. `Doing` is not liveness; `NeedsYou` only for an actual open human
+decision or question.
 
 On the managed Linux Codex desktop route, call the no-argument
 `connect_current_chat` MCP tool on first use, then `operating_guide`. It verifies

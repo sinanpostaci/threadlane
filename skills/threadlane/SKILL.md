@@ -10,8 +10,18 @@ your model in Codex; Threadlane profiles select execution roles. Infer from the
 conversation whether the human wants to discuss an idea, track work, run an
 approved Worker task, continue legacy multi-role work, or inspect status.
 
-Write code, comments, labels, and documentation in English. Answer the human in
-their language.
+Native Codex is the Coworker; desktop/UI automation is optional observation
+(windows, screenshots, browser tools, and computer-control access), not a
+prerequisite. Missing windows, screenshots, browser tools or computer-control
+access alone must not block an otherwise authorized ordinary Worker. Explicit task-specific UI acceptance still applies. Genuine human observation
+is sufficient only when it meets that condition; it does not replace
+explicitly required instrumented evidence. Do not invent an extra UI visit or
+repeated approval.
+
+Human-facing progress, questions, and summaries follow the active human conversation
+language, not tool/provider output language. Write software labels, code, comments,
+identifiers, and documentation in English unless the human explicitly asks
+otherwise; do not translate protocol IDs or add locale configuration.
 
 ## Connect and recover context
 
@@ -68,6 +78,17 @@ authorization. Within that unchanged scope, reuse the exact existing approval;
 changed scope, model, effort, quota, repository, base, or task identity needs a
 fresh preview. Never self-approve or treat a profile, backlog edit, worker
 prose, or CLI flag as authority.
+
+Ordinary Worker sequence: one exact human scope approval, refresh required live
+identity/revisions, guarded start exactly once, wait for an actual callback
+without MCP polling loops, pull/ACK the real batch, recover the original
+item/`execution_ref` mapping, read the durable result, inspect real physical
+delivery, then guarded complete or truthful reject. A missing notice or reply
+uses the original receipt/result; possible effects or `Unknown` never permit
+redispatch. Preserve legitimate startup, authority, binding, readiness, revision,
+and digest refusals; UI availability never replaces them, and supported host
+startup is still required. `Doing` is not liveness; `NeedsYou` only for an actual
+open human decision or question.
 
 Use the guarded paired tools only with real enrollment and the exact frozen
 approval/task identity:

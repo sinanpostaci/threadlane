@@ -656,7 +656,7 @@ async fn operating_guide_and_startup_instructions_report_current_version_and_wor
 {
     use rmcp::handler::server::wrapper::Parameters;
 
-    assert_eq!(OPERATING_GUIDE_VERSION, "2026-11-13.v1");
+    assert_eq!(OPERATING_GUIDE_VERSION, "2026-11-15.v1");
     assert!(SCOPED_MCP_STARTUP_INSTRUCTIONS.contains(OPERATING_GUIDE_VERSION));
     assert!(PAIRED_MCP_STARTUP_INSTRUCTIONS.contains(OPERATING_GUIDE_VERSION));
     assert!(OPERATING_GUIDE_MARKDOWN.contains(OPERATING_GUIDE_VERSION));
@@ -665,7 +665,7 @@ async fn operating_guide_and_startup_instructions_report_current_version_and_wor
     assert!(OPERATING_GUIDE_MARKDOWN.contains("role_label"));
 
     let current = OperatingGuideResponse::current();
-    assert_eq!(current.version, "2026-11-13.v1");
+    assert_eq!(current.version, "2026-11-15.v1");
     assert_eq!(current.guide_markdown, OPERATING_GUIDE_MARKDOWN);
 
     let tmp = TempDir::new().expect("tempdir");
@@ -687,7 +687,7 @@ async fn operating_guide_and_startup_instructions_report_current_version_and_wor
         .description
         .as_deref()
         .expect("scoped operating_guide description");
-    assert!(scoped_desc.contains("2026-11-13.v1"));
+    assert!(scoped_desc.contains("2026-11-15.v1"));
     assert!(scoped_desc.contains("Worker (coder)"));
     assert!(scoped_desc.contains("complete job admission"));
 
@@ -706,7 +706,7 @@ async fn operating_guide_and_startup_instructions_report_current_version_and_wor
         .description
         .as_deref()
         .expect("paired operating_guide description");
-    assert!(paired_desc.contains("2026-11-13.v1"));
+    assert!(paired_desc.contains("2026-11-15.v1"));
     assert!(paired_desc.contains("Worker (coder)"));
     assert!(paired_desc.contains("complete job admission"));
 
@@ -738,7 +738,7 @@ async fn operating_guide_and_startup_instructions_report_current_version_and_wor
         .expect("paired operating_guide")
         .structured_content
         .expect("structured guide");
-    assert_eq!(guide_res["data"]["version"], "2026-11-13.v1");
+    assert_eq!(guide_res["data"]["version"], "2026-11-15.v1");
     assert_eq!(
         guide_res["data"]["guide_markdown"],
         OPERATING_GUIDE_MARKDOWN

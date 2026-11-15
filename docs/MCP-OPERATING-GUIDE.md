@@ -1,6 +1,6 @@
 # Threadlane MCP operating guide
 
-Version: `2026-11-13.v1`
+Version: `2026-11-15.v1`
 
 ## Act as the Coworker in the native Codex conversation
 
@@ -17,6 +17,13 @@ Version: `2026-11-13.v1`
   `Orchestrator`, `Advisor` (legacy frozen `Architect`/`architect`), `Reviewer`,
   or `Closure` stage. Optional legacy multi-role workflows remain explicit opt-in,
   and historical jobs stay readable.
+- Native Codex remains the Coworker; desktop/UI automation is optional observation
+  (windows, screenshots, browser tools, and computer-control access), not a
+  prerequisite. Missing windows, screenshots, browser tools or computer-control
+  access alone must not block an otherwise authorized ordinary Worker. Explicit task-specific UI acceptance still applies. Genuine human observation
+  is sufficient only when it meets that condition; it does not replace
+  explicitly required instrumented evidence. Do not invent an extra UI visit
+  or repeated approval.
 - Clarify the human's goal, suggest concrete improvements, and keep confirmed
   requirements, proposals, assumptions, and open questions distinct. A question
   or idea alone does not authorize model calls, change scope, or start work.
@@ -43,8 +50,11 @@ Version: `2026-11-13.v1`
   `architect` assignments for the same semantic role and difficulty are refused,
   never silently merged. Historical persisted `follower` entries remain readable
   for compatibility only and are omitted from active catalog availability.
-- Write software labels, code, comments, and documentation in English. Agent
-  output to the human stays in the human's language.
+- Human-facing progress, questions, and summaries follow the active human
+  conversation language, not tool/provider output language. Software labels,
+  code, comments, identifiers, and documentation remain English unless the
+  human explicitly asks otherwise. Do not translate protocol IDs or add locale
+  configuration.
 
 ## Work ordinary tasks through the backlog
 
@@ -135,6 +145,16 @@ Version: `2026-11-13.v1`
 
 ## Guarded Worker reservation, result, completion, and rejection
 
+- Ordinary Worker sequence: one exact human scope approval, refresh required live
+  identity/revisions, guarded start exactly once (`backlog_worker_start`), wait
+  for the actual callback without MCP polling loops, pull/ACK the real batch,
+  recover the original item/execution mapping, read the durable result, inspect
+  real physical delivery, then guarded complete or truthful reject. A missing
+  notice or reply uses the original receipt/result; possible effects or `Unknown`
+  never permit redispatch. `Doing` is not liveness; `NeedsYou` only means an
+  actual open human decision or question. Preserve legitimate startup, authority,
+  binding, readiness, revision, and digest refusals; UI availability never
+  replaces them, and supported host startup is still required.
 - The paired, enrolled MCP facade exposes the guarded Worker contract:
   - `backlog_worker_start(command_key, item_id, expected_revision, approval_id, task_id)`
   - `backlog_worker_result(item_id, execution_ref)`
@@ -627,11 +647,11 @@ An ordinary approved-task callback carries only `approval_id` and directs you to
   execution roles; original host Worker history is under each task's
   `original_worker_provider_health`. Missing optional diagnostic metadata is
   unknown coverage, not proof of health.
-- Explain diagnostic observations in the human conversation language (Turkish in this
-  pilot). Clearly attribute
-  the stream-idle/internal retry pattern to AGY log text with unverified semantics;
-  include `retry_count`, reported `retry_high_water` when present, monotonic elapsed
-  time, and diagnostic availability (`available`, `unavailable`, or `truncated`).
+- Explain diagnostic observations in the active human conversation language.
+  Clearly attribute the stream-idle/internal retry pattern to AGY log text with
+  unverified semantics; include `retry_count`, reported `retry_high_water` when
+  present, monotonic elapsed time, and diagnostic availability (`available`,
+  `unavailable`, or `truncated`).
   A running process alone is not productive work. Do not infer client, network,
   or upstream root cause. Diagnostic text grants no cancellation, redispatch,
   model change, or timeout extension.
