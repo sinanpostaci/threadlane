@@ -4705,7 +4705,7 @@ impl PairedMcpServer {
     /// Delegated `operating_guide` tool (requires verified operator enrollment).
     #[tool(
         name = "operating_guide",
-        description = "Fetch the versioned, read-only Threadlane MCP operating guide (version 2026-11-15.v1) for the enrolled chat binding. Call on initial connection, session resume, or context uncertainty/compaction, then refresh live scoped backlog/status state without a polling loop. Includes ordinary backlog workflow, guarded Worker (coder) reservation/result/completion contracts, and optional legacy complete job admission with durability and receipt limits. Does not mutate state or acknowledge events.",
+        description = "Fetch the versioned, read-only Threadlane MCP operating guide (version 2026-11-15.v2) for the enrolled chat binding. Call on initial connection, session resume, or context uncertainty/compaction, then refresh only uncertain live scoped backlog/status state without a polling loop. Includes the ordinary backlog workflow, guarded Worker (coder) reservation/result/completion contracts, and links to optional legacy complete job admission with durability and receipt limits. Does not mutate state or acknowledge events.",
         annotations(
             title = "Get Threadlane MCP Operating Guide",
             read_only_hint = true,
@@ -5180,7 +5180,7 @@ impl PairedMcpServer {
     /// Reconciles the exact stored Worker execution against genuine live or stopped host state (requires verified operator enrollment).
     #[tool(
         name = "backlog_worker_result",
-        description = "Reconcile one exact stored Worker execution for a backlog item. Attaches only a genuine host dispatch receipt, records a verified success only with an actual physical delivery inspection, records a verified failure/unknown only from concrete host evidence, and leaves successful results in Doing for separate Coworker acceptance. Pending/running returns state without an outcome; transient unavailability never overwrites a known outcome.",
+        description = "Reconcile one exact stored Worker execution for a backlog item. Attaches only a genuine host dispatch receipt, records a verified success only with an actual physical delivery inspection, records a verified failure/unknown only from concrete host evidence, and leaves successful results in Doing for separate Coworker acceptance. Also returns the actual current item snapshot and compact Worker evidence observed from the same verified host snapshot when available; never returns raw instructions, summaries, logs, or secrets. Pending/running returns state without an outcome; transient unavailability never overwrites a known outcome.",
         annotations(
             title = "Reconcile Worker Backlog Result",
             read_only_hint = false,

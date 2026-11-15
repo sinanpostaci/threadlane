@@ -765,12 +765,57 @@ async fn guarded_worker_backlog_start_result_complete_duplicate_stopped_and_repl
         .as_str()
         .expect("worktree identity")
         .to_string();
-    let item_after_result = get_item(&mcp, &item_id).await;
+    let item_snapshot = result_data["item_snapshot"]
+        .as_object()
+        .expect("current item snapshot returned by result");
+    assert_eq!(item_snapshot["item_id"].as_str(), Some(item_id.as_str()));
+    assert_eq!(item_snapshot["status"].as_str(), Some("doing"));
     assert_eq!(
-        item_after_result.status,
-        BacklogStatus::Doing,
-        "a successful result alone must remain Doing pending Coworker acceptance"
+        item_snapshot["current_execution_ref"].as_str(),
+        Some(first_execution.execution_ref.as_str()),
+        "the result must return the actual current execution reference"
     );
+    let item_snapshot_revision = item_snapshot["revision"]
+        .as_u64()
+        .expect("current item revision");
+    let worker_evidence = result_data["worker_evidence"]
+        .as_object()
+        .expect("compact Worker evidence returned by result");
+    assert_eq!(
+        worker_evidence["approval_id"].as_str(),
+        Some(approval.approval_id.as_str())
+    );
+    assert_eq!(worker_evidence["task_id"].as_str(), Some("task-root-agy"));
+    assert_eq!(
+        worker_evidence["requested_model"].as_str(),
+        Some("gemini-4-argon-high")
+    );
+    assert_eq!(worker_evidence["requested_effort"].as_str(), Some("high"));
+    assert_eq!(worker_evidence["violation_count"], 0);
+    assert_eq!(worker_evidence["stdout_truncated"], false);
+    assert_eq!(worker_evidence["stderr_truncated"], false);
+    assert!(worker_evidence["run_id"]
+        .as_str()
+        .is_some_and(|value| !value.is_empty()));
+    assert!(worker_evidence["worker_id"]
+        .as_str()
+        .is_some_and(|value| !value.is_empty()));
+    assert!(worker_evidence["attempt_count"]
+        .as_u64()
+        .is_some_and(|value| value >= 1));
+    let evidence_worktree_path = worker_evidence["task_worktree_path"]
+        .as_str()
+        .expect("actual scoped task worktree path")
+        .to_string();
+    let serialized_result =
+        serde_json::to_string(&result_data).expect("serialize bounded result evidence");
+    assert!(
+        !serialized_result.contains("Guarded Worker backlog happy path"),
+        "result evidence must not expose the raw Worker instruction"
+    );
+    assert!(!serialized_result.contains("\"instruction\""));
+    assert!(!serialized_result.contains("\"final_summary\""));
+    assert!(!serialized_result.contains("\"failure_reason\""));
 
     // Re-reading the known outcome reuses/compares durable evidence without another history entry.
     let replayed_result = mcp
@@ -784,10 +829,13 @@ async fn guarded_worker_backlog_start_result_complete_duplicate_stopped_and_repl
         )
         .await
         .expect("re-read stored successful outcome");
-    let replayed_execution: WorkerBacklogExecution = serde_json::from_value(
-        replayed_result.structured_content.unwrap()["data"]["execution"].clone(),
-    )
-    .expect("decode replayed result execution");
+    let replayed_data = replayed_result
+        .structured_content
+        .expect("replayed result data")["data"]
+        .clone();
+    let replayed_execution: WorkerBacklogExecution =
+        serde_json::from_value(replayed_data["execution"].clone())
+            .expect("decode replayed result execution");
     assert_eq!(
         replayed_execution
             .outcome
@@ -796,8 +844,8 @@ async fn guarded_worker_backlog_start_result_complete_duplicate_stopped_and_repl
         Some(result_digest.as_str())
     );
     assert_eq!(
-        get_item(&mcp, &item_id).await.revision,
-        item_after_result.revision,
+        replayed_data["item_snapshot"]["revision"].as_u64(),
+        Some(item_snapshot_revision),
         "known outcome re-read must not append another backlog revision"
     );
 
@@ -829,13 +877,8 @@ async fn guarded_worker_backlog_start_result_complete_duplicate_stopped_and_repl
         Some(result_digest.as_str())
     );
     assert_eq!(read_invocation_count(&fixture.agy_count_file), 1);
-    assert_eq!(
-        get_item(&mcp, &item_id).await.revision,
-        item_after_result.revision,
-        "duplicate start after an outcome must not append another backlog revision"
-    );
 
-    let item_before_completion = item_after_result;
+    let item_before_completion_revision = item_snapshot_revision;
     let work_area_root = fixture
         .sessions_dir
         .join(&approval.approval_id)
@@ -843,6 +886,11 @@ async fn guarded_worker_backlog_start_result_complete_duplicate_stopped_and_repl
     let checkout = threadlane_workers::load_and_verify_manifest(&work_area_root, &worktree_id)
         .expect("load verified task worktree manifest")
         .checkout_path;
+    assert_eq!(
+        fs::canonicalize(&evidence_worktree_path).expect("canonical evidence task worktree"),
+        fs::canonicalize(&checkout).expect("canonical verified task checkout"),
+        "Worker evidence must expose the actual scoped task worktree path"
+    );
     let delivered_file = checkout.join("src/lib.rs");
     let original_bytes = fs::read(&delivered_file).expect("read delivered file");
     let mut changed_bytes = original_bytes.clone();
@@ -854,7 +902,7 @@ async fn guarded_worker_backlog_start_result_complete_duplicate_stopped_and_repl
         "item_id": item_id,
         "execution_ref": first_execution.execution_ref,
         "command_key": "complete-happy",
-        "expected_revision": item_before_completion.revision,
+        "expected_revision": item_before_completion_revision,
         "expected_result_digest": result_digest,
         "expected_delivery_digest": delivery_digest,
         "acceptance_note": "Accepted the exact verified Worker delivery.",

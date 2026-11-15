@@ -131,6 +131,114 @@ pub struct WorkerBacklogStartOutcome {
     pub host_status: Option<TaskExecutionStatus>,
 }
 
+/// Compact current backlog item snapshot read from scoped core after reconciliation.
+///
+/// This is an observed projection, never a computed or caller-supplied value. It lets an
+/// ordinary Coworker complete or reject with the actual current revision without a separate
+/// `backlog_get` or `approved_task` read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerBacklogItemSnapshot {
+    /// Actual software-generated backlog item identifier.
+    pub item_id: String,
+    /// Actual current backlog item revision after reconciliation.
+    pub revision: u64,
+    /// Actual current backlog item status after reconciliation.
+    pub status: BacklogStatus,
+    /// Actual current Worker execution reference, when one holds the item.
+    pub current_execution_ref: Option<String>,
+}
+
+/// Compact Worker evidence derived from the same verified host task snapshot used for
+/// reconciliation.
+///
+/// It intentionally excludes the raw instruction, worker summaries, provider logs, environment,
+/// credentials, and arbitrary captured text. Optional fields stay absent when the verified
+/// snapshot does not carry them; they are never synthesized.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerBacklogWorkerEvidence {
+    /// Frozen approval identifier verified by the snapshot.
+    pub approval_id: String,
+    /// Frozen approved task identifier verified by the snapshot.
+    pub task_id: String,
+    /// Genuine runtime session binding identifier.
+    pub session_binding_id: String,
+    /// Actual software-generated run identifier.
+    pub run_id: String,
+    /// Actual software-generated worker identifier.
+    pub worker_id: String,
+    /// Frozen trusted execution profile identifier.
+    pub profile_id: String,
+    /// Provider fixed by the trusted execution profile.
+    pub provider: String,
+    /// Exact model requested by the trusted execution profile.
+    pub requested_model: String,
+    /// Exact reasoning effort requested by the trusted execution profile.
+    pub requested_effort: String,
+    /// Model identifier observed in provider telemetry, when reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_model: Option<String>,
+    /// Reasoning effort observed in provider telemetry, when reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_effort: Option<String>,
+    /// Verified runtime Worker status from the same snapshot.
+    pub worker_status: WorkerStatus,
+    /// Current worker run revision.
+    pub worker_revision: u64,
+    /// Number of dispatch claims attempted.
+    pub attempt_count: u32,
+    /// Actual runtime start timestamp in milliseconds since the Unix epoch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at_ms: Option<i64>,
+    /// Actual runtime completion timestamp in milliseconds since the Unix epoch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at_ms: Option<i64>,
+    /// Actual measured terminal duration in milliseconds when proven.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    /// Process exit code when the worker exited normally.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    /// Terminating signal number when the worker was killed by a signal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal: Option<i32>,
+    /// Whether the worker exceeded its configured timeout budget, when terminal evidence exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timed_out: Option<bool>,
+    /// Whether the worker was terminated due to cancellation, when terminal evidence exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancelled: Option<bool>,
+    /// Whether cancellation was requested before completion, when terminal evidence exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancel_requested_before_completion: Option<bool>,
+    /// Whether verifiable model telemetry was missing, when terminal evidence exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub missing_model_evidence: Option<bool>,
+    /// Whether verifiable reasoning effort telemetry was missing, when terminal evidence exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub missing_effort_evidence: Option<bool>,
+    /// Whether the provider emitted a structured error event, when terminal evidence exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_error: Option<bool>,
+    /// Whether descendant processes survived after the leader exited, when terminal evidence exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incomplete_cleanup: Option<bool>,
+    /// Whether the post-run Git diff gate rejected the worktree changes, when terminal evidence exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rejected_by_diff_gate: Option<bool>,
+    /// Total diff-gate scope violations, when terminal evidence exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub violation_count: Option<u32>,
+    /// Whether stdout exceeded its byte budget, when terminal evidence exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stdout_truncated: Option<bool>,
+    /// Whether stderr exceeded its byte budget, when terminal evidence exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stderr_truncated: Option<bool>,
+    /// Actual scoped task worktree path from the verified Worker snapshot, when recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_worktree_path: Option<String>,
+}
+
 /// Result and reconciliation response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerBacklogResultOutcome {
@@ -142,6 +250,12 @@ pub struct WorkerBacklogResultOutcome {
     /// Path-free physical delivery inspection for exact Coworker acceptance binding.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delivery: Option<DeliveryInspection>,
+    /// Compact current item snapshot read from scoped core after reconciliation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_snapshot: Option<WorkerBacklogItemSnapshot>,
+    /// Compact Worker evidence from the same verified host snapshot, when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_evidence: Option<WorkerBacklogWorkerEvidence>,
 }
 
 /// Separate completion response.
@@ -469,11 +583,9 @@ impl WorkerBacklogService {
             .load_execution_authority(binding_id, thread_uuid, &execution)
             .await?;
         if item.current_execution_ref.as_deref() != Some(execution.execution_ref.as_str()) {
-            return Ok(WorkerBacklogResultOutcome {
-                execution,
-                host_status: None,
-                delivery: None,
-            });
+            return self
+                .finalize_result(binding_id, &params.item_id, execution, None, None, None)
+                .await;
         }
 
         let client = self.host_client(binding_id, &record.thread_uuid)?;
@@ -492,11 +604,9 @@ impl WorkerBacklogService {
                     .as_ref()
                     .is_some_and(|outcome| outcome.outcome != WorkerBacklogOutcome::Unknown);
                 if known_outcome || execution.completion.is_some() {
-                    return Ok(WorkerBacklogResultOutcome {
-                        execution,
-                        host_status: None,
-                        delivery: None,
-                    });
+                    return self
+                        .finalize_result(binding_id, &params.item_id, execution, None, None, None)
+                        .await;
                 }
                 return Err(WorkerBacklogError::from_host_error(&error));
             }
@@ -504,11 +614,9 @@ impl WorkerBacklogService {
 
         let Some(snapshot) = snapshot else {
             if execution.outcome.is_some() || execution.completion.is_some() {
-                return Ok(WorkerBacklogResultOutcome {
-                    execution,
-                    host_status: None,
-                    delivery: None,
-                });
+                return self
+                    .finalize_result(binding_id, &params.item_id, execution, None, None, None)
+                    .await;
             }
             if execution.dispatch_receipt.is_some() {
                 return Err(WorkerBacklogError::new(
@@ -516,11 +624,9 @@ impl WorkerBacklogService {
                     "The stored Worker invocation has no readable live or stopped host result.",
                 ));
             }
-            return Ok(WorkerBacklogResultOutcome {
-                execution,
-                host_status: None,
-                delivery: None,
-            });
+            return self
+                .finalize_result(binding_id, &params.item_id, execution, None, None, None)
+                .await;
         };
 
         if let Some(receipt) = execution.dispatch_receipt.as_ref() {
@@ -535,11 +641,16 @@ impl WorkerBacklogService {
         }
 
         if execution.completion.is_some() {
-            return Ok(WorkerBacklogResultOutcome {
-                execution,
-                host_status: Some(snapshot.status),
-                delivery: None,
-            });
+            return self
+                .finalize_result(
+                    binding_id,
+                    &params.item_id,
+                    execution,
+                    Some(snapshot.status),
+                    None,
+                    Some(&snapshot),
+                )
+                .await;
         }
 
         let previous_kind = execution.outcome.as_ref().map(|outcome| outcome.outcome);
@@ -550,7 +661,7 @@ impl WorkerBacklogService {
         if let Some(previous_kind) = previous_kind {
             if previous_kind == WorkerBacklogOutcome::Unknown {
                 if snapshot.status != TaskExecutionStatus::Unknown {
-                    return self
+                    let outcome = self
                         .reconcile_known_outcome(
                             &client,
                             binding_id,
@@ -562,6 +673,16 @@ impl WorkerBacklogService {
                             final_recheck
                                 .take()
                                 .expect("result recheck closure must be available"),
+                        )
+                        .await?;
+                    return self
+                        .finalize_result(
+                            binding_id,
+                            &params.item_id,
+                            outcome.execution,
+                            outcome.host_status,
+                            outcome.delivery,
+                            Some(&snapshot),
                         )
                         .await;
                 }
@@ -577,11 +698,16 @@ impl WorkerBacklogService {
                         &snapshot,
                     )
                     .await?;
-                return Ok(WorkerBacklogResultOutcome {
-                    execution,
-                    host_status: Some(snapshot.status),
-                    delivery: None,
-                });
+                return self
+                    .finalize_result(
+                        binding_id,
+                        &params.item_id,
+                        execution,
+                        Some(snapshot.status),
+                        None,
+                        Some(&snapshot),
+                    )
+                    .await;
             }
             if previous_kind == WorkerBacklogOutcome::Success
                 && snapshot.status == TaskExecutionStatus::ReadyForReview
@@ -603,18 +729,28 @@ impl WorkerBacklogService {
                             "The current Worker result digest differs from the stored successful outcome.",
                         ));
                     }
-                    return Ok(WorkerBacklogResultOutcome {
-                        execution,
-                        host_status: Some(snapshot.status),
-                        delivery: Some(inspection),
-                    });
+                    return self
+                        .finalize_result(
+                            binding_id,
+                            &params.item_id,
+                            execution,
+                            Some(snapshot.status),
+                            Some(inspection),
+                            Some(&snapshot),
+                        )
+                        .await;
                 }
             }
-            return Ok(WorkerBacklogResultOutcome {
-                execution,
-                host_status: Some(snapshot.status),
-                delivery: None,
-            });
+            return self
+                .finalize_result(
+                    binding_id,
+                    &params.item_id,
+                    execution,
+                    Some(snapshot.status),
+                    None,
+                    Some(&snapshot),
+                )
+                .await;
         }
 
         match snapshot.status {
@@ -625,11 +761,17 @@ impl WorkerBacklogService {
             | TaskExecutionStatus::NotStarted
             | TaskExecutionStatus::DependencyInputsUnverified
             | TaskExecutionStatus::DependencyInputsReady
-            | TaskExecutionStatus::NativeRouteRequired => Ok(WorkerBacklogResultOutcome {
-                execution,
-                host_status: Some(snapshot.status),
-                delivery: None,
-            }),
+            | TaskExecutionStatus::NativeRouteRequired => {
+                self.finalize_result(
+                    binding_id,
+                    &params.item_id,
+                    execution,
+                    Some(snapshot.status),
+                    None,
+                    Some(&snapshot),
+                )
+                .await
+            }
             TaskExecutionStatus::Unknown => {
                 final_recheck
                     .as_ref()
@@ -649,31 +791,71 @@ impl WorkerBacklogService {
                 let execution = self
                     .record_unknown(binding_id, &record.thread_uuid, execution)
                     .await?;
-                Ok(WorkerBacklogResultOutcome {
+                self.finalize_result(
+                    binding_id,
+                    &params.item_id,
                     execution,
-                    host_status: Some(snapshot.status),
-                    delivery: None,
-                })
+                    Some(snapshot.status),
+                    None,
+                    Some(&snapshot),
+                )
+                .await
             }
             TaskExecutionStatus::ReadyForReview
             | TaskExecutionStatus::Failed
             | TaskExecutionStatus::Cancelled
             | TaskExecutionStatus::TimedOut => {
-                self.reconcile_known_outcome(
-                    &client,
+                let outcome = self
+                    .reconcile_known_outcome(
+                        &client,
+                        binding_id,
+                        &item,
+                        execution,
+                        &snapshot,
+                        &record,
+                        &task,
+                        final_recheck
+                            .take()
+                            .expect("result recheck closure must be available"),
+                    )
+                    .await?;
+                self.finalize_result(
                     binding_id,
-                    &item,
-                    execution,
-                    &snapshot,
-                    &record,
-                    &task,
-                    final_recheck
-                        .take()
-                        .expect("result recheck closure must be available"),
+                    &params.item_id,
+                    outcome.execution,
+                    outcome.host_status,
+                    outcome.delivery,
+                    Some(&snapshot),
                 )
                 .await
             }
         }
+    }
+
+    /// Reads the current scoped item and attaches the compact observed projection and the
+    /// optional Worker evidence from the same already verified host snapshot.
+    async fn finalize_result(
+        &self,
+        binding_id: &str,
+        item_id: &str,
+        execution: WorkerBacklogExecution,
+        host_status: Option<TaskExecutionStatus>,
+        delivery: Option<DeliveryInspection>,
+        snapshot: Option<&TaskStateSnapshot>,
+    ) -> Result<WorkerBacklogResultOutcome, WorkerBacklogError> {
+        let item = self.load_item(binding_id, item_id).await?;
+        Ok(WorkerBacklogResultOutcome {
+            execution,
+            host_status,
+            delivery,
+            item_snapshot: Some(WorkerBacklogItemSnapshot {
+                item_id: item.item_id,
+                revision: item.revision,
+                status: item.status,
+                current_execution_ref: item.current_execution_ref,
+            }),
+            worker_evidence: snapshot.and_then(worker_evidence_from_snapshot),
+        })
     }
 
     /// Commits separate Coworker acceptance completion only after a fresh independent host
@@ -1298,6 +1480,8 @@ impl WorkerBacklogService {
                     execution,
                     host_status: Some(snapshot.status),
                     delivery: Some(inspection),
+                    item_snapshot: None,
+                    worker_evidence: None,
                 })
             }
             TaskExecutionStatus::Failed
@@ -1330,12 +1514,16 @@ impl WorkerBacklogService {
                     execution,
                     host_status: Some(snapshot.status),
                     delivery: None,
+                    item_snapshot: None,
+                    worker_evidence: None,
                 })
             }
             _ => Ok(WorkerBacklogResultOutcome {
                 execution,
                 host_status: Some(snapshot.status),
                 delivery: None,
+                item_snapshot: None,
+                worker_evidence: None,
             }),
         }
     }
@@ -1944,6 +2132,47 @@ fn verify_snapshot_identity(
     Ok(())
 }
 
+fn worker_evidence_from_snapshot(
+    snapshot: &TaskStateSnapshot,
+) -> Option<WorkerBacklogWorkerEvidence> {
+    let worker = snapshot.worker.as_ref()?;
+    let outcome = worker.outcome.as_ref();
+    Some(WorkerBacklogWorkerEvidence {
+        approval_id: snapshot.approval_id.clone(),
+        task_id: snapshot.task_id.clone(),
+        session_binding_id: snapshot.session_binding_id.clone(),
+        run_id: worker.run_id.clone(),
+        worker_id: worker.worker_id.clone(),
+        profile_id: worker.profile_id.clone(),
+        provider: worker.provider.clone(),
+        requested_model: worker.requested_model.clone(),
+        requested_effort: worker.requested_effort.clone(),
+        observed_model: worker.observed_model.clone(),
+        observed_effort: worker.observed_effort.clone(),
+        worker_status: worker.status,
+        worker_revision: worker.revision,
+        attempt_count: worker.attempt_count,
+        started_at_ms: worker.started_at_ms,
+        completed_at_ms: worker.completed_at_ms,
+        duration_ms: outcome.and_then(|outcome| outcome.duration_ms),
+        exit_code: outcome.and_then(|outcome| outcome.exit_code),
+        signal: outcome.and_then(|outcome| outcome.signal),
+        timed_out: outcome.map(|outcome| outcome.timed_out),
+        cancelled: outcome.map(|outcome| outcome.cancelled),
+        cancel_requested_before_completion: outcome
+            .map(|outcome| outcome.cancel_requested_before_completion),
+        missing_model_evidence: outcome.map(|outcome| outcome.missing_model_evidence),
+        missing_effort_evidence: outcome.map(|outcome| outcome.missing_effort_evidence),
+        provider_error: outcome.map(|outcome| outcome.provider_error),
+        incomplete_cleanup: outcome.map(|outcome| outcome.incomplete_cleanup),
+        rejected_by_diff_gate: outcome.map(|outcome| outcome.rejected_by_diff_gate),
+        violation_count: outcome.map(|outcome| outcome.violation_count),
+        stdout_truncated: outcome.map(|outcome| outcome.stdout_truncated),
+        stderr_truncated: outcome.map(|outcome| outcome.stderr_truncated),
+        task_worktree_path: worker.worktree.task_worktree_path.clone(),
+    })
+}
+
 fn receipt_from_snapshot(
     snapshot: &TaskStateSnapshot,
 ) -> Result<Option<WorkerBacklogDispatchReceipt>, WorkerBacklogError> {
@@ -2371,8 +2600,179 @@ pub(crate) const WORKER_BACKLOG_REJECT_TOOL: &str = REJECT_TOOL;
 
 #[cfg(test)]
 mod tests {
-    use super::{failure_note_for, FailureNoteEvidence};
-    use threadlane_host::TaskExecutionStatus;
+    use super::{
+        failure_note_for, worker_evidence_from_snapshot, FailureNoteEvidence,
+        WorkerBacklogResultOutcome, WorkerBacklogWorkerEvidence,
+    };
+    use serde_json::json;
+    use threadlane_core::WorkerProgressSummary;
+    use threadlane_host::{TaskExecutionStatus, TaskStateSnapshot};
+
+    fn task_snapshot_with_worker(outcome: Option<serde_json::Value>) -> TaskStateSnapshot {
+        serde_json::from_value(json!({
+            "approval_id": "apr_test",
+            "subject_digest": "a".repeat(64),
+            "binding_id": "bnd_test",
+            "thread_uuid": "0196ed00-0000-7000-8000-000000000001",
+            "session_binding_id": "bnd_session",
+            "task_id": "task-root",
+            "task_digest": "b".repeat(64),
+            "adapter": "opencode_v2",
+            "provider": "opencode_v2",
+            "depends_on": [],
+            "profile_id": "profile-main",
+            "command_key": "command-key",
+            "status": if outcome.is_some() { "ready_for_review" } else { "running" },
+            "run_id": "run_test",
+            "worker_id": "wrk_test",
+            "worker": {
+                "worker_id": "wrk_test",
+                "run_id": "run_test",
+                "binding_id": "bnd_session",
+                "revision": 3,
+                "status": if outcome.is_some() { "completed" } else { "running" },
+                "profile_id": "profile-main",
+                "profile_digest": "c".repeat(64),
+                "provider": "opencode-go",
+                "requested_model": "deepseek-v4.1-flash",
+                "requested_effort": "max",
+                "instruction": "Fixture instruction must not enter compact evidence.",
+                "attempt_count": 1,
+                "worktree": { "base_commit": "d".repeat(40) },
+                "progress": WorkerProgressSummary::default(),
+                "outcome": outcome,
+                "created_at_ms": 1_700_000_000_000_i64,
+                "updated_at_ms": 1_700_000_000_001_i64
+            },
+            "accepted": false
+        }))
+        .expect("decode fixture task and Worker evidence")
+    }
+
+    #[test]
+    fn terminal_gate_evidence_preserves_observed_values() {
+        for (violation_count, stdout_truncated, stderr_truncated) in
+            [(0, false, false), (2, true, false), (0, false, true)]
+        {
+            let snapshot = task_snapshot_with_worker(Some(json!({
+                "exit_code": 0,
+                "timed_out": false,
+                "cancelled": false,
+                "cancel_requested_before_completion": false,
+                "missing_model_evidence": false,
+                "missing_effort_evidence": false,
+                "provider_error": false,
+                "incomplete_cleanup": false,
+                "rejected_by_diff_gate": false,
+                "stdout_truncated": stdout_truncated,
+                "stderr_truncated": stderr_truncated,
+                "acceptance_state": "ready_for_review",
+                "changed_paths_count": 0,
+                "changed_paths_preview": [],
+                "violation_count": violation_count,
+                "violation_summaries": []
+            })));
+            let evidence = worker_evidence_from_snapshot(&snapshot).expect("Worker evidence");
+            assert_eq!(evidence.violation_count, Some(violation_count));
+            assert_eq!(evidence.stdout_truncated, Some(stdout_truncated));
+            assert_eq!(evidence.stderr_truncated, Some(stderr_truncated));
+            let encoded = serde_json::to_value(evidence).expect("serialize evidence");
+            assert_eq!(encoded["violation_count"], violation_count);
+            assert_eq!(encoded["stdout_truncated"], stdout_truncated);
+            assert_eq!(encoded["stderr_truncated"], stderr_truncated);
+        }
+    }
+
+    #[test]
+    fn running_worker_without_outcome_does_not_invent_terminal_evidence() {
+        let snapshot = task_snapshot_with_worker(None);
+        let evidence = worker_evidence_from_snapshot(&snapshot).expect("running Worker evidence");
+        assert_eq!(evidence.attempt_count, 1);
+        assert!(evidence.violation_count.is_none());
+        assert!(evidence.stdout_truncated.is_none());
+        assert!(evidence.stderr_truncated.is_none());
+        let encoded = serde_json::to_value(evidence).expect("serialize running evidence");
+        for field in ["violation_count", "stdout_truncated", "stderr_truncated"] {
+            assert!(
+                encoded.get(field).is_none(),
+                "absent terminal field {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_worker_evidence_without_gate_fields_remains_unknown() {
+        let snapshot = task_snapshot_with_worker(None);
+        let evidence = worker_evidence_from_snapshot(&snapshot).expect("Worker evidence");
+        let encoded = serde_json::to_value(evidence).expect("serialize legacy-shaped evidence");
+        let decoded: WorkerBacklogWorkerEvidence =
+            serde_json::from_value(encoded).expect("decode older optional evidence fields");
+        assert!(decoded.violation_count.is_none());
+        assert!(decoded.stdout_truncated.is_none());
+        assert!(decoded.stderr_truncated.is_none());
+    }
+
+    #[test]
+    fn absent_worker_snapshot_stays_honestly_absent() {
+        let snapshot: TaskStateSnapshot = serde_json::from_value(json!({
+            "approval_id": "apr_0196ed00-0000-7000-8000-000000000001",
+            "subject_digest": "a".repeat(64),
+            "binding_id": "bnd_0196ed00-0000-7000-8000-000000000001",
+            "thread_uuid": "0196ed00-0000-7000-8000-000000000001",
+            "session_binding_id": "sbnd_0196ed00-0000-7000-8000-000000000001",
+            "task_id": "task-root",
+            "task_digest": "b".repeat(64),
+            "adapter": "opencode_v2",
+            "provider": "opencode_v2",
+            "depends_on": [],
+            "profile_id": "profile-main",
+            "command_key": "command-key",
+            "status": "not_started",
+            "run_id": null,
+            "worker_id": null,
+            "worker": null,
+            "accepted": false
+        }))
+        .expect("decode task snapshot without a Worker record");
+        assert!(worker_evidence_from_snapshot(&snapshot).is_none());
+    }
+
+    #[test]
+    fn legacy_result_payload_without_observed_projection_still_deserializes() {
+        let legacy = json!({
+            "execution": {
+                "execution_ref": "wbe_0196ed00-0000-7000-8000-000000000001",
+                "binding_id": "bnd_0196ed00-0000-7000-8000-000000000001",
+                "item_id": "blg_0196ed00-0000-7000-8000-000000000001",
+                "authority": {
+                    "approval_id": "apr_0196ed00-0000-7000-8000-000000000001",
+                    "subject_digest": "a".repeat(64),
+                    "task_id": "task-root",
+                    "task_digest": "b".repeat(64)
+                },
+                "acceptance_condition_digest": "c".repeat(64),
+                "delivery_description_digest": "d".repeat(64),
+                "reservation_revision": 2,
+                "reserved_at_ms": 1_700_000_000_000_i64,
+                "dispatch_receipt": null,
+                "attached_at_ms": null,
+                "outcome": null,
+                "completion": null
+            },
+            "host_status": "ready_for_review"
+        });
+        let outcome: WorkerBacklogResultOutcome =
+            serde_json::from_value(legacy).expect("legacy result payload must deserialize");
+        assert!(outcome.item_snapshot.is_none());
+        assert!(outcome.worker_evidence.is_none());
+        assert_eq!(
+            outcome.host_status,
+            Some(TaskExecutionStatus::ReadyForReview)
+        );
+        let encoded = serde_json::to_value(&outcome).expect("serialize legacy-compatible result");
+        assert!(encoded.get("item_snapshot").is_none());
+        assert!(encoded.get("worker_evidence").is_none());
+    }
 
     #[test]
     fn failure_notes_distinguish_structured_terminal_categories() {

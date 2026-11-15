@@ -41,6 +41,8 @@ const PROFILE_ID: &str = "profile-approval-cli";
 const PLAN_ID: &str = "plan-approval-cli";
 const MAX_REQUEST_BYTES: usize = 1_048_576;
 const SECRET_SENTINEL: &str = "THREADLANE_APPROVAL_SECRET_SENTINEL_7d1f6e4a";
+const ORDINARY_WORKER_QUICKSTART: &str =
+    include_str!("../../../docs/ORDINARY-WORKER-QUICKSTART.md");
 
 struct ApprovalFixture {
     _tmp: TempDir,
@@ -804,6 +806,88 @@ async fn prepare_freezes_exact_scope_without_approval_execution_or_worktree_side
     assert_eq!(child.model_arg, "opencode-go/deepseek-v4.1-flash");
     assert_eq!(child.effort.as_deref(), Some("max"));
 
+    fx.assert_no_approval_artifacts();
+    fx.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quickstart_example_prepares_exact_intent_without_worker_invocation() {
+    let mut fx = ApprovalFixture::start().await;
+
+    let marker = "```json\n";
+    let start = ORDINARY_WORKER_QUICKSTART
+        .find(marker)
+        .expect("quickstart strict JSON example")
+        + marker.len();
+    let rest = &ORDINARY_WORKER_QUICKSTART[start..];
+    let end = rest
+        .find("\n```")
+        .expect("quickstart JSON example terminator");
+    let mut intent: OperatorApprovalIntent =
+        serde_json::from_str(&rest[..end]).expect("documented quickstart JSON is a strict intent");
+
+    intent.binding_id = fx.binding_id.clone();
+    intent.thread_uuid = THREAD_UUID.to_string();
+    intent.plan_id = PLAN_ID.to_string();
+    intent.plan_revision = fx.plan_revision;
+    intent.expected_registry_revision = fx.registry_revision;
+    intent.repository_path = fx.repo.clone();
+    intent.base_commit = fx.base_commit.clone();
+    intent.approved_task_ids = vec!["task-root".to_string()];
+    intent.approved_write_paths = vec!["src/lib.rs".to_string()];
+    intent.max_parallel = 1;
+
+    let path = fx.write_request("quickstart-intent.json", &intent);
+    let preview: OperatorApprovalPreview = parse_success(
+        &fx.run_prepare(&path).await,
+        "prepare documented quickstart intent",
+    );
+
+    assert_eq!(preview.request.binding_id, fx.binding_id);
+    assert_eq!(preview.request.thread_uuid, THREAD_UUID);
+    assert_eq!(preview.request.plan_id, PLAN_ID);
+    assert_eq!(preview.request.plan_revision, fx.plan_revision);
+    assert_eq!(
+        preview.request.expected_registry_revision,
+        fx.registry_revision
+    );
+    assert_eq!(preview.request.expected_plan_digest, fx.plan_digest);
+    assert_eq!(preview.request.repository_path, fx.repo);
+    assert_eq!(preview.request.base_commit, fx.base_commit);
+    assert_eq!(
+        preview.request.approved_task_ids,
+        vec!["task-root".to_string()]
+    );
+    assert_eq!(
+        preview.request.approved_write_paths,
+        vec!["src/lib.rs".to_string()]
+    );
+    assert_eq!(preview.request.max_parallel, 1);
+    assert_eq!(
+        preview.request.budgets.timeout_ms,
+        intent.budgets.timeout_ms
+    );
+    assert_eq!(
+        preview.request.budgets.max_stdout_bytes,
+        intent.budgets.max_stdout_bytes
+    );
+    assert_eq!(
+        preview.request.budgets.max_stderr_bytes,
+        intent.budgets.max_stderr_bytes
+    );
+    assert_eq!(
+        preview.request.budgets.max_line_bytes,
+        intent.budgets.max_line_bytes
+    );
+    assert_eq!(
+        preview.request.budgets.max_events,
+        intent.budgets.max_events
+    );
+    assert_eq!(preview.tasks.len(), 1);
+    assert_eq!(preview.tasks[0].task_id, "task-root");
+    assert_sha256(&preview.subject_digest, "quickstart preview subject_digest");
+
+    fx.assert_no_worker_invocation();
     fx.assert_no_approval_artifacts();
     fx.shutdown().await;
 }

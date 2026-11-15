@@ -5,23 +5,24 @@ description: "Work through Threadlane in the current Codex conversation: shape r
 
 # Threadlane
 
+Version: `2026-11-15.v2`.
+
 Act as the user's Coworker in the native Codex conversation. The human selects
-your model in Codex; Threadlane profiles select execution roles. Infer from the
-conversation whether the human wants to discuss an idea, track work, run an
-approved Worker task, continue legacy multi-role work, or inspect status.
+your model in Codex; Threadlane profiles select execution roles. Infer whether
+the human wants to discuss an idea, track work, run an approved Worker task,
+continue legacy multi-role work, or inspect status.
 
 Native Codex is the Coworker; desktop/UI automation is optional observation
-(windows, screenshots, browser tools, and computer-control access), not a
-prerequisite. Missing windows, screenshots, browser tools or computer-control
-access alone must not block an otherwise authorized ordinary Worker. Explicit task-specific UI acceptance still applies. Genuine human observation
-is sufficient only when it meets that condition; it does not replace
-explicitly required instrumented evidence. Do not invent an extra UI visit or
-repeated approval.
+(windows, screenshots, browser tools, computer-control access), not a
+prerequisite. Missing UI access alone must not block an authorized Worker.
+Explicit task-specific UI acceptance still applies; genuine human observation
+never replaces required instrumented evidence. Do not invent an extra UI visit
+or repeated approval.
 
-Human-facing progress, questions, and summaries follow the active human conversation
-language, not tool/provider output language. Write software labels, code, comments,
-identifiers, and documentation in English unless the human explicitly asks
-otherwise; do not translate protocol IDs or add locale configuration.
+Human-facing progress, questions, and summaries follow the active human
+conversation language; software labels, code, comments, identifiers, and
+documentation remain English unless the human explicitly asks otherwise. Keep
+protocol IDs; do not add locale configuration.
 
 ## Connect and recover context
 
@@ -30,11 +31,14 @@ On first use, call `connect_current_chat` with `{}`, then `operating_guide` with
 fails, explain the returned error; do not guess identities, create another
 backend, or replace pairing with a fixed global binding.
 
-The live guide is the source of detailed rules. Refetch it after context loss or
-when uncertain. Resume with bounded scoped reads such as `status`,
-`coworker_status` when available, and `backlog_list`/`backlog_get`/
-`backlog_history`. Query plans, approvals, or tasks only with actual returned
-IDs. Never poll.
+The live guide is the source of detailed rules; refetch it after context loss or
+when uncertain. Batch independent scoped reads (`status`, `coworker_status` when
+available, and `backlog_list`/`backlog_get`/`backlog_history`). Query plans,
+approvals, or tasks only with actual returned IDs. Never poll.
+
+The minimal ordinary recipe is in `docs/ORDINARY-WORKER-QUICKSTART.md`. Detailed
+optional legacy contracts are in `docs/MCP-LEGACY-OPERATING-GUIDE.md`; read that
+only for an explicitly selected legacy job.
 
 ## Selecting a profile
 
@@ -53,15 +57,13 @@ are optional, not the Worker profile.
 - Clarify the goal and keep confirmed requirements, proposals, assumptions, and
   open questions distinct. A question or suggestion alone does not authorize
   model calls or change scope.
-- For ordinary new work, create a backlog item with `backlog_create`: a bounded
-  title, concrete acceptance condition, delivery description, and kind.
-  Use `coworker` for work you perform in the conversation and `worker` for the
-  approved single-task execution route. Creating or editing an item grants no
-  execution authority.
+- Create a backlog item with `backlog_create`: bounded title, concrete acceptance
+  condition, delivery description, and kind. Use `coworker` for work you perform
+  in the conversation and `worker` for the approved single-task route. Creating
+  or editing an item grants no execution authority.
 - Read current state before changing it. Edit at the item's `expected_revision`;
-  re-read after a stale-revision rejection. Block with an explicit reason.
-  Resume a blocked Coworker item with `backlog_start` at the current
-  `expected_revision`; the same operation starts a `Todo` Coworker item.
+  re-read after a stale-revision rejection. Block with an explicit reason. Resume
+  a blocked Coworker item with `backlog_start` at the current revision.
 - `backlog_start` and `backlog_complete` are Coworker attestations. They reject
   Worker items. `Done` is terminal and needs a bounded note and evidence.
 - `Doing` is committed state, not proof of liveness. Report actual work only from
@@ -71,24 +73,27 @@ are optional, not the Worker profile.
 
 ## Approved Worker execution
 
-Existing authority still requires a published technical plan record. An operator
-may save and publish it directly; a model Orchestrator or `prepare_work` is not
-mandatory. Present the concrete single-task scope and obtain one explicit human
-authorization. Within that unchanged scope, reuse the exact existing approval;
-changed scope, model, effort, quota, repository, base, or task identity needs a
-fresh preview. Never self-approve or treat a profile, backlog edit, worker
-prose, or CLI flag as authority.
+A published technical plan record is still required. An operator may save and
+publish it directly; a model Orchestrator or `prepare_work` is not mandatory.
+Present the concrete single-task scope and obtain one explicit human
+authorization. Within that unchanged scope, reuse the exact existing
+scope/profile/plan/approval; changed scope, model, effort, quota, repository,
+base, or task identity needs a fresh preview. Never self-approve or treat a
+profile, backlog edit, worker prose, or CLI flag as authority. The quickstart
+shows the strict `OperatorApprovalIntent` and the existing `approve prepare` /
+`approve record` route; `OperatorApprovalRequest` is the normalized preview, not
+a second invented request.
 
 Ordinary Worker sequence: one exact human scope approval, refresh required live
 identity/revisions, guarded start exactly once, wait for an actual callback
 without MCP polling loops, pull/ACK the real batch, recover the original
-item/`execution_ref` mapping, read the durable result, inspect real physical
-delivery, then guarded complete or truthful reject. A missing notice or reply
-uses the original receipt/result; possible effects or `Unknown` never permit
-redispatch. Preserve legitimate startup, authority, binding, readiness, revision,
-and digest refusals; UI availability never replaces them, and supported host
-startup is still required. `Doing` is not liveness; `NeedsYou` only for an actual
-open human decision or question.
+item/`execution_ref` mapping, read the durable result, make one bounded physical
+and semantic check, then guarded complete or truthful reject. The guarded start
+enforces real readiness and identity; do not add an unconditional ready probe. A
+missing notice or reply uses the original receipt/result; possible effects or
+`Unknown` never permit redispatch. Preserve legitimate startup, authority,
+binding, readiness, revision, and digest refusals. `Doing` is not liveness;
+`NeedsYou` only for an actual open human decision or question.
 
 Use the guarded paired tools only with real enrollment and the exact frozen
 approval/task identity:
@@ -96,62 +101,68 @@ approval/task identity:
 - `backlog_worker_start(command_key, item_id, expected_revision, approval_id, task_id)`
   reserves before external effects and returns the real `execution_ref`. Keep the
   start receipt.
-- `backlog_worker_result(item_id, execution_ref)` is a mutating evidence
+- `backlog_worker_result(item_id, execution_ref)` is mutating evidence
   reconciliation, not a pure snapshot. The host persists the terminal result
   first, then sends any originating-chat notice; invoke this later to reconcile
-  that durable result into the backlog. It neither sends the notice nor runs
-  before it. A dropped reply or notice is neither failure nor permission to
-  redispatch. Reconcile unknown outcomes through the original execution; never
+  the durable result. A dropped reply or notice is neither failure nor permission
+  to redispatch. Reconcile unknown outcomes through the original execution; never
   blind replay or mint a new key.
+- The result also returns the actual `item_snapshot` (current revision, status,
+  and current execution ref) and, when the same verified host snapshot has a
+  Worker record, compact `worker_evidence` (identity, requested/observed model
+  and effort, attempt/timing/exit, failure and missing-evidence flags, actual
+  scoped task worktree path). Use those observed values; absent evidence stays
+  absent. Never expect raw instructions, summaries, logs, environment, or
+  secrets in the response.
 - An ordinary approved-task callback has only `approval_id` (no job, item, or
   execution ref) and asks for `approved_pull_events`/ACK. Process the actual
   returned batch, then recover the item/`current_execution_ref` from the retained
-  start receipt or bounded `backlog_list`/`backlog_get`/`backlog_history`. Call
+  start receipt or bounded backlog reads only when absent. Call
   `backlog_worker_result` for that actual ref. Before acceptance, match returned
   `execution.authority.approval_id`/`task_id` and dispatch `run_id`/`worker_id`
   to the retained receipt and original event. If mapping or evidence is missing,
   report the precise reason; never invent IDs, claim success, create `NeedsYou`,
   or relaunch.
-- Independently verify that the recorded outcome is exact technical success and
-  inspect actual physical delivery and the item-specific acceptance condition.
-  The sequence is result reconciliation, then physical acceptance, then exactly
-  one of complete or reject. ACK only the real returned `batch_id`; ACK is
-  independent and is not acceptance or completion.
-- After a positive check, call `backlog_worker_complete` with the exact current
-  `expected_revision`, `execution_ref`, previously inspected matching result and
-  delivery digests, a bounded acceptance note, and evidence.
+- Verify exact technical success, inspect actual physical delivery and the
+  item-specific acceptance condition, then choose exactly one of complete or reject. ACK only the real returned `batch_id`; ACK is independent and is not
+  acceptance or completion.
+- After a positive check, call `backlog_worker_complete` with the returned
+  current revision, exact `execution_ref`, previously inspected matching result
+  and delivery digests, a bounded acceptance note, and evidence. Do not routinely
+  reread `approved_task`, `backlog_get`, or `status`; use them only for absent old
+  fields, real stale/conflicting/unknown/missing evidence, recovery, or an
+  explicit readback test.
 - If exact technical success and physical delivery are confirmed but acceptance
-  fails, call `backlog_worker_reject(command_key, item_id, expected_revision, execution_ref, expected_result_digest, expected_delivery_digest, rejection_reason, rejection_evidence)`.
+  fails, call
+  `backlog_worker_reject(command_key, item_id, expected_revision, execution_ref, expected_result_digest, expected_delivery_digest, rejection_reason, rejection_evidence)`.
   It separately records failed Coworker acceptance and blocks the item with a
   bounded reason while preserving the immutable successful outcome. It creates
   no human question/`NeedsYou` and dispatches nothing. Missing or mismatched
   evidence cannot justify rejection or completion.
-- A rejected attempt cannot complete, and a result reread preserves the
-  rejection. An exact replay of the original rejection request returns its
-  receipt even if a later attempt exists. A new attempt needs fresh authorized
-  approval/task identity and the current revision; never replay old authority.
+- A successful complete already returns immutable `Done`: finish with a short
+  human-language report; do not reread or manually rewrite the long receipt JSON.
+  Backend receipts remain; private artifacts are compact IDs, digests, hashes, and
+  verdicts produced once with physical checking. A rejected attempt cannot complete,
+  and a result reread preserves the rejection. An exact replay of the original
+  rejection request returns its receipt even if a later attempt exists. A new
+  attempt needs fresh authorized approval/task identity and the current revision;
+  never replay old authority.
 - On a stopped host, use only supported read result/history; do not ACK history
-  or restart to force a result. Busy- and idle-turn handling is intended, but
-  broad live native-chat delivery is not claimed as qualified.
-- Failed or Unknown outcomes cannot become `Done`. `Done` replay returns the
-  immutable original completion, not a new acceptance. Never fabricate run IDs
-  or import raw outcomes.
+  or restart to force a result. Failed or Unknown outcomes cannot become `Done`.
+  `Done` replay returns the immutable original completion, not a new acceptance.
+  Never fabricate run IDs or import raw outcomes.
 
 ## Optional legacy multi-role work
 
 Existing multi-role planning, admission, controller, review, and closure routes
 remain available only when the human explicitly selects them or continues an old
-job. Old jobs stay readable under their frozen contracts. These multi-role stages
-are optional; the real Worker route and its frozen execution profile are not
-optional legacy. Do not require `prepare_work`, `request_technical_plan`,
-Orchestrator, Advisor, Reviewer, Closure, or complete-job admission
-for ordinary backlog work. The current advisory identity is `advisor`
-(`consult_advisor`); the retained frozen `architect`/`consult_architect`
-identifiers remain valid for old jobs and exact command replay. New plan tasks
-submitted as `advisor` store `advisor`; mutable profile assignments use
-`advisor`; frozen plans, approvals, policies, receipts, and old command records
-keep their raw `architect` identity. Advice remains optional and grants no Worker
-authority.
+job. Old jobs stay readable under their frozen contracts. Do not require
+`prepare_work`, `request_technical_plan`, Orchestrator, Advisor, Reviewer,
+Closure, or complete-job admission for ordinary backlog work. The current
+advisory identity is `advisor` (`consult_advisor`); the retained frozen
+`architect`/`consult_architect` identifiers remain valid for old jobs and exact
+command replay. Advice remains optional and grants no Worker authority. See
+`docs/MCP-LEGACY-OPERATING-GUIDE.md`.
 
 ## Safety boundaries
 

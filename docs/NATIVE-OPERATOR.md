@@ -28,18 +28,25 @@ Run `threadlane guide` to print the canonical versioned operating guide
 ([`docs/MCP-OPERATING-GUIDE.md`](MCP-OPERATING-GUIDE.md)) offline without network
 or supervisor access. When connected over MCP (`threadlane mcp` or enrolled
 `threadlane-native-mcp`), call the read-only `operating_guide` (`{}`) tool to
-fetch the same shared guide and version (`2026-11-15.v1`).
+fetch the same shared guide and version (`2026-11-15.v2`).
 
 Compaction detection and memory retention are not automatic. On initial
 connection, session resume, context uncertainty, or before external effects when
 rules or state are uncertain, refetch `operating_guide` (or run `threadlane guide`
-on the trusted-local CLI route) and then refresh live scoped state and revisions
-(`status`, bounded `backlog_list` / `backlog_get` / `backlog_history`, and only
-actual recorded execution references when invoking guarded
-`backlog_worker_result` or `backlog_worker_reject`). Read `list_approvals`,
-`approved_session`, and `approved_task` when their actual IDs are known. Legacy
-jobs additionally use `coworker_status`, `list_plans`, and `get_plan`. Do not
-invent identifiers or use a polling loop.
+on the trusted-local CLI route) and then batch independent live scoped reads.
+Refresh only the uncertain revisions (`status`, bounded `backlog_list` /
+`backlog_get` / `backlog_history`, and actual recorded execution references only
+when invoking guarded `backlog_worker_result` or `backlog_worker_reject`). Read
+`list_approvals`, `approved_session`, and `approved_task` only when their actual
+IDs are already known. Routine guarded completion uses the current
+`item_snapshot` and `worker_evidence` returned by `backlog_worker_result`; do not
+reread `approved_task`, `backlog_get`, or `status` merely to obtain the revision
+unless a field is genuinely absent, evidence is stale/conflicting/unknown, or an
+explicit readback test requires it. Legacy jobs additionally use
+`coworker_status`, `list_plans`, and `get_plan`. Do not invent identifiers or use
+a polling loop. The detailed legacy contracts are preserved in
+[`docs/MCP-LEGACY-OPERATING-GUIDE.md`](MCP-LEGACY-OPERATING-GUIDE.md) and are
+opt-in only.
 
 ## Setup and planning
 
@@ -49,23 +56,36 @@ explicit human authorization. Within that unchanged scope, an operator may
 publish the required technical plan record directly with `save-draft` and
 `publish` (no model `Orchestrator` or `prepare_work` is mandatory), record the
 exact authority, and launch the Worker without redundant approval ceremonies.
-Backlog creation or editing is not authority, and a local flag remains an
-attestation, not authentication. Changed scope, model, effort, quota,
-repository, base, or task identity needs a fresh concrete preview. Real Worker
-execution still requires a frozen execution profile and registry revision plus
-exact model/effort/canonical pins in the authority; a Coworker-only backlog item
-has no execution profile. Only the multi-role stages are optional.
+Reuse an existing unchanged scope, profile, plan, and approval instead of
+re-preparing them. [The ordinary Worker quickstart](ORDINARY-WORKER-QUICKSTART.md)
+has the minimal strict `OperatorApprovalIntent` JSON and the exact
+`approve prepare` / `approve record` commands; `OperatorApprovalRequest` is the
+normalized preview object, not a second invented request. Backlog creation or
+editing is not authority, and a local flag remains an attestation, not
+authentication. Changed scope, model, effort, quota, repository, base, or task
+identity needs a fresh concrete preview. Real Worker execution still requires a
+frozen execution profile and registry revision plus exact model/effort/canonical
+pins in the authority; a Coworker-only backlog item has no execution profile.
+Only the multi-role stages are optional.
 
 The ordinary Worker sequence is one exact human scope approval, refresh required
 live identity/revisions, guarded start exactly once, wait for an actual callback
 without MCP polling loops, pull/ACK the real batch, recover the original
-item/execution mapping, read the durable result, inspect real physical delivery,
-then guarded complete or truthful reject. Missing notice or reply uses the
-original receipt/result; possible effects or `Unknown` never permit redispatch.
-Preserve legitimate startup, authority, binding, readiness, revision, and digest
-refusals; UI availability replaces none of them, and supported host startup is
-still required. `Doing` is not liveness; `NeedsYou` only for an actual open human
-decision or question.
+item/execution mapping, read the durable result, make one bounded physical and
+semantic acceptance check, then guarded complete or truthful reject. The guarded
+start enforces real readiness and identity; do not add an unconditional ready
+probe. The result returns the actual current `item_snapshot` (revision/status/current ref) and
+compact `worker_evidence` from the same verified host snapshot when available, so
+completion normally needs no extra `approved_task`, `backlog_get`, or `status`
+read. A successful complete already returns immutable `Done`: report it briefly
+in the human conversation language and do not reread or manually rewrite the long
+receipt JSON. Backend receipts remain; private artifacts are compact IDs, digests,
+hashes, and verdicts produced once with physical checking. Missing notice or reply
+uses the original receipt/result; possible effects or `Unknown` never permit
+redispatch. Preserve legitimate startup, authority, binding, readiness, revision,
+and digest refusals; UI availability replaces none of them, and supported host
+startup is still required. `Doing` is not liveness; `NeedsYou` only for an actual
+open human decision or question.
 
 On the managed Linux Codex desktop route, call the no-argument
 `connect_current_chat` MCP tool on first use, then `operating_guide`. It verifies
@@ -84,7 +104,9 @@ or `available: false` with `code` and `message` when unconfigured).
 The following planning-grant and complete-job admission sequence is not required
 for ordinary backlog work. Use it only when the human explicitly selects a
 legacy multi-role job or continues an existing one. Old jobs remain readable
-under their original frozen contracts.
+under their original frozen contracts. The detailed MCP-side legacy contracts
+are also preserved in
+[`docs/MCP-LEGACY-OPERATING-GUIDE.md`](MCP-LEGACY-OPERATING-GUIDE.md).
 
 On a fresh chat without an active planning grant or execution approval:
 
