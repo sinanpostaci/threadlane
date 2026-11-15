@@ -123,8 +123,14 @@ remain available only when the human explicitly selects them or continues an old
 job. Old jobs stay readable under their frozen contracts. These multi-role stages
 are optional; the real Worker route and its frozen execution profile are not
 optional legacy. Do not require `prepare_work`, `request_technical_plan`,
-Orchestrator, Architect, Reviewer, Closure, or complete-job admission for
-ordinary backlog work.
+Orchestrator, Advisor, Reviewer, Closure, or complete-job admission
+for ordinary backlog work. The current advisory identity is `advisor`
+(`consult_advisor`); the retained frozen `architect`/`consult_architect`
+identifiers remain valid for old jobs and exact command replay. New plan tasks
+submitted as `advisor` store `advisor`; mutable profile assignments use
+`advisor`; frozen plans, approvals, policies, receipts, and old command records
+keep their raw `architect` identity. Advice remains optional and grants no Worker
+authority.
 
 ## Safety boundaries
 

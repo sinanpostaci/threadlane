@@ -50,7 +50,7 @@ use crate::types::{
     DependencyInputSummary, DependencyPredecessorSelection, HostNotificationDeliveryStatus,
     HostNotificationRearmReport, HostNotificationStatusReport, HostPhase, HostSessionManifest,
     HostSessionSummary, PrepareDependencyInputsRequest, TaskDispatchIntent, TaskExecutionStatus,
-    TaskRunReceipt, TaskStateSnapshot, APPROVED_EVENT_BATCH_MAX_BYTES,
+    TaskRunReceipt, TaskStateSnapshot, TaskTerminalSummary, APPROVED_EVENT_BATCH_MAX_BYTES,
     APPROVED_EVENT_BATCH_MAX_EVENTS, HOST_LOCK_FILENAME, MAX_TASK_RECEIPTS_BYTES,
     RUNTIME_STATE_SUBDIR, TASK_RECEIPTS_FILENAME, WORK_AREA_SUBDIR,
 };
@@ -196,7 +196,8 @@ impl CheckpointedSessionKind {
 /// - Never exposes supervisor bearer tokens or local filesystem paths in return values or `Debug`.
 #[derive(Clone)]
 pub struct ApprovedHostClient {
-    authority: Arc<AuthorityStore>,
+    authority: Option<Arc<AuthorityStore>>,
+    authority_dir: PathBuf,
     sessions_dir: PathBuf,
     control_binding_id: String,
     native_thread_uuid: String,
@@ -261,9 +262,43 @@ impl ApprovedHostClient {
 
         let canonical_sessions_dir =
             validate_sessions_root(sessions_dir.as_ref(), &[("authority_dir", authority.dir())])?;
+        let authority_dir = authority.dir().to_path_buf();
 
         Ok(Self {
-            authority,
+            authority: Some(authority),
+            authority_dir,
+            sessions_dir: canonical_sessions_dir,
+            control_binding_id,
+            native_thread_uuid,
+        })
+    }
+
+    /// Constructs a strictly read-only client for exact terminal-history reads.
+    ///
+    /// No global store is opened or created. The authority directory and sessions root must already
+    /// exist as validated private directories, and every read reuses the same approval/session
+    /// scope checks as an opened client. The client is private so it can never dispatch, cancel,
+    /// ACK, or otherwise mutate through a read-only construction.
+    fn readonly_at(
+        authority_dir: &Path,
+        sessions_dir: &Path,
+        control_binding_id: impl Into<String>,
+        native_thread_uuid: impl Into<String>,
+    ) -> Result<Self, HostError> {
+        let control_binding_id = control_binding_id.into();
+        let native_thread_uuid = native_thread_uuid.into();
+        validate_identifier("control_binding_id", &control_binding_id)?;
+        validate_canonical_thread_uuid("native_thread_uuid", &native_thread_uuid)?;
+
+        let canonical_authority_dir = verify_existing_private_dir(authority_dir)?;
+        let canonical_sessions_dir = validate_existing_sessions_root(
+            sessions_dir,
+            &[("authority_dir", canonical_authority_dir.as_path())],
+        )?;
+
+        Ok(Self {
+            authority: None,
+            authority_dir: canonical_authority_dir,
             sessions_dir: canonical_sessions_dir,
             control_binding_id,
             native_thread_uuid,
@@ -1052,7 +1087,7 @@ impl ApprovedHostClient {
         }
 
         // Verify that the active source plan is still Published and materialize the frozen profiles.
-        let materialized = self.authority.materialize(
+        let materialized = self.authority_store()?.materialize(
             &session.record.approval_id,
             &session.live_binding,
             &session.work_area_dir,
@@ -1192,7 +1227,7 @@ impl ApprovedHostClient {
             task_id,
         )?;
 
-        let materialized = self.authority.materialize(
+        let materialized = self.authority_store()?.materialize(
             &session.record.approval_id,
             &session.live_binding,
             &session.work_area_dir,
@@ -1762,6 +1797,447 @@ impl ApprovedHostClient {
         }
     }
 
+    /// Reads one bounded, path-free summary of the verified running or terminal Worker attempt for
+    /// `task_id` in `approval_id` using only existing read-only authority, session, receipt, and
+    /// runtime verification.
+    ///
+    /// - A live `Ready` session uses the same noncreating [`ReadySessionAccess::ReadonlyPresence`]
+    ///   session verification as worker-presence reads, then verifies the exact frozen task,
+    ///   sealed receipt, session binding, run, worker, profile, and owned work area before and
+    ///   after the runtime read. A running attempt is reported with its actual runtime status and
+    ///   missing telemetry stays `None`; it is never evidence of live process presence.
+    /// - A `Stopped` session and a stale/orphaned `Ready` session use the existing noncreating
+    ///   `host.lock` ownership probe, the shared `supervisor.lock` release guard, the read-only
+    ///   task-ledger reader, and the bounded checkpointed `state.db` reader. An orphaned `Ready`
+    ///   session still requires complete terminal Worker evidence.
+    /// - Returns `Ok(None)` for a task that never started, an unavailable or unverifiable session,
+    ///   or a worker record that no longer matches its sealed receipt.
+    ///
+    /// The method never dispatches, cancels, ACKs, starts or restarts a host, creates stores or
+    /// locks, acquires an existing `task-receipts.lock`, or changes cursors.
+    pub async fn get_task_terminal_summary_readonly_at(
+        authority_dir: &Path,
+        sessions_dir: &Path,
+        control_binding_id: &str,
+        native_thread_uuid: &str,
+        approval_id: &str,
+        task_id: &str,
+    ) -> Result<Option<TaskTerminalSummary>, HostError> {
+        validate_approval_id(approval_id)?;
+        validate_identifier("task_id", task_id)?;
+        let client = Self::readonly_at(
+            authority_dir,
+            sessions_dir,
+            control_binding_id,
+            native_thread_uuid,
+        )?;
+        let record = client.resolve_authorized_approval(approval_id)?;
+        let task = record
+            .tasks
+            .iter()
+            .find(|task| task.task_id == task_id)
+            .ok_or_else(|| HostError::UnknownTask {
+                approval_id: record.approval_id.clone(),
+                task_id: task_id.to_string(),
+            })?
+            .clone();
+        if !task.is_frozen_headless_worker() {
+            // Native-route tasks have no Worker execution summary; keep the established absent
+            // observation instead of surfacing a new error to the read-only caller.
+            return Ok(None);
+        }
+        // The requested model/effort metadata comes from the frozen profile, so the enclosing
+        // approved canonical repository must still be a real canonical directory.
+        verify_existing_canonical_repository_readonly(&record.repository_path)?;
+
+        let session_candidate = client.sessions_dir.join(&record.approval_id);
+        match std::fs::symlink_metadata(&session_candidate) {
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => {
+                return Err(HostError::Io {
+                    operation: "symlink_metadata(summary session_dir)".to_string(),
+                    reason: err.to_string(),
+                });
+            }
+        }
+        let session_dir = verify_existing_session_dir(&client.sessions_dir, &record.approval_id)?;
+        let Some(initial_manifest) = read_host_manifest_optional(&session_dir, &record)? else {
+            return Ok(None);
+        };
+
+        let summary = match initial_manifest.phase {
+            HostPhase::Ready => {
+                client
+                    .read_live_or_orphaned_task_summary(
+                        &record,
+                        &session_dir,
+                        &initial_manifest,
+                        &task,
+                    )
+                    .await
+            }
+            HostPhase::Stopped => client.read_checkpointed_task_summary(
+                &record,
+                &session_dir,
+                &initial_manifest,
+                &task,
+                CheckpointedSessionKind::Stopped,
+            ),
+            HostPhase::Bootstrapping | HostPhase::Stopping | HostPhase::Failed => Ok(None),
+        };
+        match summary {
+            Ok(summary) => Ok(summary),
+            // Preserve the established contract: an unavailable or non-terminal session is an
+            // absent observation, while scope, receipt, and corruption refusals remain errors.
+            Err(HostError::HostNotReady { .. }) => Ok(None),
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Reads a running or terminal summary from a live `Ready` session, falling back to the strict
+    /// orphaned-`Ready` history path only when the live session verification declines.
+    async fn read_live_or_orphaned_task_summary(
+        &self,
+        record: &ApprovalRecord,
+        session_dir: &Path,
+        initial_manifest: &HostSessionManifest,
+        task: &ApprovedTaskRecord,
+    ) -> Result<Option<TaskTerminalSummary>, HostError> {
+        if initial_manifest.phase != HostPhase::Ready
+            || !initial_manifest.gates.supervisor_authenticated_ready
+        {
+            return Ok(None);
+        }
+        let Some(expected_instance_id) = initial_manifest.instance_id.clone() else {
+            return Ok(None);
+        };
+        let Some(session) = Self::verify_ready_session_for_record(
+            record,
+            &self.sessions_dir,
+            &self.native_thread_uuid,
+            Some(&expected_instance_id),
+            ReadySessionAccess::ReadonlyPresence,
+        )
+        .await?
+        else {
+            // A released host.lock (or unavailable live IPC) is never treated as live metadata.
+            // Only the existing strict orphaned-Ready guards may read that stale session.
+            return self.read_checkpointed_task_summary(
+                record,
+                session_dir,
+                initial_manifest,
+                task,
+                CheckpointedSessionKind::OrphanedReady,
+            );
+        };
+
+        let session_task = session
+            .record
+            .tasks
+            .iter()
+            .find(|candidate| candidate.task_id == task.task_id)
+            .ok_or_else(|| HostError::UnknownTask {
+                approval_id: session.record.approval_id.clone(),
+                task_id: task.task_id.clone(),
+            })?;
+        if !session_task.is_frozen_headless_worker() {
+            return Err(HostError::NativeRouteRequired {
+                approval_id: session.record.approval_id.clone(),
+                task_id: session_task.task_id.clone(),
+                adapter: session_task.adapter,
+            });
+        }
+        let session_binding_id = session.manifest.session_binding_id.clone().ok_or_else(|| {
+            HostError::CorruptManifest {
+                path: session.session_dir.display().to_string(),
+                reason: "ready manifest is missing session_binding_id".to_string(),
+            }
+        })?;
+        let Some(receipt) = read_exact_task_receipt_readonly(
+            &session.session_dir,
+            &session.record,
+            &session_binding_id,
+            &session_task.task_id,
+        )?
+        else {
+            return Ok(None);
+        };
+        verify_receipt_matches_task(&receipt, session_task)?;
+        let worker = match session
+            .scoped_client
+            .get_worker(receipt.run_id.clone())
+            .await
+        {
+            Ok(worker) => worker,
+            Err(threadlane::Error::Remote(api_err))
+                if api_err.code == RuntimeErrorCode::WorkerNotFound =>
+            {
+                return Ok(None);
+            }
+            Err(err) => return Err(err.into()),
+        };
+        verify_exact_task_worker(
+            &session.record,
+            &session.live_binding.binding_id,
+            &session.work_area_dir,
+            session_task,
+            &receipt,
+            &worker,
+        )?;
+
+        // Synchronous final guards use only freshly read, noncreating state after the last await.
+        let final_manifest = read_host_manifest_optional(&session.session_dir, &session.record)?;
+        let Some(final_manifest) = final_manifest else {
+            return Ok(None);
+        };
+        if final_manifest.phase != HostPhase::Ready
+            || !final_manifest.gates.supervisor_authenticated_ready
+            || final_manifest.instance_id.as_deref() != Some(expected_instance_id.as_str())
+            || final_manifest.session_binding_id.as_deref() != Some(session_binding_id.as_str())
+            || !is_host_lock_held_readonly(&session.session_dir)?
+        {
+            return Ok(None);
+        }
+        let final_receipt = read_exact_task_receipt_readonly(
+            &session.session_dir,
+            &session.record,
+            &session_binding_id,
+            &session_task.task_id,
+        )?;
+        if final_receipt.as_ref() != Some(&receipt) {
+            return Ok(None);
+        }
+        // A running attempt may legitimately advance between reads. Re-read and re-verify the
+        // exact attempt identity, then report the newer metadata instead of stale values.
+        let final_worker = match session
+            .scoped_client
+            .get_worker(receipt.run_id.clone())
+            .await
+        {
+            Ok(worker) => worker,
+            Err(threadlane::Error::Remote(api_err))
+                if api_err.code == RuntimeErrorCode::WorkerNotFound =>
+            {
+                return Ok(None);
+            }
+            Err(err) => return Err(err.into()),
+        };
+        verify_exact_task_worker(
+            &session.record,
+            &session.live_binding.binding_id,
+            &session.work_area_dir,
+            session_task,
+            &receipt,
+            &final_worker,
+        )?;
+
+        Ok(Some(build_task_terminal_summary(
+            &session.record,
+            &session_binding_id,
+            session_task,
+            &receipt,
+            &final_worker,
+        )))
+    }
+
+    /// Reads one verified running or terminal summary from a `Stopped` session or a stale
+    /// `Ready` manifest whose host and supervisor locks are demonstrably released.
+    ///
+    /// The existing session lifetime lock is probed without blocking; the ledger is read through
+    /// the noncreating read-only reader, and the worker snapshot is read only from the exact
+    /// checkpointed or orphaned-Ready runtime database.
+    fn read_checkpointed_task_summary(
+        &self,
+        record: &ApprovalRecord,
+        initial_session_dir: &Path,
+        initial_manifest: &HostSessionManifest,
+        task: &ApprovedTaskRecord,
+        kind: CheckpointedSessionKind,
+    ) -> Result<Option<TaskTerminalSummary>, HostError> {
+        kind.validate_initial_manifest(record, initial_manifest)?;
+        let session_binding_id = initial_manifest.session_binding_id.clone().ok_or_else(|| {
+            HostError::CorruptManifest {
+                path: initial_session_dir.display().to_string(),
+                reason: format!(
+                    "{} manifest is missing session_binding_id",
+                    initial_manifest.phase
+                ),
+            }
+        })?;
+
+        let host_lock_guard =
+            ExistingHostLockGuard::acquire(initial_session_dir, &record.approval_id, kind.phase())?;
+        let session_dir = verify_existing_session_dir(&self.sessions_dir, &record.approval_id)?;
+        let Some(locked_manifest) = read_host_manifest_optional(&session_dir, record)? else {
+            return Ok(None);
+        };
+        kind.validate_locked_manifest(record, initial_manifest, &locked_manifest)?;
+        host_lock_guard.verify_identity(&session_dir)?;
+
+        let runtime_state_dir =
+            verify_existing_private_dir(&session_dir.join(RUNTIME_STATE_SUBDIR))?;
+        let work_area_dir = verify_existing_private_dir(&session_dir.join(WORK_AREA_SUBDIR))?;
+        verify_stopped_supervisor_lock_not_held(
+            &runtime_state_dir,
+            &record.approval_id,
+            kind.phase(),
+        )?;
+
+        let session_task = record
+            .tasks
+            .iter()
+            .find(|candidate| candidate.task_id == task.task_id)
+            .ok_or_else(|| HostError::UnknownTask {
+                approval_id: record.approval_id.clone(),
+                task_id: task.task_id.clone(),
+            })?;
+        if !session_task.is_frozen_headless_worker() {
+            return Err(HostError::NativeRouteRequired {
+                approval_id: record.approval_id.clone(),
+                task_id: session_task.task_id.clone(),
+                adapter: session_task.adapter,
+            });
+        }
+
+        let receipt_identity_path = session_dir.join(TASK_RECEIPTS_FILENAME);
+
+        let Some((_intents, receipts)) =
+            read_session_task_ledger_readonly(&session_dir, record, &session_binding_id)?
+        else {
+            return Ok(None);
+        };
+        let Some(receipt) = receipts
+            .into_iter()
+            .find(|entry| entry.task_id == session_task.task_id)
+        else {
+            return Ok(None);
+        };
+        verify_receipt_matches_task(&receipt, session_task)?;
+
+        let receipt_identity_before = if kind.requires_original_receipt() {
+            Some(read_regular_file_identity(&receipt_identity_path)?)
+        } else {
+            None
+        };
+        let receipt_bytes_before = if kind.requires_original_receipt() {
+            Some(read_regular_file_bytes(&receipt_identity_path)?)
+        } else {
+            None
+        };
+
+        let db_path = runtime_state_dir.join("state.db");
+        let worker = match kind {
+            CheckpointedSessionKind::Stopped => Core::get_worker_readonly(
+                &db_path,
+                &session_binding_id,
+                &self.native_thread_uuid,
+                &receipt.run_id,
+            ),
+            CheckpointedSessionKind::OrphanedReady => read_orphaned_ready_worker_snapshot(
+                &db_path,
+                &session_binding_id,
+                &self.native_thread_uuid,
+                &receipt,
+            ),
+        }
+        .map_err(|err| {
+            map_readonly_sqlite_read_error(
+                err,
+                &record.approval_id,
+                &db_path,
+                &session_binding_id,
+                &self.native_thread_uuid,
+                kind,
+            )
+        })?;
+        verify_exact_task_worker(
+            record,
+            &session_binding_id,
+            &work_area_dir,
+            session_task,
+            &receipt,
+            &worker,
+        )?;
+        if kind.requires_original_receipt() {
+            verify_orphaned_terminal_worker(record, &receipt, &worker)?;
+        }
+
+        // Recheck the manifest, session lifetime lock, released supervisor lock, original receipt
+        // bytes, and exact worker history after the read so a concurrent restart cannot be
+        // mistaken for durable history.
+        let Some(post_manifest) = read_host_manifest_optional(&session_dir, record)? else {
+            return Ok(None);
+        };
+        kind.validate_locked_manifest(record, &locked_manifest, &post_manifest)?;
+        host_lock_guard.verify_identity(&session_dir)?;
+        verify_stopped_supervisor_lock_not_held(
+            &runtime_state_dir,
+            &record.approval_id,
+            kind.phase(),
+        )?;
+
+        let Some((_post_intents, post_receipts)) =
+            read_session_task_ledger_readonly(&session_dir, record, &session_binding_id)?
+        else {
+            return Ok(None);
+        };
+        let post_receipt = post_receipts
+            .into_iter()
+            .find(|entry| entry.task_id == session_task.task_id);
+        if post_receipt.as_ref() != Some(&receipt) {
+            return Err(HostError::CorruptSessionState {
+                reason: "task receipt changed during read-only Worker summary read".to_string(),
+            });
+        }
+
+        if kind.requires_original_receipt() {
+            if Some(read_regular_file_identity(&receipt_identity_path)?) != receipt_identity_before
+            {
+                return Err(HostError::SecurityViolation {
+                    path: session_dir.display().to_string(),
+                    reason: "orphaned Ready task receipt identity changed during summary read"
+                        .to_string(),
+                });
+            }
+            if Some(read_regular_file_bytes(&receipt_identity_path)?) != receipt_bytes_before {
+                return Err(HostError::CorruptSessionState {
+                    reason: "orphaned Ready task receipt bytes changed during summary read"
+                        .to_string(),
+                });
+            }
+            let post_worker = read_orphaned_ready_worker_snapshot(
+                &db_path,
+                &session_binding_id,
+                &self.native_thread_uuid,
+                &receipt,
+            )
+            .map_err(|err| {
+                map_readonly_sqlite_read_error(
+                    err,
+                    &record.approval_id,
+                    &db_path,
+                    &session_binding_id,
+                    &self.native_thread_uuid,
+                    kind,
+                )
+            })?;
+            if post_worker != worker {
+                return Err(HostError::CorruptSessionState {
+                    reason: "orphaned Ready worker history changed during summary read".to_string(),
+                });
+            }
+        }
+
+        Ok(Some(build_task_terminal_summary(
+            record,
+            &session_binding_id,
+            session_task,
+            &receipt,
+            &worker,
+        )))
+    }
+
     /// Returns the runtime's actual, bounded worker-process presence for `task_id` in
     /// `approval_id` when an active authenticated host session currently owns that exact run.
     ///
@@ -1773,7 +2249,7 @@ impl ApprovedHostClient {
         task_id: &str,
     ) -> Result<Option<WorkerPresenceSnapshot>, HostError> {
         Self::get_task_presence_readonly_at(
-            self.authority.dir(),
+            self.authority_dir.as_path(),
             &self.sessions_dir,
             &self.control_binding_id,
             &self.native_thread_uuid,
@@ -3705,7 +4181,10 @@ impl ApprovedHostClient {
 
     fn resolve_authorized_approval(&self, approval_id: &str) -> Result<ApprovalRecord, HostError> {
         validate_approval_id(approval_id)?;
-        let record = self.authority.get_for_operator(approval_id)?;
+        let record = match self.authority.as_ref() {
+            Some(authority) => authority.get_for_operator(approval_id)?,
+            None => AuthorityStore::get_for_operator_readonly_at(&self.authority_dir, approval_id)?,
+        };
 
         // Authoritative caller scope check BEFORE accessing the host session directory.
         if record.binding_id != self.control_binding_id {
@@ -3731,15 +4210,35 @@ impl ApprovedHostClient {
             });
         }
 
-        validate_sessions_root(
-            &self.sessions_dir,
-            &[
-                ("authority_dir", self.authority.dir()),
-                ("repository_path", record.repository_path.as_path()),
-            ],
-        )?;
+        let validation = if self.authority.is_some() {
+            validate_sessions_root(
+                &self.sessions_dir,
+                &[
+                    ("authority_dir", self.authority_dir.as_path()),
+                    ("repository_path", record.repository_path.as_path()),
+                ],
+            )
+        } else {
+            validate_existing_sessions_root(
+                &self.sessions_dir,
+                &[
+                    ("authority_dir", self.authority_dir.as_path()),
+                    ("repository_path", record.repository_path.as_path()),
+                ],
+            )
+        };
+        validation?;
 
         Ok(record)
+    }
+
+    fn authority_store(&self) -> Result<&AuthorityStore, HostError> {
+        self.authority
+            .as_deref()
+            .ok_or_else(|| HostError::Validation {
+                field: "authority".to_string(),
+                reason: "read-only host client cannot materialize or dispatch tasks".to_string(),
+            })
     }
 
     async fn verify_active_ready_session(
@@ -4659,6 +5158,129 @@ fn verify_exact_task_worker(
     Ok(())
 }
 
+fn non_empty_optional(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// Verifies the approved repository is still an absolute canonical existing directory without
+/// symlink components before frozen profile metadata is exposed.
+fn verify_existing_canonical_repository_readonly(repository_path: &Path) -> Result<(), HostError> {
+    if !repository_path.is_absolute() {
+        return Err(HostError::SecurityViolation {
+            path: repository_path.display().to_string(),
+            reason: "approved repository_path must be absolute".to_string(),
+        });
+    }
+    let checked = ensure_no_symlink_components(repository_path)?;
+    let meta = std::fs::symlink_metadata(&checked).map_err(|err| HostError::Io {
+        operation: "symlink_metadata(repository_path)".to_string(),
+        reason: err.to_string(),
+    })?;
+    if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
+        return Err(HostError::SecurityViolation {
+            path: checked.display().to_string(),
+            reason: "approved repository_path must be an existing non-symlink directory"
+                .to_string(),
+        });
+    }
+    let canonical = std::fs::canonicalize(&checked).map_err(|err| HostError::Io {
+        operation: "canonicalize(repository_path)".to_string(),
+        reason: err.to_string(),
+    })?;
+    if canonical != checked {
+        return Err(HostError::SecurityViolation {
+            path: checked.display().to_string(),
+            reason: "approved repository_path must be a canonical directory path".to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn verify_receipt_matches_task(
+    receipt: &TaskRunReceipt,
+    task: &ApprovedTaskRecord,
+) -> Result<(), HostError> {
+    if receipt.task_id != task.task_id
+        || receipt.task_digest != task.task_digest
+        || Some(receipt.profile_id.as_str()) != task.profile_id.as_deref()
+        || Some(receipt.command_key.as_str()) != task.command_key.as_deref()
+    {
+        return Err(HostError::CorruptSessionState {
+            reason: format!(
+                "sealed receipt for task `{}` does not match the frozen task identity",
+                task.task_id
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn valid_worker_timestamp_ms(value: Option<i64>) -> Option<i64> {
+    value.filter(|&value| value > 0)
+}
+
+/// Derives an elapsed duration only from two valid positive timestamps in nondecreasing order.
+///
+/// `checked_sub` keeps extreme values such as `i64::MIN`/`i64::MAX` from overflowing during
+/// observation of an invalid or corrupted runtime record.
+fn safe_elapsed_duration_ms(
+    started_at_ms: Option<i64>,
+    finished_at_ms: Option<i64>,
+) -> Option<u64> {
+    let started = valid_worker_timestamp_ms(started_at_ms)?;
+    let finished = valid_worker_timestamp_ms(finished_at_ms)?;
+    finished
+        .checked_sub(started)
+        .and_then(|elapsed| u64::try_from(elapsed).ok())
+}
+
+/// Builds the bounded, path-free summary from the exact verified record/receipt/worker identity.
+///
+/// Missing telemetry stays `None`; a measured runtime duration is preserved independently of the
+/// optional start/finish timestamps.
+fn build_task_terminal_summary(
+    record: &ApprovalRecord,
+    session_binding_id: &str,
+    task: &ApprovedTaskRecord,
+    receipt: &TaskRunReceipt,
+    worker: &WorkerSnapshot,
+) -> TaskTerminalSummary {
+    let started_at_ms = valid_worker_timestamp_ms(worker.started_at_ms);
+    let finished_at_ms = valid_worker_timestamp_ms(worker.completed_at_ms);
+    let measured_duration_ms = worker
+        .outcome
+        .as_ref()
+        .and_then(|outcome| outcome.duration_ms);
+    let duration_ms =
+        measured_duration_ms.or_else(|| safe_elapsed_duration_ms(started_at_ms, finished_at_ms));
+
+    TaskTerminalSummary {
+        approval_id: record.approval_id.clone(),
+        subject_digest: record.subject_digest.clone(),
+        binding_id: record.binding_id.clone(),
+        thread_uuid: record.thread_uuid.clone(),
+        session_binding_id: session_binding_id.to_string(),
+        task_id: task.task_id.clone(),
+        task_digest: task.task_digest.clone(),
+        run_id: receipt.run_id.clone(),
+        worker_id: receipt.worker_id.clone(),
+        provider: non_empty_optional(&worker.provider),
+        requested_model: non_empty_optional(&worker.requested_model),
+        observed_model: worker.observed_model.clone(),
+        requested_effort: non_empty_optional(&worker.requested_effort),
+        observed_effort: worker.observed_effort.clone(),
+        worker_status: worker.status,
+        started_at_ms,
+        finished_at_ms,
+        duration_ms,
+    }
+}
+
 fn map_readonly_sqlite_read_error(
     err: ReadonlySqliteError,
     approval_id: &str,
@@ -5225,5 +5847,48 @@ mod tests {
             first <= second && second <= third,
             "advanced sample ages must be nondecreasing"
         );
+    }
+
+    #[test]
+    fn safe_elapsed_duration_rejects_invalid_negative_and_extreme_timestamps_without_overflow() {
+        assert_eq!(
+            safe_elapsed_duration_ms(Some(1_000), Some(4_500)),
+            Some(3_500)
+        );
+        assert_eq!(safe_elapsed_duration_ms(Some(1_000), Some(1_000)), Some(0));
+        assert_eq!(safe_elapsed_duration_ms(Some(1_000), None), None);
+        assert_eq!(safe_elapsed_duration_ms(None, Some(4_500)), None);
+        assert_eq!(safe_elapsed_duration_ms(None, None), None);
+        assert_eq!(safe_elapsed_duration_ms(Some(0), Some(4_500)), None);
+        assert_eq!(safe_elapsed_duration_ms(Some(-1), Some(4_500)), None);
+        assert_eq!(safe_elapsed_duration_ms(Some(4_500), Some(-1)), None);
+        assert_eq!(
+            safe_elapsed_duration_ms(Some(i64::MIN), Some(0)),
+            None,
+            "a negative start with an invalid finish must not subtract unchecked"
+        );
+        assert_eq!(
+            safe_elapsed_duration_ms(Some(i64::MIN), Some(i64::MAX)),
+            None,
+            "extreme out-of-range timestamps must not overflow"
+        );
+        assert_eq!(
+            safe_elapsed_duration_ms(Some(1_000), Some(i64::MAX)),
+            u64::try_from(i64::MAX - 1_000).ok(),
+            "a valid large positive elapsed interval is preserved"
+        );
+        assert_eq!(
+            safe_elapsed_duration_ms(Some(4_500), Some(1_000)),
+            None,
+            "a finish earlier than its start is not a usable elapsed interval"
+        );
+    }
+
+    #[test]
+    fn terminal_summary_timing_filters_nonpositive_timestamps() {
+        assert_eq!(valid_worker_timestamp_ms(Some(1)), Some(1));
+        assert_eq!(valid_worker_timestamp_ms(Some(0)), None);
+        assert_eq!(valid_worker_timestamp_ms(Some(-1)), None);
+        assert_eq!(valid_worker_timestamp_ms(None), None);
     }
 }

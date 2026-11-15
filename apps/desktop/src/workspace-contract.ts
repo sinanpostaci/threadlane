@@ -9,6 +9,8 @@ import {
   MAX_WORKSPACE_CANONICAL_PATH_BYTES,
   MAX_WORKSPACE_CHAT_WORK_EVENTS_PER_CHAT,
   MAX_WORKSPACE_CHAT_WORK_EVENTS_TOTAL,
+  MAX_WORKSPACE_CHAT_WORK_EXECUTIONS_PER_CHAT,
+  MAX_WORKSPACE_CHAT_WORK_EXECUTIONS_TOTAL,
   MAX_WORKSPACE_CHAT_WORK_ITEMS_PER_CHAT,
   MAX_WORKSPACE_CHAT_WORK_ITEMS_TOTAL,
   MAX_WORKSPACE_CHAT_WORK_PRESENCE_PER_CHAT,
@@ -96,6 +98,10 @@ import type {
   WorkspaceTaskAttempt,
   WorkspaceTaskCandidate,
   WorkspaceTaskHistory,
+  WorkspaceWorkerExecution,
+  WorkspaceWorkerExecutionAcceptance,
+  WorkspaceWorkerExecutionOutcome,
+  WorkspaceWorkerExecutionStatus,
 } from './observation/types.ts';
 
 export {
@@ -109,6 +115,8 @@ export {
   MAX_WORKSPACE_CANONICAL_PATH_BYTES,
   MAX_WORKSPACE_CHAT_WORK_EVENTS_PER_CHAT,
   MAX_WORKSPACE_CHAT_WORK_EVENTS_TOTAL,
+  MAX_WORKSPACE_CHAT_WORK_EXECUTIONS_PER_CHAT,
+  MAX_WORKSPACE_CHAT_WORK_EXECUTIONS_TOTAL,
   MAX_WORKSPACE_CHAT_WORK_ITEMS_PER_CHAT,
   MAX_WORKSPACE_CHAT_WORK_ITEMS_TOTAL,
   MAX_WORKSPACE_CHAT_WORK_PRESENCE_PER_CHAT,
@@ -188,6 +196,10 @@ export type {
   WorkspaceTaskAttempt,
   WorkspaceTaskCandidate,
   WorkspaceTaskHistory,
+  WorkspaceWorkerExecution,
+  WorkspaceWorkerExecutionAcceptance,
+  WorkspaceWorkerExecutionOutcome,
+  WorkspaceWorkerExecutionStatus,
 };
 
 // ---------------------------------------------------------------------------
@@ -2924,6 +2936,302 @@ function normalizeBacklogPresence(raw: unknown): WorkspaceBacklogWorkerPresence 
   };
 }
 
+function cleanOptionalExecutionText(raw: unknown): string | null {
+  const clean = sanitizeWorkspaceSelectionToken(raw);
+  if (clean === null) {
+    return null;
+  }
+  const lower = clean.toLowerCase();
+  if (
+    lower === 'unknown' ||
+    lower === 'not_reported' ||
+    lower === 'not reported' ||
+    lower === 'n/a' ||
+    lower === 'none'
+  ) {
+    return null;
+  }
+  return clean;
+}
+
+function cleanOptionalExecutionToken(raw: unknown): string | null {
+  if (typeof raw !== 'string') {
+    return null;
+  }
+  const trimmed = raw.trim();
+  if (trimmed.length === 0) {
+    return null;
+  }
+  const clean = sanitizeWorkspaceSelectionToken(raw);
+  if (
+    clean === null ||
+    clean !== trimmed ||
+    utf8ByteLength(clean) > MAX_WORKSPACE_LABEL_BYTES ||
+    !/^[A-Za-z0-9_.-]+$/.test(clean)
+  ) {
+    return null;
+  }
+  return clean.toLowerCase();
+}
+
+function parseWorkerExecutionOutcome(raw: unknown): WorkspaceWorkerExecutionOutcome | null {
+  const token = cleanOptionalExecutionToken(raw);
+  return token === 'success' || token === 'failure' || token === 'unknown'
+    ? token
+    : null;
+}
+
+const TERMINAL_WORKER_EXECUTION_STATUSES: ReadonlySet<string> = new Set([
+  'completed',
+  'failed',
+  'cancelled',
+  'timed_out',
+  'unknown',
+]);
+
+const TERMINAL_WORKER_EXECUTION_ACCEPTANCES: ReadonlySet<string> = new Set([
+  'accepted',
+  'verified_accepted',
+  'rejected',
+  'rejected_by_diff_gate',
+  'execution_failed',
+]);
+
+/**
+ * Prefers the most terminal/complete duplicate record for one immutable
+ * `execution_ref`. A refresh that repeats the same attempt must never replace
+ * proven terminal timing metadata with a sparser copy.
+ */
+function workerExecutionRecordRank(execution: WorkspaceWorkerExecution): number {
+  let rank = 0;
+  const status = execution.worker_status?.toLowerCase() ?? '';
+  const acceptance = execution.acceptance?.toLowerCase() ?? '';
+  if (
+    execution.outcome !== null ||
+    execution.finished_at_ms !== null ||
+    TERMINAL_WORKER_EXECUTION_STATUSES.has(status) ||
+    TERMINAL_WORKER_EXECUTION_ACCEPTANCES.has(acceptance)
+  ) {
+    rank += 1_000;
+  }
+  if (execution.outcome !== null) {
+    rank += execution.outcome === 'unknown' ? 64 : 192;
+  }
+  if (execution.worker_status !== null) {
+    rank += 64;
+  }
+  if (execution.acceptance !== null) {
+    rank += 32;
+  }
+  if (execution.duration_ms !== null) {
+    rank += 16;
+  }
+  if (execution.finished_at_ms !== null) {
+    rank += 8;
+  }
+  if (execution.started_at_ms !== null) {
+    rank += 4;
+  }
+  if (execution.observed_model !== null) {
+    rank += 2;
+  }
+  if (execution.observed_effort !== null) {
+    rank += 1;
+  }
+  return rank;
+}
+
+function workerExecutionJoinKey(itemId: string, executionRef: string): string {
+  return `${itemId}\u0000${executionRef}`;
+}
+
+/**
+ * Immutable attempt identity used to decide whether two records for the same
+ * item/execution ref may be merged. Runtime metadata may enrich a later refresh,
+ * but no field here may change for the same attempt.
+ */
+function workerExecutionIdentityKey(execution: WorkspaceWorkerExecution): string {
+  return [
+    execution.item_id,
+    execution.execution_ref,
+    execution.approval_id,
+    execution.task_id,
+    execution.session_binding_id,
+    execution.run_id,
+    execution.worker_id,
+  ].join('\u0000');
+}
+
+function compareWorkerExecutions(
+  left: WorkspaceWorkerExecution,
+  right: WorkspaceWorkerExecution,
+): number {
+  const leftStarted = left.started_at_ms ?? Number.MIN_SAFE_INTEGER;
+  const rightStarted = right.started_at_ms ?? Number.MIN_SAFE_INTEGER;
+  if (leftStarted !== rightStarted) {
+    return leftStarted - rightStarted;
+  }
+  if (left.item_id !== right.item_id) {
+    return compareStringsUtf8(left.item_id, right.item_id);
+  }
+  return compareStringsUtf8(left.execution_ref, right.execution_ref);
+}
+
+function normalizeWorkerExecutionRecord(
+  raw: unknown,
+  identity: WorkspaceChatIdentity,
+  itemById: ReadonlyMap<string, BacklogItem>,
+  eventExecutionKeys: ReadonlySet<string>,
+): WorkspaceWorkerExecution | null {
+  if (!isRecord(raw)) {
+    return null;
+  }
+  const itemId = cleanBacklogToken(raw.item_id, MAX_WORKSPACE_LABEL_BYTES);
+  const executionRef = cleanBacklogToken(raw.execution_ref, MAX_WORKSPACE_LABEL_BYTES);
+  const approvalId = cleanBacklogToken(raw.approval_id, MAX_WORKSPACE_LABEL_BYTES);
+  const taskId = cleanBacklogToken(raw.task_id, MAX_WORKSPACE_LABEL_BYTES);
+  const sessionBindingId = cleanBacklogToken(
+    raw.session_binding_id,
+    MAX_WORKSPACE_LABEL_BYTES,
+  );
+  const runId = cleanBacklogToken(raw.run_id, MAX_WORKSPACE_LABEL_BYTES);
+  const workerId = cleanBacklogToken(raw.worker_id, MAX_WORKSPACE_LABEL_BYTES);
+  if (
+    itemId === null ||
+    executionRef === null ||
+    approvalId === null ||
+    taskId === null ||
+    sessionBindingId === null ||
+    runId === null ||
+    workerId === null
+  ) {
+    return null;
+  }
+  if (
+    [itemId, executionRef, approvalId, taskId, sessionBindingId, runId, workerId].includes(
+      'unknown',
+    )
+  ) {
+    return null;
+  }
+  // The control chat binding and the approved-host runtime binding are distinct
+  // and both are frozen at dispatch. Never require them to be equal or replace
+  // the runtime binding with the control binding.
+  const item = itemById.get(itemId);
+  if (item !== undefined) {
+    if (item.binding_id !== identity.binding_id || item.kind !== 'worker') {
+      return null;
+    }
+  } else if (!eventExecutionKeys.has(workerExecutionJoinKey(itemId, executionRef))) {
+    // An item may have left the bounded item window while its retained event
+    // still proves this exact attempt. Metadata without either join is refused.
+    return null;
+  }
+
+  const startedAtMs = cleanPositiveIntOrNull(raw.started_at_ms);
+  const rawFinishedAtMs = cleanPositiveIntOrNull(raw.finished_at_ms);
+  const finishedAtMs =
+    startedAtMs !== null &&
+    rawFinishedAtMs !== null &&
+    rawFinishedAtMs < startedAtMs
+      ? null
+      : rawFinishedAtMs;
+
+  return {
+    item_id: itemId,
+    execution_ref: executionRef,
+    approval_id: approvalId,
+    task_id: taskId,
+    session_binding_id: sessionBindingId,
+    run_id: runId,
+    worker_id: workerId,
+    provider: cleanOptionalExecutionText(raw.provider),
+    requested_model: cleanOptionalExecutionText(raw.requested_model),
+    observed_model: cleanOptionalExecutionText(raw.observed_model),
+    requested_effort: cleanOptionalExecutionText(raw.requested_effort),
+    observed_effort: cleanOptionalExecutionText(raw.observed_effort),
+    worker_status: cleanOptionalExecutionToken(raw.worker_status),
+    started_at_ms: startedAtMs,
+    finished_at_ms: finishedAtMs,
+    duration_ms: cleanNonNegativeIntOrNull(raw.duration_ms),
+    outcome: parseWorkerExecutionOutcome(raw.outcome),
+    acceptance: cleanOptionalExecutionToken(raw.acceptance),
+  };
+}
+
+function normalizeWorkerExecutionList(
+  raw: unknown,
+  identity: WorkspaceChatIdentity,
+  itemById: ReadonlyMap<string, BacklogItem>,
+  eventExecutionKeys: ReadonlySet<string>,
+): { items: WorkspaceWorkerExecution[]; omitted: number } {
+  if (!Array.isArray(raw)) {
+    return { items: [], omitted: 0 };
+  }
+  let omitted = 0;
+  interface ExecutionGroup {
+    identityKey: string;
+    selected: WorkspaceWorkerExecution | null;
+    rows: number;
+    conflicted: boolean;
+  }
+  const groups = new Map<string, ExecutionGroup>();
+  for (const entry of raw) {
+    const execution = normalizeWorkerExecutionRecord(
+      entry,
+      identity,
+      itemById,
+      eventExecutionKeys,
+    );
+    if (execution === null) {
+      omitted += 1;
+      continue;
+    }
+    const key = workerExecutionJoinKey(execution.item_id, execution.execution_ref);
+    const identityKey = workerExecutionIdentityKey(execution);
+    const group = groups.get(key);
+    if (group === undefined) {
+      groups.set(key, {
+        identityKey,
+        selected: execution,
+        rows: 1,
+        conflicted: false,
+      });
+      continue;
+    }
+    group.rows += 1;
+    if (group.conflicted) {
+      // Once a group contradicts its immutable identity, no later row may
+      // resurrect it as a different attempt.
+      omitted += 1;
+      continue;
+    }
+    if (group.identityKey !== identityKey) {
+      // Quarantine the whole group, including rows already merged above.
+      omitted += group.rows;
+      group.conflicted = true;
+      group.selected = null;
+      continue;
+    }
+    const existing = group.selected;
+    if (
+      existing === null ||
+      workerExecutionRecordRank(execution) > workerExecutionRecordRank(existing)
+    ) {
+      group.selected = execution;
+    }
+  }
+  const ordered = Array.from(groups.values())
+    .filter(
+      (group): group is ExecutionGroup & { selected: WorkspaceWorkerExecution } =>
+        !group.conflicted && group.selected !== null,
+    )
+    .map((group) => group.selected)
+    .sort(compareWorkerExecutions);
+  const capped = capTail(ordered, MAX_WORKSPACE_CHAT_WORK_EXECUTIONS_PER_CHAT);
+  return { items: capped.items, omitted: omitted + capped.omitted };
+}
+
 function normalizeWorkspaceChatWorkEntry(raw: unknown): WorkspaceChatWork | null {
   if (!isRecord(raw)) {
     return null;
@@ -2940,6 +3248,7 @@ function normalizeWorkspaceChatWorkEntry(raw: unknown): WorkspaceChatWork | null
     items_omitted: cleanNonNegativeInt(rawBounds.items_omitted, 0),
     events_omitted: cleanNonNegativeInt(rawBounds.events_omitted, 0),
     presence_omitted: cleanNonNegativeInt(rawBounds.presence_omitted, 0),
+    executions_omitted: cleanNonNegativeInt(rawBounds.executions_omitted, 0),
   };
 
   let itemsOmitted = 0;
@@ -3007,6 +3316,14 @@ function normalizeWorkspaceChatWorkEntry(raw: unknown): WorkspaceChatWork | null
     events = events.slice(overflow);
     eventsOmitted += overflow;
   }
+  const eventExecutionKeys = new Set<string>();
+  for (const event of events) {
+    if (event.execution_ref !== null) {
+      eventExecutionKeys.add(
+        workerExecutionJoinKey(event.item_id, event.execution_ref),
+      );
+    }
+  }
 
   let presenceOmitted = 0;
   const presenceByKey = new Map<string, WorkspaceBacklogWorkerPresence>();
@@ -3043,16 +3360,25 @@ function normalizeWorkspaceChatWorkEntry(raw: unknown): WorkspaceChatWork | null
     presenceOmitted += overflow;
   }
 
+  const workerExecutions = normalizeWorkerExecutionList(
+    raw.worker_executions,
+    identity,
+    itemById,
+    eventExecutionKeys,
+  );
+
   return {
     identity,
     availability,
     items,
     events,
     worker_presence: workerPresence,
+    worker_executions: workerExecutions.items,
     bounds: {
       items_omitted: bounds.items_omitted + itemsOmitted,
       events_omitted: bounds.events_omitted + eventsOmitted,
       presence_omitted: bounds.presence_omitted + presenceOmitted,
+      executions_omitted: (bounds.executions_omitted ?? 0) + workerExecutions.omitted,
     },
   };
 }
@@ -3080,49 +3406,80 @@ function compareBacklogPresence(
   );
 }
 
+interface RawChatWorkAggregate {
+  identity: WorkspaceChatIdentity;
+  availability: 'available' | 'unavailable';
+  items: unknown[];
+  events: unknown[];
+  worker_presence: unknown[];
+  worker_executions: unknown[];
+  bounds: {
+    items_omitted: number;
+    events_omitted: number;
+    presence_omitted: number;
+    executions_omitted: number;
+  };
+}
+
+function rawChatWorkArray(value: unknown): unknown[] {
+  return Array.isArray(value) ? value.slice() : [];
+}
+
 function normalizeWorkspaceChatWorkList(raw: unknown): WorkspaceChatWork[] {
-  const merged = new Map<
-    string,
-    {
-      identity: WorkspaceChatIdentity;
-      availability: 'available' | 'unavailable';
-      items: BacklogItem[];
-      events: WorkspaceBacklogEvent[];
-      worker_presence: WorkspaceBacklogWorkerPresence[];
-      bounds: WorkspaceChatWorkBounds;
-    }
-  >();
+  // Group every raw row by the complete canonical chat identity before any
+  // lossy item/event/execution normalization. In particular, a Worker
+  // execution group split across entries must still quarantine as one group;
+  // normalizing each entry first would turn a conflict into a missing row and
+  // could resurrect it from a later refresh copy of the same chat.
+  const merged = new Map<string, RawChatWorkAggregate>();
   if (Array.isArray(raw)) {
     for (const entry of raw) {
-      const work = normalizeWorkspaceChatWorkEntry(entry);
-      if (work === null) {
+      if (!isRecord(entry)) {
         continue;
       }
-      const key = formatWorkspaceChatIdentityKey(work.identity);
+      let identity: WorkspaceChatIdentity;
+      try {
+        identity = validateWorkspaceChatIdentity(entry.identity);
+      } catch {
+        continue;
+      }
+      const key = formatWorkspaceChatIdentityKey(identity);
       if (key === null) {
         continue;
       }
-      const existing = merged.get(key);
-      if (existing === undefined) {
-        merged.set(key, {
-          identity: work.identity,
-          availability: work.availability,
-          items: work.items.slice(),
-          events: work.events.slice(),
-          worker_presence: work.worker_presence.slice(),
-          bounds: { ...work.bounds },
-        });
-      } else {
-        if (work.availability === 'available') {
-          existing.availability = 'available';
-        }
-        existing.items.push(...work.items);
-        existing.events.push(...work.events);
-        existing.worker_presence.push(...work.worker_presence);
-        existing.bounds.items_omitted += work.bounds.items_omitted;
-        existing.bounds.events_omitted += work.bounds.events_omitted;
-        existing.bounds.presence_omitted += work.bounds.presence_omitted;
+      let aggregate = merged.get(key);
+      if (aggregate === undefined) {
+        aggregate = {
+          identity,
+          availability: 'unavailable',
+          items: [],
+          events: [],
+          worker_presence: [],
+          worker_executions: [],
+          bounds: {
+            items_omitted: 0,
+            events_omitted: 0,
+            presence_omitted: 0,
+            executions_omitted: 0,
+          },
+        };
+        merged.set(key, aggregate);
       }
+      if (entry.availability === 'available') {
+        aggregate.availability = 'available';
+      }
+      const rawBounds = isRecord(entry.bounds) ? entry.bounds : {};
+      aggregate.bounds.items_omitted += cleanNonNegativeInt(rawBounds.items_omitted, 0);
+      aggregate.bounds.events_omitted += cleanNonNegativeInt(rawBounds.events_omitted, 0);
+      aggregate.bounds.presence_omitted += cleanNonNegativeInt(rawBounds.presence_omitted, 0);
+      aggregate.bounds.executions_omitted += cleanNonNegativeInt(
+        rawBounds.executions_omitted,
+        0,
+      );
+      aggregate.items.push(...rawChatWorkArray(entry.items));
+      aggregate.events.push(...rawChatWorkArray(entry.events));
+      aggregate.worker_presence.push(...rawChatWorkArray(entry.worker_presence));
+      aggregate.worker_executions.push(...rawChatWorkArray(entry.worker_executions));
     }
   }
 
@@ -3133,7 +3490,15 @@ function normalizeWorkspaceChatWorkList(raw: unknown): WorkspaceChatWork[] {
     if (!entry) {
       continue;
     }
-    const normalized = normalizeWorkspaceChatWork(entry);
+    const normalized = normalizeWorkspaceChatWorkEntry({
+      identity: entry.identity,
+      availability: entry.availability,
+      items: entry.items,
+      events: entry.events,
+      worker_presence: entry.worker_presence,
+      worker_executions: entry.worker_executions,
+      bounds: entry.bounds,
+    });
     if (normalized !== null) {
       chatWork.push(normalized);
     }
@@ -3142,6 +3507,10 @@ function normalizeWorkspaceChatWorkList(raw: unknown): WorkspaceChatWork[] {
   let totalItems = chatWork.reduce((sum, work) => sum + work.items.length, 0);
   let totalEvents = chatWork.reduce((sum, work) => sum + work.events.length, 0);
   let totalPresence = chatWork.reduce((sum, work) => sum + work.worker_presence.length, 0);
+  let totalExecutions = chatWork.reduce(
+    (sum, work) => sum + (work.worker_executions?.length ?? 0),
+    0,
+  );
   if (totalItems > MAX_WORKSPACE_CHAT_WORK_ITEMS_TOTAL) {
     for (let index = chatWork.length - 1; index >= 0; index -= 1) {
       if (totalItems <= MAX_WORKSPACE_CHAT_WORK_ITEMS_TOTAL) {
@@ -3155,6 +3524,14 @@ function normalizeWorkspaceChatWorkList(raw: unknown): WorkspaceChatWork[] {
         work.bounds.items_omitted += remove;
         totalItems -= remove;
         const remainingItemIds = new Set(work.items.map((item) => item.item_id));
+        const retainedEventExecutionKeys = new Set<string>();
+        for (const event of work.events) {
+          if (event.execution_ref !== null) {
+            retainedEventExecutionKeys.add(
+              workerExecutionJoinKey(event.item_id, event.execution_ref),
+            );
+          }
+        }
         const presenceBefore = work.worker_presence.length;
         work.worker_presence = work.worker_presence.filter((presence) =>
           remainingItemIds.has(presence.item_id),
@@ -3163,6 +3540,22 @@ function normalizeWorkspaceChatWorkList(raw: unknown): WorkspaceChatWork[] {
         if (removedPresence > 0) {
           work.bounds.presence_omitted += removedPresence;
           totalPresence -= removedPresence;
+        }
+        const executionsBefore = work.worker_executions?.length ?? 0;
+        if (work.worker_executions !== undefined) {
+          work.worker_executions = work.worker_executions.filter(
+            (execution) =>
+              remainingItemIds.has(execution.item_id) ||
+              retainedEventExecutionKeys.has(
+                workerExecutionJoinKey(execution.item_id, execution.execution_ref),
+              ),
+          );
+        }
+        const removedExecutions = executionsBefore - (work.worker_executions?.length ?? 0);
+        if (removedExecutions > 0) {
+          work.bounds.executions_omitted =
+            (work.bounds.executions_omitted ?? 0) + removedExecutions;
+          totalExecutions -= removedExecutions;
         }
       }
     }
@@ -3199,6 +3592,24 @@ function normalizeWorkspaceChatWorkList(raw: unknown): WorkspaceChatWork[] {
         );
         work.bounds.presence_omitted += remove;
         totalPresence -= remove;
+      }
+    }
+  }
+
+  if (totalExecutions > MAX_WORKSPACE_CHAT_WORK_EXECUTIONS_TOTAL) {
+    for (let index = chatWork.length - 1; index >= 0; index -= 1) {
+      if (totalExecutions <= MAX_WORKSPACE_CHAT_WORK_EXECUTIONS_TOTAL) {
+        break;
+      }
+      const work = chatWork[index]!;
+      const executions = work.worker_executions ?? [];
+      const overflow = totalExecutions - MAX_WORKSPACE_CHAT_WORK_EXECUTIONS_TOTAL;
+      const remove = Math.min(overflow, executions.length);
+      if (remove > 0) {
+        work.worker_executions = executions.slice(remove);
+        work.bounds.executions_omitted =
+          (work.bounds.executions_omitted ?? 0) + remove;
+        totalExecutions -= remove;
       }
     }
   }

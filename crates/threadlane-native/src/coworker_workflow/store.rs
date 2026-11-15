@@ -236,13 +236,13 @@ impl CoworkerBindingLedger {
                         "ArchitectAdviceRecord references a missing reservation_id",
                     )
                 })?;
-            if reservation.role != WorkflowRole::Architect
+            if !reservation.role.is_advisor()
                 || reservation.status != PlanningReservationStatus::Completed
                 || reservation.context_digest != advice.context_digest
             {
                 return Err(NativeError::new(
                     NativeErrorCode::ProtocolError,
-                    "ArchitectAdviceRecord must bind a completed Architect reservation with matching context_digest",
+                    "ArchitectAdviceRecord must bind a completed advisory reservation with matching context_digest",
                 ));
             }
             if advice.context_dependencies.project_base.repository_path
@@ -1239,13 +1239,10 @@ impl CoworkerWorkflowStore {
                 "context_digest must be a 64-character lowercase hex SHA-256",
             )
         })?;
-        if !matches!(
-            request.role,
-            WorkflowRole::Orchestrator | WorkflowRole::Architect
-        ) {
+        if !matches!(request.role, WorkflowRole::Orchestrator) && !request.role.is_advisor() {
             return Err(NativeError::new(
                 NativeErrorCode::ValidationFailed,
-                "ReservePlanningCallRequest.role must be Orchestrator or Architect",
+                "ReservePlanningCallRequest.role must be Orchestrator or the advisory role",
             ));
         }
         validate_non_native_worker_choice(request.role, &request.selected_choice)?;
@@ -1309,7 +1306,7 @@ impl CoworkerWorkflowStore {
 
                 if ledger.planning_grants.iter().any(|g| {
                     g.reservations.iter().any(|r| {
-                        r.role == request.role
+                        r.role.canonical() == request.role.canonical()
                             && r.context_digest == request.context_digest
                             && r.status.is_ambiguous()
                     })
@@ -1355,12 +1352,12 @@ impl CoworkerWorkflowStore {
                             ));
                         }
                     }
-                    WorkflowRole::Architect => {
+                    WorkflowRole::Architect | WorkflowRole::Advisor => {
                         if grant.usage.reserved_architect_calls >= grant.budget.max_architect_calls
                         {
                             return Err(NativeError::new(
                                 NativeErrorCode::ValidationFailed,
-                                "planning grant architect call budget is exhausted",
+                                "planning grant advisory call budget is exhausted",
                             ));
                         }
                     }
@@ -1691,12 +1688,12 @@ impl CoworkerWorkflowStore {
                             "referenced reservation_id was not found on the grant",
                         )
                     })?;
-                if reservation.role != WorkflowRole::Architect
+                if !reservation.role.is_advisor()
                     || reservation.status != PlanningReservationStatus::Completed
                 {
                     return Err(NativeError::new(
                         NativeErrorCode::ValidationFailed,
-                        "ArchitectAdviceRecord requires a Completed reservation for WorkflowRole::Architect",
+                        "ArchitectAdviceRecord requires a Completed reservation for the advisory role",
                     ));
                 }
                 if reservation.context_digest != context_digest {
@@ -4256,7 +4253,7 @@ pub(crate) fn prepare_job_approval_in_ledger(
     let mut unique_roles = BTreeSet::new();
     let mut role_reqs = Vec::new();
     for task in &approval.tasks {
-        if unique_roles.insert((task.role, task.difficulty)) {
+        if unique_roles.insert((task.role.canonical(), task.difficulty)) {
             role_reqs.push(RolePreflightRequest::new(task.role, Some(task.difficulty)));
         }
     }
@@ -4281,7 +4278,7 @@ pub(crate) fn prepare_job_approval_in_ledger(
             .roles
             .iter()
             .find(|o| {
-                o.role == approved_task.role
+                o.role.canonical() == approved_task.role.canonical()
                     && o.requested_difficulty == Some(approved_task.difficulty)
             })
             .and_then(|o| o.selected.as_ref())

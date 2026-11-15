@@ -171,8 +171,9 @@ pub struct NativeMcpCli {
     )]
     pub host_executable: Option<PathBuf>,
 
-    /// Explicit operator-only opt-in (disabled by default) allowing `consult_architect`,
-    /// `request_technical_plan`, and `start_execution` to configure scoped native coworker
+    /// Explicit operator-only opt-in (disabled by default) allowing `consult_advisor`,
+    /// `consult_architect`, `request_technical_plan`, and `start_execution` to configure scoped
+    /// native coworker
     /// completion and milestone notices for the verified MCP parent session. When combined with
     /// `--auto-start-approved-hosts`, an eligible initial direct `start_approved_task` launch also
     /// attaches the same fixed native notice transport before spawning its fresh host. Requires

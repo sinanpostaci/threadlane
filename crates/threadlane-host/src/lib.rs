@@ -94,7 +94,7 @@ pub use types::{
     HostSessionSummary, PrepareDependencyInputsRequest, TaskDispatchIntent,
     TaskEvidenceVerificationStatus, TaskExecutionStatus, TaskIntegrationLifecycleStatus,
     TaskLifecycleProjection, TaskReviewLifecycleStatus, TaskRunReceipt, TaskStateSnapshot,
-    VerifiedIntegrationReceiptSummary, VerifiedReviewReceiptSummary,
+    TaskTerminalSummary, VerifiedIntegrationReceiptSummary, VerifiedReviewReceiptSummary,
     APPROVED_EVENT_BATCH_MAX_BYTES, APPROVED_EVENT_BATCH_MAX_EVENTS,
     HOST_LAUNCH_INTENT_SCHEMA_VERSION, HOST_LOCK_FILENAME, HOST_MANIFEST_FILENAME,
     HOST_MANIFEST_SCHEMA_VERSION, LAUNCH_INTENTS_SUBDIR, MAX_HOST_MANIFEST_BYTES,
@@ -105,6 +105,7 @@ pub use types::{
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::fs::{self, File};
     use std::io::Write;
     use std::os::unix::fs::{symlink, PermissionsExt};
@@ -10075,6 +10076,284 @@ exit 0
         let nul_session_dir = fixture_nul.sessions_dir.join(&nul_record.approval_id);
         if nul_session_dir.exists() {
             assert!(!is_host_lock_held(&nul_session_dir).expect("NUL startup owner released"));
+        }
+    }
+
+    #[tokio::test]
+    async fn readonly_terminal_summary_reports_running_and_terminal_metadata_without_effects() {
+        let fixture = setup_fixture();
+        let approval_id = create_approved_plan(
+            &fixture,
+            "plan-live-summary",
+            BINDING_A,
+            THREAD_UUID_A,
+            default_tasks("SLOW_WAIT_FOR_CANCEL live summary test"),
+        );
+        let host = ApprovedHost::start(
+            ApprovedHostConfig::new(
+                &fixture.registry_dir,
+                &fixture.plans_dir,
+                &fixture.authority_dir,
+                &fixture.sessions_dir,
+                &approval_id,
+            )
+            .with_tick_interval(Duration::from_millis(20)),
+        )
+        .await
+        .expect("start live summary host");
+        let client = ApprovedHostClient::open(
+            &fixture.registry_dir,
+            &fixture.plans_dir,
+            &fixture.authority_dir,
+            &fixture.sessions_dir,
+            BINDING_A,
+            THREAD_UUID_A,
+        )
+        .expect("open live summary client");
+
+        client
+            .dispatch_task(&approval_id, "task-root-agy")
+            .await
+            .expect("dispatch live summary task");
+        let running = wait_for_task_status(&client, &approval_id, "task-root-agy", |status| {
+            status == TaskExecutionStatus::Running
+        })
+        .await;
+        let running_worker = running
+            .worker
+            .as_ref()
+            .expect("running worker snapshot present");
+
+        let live = tokio::time::timeout(
+            Duration::from_secs(3),
+            ApprovedHostClient::get_task_terminal_summary_readonly_at(
+                &fixture.authority_dir,
+                &fixture.sessions_dir,
+                BINDING_A,
+                THREAD_UUID_A,
+                &approval_id,
+                "task-root-agy",
+            ),
+        )
+        .await
+        .expect("live summary must return within the observation budget")
+        .expect("live summary read")
+        .expect("running worker summary");
+        assert_eq!(live.approval_id, approval_id);
+        assert_eq!(live.subject_digest, running.subject_digest);
+        assert_eq!(live.binding_id, BINDING_A);
+        assert_eq!(live.thread_uuid, THREAD_UUID_A);
+        assert_eq!(live.session_binding_id, host.session_binding_id());
+        assert_eq!(live.task_id, "task-root-agy");
+        assert_eq!(live.task_digest, running.task_digest);
+        assert_eq!(Some(live.run_id.as_str()), running.run_id.as_deref());
+        assert_eq!(Some(live.worker_id.as_str()), running.worker_id.as_deref());
+        assert_eq!(live.provider.as_deref(), Some("antigravity"));
+        assert_eq!(live.requested_model.as_deref(), Some("gemini-4-argon-high"));
+        assert_eq!(live.requested_effort.as_deref(), Some("high"));
+        assert_eq!(live.worker_status, threadlane::WorkerStatus::Running);
+        assert_eq!(live.started_at_ms, running_worker.started_at_ms);
+        assert!(
+            live.started_at_ms.is_some_and(|started| started > 0),
+            "a running attempt reports its measured start when available"
+        );
+        assert_eq!(live.finished_at_ms, None);
+        assert_eq!(live.duration_ms, None);
+
+        let wrong_scope = ApprovedHostClient::get_task_terminal_summary_readonly_at(
+            &fixture.authority_dir,
+            &fixture.sessions_dir,
+            BINDING_B,
+            THREAD_UUID_A,
+            &approval_id,
+            "task-root-agy",
+        )
+        .await
+        .expect_err("a wrong control binding must not read another chat's worker metadata");
+        assert_eq!(wrong_scope.code(), "scope_mismatch");
+
+        client
+            .cancel_task(
+                &approval_id,
+                "task-root-agy",
+                running_worker.revision,
+                Some("live summary cancellation".to_string()),
+            )
+            .await
+            .expect("cancel live summary task");
+        wait_for_task_status(&client, &approval_id, "task-root-agy", |status| {
+            status == TaskExecutionStatus::Cancelled
+        })
+        .await;
+
+        let terminal = ApprovedHostClient::get_task_terminal_summary_readonly_at(
+            &fixture.authority_dir,
+            &fixture.sessions_dir,
+            BINDING_A,
+            THREAD_UUID_A,
+            &approval_id,
+            "task-root-agy",
+        )
+        .await
+        .expect("terminal live summary read")
+        .expect("terminal worker summary");
+        assert_eq!(terminal.worker_status, threadlane::WorkerStatus::Cancelled);
+        assert!(terminal.finished_at_ms.is_some_and(|finished| finished > 0));
+        assert!(
+            terminal.duration_ms.is_some(),
+            "the measured terminal duration is preserved"
+        );
+
+        host.shutdown().await.expect("shutdown live summary host");
+
+        let session_dir = fixture.sessions_dir.join(&approval_id);
+        let receipts_path = session_dir.join(TASK_RECEIPTS_FILENAME);
+        let entries_before: BTreeSet<String> = fs::read_dir(&session_dir)
+            .expect("read stopped session dir")
+            .map(|entry| {
+                entry
+                    .expect("stopped session entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        let receipts_before = fs::read(&receipts_path).expect("read stopped receipts");
+
+        let stopped = ApprovedHostClient::get_task_terminal_summary_readonly_at(
+            &fixture.authority_dir,
+            &fixture.sessions_dir,
+            BINDING_A,
+            THREAD_UUID_A,
+            &approval_id,
+            "task-root-agy",
+        )
+        .await
+        .expect("stopped summary read")
+        .expect("stopped worker summary");
+        assert_eq!(stopped.approval_id, terminal.approval_id);
+        assert_eq!(stopped.session_binding_id, terminal.session_binding_id);
+        assert_eq!(stopped.run_id, terminal.run_id);
+        assert_eq!(stopped.worker_id, terminal.worker_id);
+        assert_eq!(stopped.worker_status, threadlane::WorkerStatus::Cancelled);
+        assert_eq!(stopped.started_at_ms, terminal.started_at_ms);
+        assert_eq!(stopped.finished_at_ms, terminal.finished_at_ms);
+        assert_eq!(stopped.duration_ms, terminal.duration_ms);
+
+        let entries_after: BTreeSet<String> = fs::read_dir(&session_dir)
+            .expect("re-read stopped session dir")
+            .map(|entry| {
+                entry
+                    .expect("stopped session entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert_eq!(
+            entries_after, entries_before,
+            "the stopped summary read must not create database or lock files"
+        );
+        assert_eq!(
+            fs::read(&receipts_path).expect("re-read stopped receipts"),
+            receipts_before
+        );
+        assert!(!session_dir
+            .join(RUNTIME_STATE_SUBDIR)
+            .join("state.db-wal")
+            .exists());
+        assert!(!session_dir
+            .join(RUNTIME_STATE_SUBDIR)
+            .join("state.db-shm")
+            .exists());
+
+        // An external exclusive `task-receipts.lock` holder must not block or be released by the
+        // observation read; the read-only ledger path never acquires that lock.
+        {
+            use fs2::FileExt;
+            let lock_path = session_dir.join(TASK_RECEIPTS_LOCK_FILENAME);
+            let lock_file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&lock_path)
+                .expect("open existing receipts lock");
+            lock_file
+                .lock_exclusive()
+                .expect("hold existing receipts lock");
+            let summarized = tokio::time::timeout(
+                Duration::from_secs(2),
+                ApprovedHostClient::get_task_terminal_summary_readonly_at(
+                    &fixture.authority_dir,
+                    &fixture.sessions_dir,
+                    BINDING_A,
+                    THREAD_UUID_A,
+                    &approval_id,
+                    "task-root-agy",
+                ),
+            )
+            .await
+            .expect("a held receipts lock must not block the read-only summary")
+            .expect("held-lock summary read")
+            .expect("held-lock worker summary");
+            assert_eq!(
+                summarized.worker_status,
+                threadlane::WorkerStatus::Cancelled
+            );
+            let second = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&lock_path)
+                .expect("open second receipts lock handle");
+            assert!(
+                second.try_lock_exclusive().is_err(),
+                "the observation read must not release an externally held receipts lock"
+            );
+            lock_file.unlock().expect("release receipts lock");
+        }
+
+        let missing_authority = fixture.root.join("missing-summary-authority");
+        let missing_sessions = fixture.root.join("missing-summary-sessions");
+        let missing_err = ApprovedHostClient::get_task_terminal_summary_readonly_at(
+            &missing_authority,
+            &missing_sessions,
+            BINDING_A,
+            THREAD_UUID_A,
+            &approval_id,
+            "task-root-agy",
+        )
+        .await
+        .expect_err("missing authority and sessions roots must be refused");
+        assert_eq!(missing_err.code(), "security_violation");
+        assert!(!missing_authority.exists());
+        assert!(!missing_sessions.exists());
+
+        let mut tampered_receipts: serde_json::Value =
+            serde_json::from_slice(&receipts_before).expect("parse stopped receipts");
+        tampered_receipts["receipts"][0]["run_id"] =
+            serde_json::Value::String("run_ffffffffffffffffffffffffffffffff".to_string());
+        let tampered_bytes =
+            serde_json::to_vec(&tampered_receipts).expect("serialize tampered receipts");
+        fs::write(&receipts_path, &tampered_bytes).expect("write tampered receipts");
+        fs::set_permissions(&receipts_path, fs::Permissions::from_mode(0o600))
+            .expect("chmod tampered receipts");
+        let tampered = ApprovedHostClient::get_task_terminal_summary_readonly_at(
+            &fixture.authority_dir,
+            &fixture.sessions_dir,
+            BINDING_A,
+            THREAD_UUID_A,
+            &approval_id,
+            "task-root-agy",
+        )
+        .await;
+        match tampered {
+            Err(err) => assert!(
+                matches!(err.code(), "corrupt_receipts" | "corrupt_session_state"),
+                "unexpected tampered-receipt refusal: {err:?}"
+            ),
+            Ok(None) => {}
+            Ok(Some(_)) => {
+                panic!("a sealed receipt whose run identity does not resolve must not summarize")
+            }
         }
     }
 }

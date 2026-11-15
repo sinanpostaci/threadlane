@@ -3,7 +3,7 @@
 //!
 //! ## Core Invariants
 //!
-//! - **Standing read-only grant authority**: Every Orchestrator or Architect call requires an
+//! - **Standing read-only grant authority**: Every Orchestrator or advisory call requires an
 //!   active, non-expired, non-revoked [`PlanningAdviceGrant`] with strictly read-only capabilities
 //!   ([`PlanningReadOnlyCapabilities::strict_read_only`]) and finite call/time/output caps.
 //!   Read-only planning and advice calls never create or enlarge grants, never approve or dispatch
@@ -67,7 +67,8 @@ use threadlane_workflow::{
 use crate::coworker_observation::{
     begin_coworker_call_observation, extract_observed_model_and_effort, extract_observed_usage,
     CoworkerCallFinishSpec, CoworkerCallObservationSpec, CoworkerObservationExecutorSpec,
-    COWORKER_OBS_OP_PLANNING_ARCHITECT, COWORKER_OBS_OP_PLANNING_ORCHESTRATOR,
+    COWORKER_OBS_OP_PLANNING_ADVISOR, COWORKER_OBS_OP_PLANNING_ARCHITECT,
+    COWORKER_OBS_OP_PLANNING_ORCHESTRATOR,
 };
 use crate::coworker_workflow::contracts::{
     deterministic_prefixed_id, sha256_hex, validate_bounded_text,
@@ -174,7 +175,7 @@ pub struct RunArchitectAdviceRequest {
     pub request_key: String,
     /// Optional expected current ledger revision (CAS check).
     pub expected_ledger_revision: Option<u64>,
-    /// Optional difficulty tier used to select the `WorkflowRole::Architect` model.
+    /// Optional difficulty tier used to select the advisory-role model.
     pub difficulty: Option<Difficulty>,
     /// Exact real context dependencies for this architectural question.
     pub context_dependencies: ArchitectContextDependencies,
@@ -1097,7 +1098,7 @@ pub enum PlanningArtifactOutcomeKind {
     },
 }
 
-/// Bounded private (`0600`) report artifact persisted for an Orchestrator or Architect call.
+/// Bounded private (`0600`) report artifact persisted for an Orchestrator or advisory call.
 ///
 /// Stores real provider metadata, execution report, bounded advisory response, output digests, and
 /// validated structured output without persisting raw private user conversation logs.
@@ -1120,7 +1121,7 @@ pub struct PersistedPlanningCallArtifact {
     pub run_id: String,
     /// Idempotent caller request key.
     pub request_key: String,
-    /// Executed role (`Orchestrator` or `Architect`).
+    /// Executed role (`Orchestrator`, current `Advisor`, or retained legacy `Architect`).
     pub role: WorkflowRole,
     /// Pinned workflow profile identifier from the standing grant.
     pub profile_id: String,
@@ -1223,13 +1224,10 @@ impl PersistedPlanningCallArtifact {
         validate_bounded_identifier(&self.reservation_id, "reservation_id", MAX_COWORKER_ID_LEN)?;
         validate_bounded_identifier(&self.run_id, "run_id", MAX_COWORKER_ID_LEN)?;
         validate_bounded_identifier(&self.request_key, "request_key", MAX_COWORKER_ID_LEN)?;
-        if !matches!(
-            self.role,
-            WorkflowRole::Orchestrator | WorkflowRole::Architect
-        ) {
+        if !matches!(self.role, WorkflowRole::Orchestrator) && !self.role.is_advisor() {
             return Err(NativeError::new(
                 NativeErrorCode::ProtocolError,
-                "planning artifact role must be Orchestrator or Architect",
+                "planning artifact role must be Orchestrator or the advisory role",
             ));
         }
         validate_bounded_identifier(&self.profile_id, "profile_id", MAX_COWORKER_ID_LEN)?;
@@ -1332,10 +1330,10 @@ impl PersistedPlanningCallArtifact {
                 structured_advice,
                 decision_digest,
             } => {
-                if self.role != WorkflowRole::Architect {
+                if !self.role.is_advisor() {
                     return Err(NativeError::new(
                         NativeErrorCode::ProtocolError,
-                        "ArchitectAdvice artifact outcome requires role == WorkflowRole::Architect",
+                        "ArchitectAdvice artifact outcome requires the advisory role (advisor or retained legacy architect)",
                     ));
                 }
                 validate_bounded_text(question_summary, "artifact.question_summary")?;
@@ -1959,7 +1957,30 @@ impl CoworkerPlanningService {
     }
 
     /// Obtains or reuses dependency-bound [`ArchitectAdviceRecord`] under an active
-    /// [`PlanningAdviceGrant`].
+    /// [`PlanningAdviceGrant`] using the current canonical `Advisor` identity.
+    ///
+    /// New reservations and persisted artifacts record `WorkflowRole::Advisor`. The retained
+    /// [`ArchitectAdviceRecord`] type and result kind names are compatibility identifiers.
+    pub async fn obtain_advisor_advice(
+        &self,
+        request: &RunArchitectAdviceRequest,
+    ) -> Result<ArchitectAdviceOutcome, NativeError> {
+        self.obtain_advisor_advice_with_health(request, None).await
+    }
+
+    /// Executes a canonical Advisor call with explicitly borrowed physical command ownership for
+    /// optional live provider metadata.
+    pub async fn obtain_advisor_advice_with_health(
+        &self,
+        request: &RunArchitectAdviceRequest,
+        health_owner: Option<&crate::provider_health::PlanningHealthOwner<'_>>,
+    ) -> Result<ArchitectAdviceOutcome, NativeError> {
+        self.obtain_advisor_advice_with_role(request, health_owner, WorkflowRole::Advisor)
+            .await
+    }
+
+    /// Obtains or reuses dependency-bound [`ArchitectAdviceRecord`] under an active
+    /// [`PlanningAdviceGrant`] using the retained legacy `Architect` identity.
     pub async fn obtain_architect_advice(
         &self,
         request: &RunArchitectAdviceRequest,
@@ -1968,12 +1989,29 @@ impl CoworkerPlanningService {
             .await
     }
 
-    /// Executes with explicitly borrowed physical command ownership for optional live metadata.
+    /// Executes the retained legacy Architect path with explicitly borrowed physical command
+    /// ownership for optional live metadata.
     pub async fn obtain_architect_advice_with_health(
         &self,
         request: &RunArchitectAdviceRequest,
         health_owner: Option<&crate::provider_health::PlanningHealthOwner<'_>>,
     ) -> Result<ArchitectAdviceOutcome, NativeError> {
+        self.obtain_advisor_advice_with_role(request, health_owner, WorkflowRole::Architect)
+            .await
+    }
+
+    async fn obtain_advisor_advice_with_role(
+        &self,
+        request: &RunArchitectAdviceRequest,
+        health_owner: Option<&crate::provider_health::PlanningHealthOwner<'_>>,
+        role: WorkflowRole,
+    ) -> Result<ArchitectAdviceOutcome, NativeError> {
+        if !role.is_advisor() {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "advisory execution requires the Advisor or retained legacy Architect role",
+            ));
+        }
         if let Some(owner) = health_owner {
             owner.verify_service_request(
                 self,
@@ -1981,13 +2019,13 @@ impl CoworkerPlanningService {
                 &request.thread_uuid,
                 &request.grant_id,
                 &request.request_key,
-                WorkflowRole::Architect,
+                role,
             )?;
         }
         validate_bounded_identifier(&request.binding_id, "binding_id", MAX_COWORKER_ID_LEN)?;
         let binding_mutex = self.binding_async_mutex(&request.binding_id);
         let _binding_guard = binding_mutex.lock().await;
-        self.obtain_architect_advice_locked(request, health_owner)
+        self.obtain_advisor_advice_locked(request, health_owner, role)
             .await
     }
 
@@ -1995,6 +2033,16 @@ impl CoworkerPlanningService {
         &self,
         request: &RunArchitectAdviceRequest,
         health_owner: Option<&crate::provider_health::PlanningHealthOwner<'_>>,
+    ) -> Result<ArchitectAdviceOutcome, NativeError> {
+        self.obtain_advisor_advice_locked(request, health_owner, WorkflowRole::Architect)
+            .await
+    }
+
+    async fn obtain_advisor_advice_locked(
+        &self,
+        request: &RunArchitectAdviceRequest,
+        health_owner: Option<&crate::provider_health::PlanningHealthOwner<'_>>,
+        role: WorkflowRole,
     ) -> Result<ArchitectAdviceOutcome, NativeError> {
         validate_bounded_identifier(&request.binding_id, "binding_id", MAX_COWORKER_ID_LEN)?;
         validate_bounded_identifier(&request.grant_id, "grant_id", MAX_COWORKER_ID_LEN)?;
@@ -2055,6 +2103,12 @@ impl CoworkerPlanningService {
         }
 
         let grant = find_grant(&ledger, &request.grant_id)?;
+        if role == WorkflowRole::Advisor && !grant.policy.explicitly_authorizes_advisor() {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "canonical Advisor consultation requires planning authority that explicitly names the advisor role; use the retained legacy Architect entrypoint for a pre-transition architect-only grant",
+            ));
+        }
         verify_call_base_against_grant(
             &grant.project_base,
             &request.context_dependencies.project_base,
@@ -2072,12 +2126,8 @@ impl CoworkerPlanningService {
 
         let live_reg_snapshot = read_registry_snapshot_readonly(&self.registry_dir)?;
         let reg_snapshot = verify_grant_registry_dependencies(&live_reg_snapshot, grant)?;
-        let (selected_choice, provider, executable_path) = resolve_headless_planning_worker(
-            &reg_snapshot,
-            grant,
-            WorkflowRole::Architect,
-            request.difficulty,
-        )?;
+        let (selected_choice, provider, executable_path) =
+            resolve_headless_planning_worker(&reg_snapshot, grant, role, request.difficulty)?;
 
         let verified_prior_advice = self.resolve_and_verify_prior_advice_context(
             &ledger,
@@ -2127,7 +2177,7 @@ impl CoworkerPlanningService {
             .iter()
             .find(|r| r.request_key == request.request_key)
         {
-            if existing_res.role != WorkflowRole::Architect
+            if existing_res.role != role
                 || existing_res.difficulty != request.difficulty
                 || existing_res.selected_choice != selected_choice
                 || existing_res.context_digest != context_digest
@@ -2169,6 +2219,15 @@ impl CoworkerPlanningService {
                     || cand_grant.registry_revision != grant.registry_revision
                     || cand_grant.policy_digest != grant.policy_digest
                 {
+                    continue;
+                }
+                if !cand_grant.reservations.iter().any(|reservation| {
+                    reservation.reservation_id == candidate.reservation_id
+                        && reservation.role == role
+                }) {
+                    // Never reuse an advisory artifact produced under the other raw advisory
+                    // spelling. The two identities are semantically equivalent for eligibility
+                    // but remain distinct provenance inside persisted evidence.
                     continue;
                 }
                 let artifact_id = candidate.report_artifact_id.as_deref().ok_or_else(|| {
@@ -2238,7 +2297,7 @@ impl CoworkerPlanningService {
                     grant_id: request.grant_id.clone(),
                     request_key: request.request_key.clone(),
                     expected_ledger_revision: request.expected_ledger_revision,
-                    role: WorkflowRole::Architect,
+                    role,
                     difficulty: request.difficulty,
                     selected_choice: selected_choice.clone(),
                     context_digest: context_digest.clone(),
@@ -2381,10 +2440,15 @@ impl CoworkerPlanningService {
                 (None, None)
             }
         };
+        let (observation_operation, observation_title) = if role == WorkflowRole::Advisor {
+            (COWORKER_OBS_OP_PLANNING_ADVISOR, "Advisor consultation")
+        } else {
+            (COWORKER_OBS_OP_PLANNING_ARCHITECT, "Architect consultation")
+        };
         let obs_handle = begin_coworker_call_observation(CoworkerCallObservationSpec {
             journal_dir: self.store.plans_dir().to_path_buf(),
-            operation: COWORKER_OBS_OP_PLANNING_ARCHITECT.to_string(),
-            title: "Architect consultation".to_string(),
+            operation: observation_operation.to_string(),
+            title: observation_title.to_string(),
             call_key: reservation.reservation_id.clone(),
             binding_id: request.binding_id.clone(),
             thread_uuid: request.thread_uuid.clone(),
@@ -2403,7 +2467,7 @@ impl CoworkerPlanningService {
             worker_id: None,
             candidate_id: None,
             executor: CoworkerObservationExecutorSpec::from_selected_role_choice(
-                WorkflowRole::Architect,
+                role,
                 &selected_choice,
             ),
             verified_context: None,
@@ -2614,7 +2678,7 @@ impl CoworkerPlanningService {
             reservation_id: reservation.reservation_id.clone(),
             run_id: run_id.clone(),
             request_key: request.request_key.clone(),
-            role: WorkflowRole::Architect,
+            role,
             profile_id: grant.profile_id.clone(),
             registry_revision: grant.registry_revision,
             policy_digest: grant.policy_digest.clone(),
@@ -2968,7 +3032,7 @@ impl CoworkerPlanningService {
                         "stored ArchitectAdviceRecord references a missing reservation on its grant",
                     )
                 })?;
-            if prior_res.role != WorkflowRole::Architect
+            if !prior_res.role.is_advisor()
                 || prior_res.status != PlanningReservationStatus::Completed
                 || prior_res.selected_choice != stored.selected_choice
                 || !constant_time_str_eq(&prior_res.context_digest, &stored.context_digest)
@@ -3328,9 +3392,18 @@ impl CoworkerPlanningService {
                             accept_into_brief: false,
                             current_time_ms: request.current_time_ms,
                         };
-                        let arch_outcome = self
-                            .obtain_architect_advice_locked(&arch_req, health_owner)
-                            .await?;
+                        let arch_outcome =
+                            if grant_snapshot.policy.advisory_role() == WorkflowRole::Advisor {
+                                self.obtain_advisor_advice_locked(
+                                    &arch_req,
+                                    health_owner,
+                                    WorkflowRole::Advisor,
+                                )
+                                .await?
+                            } else {
+                                self.obtain_architect_advice_locked(&arch_req, health_owner)
+                                    .await?
+                            };
                         if !active_advice_ids.contains(&arch_outcome.record.advice_id) {
                             active_advice_ids.push(arch_outcome.record.advice_id.clone());
                         }

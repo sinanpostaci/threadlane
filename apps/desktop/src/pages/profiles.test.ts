@@ -5,7 +5,7 @@ import { describe, it } from 'node:test';
 import {
   DIFFICULTIES,
   EXECUTION_ROLES,
-  WORKFLOW_ROLES,
+  LEGACY_WORKFLOW_ROLES,
   createEmptyRegistrySnapshot,
   type ModelDefinition,
   type RegistrySnapshot,
@@ -464,7 +464,7 @@ function makeLegacySixRoleAssignments(
   modelId: string = 'gemini-argon',
   effort: string | null = 'high'
 ): RoleAssignment[] {
-  return WORKFLOW_ROLES.map((role) => ({
+  return LEGACY_WORKFLOW_ROLES.map((role) => ({
     role,
     difficulty: null,
     choice: { model_id: modelId, effort },
@@ -475,7 +475,7 @@ describe('profiles coworker native model simplification', () => {
   it('exposes only the five configurable execution roles in profile tables', () => {
     assert.deepEqual(PROFILE_EXECUTION_ROLES, [
       'orchestrator',
-      'architect',
+      'advisor',
       'coder',
       'reviewer',
       'closure',
@@ -483,7 +483,7 @@ describe('profiles coworker native model simplification', () => {
     const empty = createEmptyTable();
     assert.deepEqual(Object.keys(empty), [
       'orchestrator',
-      'architect',
+      'advisor',
       'coder',
       'reviewer',
       'closure',
@@ -580,7 +580,7 @@ describe('profiles coworker native model simplification', () => {
       savedProfile.assignments.map((a) => `${a.role}:${a.difficulty ?? 'default'}`),
       [
         'orchestrator:default',
-        'architect:default',
+        'advisor:default',
         'coder:default',
         'coder:hard',
         'reviewer:default',
@@ -615,7 +615,15 @@ describe('profiles coworker native model simplification', () => {
     const roleFieldsets = renderedRoot.querySelectorAll('[data-profile-role]');
     assert.deepEqual(
       roleFieldsets.map((el) => el.getAttribute('data-profile-role')),
-      ['orchestrator', 'architect', 'coder', 'reviewer', 'closure']
+      ['orchestrator', 'advisor', 'coder', 'reviewer', 'closure']
+    );
+    assert.equal(
+      renderedRoot
+        .querySelector('[data-profile-role="advisor"]')
+        ?.querySelector('legend')
+        ?.textContent.includes('Advisor'),
+      true,
+      'the canonical advisor row must be presented as Advisor'
     );
     assert.equal(
       renderedRoot.querySelector('[data-profile-role="follower"]'),
@@ -668,14 +676,14 @@ describe('profiles coworker native model simplification', () => {
     assert.ok(idDetails, 'expected internal profile ID under a details disclosure');
     assert.equal(idDetails.open, false);
 
-    const architectDefaultModel = renderedRoot.querySelector(
-      '[data-model-key="architect:default"]'
+    const advisorDefaultModel = renderedRoot.querySelector(
+      '[data-model-key="advisor:default"]'
     );
-    assert.ok(architectDefaultModel, 'expected architect default model selector');
-    architectDefaultModel.value = '';
-    architectDefaultModel.dispatchEvent('change');
+    assert.ok(advisorDefaultModel, 'expected advisor default model selector');
+    advisorDefaultModel.value = '';
+    advisorDefaultModel.dispatchEvent('change');
     assert.equal(draftStatus.textContent.includes('4/5 role defaults set'), true);
-    assert.equal(draftStatus.textContent.includes('Missing defaults: Architect'), true);
+    assert.equal(draftStatus.textContent.includes('Missing defaults: Advisor'), true);
     assert.equal(renderedRoot.querySelector('[role="alert"]'), null);
 
     const nameInput =
@@ -1108,5 +1116,146 @@ describe('profile difficulty override reset', () => {
     );
 
     page.dispose();
+  });
+});
+
+describe('advisor configuration compatibility', () => {
+  it('reads a genuine legacy architect profile into the advisor-only editor table without rewriting the raw record', () => {
+    const legacyProfile: WorkflowProfile = {
+      id: 'profile-legacy-table',
+      name: 'Legacy Table Profile',
+      assignments: [
+        {
+          role: 'architect',
+          difficulty: null,
+          choice: { model_id: 'gemini-argon', effort: 'medium' },
+        },
+        {
+          role: 'architect',
+          difficulty: 'hard',
+          choice: { model_id: 'gemini-argon', effort: 'high' },
+        },
+      ],
+    };
+    const rawBefore = JSON.stringify(legacyProfile);
+
+    const table = tableFromProfile(legacyProfile);
+    assert.deepEqual(Object.keys(table), [
+      'orchestrator',
+      'advisor',
+      'coder',
+      'reviewer',
+      'closure',
+    ]);
+    assert.equal('architect' in table, false);
+    assert.deepEqual(table.advisor.default, {
+      model_id: 'gemini-argon',
+      effort: 'medium',
+      pending_family: null,
+    });
+    assert.deepEqual(table.advisor.hard, {
+      model_id: 'gemini-argon',
+      effort: 'high',
+      pending_family: null,
+    });
+    assert.equal(JSON.stringify(legacyProfile), rawBefore);
+    assert.equal(legacyProfile.assignments[0]?.role, 'architect');
+
+    const assignments = assignmentsFromTable(table);
+    assert.deepEqual(
+      assignments.map((assignment) => `${assignment.role}:${assignment.difficulty ?? 'default'}`),
+      ['advisor:default', 'advisor:hard']
+    );
+    assert.equal(assignments.some((assignment) => assignment.role === 'architect'), false);
+    assert.deepEqual(assignments[0]?.choice, { model_id: 'gemini-argon', effort: 'medium' });
+    assert.deepEqual(assignments[1]?.choice, { model_id: 'gemini-argon', effort: 'high' });
+  });
+
+  it('preserves advisor defaults and overrides while emitting advisor for new profile writes', () => {
+    const advisorProfile: WorkflowProfile = {
+      id: 'profile-advisor',
+      name: 'Advisor Profile',
+      assignments: [
+        {
+          role: 'advisor',
+          difficulty: null,
+          choice: { model_id: 'gemini-argon', effort: 'medium' },
+        },
+        {
+          role: 'architect',
+          difficulty: 'hard',
+          choice: { model_id: 'gemini-argon', effort: 'high' },
+        },
+        ...PROFILE_EXECUTION_ROLES.filter((role) => role !== 'advisor').map(
+          (role): RoleAssignment => ({
+            role,
+            difficulty: null,
+            choice: { model_id: 'gemini-argon', effort: 'high' },
+          })
+        ),
+      ],
+    };
+    const snapshot = makeSnapshot([advisorProfile]);
+    const summary = summarizeProfile(snapshot, advisorProfile);
+    assert.equal(summary.defaultCount, 5);
+    assert.equal(summary.overrideCount, 1);
+    assert.deepEqual(summary.missingDefaults, []);
+
+    const table = tableFromProfile(advisorProfile);
+    assert.equal(table.advisor.default.model_id, 'gemini-argon');
+    assert.equal(table.advisor.default.effort, 'medium');
+    assert.equal(table.advisor.hard.model_id, 'gemini-argon');
+    assert.equal(table.advisor.hard.effort, 'high');
+
+    const saved = profileFromDraft({
+      mode: 'edit',
+      id: advisorProfile.id,
+      name: advisorProfile.name,
+      sourceId: advisorProfile.id,
+      sourceRevision: snapshot.revision,
+      sourceSignature: profileSignature(advisorProfile),
+      cloneOfName: null,
+      assignments: table,
+      decisionAdvisor: null,
+      externalChanged: false,
+      externalDeleted: false,
+      overwriteAcknowledged: false,
+      acknowledgedSignature: null,
+    });
+    const savedAdvisorDefault = saved.assignments.find(
+      (assignment) => assignment.role === 'advisor' && assignment.difficulty === null
+    );
+    assert.ok(savedAdvisorDefault, 'expected an advisor default assignment');
+    assert.equal(savedAdvisorDefault.choice.model_id, 'gemini-argon');
+    assert.equal(savedAdvisorDefault.choice.effort, 'medium');
+    assert.equal(
+      saved.assignments.filter((assignment) => assignment.role === 'architect').length,
+      0
+    );
+    assert.equal(profileSignature(advisorProfile), profileSignature(saved));
+  });
+
+  it('refuses dual-alias duplicate slots instead of silently dropping a legacy assignment', () => {
+    assert.throws(
+      () =>
+        tableFromProfile({
+          id: 'profile-duplicate',
+          name: 'Duplicate Advisor',
+          assignments: [
+            {
+              role: 'architect',
+              difficulty: 'hard',
+              choice: { model_id: 'gemini-argon', effort: 'high' },
+            },
+            {
+              role: 'advisor',
+              difficulty: 'hard',
+              choice: { model_id: 'gemini-argon', effort: 'high' },
+            },
+          ],
+        }),
+      (error: unknown) =>
+        (error as { code?: string }).code === 'duplicate_assignment'
+    );
   });
 });

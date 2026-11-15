@@ -70,6 +70,7 @@ import {
   measureDomMessageViewport,
   orderWorkspaceMessageItems,
   readWorkspaceChatWork,
+  resolveChatWorkExecutionFooterState,
   resolveMessageScrollChatKey,
   resolveMessageViewportResize,
   resolveVerifiedChatJobIds,
@@ -141,6 +142,23 @@ import type {
   WorkspaceTaskCandidate,
   WorkspaceTaskHistory,
 } from './workspace-contract.ts';
+
+/**
+ * Current and legacy Advisor spellings share one human label. Raw recorded role
+ * tokens remain unchanged in read-only evidence rows.
+ */
+function formatWorkspaceRoleLabel(role: string | null | undefined): string {
+  const normalized = role?.trim().toLowerCase();
+  if (normalized === 'architect' || normalized === 'advisor') {
+    return 'Advisor';
+  }
+  return formatExecutorRoleLabel(role);
+}
+
+function normalizeWorkspaceRoleText(value: string): string {
+  const normalized = value.trim().toLowerCase();
+  return normalized === 'architect' || normalized === 'advisor' ? 'Advisor' : value;
+}
 
 // ---------------------------------------------------------------------------
 // Centered & Row-Aligned Activity Spinner
@@ -1476,7 +1494,7 @@ export function WorkspaceMessagesPanel({
                 const sourceMeta = formatMessageSourceMeta(item.source_kind);
                 const SourceIcon = sourceMeta.icon;
                 const actorLabel = item.actor_role
-                  ? capitalizeFirst(formatExecutorRoleLabel(item.actor_role))
+                  ? capitalizeFirst(formatWorkspaceRoleLabel(item.actor_role))
                   : null;
                 const conciseTime = formatConciseMessageTime(
                   item.source_order.recorded_at_ms,
@@ -1768,7 +1786,7 @@ function renderExecutorMeta(executor: ObservationExecutor | null): string {
     return 'Executor not recorded';
   }
   const identityParts = [
-    executor.role ? formatExecutorRoleLabel(executor.role) : null,
+    executor.role ? formatWorkspaceRoleLabel(executor.role) : null,
     executor.tool,
     executor.provider,
   ].filter((part): part is string => Boolean(part));
@@ -1893,7 +1911,7 @@ function renderTaskHistoryCard(
           <h5 className="tl-wp-job-title">{task.title}</h5>
           <div className="tl-wp-job-subline">
             <span className="tl-wp-mono">{task.task_id}</span>
-            {task.role && <span>Role: {formatExecutorRoleLabel(task.role)}</span>}
+            {task.role && <span>Role: {formatWorkspaceRoleLabel(task.role)}</span>}
             {task.difficulty && <span>Difficulty: {task.difficulty}</span>}
             {task.stage && <span>Stage: {task.stage}</span>}
             <span>Current attempt: #{task.current_attempt_no}</span>
@@ -1999,7 +2017,7 @@ function renderRunItem(run: WorkspaceRunRecord) {
         <span className="tl-wp-pill" data-tone="neutral">
           <span className="tl-wp-pill-label">{run.status}</span>
         </span>
-        {run.role && <span>Role: {formatExecutorRoleLabel(run.role)}</span>}
+        {run.role && <span>Role: {formatWorkspaceRoleLabel(run.role)}</span>}
         {run.task_id && <span className="tl-wp-mono">Task: {run.task_id}</span>}
         {run.attempt_no !== null && <span>Attempt #{run.attempt_no}</span>}
         {run.worker_id && <span className="tl-wp-mono">Worker: {run.worker_id}</span>}
@@ -2074,7 +2092,7 @@ function collectRecordLinkItems(links: WorkspaceRecordLinks): string[] {
     items.push(`Follow-up jobs: ${links.follow_up_job_ids.join(', ')}`);
   }
   if (links.architect_advice_ids.length > 0) {
-    items.push(`Architect advice: ${links.architect_advice_ids.join(', ')}`);
+    items.push(`Advisor advice: ${links.architect_advice_ids.join(', ')}`);
   }
   if (links.source_request_ids.length > 0) {
     items.push(`Source requests: ${links.source_request_ids.join(', ')}`);
@@ -2663,8 +2681,8 @@ function ActivityRequestAuditCard({
               <ProviderBrandBadge brand={brandKey} size={13} />
               <span>
                 {executorDisplay.model
-                  ? `${executorDisplay.role} · ${executorDisplay.model}`
-                  : executorDisplay.role}
+                  ? `${normalizeWorkspaceRoleText(executorDisplay.role)} · ${executorDisplay.model}`
+                  : normalizeWorkspaceRoleText(executorDisplay.role)}
               </span>
             </span>
             <span>{compactDuration.value}</span>
@@ -2733,7 +2751,7 @@ function ActivityRequestAuditCard({
               <span className="tl-wp-audit-value">{row.requesterLine.value}</span>
               <span>
                 Evidence: {row.requesterEvidence} · Source: {row.actorSource} · Role:{' '}
-                {row.actorRole}
+                {normalizeWorkspaceRoleText(row.actorRole)}
               </span>
               <span>Configured selection: {row.actorSelectedSummary}</span>
             </div>
@@ -3416,10 +3434,47 @@ export function WorkspaceChatWorkSurface({
     scrollHeight: number;
   } | null>(null);
 
+  const snapshotGeneratedAtMs =
+    typeof snapshot?.generated_at_ms === 'number' &&
+    Number.isFinite(snapshot.generated_at_ms)
+      ? Math.trunc(snapshot.generated_at_ms)
+      : null;
+  const [fallbackClock, setFallbackClock] = useState(() => ({
+    logicalMs: snapshotGeneratedAtMs ?? Date.now(),
+    realMs: Date.now(),
+  }));
+  useEffect(() => {
+    if (typeof nowMs === 'number' && Number.isFinite(nowMs)) {
+      return;
+    }
+    setFallbackClock({
+      logicalMs: snapshotGeneratedAtMs ?? Date.now(),
+      realMs: Date.now(),
+    });
+  }, [nowMs, snapshotGeneratedAtMs]);
+  useEffect(() => {
+    if (typeof nowMs === 'number' && Number.isFinite(nowMs)) {
+      return;
+    }
+    if (typeof window === 'undefined') {
+      return;
+    }
+    // The surface still ages footer liveness and timers when the parent does not
+    // pass its own visible-UI clock and no new snapshot arrives. The logical
+    // clock starts from the snapshot generation time and advances by real time.
+    const intervalId = window.setInterval(() => {
+      setFallbackClock((previous) => ({
+        logicalMs: previous.logicalMs + (Date.now() - previous.realMs),
+        realMs: Date.now(),
+      }));
+    }, 1_000);
+    return () => window.clearInterval(intervalId);
+  }, [nowMs]);
+
   const referenceNowMs =
     typeof nowMs === 'number' && Number.isFinite(nowMs)
       ? nowMs
-      : snapshot?.generated_at_ms ?? Date.now();
+      : fallbackClock.logicalMs;
 
   const chatWork = useMemo(() => readWorkspaceChatWork(snapshot), [snapshot]);
   const selection = useMemo(
@@ -3812,6 +3867,11 @@ export function WorkspaceChatWorkSurface({
                 event.note !== null && event.note.trim() !== event.title.trim()
                   ? event.note
                   : null;
+              const execution = event.workerExecution;
+              const executionFooter =
+                execution !== null
+                  ? resolveChatWorkExecutionFooterState(execution, referenceNowMs)
+                  : null;
               return (
                 <li
                   key={event.key}
@@ -3833,6 +3893,49 @@ export function WorkspaceChatWorkSurface({
                     {event.title.trim().length > 0 ? event.title : 'Untitled backlog item'}
                   </p>
                   {note !== null ? <p className="tl-cw-event-note">{note}</p> : null}
+                  {execution !== null && executionFooter !== null ? (
+                    <div
+                      className="tl-cw-execution"
+                      data-worker-execution-summary={execution.executionRef}
+                      data-worker-status={executionFooter.statusKey}
+                    >
+                      <ProviderBrandBadge
+                        brand={resolveProviderBrandKey(execution.provider, execution.modelRaw)}
+                        size={12}
+                      />
+                      {execution.model !== null ? (
+                        <span
+                          className="tl-cw-execution-model"
+                          data-worker-execution-model="true"
+                        >
+                          {execution.model}
+                        </span>
+                      ) : null}
+                      {execution.effort !== null ? (
+                        <span
+                          className="tl-cw-execution-effort"
+                          data-worker-execution-effort="true"
+                        >
+                          {execution.effort}
+                        </span>
+                      ) : null}
+                      <span
+                        className="tl-cw-execution-status"
+                        data-worker-execution-status={executionFooter.statusKey}
+                      >
+                        {executionFooter.statusLabel}
+                      </span>
+                      {executionFooter.duration !== null &&
+                      executionFooter.durationLabel !== null ? (
+                        <span
+                          className="tl-cw-execution-duration"
+                          data-worker-execution-duration={executionFooter.duration.kind}
+                        >
+                          {executionFooter.durationLabel}
+                        </span>
+                      ) : null}
+                    </div>
+                  ) : null}
                 </li>
               );
             })}

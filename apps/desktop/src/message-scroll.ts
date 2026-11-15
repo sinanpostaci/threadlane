@@ -5,10 +5,15 @@ import type {
 } from './observation/types.ts';
 import type { ActivityFeedScope } from './pages/activity-feed-model.ts';
 import {
+  formatDurationMs,
+  formatFriendlyModel,
+} from './pages/activity-feed-model.ts';
+import {
   WORKSPACE_SAMPLE_STALE_THRESHOLD_MS,
   evaluateWorkspaceNativeSampleAt,
   formatWorkspaceChatIdentityKey,
   isValidWorkspaceChatIdentity,
+  sanitizeWorkspaceSelectionToken,
   workspaceChatIdentitiesEqual,
 } from './workspace-contract.ts';
 import type {
@@ -18,6 +23,7 @@ import type {
   WorkspaceJobHistory,
   WorkspaceMessageItem,
   WorkspaceNativeSample,
+  WorkspaceWorkerExecution,
 } from './workspace-contract.ts';
 
 /**
@@ -48,10 +54,13 @@ const VISIBILITY_EPSILON_PX = 0.5;
 export const MAX_CHAT_WORK_ITEMS = 200 as const;
 export const MAX_CHAT_WORK_EVENTS = 500 as const;
 export const MAX_CHAT_WORK_PRESENCE = 32 as const;
+export const MAX_CHAT_WORK_EXECUTIONS = 32 as const;
+export const MAX_CHAT_WORK_EXECUTIONS_TOTAL = 128 as const;
 
 export type ChatWorkItem = WorkspaceChatWork['items'][number];
 export type ChatWorkEvent = WorkspaceChatWork['events'][number];
 export type ChatWorkPresence = WorkspaceChatWork['worker_presence'][number];
+export type ChatWorkExecution = WorkspaceWorkerExecution;
 export type ChatWorkStatus = ChatWorkItem['status'];
 export type ChatWorkKind = ChatWorkItem['kind'];
 export type ChatWorkEventOutcome = ChatWorkEvent['outcome'];
@@ -120,6 +129,87 @@ function chatWorkCandidates(value: unknown): ChatWorkCandidate[] {
   return candidates;
 }
 
+interface ChatWorkCandidateAggregate {
+  identity: WorkspaceChatIdentity;
+  availability: 'available' | 'unavailable';
+  items: unknown[];
+  events: unknown[];
+  worker_presence: unknown[];
+  worker_executions: unknown[];
+  bounds: {
+    items_omitted: number;
+    events_omitted: number;
+    presence_omitted: number;
+    executions_omitted: number;
+  };
+}
+
+function rawChatWorkArray(value: unknown): unknown[] {
+  return Array.isArray(value) ? value.slice() : [];
+}
+
+/**
+ * Combines every raw row for the same complete canonical chat identity before
+ * normalization. Selecting or verifying only the first entry would let a valid
+ * entry hide a later contradicting Worker execution group and transfer its
+ * terminal metadata.
+ */
+function mergeChatWorkCandidatesByIdentity(value: unknown): ChatWorkCandidate[] {
+  const merged = new Map<string, ChatWorkCandidateAggregate>();
+  for (const candidate of chatWorkCandidates(value)) {
+    const key = formatWorkspaceChatIdentityKey(candidate.identity);
+    if (key === null) {
+      continue;
+    }
+    let aggregate = merged.get(key);
+    if (aggregate === undefined) {
+      aggregate = {
+        identity: candidate.identity,
+        availability: 'unavailable',
+        items: [],
+        events: [],
+        worker_presence: [],
+        worker_executions: [],
+        bounds: {
+          items_omitted: 0,
+          events_omitted: 0,
+          presence_omitted: 0,
+          executions_omitted: 0,
+        },
+      };
+      merged.set(key, aggregate);
+    }
+    if (candidate.availability === 'available') {
+      aggregate.availability = 'available';
+    }
+    const bounds = isRecord(candidate.bounds) ? candidate.bounds : {};
+    aggregate.bounds.items_omitted += cleanNonNegativeInt(bounds.items_omitted);
+    aggregate.bounds.events_omitted += cleanNonNegativeInt(bounds.events_omitted);
+    aggregate.bounds.presence_omitted += cleanNonNegativeInt(bounds.presence_omitted);
+    aggregate.bounds.executions_omitted += cleanNonNegativeInt(
+      bounds.executions_omitted,
+    );
+    aggregate.items.push(...rawChatWorkArray(candidate.items));
+    aggregate.events.push(...rawChatWorkArray(candidate.events));
+    aggregate.worker_presence.push(...rawChatWorkArray(candidate.worker_presence));
+    aggregate.worker_executions.push(...rawChatWorkArray(candidate.worker_executions));
+  }
+  return Array.from(merged.values()).map((aggregate) => ({
+    identity: aggregate.identity,
+    availability: aggregate.availability,
+    items: aggregate.items,
+    events: aggregate.events,
+    worker_presence: aggregate.worker_presence,
+    worker_executions: aggregate.worker_executions,
+    bounds: {
+      items_omitted: aggregate.bounds.items_omitted,
+      events_omitted: aggregate.bounds.events_omitted,
+      presence_omitted: aggregate.bounds.presence_omitted,
+      executions_omitted: aggregate.bounds.executions_omitted,
+    },
+  }));
+}
+
 function isNativeSampleCandidate(value: unknown): value is WorkspaceNativeSample {
   // The canonical chat identity is the only trusted key here. Every remaining
   // field is re-validated and normalized by evaluateWorkspaceNativeSampleAt.
@@ -148,12 +238,25 @@ function cleanNonNegativeInt(value: unknown, fallback = 0): number {
   return truncated >= 0 ? truncated : fallback;
 }
 
+function cleanNonNegativeIntOrNull(value: unknown): number | null {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    return null;
+  }
+  const truncated = Math.trunc(value);
+  return truncated >= 0 ? truncated : null;
+}
+
 function cleanOptionalTimestamp(value: unknown): number | null {
   if (typeof value !== 'number' || !Number.isFinite(value)) {
     return null;
   }
   const truncated = Math.trunc(value);
   return truncated >= 0 ? truncated : null;
+}
+
+function cleanOptionalPositiveTimestamp(value: unknown): number | null {
+  const timestamp = cleanOptionalTimestamp(value);
+  return timestamp !== null && timestamp > 0 ? timestamp : null;
 }
 
 function cleanOptionalString(value: unknown): string | null {
@@ -262,10 +365,57 @@ function capChatWorkHead<T>(
   return { items: Array.from(items.slice(0, max)), omitted: items.length - max };
 }
 
+/**
+ * Reconciles duplicate raw item rows by exact binding/item identity before the
+ * bounded window. A duplicate is an omission; only a strictly newer revision
+ * replaces the retained revision and its matching status.
+ */
+function reconcileChatWorkItems(
+  items: readonly ChatWorkItem[],
+): { items: ChatWorkItem[]; omitted: number } {
+  const byIdentity = new Map<string, ChatWorkItem>();
+  let omitted = 0;
+  for (const item of items) {
+    const key = `${item.binding_id}\u0000${item.item_id}`;
+    const existing = byIdentity.get(key);
+    if (existing === undefined) {
+      byIdentity.set(key, item);
+      continue;
+    }
+    omitted += 1;
+    if (item.revision > existing.revision) {
+      byIdentity.set(key, item);
+    }
+  }
+  return { items: Array.from(byIdentity.values()), omitted };
+}
+
+/**
+ * Collapses duplicate samples of the same immutable attempt after the existing
+ * deterministic presence ordering, so repeated samples cannot consume bounded
+ * slots or hide an unrelated Worker. Distinct attempts remain distinct.
+ */
+function reconcileChatWorkPresence(
+  presence: readonly ChatWorkPresence[],
+): { presence: ChatWorkPresence[]; omitted: number } {
+  const byAttempt = new Map<string, ChatWorkPresence>();
+  let omitted = 0;
+  for (const entry of presence) {
+    const key = `${entry.item_id}\u0000${entry.execution_ref}`;
+    if (byAttempt.has(key)) {
+      omitted += 1;
+      continue;
+    }
+    byAttempt.set(key, entry);
+  }
+  return { presence: Array.from(byAttempt.values()), omitted };
+}
+
 export interface ChatWorkBoundsView {
   itemsOmitted: number;
   eventsOmitted: number;
   presenceOmitted: number;
+  executionsOmitted: number;
 }
 
 export interface WorkspaceChatWorkSelection {
@@ -275,6 +425,7 @@ export interface WorkspaceChatWorkSelection {
   items: ChatWorkItem[];
   events: ChatWorkEvent[];
   presence: ChatWorkPresence[];
+  executions: ChatWorkExecution[];
   bounds: ChatWorkBoundsView;
   notices: string[];
   unavailableReason: string | null;
@@ -291,7 +442,13 @@ function emptyChatWorkSelection(
     items: [],
     events: [],
     presence: [],
-    bounds: { itemsOmitted: 0, eventsOmitted: 0, presenceOmitted: 0 },
+    executions: [],
+    bounds: {
+      itemsOmitted: 0,
+      eventsOmitted: 0,
+      presenceOmitted: 0,
+      executionsOmitted: 0,
+    },
     notices: reason !== null ? [reason] : [],
     unavailableReason: reason,
   };
@@ -309,6 +466,325 @@ export function readWorkspaceChatWork(snapshot: unknown): readonly ChatWorkCandi
   return chatWorkCandidates(snapshot.chat_work);
 }
 
+function cleanExecutionId(value: unknown): string | null {
+  if (typeof value !== 'string') {
+    return null;
+  }
+  const clean = sanitizeWorkspaceSelectionToken(value);
+  if (
+    clean === null ||
+    clean !== value ||
+    UTF8_ENCODER.encode(clean).byteLength > 128 ||
+    !/^[A-Za-z0-9_.:-]+$/.test(clean)
+  ) {
+    return null;
+  }
+  return clean;
+}
+
+function cleanExecutionMetadataText(value: unknown): string | null {
+  const clean = sanitizeWorkspaceSelectionToken(value);
+  if (clean === null) {
+    return null;
+  }
+  if (/^(unknown|not_reported|not reported|n\/a|none)$/i.test(clean)) {
+    return null;
+  }
+  return clean;
+}
+
+function cleanExecutionToken(value: unknown): string | null {
+  if (typeof value !== 'string') {
+    return null;
+  }
+  const trimmed = value.trim();
+  const clean = sanitizeWorkspaceSelectionToken(value);
+  if (
+    trimmed.length === 0 ||
+    clean === null ||
+    clean !== trimmed ||
+    UTF8_ENCODER.encode(clean).byteLength > 128 ||
+    !/^[A-Za-z0-9_.-]+$/.test(clean)
+  ) {
+    return null;
+  }
+  return clean.toLowerCase();
+}
+
+const TERMINAL_EXECUTION_STATUS_TOKENS: ReadonlySet<string> = new Set([
+  'completed',
+  'failed',
+  'cancelled',
+  'timed_out',
+  'unknown',
+]);
+
+const TERMINAL_EXECUTION_ACCEPTANCE_TOKENS: ReadonlySet<string> = new Set([
+  'accepted',
+  'verified_accepted',
+  'rejected',
+  'rejected_by_diff_gate',
+  'execution_failed',
+]);
+
+function executionRecordRank(execution: ChatWorkExecution): number {
+  const status = execution.worker_status?.toLowerCase() ?? '';
+  const acceptance = execution.acceptance?.toLowerCase() ?? '';
+  let rank = 0;
+  if (
+    execution.outcome !== null ||
+    execution.finished_at_ms !== null ||
+    TERMINAL_EXECUTION_STATUS_TOKENS.has(status) ||
+    TERMINAL_EXECUTION_ACCEPTANCE_TOKENS.has(acceptance)
+  ) {
+    rank += 1_000;
+  }
+  if (execution.outcome !== null) {
+    rank += execution.outcome === 'unknown' ? 64 : 192;
+  }
+  if (execution.worker_status !== null) {
+    rank += 64;
+  }
+  if (execution.acceptance !== null) {
+    rank += 32;
+  }
+  if (execution.duration_ms !== null) {
+    rank += 16;
+  }
+  if (execution.finished_at_ms !== null) {
+    rank += 8;
+  }
+  if (execution.started_at_ms !== null) {
+    rank += 4;
+  }
+  if (execution.observed_model !== null) {
+    rank += 2;
+  }
+  if (execution.observed_effort !== null) {
+    rank += 1;
+  }
+  return rank;
+}
+
+function chatWorkExecutionJoinKey(itemId: string, executionRef: string): string {
+  return `${itemId}\u0000${executionRef}`;
+}
+
+/**
+ * Immutable attempt identity used to decide whether two execution records may
+ * enrich one footer. Only rows with the same full identity may be ranked and
+ * merged; the control chat binding is not part of this comparison and never
+ * replaces the approved-host session binding.
+ */
+function chatWorkExecutionIdentityKey(execution: ChatWorkExecution): string {
+  return [
+    execution.item_id,
+    execution.execution_ref,
+    execution.approval_id,
+    execution.task_id,
+    execution.session_binding_id,
+    execution.run_id,
+    execution.worker_id,
+  ].join('\u0000');
+}
+
+/**
+ * Pairs a presence sample with metadata only when every available immutable
+ * identity field matches exactly. The presence wire record has no
+ * `session_binding_id`, so the approved-host runtime binding is never compared
+ * with (or substituted by) the control chat binding.
+ */
+function chatWorkPresenceJoinKey(
+  itemId: string,
+  executionRef: string,
+  approvalId: string,
+  taskId: string,
+  runId: string,
+  workerId: string,
+): string {
+  return [itemId, executionRef, approvalId, taskId, runId, workerId].join('\u0000');
+}
+
+function compareChatWorkExecutions(
+  left: ChatWorkExecution,
+  right: ChatWorkExecution,
+): number {
+  const leftStarted = left.started_at_ms ?? Number.MIN_SAFE_INTEGER;
+  const rightStarted = right.started_at_ms ?? Number.MIN_SAFE_INTEGER;
+  if (leftStarted !== rightStarted) {
+    return leftStarted - rightStarted;
+  }
+  if (left.item_id !== right.item_id) {
+    return left.item_id < right.item_id ? -1 : 1;
+  }
+  if (left.execution_ref !== right.execution_ref) {
+    return left.execution_ref < right.execution_ref ? -1 : 1;
+  }
+  return 0;
+}
+
+function normalizeChatWorkExecutionRecord(
+  raw: unknown,
+  identity: WorkspaceChatIdentity,
+  itemById: ReadonlyMap<string, ChatWorkItem>,
+  eventExecutionKeys: ReadonlySet<string>,
+): ChatWorkExecution | null {
+  if (!isRecord(raw)) {
+    return null;
+  }
+  const itemId = cleanExecutionId(raw.item_id);
+  const executionRef = cleanExecutionId(raw.execution_ref);
+  const approvalId = cleanExecutionId(raw.approval_id);
+  const taskId = cleanExecutionId(raw.task_id);
+  const sessionBindingId = cleanExecutionId(raw.session_binding_id);
+  const runId = cleanExecutionId(raw.run_id);
+  const workerId = cleanExecutionId(raw.worker_id);
+  if (
+    itemId === null ||
+    executionRef === null ||
+    approvalId === null ||
+    taskId === null ||
+    sessionBindingId === null ||
+    runId === null ||
+    workerId === null
+  ) {
+    return null;
+  }
+  if (
+    [itemId, executionRef, approvalId, taskId, sessionBindingId, runId, workerId].includes(
+      'unknown',
+    )
+  ) {
+    return null;
+  }
+  // The control chat binding and the approved-host runtime binding are distinct
+  // and both are frozen at dispatch. Never require them to be equal or replace
+  // the runtime binding with the control binding.
+  const item = itemById.get(itemId);
+  if (item !== undefined) {
+    if (item.binding_id !== identity.binding_id || item.kind !== 'worker') {
+      return null;
+    }
+  } else if (
+    !eventExecutionKeys.has(chatWorkExecutionJoinKey(itemId, executionRef))
+  ) {
+    // An item may have left the bounded item window while its retained event
+    // still proves this exact attempt. Metadata without either join is refused.
+    return null;
+  }
+
+  const startedAtMs = cleanOptionalPositiveTimestamp(raw.started_at_ms);
+  const rawFinishedAtMs = cleanOptionalPositiveTimestamp(raw.finished_at_ms);
+  const finishedAtMs =
+    startedAtMs !== null &&
+    rawFinishedAtMs !== null &&
+    rawFinishedAtMs < startedAtMs
+      ? null
+      : rawFinishedAtMs;
+  const outcomeToken = cleanExecutionToken(raw.outcome);
+  const outcome: ChatWorkExecution['outcome'] =
+    outcomeToken === 'success' || outcomeToken === 'failure' || outcomeToken === 'unknown'
+      ? outcomeToken
+      : null;
+
+  return {
+    item_id: itemId,
+    execution_ref: executionRef,
+    approval_id: approvalId,
+    task_id: taskId,
+    session_binding_id: sessionBindingId,
+    run_id: runId,
+    worker_id: workerId,
+    provider: cleanExecutionMetadataText(raw.provider),
+    requested_model: cleanExecutionMetadataText(raw.requested_model),
+    observed_model: cleanExecutionMetadataText(raw.observed_model),
+    requested_effort: cleanExecutionMetadataText(raw.requested_effort),
+    observed_effort: cleanExecutionMetadataText(raw.observed_effort),
+    worker_status: cleanExecutionToken(raw.worker_status),
+    started_at_ms: startedAtMs,
+    finished_at_ms: finishedAtMs,
+    duration_ms: cleanNonNegativeIntOrNull(raw.duration_ms),
+    outcome,
+    acceptance: cleanExecutionToken(raw.acceptance),
+  };
+}
+
+function normalizeChatWorkExecutions(
+  raw: unknown,
+  identity: WorkspaceChatIdentity,
+  itemById: ReadonlyMap<string, ChatWorkItem>,
+  eventExecutionKeys: ReadonlySet<string>,
+): { executions: ChatWorkExecution[]; omitted: number } {
+  if (!Array.isArray(raw)) {
+    return { executions: [], omitted: 0 };
+  }
+  let omitted = 0;
+  interface ExecutionGroup {
+    identityKey: string;
+    selected: ChatWorkExecution | null;
+    rows: number;
+    conflicted: boolean;
+  }
+  const groups = new Map<string, ExecutionGroup>();
+  for (const entry of raw) {
+    const execution = normalizeChatWorkExecutionRecord(
+      entry,
+      identity,
+      itemById,
+      eventExecutionKeys,
+    );
+    if (execution === null) {
+      omitted += 1;
+      continue;
+    }
+    const key = chatWorkExecutionJoinKey(execution.item_id, execution.execution_ref);
+    const identityKey = chatWorkExecutionIdentityKey(execution);
+    const group = groups.get(key);
+    if (group === undefined) {
+      groups.set(key, {
+        identityKey,
+        selected: execution,
+        rows: 1,
+        conflicted: false,
+      });
+      continue;
+    }
+    group.rows += 1;
+    if (group.conflicted) {
+      // A later row must never resurrect a quarantined attempt.
+      omitted += 1;
+      continue;
+    }
+    if (group.identityKey !== identityKey) {
+      // Immutable approval/task/session/run/worker identity contradicted this
+      // same item/execution ref: refuse the whole group instead of ranking it.
+      omitted += group.rows;
+      group.conflicted = true;
+      group.selected = null;
+      continue;
+    }
+    const existing = group.selected;
+    if (
+      existing === null ||
+      executionRecordRank(execution) > executionRecordRank(existing)
+    ) {
+      group.selected = execution;
+    }
+  }
+  const ordered = Array.from(groups.values())
+    .filter(
+      (group): group is ExecutionGroup & { selected: ChatWorkExecution } =>
+        !group.conflicted && group.selected !== null,
+    )
+    .map((group) => group.selected)
+    .sort(compareChatWorkExecutions);
+  const capped = capChatWorkTail(ordered, MAX_CHAT_WORK_EXECUTIONS);
+  return {
+    executions: capped.items,
+    omitted: omitted + capped.omitted,
+  };
+}
+
 function buildChatWorkSelectionFromWork(
   identity: WorkspaceChatIdentity,
   work: ChatWorkCandidate,
@@ -320,7 +796,15 @@ function buildChatWorkSelectionFromWork(
 
   const rawItems: readonly unknown[] = Array.isArray(work.items) ? work.items : [];
   const usableItems = rawItems.filter(isUsableChatWorkItem);
-  const itemCap = capChatWorkHead(usableItems, MAX_CHAT_WORK_ITEMS);
+  const itemResult = reconcileChatWorkItems(usableItems);
+  const itemCap = capChatWorkHead(itemResult.items, MAX_CHAT_WORK_ITEMS);
+  const itemById = new Map<string, ChatWorkItem>(
+    itemCap.items.map((item) => [item.item_id, item] as const),
+  );
+
+  const rawExecutions: readonly unknown[] = Array.isArray(work.worker_executions)
+    ? work.worker_executions
+    : [];
 
   const rawEvents: readonly unknown[] = Array.isArray(work.events) ? work.events : [];
   const usableEvents = rawEvents.filter(isUsableChatWorkEvent).sort(compareChatWorkEvents);
@@ -334,6 +818,20 @@ function buildChatWorkSelectionFromWork(
     dedupedEvents.push(event);
   }
   const eventCap = capChatWorkTail(dedupedEvents, MAX_CHAT_WORK_EVENTS);
+  const eventExecutionKeys = new Set<string>();
+  for (const event of eventCap.items) {
+    if (event.execution_ref !== null) {
+      eventExecutionKeys.add(
+        chatWorkExecutionJoinKey(event.item_id, event.execution_ref),
+      );
+    }
+  }
+  const executionResult = normalizeChatWorkExecutions(
+    rawExecutions,
+    identity,
+    itemById,
+    eventExecutionKeys,
+  );
 
   const rawPresence: readonly unknown[] = Array.isArray(work.worker_presence)
     ? work.worker_presence
@@ -352,16 +850,23 @@ function buildChatWorkSelectionFromWork(
       if (leftPriority !== rightPriority) {
         return rightPriority - leftPriority;
       }
+      const leftSampledAtMs = cleanOptionalTimestamp(left.sampled_at_ms) ?? 0;
+      const rightSampledAtMs = cleanOptionalTimestamp(right.sampled_at_ms) ?? 0;
+      if (leftSampledAtMs !== rightSampledAtMs) {
+        return rightSampledAtMs - leftSampledAtMs;
+      }
       if (left.item_id !== right.item_id) {
         return left.item_id < right.item_id ? -1 : 1;
       }
       return left.execution_ref < right.execution_ref ? -1 : 1;
     });
-  const presenceCap = capChatWorkHead(usablePresence, MAX_CHAT_WORK_PRESENCE);
+  const presenceResult = reconcileChatWorkPresence(usablePresence);
+  const presenceCap = capChatWorkHead(presenceResult.presence, MAX_CHAT_WORK_PRESENCE);
 
   const itemsOmitted =
     cleanNonNegativeInt(rawBounds.items_omitted) +
     (rawItems.length - usableItems.length) +
+    itemResult.omitted +
     itemCap.omitted;
   const eventsOmitted =
     cleanNonNegativeInt(rawBounds.events_omitted) +
@@ -370,7 +875,10 @@ function buildChatWorkSelectionFromWork(
   const presenceOmitted =
     cleanNonNegativeInt(rawBounds.presence_omitted) +
     (rawPresence.length - usablePresence.length) +
+    presenceResult.omitted +
     presenceCap.omitted;
+  const executionsOmitted =
+    cleanNonNegativeInt(rawBounds.executions_omitted) + executionResult.omitted;
 
   const notices: string[] = [];
   if (availability === 'unavailable') {
@@ -391,6 +899,11 @@ function buildChatWorkSelectionFromWork(
       `${presenceOmitted} worker presence ${presenceOmitted === 1 ? 'record is' : 'records are'} outside this bounded window.`,
     );
   }
+  if (executionsOmitted > 0) {
+    notices.push(
+      `${executionsOmitted} worker execution ${executionsOmitted === 1 ? 'record is' : 'records are'} outside this bounded window.`,
+    );
+  }
 
   return {
     chatKey,
@@ -399,7 +912,13 @@ function buildChatWorkSelectionFromWork(
     items: itemCap.items,
     events: eventCap.items,
     presence: presenceCap.items,
-    bounds: { itemsOmitted, eventsOmitted, presenceOmitted },
+    executions: executionResult.executions,
+    bounds: {
+      itemsOmitted,
+      eventsOmitted,
+      presenceOmitted,
+      executionsOmitted,
+    },
     notices,
     unavailableReason:
       availability === 'unavailable'
@@ -409,8 +928,9 @@ function buildChatWorkSelectionFromWork(
 }
 
 /**
- * Selects the exact canonical chat identity. Titles, project labels, binding
- * suffixes, session ids, and job ids are never used as identity substitutes.
+ * Selects the exact canonical chat identity after composing every raw row for
+ * that identity. Titles, project labels, binding suffixes, session ids, and job
+ * ids are never used as identity substitutes.
  */
 export function selectWorkspaceChatWork(
   chatWork: unknown,
@@ -419,7 +939,7 @@ export function selectWorkspaceChatWork(
   if (identity === null || identity === undefined || !isValidWorkspaceChatIdentity(identity)) {
     return emptyChatWorkSelection(null, 'Chat identity is unavailable.');
   }
-  for (const candidate of chatWorkCandidates(chatWork)) {
+  for (const candidate of mergeChatWorkCandidatesByIdentity(chatWork)) {
     if (workspaceChatIdentitiesEqual(candidate.identity, identity)) {
       return buildChatWorkSelectionFromWork(candidate.identity, candidate);
     }
@@ -443,6 +963,7 @@ export interface ChatWorkEventView {
   outcome: ChatWorkEventOutcome;
   note: string | null;
   tone: ChatWorkTone;
+  workerExecution: ChatWorkExecutionSummaryView | null;
 }
 
 function humanizeChatWorkAction(action: string): string {
@@ -490,16 +1011,411 @@ function resolveChatWorkEventTone(event: ChatWorkEvent): ChatWorkTone {
   return 'neutral';
 }
 
+export type ChatWorkExecutionStatusKey =
+  | 'completed'
+  | 'checking'
+  | 'rejected'
+  | 'failed'
+  | 'timed_out'
+  | 'cancelled'
+  | 'unknown'
+  | 'queued'
+  | 'claimed'
+  | 'dispatched'
+  | 'working'
+  | 'unavailable'
+  | 'cancelling';
+
+export type ChatWorkExecutionDuration =
+  | { readonly kind: 'final'; readonly durationMs: number }
+  | { readonly kind: 'elapsed'; readonly startedAtMs: number };
+
+/**
+ * Compact, scope-verified execution metadata for one stream footer. Durable
+ * execution state stays separate from live evidence: Working/Status unavailable
+ * are resolved at render time from the exact presence record and current clock.
+ */
+export interface ChatWorkExecutionSummaryView {
+  key: string;
+  executionRef: string;
+  itemId: string;
+  provider: string | null;
+  modelRaw: string | null;
+  model: string | null;
+  effort: string | null;
+  statusKey: ChatWorkExecutionStatusKey;
+  statusLabel: string;
+  tone: ChatWorkTone;
+  duration: ChatWorkExecutionDuration | null;
+  /** Additive current-clock inputs; older literal summaries may omit them. */
+  startedAtMs?: number | null;
+  presence?: ChatWorkPresence | null;
+  itemStatus?: ChatWorkStatus | null;
+  itemCurrentExecutionRef?: string | null;
+}
+
+const EXECUTION_STATUS_PRESENTATION: Readonly<
+  Record<ChatWorkExecutionStatusKey, { label: string; tone: ChatWorkTone }>
+> = {
+  completed: { label: 'Completed', tone: 'success' },
+  checking: { label: 'Checking', tone: 'attention' },
+  rejected: { label: 'Rejected', tone: 'danger' },
+  failed: { label: 'Failed', tone: 'danger' },
+  timed_out: { label: 'Timed out', tone: 'danger' },
+  cancelled: { label: 'Cancelled', tone: 'neutral' },
+  unknown: { label: 'Unknown', tone: 'neutral' },
+  queued: { label: 'Queued', tone: 'neutral' },
+  claimed: { label: 'Claimed', tone: 'neutral' },
+  dispatched: { label: 'Dispatched', tone: 'neutral' },
+  working: { label: 'Working', tone: 'working' },
+  unavailable: { label: 'Status unavailable', tone: 'neutral' },
+  cancelling: { label: 'Cancelling', tone: 'attention' },
+};
+
+const CANCELLED_EXECUTION_TOKENS: ReadonlySet<string> = new Set([
+  'cancelled',
+  'canceled',
+]);
+
+const REJECTED_ACCEPTANCE_TOKENS: ReadonlySet<string> = new Set([
+  'rejected',
+  'rejected_by_diff_gate',
+  'not_accepted',
+]);
+
+const CHECKING_ACCEPTANCE_TOKENS: ReadonlySet<string> = new Set([
+  'accepted',
+  'verified_accepted',
+  'pending_review',
+  'ready_for_review',
+]);
+
+const ACCEPTED_DONE_ACCEPTANCE_TOKENS: ReadonlySet<string> = new Set([
+  'accepted',
+  'verified_accepted',
+]);
+
+function lowerToken(value: string | null | undefined): string {
+  return typeof value === 'string' ? value.trim().toLowerCase() : '';
+}
+
+function capitalizeExecutionEffort(value: string): string {
+  return value.length > 0 ? `${value.charAt(0).toUpperCase()}${value.slice(1)}` : value;
+}
+
+function resolveChatWorkExecutionStatus(
+  execution: ChatWorkExecution,
+  item: ChatWorkItem | null,
+): ChatWorkExecutionStatusKey {
+  const workerStatus = lowerToken(execution.worker_status);
+  const outcome = lowerToken(execution.outcome);
+  const acceptance = lowerToken(execution.acceptance);
+
+  const terminalNonSuccess =
+    CANCELLED_EXECUTION_TOKENS.has(workerStatus) ||
+    CANCELLED_EXECUTION_TOKENS.has(outcome) ||
+    workerStatus === 'cancel_requested' ||
+    workerStatus === 'timed_out' ||
+    outcome === 'timed_out' ||
+    outcome === 'failure' ||
+    workerStatus === 'failed' ||
+    acceptance === 'execution_failed' ||
+    outcome === 'unknown' ||
+    workerStatus === 'unknown';
+  const technicallySuccessful =
+    !terminalNonSuccess &&
+    (outcome === 'success' ||
+      workerStatus === 'completed' ||
+      workerStatus === 'succeeded');
+  const acceptedExecution =
+    technicallySuccessful &&
+    !REJECTED_ACCEPTANCE_TOKENS.has(acceptance) &&
+    ACCEPTED_DONE_ACCEPTANCE_TOKENS.has(acceptance);
+  const guardedDone =
+    acceptedExecution ||
+    (item !== null &&
+      item.status === 'done' &&
+      technicallySuccessful &&
+      !REJECTED_ACCEPTANCE_TOKENS.has(acceptance) &&
+      item.current_execution_ref === execution.execution_ref);
+  if (guardedDone) {
+    return 'completed';
+  }
+
+  if (
+    CANCELLED_EXECUTION_TOKENS.has(workerStatus) ||
+    CANCELLED_EXECUTION_TOKENS.has(outcome)
+  ) {
+    return 'cancelled';
+  }
+  if (workerStatus === 'cancel_requested') {
+    return 'cancelling';
+  }
+  if (workerStatus === 'timed_out' || outcome === 'timed_out') {
+    return 'timed_out';
+  }
+  if (
+    outcome === 'failure' ||
+    workerStatus === 'failed' ||
+    acceptance === 'execution_failed'
+  ) {
+    return 'failed';
+  }
+  if (outcome === 'unknown' || workerStatus === 'unknown') {
+    return 'unknown';
+  }
+  if (REJECTED_ACCEPTANCE_TOKENS.has(acceptance)) {
+    return 'rejected';
+  }
+  if (
+    outcome === 'success' ||
+    workerStatus === 'completed' ||
+    workerStatus === 'ready_for_review' ||
+    workerStatus === 'succeeded' ||
+    CHECKING_ACCEPTANCE_TOKENS.has(acceptance)
+  ) {
+    return 'checking';
+  }
+  if (workerStatus === 'queued') {
+    return 'queued';
+  }
+  if (workerStatus === 'claimed') {
+    return 'claimed';
+  }
+  return 'dispatched';
+}
+
+function isTerminalChatWorkExecution(statusKey: ChatWorkExecutionStatusKey): boolean {
+  return (
+    statusKey === 'completed' ||
+    statusKey === 'checking' ||
+    statusKey === 'rejected' ||
+    statusKey === 'failed' ||
+    statusKey === 'timed_out' ||
+    statusKey === 'cancelled' ||
+    statusKey === 'unknown'
+  );
+}
+
+function resolveChatWorkExecutionDuration(
+  execution: ChatWorkExecution,
+  statusKey: ChatWorkExecutionStatusKey,
+): ChatWorkExecutionDuration | null {
+  const terminal = isTerminalChatWorkExecution(statusKey);
+  if (terminal && execution.duration_ms !== null) {
+    return { kind: 'final', durationMs: execution.duration_ms };
+  }
+  const startedAtMs = execution.started_at_ms;
+  const finishedAtMs = execution.finished_at_ms;
+  if (
+    startedAtMs !== null &&
+    finishedAtMs !== null &&
+    finishedAtMs >= startedAtMs
+  ) {
+    return { kind: 'final', durationMs: finishedAtMs - startedAtMs };
+  }
+  if (terminal) {
+    return null;
+  }
+  if (startedAtMs !== null) {
+    return { kind: 'elapsed', startedAtMs };
+  }
+  return null;
+}
+
+function formatChatWorkExecutionDuration(
+  duration: ChatWorkExecutionDuration | null,
+  nowMs: number,
+): string | null {
+  if (duration === null) {
+    return null;
+  }
+  if (duration.kind === 'final') {
+    return formatDurationMs(duration.durationMs);
+  }
+  if (!Number.isFinite(nowMs)) {
+    return null;
+  }
+  const elapsedMs = Math.trunc(nowMs) - duration.startedAtMs;
+  if (elapsedMs < 0) {
+    return null;
+  }
+  return `Elapsed ${formatDurationMs(elapsedMs)}`;
+}
+
+/**
+ * Resolves a stored final/elapsed duration label. Footer liveness uses
+ * `resolveChatWorkExecutionFooterState` so expired presence cannot keep ticking.
+ */
+export function resolveChatWorkExecutionDurationLabel(
+  view: ChatWorkExecutionSummaryView,
+  nowMs: number,
+): string | null {
+  return formatChatWorkExecutionDuration(view.duration, nowMs);
+}
+
+export interface ChatWorkExecutionFooterState {
+  statusKey: ChatWorkExecutionStatusKey;
+  statusLabel: string;
+  tone: ChatWorkTone;
+  duration: ChatWorkExecutionDuration | null;
+  durationLabel: string | null;
+}
+
+/**
+ * Resolves the one footer at the current clock tick. Only the existing exact
+ * current-execution presence validator may turn a dispatch receipt into
+ * Working. A present but expired/stale/unavailable sample becomes Status
+ * unavailable and removes the ticking timer; dispatch-only work stays
+ * Dispatched. Running/Doing alone never proves liveness.
+ */
+export function resolveChatWorkExecutionFooterState(
+  view: ChatWorkExecutionSummaryView,
+  nowMs: number,
+): ChatWorkExecutionFooterState {
+  let statusKey = view.statusKey;
+  const presence = view.presence ?? null;
+  if (!isTerminalChatWorkExecution(statusKey) && statusKey === 'dispatched') {
+    if (presence !== null) {
+      const itemStatus = view.itemStatus ?? null;
+      const item =
+        itemStatus !== null
+          ? {
+              status: itemStatus,
+              current_execution_ref: view.itemCurrentExecutionRef ?? null,
+            }
+          : null;
+      statusKey =
+        item !== null && isLiveChatWorkWorkerPresence(presence, item, nowMs)
+          ? 'working'
+          : 'unavailable';
+    }
+  }
+
+  let duration: ChatWorkExecutionDuration | null;
+  if (statusKey === 'working') {
+    const startedAtMs = view.startedAtMs ?? null;
+    duration =
+      startedAtMs !== null && startedAtMs > 0
+        ? { kind: 'elapsed', startedAtMs }
+        : null;
+  } else if (isTerminalChatWorkExecution(view.statusKey)) {
+    duration = view.duration;
+  } else {
+    // Queued, claimed, dispatched, unavailable, and cancelling footers never
+    // tick. Only proven fresh Worker presence advances an elapsed timer.
+    duration = null;
+  }
+
+  const presentation = EXECUTION_STATUS_PRESENTATION[statusKey];
+  return {
+    statusKey,
+    statusLabel: presentation.label,
+    tone: presentation.tone,
+    duration,
+    durationLabel: formatChatWorkExecutionDuration(duration, nowMs),
+  };
+}
+
+export function buildChatWorkExecutionSummaries(
+  selection: WorkspaceChatWorkSelection,
+): ChatWorkExecutionSummaryView[] {
+  const chatKey = selection.chatKey ?? 'unscoped';
+  const itemById = new Map<string, ChatWorkItem>(
+    selection.items.map((item) => [item.item_id, item] as const),
+  );
+  const presenceByExecution = new Map<string, ChatWorkPresence>();
+  for (const presence of selection.presence) {
+    const key = chatWorkPresenceJoinKey(
+      presence.item_id,
+      presence.execution_ref,
+      presence.approval_id,
+      presence.task_id,
+      presence.run_id,
+      presence.worker_id,
+    );
+    if (!presenceByExecution.has(key)) {
+      presenceByExecution.set(key, presence);
+    }
+  }
+  // Normalization already quarantines contradicting records. Re-check here so
+  // a caller-constructed selection still cannot attach Completed/model/final
+  // duration from a group whose immutable identity contradicts itself.
+  const identityByJoinKey = new Map<string, string>();
+  const conflictingJoinKeys = new Set<string>();
+  for (const execution of selection.executions) {
+    const joinKey = chatWorkExecutionJoinKey(
+      execution.item_id,
+      execution.execution_ref,
+    );
+    const identityKey = chatWorkExecutionIdentityKey(execution);
+    const existing = identityByJoinKey.get(joinKey);
+    if (existing === undefined) {
+      identityByJoinKey.set(joinKey, identityKey);
+    } else if (existing !== identityKey) {
+      conflictingJoinKeys.add(joinKey);
+    }
+  }
+  const summaries: ChatWorkExecutionSummaryView[] = [];
+  for (const execution of selection.executions) {
+    const item = itemById.get(execution.item_id) ?? null;
+    const statusKey = resolveChatWorkExecutionStatus(execution, item);
+    const presentation = EXECUTION_STATUS_PRESENTATION[statusKey];
+    const modelRaw = execution.observed_model ?? execution.requested_model;
+    const effortRaw = execution.observed_effort ?? execution.requested_effort;
+    const joinKey = chatWorkExecutionJoinKey(
+      execution.item_id,
+      execution.execution_ref,
+    );
+    if (conflictingJoinKeys.has(joinKey)) {
+      continue;
+    }
+    summaries.push({
+      key: `${chatKey}\u0000${joinKey}`,
+      executionRef: execution.execution_ref,
+      itemId: execution.item_id,
+      provider: execution.provider,
+      modelRaw,
+      model: modelRaw !== null ? formatFriendlyModel(modelRaw) : null,
+      effort: effortRaw !== null ? capitalizeExecutionEffort(effortRaw) : null,
+      statusKey,
+      statusLabel: presentation.label,
+      tone: presentation.tone,
+      duration: resolveChatWorkExecutionDuration(execution, statusKey),
+      startedAtMs: execution.started_at_ms,
+      presence:
+        presenceByExecution.get(
+          chatWorkPresenceJoinKey(
+            execution.item_id,
+            execution.execution_ref,
+            execution.approval_id,
+            execution.task_id,
+            execution.run_id,
+            execution.worker_id,
+          ),
+        ) ?? null,
+      itemStatus: item?.status ?? null,
+      itemCurrentExecutionRef: item?.current_execution_ref ?? null,
+    });
+  }
+  return summaries;
+}
+
 /**
  * Builds the chronological stream oldest to newest. Only the actual
  * `worker_outcome_recorded` event may carry an outcome; a later durable result
  * is never projected backwards onto earlier reservation or completion events.
+ *
+ * A compact execution footer attaches only to the latest retained event for its
+ * exact `item_id` + `execution_ref`, so refreshed snapshots and duplicate events
+ * never duplicate footers, collapse another item's textual ref, or rewrite an
+ * older event's action, time, or outcome.
  */
 export function buildChatWorkEventViews(
   selection: WorkspaceChatWorkSelection,
 ): ChatWorkEventView[] {
   const chatKey = selection.chatKey ?? 'unscoped';
-  return selection.events.map((event) => {
+  const views = selection.events.map((event) => {
     const title = typeof event.title === 'string' ? event.title : '';
     return {
       key: `${chatKey}\u0000${event.event_id}\u0000${event.sequence}`,
@@ -517,8 +1433,29 @@ export function buildChatWorkEventViews(
       outcome: event.action === 'worker_outcome_recorded' ? event.outcome : null,
       note: cleanOptionalString(event.note),
       tone: resolveChatWorkEventTone(event),
+      workerExecution: null as ChatWorkExecutionSummaryView | null,
     };
   });
+
+  const latestEventByExecutionKey = new Map<string, number>();
+  selection.events.forEach((event, index) => {
+    const executionRef = cleanOptionalString(event.execution_ref);
+    if (executionRef !== null) {
+      latestEventByExecutionKey.set(
+        chatWorkExecutionJoinKey(event.item_id, executionRef),
+        index,
+      );
+    }
+  });
+  for (const summary of buildChatWorkExecutionSummaries(selection)) {
+    const latestIndex = latestEventByExecutionKey.get(
+      chatWorkExecutionJoinKey(summary.itemId, summary.executionRef),
+    );
+    if (latestIndex !== undefined) {
+      views[latestIndex]!.workerExecution = summary;
+    }
+  }
+  return views;
 }
 
 export interface ChatWorkBacklogItemView {
@@ -630,7 +1567,7 @@ export interface ChatWorkLivenessOptions {
 
 function isLiveChatWorkWorkerPresence(
   presence: ChatWorkPresence,
-  item: ChatWorkItem,
+  item: Pick<ChatWorkItem, 'status' | 'current_execution_ref'>,
   nowMs: number,
 ): boolean {
   if (item.status !== 'doing' || item.current_execution_ref === null) {
@@ -839,7 +1776,7 @@ export function buildChatWorkLivenessIndex(
   options: ChatWorkLivenessOptions,
 ): Map<string, ChatWorkLiveness> {
   const workByKey = new Map<string, ChatWorkCandidate>();
-  for (const work of chatWorkCandidates(chatWork)) {
+  for (const work of mergeChatWorkCandidatesByIdentity(chatWork)) {
     const key = formatWorkspaceChatIdentityKey(work.identity);
     if (key !== null && !workByKey.has(key)) {
       workByKey.set(key, work);

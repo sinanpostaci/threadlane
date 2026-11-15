@@ -1,6 +1,7 @@
 import { expect, test, type Locator, type Page } from '@playwright/test';
 
 import {
+  advanceWorkspaceGeneratedAtFixture,
   appendChatWorkEventFixture,
   backlogButton,
   BETA_CHAT_ONLY_SENTINEL,
@@ -9,7 +10,9 @@ import {
   buildHistoricalFailureWorkspaceSnapshot,
   buildMinimalChatWorkspaceSnapshot,
   buildMinimalChatWorkspaceSnapshotWithMalformedWork,
+  buildMinimalChatWorkspaceSnapshotWithoutWorkerExecutions,
   buildPendingAcceptanceWorkspaceSnapshot,
+  buildWorkerMetadataWorkspaceSnapshot,
   CHAT_ALPHA_IDENTITY,
   CHAT_BETA_SAME_PROJECT_IDENTITY,
   CHAT_GAMMA_IDENTITY,
@@ -18,6 +21,7 @@ import {
   closeBacklogWithEscape,
   createBacklogEvent,
   createBacklogWorkerPresence,
+  createWorkerExecution,
   EXTERNAL_RESOLUTION_FULL_SUMMARY,
   EXTERNAL_RESOLUTION_UNRELATED_QUESTION,
   expectNoHorizontalOverflow,
@@ -32,23 +36,48 @@ import {
   FOUR_PART_SOURCE_ONLY_IDENTITY,
   FOUR_PART_SOURCE_ONLY_SENTINEL,
   getChatWorkFixture,
+  getChatWorkWorkerExecutionsFixture,
   installWorkspaceTauriFixture,
+  MINIMAL_CHAT_ACCEPTED_COMPLETED_EVENT_TITLE,
+  MINIMAL_CHAT_ACCEPTED_COMPLETION_NOTE,
+  MINIMAL_CHAT_ACCEPTED_TITLE,
+  MINIMAL_CHAT_ALPHA_ACCEPTED_EXECUTION_REF,
+  MINIMAL_CHAT_ALPHA_CANCELLED_EXECUTION_REF,
+  MINIMAL_CHAT_ALPHA_CANCELLED_PREVIOUS_EXECUTION_REF,
+  MINIMAL_CHAT_ALPHA_CHECKING_EXECUTION_REF,
+  MINIMAL_CHAT_ALPHA_CHECKING_ITEM_ID,
   MINIMAL_CHAT_ALPHA_DOING_ITEM_ID,
+  MINIMAL_CHAT_ALPHA_FAILED_EXECUTION_REF,
+  MINIMAL_CHAT_ALPHA_LIVE_EXECUTION_REF,
+  MINIMAL_CHAT_ALPHA_PREPARING_EXECUTION_REF,
+  MINIMAL_CHAT_ALPHA_UNKNOWN_EXECUTION_REF,
   MINIMAL_CHAT_APPENDED_EVENT_TITLE,
   MINIMAL_CHAT_AUTHORED_LANGUAGE_TITLE,
   MINIMAL_CHAT_BETA_BACKLOG_SENTINEL,
+  MINIMAL_CHAT_BETA_WORKER_COMPLETED_EVENT_TITLE,
+  MINIMAL_CHAT_BETA_WORKER_EXECUTION_REF,
+  MINIMAL_CHAT_BETA_WORKER_TITLE,
   MINIMAL_CHAT_BLOCKED_REASON,
   MINIMAL_CHAT_BLOCKED_TITLE,
+  MINIMAL_CHAT_CANCELLED_EVENT_TITLE,
+  MINIMAL_CHAT_CANCELLED_PREVIOUS_EVENT_TITLE,
+  MINIMAL_CHAT_CANCELLED_TITLE,
+  MINIMAL_CHAT_CHECKING_EVENT_TITLE,
+  MINIMAL_CHAT_CHECKING_TITLE,
   MINIMAL_CHAT_COWORKER_DOING_TITLE,
+  MINIMAL_CHAT_DISPATCH_EVENT_TITLE,
   MINIMAL_CHAT_DOING_TITLE,
   MINIMAL_CHAT_DONE_TITLE,
   MINIMAL_CHAT_FAILED_TITLE,
   MINIMAL_CHAT_GAMMA_BACKLOG_SENTINEL,
   MINIMAL_CHAT_LEGACY_MESSAGE_SENTINEL,
+  MINIMAL_CHAT_LIVE_PROGRESS_EVENT_TITLE,
   MINIMAL_CHAT_MALFORMED_WORK_SENTINEL,
   MINIMAL_CHAT_PREPARING_TITLE,
   MINIMAL_CHAT_READING_ANCHOR_TITLE,
   MINIMAL_CHAT_TODO_TITLE,
+  MINIMAL_CHAT_UNKNOWN_EVENT_TITLE,
+  MINIMAL_CHAT_UNKNOWN_TITLE,
   MINIMAL_CHAT_WRONG_SCOPE_WORK_SENTINEL,
   openBacklog,
   resolveBacklogItemRow,
@@ -61,6 +90,8 @@ import {
   triggerWorkspaceRefresh,
   updateChatWorkFixture,
   updateChatWorkPresenceFixture,
+  updateChatWorkWorkerExecutionFixture,
+  updateChatWorkWorkerExecutionsFixture,
   updateNativeActivityFixture,
   workspaceSection,
   WRONG_SCOPE_QUARANTINE_SENTINEL,
@@ -70,6 +101,7 @@ import {
   WORKSPACE_CHAT_ARCHIVE_STORAGE_KEY,
   WORKSPACE_SAMPLE_STALE_THRESHOLD_MS,
   workspaceChatIdentitiesEqual,
+  type WorkspaceSnapshot,
 } from '../src/workspace-contract.ts';
 
 // The minimal chat contract replaces ordinary Messages/Jobs/Activity tabs with
@@ -94,10 +126,13 @@ function minimalAppearanceStorage(theme: 'light' | 'dark'): string {
 async function installMinimal(
   page: Page,
   viewport: { width: number; height: number } = { width: 1040, height: 760 },
-  options: { appearanceTheme?: 'light' | 'dark' } = {},
+  options: {
+    appearanceTheme?: 'light' | 'dark';
+    workspaceSnapshot?: WorkspaceSnapshot;
+  } = {},
 ) {
   const controller = await installWorkspaceTauriFixture(page, {
-    workspaceSnapshot: buildMinimalChatWorkspaceSnapshot(),
+    workspaceSnapshot: options.workspaceSnapshot ?? buildMinimalChatWorkspaceSnapshot(),
     ...(options.appearanceTheme
       ? {
           initialLocalStorage: {
@@ -113,6 +148,22 @@ async function installMinimal(
   await expect(page.locator('#app .tl-app-shell, #app .tl-app').first()).toBeVisible();
   // The workspace independently orders chats, so Alpha is not guaranteed to be
   // selected merely because it appears first in the fixture chat list.
+  await selectChat(page, 'Workspace UI Contract');
+  await expect(chatHeader(page, 'Workspace UI Contract')).toBeVisible();
+  await page.setViewportSize(viewport);
+  return controller;
+}
+
+async function installWorkerMetadata(
+  page: Page,
+  viewport: { width: number; height: number } = { width: 1040, height: 760 },
+) {
+  const controller = await installWorkspaceTauriFixture(page, {
+    workspaceSnapshot: buildWorkerMetadataWorkspaceSnapshot(),
+  });
+  await page.setViewportSize({ width: 1040, height: 760 });
+  await page.goto('/');
+  await expect(page.locator('#app .tl-app-shell, #app .tl-app').first()).toBeVisible();
   await selectChat(page, 'Workspace UI Contract');
   await expect(chatHeader(page, 'Workspace UI Contract')).toBeVisible();
   await page.setViewportSize(viewport);
@@ -465,6 +516,187 @@ async function expectNoVisibleWorking(scope: Locator): Promise<void> {
         .evaluateAll((nodes) => nodes.filter((node) => node.checkVisibility()).length),
     )
     .toBe(0);
+}
+
+function workerExecutionFooter(eventRow: Locator, executionRef: string): Locator {
+  // Anchor to the exact expected event row. A surface-wide lookup could pass
+  // while the footer is attached to an older event or duplicated elsewhere.
+  return eventRow.locator(
+    `[data-worker-execution-summary="${executionRef}"]`,
+  );
+}
+
+async function expectSingleWorkerExecutionFooter(
+  eventRow: Locator,
+  executionRef: string,
+  context: string,
+): Promise<Locator> {
+  const footer = workerExecutionFooter(eventRow, executionRef);
+  await expect(
+    footer,
+    `${context}: expected exactly one execution footer under the latest event row`,
+  ).toHaveCount(1);
+  await expect(footer).toBeVisible();
+  return footer;
+}
+
+async function expectNoWorkerExecutionFooter(
+  eventRow: Locator,
+  executionRef: string,
+  context: string,
+): Promise<void> {
+  await expect(
+    workerExecutionFooter(eventRow, executionRef),
+    `${context}: an earlier event for the same execution must not carry the footer`,
+  ).toHaveCount(0);
+}
+
+function resolveAllStreamEventRows(page: Page, title: string): Locator {
+  // Two distinct attempts can share display text. The event-row list keeps
+  // earlier-placement assertions anchored to every exact row, not only the first.
+  return streamScroller(page)
+    .locator('[data-chat-event-id]')
+    .filter({ hasText: title });
+}
+
+async function expectWorkerFooterAtLatestEvent(
+  page: Page,
+  latestTitle: string,
+  earlierTitles: readonly string[],
+  executionRef: string,
+): Promise<Locator> {
+  const latestRow = await resolveStreamEventRow(page, latestTitle);
+  await expect(latestRow).toBeVisible();
+  for (const title of earlierTitles) {
+    const earlierRow = await resolveStreamEventRow(page, title);
+    await expect(earlierRow).toBeVisible();
+    await expectNoWorkerExecutionFooter(earlierRow, executionRef, latestTitle);
+  }
+  const footer = await expectSingleWorkerExecutionFooter(
+    latestRow,
+    executionRef,
+    latestTitle,
+  );
+  await expect(
+    workspaceSection(page).locator(
+      `[data-worker-execution-summary="${executionRef}"]`,
+    ),
+    `${latestTitle}: the selected chat must expose one matching footer in total`,
+  ).toHaveCount(1);
+  return footer;
+}
+
+async function readWorkerFooterStatus(footer: Locator): Promise<string | null> {
+  return footer.getAttribute('data-worker-status');
+}
+
+async function expectWorkerFooterStatus(
+  footer: Locator,
+  expectedStatus: string,
+  expectedLabel: string,
+): Promise<string> {
+  await expect(footer).toHaveCount(1);
+  await expect(footer).toBeVisible();
+  await expect(footer).toHaveAttribute('data-worker-status', expectedStatus);
+  const status = await readWorkerFooterStatus(footer);
+  expect(status, 'Worker execution footer must expose its exact status').toBe(
+    expectedStatus,
+  );
+  const statusLabel = footer.locator('[data-worker-execution-status]');
+  await expect(statusLabel).toHaveCount(1);
+  await expect(statusLabel).toBeVisible();
+  await expect(statusLabel).toHaveText(expectedLabel);
+  expect((await footer.innerText()).trim().length).toBeGreaterThan(0);
+  return status ?? '';
+}
+
+type WorkerFooterDurationExpectation =
+  | { readonly kind: 'final' | 'elapsed'; readonly text: RegExp }
+  | null;
+
+interface WorkerFooterExpectation {
+  readonly brand: 'gemini' | 'openai' | 'generic';
+  readonly model: RegExp | null;
+  readonly effort: RegExp | null;
+  /** Omit to leave duration unasserted; null requires the duration to be absent. */
+  readonly duration?: WorkerFooterDurationExpectation;
+  readonly status: string;
+  readonly label: string;
+}
+
+async function expectWorkerFooterMetadata(
+  footer: Locator,
+  expected: WorkerFooterExpectation,
+): Promise<string> {
+  const brand = footer.locator(`[data-brand="${expected.brand}"]`);
+  await expect(brand).toHaveCount(1);
+  await expect(brand).toBeVisible();
+
+  const model = footer.locator('[data-worker-execution-model="true"]');
+  if (expected.model === null) {
+    await expect(model).toHaveCount(0);
+  } else {
+    await expect(model).toHaveCount(1);
+    await expect(model).toBeVisible();
+    expect((await model.innerText()).trim()).toMatch(expected.model);
+  }
+
+  const effort = footer.locator('[data-worker-execution-effort="true"]');
+  if (expected.effort === null) {
+    await expect(effort).toHaveCount(0);
+  } else {
+    await expect(effort).toHaveCount(1);
+    await expect(effort).toBeVisible();
+    expect((await effort.innerText()).trim()).toMatch(expected.effort);
+  }
+
+  const status = await expectWorkerFooterStatus(
+    footer,
+    expected.status,
+    expected.label,
+  );
+
+  const duration = footer.locator('[data-worker-execution-duration]');
+  if (expected.duration === undefined) {
+    return status;
+  }
+  if (expected.duration === null) {
+    await expect(duration).toHaveCount(0);
+    return status;
+  }
+  await expect(duration).toHaveCount(1);
+  await expect(duration).toBeVisible();
+  await expect(duration).toHaveAttribute(
+    'data-worker-execution-duration',
+    expected.duration.kind,
+  );
+  expect((await duration.innerText()).replace(/\s+/g, ' ').trim()).toMatch(
+    expected.duration.text,
+  );
+  return status;
+}
+
+function elapsedSecondsFromWorkerFooter(text: string): number | null {
+  const clockMatch = text.match(/\b(\d+):(\d{2})\b/);
+  if (clockMatch) {
+    return Number(clockMatch[1]) * 60 + Number(clockMatch[2]);
+  }
+  const secondsMatch = text.match(/\b(\d+(?:\.\d+)?)\s*s\b/i);
+  return secondsMatch ? Number(secondsMatch[1]) : null;
+}
+
+async function openDesktopBuildRow(page: Page): Promise<Locator> {
+  const settings = page.locator('section[aria-label="Settings"]').first();
+  await expect(settings).toBeVisible();
+  // The product renders the static compile-time identity as one named group.
+  // There is no runtime build-info command or window override to seed.
+  const row = settings.getByRole('group', {
+    name: 'Desktop build',
+    exact: true,
+  });
+  await expect(row).toHaveCount(1);
+  await expect(row).toBeVisible();
+  return row;
 }
 
 async function expectNoNeedsYouInScope(scope: Locator): Promise<void> {
@@ -2102,6 +2334,1158 @@ test.describe('Workspace identity isolation, navigation, and archive usability',
       resolveStreamEventRow(page, MINIMAL_CHAT_READING_ANCHOR_TITLE),
     ).toBeVisible();
     await expect(backlogButton(page)).toBeVisible();
+  });
+});
+
+test.describe('Compact Worker execution metadata footer', () => {
+  test('keeps the fresh Working badge, Coworker/Worker live strip, and elapsed timer, then drops liveness for expired and stale samples', async ({
+    page,
+  }) => {
+    const liveSnapshot = updateNativeActivityFixture(
+      buildWorkerMetadataWorkspaceSnapshot(),
+      CHAT_ALPHA_IDENTITY,
+      'working',
+    );
+    const controller = await installWorkspaceTauriFixture(page, {
+      workspaceSnapshot: liveSnapshot,
+    });
+    await page.setViewportSize({ width: 1040, height: 760 });
+    await page.goto('/');
+    await selectChat(page, 'Workspace UI Contract');
+    await expect(chatHeader(page, 'Workspace UI Contract')).toBeVisible();
+
+    const workspace = workspaceSection(page);
+    const header = chatHeader(page, 'Workspace UI Contract');
+    await expect(header.getByText(/^Working$/i).first()).toBeVisible();
+    await expectLiveAgentWorking(workspace, 'Coworker');
+    await expectLiveAgentWorking(workspace, 'Worker');
+
+    const liveFooter = await expectWorkerFooterAtLatestEvent(
+      page,
+      MINIMAL_CHAT_LIVE_PROGRESS_EVENT_TITLE,
+      [
+        `Preparing Worker execution for ${MINIMAL_CHAT_DOING_TITLE}`,
+        `Worker execution attached for ${MINIMAL_CHAT_DOING_TITLE}`,
+      ],
+      MINIMAL_CHAT_ALPHA_LIVE_EXECUTION_REF,
+    );
+    // Exact current execution presence is the only proof that the durable
+    // dispatch metadata is Working.
+    await expectWorkerFooterMetadata(liveFooter, {
+      brand: 'gemini',
+      model: /^Argon$/i,
+      effort: /^High$/i,
+      status: 'working',
+      label: 'Working',
+      duration: {
+        kind: 'elapsed',
+        text: /^Elapsed\s+\d+(?:\.\d+)?s$/i,
+      },
+    });
+    const initialElapsed = elapsedSecondsFromWorkerFooter(await liveFooter.innerText());
+    expect(initialElapsed).not.toBeNull();
+    expect(initialElapsed!).toBeGreaterThanOrEqual(14);
+
+    // The timer comes from the actual start timestamp and keeps advancing while
+    // the original sample is still inside its freshness window. Advance the
+    // browser clock only; no new snapshot or sample is injected.
+    await page.clock.setFixedTime(FIXTURE_BASE_NOW_MS + 3_000);
+    await expectWorkerFooterStatus(liveFooter, 'working', 'Working');
+    await expect(header.getByText(/^Working$/i).first()).toBeVisible();
+    await expectLiveAgentWorking(workspace, 'Worker');
+    await expectLiveAgentWorking(workspace, 'Coworker');
+    await expect
+      .poll(
+        async () =>
+          elapsedSecondsFromWorkerFooter(await liveFooter.innerText()) ?? -1,
+        { timeout: 5_000 },
+      )
+      .toBeGreaterThanOrEqual(initialElapsed! + 2);
+
+    // The original presence deadline is sampled_at_ms + max_sample_age_ms, so
+    // advancing the same browser clock past it expires the only proof without
+    // injecting any fresh snapshot. The footer keeps its durable item/execution
+    // scope but renders Status unavailable and no ticking elapsed timer.
+    const expiredClockMs =
+      FIXTURE_BASE_NOW_MS + WORKSPACE_SAMPLE_STALE_THRESHOLD_MS + 1_000;
+    await page.clock.setFixedTime(expiredClockMs);
+    await expect
+      .poll(
+        async () => readWorkerFooterStatus(liveFooter),
+        { timeout: 5_000 },
+      )
+      .toBe('unavailable');
+    await expect(liveFooter).toBeVisible();
+    await expectWorkerFooterMetadata(liveFooter, {
+      brand: 'gemini',
+      model: /^Argon$/i,
+      effort: /^High$/i,
+      status: 'unavailable',
+      label: 'Status unavailable',
+      duration: null,
+    });
+    await expectNoVisibleWorking(workspace);
+    await expectNoLiveAgentWorking(workspace, 'Worker');
+    await expectNoLiveAgentWorking(workspace, 'Coworker');
+
+    const stalePresence = createBacklogWorkerPresence({
+      itemId: MINIMAL_CHAT_ALPHA_DOING_ITEM_ID,
+      executionRef: MINIMAL_CHAT_ALPHA_LIVE_EXECUTION_REF,
+      availability: 'live',
+      freshness: 'stale',
+      live: false,
+      sampledAtMs: FIXTURE_BASE_NOW_MS - 10_000,
+      sampleAgeMs: 10_000,
+      maxSampleAgeMs: 5_000,
+      expiresAtMs: FIXTURE_BASE_NOW_MS - 5_000,
+    });
+    const staleSnapshot = updateChatWorkPresenceFixture(
+      updateNativeActivityFixture(
+        advanceWorkspaceGeneratedAtFixture(liveSnapshot, expiredClockMs),
+        CHAT_ALPHA_IDENTITY,
+        'idle',
+      ),
+      CHAT_ALPHA_IDENTITY,
+      [stalePresence],
+    );
+    await controller.setWorkspaceSnapshot(staleSnapshot);
+    await triggerWorkspaceRefresh(page);
+
+    await expect(liveFooter).toBeVisible();
+    await expectWorkerFooterMetadata(liveFooter, {
+      brand: 'gemini',
+      model: /^Argon$/i,
+      effort: /^High$/i,
+      status: 'unavailable',
+      label: 'Status unavailable',
+      duration: null,
+    });
+    await expect
+      .poll(async () => /working/i.test(await liveFooter.innerText()))
+      .toBe(false);
+    await expectNoVisibleWorking(workspace);
+    await expectNoLiveAgentWorking(workspace, 'Worker');
+    await expectNoNeedsYou(page);
+  });
+
+  test('treats dispatch without live presence as non-Working and keeps failure, cancellation, and unknown distinct without NeedsYou', async ({
+    page,
+  }) => {
+    const controller = await installWorkerMetadata(page);
+    const workspace = workspaceSection(page);
+
+    const dispatchFooter = await expectWorkerFooterAtLatestEvent(
+      page,
+      MINIMAL_CHAT_DISPATCH_EVENT_TITLE,
+      [`Preparing Worker execution for ${MINIMAL_CHAT_PREPARING_TITLE}`],
+      MINIMAL_CHAT_ALPHA_PREPARING_EXECUTION_REF,
+    );
+    const dispatchStatus = await expectWorkerFooterMetadata(dispatchFooter, {
+      brand: 'gemini',
+      model: /^Argon$/i,
+      effort: /^High$/i,
+      status: 'claimed',
+      label: 'Claimed',
+      duration: null,
+    });
+    expect(dispatchStatus).toBe('claimed');
+    await expect
+      .poll(async () => /working/i.test(await dispatchFooter.innerText()))
+      .toBe(false);
+
+    // The only live Worker row belongs to the fresh Doing execution, never to
+    // the dispatch receipt above.
+    const liveWorkerRows = liveAgentList(workspace)
+      .locator('li[data-agent-role="worker"]')
+      .filter({ hasText: MINIMAL_CHAT_DOING_TITLE });
+    await expect(liveWorkerRows).toHaveCount(1);
+    await expect(
+      liveAgentList(workspace)
+        .locator('li[data-agent-role="worker"]')
+        .filter({ hasText: MINIMAL_CHAT_PREPARING_TITLE }),
+    ).toHaveCount(0);
+
+    // A running execution record without live presence is still dispatch-only:
+    // it renders Dispatched, never Working, and carries no fabricated timer.
+    const dispatchOnlyBase = await controller.getWorkspaceSnapshot();
+    expect(dispatchOnlyBase).not.toBeNull();
+    const dispatchOnlySnapshot = updateChatWorkWorkerExecutionFixture(
+      dispatchOnlyBase!,
+      CHAT_ALPHA_IDENTITY,
+      MINIMAL_CHAT_ALPHA_PREPARING_EXECUTION_REF,
+      { worker_status: 'running', outcome: null, acceptance: null },
+    );
+    await controller.setWorkspaceSnapshot(dispatchOnlySnapshot);
+    await triggerWorkspaceRefresh(page);
+    const dispatchedFooter = await expectWorkerFooterAtLatestEvent(
+      page,
+      MINIMAL_CHAT_DISPATCH_EVENT_TITLE,
+      [`Preparing Worker execution for ${MINIMAL_CHAT_PREPARING_TITLE}`],
+      MINIMAL_CHAT_ALPHA_PREPARING_EXECUTION_REF,
+    );
+    const dispatchedStatus = await expectWorkerFooterMetadata(dispatchedFooter, {
+      brand: 'gemini',
+      model: /^Argon$/i,
+      effort: /^High$/i,
+      status: 'dispatched',
+      label: 'Dispatched',
+      duration: null,
+    });
+    await expect
+      .poll(async () => /working/i.test(await dispatchedFooter.innerText()))
+      .toBe(false);
+
+    const failedFooter = await expectWorkerFooterAtLatestEvent(
+      page,
+      `Worker result recorded: Failed for ${MINIMAL_CHAT_FAILED_TITLE}`,
+      [`Preparing Worker execution for ${MINIMAL_CHAT_FAILED_TITLE}`],
+      MINIMAL_CHAT_ALPHA_FAILED_EXECUTION_REF,
+    );
+    const failedStatus = await expectWorkerFooterMetadata(failedFooter, {
+      brand: 'gemini',
+      model: /^Argon$/i,
+      effort: /^High$/i,
+      status: 'failed',
+      label: 'Failed',
+      duration: { kind: 'final', text: /^1s$/i },
+    });
+
+    const cancelledFooter = await expectWorkerFooterAtLatestEvent(
+      page,
+      MINIMAL_CHAT_CANCELLED_EVENT_TITLE,
+      [`Preparing Worker execution for ${MINIMAL_CHAT_CANCELLED_TITLE}`],
+      MINIMAL_CHAT_ALPHA_CANCELLED_EXECUTION_REF,
+    );
+    const cancelledStatus = await expectWorkerFooterMetadata(cancelledFooter, {
+      brand: 'gemini',
+      model: /^Argon$/i,
+      effort: /^High$/i,
+      status: 'cancelled',
+      label: 'Cancelled',
+      duration: { kind: 'final', text: /^10s$/i },
+    });
+
+    const unknownFooter = await expectWorkerFooterAtLatestEvent(
+      page,
+      MINIMAL_CHAT_UNKNOWN_EVENT_TITLE,
+      [`Preparing Worker execution for ${MINIMAL_CHAT_UNKNOWN_TITLE}`],
+      MINIMAL_CHAT_ALPHA_UNKNOWN_EXECUTION_REF,
+    );
+    const unknownStatus = await expectWorkerFooterMetadata(unknownFooter, {
+      brand: 'gemini',
+      model: /^Argon$/i,
+      effort: /^High$/i,
+      status: 'unknown',
+      label: 'Unknown',
+      duration: null,
+    });
+
+    expect(
+      new Set([
+        dispatchStatus,
+        dispatchedStatus,
+        failedStatus,
+        cancelledStatus,
+        unknownStatus,
+      ]).size,
+    ).toBe(5);
+    await expectNoNeedsYou(page);
+
+    const dialog = await openBacklog(page);
+    await expectCommittedBacklogStatus(dialog, MINIMAL_CHAT_FAILED_TITLE, 'blocked');
+    await expectCommittedBacklogStatus(dialog, MINIMAL_CHAT_CANCELLED_TITLE, 'blocked');
+    await expectCommittedBacklogStatus(dialog, MINIMAL_CHAT_UNKNOWN_TITLE, 'blocked');
+    await closeBacklogWithEscape(page);
+  });
+
+  test('shows technical success as Checking and only accepted guarded completion as Completed with the recorded duration and model', async ({
+    page,
+  }) => {
+    await installWorkerMetadata(page);
+    const workspace = workspaceSection(page);
+
+    const checkingRow = await resolveStreamEventRow(
+      page,
+      MINIMAL_CHAT_CHECKING_EVENT_TITLE,
+    );
+    const checkingFooter = await expectWorkerFooterAtLatestEvent(
+      page,
+      MINIMAL_CHAT_CHECKING_EVENT_TITLE,
+      [`Preparing Worker execution for ${MINIMAL_CHAT_CHECKING_TITLE}`],
+      MINIMAL_CHAT_ALPHA_CHECKING_EXECUTION_REF,
+    );
+    const checkingStatus = await expectWorkerFooterMetadata(checkingFooter, {
+      brand: 'gemini',
+      model: /^Argon$/i,
+      effort: /^High$/i,
+      status: 'checking',
+      label: 'Checking',
+      duration: { kind: 'final', text: /^55s$/i },
+    });
+    expect(checkingStatus).toBe('checking');
+
+    const acceptedRow = await resolveStreamEventRow(
+      page,
+      MINIMAL_CHAT_ACCEPTED_COMPLETED_EVENT_TITLE,
+    );
+    const acceptedFooter = await expectWorkerFooterAtLatestEvent(
+      page,
+      MINIMAL_CHAT_ACCEPTED_COMPLETED_EVENT_TITLE,
+      [
+        `Preparing Worker execution for ${MINIMAL_CHAT_ACCEPTED_TITLE}`,
+        `Worker result recorded: Awaiting check for ${MINIMAL_CHAT_ACCEPTED_TITLE}`,
+      ],
+      MINIMAL_CHAT_ALPHA_ACCEPTED_EXECUTION_REF,
+    );
+    const completedStatus = await expectWorkerFooterMetadata(acceptedFooter, {
+      brand: 'gemini',
+      model: /^Argon$/i,
+      effort: /^High$/i,
+      status: 'completed',
+      label: 'Completed',
+      duration: { kind: 'final', text: /^45s$/i },
+    });
+    expect(completedStatus).toBe('completed');
+    await expect(
+      acceptedRow.getByText(MINIMAL_CHAT_ACCEPTED_COMPLETION_NOTE, { exact: true }),
+    ).toHaveCount(1);
+
+    const dialog = await openBacklog(page);
+    await expectCommittedBacklogStatus(dialog, MINIMAL_CHAT_CHECKING_TITLE, 'doing');
+    await expectCommittedBacklogStatus(dialog, MINIMAL_CHAT_ACCEPTED_TITLE, 'done');
+    const acceptedDrawerItem = await resolveBacklogItemRow(
+      dialog,
+      MINIMAL_CHAT_ACCEPTED_TITLE,
+    );
+    await acceptedDrawerItem.locator('summary').first().click();
+    await expect(
+      dialog.getByText(MINIMAL_CHAT_ACCEPTED_COMPLETION_NOTE, { exact: true }),
+    ).toBeVisible();
+    await closeBacklogWithEscape(page);
+    await expectNoNeedsYou(page);
+
+    // The accepted Done item stays terminal: the Checking attempt is a separate
+    // item and is not rendered as a Done or accepted result.
+    await expect(
+      checkingRow.getByText(MINIMAL_CHAT_ACCEPTED_COMPLETION_NOTE, { exact: true }),
+    ).toHaveCount(0);
+  });
+
+  test('defaults old payloads to no execution summaries and omits unproven model and timing metadata', async ({
+    page,
+  }) => {
+    const controller = await installWorkspaceTauriFixture(page, {
+      workspaceSnapshot: buildMinimalChatWorkspaceSnapshotWithoutWorkerExecutions(),
+    });
+    await page.setViewportSize({ width: 1040, height: 760 });
+    await page.goto('/');
+    await selectChat(page, 'Workspace UI Contract');
+    await expect(chatHeader(page, 'Workspace UI Contract')).toBeVisible();
+
+    const workspace = workspaceSection(page);
+    await expect(
+      resolveStreamEventRow(page, MINIMAL_CHAT_READING_ANCHOR_TITLE),
+    ).toBeVisible();
+    await expect(workspace.locator('[data-worker-execution-summary]')).toHaveCount(0);
+    // Presence, not the additive metadata array, remains the liveness proof.
+    await expectLiveAgentWorking(workspace, 'Worker');
+    await expectNoNeedsYou(page);
+
+    const missingMetadataSnapshot = buildWorkerMetadataWorkspaceSnapshot();
+    const withoutTelemetry = updateChatWorkWorkerExecutionFixture(
+      missingMetadataSnapshot,
+      CHAT_ALPHA_IDENTITY,
+      MINIMAL_CHAT_ALPHA_ACCEPTED_EXECUTION_REF,
+      {
+        provider: null,
+        requested_model: null,
+        observed_model: null,
+        requested_effort: null,
+        observed_effort: null,
+        started_at_ms: null,
+        finished_at_ms: null,
+        duration_ms: null,
+      },
+    );
+    await controller.setWorkspaceSnapshot(withoutTelemetry);
+    await triggerWorkspaceRefresh(page);
+    await selectChat(page, 'Workspace UI Contract');
+
+    const acceptedFooter = await expectWorkerFooterAtLatestEvent(
+      page,
+      MINIMAL_CHAT_ACCEPTED_COMPLETED_EVENT_TITLE,
+      [
+        `Preparing Worker execution for ${MINIMAL_CHAT_ACCEPTED_TITLE}`,
+        `Worker result recorded: Awaiting check for ${MINIMAL_CHAT_ACCEPTED_TITLE}`,
+      ],
+      MINIMAL_CHAT_ALPHA_ACCEPTED_EXECUTION_REF,
+    );
+    await expectWorkerFooterMetadata(acceptedFooter, {
+      brand: 'generic',
+      model: null,
+      effort: null,
+      status: 'completed',
+      label: 'Completed',
+      duration: null,
+    });
+    await expect
+      .poll(async () => /argon/i.test(await acceptedFooter.innerText()))
+      .toBe(false);
+    await expect
+      .poll(async () =>
+        /\b45(?:\.0)?s\b/.test(
+          (await acceptedFooter.innerText()).replace(/\s+/g, ' '),
+        ),
+      )
+      .toBe(false);
+    await expectNoNeedsYou(page);
+  });
+
+  test('isolates exact attempts and chats, and deduplicates repeated snapshots, events, and execution records', async ({
+    page,
+  }) => {
+    const controller = await installWorkerMetadata(page);
+    const baseSnapshot = await controller.getWorkspaceSnapshot();
+    expect(baseSnapshot).not.toBeNull();
+    const workspace = workspaceSection(page);
+
+    const executions = getChatWorkWorkerExecutionsFixture(
+      baseSnapshot!,
+      CHAT_ALPHA_IDENTITY,
+    );
+    expect(executions.length).toBeGreaterThan(0);
+    for (const execution of executions) {
+      expect(execution.session_binding_id).not.toBe(
+        CHAT_ALPHA_IDENTITY.binding_id,
+      );
+      expect(execution.session_binding_id.trim().length).toBeGreaterThan(0);
+      expect(execution.item_id.trim().length).toBeGreaterThan(0);
+      expect(execution.run_id.trim().length).toBeGreaterThan(0);
+      expect(execution.worker_id.trim().length).toBeGreaterThan(0);
+    }
+    expect(
+      new Set(executions.map((execution) => execution.session_binding_id)).size,
+    ).toBe(executions.length);
+    const betaExecutions = getChatWorkWorkerExecutionsFixture(
+      baseSnapshot!,
+      CHAT_BETA_SAME_PROJECT_IDENTITY,
+    );
+    expect(betaExecutions).toHaveLength(1);
+    expect(betaExecutions[0]!.execution_ref).toBe(
+      MINIMAL_CHAT_BETA_WORKER_EXECUTION_REF,
+    );
+    expect(betaExecutions[0]!.session_binding_id).not.toBe(
+      CHAT_BETA_SAME_PROJECT_IDENTITY.binding_id,
+    );
+    const alphaSharedRefExecution = executions.find(
+      (execution) =>
+        execution.execution_ref === MINIMAL_CHAT_BETA_WORKER_EXECUTION_REF,
+    );
+    expect(alphaSharedRefExecution).toBeDefined();
+    expect(betaExecutions[0]!.session_binding_id).not.toBe(
+      alphaSharedRefExecution!.session_binding_id,
+    );
+    expect(betaExecutions[0]!.item_id).not.toBe(
+      alphaSharedRefExecution!.item_id,
+    );
+    expect(betaExecutions[0]!.run_id).not.toBe(alphaSharedRefExecution!.run_id);
+    expect(betaExecutions[0]!.worker_id).not.toBe(
+      alphaSharedRefExecution!.worker_id,
+    );
+
+    const previousFooter = await expectWorkerFooterAtLatestEvent(
+      page,
+      MINIMAL_CHAT_CANCELLED_PREVIOUS_EVENT_TITLE,
+      [`Preparing Worker execution for ${MINIMAL_CHAT_CANCELLED_TITLE}`],
+      MINIMAL_CHAT_ALPHA_CANCELLED_PREVIOUS_EXECUTION_REF,
+    );
+    const previousStatus = await expectWorkerFooterMetadata(previousFooter, {
+      brand: 'gemini',
+      model: /^Argon$/i,
+      effort: /^High$/i,
+      status: 'failed',
+      label: 'Failed',
+      duration: { kind: 'final', text: /^5s$/i },
+    });
+
+    const currentFooter = await expectWorkerFooterAtLatestEvent(
+      page,
+      MINIMAL_CHAT_CANCELLED_EVENT_TITLE,
+      [`Preparing Worker execution for ${MINIMAL_CHAT_CANCELLED_TITLE}`],
+      MINIMAL_CHAT_ALPHA_CANCELLED_EXECUTION_REF,
+    );
+    const currentStatus = await expectWorkerFooterMetadata(currentFooter, {
+      brand: 'gemini',
+      model: /^Argon$/i,
+      effort: /^High$/i,
+      status: 'cancelled',
+      label: 'Cancelled',
+      duration: { kind: 'final', text: /^10s$/i },
+    });
+    expect(previousStatus).not.toBe(currentStatus);
+
+    // The two cancellation attempts share the same preparation title. Every
+    // earlier row for the current execution must stay footer-free.
+    const sharedPreparationRows = resolveAllStreamEventRows(
+      page,
+      `Preparing Worker execution for ${MINIMAL_CHAT_CANCELLED_TITLE}`,
+    );
+    await expect(sharedPreparationRows).toHaveCount(2);
+    for (let index = 0; index < 2; index += 1) {
+      await expectNoWorkerExecutionFooter(
+        sharedPreparationRows.nth(index),
+        MINIMAL_CHAT_ALPHA_CANCELLED_EXECUTION_REF,
+        'shared cancellation preparation title',
+      );
+    }
+
+    const acceptedEarlierTitles = [
+      `Preparing Worker execution for ${MINIMAL_CHAT_ACCEPTED_TITLE}`,
+      `Worker result recorded: Awaiting check for ${MINIMAL_CHAT_ACCEPTED_TITLE}`,
+    ];
+    const acceptedFooter = await expectWorkerFooterAtLatestEvent(
+      page,
+      MINIMAL_CHAT_ACCEPTED_COMPLETED_EVENT_TITLE,
+      acceptedEarlierTitles,
+      MINIMAL_CHAT_ALPHA_ACCEPTED_EXECUTION_REF,
+    );
+    await expectWorkerFooterMetadata(acceptedFooter, {
+      brand: 'gemini',
+      model: /^Argon$/i,
+      effort: /^High$/i,
+      status: 'completed',
+      label: 'Completed',
+      duration: { kind: 'final', text: /^45s$/i },
+    });
+
+    // The sibling chat reuses the same execution reference with different
+    // runtime metadata. The selected Alpha footer must stay Alpha-scoped.
+    await expect(workspace.getByText(MINIMAL_CHAT_BETA_WORKER_TITLE)).toHaveCount(0);
+    await expect(
+      workspace.getByText(MINIMAL_CHAT_BETA_WORKER_COMPLETED_EVENT_TITLE),
+    ).toHaveCount(0);
+
+    await controller.setWorkspaceSnapshot(baseSnapshot!);
+    await triggerWorkspaceRefresh(page);
+    await controller.setWorkspaceSnapshot(baseSnapshot!);
+    await triggerWorkspaceRefresh(page);
+    await expect(
+      workspace.getByText(MINIMAL_CHAT_ACCEPTED_COMPLETED_EVENT_TITLE, { exact: true }),
+    ).toHaveCount(1);
+    const stableAcceptedFooter = await expectWorkerFooterAtLatestEvent(
+      page,
+      MINIMAL_CHAT_ACCEPTED_COMPLETED_EVENT_TITLE,
+      acceptedEarlierTitles,
+      MINIMAL_CHAT_ALPHA_ACCEPTED_EXECUTION_REF,
+    );
+    await expectWorkerFooterStatus(stableAcceptedFooter, 'completed', 'Completed');
+
+    const alphaWork = getChatWorkFixture(baseSnapshot!, CHAT_ALPHA_IDENTITY);
+    const acceptedEvent = alphaWork.events.find(
+      (event) => event.title === MINIMAL_CHAT_ACCEPTED_COMPLETED_EVENT_TITLE,
+    );
+    expect(acceptedEvent).toBeDefined();
+    const duplicateEventSnapshot = appendChatWorkEventFixture(
+      baseSnapshot!,
+      CHAT_ALPHA_IDENTITY,
+      {
+        ...acceptedEvent!,
+        note: 'Duplicate event ID payload must not add a second footer.',
+      },
+    );
+    await controller.setWorkspaceSnapshot(duplicateEventSnapshot);
+    await triggerWorkspaceRefresh(page);
+    await expect(
+      workspace.getByText(MINIMAL_CHAT_ACCEPTED_COMPLETED_EVENT_TITLE, { exact: true }),
+    ).toHaveCount(1);
+    const duplicateEventFooter = await expectWorkerFooterAtLatestEvent(
+      page,
+      MINIMAL_CHAT_ACCEPTED_COMPLETED_EVENT_TITLE,
+      acceptedEarlierTitles,
+      MINIMAL_CHAT_ALPHA_ACCEPTED_EXECUTION_REF,
+    );
+    await expectWorkerFooterStatus(duplicateEventFooter, 'completed', 'Completed');
+
+    const acceptedExecution = executions.find(
+      (execution) =>
+        execution.execution_ref === MINIMAL_CHAT_ALPHA_ACCEPTED_EXECUTION_REF,
+    );
+    expect(acceptedExecution).toBeDefined();
+    const duplicateExecutionSnapshot = updateChatWorkWorkerExecutionsFixture(
+      baseSnapshot!,
+      CHAT_ALPHA_IDENTITY,
+      [...executions, acceptedExecution!],
+    );
+    await controller.setWorkspaceSnapshot(duplicateExecutionSnapshot);
+    await triggerWorkspaceRefresh(page);
+    const duplicateExecutionFooter = await expectWorkerFooterAtLatestEvent(
+      page,
+      MINIMAL_CHAT_ACCEPTED_COMPLETED_EVENT_TITLE,
+      acceptedEarlierTitles,
+      MINIMAL_CHAT_ALPHA_ACCEPTED_EXECUTION_REF,
+    );
+    await expectWorkerFooterStatus(
+      duplicateExecutionFooter,
+      'completed',
+      'Completed',
+    );
+
+    await selectChat(page, 'Release Verification Gate');
+    const betaWorkspace = workspaceSection(page);
+    const betaFooter = await expectWorkerFooterAtLatestEvent(
+      page,
+      MINIMAL_CHAT_BETA_WORKER_COMPLETED_EVENT_TITLE,
+      [
+        `Preparing Worker execution for ${MINIMAL_CHAT_BETA_WORKER_TITLE}`,
+        `Worker result recorded: Awaiting check for ${MINIMAL_CHAT_BETA_WORKER_TITLE}`,
+      ],
+      MINIMAL_CHAT_BETA_WORKER_EXECUTION_REF,
+    );
+    await expectWorkerFooterMetadata(betaFooter, {
+      brand: 'openai',
+      model: /^GPT-5\.4$/i,
+      effort: /^High$/i,
+      status: 'completed',
+      label: 'Completed',
+      duration: { kind: 'final', text: /^12s$/i },
+    });
+    await expect(betaWorkspace.getByText(MINIMAL_CHAT_ACCEPTED_TITLE)).toHaveCount(0);
+    await expect
+      .poll(async () =>
+        /\b45(?:\.0)?s\b/.test(
+          (await betaFooter.innerText()).replace(/\s+/g, ' '),
+        ),
+      )
+      .toBe(false);
+  });
+
+  test('quarantines conflicting Worker execution identities instead of transferring Completed metadata', async ({
+    page,
+  }) => {
+    const controller = await installWorkerMetadata(page);
+    const baseSnapshot = await controller.getWorkspaceSnapshot();
+    expect(baseSnapshot).not.toBeNull();
+    const workspace = workspaceSection(page);
+    const acceptedEarlierTitles = [
+      `Preparing Worker execution for ${MINIMAL_CHAT_ACCEPTED_TITLE}`,
+      `Worker result recorded: Awaiting check for ${MINIMAL_CHAT_ACCEPTED_TITLE}`,
+    ];
+
+    const acceptedFooter = await expectWorkerFooterAtLatestEvent(
+      page,
+      MINIMAL_CHAT_ACCEPTED_COMPLETED_EVENT_TITLE,
+      acceptedEarlierTitles,
+      MINIMAL_CHAT_ALPHA_ACCEPTED_EXECUTION_REF,
+    );
+    await expectWorkerFooterMetadata(acceptedFooter, {
+      brand: 'gemini',
+      model: /^Argon$/i,
+      effort: /^High$/i,
+      status: 'completed',
+      label: 'Completed',
+      duration: { kind: 'final', text: /^45s$/i },
+    });
+
+    const executions = getChatWorkWorkerExecutionsFixture(
+      baseSnapshot!,
+      CHAT_ALPHA_IDENTITY,
+    );
+    const acceptedExecution = executions.find(
+      (execution) =>
+        execution.execution_ref === MINIMAL_CHAT_ALPHA_ACCEPTED_EXECUTION_REF,
+    );
+    expect(acceptedExecution).toBeDefined();
+    const conflictingExecution = createWorkerExecution({
+      identity: CHAT_ALPHA_IDENTITY,
+      itemId: acceptedExecution!.item_id,
+      executionRef: acceptedExecution!.execution_ref,
+      approvalId: 'apr_conflicting_worker_identity',
+      taskId: acceptedExecution!.task_id,
+      sessionBindingId: acceptedExecution!.session_binding_id,
+      runId: acceptedExecution!.run_id,
+      workerId: acceptedExecution!.worker_id,
+      provider: 'google',
+      requestedModel: 'gemini-4-argon-high',
+      observedModel: 'gemini-4-argon-high',
+      requestedEffort: 'high',
+      observedEffort: 'high',
+      workerStatus: 'completed',
+      startedAtMs: FIXTURE_BASE_NOW_MS - 70_000,
+      finishedAtMs: FIXTURE_BASE_NOW_MS - 20_000,
+      durationMs: 50_000,
+      outcome: 'success',
+      acceptance: 'accepted',
+    });
+    const conflictSnapshot = updateChatWorkWorkerExecutionsFixture(
+      baseSnapshot!,
+      CHAT_ALPHA_IDENTITY,
+      [...executions, conflictingExecution],
+    );
+    await controller.setWorkspaceSnapshot(conflictSnapshot);
+    await triggerWorkspaceRefresh(page);
+
+    // The same item/execution ref now carries contradicting immutable approval
+    // identity, so the whole group is quarantined: no Completed label, model,
+    // effort, or final duration may survive on the latest event row.
+    await expect(
+      workspace.locator(
+        `[data-worker-execution-summary="${MINIMAL_CHAT_ALPHA_ACCEPTED_EXECUTION_REF}"]`,
+      ),
+    ).toHaveCount(0);
+    await expect(
+      resolveStreamEventRow(page, MINIMAL_CHAT_ACCEPTED_COMPLETED_EVENT_TITLE),
+    ).toBeVisible();
+
+    // Unrelated exact executions remain rendered; the rejection is scoped to the
+    // conflicting identity group only.
+    const checkingFooter = await expectWorkerFooterAtLatestEvent(
+      page,
+      MINIMAL_CHAT_CHECKING_EVENT_TITLE,
+      [`Preparing Worker execution for ${MINIMAL_CHAT_CHECKING_TITLE}`],
+      MINIMAL_CHAT_ALPHA_CHECKING_EXECUTION_REF,
+    );
+    await expectWorkerFooterMetadata(checkingFooter, {
+      brand: 'gemini',
+      model: /^Argon$/i,
+      effort: /^High$/i,
+      status: 'checking',
+      label: 'Checking',
+      duration: { kind: 'final', text: /^55s$/i },
+    });
+    await expectNoNeedsYou(page);
+
+    const dialog = await openBacklog(page);
+    await expect(
+      dialog.getByText('2 worker execution records are outside this bounded window.', {
+        exact: true,
+      }),
+    ).toBeVisible();
+    await closeBacklogWithEscape(page);
+  });
+
+  test('quarantines a Worker identity conflict split across duplicate chat_work entries', async ({
+    page,
+  }) => {
+    const controller = await installWorkerMetadata(page);
+    const baseSnapshot = await controller.getWorkspaceSnapshot();
+    expect(baseSnapshot).not.toBeNull();
+    const workspace = workspaceSection(page);
+    const acceptedEarlierTitles = [
+      `Preparing Worker execution for ${MINIMAL_CHAT_ACCEPTED_TITLE}`,
+      `Worker result recorded: Awaiting check for ${MINIMAL_CHAT_ACCEPTED_TITLE}`,
+    ];
+    const acceptedFooter = await expectWorkerFooterAtLatestEvent(
+      page,
+      MINIMAL_CHAT_ACCEPTED_COMPLETED_EVENT_TITLE,
+      acceptedEarlierTitles,
+      MINIMAL_CHAT_ALPHA_ACCEPTED_EXECUTION_REF,
+    );
+    await expectWorkerFooterMetadata(acceptedFooter, {
+      brand: 'gemini',
+      model: /^Argon$/i,
+      effort: /^High$/i,
+      status: 'completed',
+      label: 'Completed',
+      duration: { kind: 'final', text: /^45s$/i },
+    });
+
+    const executions = getChatWorkWorkerExecutionsFixture(
+      baseSnapshot!,
+      CHAT_ALPHA_IDENTITY,
+    );
+    const acceptedExecution = executions.find(
+      (execution) =>
+        execution.execution_ref === MINIMAL_CHAT_ALPHA_ACCEPTED_EXECUTION_REF,
+    );
+    expect(acceptedExecution).toBeDefined();
+    const conflictingExecution = createWorkerExecution({
+      identity: CHAT_ALPHA_IDENTITY,
+      itemId: acceptedExecution!.item_id,
+      executionRef: acceptedExecution!.execution_ref,
+      approvalId: 'apr_cross_entry_conflict',
+      taskId: acceptedExecution!.task_id,
+      sessionBindingId: acceptedExecution!.session_binding_id,
+      runId: acceptedExecution!.run_id,
+      workerId: acceptedExecution!.worker_id,
+      provider: 'google',
+      requestedModel: 'gemini-4-argon-high',
+      observedModel: 'gemini-4-argon-high',
+      requestedEffort: 'high',
+      observedEffort: 'high',
+      workerStatus: 'completed',
+      startedAtMs: FIXTURE_BASE_NOW_MS - 70_000,
+      finishedAtMs: FIXTURE_BASE_NOW_MS - 20_000,
+      durationMs: 50_000,
+      outcome: 'success',
+      acceptance: 'accepted',
+    });
+
+    const work = getChatWorkFixture(baseSnapshot!, CHAT_ALPHA_IDENTITY);
+    const crossEntrySnapshot = parseWorkspaceSnapshot({
+      ...baseSnapshot!,
+      chat_work: [
+        ...baseSnapshot!.chat_work.filter(
+          (entry) => !workspaceChatIdentitiesEqual(entry.identity, CHAT_ALPHA_IDENTITY),
+        ),
+        { ...work },
+        {
+          ...work,
+          items: [],
+          events: [],
+          worker_presence: [],
+          worker_executions: [acceptedExecution!, conflictingExecution],
+          bounds: { ...work.bounds, executions_omitted: 0 },
+        },
+      ],
+    });
+    await controller.setWorkspaceSnapshot(crossEntrySnapshot);
+    await triggerWorkspaceRefresh(page);
+
+    // The first entry is valid on its own; the contradicting identity arrives in
+    // a later entry with the same exact canonical chat identity. The composed
+    // chat must quarantine all three conflicting rows, never keep Completed.
+    await expect(
+      workspace.locator(
+        `[data-worker-execution-summary="${MINIMAL_CHAT_ALPHA_ACCEPTED_EXECUTION_REF}"]`,
+      ),
+    ).toHaveCount(0);
+    await expect(
+      resolveStreamEventRow(page, MINIMAL_CHAT_ACCEPTED_COMPLETED_EVENT_TITLE),
+    ).toBeVisible();
+    const checkingFooter = await expectWorkerFooterAtLatestEvent(
+      page,
+      MINIMAL_CHAT_CHECKING_EVENT_TITLE,
+      [`Preparing Worker execution for ${MINIMAL_CHAT_CHECKING_TITLE}`],
+      MINIMAL_CHAT_ALPHA_CHECKING_EXECUTION_REF,
+    );
+    await expectWorkerFooterMetadata(checkingFooter, {
+      brand: 'gemini',
+      model: /^Argon$/i,
+      effort: /^High$/i,
+      status: 'checking',
+      label: 'Checking',
+      duration: { kind: 'final', text: /^55s$/i },
+    });
+    await expectNoNeedsYou(page);
+
+    const dialog = await openBacklog(page);
+    await expect(
+      dialog.getByText('3 worker execution records are outside this bounded window.', {
+        exact: true,
+      }),
+    ).toBeVisible();
+    await closeBacklogWithEscape(page);
+  });
+
+  test('preserves the final Completed status, model, and fixed duration across a browser reload', async ({
+    page,
+  }) => {
+    await installWorkerMetadata(page);
+    const acceptedEarlierTitles = [
+      `Preparing Worker execution for ${MINIMAL_CHAT_ACCEPTED_TITLE}`,
+      `Worker result recorded: Awaiting check for ${MINIMAL_CHAT_ACCEPTED_TITLE}`,
+    ];
+    const acceptedFooter = await expectWorkerFooterAtLatestEvent(
+      page,
+      MINIMAL_CHAT_ACCEPTED_COMPLETED_EVENT_TITLE,
+      acceptedEarlierTitles,
+      MINIMAL_CHAT_ALPHA_ACCEPTED_EXECUTION_REF,
+    );
+    const beforeStatus = await expectWorkerFooterMetadata(acceptedFooter, {
+      brand: 'gemini',
+      model: /^Argon$/i,
+      effort: /^High$/i,
+      status: 'completed',
+      label: 'Completed',
+      duration: { kind: 'final', text: /^45s$/i },
+    });
+
+    await page.reload();
+    await expect(page.locator('#app .tl-app-shell, #app .tl-app').first()).toBeVisible();
+    await selectChat(page, 'Workspace UI Contract');
+    await expect(chatHeader(page, 'Workspace UI Contract')).toBeVisible();
+
+    const reloadedFooter = await expectWorkerFooterAtLatestEvent(
+      page,
+      MINIMAL_CHAT_ACCEPTED_COMPLETED_EVENT_TITLE,
+      acceptedEarlierTitles,
+      MINIMAL_CHAT_ALPHA_ACCEPTED_EXECUTION_REF,
+    );
+    const reloadedStatus = await expectWorkerFooterMetadata(reloadedFooter, {
+      brand: 'gemini',
+      model: /^Argon$/i,
+      effort: /^High$/i,
+      status: 'completed',
+      label: 'Completed',
+      duration: { kind: 'final', text: /^45s$/i },
+    });
+    expect(reloadedStatus).toBe(beforeStatus);
+
+    const dialog = await openBacklog(page);
+    await expectCommittedBacklogStatus(dialog, MINIMAL_CHAT_ACCEPTED_TITLE, 'done');
+    await closeBacklogWithEscape(page);
+  });
+
+  test('applies partial cancellation to one exact execution without changing another completed execution', async ({
+    page,
+  }) => {
+    const controller = await installWorkerMetadata(page);
+    const baseSnapshot = await controller.getWorkspaceSnapshot();
+    expect(baseSnapshot).not.toBeNull();
+
+    const acceptedEarlierTitles = [
+      `Preparing Worker execution for ${MINIMAL_CHAT_ACCEPTED_TITLE}`,
+      `Worker result recorded: Awaiting check for ${MINIMAL_CHAT_ACCEPTED_TITLE}`,
+    ];
+    const acceptedFooter = await expectWorkerFooterAtLatestEvent(
+      page,
+      MINIMAL_CHAT_ACCEPTED_COMPLETED_EVENT_TITLE,
+      acceptedEarlierTitles,
+      MINIMAL_CHAT_ALPHA_ACCEPTED_EXECUTION_REF,
+    );
+    const acceptedStatus = await expectWorkerFooterMetadata(acceptedFooter, {
+      brand: 'gemini',
+      model: /^Argon$/i,
+      effort: /^High$/i,
+      status: 'completed',
+      label: 'Completed',
+      duration: { kind: 'final', text: /^45s$/i },
+    });
+
+    let cancelledSnapshot = updateChatWorkWorkerExecutionFixture(
+      baseSnapshot!,
+      CHAT_ALPHA_IDENTITY,
+      MINIMAL_CHAT_ALPHA_CHECKING_EXECUTION_REF,
+      { worker_status: 'cancel_requested', acceptance: null },
+    );
+    await controller.setWorkspaceSnapshot(cancelledSnapshot);
+    await triggerWorkspaceRefresh(page);
+
+    const checkingEarlierTitles = [
+      `Preparing Worker execution for ${MINIMAL_CHAT_CHECKING_TITLE}`,
+    ];
+    const checkingFooter = await expectWorkerFooterAtLatestEvent(
+      page,
+      MINIMAL_CHAT_CHECKING_EVENT_TITLE,
+      checkingEarlierTitles,
+      MINIMAL_CHAT_ALPHA_CHECKING_EXECUTION_REF,
+    );
+    await expectWorkerFooterMetadata(checkingFooter, {
+      brand: 'gemini',
+      model: /^Argon$/i,
+      effort: /^High$/i,
+      status: 'cancelling',
+      label: 'Cancelling',
+    });
+
+    cancelledSnapshot = updateChatWorkWorkerExecutionFixture(
+      cancelledSnapshot,
+      CHAT_ALPHA_IDENTITY,
+      MINIMAL_CHAT_ALPHA_CHECKING_EXECUTION_REF,
+      {
+        worker_status: 'cancelled',
+        outcome: null,
+        finished_at_ms: FIXTURE_BASE_NOW_MS - 1_000,
+        duration_ms: 57_000,
+      },
+    );
+    const currentWork = getChatWorkFixture(cancelledSnapshot, CHAT_ALPHA_IDENTITY);
+    cancelledSnapshot = updateChatWorkFixture(
+      cancelledSnapshot,
+      CHAT_ALPHA_IDENTITY,
+      {
+        items: currentWork.items.map((item) =>
+          item.item_id === MINIMAL_CHAT_ALPHA_CHECKING_ITEM_ID
+            ? {
+                ...item,
+                status: 'blocked',
+                blocked_reason:
+                  'Cancellation verified without creating a human request.',
+              }
+            : item,
+        ),
+      },
+    );
+    await controller.setWorkspaceSnapshot(cancelledSnapshot);
+    await triggerWorkspaceRefresh(page);
+
+    const cancelledCheckingFooter = await expectWorkerFooterAtLatestEvent(
+      page,
+      MINIMAL_CHAT_CHECKING_EVENT_TITLE,
+      checkingEarlierTitles,
+      MINIMAL_CHAT_ALPHA_CHECKING_EXECUTION_REF,
+    );
+    await expectWorkerFooterMetadata(cancelledCheckingFooter, {
+      brand: 'gemini',
+      model: /^Argon$/i,
+      effort: /^High$/i,
+      status: 'cancelled',
+      label: 'Cancelled',
+      duration: { kind: 'final', text: /^57s$/i },
+    });
+    const retainedAcceptedStatus = await expectWorkerFooterMetadata(
+      acceptedFooter,
+      {
+        brand: 'gemini',
+        model: /^Argon$/i,
+        effort: /^High$/i,
+        status: 'completed',
+        label: 'Completed',
+        duration: { kind: 'final', text: /^45s$/i },
+      },
+    );
+    expect(retainedAcceptedStatus).toBe(acceptedStatus);
+    await expectNoNeedsYou(page);
+
+    const dialog = await openBacklog(page);
+    await expectCommittedBacklogStatus(dialog, MINIMAL_CHAT_CHECKING_TITLE, 'blocked');
+    await expectCommittedBacklogStatus(dialog, MINIMAL_CHAT_ACCEPTED_TITLE, 'done');
+    await closeBacklogWithEscape(page);
+  });
+
+  test('keeps the compact footer readable without horizontal overflow at 1440px and 390px', async ({
+    page,
+  }) => {
+    await installWorkerMetadata(page, { width: 1440, height: 900 });
+    const workspace = workspaceSection(page);
+
+    const acceptedFooter = await expectWorkerFooterAtLatestEvent(
+      page,
+      MINIMAL_CHAT_ACCEPTED_COMPLETED_EVENT_TITLE,
+      [
+        `Preparing Worker execution for ${MINIMAL_CHAT_ACCEPTED_TITLE}`,
+        `Worker result recorded: Awaiting check for ${MINIMAL_CHAT_ACCEPTED_TITLE}`,
+      ],
+      MINIMAL_CHAT_ALPHA_ACCEPTED_EXECUTION_REF,
+    );
+    await expectWorkerFooterMetadata(acceptedFooter, {
+      brand: 'gemini',
+      model: /^Argon$/i,
+      effort: /^High$/i,
+      status: 'completed',
+      label: 'Completed',
+      duration: { kind: 'final', text: /^45s$/i },
+    });
+    await acceptedFooter.scrollIntoViewIfNeeded();
+    await expect(acceptedFooter).toBeVisible();
+    const wideBox = await acceptedFooter.boundingBox();
+    expect(wideBox).not.toBeNull();
+    expect(wideBox!.width).toBeGreaterThan(80);
+    expect(wideBox!.height).toBeGreaterThanOrEqual(12);
+    expect(
+      await acceptedFooter.evaluate(
+        (element) => element.scrollWidth <= element.clientWidth + 1,
+      ),
+    ).toBe(true);
+    await expectNoHorizontalOverflow(page, '1440px Worker metadata footer');
+
+    await page.setViewportSize({ width: 390, height: 740 });
+    await expect(workspace).toBeVisible();
+    await acceptedFooter.scrollIntoViewIfNeeded();
+    await expect(acceptedFooter).toBeVisible();
+    const narrowBox = await acceptedFooter.boundingBox();
+    expect(narrowBox).not.toBeNull();
+    expect(narrowBox!.width).toBeGreaterThan(80);
+    expect(narrowBox!.height).toBeGreaterThanOrEqual(12);
+    expect(
+      await acceptedFooter.evaluate(
+        (element) => element.scrollWidth <= element.clientWidth + 1,
+      ),
+    ).toBe(true);
+    await expectNoHorizontalOverflow(page, '390px Worker metadata footer');
+
+    // The exact current execution still has a fresh presence sample at the
+    // fixed fixture clock, so the compact footer renders Working with its live
+    // elapsed duration at the narrow width instead of a dispatch-only label.
+    const liveFooter = await expectWorkerFooterAtLatestEvent(
+      page,
+      MINIMAL_CHAT_LIVE_PROGRESS_EVENT_TITLE,
+      [
+        `Preparing Worker execution for ${MINIMAL_CHAT_DOING_TITLE}`,
+        `Worker execution attached for ${MINIMAL_CHAT_DOING_TITLE}`,
+      ],
+      MINIMAL_CHAT_ALPHA_LIVE_EXECUTION_REF,
+    );
+    await liveFooter.scrollIntoViewIfNeeded();
+    await expectWorkerFooterMetadata(liveFooter, {
+      brand: 'gemini',
+      model: /^Argon$/i,
+      effort: /^High$/i,
+      status: 'working',
+      label: 'Working',
+      duration: {
+        kind: 'elapsed',
+        text: /^Elapsed\s+\d+(?:\.\d+)?s$/i,
+      },
+    });
+    await expectNoHorizontalOverflow(page, '390px live Worker metadata footer');
+
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await acceptedFooter.scrollIntoViewIfNeeded();
+    await expect(acceptedFooter).toBeVisible();
+    await expectNoHorizontalOverflow(page, 'restored 1440px Worker metadata footer');
+  });
+
+  test('reports the compiled Desktop build identity from the actual Vite build input in Settings', async ({
+    page,
+  }) => {
+    // The identity is a static compile-time string in build-info.ts. The test
+    // worker sees the same VITE_ input that the separately built preview used;
+    // there is no runtime build-info command or window override to seed.
+    const rawBuildInput = process.env.VITE_THREADLANE_DESKTOP_BUILD_IDENTITY;
+    const buildInput = rawBuildInput?.trim() ?? '';
+    const expected =
+      buildInput === ''
+        ? { statusLabel: 'Unknown source', displayValue: 'unknown' }
+        : buildInput === 'dirty'
+          ? { statusLabel: 'Dirty source', displayValue: 'dirty' }
+          : /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(buildInput)
+            ? {
+                statusLabel: 'Clean source',
+                displayValue: buildInput.slice(0, 12),
+              }
+            : { statusLabel: 'Unknown source', displayValue: 'unknown' };
+
+    const controller = await installMinimal(page, {
+      width: 1040,
+      height: 760,
+    });
+    await sidebar(page)
+      .getByRole('button', { name: 'Settings', exact: true })
+      .click();
+    const row = await openDesktopBuildRow(page);
+    expect(
+      (await controller.getInvocations()).filter((call) =>
+        /build|identit/i.test(call.cmd),
+      ),
+      'Desktop build identity must come from the static compile-time value, not runtime IPC',
+    ).toEqual([]);
+
+    await expect(row.getByText('Desktop build', { exact: true })).toHaveCount(1);
+    await expect(
+      row.getByText(expected.statusLabel, { exact: true }),
+    ).toHaveCount(1);
+    await expect(
+      row.getByText(expected.displayValue, { exact: true }),
+    ).toHaveCount(1);
+
+    const text = (await row.innerText()).replace(/\s+/g, ' ').trim();
+    expect(text).toContain(expected.statusLabel);
+    expect(text).toContain(expected.displayValue);
+
+    if (expected.statusLabel === 'Unknown source') {
+      expect(text).not.toMatch(/\b[0-9a-f]{7,64}\b/i);
+      expect(text).not.toMatch(/clean source|dirty source/i);
+    } else if (expected.statusLabel === 'Dirty source') {
+      // A dirty source has no validated revision to display.
+      expect(text).not.toMatch(/\b[0-9a-f]{7,64}\b/i);
+      expect(text).not.toMatch(/clean source/i);
+    } else {
+      expect(text).not.toMatch(/\bdirty\b/i);
+      // Only the 12-character display revision is visible, not the full input.
+      expect(text).toContain(expected.displayValue);
+      expect(text).not.toContain(buildInput);
+    }
   });
 });
 

@@ -132,7 +132,7 @@ impl ProviderHealthInvocation {
         validate_digest(digest)?;
         match self {
             Self::Planning { .. }
-                if matches!(role, WorkflowRole::Architect | WorkflowRole::Orchestrator) =>
+                if matches!(role, WorkflowRole::Orchestrator) || role.is_advisor() =>
             {
                 Ok(())
             }

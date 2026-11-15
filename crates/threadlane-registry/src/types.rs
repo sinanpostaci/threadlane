@@ -2,6 +2,7 @@ use std::fmt;
 use std::path::PathBuf;
 use std::str::FromStr;
 
+use serde::ser::{SerializeSeq, SerializeStruct};
 use serde::{Deserialize, Serialize};
 
 use crate::error::RegistryError;
@@ -212,6 +213,12 @@ pub struct ModelChoice {
 
 /// Canonical Threadlane workflow roles, including the five configurable execution roles and
 /// the legacy [`Self::Follower`] variant retained for historical snapshot/plan compatibility.
+///
+/// [`Self::Advisor`] is the current advisory identity (`"advisor"`). [`Self::Architect`] is the
+/// retained legacy advisory identity (`"architect"`) that frozen plans, approvals, policies,
+/// receipts, and standing grants may still contain. The two variants are semantically the same
+/// role for lookup and eligibility, but they are deliberately distinct values so raw legacy
+/// identity always serializes and hashes back to `"architect"` instead of being rewritten.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkflowRole {
@@ -224,7 +231,17 @@ pub enum WorkflowRole {
     /// Substantive workflow orchestrator role.
     #[serde(rename = "orchestrator")]
     Orchestrator,
-    /// System and task architect role.
+    /// Current system and task advisory role.
+    ///
+    /// New advisory requests, reservations, artifacts, plan tasks, and configuration writes use
+    /// this identity. It is the single advisory entry in [`Self::EXECUTION_ROLES`].
+    #[serde(rename = "advisor")]
+    Advisor,
+    /// Legacy advisory role identity retained for frozen v1 plans, approvals, policies, grants,
+    /// receipts, and command replay.
+    ///
+    /// Never created by new canonical advisory paths; see [`Self::canonical`] and
+    /// [`Self::v1_hash_role`]. It is not a sixth configurable execution role.
     #[serde(rename = "architect")]
     Architect,
     /// Task execution worker role (user-facing label `Worker`; canonical wire and storage identifier `"coder"`).
@@ -239,8 +256,39 @@ pub enum WorkflowRole {
 }
 
 impl WorkflowRole {
-    /// All six [`WorkflowRole`] variants in canonical workflow order, including legacy [`Self::Follower`].
-    pub const ALL: [Self; 6] = [
+    /// All seven [`WorkflowRole`] variants in canonical declaration order, including legacy
+    /// [`Self::Follower`] and legacy [`Self::Architect`].
+    pub const ALL: [Self; 7] = [
+        Self::Follower,
+        Self::Orchestrator,
+        Self::Advisor,
+        Self::Architect,
+        Self::Coder,
+        Self::Reviewer,
+        Self::Closure,
+    ];
+
+    /// The five configurable execution roles in Threadlane profiles (`Orchestrator`, `Advisor`,
+    /// `Coder` / user-facing `Worker`, `Reviewer`, `Closure`).
+    ///
+    /// Native Coworker chat model selection is controlled by the human in Codex and is outside
+    /// profile execution role assignments. Legacy [`Self::Architect`] is the same semantic
+    /// advisory slot and never adds a sixth configurable role.
+    pub const EXECUTION_ROLES: [Self; 5] = [
+        Self::Orchestrator,
+        Self::Advisor,
+        Self::Coder,
+        Self::Reviewer,
+        Self::Closure,
+    ];
+
+    /// The stable v1 role set used to expand policy rules with an empty `roles` list into the
+    /// canonical digest domain.
+    ///
+    /// This is an internal compatibility projection, not the current configurable role list.
+    /// `advisor` is projected to legacy `architect` through [`Self::v1_hash_role`] so equivalent
+    /// pre-transition and post-transition policies keep the exact v1 digest.
+    pub const V1_HASH_ROLES: [Self; 6] = [
         Self::Follower,
         Self::Orchestrator,
         Self::Architect,
@@ -249,19 +297,10 @@ impl WorkflowRole {
         Self::Closure,
     ];
 
-    /// The five configurable execution roles in Threadlane profiles (`Orchestrator`, `Architect`, `Coder` / user-facing `Worker`, `Reviewer`, `Closure`).
+    /// Returns `true` when `self` belongs to the five configurable execution roles.
     ///
-    /// Native Coworker chat model selection is controlled by the human in Codex and is outside
-    /// profile execution role assignments.
-    pub const EXECUTION_ROLES: [Self; 5] = [
-        Self::Orchestrator,
-        Self::Architect,
-        Self::Coder,
-        Self::Reviewer,
-        Self::Closure,
-    ];
-
-    /// Returns `true` when `self` is one of the five configurable execution roles.
+    /// Legacy [`Self::Architect`] is semantically the advisory execution role retained for frozen
+    /// records, so it also returns `true`. [`Self::Follower`] is the only non-execution role.
     pub const fn is_execution_role(self) -> bool {
         !matches!(self, Self::Follower)
     }
@@ -271,11 +310,47 @@ impl WorkflowRole {
         matches!(self, Self::Follower)
     }
 
+    /// Returns `true` when `self` is the advisory role in either raw spelling.
+    pub const fn is_advisor(self) -> bool {
+        matches!(self, Self::Advisor | Self::Architect)
+    }
+
+    /// Returns `true` when `self` is the retained legacy advisory spelling.
+    pub const fn is_legacy_architect(self) -> bool {
+        matches!(self, Self::Architect)
+    }
+
+    /// Returns the current semantic identity for this role: legacy [`Self::Architect`] becomes
+    /// [`Self::Advisor`] and every other role is unchanged.
+    ///
+    /// Use this only at explicit semantic lookup, eligibility, selection, and duplicate-detection
+    /// boundaries. Never use it to rewrite a frozen raw role field, digest, ID, or revision.
+    pub const fn canonical(self) -> Self {
+        match self {
+            Self::Architect => Self::Advisor,
+            other => other,
+        }
+    }
+
+    /// Returns the stable v1 canonical advisory spelling used inside the unchanged execution
+    /// policy and scoped-profile dependency digest domains.
+    ///
+    /// [`Self::Advisor`] maps to legacy [`Self::Architect`], which keeps every pre-transition
+    /// digest reproducible. Do not use this projection for new workflow identities outside those
+    /// compatibility hash domains.
+    pub const fn v1_hash_role(self) -> Self {
+        match self {
+            Self::Advisor => Self::Architect,
+            other => other,
+        }
+    }
+
     /// Returns the canonical `snake_case` identifier for this role (`"coder"` for [`Self::Coder`]).
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Follower => "follower",
             Self::Orchestrator => "orchestrator",
+            Self::Advisor => "advisor",
             Self::Architect => "architect",
             Self::Coder => "coder",
             Self::Reviewer => "reviewer",
@@ -284,15 +359,34 @@ impl WorkflowRole {
     }
 
     /// Returns the human-readable user-facing display label for this role (`"Worker"` for [`Self::Coder`]).
+    ///
+    /// Both current [`Self::Advisor`] and frozen [`Self::Architect`] display as `Advisor`.
     pub const fn display_label(self) -> &'static str {
         match self {
             Self::Follower => "Follower",
             Self::Orchestrator => "Orchestrator",
-            Self::Architect => "Architect",
+            Self::Advisor | Self::Architect => "Advisor",
             Self::Coder => "Worker",
             Self::Reviewer => "Reviewer",
             Self::Closure => "Closure",
         }
+    }
+
+    /// Returns the mutable profile-configuration key for this role.
+    ///
+    /// Both advisory spellings project to `"advisor"` in mutable [`WorkflowProfile`] output.
+    /// Frozen plan, approval, policy, receipt, [`RoleAssignment`], and scoped dependency
+    /// serialization stays on [`Self::as_str`] so historical bytes and digests do not change.
+    pub const fn configuration_key(self) -> &'static str {
+        match self {
+            Self::Advisor | Self::Architect => "advisor",
+            _ => self.as_str(),
+        }
+    }
+
+    /// Returns the user-facing label for mutable configuration (`"Advisor"` for both advisory spellings).
+    pub const fn configuration_label(self) -> &'static str {
+        self.display_label()
     }
 }
 
@@ -309,6 +403,7 @@ impl FromStr for WorkflowRole {
         match s {
             "follower" => Ok(Self::Follower),
             "orchestrator" => Ok(Self::Orchestrator),
+            "advisor" => Ok(Self::Advisor),
             "architect" => Ok(Self::Architect),
             "coder" | "worker" => Ok(Self::Coder),
             "reviewer" => Ok(Self::Reviewer),
@@ -377,6 +472,12 @@ impl FromStr for Difficulty {
 ///
 /// When `difficulty` is `None` (`null` in JSON), the assignment acts as the explicit
 /// role-level default fallback when no exact difficulty match is configured for that role.
+///
+/// A legacy [`WorkflowRole::Architect`] value always serializes as the canonical v1 role spelling
+/// (`architect`) so frozen approval, policy, plan, receipt, and [`ScopedProfileDependencySpec`]
+/// bytes and digests do not change. A current [`WorkflowRole::Advisor`] value serializes as
+/// `advisor`. [`WorkflowProfile`] projects both mutable advisory spellings as `advisor` in its
+/// configuration output.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RoleAssignment {
@@ -431,8 +532,9 @@ impl FromStr for DecisionAdvisorMode {
     }
 }
 
-/// Optional decision advisor model selection for a [`WorkflowProfile`], separate from the
-/// six worker [`WorkflowRole`] assignments.
+/// Optional Decision advisor (Jev/OpenAI Decisions) model selection for a [`WorkflowProfile`],
+/// separate from the five configurable execution [`WorkflowRole`] assignments and the frozen
+/// Advisor/`architect` alias transition.
 ///
 /// Selecting a decision advisor in the registry is static configuration only; it does not
 /// perform live API inference, verify credentials, or authorize provider execution.
@@ -450,7 +552,7 @@ pub struct DecisionAdvisor {
 /// Partial profiles (profiles that omit one or more roles or difficulties) can be saved;
 /// unassigned roles/difficulties produce an explicit error at resolution time rather than
 /// substituting an unapproved model.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkflowProfile {
     /// Stable unique profile identifier.
@@ -458,10 +560,65 @@ pub struct WorkflowProfile {
     /// Human-readable profile name.
     pub name: String,
     /// Role and difficulty assignments configured for this profile.
+    ///
+    /// This mutable configuration projection serializes both [`WorkflowRole::Advisor`] and the
+    /// retained legacy [`WorkflowRole::Architect`] as `advisor`. The [`RoleAssignment`] type
+    /// itself and frozen authority serialization retain each raw role spelling for byte and
+    /// digest compatibility.
     pub assignments: Vec<RoleAssignment>,
     /// Optional decision advisor configuration (`None` when disabled/unset).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub decision_advisor: Option<DecisionAdvisor>,
+}
+
+#[derive(Serialize)]
+struct ConfigurationRoleAssignment<'a> {
+    role: &'static str,
+    difficulty: Option<Difficulty>,
+    choice: &'a ModelChoice,
+}
+
+struct ConfigurationRoleAssignments<'a>(&'a [RoleAssignment]);
+
+impl Serialize for ConfigurationRoleAssignments<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+        for assignment in self.0 {
+            sequence.serialize_element(&ConfigurationRoleAssignment {
+                role: assignment.role.configuration_key(),
+                difficulty: assignment.difficulty,
+                choice: &assignment.choice,
+            })?;
+        }
+        sequence.end()
+    }
+}
+
+impl Serialize for WorkflowProfile {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let field_count = if self.decision_advisor.is_some() {
+            4
+        } else {
+            3
+        };
+        let mut state = serializer.serialize_struct("WorkflowProfile", field_count)?;
+        state.serialize_field("id", &self.id)?;
+        state.serialize_field("name", &self.name)?;
+        state.serialize_field(
+            "assignments",
+            &ConfigurationRoleAssignments(&self.assignments),
+        )?;
+        if let Some(ref advisor) = self.decision_advisor {
+            state.serialize_field("decision_advisor", advisor)?;
+        }
+        state.end()
+    }
 }
 
 impl WorkflowProfile {
@@ -475,11 +632,14 @@ impl WorkflowProfile {
 
     /// Returns `true` when every role in [`WorkflowRole::EXECUTION_ROLES`] has an explicit
     /// default assignment (`difficulty: None`).
+    ///
+    /// Lookup is semantic: a retained legacy `architect` default satisfies the current `advisor`
+    /// execution-role slot without rewriting either spelling.
     pub fn has_complete_execution_defaults(&self) -> bool {
         WorkflowRole::EXECUTION_ROLES.iter().all(|&role| {
-            self.assignments
-                .iter()
-                .any(|assignment| assignment.role == role && assignment.difficulty.is_none())
+            self.assignments.iter().any(|assignment| {
+                assignment.role.canonical() == role.canonical() && assignment.difficulty.is_none()
+            })
         })
     }
 }
@@ -624,6 +784,11 @@ pub struct ScopedModelDependency {
 /// `ModelDefinition::label`, `ToolDefinition::label`) are excluded so unrelated registry edits
 /// cannot invalidate an unchanged profile's standing planning authority, while any semantic change
 /// to the selected profile's assignments, models, efforts, or tools is detected deterministically.
+/// Its [`RoleAssignment`] entries intentionally retain the stable v1 hash representation, which
+/// projects current `advisor` assignments to the legacy `architect` spelling. That internal
+/// compatibility domain keeps historical dependency bytes and standing-grant digests unchanged;
+/// it does not rewrite newly stored grants, plans, requests, or artifacts, which keep the actual
+/// `advisor` identity outside this proof.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ScopedProfileDependencySpec {
@@ -647,6 +812,7 @@ mod tests {
     fn workflow_role_display_label_from_str_alias_and_strict_serde_contract() {
         assert_eq!(WorkflowRole::Follower.as_str(), "follower");
         assert_eq!(WorkflowRole::Orchestrator.as_str(), "orchestrator");
+        assert_eq!(WorkflowRole::Advisor.as_str(), "advisor");
         assert_eq!(WorkflowRole::Architect.as_str(), "architect");
         assert_eq!(WorkflowRole::Coder.as_str(), "coder");
         assert_eq!(WorkflowRole::Reviewer.as_str(), "reviewer");
@@ -656,13 +822,48 @@ mod tests {
 
         assert_eq!(WorkflowRole::Follower.display_label(), "Follower");
         assert_eq!(WorkflowRole::Orchestrator.display_label(), "Orchestrator");
-        assert_eq!(WorkflowRole::Architect.display_label(), "Architect");
+        assert_eq!(
+            WorkflowRole::Advisor.display_label(),
+            "Advisor",
+            "the current advisory role displays as Advisor"
+        );
+        assert_eq!(
+            WorkflowRole::Architect.display_label(),
+            "Advisor",
+            "the retained legacy advisory identity also displays as Advisor"
+        );
+        assert_eq!(WorkflowRole::Architect.configuration_label(), "Advisor");
+        assert_eq!(WorkflowRole::Advisor.configuration_label(), "Advisor");
         assert_eq!(WorkflowRole::Coder.display_label(), "Worker");
         assert_eq!(WorkflowRole::Reviewer.display_label(), "Reviewer");
         assert_eq!(WorkflowRole::Closure.display_label(), "Closure");
+        assert_eq!(WorkflowRole::Architect.configuration_key(), "advisor");
+        assert_eq!(WorkflowRole::Advisor.configuration_key(), "advisor");
+        assert_eq!(WorkflowRole::Architect.as_str(), "architect");
+        assert_eq!(WorkflowRole::Advisor.as_str(), "advisor");
+
+        assert_eq!(WorkflowRole::Architect.canonical(), WorkflowRole::Advisor);
+        assert_eq!(WorkflowRole::Advisor.canonical(), WorkflowRole::Advisor);
+        assert_eq!(WorkflowRole::Coder.canonical(), WorkflowRole::Coder);
+        assert!(WorkflowRole::Architect.is_advisor());
+        assert!(WorkflowRole::Advisor.is_advisor());
+        assert!(!WorkflowRole::Coder.is_advisor());
+        assert_eq!(
+            WorkflowRole::Advisor.v1_hash_role(),
+            WorkflowRole::Architect
+        );
+        assert_eq!(
+            WorkflowRole::Architect.v1_hash_role(),
+            WorkflowRole::Architect
+        );
 
         assert_eq!("coder".parse::<WorkflowRole>(), Ok(WorkflowRole::Coder));
         assert_eq!("worker".parse::<WorkflowRole>(), Ok(WorkflowRole::Coder));
+        assert_eq!(
+            "architect".parse::<WorkflowRole>(),
+            Ok(WorkflowRole::Architect)
+        );
+        assert_eq!("advisor".parse::<WorkflowRole>(), Ok(WorkflowRole::Advisor));
         for role in WorkflowRole::ALL {
             assert_eq!(role.as_str().parse::<WorkflowRole>(), Ok(role));
         }
@@ -684,6 +885,22 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<WorkflowRole>("\"coder\"").expect("deserialize coder"),
             WorkflowRole::Coder
+        );
+        assert_eq!(
+            serde_json::to_string(&WorkflowRole::Advisor).expect("serialize Advisor"),
+            "\"advisor\""
+        );
+        assert_eq!(
+            serde_json::to_string(&WorkflowRole::Architect).expect("serialize legacy Architect"),
+            "\"architect\""
+        );
+        assert_eq!(
+            serde_json::from_str::<WorkflowRole>("\"advisor\"").expect("deserialize advisor"),
+            WorkflowRole::Advisor
+        );
+        assert_eq!(
+            serde_json::from_str::<WorkflowRole>("\"architect\"").expect("deserialize architect"),
+            WorkflowRole::Architect
         );
         for rejected in ["\"worker\"", "\"Worker\"", "\"builder\"", "\"unknown\""] {
             assert!(
@@ -708,5 +925,82 @@ mod tests {
             .is_err(),
             "simultaneous coder and worker keys in a role map must fail closed"
         );
+    }
+
+    #[test]
+    fn workflow_profile_projects_advisor_without_changing_global_role_assignment_bytes() {
+        let legacy_assignment = RoleAssignment {
+            role: WorkflowRole::Architect,
+            difficulty: None,
+            choice: ModelChoice {
+                model_id: "model-1".to_string(),
+                effort: Some("high".to_string()),
+            },
+        };
+        let advisor_assignment = RoleAssignment {
+            role: WorkflowRole::Advisor,
+            difficulty: None,
+            choice: ModelChoice {
+                model_id: "model-1".to_string(),
+                effort: Some("high".to_string()),
+            },
+        };
+
+        // Frozen/global RoleAssignment serialization keeps canonical v1 architect bytes.
+        assert_eq!(
+            serde_json::to_string(&legacy_assignment).expect("serialize global RoleAssignment"),
+            r#"{"role":"architect","difficulty":null,"choice":{"model_id":"model-1","effort":"high"}}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&WorkflowRole::Architect).expect("serialize global role"),
+            "\"architect\""
+        );
+        // A raw legacy identity must round-trip without being rewritten.
+        assert_eq!(
+            serde_json::from_str::<RoleAssignment>(
+                r#"{"role":"architect","difficulty":null,"choice":{"model_id":"model-1","effort":"high"}}"#
+            )
+            .expect("deserialize legacy assignment"),
+            legacy_assignment
+        );
+
+        // Current Advisor serialization is distinct and preserves the current identity.
+        assert_eq!(
+            serde_json::to_string(&advisor_assignment).expect("serialize Advisor RoleAssignment"),
+            r#"{"role":"advisor","difficulty":null,"choice":{"model_id":"model-1","effort":"high"}}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<RoleAssignment>(
+                r#"{"role":"advisor","difficulty":null,"choice":{"model_id":"model-1","effort":"high"}}"#
+            )
+            .expect("deserialize advisor assignment"),
+            advisor_assignment
+        );
+
+        let profile = WorkflowProfile {
+            id: "profile-1".to_string(),
+            name: "Profile 1".to_string(),
+            assignments: vec![legacy_assignment.clone()],
+            decision_advisor: None,
+        };
+        let encoded = serde_json::to_string(&profile).expect("serialize profile");
+        assert_eq!(
+            encoded,
+            r#"{"id":"profile-1","name":"Profile 1","assignments":[{"role":"advisor","difficulty":null,"choice":{"model_id":"model-1","effort":"high"}}]}"#
+        );
+
+        // Mutable profile deserialization keeps raw identity: architect stays Architect,
+        // advisor becomes the distinct current Advisor value.
+        for (role, expected) in [
+            ("advisor", WorkflowRole::Advisor),
+            ("architect", WorkflowRole::Architect),
+        ] {
+            let json = format!(
+                r#"{{"id":"p","name":"P","assignments":[{{"role":"{role}","difficulty":null,"choice":{{"model_id":"model-1","effort":"high"}}}}]}}"#
+            );
+            let decoded: WorkflowProfile =
+                serde_json::from_str(&json).expect("deserialize profile role");
+            assert_eq!(decoded.assignments[0].role, expected);
+        }
     }
 }

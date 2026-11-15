@@ -6,7 +6,8 @@
 //! - **Pure preview (`prepare_planning_grant_preview`)**: Validates binding/thread scope, canonical
 //!   live Git repository and base commit/tree (via bounded read-only Git verification), explicit
 //!   workflow profile and registry revision, supported headless worker routes (`Antigravity` or
-//!   `OpencodeV2`) for [`WorkflowRole::Orchestrator`] and [`WorkflowRole::Architect`], strict
+//!   `OpencodeV2`) for [`WorkflowRole::Orchestrator`] and the advisory role (current
+//!   [`WorkflowRole::Advisor`] or retained legacy [`WorkflowRole::Architect`]), strict
 //!   read-only capabilities, finite call and per-call budgets, and meaningful expiry with no
 //!   provider, host, vault, network, or state-mutation side effects (never creating directories,
 //!   files, lockfiles, or call reservations).
@@ -124,15 +125,13 @@ type FrozenRoleChoiceSortKey<'a> = (
 );
 
 impl FrozenPlanningRoleChoice {
-    /// Validates that this frozen role choice is a supported headless worker for `Orchestrator` or `Architect`.
+    /// Validates that this frozen role choice is a supported headless worker for `Orchestrator`
+    /// or the advisory role (current `Advisor` or retained legacy `Architect`).
     pub fn validate(&self) -> Result<(), NativeError> {
-        if !matches!(
-            self.role,
-            WorkflowRole::Orchestrator | WorkflowRole::Architect
-        ) {
+        if !matches!(self.role, WorkflowRole::Orchestrator) && !self.role.is_advisor() {
             return Err(NativeError::new(
                 NativeErrorCode::ValidationFailed,
-                "planning grant role must be WorkflowRole::Orchestrator or WorkflowRole::Architect",
+                "planning grant role must be Orchestrator or the advisory role",
             ));
         }
         validate_non_native_worker_choice(self.role, &self.selected_choice)
@@ -288,7 +287,7 @@ impl PlanningGrantPreview {
         let mut canonical_choices = self.frozen_role_choices.clone();
         for item in &canonical_choices {
             item.validate()?;
-            if !seen_roles.insert((item.role, item.requested_difficulty)) {
+            if !seen_roles.insert((item.role.canonical(), item.requested_difficulty)) {
                 return Err(NativeError::new(
                     NativeErrorCode::ValidationFailed,
                     "PlanningGrantPreview.frozen_role_choices contains duplicate (role, difficulty) entries",
@@ -601,14 +600,11 @@ pub fn prepare_planning_grant_preview(
         ));
     }
     for entry in &request.roles {
-        if !matches!(
-            entry.role,
-            WorkflowRole::Orchestrator | WorkflowRole::Architect
-        ) {
+        if !matches!(entry.role, WorkflowRole::Orchestrator) && !entry.role.is_advisor() {
             return Err(NativeError::new(
                 NativeErrorCode::ValidationFailed,
                 format!(
-                    "role `{}` is not permitted in a PlanningAdviceGrant (only Orchestrator and Architect are allowed)",
+                    "role `{}` is not permitted in a PlanningAdviceGrant (only Orchestrator and the advisory role are allowed)",
                     entry.role
                 ),
             ));
@@ -1016,14 +1012,14 @@ fn validate_planning_policy_roles_and_budget(
     if policy.allow_rules.is_empty() {
         return Err(NativeError::new(
             NativeErrorCode::ValidationFailed,
-            "PlanningAdviceGrant policy must contain at least one explicit allow rule for Orchestrator or Architect",
+            "PlanningAdviceGrant policy must contain at least one explicit allow rule for Orchestrator or the advisory role",
         ));
     }
     for rule in &policy.allow_rules {
         if rule.roles.is_empty() {
             return Err(NativeError::new(
                 NativeErrorCode::ValidationFailed,
-                "PlanningAdviceGrant policy allow rules must explicitly list Orchestrator and/or Architect roles",
+                "PlanningAdviceGrant policy allow rules must explicitly list Orchestrator and/or the advisory role",
             ));
         }
         for &role in &rule.roles {
@@ -1036,18 +1032,18 @@ fn validate_planning_policy_roles_and_budget(
                         ));
                     }
                 }
-                WorkflowRole::Architect => {
+                WorkflowRole::Architect | WorkflowRole::Advisor => {
                     if budget.max_architect_calls == 0 {
                         return Err(NativeError::new(
                             NativeErrorCode::ValidationFailed,
-                            "policy permits WorkflowRole::Architect when max_architect_calls is 0",
+                            "policy permits the advisory role when max_architect_calls is 0",
                         ));
                     }
                 }
                 _ => {
                     return Err(NativeError::new(
                         NativeErrorCode::ValidationFailed,
-                        "PlanningAdviceGrant policy rules must restrict roles to Orchestrator and/or Architect only",
+                        "PlanningAdviceGrant policy rules must restrict roles to Orchestrator and/or the advisory role only",
                     ));
                 }
             }
@@ -1061,7 +1057,7 @@ fn validate_role_presence_matches_budget(
     budget: &PlanningCallBudget,
 ) -> Result<(), NativeError> {
     let has_orch = choices.iter().any(|c| c.role == WorkflowRole::Orchestrator);
-    let has_arch = choices.iter().any(|c| c.role == WorkflowRole::Architect);
+    let has_arch = choices.iter().any(|c| c.role.is_advisor());
     if has_orch != (budget.max_orchestrator_calls > 0) {
         return Err(NativeError::new(
             NativeErrorCode::ValidationFailed,
@@ -1071,7 +1067,7 @@ fn validate_role_presence_matches_budget(
     if has_arch != (budget.max_architect_calls > 0) {
         return Err(NativeError::new(
             NativeErrorCode::ValidationFailed,
-            "Architect role presence must match positive max_architect_calls budget",
+            "advisory role presence must match positive max_architect_calls budget",
         ));
     }
     Ok(())
@@ -1085,7 +1081,7 @@ fn validate_policy_bound_to_frozen_choices(
         for &role in &rule.roles {
             if rule.allow_no_effort {
                 let matched = choices.iter().any(|c| {
-                    c.role == role
+                    c.role.canonical() == role.canonical()
                         && c.selected_choice.tool_id == rule.tool_id
                         && c.selected_choice.model_id == rule.model_id
                         && c.selected_choice.effort.is_none()
@@ -1099,7 +1095,7 @@ fn validate_policy_bound_to_frozen_choices(
             }
             for effort in &rule.efforts {
                 let matched = choices.iter().any(|c| {
-                    c.role == role
+                    c.role.canonical() == role.canonical()
                         && c.selected_choice.tool_id == rule.tool_id
                         && c.selected_choice.model_id == rule.model_id
                         && c.selected_choice.effort.as_deref() == Some(effort.as_str())
@@ -1147,14 +1143,15 @@ fn validate_policy_rules_against_snapshot(
             }
             ToolAdapter::CodexCli => {
                 if rule.roles.is_empty()
-                    || !rule.roles.iter().all(|role| {
-                        matches!(role, WorkflowRole::Orchestrator | WorkflowRole::Architect)
-                    })
+                    || !rule
+                        .roles
+                        .iter()
+                        .all(|role| matches!(role, WorkflowRole::Orchestrator) || role.is_advisor())
                 {
                     return Err(NativeError::new(
                         NativeErrorCode::ValidationFailed,
                         format!(
-                            "CodexCli policy rule on tool `{}` may only authorize read-only planning roles (Orchestrator or Architect)",
+                            "CodexCli policy rule on tool `{}` may only authorize read-only planning roles (Orchestrator or the advisory role)",
                             tool.id
                         ),
                     ));

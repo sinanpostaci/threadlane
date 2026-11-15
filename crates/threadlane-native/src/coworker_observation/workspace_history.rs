@@ -4931,6 +4931,7 @@ const fn workflow_role_name(role: WorkflowRole) -> &'static str {
     match role {
         WorkflowRole::Follower => "follower",
         WorkflowRole::Orchestrator => "orchestrator",
+        WorkflowRole::Advisor => "advisor",
         WorkflowRole::Architect => "architect",
         WorkflowRole::Coder => "coder",
         WorkflowRole::Reviewer => "reviewer",

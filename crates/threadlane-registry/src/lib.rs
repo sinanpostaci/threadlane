@@ -133,6 +133,7 @@ mod tests {
         let expected_roles = [
             (WorkflowRole::Follower, "follower"),
             (WorkflowRole::Orchestrator, "orchestrator"),
+            (WorkflowRole::Advisor, "advisor"),
             (WorkflowRole::Architect, "architect"),
             (WorkflowRole::Coder, "coder"),
             (WorkflowRole::Reviewer, "reviewer"),
@@ -349,6 +350,7 @@ mod tests {
                 },
             )
             .expect("store A apply rev 0 -> 1");
+        let bytes_before_stale = fs::read(store_a.registry_path()).expect("read registry bytes");
 
         let err = store_b
             .apply(
@@ -366,6 +368,11 @@ mod tests {
             }
         );
         assert_eq!(err.code(), "stale_revision");
+        assert_eq!(
+            fs::read(store_a.registry_path()).expect("read registry bytes after stale write"),
+            bytes_before_stale,
+            "a stale compare-and-swap write must leave the registry bytes unchanged",
+        );
 
         let latest = store_b.snapshot().expect("store B reread snapshot");
         assert_eq!(latest.revision, 1);
@@ -886,6 +893,21 @@ mod tests {
             serde_json::to_string(&decoded_null).expect("reserialize explicit null advisor");
         assert_eq!(reencoded_null, legacy_profile_json);
 
+        // A legacy architect configuration is projected to the mutable configuration key
+        // `advisor`; frozen RoleAssignment bytes stay on `architect`.
+        let legacy_architect_profile_json = r#"{"id":"legacy-architect","name":"Legacy Architect","assignments":[{"role":"architect","difficulty":"hard","choice":{"model_id":"argon","effort":"high"}}]}"#;
+        let decoded_architect: WorkflowProfile =
+            serde_json::from_str(legacy_architect_profile_json)
+                .expect("deserialize legacy architect profile");
+        assert_eq!(
+            decoded_architect.assignments[0].role,
+            WorkflowRole::Architect
+        );
+        let projected_architect_profile_json = r#"{"id":"legacy-architect","name":"Legacy Architect","assignments":[{"role":"advisor","difficulty":"hard","choice":{"model_id":"argon","effort":"high"}}]}"#;
+        let reencoded_architect = serde_json::to_string(&decoded_architect)
+            .expect("reserialize legacy architect profile");
+        assert_eq!(reencoded_architect, projected_architect_profile_json);
+
         // Configured `Some(DecisionAdvisor)` roundtrips cleanly in shadow mode.
         let with_advisor = WorkflowProfile {
             id: "with-jev".to_string(),
@@ -984,9 +1006,11 @@ mod tests {
 }
 "#;
         fs::write(store.registry_path(), legacy_snapshot_json).expect("write legacy registry.json");
+        let initial_bytes = fs::read(store.registry_path()).expect("read legacy bytes");
         let loaded = store.snapshot().expect("load legacy snapshot");
         assert_eq!(loaded.profiles.len(), 1);
         assert_eq!(loaded.profiles[0].decision_advisor, None);
+        assert_eq!(loaded.revision, 1);
         assert_eq!(
             store.snapshot_readonly().expect("readonly snapshot"),
             loaded
@@ -994,6 +1018,11 @@ mod tests {
         let readonly_at =
             RegistryStore::read_snapshot_readonly_at(&config_dir).expect("readonly_at snapshot");
         assert_eq!(readonly_at, loaded);
+        assert_eq!(
+            fs::read(store.registry_path()).expect("read bytes after legacy reads"),
+            initial_bytes,
+            "plain reads must not migrate, rewrite, or bump the legacy registry",
+        );
 
         let updated = store
             .apply(
@@ -1010,6 +1039,209 @@ mod tests {
             !saved_text.contains("decision_advisor"),
             "None decision_advisor must stay omitted on disk"
         );
+    }
+
+    #[test]
+    fn advisor_profile_save_reload_and_both_aliases_resolve_identically() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_dir = temp.path().join("registry");
+        let store = RegistryStore::open(&config_dir).expect("open store");
+        let s1 = store
+            .apply(
+                0,
+                RegistryChange::UpsertTool {
+                    tool: sample_tool("agy", ToolAdapter::Antigravity),
+                },
+            )
+            .expect("upsert tool");
+        let s2 = store
+            .apply(
+                s1.revision,
+                RegistryChange::UpsertModel {
+                    model: sample_model("argon", "agy", &["high"], false),
+                },
+            )
+            .expect("upsert model");
+
+        let architect_profile = WorkflowProfile {
+            id: "legacy-architect".to_string(),
+            name: "Legacy Architect".to_string(),
+            assignments: vec![RoleAssignment {
+                role: WorkflowRole::Architect,
+                difficulty: None,
+                choice: ModelChoice {
+                    model_id: "argon".to_string(),
+                    effort: Some("high".to_string()),
+                },
+            }],
+            decision_advisor: None,
+        };
+        let saved = store
+            .apply(
+                s2.revision,
+                RegistryChange::UpsertProfile {
+                    profile: architect_profile,
+                },
+            )
+            .expect("save legacy architect profile");
+        let on_disk = fs::read_to_string(store.registry_path()).expect("read registry.json");
+        assert!(
+            on_disk.contains("\"role\": \"advisor\""),
+            "explicit profile mutations must persist the advisor configuration key"
+        );
+        assert!(
+            !on_disk.contains("\"role\": \"architect\""),
+            "profile configuration writes must not persist the frozen architect key"
+        );
+
+        let reopened = RegistryStore::open(&config_dir).expect("reopen store");
+        let loaded = reopened.snapshot().expect("reload snapshot");
+        assert_eq!(loaded.revision, saved.revision);
+        assert_eq!(loaded.profiles.len(), 1);
+        assert_eq!(loaded.profiles[0].id, saved.profiles[0].id);
+        assert_eq!(
+            loaded.profiles[0].assignments[0].role,
+            WorkflowRole::Advisor,
+            "mutable profile configuration canonicalizes legacy advisory writes to the current advisor identity"
+        );
+
+        let advisor_profile_json = r#"{
+  "id": "advisor-alias",
+  "name": "Advisor Alias",
+  "assignments": [
+    {
+      "role": "advisor",
+      "difficulty": null,
+      "choice": {
+        "model_id": "argon",
+        "effort": "high"
+      }
+    }
+  ]
+}"#;
+        let advisor_profile: WorkflowProfile =
+            serde_json::from_str(advisor_profile_json).expect("deserialize advisor role");
+        assert_eq!(advisor_profile.assignments[0].role, WorkflowRole::Advisor);
+        let with_alias = reopened
+            .apply(
+                loaded.revision,
+                RegistryChange::UpsertProfile {
+                    profile: advisor_profile,
+                },
+            )
+            .expect("save advisor profile");
+
+        let architect_choice = resolve_choice(
+            &with_alias,
+            "legacy-architect",
+            WorkflowRole::Architect,
+            None,
+        )
+        .expect("resolve architect profile");
+        let advisor_choice =
+            resolve_choice(&with_alias, "advisor-alias", WorkflowRole::Architect, None)
+                .expect("resolve advisor profile with legacy request");
+        let current_choice =
+            resolve_choice(&with_alias, "legacy-architect", WorkflowRole::Advisor, None)
+                .expect("resolve legacy profile with current advisor request");
+        assert_eq!(architect_choice, advisor_choice);
+        assert_eq!(architect_choice, current_choice);
+        assert_eq!(
+            architect_choice,
+            ModelChoice {
+                model_id: "argon".to_string(),
+                effort: Some("high".to_string()),
+            }
+        );
+
+        // Global/frozen dependency bytes keep the architect spelling and canonical ordering.
+        let spec = ScopedProfileDependencySpec::from_snapshot(&with_alias, "advisor-alias")
+            .expect("scoped dependency spec");
+        let spec_json = serde_json::to_string(&spec).expect("serialize scoped dependency spec");
+        assert!(spec_json.contains(r#""role":"architect""#));
+        assert!(!spec_json.contains(r#""role":"advisor""#));
+        assert_eq!(
+            spec.assignments[0].role,
+            WorkflowRole::Architect,
+            "the internal dependency-proof representation retains the v1 advisory hash domain"
+        );
+    }
+
+    #[test]
+    fn dual_alias_duplicate_assignments_are_refused_without_touching_the_store() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_dir = temp.path().join("registry");
+        let store = RegistryStore::open(&config_dir).expect("open store");
+        let s1 = store
+            .apply(
+                0,
+                RegistryChange::UpsertTool {
+                    tool: sample_tool("agy", ToolAdapter::Antigravity),
+                },
+            )
+            .expect("upsert tool");
+        let s2 = store
+            .apply(
+                s1.revision,
+                RegistryChange::UpsertModel {
+                    model: sample_model("argon", "agy", &["high"], false),
+                },
+            )
+            .expect("upsert model");
+
+        let duplicate_json = r#"{
+  "id": "duplicate-aliases",
+  "name": "Duplicate Aliases",
+  "assignments": [
+    {
+      "role": "architect",
+      "difficulty": "hard",
+      "choice": {
+        "model_id": "argon",
+        "effort": "high"
+      }
+    },
+    {
+      "role": "advisor",
+      "difficulty": "hard",
+      "choice": {
+        "model_id": "argon",
+        "effort": "high"
+      }
+    }
+  ]
+}"#;
+        let duplicate_profile: WorkflowProfile =
+            serde_json::from_str(duplicate_json).expect("deserialize duplicate aliases");
+        assert_eq!(duplicate_profile.assignments.len(), 2);
+        assert_eq!(
+            duplicate_profile.assignments[0].role,
+            WorkflowRole::Architect
+        );
+        assert_eq!(duplicate_profile.assignments[1].role, WorkflowRole::Advisor);
+        assert!(
+            duplicate_profile
+                .assignments
+                .iter()
+                .all(|assignment| assignment.role.canonical() == WorkflowRole::Advisor),
+            "both configuration spellings must canonicalize before duplicate checks"
+        );
+
+        let before = fs::read(store.registry_path()).expect("read registry bytes");
+        let err = store
+            .apply(
+                s2.revision,
+                RegistryChange::UpsertProfile {
+                    profile: duplicate_profile,
+                },
+            )
+            .expect_err("dual-alias duplicate must be refused");
+        assert_eq!(err.code(), "duplicate_assignment");
+        assert_eq!(
+            fs::read(store.registry_path()).expect("read registry bytes after refusal"),
+            before
+        );
+        assert_eq!(store.snapshot().expect("snapshot").revision, s2.revision);
     }
 
     #[test]
@@ -1504,16 +1736,19 @@ mod tests {
             WorkflowRole::EXECUTION_ROLES,
             [
                 WorkflowRole::Orchestrator,
-                WorkflowRole::Architect,
+                WorkflowRole::Advisor,
                 WorkflowRole::Coder,
                 WorkflowRole::Reviewer,
                 WorkflowRole::Closure,
             ]
         );
         assert_eq!(WorkflowRole::EXECUTION_ROLES.len(), 5);
-        assert_eq!(WorkflowRole::ALL.len(), 6);
+        assert_eq!(WorkflowRole::ALL.len(), 7);
+        assert_eq!(WorkflowRole::V1_HASH_ROLES.len(), 6);
         assert!(!WorkflowRole::Follower.is_execution_role());
         assert!(WorkflowRole::Follower.is_legacy_follower());
+        assert!(!WorkflowRole::Architect.is_legacy_follower());
+        assert!(WorkflowRole::Architect.is_execution_role());
         for role in WorkflowRole::EXECUTION_ROLES {
             assert!(role.is_execution_role());
             assert!(!role.is_legacy_follower());
@@ -1606,5 +1841,129 @@ mod tests {
             .snapshot()
             .expect("reload snapshot with legacy follower");
         assert_eq!(reloaded, s4);
+    }
+
+    #[test]
+    fn advisor_default_and_difficulty_override_resolve_exactly_for_both_spellings() {
+        let snapshot = RegistrySnapshot {
+            schema_version: REGISTRY_SCHEMA_VERSION,
+            revision: 4,
+            tools: vec![sample_tool("agy", ToolAdapter::Antigravity)],
+            models: vec![
+                sample_model("model-default", "agy", &["high"], false),
+                sample_model("model-hard", "agy", &["high"], false),
+            ],
+            profiles: vec![WorkflowProfile {
+                id: "advisor-profile".to_string(),
+                name: "Advisor Profile".to_string(),
+                assignments: vec![
+                    RoleAssignment {
+                        role: WorkflowRole::Advisor,
+                        difficulty: None,
+                        choice: ModelChoice {
+                            model_id: "model-default".to_string(),
+                            effort: Some("high".to_string()),
+                        },
+                    },
+                    RoleAssignment {
+                        role: WorkflowRole::Advisor,
+                        difficulty: Some(Difficulty::Hard),
+                        choice: ModelChoice {
+                            model_id: "model-hard".to_string(),
+                            effort: Some("high".to_string()),
+                        },
+                    },
+                ],
+                decision_advisor: None,
+            }],
+            default_profile_id: Some("advisor-profile".to_string()),
+        };
+
+        let default_choice =
+            resolve_choice(&snapshot, "advisor-profile", WorkflowRole::Advisor, None)
+                .expect("advisor default");
+        assert_eq!(default_choice.model_id, "model-default");
+        let hard_choice = resolve_choice(
+            &snapshot,
+            "advisor-profile",
+            WorkflowRole::Advisor,
+            Some(Difficulty::Hard),
+        )
+        .expect("advisor hard override");
+        assert_eq!(hard_choice.model_id, "model-hard");
+        let easy_fallback = resolve_choice(
+            &snapshot,
+            "advisor-profile",
+            WorkflowRole::Advisor,
+            Some(Difficulty::Easy),
+        )
+        .expect("advisor easy falls back to default");
+        assert_eq!(easy_fallback, default_choice);
+        let legacy_hard = resolve_choice(
+            &snapshot,
+            "advisor-profile",
+            WorkflowRole::Architect,
+            Some(Difficulty::Hard),
+        )
+        .expect("legacy request resolves current advisor override");
+        assert_eq!(legacy_hard, hard_choice);
+    }
+
+    #[test]
+    fn current_advisor_and_legacy_architect_profile_spellings_share_v1_dependency_bytes() {
+        let tool = sample_tool("agy", ToolAdapter::Antigravity);
+        let model = sample_model("argon", "agy", &["high"], false);
+        let snapshot_for = |role: WorkflowRole| RegistrySnapshot {
+            schema_version: REGISTRY_SCHEMA_VERSION,
+            revision: 7,
+            tools: vec![tool.clone()],
+            models: vec![model.clone()],
+            profiles: vec![WorkflowProfile {
+                id: "same-profile".to_string(),
+                name: "Same Profile".to_string(),
+                assignments: vec![RoleAssignment {
+                    role,
+                    difficulty: None,
+                    choice: ModelChoice {
+                        model_id: "argon".to_string(),
+                        effort: Some("high".to_string()),
+                    },
+                }],
+                decision_advisor: None,
+            }],
+            default_profile_id: Some("same-profile".to_string()),
+        };
+
+        let legacy_spec = ScopedProfileDependencySpec::from_snapshot(
+            &snapshot_for(WorkflowRole::Architect),
+            "same-profile",
+        )
+        .expect("legacy dependency spec");
+        let current_spec = ScopedProfileDependencySpec::from_snapshot(
+            &snapshot_for(WorkflowRole::Advisor),
+            "same-profile",
+        )
+        .expect("current dependency spec");
+
+        assert_eq!(current_spec, legacy_spec);
+        assert_eq!(current_spec.assignments[0].role, WorkflowRole::Architect);
+        let current_json =
+            serde_json::to_string(&current_spec).expect("serialize current dependency spec");
+        let legacy_json =
+            serde_json::to_string(&legacy_spec).expect("serialize legacy dependency spec");
+        assert_eq!(
+            current_json, legacy_json,
+            "equivalent legacy and current advisory spellings must produce identical v1 dependency bytes"
+        );
+        assert!(current_json.contains(r#""role":"architect""#));
+        assert!(!current_json.contains(r#""role":"advisor""#));
+
+        // A manually supplied current-advisor identity is refused inside this v1 hash domain.
+        let mut invalid = current_spec.clone();
+        invalid.assignments[0].role = WorkflowRole::Advisor;
+        assert!(
+            invalid.validate().is_err(),
+            "scoped dependency specs must keep the stable v1 advisory representation"
+        );
     }
 }

@@ -77,8 +77,8 @@ use crate::pairing::{
     ConnectionIdentity, EnrollmentRecord, PairingStore, CONNECTION_IDENTITY_TOOL,
 };
 use crate::planning_gateway::{
-    ConsultArchitectParams, CoworkerPlanningGateway, CoworkerStatusParams, PlanningCommandParams,
-    PrepareWorkParams, RequestTechnicalPlanParams,
+    ConsultAdvisorParams, ConsultArchitectParams, CoworkerPlanningGateway, CoworkerStatusParams,
+    PlanningCommandParams, PrepareWorkParams, RequestTechnicalPlanParams,
 };
 
 const WORKFLOW_NOT_CONFIGURED_MESSAGE: &str =
@@ -150,6 +150,7 @@ enum McpWorkflowRole {
     Follower,
     Orchestrator,
     Architect,
+    Advisor,
     Coder,
     Worker,
     Reviewer,
@@ -162,6 +163,7 @@ impl From<McpWorkflowRole> for WorkflowRole {
             McpWorkflowRole::Follower => Self::Follower,
             McpWorkflowRole::Orchestrator => Self::Orchestrator,
             McpWorkflowRole::Architect => Self::Architect,
+            McpWorkflowRole::Advisor => Self::Advisor,
             McpWorkflowRole::Coder | McpWorkflowRole::Worker => Self::Coder,
             McpWorkflowRole::Reviewer => Self::Reviewer,
             McpWorkflowRole::Closure => Self::Closure,
@@ -191,7 +193,8 @@ enum McpDifficulty {
 /// Mirrors [`PlanTask`] with strict `#[serde(deny_unknown_fields)]` and `schemars::JsonSchema`
 /// support while accepting both `"worker"` and canonical `"coder"` at the MCP single-role input
 /// boundary (normalizing to canonical [`WorkflowRole::Coder`] so serialized and persisted task
-/// records remain `"coder"`).
+/// records remain `"coder"`). `"advisor"` stores the current [`WorkflowRole::Advisor`] identity;
+/// the retained legacy `"architect"` input keeps [`WorkflowRole::Architect`] unchanged.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PlanTaskParams {
@@ -199,7 +202,7 @@ pub struct PlanTaskParams {
     pub id: String,
     /// Short human-readable task title.
     pub title: String,
-    /// Workflow role used to resolve the target model from the workflow profile (`follower`, `orchestrator`, `architect`, `worker` or canonical `coder`, `reviewer`, `closure`; normalizes `worker` to canonical `coder`).
+    /// Workflow role used to resolve the target model from the workflow profile (`follower`, `orchestrator`, `architect`, `advisor`, `worker` or canonical `coder`, `reviewer`, `closure`; `worker` normalizes to `coder`, and `advisor` stores the current advisor identity while `architect` retains the legacy identity for exact frozen replay).
     #[schemars(with = "McpWorkflowRole")]
     #[serde(deserialize_with = "deserialize_mcp_workflow_role")]
     pub role: WorkflowRole,
@@ -1846,6 +1849,7 @@ impl PairedMcpServer {
             }
             "coworker_status"
             | "prepare_work"
+            | "consult_advisor"
             | "consult_architect"
             | "request_technical_plan"
             | "planning_command"
@@ -2113,6 +2117,10 @@ impl PairedMcpServer {
             "prepare_work" => {
                 let params = self.parse_enrolled_tool_params(tool_name, arguments)?;
                 Ok(self.prepare_work_boxed(params))
+            }
+            "consult_advisor" => {
+                let params = self.parse_enrolled_tool_params(tool_name, arguments)?;
+                Ok(self.consult_advisor_boxed(params))
             }
             "consult_architect" => {
                 let params = self.parse_enrolled_tool_params(tool_name, arguments)?;
@@ -3020,7 +3028,10 @@ impl PairedMcpServer {
             gateway = gateway.with_sibling_anchor_exe(anchor.clone());
         }
         if self.coworker_native_notices
-            && matches!(tool_name, "consult_architect" | "request_technical_plan")
+            && matches!(
+                tool_name,
+                "consult_advisor" | "consult_architect" | "request_technical_plan"
+            )
         {
             let Some((reconnect_cfg, backend_pid)) = self
                 .matched_observation_context(&trusted_binding_id, &trusted_thread_uuid)
@@ -4391,6 +4402,40 @@ impl PairedMcpServer {
         })
     }
 
+    fn consult_advisor_boxed(
+        &self,
+        params: ConsultAdvisorParams,
+    ) -> BoxedTaskLocalFuture<'_, Result<CallToolResult, CallToolResult>> {
+        Box::pin(async move {
+            let (trusted_binding_id, trusted_thread_uuid, gateway) =
+                self.verified_planning_gateway("consult_advisor")?;
+            let req_id = self
+                .begin_paired_observation_with_job(
+                    &trusted_binding_id,
+                    &trusted_thread_uuid,
+                    "consult_advisor",
+                    Some(&params.job_id),
+                    None,
+                    None,
+                )
+                .await;
+            let result = match gateway.consult_advisor(&params).await {
+                Ok(data) => Self::format_planning_gateway_result(
+                    &trusted_binding_id,
+                    "consult_advisor",
+                    data,
+                ),
+                Err(err) => Err(Self::format_planning_gateway_error(
+                    &trusted_binding_id,
+                    "consult_advisor",
+                    err,
+                )),
+            };
+            self.finish_paired_observation(req_id, &result).await;
+            result
+        })
+    }
+
     fn consult_architect_boxed(
         &self,
         params: ConsultArchitectParams,
@@ -5192,7 +5237,7 @@ impl PairedMcpServer {
     /// Lists a bounded page of configured workflow profiles from the operator registry (requires verified operator enrollment).
     #[tool(
         name = "catalog",
-        description = "List a bounded cursor-paginated page of configured workflow profiles and active five-role execution assignments (including derived human-readable role_label such as Worker for canonical coder) from the operator registry for the enrolled chat binding. Omits legacy follower assignments, CLI executable paths, and credentials; assignments referencing disabled tools report tool_enabled: false and available: false without model substitution.",
+        description = "List a bounded cursor-paginated page of configured workflow profiles and active five-role execution assignments (including derived human-readable role_label such as Worker for canonical coder and Advisor for canonical architect/advisor configuration) from the operator registry for the enrolled chat binding. Omits legacy follower assignments, CLI executable paths, and credentials; assignments referencing disabled tools report tool_enabled: false and available: false without model substitution.",
         annotations(
             title = "List Workflow Profile Catalog",
             read_only_hint = true,
@@ -5249,7 +5294,7 @@ impl PairedMcpServer {
     /// Creates or updates a draft workflow plan revision owned by the enrolled chat binding (requires verified operator enrollment).
     #[tool(
         name = "save_draft",
-        description = "Create or update an unapproved draft workflow plan revision scoped to the enrolled chat binding. Accepts task role worker or canonical coder (persisting canonical coder) and validates task DAG acyclicity, repository-relative non-protected allowed_write_paths, and role/difficulty resolution against the pinned profile_revision before persisting.",
+        description = "Create or update an unapproved draft workflow plan revision scoped to the enrolled chat binding. Accepts task role worker or canonical coder (persisting canonical coder), and advisor or frozen architect (persisting canonical architect), and validates task DAG acyclicity, repository-relative non-protected allowed_write_paths, and role/difficulty resolution against the pinned profile_revision before persisting.",
         annotations(
             title = "Save Workflow Plan Draft",
             read_only_hint = false,
@@ -5439,7 +5484,7 @@ impl PairedMcpServer {
     /// Reads bounded Coworker standing-grant, job, advice, and planning-command summaries for the enrolled chat binding (requires verified operator enrollment).
     #[tool(
         name = "coworker_status",
-        description = "Read a bounded (<= 20 per collection), prompt-redacted snapshot of standing planning grants, Coworker jobs, Architect advice metadata, and planning commands for the enrolled (binding_id, thread_uuid). Never exposes raw prompts or secret tokens.",
+        description = "Read a bounded (<= 20 per collection), prompt-redacted snapshot of standing planning grants, Coworker jobs, Advisor advice metadata (current advisor plus retained legacy architect/consult_architect identifiers), and planning commands for the enrolled (binding_id, thread_uuid). Never exposes raw prompts or secret tokens.",
         annotations(
             title = "Get Coworker Planning Status",
             read_only_hint = true,
@@ -5458,7 +5503,7 @@ impl PairedMcpServer {
     /// Creates a new Coworker job or amends an existing job's structured work brief under an active standing planning grant (requires verified operator enrollment).
     #[tool(
         name = "prepare_work",
-        description = "Create a new Coworker job or record a revision-checked work-brief amendment under an active operator-attested standing planning grant for the enrolled (binding_id, thread_uuid). Separates confirmed requirements, proposed additions, assumptions, open questions, and accepted Architect decisions. Never creates grants, self-approves execution, or starts workers.",
+        description = "Create a new Coworker job or record a revision-checked work-brief amendment under an active operator-attested standing planning grant for the enrolled (binding_id, thread_uuid). Separates confirmed requirements, proposed additions, assumptions, open questions, and accepted Advisor decisions (legacy accepted_architect_decisions field). Never creates grants, self-approves execution, or starts workers.",
         annotations(
             title = "Prepare or Amend Coworker Work Brief",
             read_only_hint = false,
@@ -5474,12 +5519,34 @@ impl PairedMcpServer {
         self.prepare_work_boxed(params).await
     }
 
-    /// Enqueues a dependency-bound Architect consultation command and triggers detached execution via `threadlane-flow` (requires verified operator enrollment).
+    /// Enqueues a dependency-bound canonical Advisor consultation command and triggers detached
+    /// execution via `threadlane-flow` (requires verified operator enrollment).
+    #[tool(
+        name = "consult_advisor",
+        description = "Enqueue a read-only, dependency-bound canonical Advisor consultation command for (grant_id, job_id) and trigger detached background execution via the canonical sibling threadlane-flow process. Requires planning authority that explicitly names the current advisor role; retained legacy architect-only grants must use consult_architect. Computes real SHA-256 file blob digests at the job's canonical project_base. Advisory output is untrusted data and is not accepted into the work brief until explicitly recorded via prepare_work.",
+        annotations(
+            title = "Consult Read-Only Advisor",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    pub async fn consult_advisor(
+        &self,
+        Parameters(params): Parameters<ConsultAdvisorParams>,
+    ) -> Result<CallToolResult, CallToolResult> {
+        self.consult_advisor_boxed(params).await
+    }
+
+    /// Enqueues a dependency-bound Advisor consultation command (retained `consult_architect`
+    /// tool name) and triggers detached execution via `threadlane-flow` (requires verified
+    /// operator enrollment).
     #[tool(
         name = "consult_architect",
-        description = "Enqueue a read-only, dependency-bound Architect consultation command for (grant_id, job_id) and trigger detached background execution via the canonical sibling threadlane-flow process. Computes real SHA-256 file blob digests at the job's canonical project_base. Advisory output is untrusted data and is not accepted into the work brief until explicitly recorded via prepare_work.",
+        description = "Enqueue a read-only, dependency-bound legacy Architect consultation command (retained consult_architect identifier) for (grant_id, job_id) and trigger detached background execution via the canonical sibling threadlane-flow process. Retains the frozen legacy architect role identity; new canonical Advisor work should use consult_advisor. Computes real SHA-256 file blob digests at the job's canonical project_base. Advisory output is untrusted data and is not accepted into the work brief until explicitly recorded via prepare_work.",
         annotations(
-            title = "Consult Read-Only Architect",
+            title = "Consult Read-Only Legacy Architect",
             read_only_hint = false,
             destructive_hint = false,
             idempotent_hint = true,
@@ -5515,7 +5582,7 @@ impl PairedMcpServer {
     /// Reads the current status and verified structured outcome (without raw prompts) of a scoped planning command (requires verified operator enrollment).
     #[tool(
         name = "planning_command",
-        description = "Read the current status and verified structured outcome (Architect advice, Orchestrator published plan summary, clarification request, or Architect consultation request) for a planning command_id owned by the enrolled (binding_id, thread_uuid). Omits raw prompts; model/advisory output is untrusted data.",
+        description = "Read the current status and verified structured outcome (Advisor advice with legacy Architect fields, Orchestrator published plan summary, clarification request, or retained requires_architect_advice consultation request) for a planning command_id owned by the enrolled (binding_id, thread_uuid). Omits raw prompts; model/advisory output is untrusted data.",
         annotations(
             title = "Get Planning Command Status and Outcome",
             read_only_hint = true,
@@ -5698,6 +5765,7 @@ fn observation_result_job_id(
     let data = payload.get("data")?;
     match tool_name {
         "prepare_work"
+        | "consult_advisor"
         | "consult_architect"
         | "request_technical_plan"
         | "planning_command"
@@ -6398,7 +6466,7 @@ mod backlog_paired_tests {
         let unbound = PairedMcpServer::new(&state_dir, pairing_store).expect("unbound server");
 
         let tools = unbound.list_tools();
-        assert_eq!(tools.len(), 52, "PairedMcpServer must expose 52 tools");
+        assert_eq!(tools.len(), 53, "PairedMcpServer must expose 53 tools");
 
         let cases: [(&str, bool, &[&str], &[&str]); 8] = [
             (

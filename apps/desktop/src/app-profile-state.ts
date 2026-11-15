@@ -19,11 +19,13 @@ import {
   DIFFICULTIES as REGISTRY_DIFFICULTIES,
   EXECUTION_ROLES,
   WORKFLOW_ROLES,
+  canonicalExecutionWorkflowRole,
+  findDuplicateWorkflowAssignment,
   isApiToolAdapter,
   workflowRoleLabel,
+  type CanonicalExecutionWorkflowRole,
   type DecisionAdvisor,
   type Difficulty,
-  type ExecutionWorkflowRole,
   type ModelDefinition,
   type RegistrySnapshot,
   type RoleAssignment,
@@ -32,7 +34,7 @@ import {
   type WorkflowRole,
 } from './registry/types.ts';
 
-export const PROFILE_EXECUTION_ROLES: readonly ExecutionWorkflowRole[] = [
+export const PROFILE_EXECUTION_ROLES: readonly CanonicalExecutionWorkflowRole[] = [
   ...EXECUTION_ROLES,
 ];
 
@@ -46,7 +48,7 @@ export const DIFFICULTY_LABELS: Record<Difficulty, string> = {
 };
 
 export interface RoleMetadata {
-  readonly id: ExecutionWorkflowRole;
+  readonly id: CanonicalExecutionWorkflowRole;
   readonly label: string;
   readonly summary: string;
 }
@@ -58,9 +60,9 @@ export const ROLE_METADATA: readonly RoleMetadata[] = [
     summary: 'Structures multi-task plans and dependency boundaries.',
   },
   {
-    id: 'architect',
-    label: workflowRoleLabel('architect'),
-    summary: 'Read-only structural analysis before plan lock.',
+    id: 'advisor',
+    label: workflowRoleLabel('advisor'),
+    summary: 'Optional read-only structural consultation before plan lock.',
   },
   {
     id: 'coder',
@@ -80,8 +82,9 @@ export const ROLE_METADATA: readonly RoleMetadata[] = [
 ];
 
 export function getRoleMetadata(role: WorkflowRole): RoleMetadata {
+  const key = canonicalExecutionWorkflowRole(role);
   return (
-    ROLE_METADATA.find((item) => item.id === role) ?? ROLE_METADATA[0]!
+    ROLE_METADATA.find((item) => item.id === key) ?? ROLE_METADATA[0]!
   );
 }
 
@@ -95,10 +98,13 @@ export interface Choice {
   pending_family?: string | null;
 }
 
-export type AssignmentTable = Record<WorkflowRole, Record<Slot, Choice>>;
+export type AssignmentTable = Record<
+  CanonicalExecutionWorkflowRole,
+  Record<Slot, Choice>
+>;
 
 export interface AssignmentIssue {
-  role: WorkflowRole;
+  role: CanonicalExecutionWorkflowRole;
   slot: Slot;
   message: string;
 }
@@ -107,8 +113,8 @@ export interface DraftAnalysis {
   errors: string[];
   issues: AssignmentIssue[];
   advisor: DecisionAdvisorValidation;
-  missingDefaults: WorkflowRole[];
-  unassignedRoles: WorkflowRole[];
+  missingDefaults: CanonicalExecutionWorkflowRole[];
+  unassignedRoles: CanonicalExecutionWorkflowRole[];
   assignmentCount: number;
   defaultCount: number;
   overrideCount: number;
@@ -118,7 +124,7 @@ export interface ProfileSummary {
   assignmentCount: number;
   defaultCount: number;
   overrideCount: number;
-  missingDefaults: WorkflowRole[];
+  missingDefaults: CanonicalExecutionWorkflowRole[];
   issues: AssignmentIssue[];
   advisor: DecisionAdvisorValidation;
 }
@@ -185,7 +191,7 @@ export type PendingSwitchIntent =
 export interface ProfilesPanelState {
   snapshot: RegistrySnapshot | null;
   selectedProfileId: string | null;
-  selectedRole: ExecutionWorkflowRole;
+  selectedRole: CanonicalExecutionWorkflowRole;
   openDifficulty: Difficulty | null;
   compactStep: 'list' | 'editor';
   draftsById: Record<string, ProfileDraft>;
@@ -239,16 +245,25 @@ export function cloneDraft(draft: ProfileDraft): ProfileDraft {
 }
 
 export function tableFromProfile(profile: WorkflowProfile): AssignmentTable {
+  const duplicate = findDuplicateWorkflowAssignment(profile.assignments);
+  if (duplicate) {
+    const error = new Error(
+      `Duplicate assignment for ${duplicate.role} (${duplicate.difficulty ?? 'default'}).`
+    ) as Error & { code?: string };
+    error.code = 'duplicate_assignment';
+    throw error;
+  }
   const table = createEmptyTable();
   for (const assignment of profile.assignments) {
-    if (!(PROFILE_EXECUTION_ROLES as readonly WorkflowRole[]).includes(assignment.role)) {
+    const role = canonicalExecutionWorkflowRole(assignment.role);
+    if (!role) {
       continue;
     }
     const slot: Slot = assignment.difficulty ?? 'default';
     if (!SLOTS.includes(slot)) {
       continue;
     }
-    table[assignment.role][slot] = {
+    table[role][slot] = {
       model_id: assignment.choice.model_id,
       effort: assignment.choice.effort ?? null,
       pending_family: null,
@@ -288,15 +303,28 @@ export function profileFromDraft(draft: ProfileDraft): WorkflowProfile {
 
 export function profileSignature(profile: WorkflowProfile): string {
   const assignments = profile.assignments
-    .filter((assignment) =>
-      (PROFILE_EXECUTION_ROLES as readonly WorkflowRole[]).includes(assignment.role)
+    .map((assignment) => {
+      const role = canonicalExecutionWorkflowRole(assignment.role);
+      if (!role) {
+        return null;
+      }
+      return {
+        role,
+        difficulty: assignment.difficulty ?? null,
+        model_id: assignment.choice.model_id,
+        effort: assignment.choice.effort ?? null,
+      };
+    })
+    .filter(
+      (
+        assignment
+      ): assignment is {
+        role: CanonicalExecutionWorkflowRole;
+        difficulty: Difficulty | null;
+        model_id: string;
+        effort: string | null;
+      } => assignment !== null
     )
-    .map((assignment) => ({
-      role: assignment.role,
-      difficulty: assignment.difficulty ?? null,
-      model_id: assignment.choice.model_id,
-      effort: assignment.choice.effort ?? null,
-    }))
     .sort((left, right) => {
       const roleDelta =
         WORKFLOW_ROLES.indexOf(left.role) - WORKFLOW_ROLES.indexOf(right.role);
@@ -322,7 +350,11 @@ export function countRoleDifficultyOverrides(
   table: AssignmentTable,
   role: WorkflowRole
 ): number {
-  const roleSlots = table[role];
+  const key = canonicalExecutionWorkflowRole(role);
+  if (!key) {
+    return 0;
+  }
+  const roleSlots = table[key];
   if (!roleSlots) {
     return 0;
   }
@@ -563,18 +595,22 @@ export function selectRoleModel(
   slot: Slot,
   selectedValue: string
 ): AssignmentTable {
+  const key = canonicalExecutionWorkflowRole(role);
+  if (!key) {
+    return cloneTable(table);
+  }
   const next = cloneTable(table);
-  const currentCell = next[role][slot];
+  const currentCell = next[key][slot];
   const trimmed = selectedValue.trim();
 
   if (!trimmed) {
-    next[role][slot] = { model_id: '', effort: null, pending_family: null };
+    next[key][slot] = { model_id: '', effort: null, pending_family: null };
     return next;
   }
 
   const index = buildRegistryIndex(snapshot);
   const currentEffort = effectiveCellEffort(index, currentCell);
-  const defaultEffort = effectiveCellEffort(index, next[role].default);
+  const defaultEffort = effectiveCellEffort(index, next[key].default);
   const preferredEffort =
     currentCell.model_id || currentCell.pending_family || currentEffort !== null
       ? currentEffort
@@ -585,7 +621,7 @@ export function selectRoleModel(
   const byFamilyKey =
     index.enabledFamiliesByKey.get(trimmed) ?? index.familiesByKey.get(trimmed);
   if (byFamilyKey) {
-    next[role][slot] = normalizeChoiceForFamily(
+    next[key][slot] = normalizeChoiceForFamily(
       byFamilyKey,
       preferredEffort,
       null
@@ -598,7 +634,7 @@ export function selectRoleModel(
     const isSpecificMember =
       familyByMember.encodedEfforts &&
       familyByMember.members.some((member) => member.id === trimmed);
-    next[role][slot] = normalizeChoiceForFamily(
+    next[key][slot] = normalizeChoiceForFamily(
       familyByMember,
       preferredEffort,
       isSpecificMember ? trimmed : null
@@ -608,12 +644,12 @@ export function selectRoleModel(
 
   const directModel = index.models.get(trimmed);
   if (directModel) {
-    next[role][slot] = normalizeChoiceForModel(directModel, preferredEffort);
+    next[key][slot] = normalizeChoiceForModel(directModel, preferredEffort);
     return next;
   }
 
   // Retain unknown model ID as-is without dropping existing effort if present
-  next[role][slot] = {
+  next[key][slot] = {
     model_id: trimmed,
     effort: preferredEffort,
     pending_family: null,
@@ -638,9 +674,13 @@ export function selectRoleEffort(
   slot: Slot,
   rawEffortValue: string | null
 ): AssignmentTable {
+  const key = canonicalExecutionWorkflowRole(role);
+  if (!key) {
+    return cloneTable(table);
+  }
   const next = cloneTable(table);
   const index = buildRegistryIndex(snapshot);
-  const currentCell = next[role][slot];
+  const currentCell = next[key][slot];
   const nextEffort =
     rawEffortValue === null || rawEffortValue.trim() === ''
       ? null
@@ -649,7 +689,7 @@ export function selectRoleEffort(
   // If editing a difficulty override that is currently inheriting, promote from role default
   const targetSourceCell =
     !currentCell.model_id && !currentCell.pending_family && slot !== 'default'
-      ? next[role].default
+      ? next[key].default
       : currentCell;
 
   const family = resolveFamilyForCell(index, targetSourceCell);
@@ -658,7 +698,7 @@ export function selectRoleEffort(
     if (!mapped) {
       return next;
     }
-    next[role][slot] = {
+    next[key][slot] = {
       model_id: mapped.model_id,
       effort: mapped.effort,
       pending_family: null,
@@ -675,7 +715,7 @@ export function selectRoleEffort(
     if (!mapped) {
       return next;
     }
-    next[role][slot] = {
+    next[key][slot] = {
       model_id: mapped.model_id,
       effort: mapped.effort,
       pending_family: null,
@@ -693,7 +733,7 @@ export function selectRoleEffort(
   if (nextEffort !== null && !currentModel.efforts.includes(nextEffort)) {
     return next;
   }
-  next[role][slot] = {
+  next[key][slot] = {
     model_id: currentModel.id,
     effort: nextEffort,
     pending_family: null,
@@ -709,9 +749,13 @@ export function clearRoleDifficultyOverrides(
   table: AssignmentTable,
   role: WorkflowRole
 ): AssignmentTable {
+  const key = canonicalExecutionWorkflowRole(role);
   const next = cloneTable(table);
+  if (!key) {
+    return next;
+  }
   for (const difficulty of DIFFICULTIES) {
-    next[role][difficulty] = {
+    next[key][difficulty] = {
       model_id: '',
       effort: null,
       pending_family: null,
@@ -1502,14 +1546,15 @@ export function cancelPendingSwitch(
 
 export function selectWorkflowRole(
   state: ProfilesPanelState,
-  role: ExecutionWorkflowRole
+  role: WorkflowRole
 ): ProfilesPanelState {
-  if (!PROFILE_EXECUTION_ROLES.includes(role)) {
+  const key = canonicalExecutionWorkflowRole(role);
+  if (!key || !PROFILE_EXECUTION_ROLES.includes(key)) {
     return state;
   }
   return {
     ...state,
-    selectedRole: role,
+    selectedRole: key,
   };
 }
 

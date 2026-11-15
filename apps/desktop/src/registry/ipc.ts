@@ -7,12 +7,15 @@ import {
 } from './profile-advisor.ts';
 export { hasTauriRuntime, isDevPreviewFixtureMode };
 import {
+  canonicalWorkflowRole,
   createEmptyRegistrySnapshot,
   DIFFICULTIES,
+  findDuplicateWorkflowAssignment,
   isApiToolAdapter,
+  isWorkflowRole,
   MAX_SAFE_REVISION,
   TOOL_ADAPTERS,
-  WORKFLOW_ROLES,
+  workflowRoleConfigValue,
   type AppError,
   type DecisionAdvice,
   type DecisionAdvisor,
@@ -354,9 +357,16 @@ export function applyRegistryChangeLocally(
           'Profile cannot exceed 30 role/difficulty assignments.'
         );
       }
+      const duplicate = findDuplicateWorkflowAssignment(profile.assignments);
+      if (duplicate) {
+        throw new AppIpcError(
+          'duplicate_assignment',
+          `Duplicate assignment for ${duplicate.role} (${duplicate.difficulty ?? 'default'}).`
+        );
+      }
       const seenSlots = new Set<string>();
       const normalizedAssignments = profile.assignments.map((assignment) => {
-        if (!WORKFLOW_ROLES.includes(assignment.role)) {
+        if (!isWorkflowRole(assignment.role)) {
           throw new AppIpcError('invalid_profile', `Invalid workflow role "${assignment.role}".`);
         }
         if (
@@ -368,11 +378,12 @@ export function applyRegistryChangeLocally(
             `Invalid difficulty "${String(assignment.difficulty)}".`
           );
         }
-        const slotKey = `${assignment.role}:${assignment.difficulty ?? 'default'}`;
+        const canonicalRole = canonicalWorkflowRole(assignment.role);
+        const slotKey = `${canonicalRole}:${assignment.difficulty ?? 'default'}`;
         if (seenSlots.has(slotKey)) {
           throw new AppIpcError(
             'duplicate_assignment',
-            `Duplicate assignment for ${assignment.role} (${assignment.difficulty ?? 'default'}).`
+            `Duplicate assignment for ${canonicalRole} (${assignment.difficulty ?? 'default'}).`
           );
         }
         seenSlots.add(slotKey);
@@ -408,7 +419,7 @@ export function applyRegistryChangeLocally(
         }
 
         return {
-          role: assignment.role,
+          role: workflowRoleConfigValue(canonicalRole),
           difficulty: assignment.difficulty,
           choice: {
             model_id: model.id,
@@ -673,7 +684,7 @@ export function validatePlanTasksDag(tasks: readonly PlanTask[]): void {
     if (!task.instruction.trim()) {
       throw new AppIpcError('invalid_plan', `Task "${id}" requires an instruction.`);
     }
-    if (!WORKFLOW_ROLES.includes(task.role)) {
+    if (!isWorkflowRole(task.role)) {
       throw new AppIpcError('invalid_plan', `Task "${id}" has invalid role "${task.role}".`);
     }
     if (!DIFFICULTIES.includes(task.difficulty)) {
@@ -811,7 +822,9 @@ export function applyPlanChangeLocally(
         id: t.id.trim(),
         title: t.title.trim(),
         instruction: t.instruction.trim(),
-        role: t.role,
+        // A saved draft is a new revision: emit the current Advisor key even when
+        // the editable task still carries the legacy `architect` input spelling.
+        role: workflowRoleConfigValue(t.role),
         difficulty: t.difficulty,
         depends_on: t.depends_on.map((d) => d.trim()).filter(Boolean),
         allowed_write_paths: t.allowed_write_paths.map((p) => p.trim()).filter(Boolean),
@@ -1065,6 +1078,40 @@ function previewToolVersionsSnapshot(): DesktopToolVersionsSnapshot {
   };
 }
 
+/**
+ * Ensures explicit profile mutations and new plan drafts are submitted with the
+ * current `advisor` key. Legacy `architect` input is still accepted, but it must
+ * not become the stored identity of a newly created assignment.
+ */
+function registryChangeForStorage(change: RegistryChange): RegistryChange {
+  if (change.op !== 'upsert_profile') {
+    return change;
+  }
+  return {
+    ...change,
+    profile: {
+      ...change.profile,
+      assignments: change.profile.assignments.map((assignment) => ({
+        ...assignment,
+        role: workflowRoleConfigValue(assignment.role),
+      })),
+    },
+  };
+}
+
+function planChangeForStorage(change: PlanChange): PlanChange {
+  if (change.op !== 'save_draft') {
+    return change;
+  }
+  return {
+    ...change,
+    tasks: change.tasks.map((task) => ({
+      ...task,
+      role: workflowRoleConfigValue(task.role),
+    })),
+  };
+}
+
 export async function desktop_registry_snapshot(): Promise<RegistrySnapshot> {
   if (!hasTauriRuntime()) {
     if (isDevPreviewFixtureMode()) {
@@ -1116,7 +1163,7 @@ export async function desktop_registry_apply(
   try {
     return await invoke<RegistrySnapshot>('desktop_registry_apply', {
       expectedRevision,
-      change,
+      change: registryChangeForStorage(change),
     });
   } catch (err) {
     throw normalizeAppError(err, 'registry_apply_failed', 'Failed to apply registry change.');
@@ -1478,7 +1525,7 @@ export async function desktop_plan_change(
   try {
     return await invoke<PlanRevision>('desktop_plan_change', {
       expectedRevision,
-      change,
+      change: planChangeForStorage(change),
     });
   } catch (err) {
     throw normalizeAppError(err, 'plan_change_failed', 'Failed to apply plan change.');

@@ -3,8 +3,10 @@ import test from 'node:test';
 
 import {
   DEFAULT_BOTTOM_FOLLOW_THRESHOLD_PX,
+  MAX_CHAT_WORK_EXECUTIONS,
   buildChatWorkBacklogGroups,
   buildChatWorkEventViews,
+  buildChatWorkExecutionSummaries,
   buildChatWorkLivenessIndex,
   captureFirstVisibleMessageAnchor,
   compareWorkspaceMessageItems,
@@ -27,6 +29,8 @@ import {
   measureItemsFromContentOffsets,
   orderWorkspaceMessageItems,
   readWorkspaceChatWork,
+  resolveChatWorkExecutionDurationLabel,
+  resolveChatWorkExecutionFooterState,
   resolveMessageScrollChatKey,
   resolveMessageViewportResize,
   resolveVerifiedChatJobIds,
@@ -39,6 +43,8 @@ import {
 } from './message-scroll.ts';
 import type {
   ChatWorkEvent,
+  ChatWorkExecution,
+  ChatWorkExecutionSummaryView,
   ChatWorkItem,
   ChatWorkPresence,
   ContentOffsetMessageItem,
@@ -1295,6 +1301,37 @@ function makePresence(
   } as ChatWorkPresence;
 }
 
+type ChatWorkExecutionFixtureOverrides = {
+  readonly [Key in keyof ChatWorkExecution]?: ChatWorkExecution[Key] | null;
+};
+
+function makeExecution(
+  bindingId: string,
+  overrides: ChatWorkExecutionFixtureOverrides = {},
+): ChatWorkExecution {
+  return {
+    item_id: 'blg_alpha',
+    execution_ref: 'exec-1',
+    approval_id: 'approval-1',
+    task_id: 'task-1',
+    session_binding_id: bindingId,
+    run_id: 'run-1',
+    worker_id: 'worker-1',
+    provider: 'opencode',
+    requested_model: 'deepseek-v4.1-flash',
+    observed_model: null,
+    requested_effort: 'max',
+    observed_effort: null,
+    worker_status: 'running',
+    started_at_ms: 9_000,
+    finished_at_ms: null,
+    duration_ms: null,
+    outcome: null,
+    acceptance: null,
+    ...overrides,
+  } as ChatWorkExecution;
+}
+
 function makeNativeSample(
   identity: WorkspaceChatIdentity,
   activity: 'working' | 'waiting_for_approval' | 'waiting_for_input' | 'idle',
@@ -1936,4 +1973,1684 @@ test('chat_work liveness index keeps native-sample state visible without inventi
   assert.equal(summary.workingAgentCount, 1);
   assert.equal(summary.waitingChatCount, 1);
   assert.equal(summary.workingChatCount, 1);
+});
+
+// ---------------------------------------------------------------------------
+// Worker execution footers: exact joins, latest-event-only, TTL, and timing
+// ---------------------------------------------------------------------------
+
+function selectExecutionFixture(
+  identity: WorkspaceChatIdentity,
+  options: {
+    item?: Partial<ChatWorkItem>;
+    execution?: ChatWorkExecutionFixtureOverrides;
+    executionRef?: string;
+    eventOverrides?: Partial<ChatWorkEvent>;
+    presence?: ChatWorkPresence[];
+  } = {},
+): {
+  selection: ReturnType<typeof selectWorkspaceChatWork>;
+  views: ReturnType<typeof buildChatWorkEventViews>;
+  summary: ChatWorkExecutionSummaryView;
+} {
+  const executionRef = options.executionRef ?? 'exec-1';
+  const item = makeBacklogItem({
+    binding_id: identity.binding_id,
+    kind: 'worker',
+    status: 'doing',
+    current_execution_ref: executionRef,
+    ...options.item,
+  });
+  const execution = makeExecution(identity.binding_id, {
+    item_id: item.item_id,
+    execution_ref: executionRef,
+    ...options.execution,
+  });
+  const event = makeBacklogEvent({
+    event_id: `${item.item_id}:${item.revision}`,
+    item_id: item.item_id,
+    revision: item.revision,
+    action: 'worker_outcome_recorded',
+    status: item.status,
+    execution_ref: executionRef,
+    sequence: item.revision,
+    recorded_at_ms: 1_000 + item.revision,
+    ...options.eventOverrides,
+  });
+  const selection = selectWorkspaceChatWork(
+    [
+      makeChatWork(identity, {
+        items: [item],
+        events: [event],
+        worker_presence: options.presence ?? [],
+        worker_executions: [execution],
+      }),
+    ],
+    identity,
+  );
+  const views = buildChatWorkEventViews(selection);
+  const summary = views.find((view) => view.workerExecution !== null)!.workerExecution!;
+  return { selection, views, summary };
+}
+
+test('worker execution footers join exact item/binding attempts and render only on the latest event for that execution', () => {
+  const identity = makeIdentity('bnd_alpha_execution_join', UUID_ALPHA);
+  const firstItem = makeBacklogItem({
+    item_id: 'blg_exec_first',
+    binding_id: identity.binding_id,
+    kind: 'worker',
+    status: 'doing',
+    current_execution_ref: 'exec-1',
+  });
+  const secondItem = makeBacklogItem({
+    item_id: 'blg_exec_second',
+    binding_id: identity.binding_id,
+    kind: 'worker',
+    status: 'blocked',
+    blocked_reason: 'The first attempt was not accepted.',
+    current_execution_ref: 'exec-2',
+  });
+  const events = [
+    makeBacklogEvent({
+      event_id: 'blg_exec_first:1',
+      sequence: 1,
+      item_id: 'blg_exec_first',
+      revision: 1,
+      action: 'worker_execution_attached',
+      status: 'doing',
+      execution_ref: 'exec-1',
+      recorded_at_ms: 1_100,
+    }),
+    makeBacklogEvent({
+      event_id: 'blg_exec_first:2',
+      sequence: 2,
+      item_id: 'blg_exec_first',
+      revision: 2,
+      action: 'worker_outcome_recorded',
+      status: 'doing',
+      execution_ref: 'exec-1',
+      outcome: 'success',
+      recorded_at_ms: 1_200,
+    }),
+    makeBacklogEvent({
+      event_id: 'blg_exec_second:1',
+      sequence: 3,
+      item_id: 'blg_exec_second',
+      revision: 1,
+      action: 'worker_outcome_recorded',
+      status: 'blocked',
+      execution_ref: 'exec-2',
+      outcome: 'failure',
+      recorded_at_ms: 1_300,
+    }),
+  ];
+  const selection = selectWorkspaceChatWork(
+    [
+      makeChatWork(identity, {
+        items: [firstItem, secondItem],
+        events,
+        worker_executions: [
+          makeExecution(identity.binding_id, {
+            item_id: 'blg_exec_first',
+            execution_ref: 'exec-1',
+            outcome: 'success',
+            worker_status: 'completed',
+            acceptance: 'pending_review',
+            started_at_ms: 900,
+            finished_at_ms: 1_200,
+          }),
+          makeExecution(identity.binding_id, {
+            item_id: 'blg_exec_second',
+            execution_ref: 'exec-2',
+            outcome: 'failure',
+            worker_status: 'failed',
+            started_at_ms: 1_000,
+            finished_at_ms: 1_300,
+          }),
+          makeExecution(identity.binding_id, {
+            item_id: 'blg_missing_item',
+            execution_ref: 'exec-orphan',
+          }),
+          makeExecution(identity.binding_id, {
+            item_id: 'blg_exec_first',
+            execution_ref: 'exec-runtime-binding',
+            session_binding_id: 'bnd_runtime_approved',
+            approval_id: 'apr_runtime',
+            task_id: 'tsk_runtime',
+            run_id: 'run_runtime',
+            worker_id: 'wrk_runtime',
+          }),
+          makeExecution(identity.binding_id, {
+            item_id: 'blg_other_chat',
+            execution_ref: 'exec-cross-chat',
+          }),
+        ],
+      }),
+    ],
+    identity,
+  );
+
+  assert.deepEqual(
+    selection.executions.map((execution) => execution.execution_ref),
+    ['exec-1', 'exec-2', 'exec-runtime-binding'],
+  );
+  const runtimeBindingExecution = selection.executions.find(
+    (execution) => execution.execution_ref === 'exec-runtime-binding',
+  );
+  assert.equal(runtimeBindingExecution?.session_binding_id, 'bnd_runtime_approved');
+  assert.equal(runtimeBindingExecution?.approval_id, 'apr_runtime');
+  assert.equal(runtimeBindingExecution?.task_id, 'tsk_runtime');
+  assert.equal(runtimeBindingExecution?.run_id, 'run_runtime');
+  assert.equal(runtimeBindingExecution?.worker_id, 'wrk_runtime');
+  assert.equal(selection.bounds.executionsOmitted, 2);
+  assert.ok(
+    selection.notices.some((notice) => notice.includes('worker execution records')),
+  );
+
+  const views = buildChatWorkEventViews(selection);
+  assert.equal(views[0]!.workerExecution, null);
+  assert.equal(views[0]!.actionLabel, 'Worker dispatched');
+  assert.equal(views[1]!.workerExecution?.executionRef, 'exec-1');
+  assert.equal(views[1]!.workerExecution?.statusKey, 'checking');
+  assert.equal(views[2]!.workerExecution?.executionRef, 'exec-2');
+  assert.equal(views[2]!.workerExecution?.statusKey, 'failed');
+  assert.equal(views[1]!.actionLabel, 'Awaiting check');
+  assert.equal(views[1]!.outcome, 'success');
+});
+
+test('worker execution status keeps dispatch, checking, guarded Done, rejection, cancellation, failure, timeout, and unknown distinct', () => {
+  const identity = makeIdentity('bnd_alpha_execution_status', UUID_ALPHA);
+
+  const dispatched = selectExecutionFixture(identity, {
+    item: { item_id: 'blg_dispatch', current_execution_ref: 'exec-1' },
+    execution: { worker_status: 'running', outcome: null },
+  });
+  assert.equal(dispatched.summary.statusKey, 'dispatched');
+  assert.equal(dispatched.summary.statusLabel, 'Dispatched');
+  assert.equal(
+    evaluateChatWorkLiveness(dispatched.selection, null, { nowMs: CHAT_WORK_NOW_MS })
+      .isWorking,
+    false,
+  );
+
+  const checking = selectExecutionFixture(identity, {
+    item: { item_id: 'blg_checking', current_execution_ref: 'exec-1' },
+    execution: {
+      worker_status: 'completed',
+      outcome: 'success',
+      acceptance: 'pending_review',
+    },
+  });
+  assert.equal(checking.summary.statusKey, 'checking');
+  assert.equal(checking.summary.statusLabel, 'Checking');
+
+  const completed = selectExecutionFixture(identity, {
+    item: {
+      item_id: 'blg_done',
+      status: 'done',
+      current_execution_ref: 'exec-1',
+      completion_note: 'Checked and accepted',
+      completion_evidence: 'Inspected the delivered artifact',
+      completed_at_ms: 1_500,
+    },
+    execution: {
+      worker_status: 'completed',
+      outcome: 'success',
+      acceptance: 'accepted',
+      finished_at_ms: 1_400,
+    },
+  });
+  assert.equal(completed.summary.statusKey, 'completed');
+  assert.equal(completed.summary.statusLabel, 'Completed');
+
+  const rejected = selectExecutionFixture(identity, {
+    item: {
+      item_id: 'blg_rejected',
+      status: 'blocked',
+      blocked_reason: 'Coworker acceptance failed.',
+      current_execution_ref: 'exec-1',
+    },
+    execution: {
+      worker_status: 'completed',
+      outcome: 'success',
+      acceptance: 'rejected',
+    },
+  });
+  assert.equal(rejected.summary.statusKey, 'rejected');
+  assert.equal(rejected.summary.statusLabel, 'Rejected');
+
+  const cancelled = selectExecutionFixture(identity, {
+    item: { item_id: 'blg_cancelled', current_execution_ref: 'exec-1' },
+    execution: { worker_status: 'cancelled', outcome: null },
+  });
+  assert.equal(cancelled.summary.statusKey, 'cancelled');
+  assert.equal(cancelled.summary.statusLabel, 'Cancelled');
+
+  const failed = selectExecutionFixture(identity, {
+    item: { item_id: 'blg_failed', current_execution_ref: 'exec-1' },
+    execution: { worker_status: 'failed', outcome: 'failure' },
+  });
+  assert.equal(failed.summary.statusKey, 'failed');
+  assert.equal(failed.summary.statusLabel, 'Failed');
+
+  const timedOut = selectExecutionFixture(identity, {
+    item: { item_id: 'blg_timeout', current_execution_ref: 'exec-1' },
+    execution: { worker_status: 'timed_out', outcome: 'failure' },
+  });
+  assert.equal(timedOut.summary.statusKey, 'timed_out');
+  assert.equal(timedOut.summary.statusLabel, 'Timed out');
+
+  const unknown = selectExecutionFixture(identity, {
+    item: { item_id: 'blg_unknown', current_execution_ref: 'exec-1' },
+    execution: { worker_status: 'unknown', outcome: 'unknown' },
+  });
+  assert.equal(unknown.summary.statusKey, 'unknown');
+  assert.equal(unknown.summary.statusLabel, 'Unknown');
+
+  assert.equal(
+    new Set([
+      dispatched.summary.statusKey,
+      checking.summary.statusKey,
+      completed.summary.statusKey,
+      rejected.summary.statusKey,
+      cancelled.summary.statusKey,
+      failed.summary.statusKey,
+      timedOut.summary.statusKey,
+      unknown.summary.statusKey,
+    ]).size,
+    8,
+  );
+});
+
+test('accepted Done stays terminal while a new attempt after rejection or failure keeps its own footer', () => {
+  const identity = makeIdentity('bnd_alpha_execution_attempts', UUID_ALPHA);
+  const rejectedItem = makeBacklogItem({
+    item_id: 'blg_retry',
+    binding_id: identity.binding_id,
+    kind: 'worker',
+    status: 'doing',
+    current_execution_ref: 'exec-2',
+    revision: 4,
+    title: 'Run the corrected attempt',
+  });
+  const doneItem = makeBacklogItem({
+    item_id: 'blg_terminal',
+    binding_id: identity.binding_id,
+    kind: 'worker',
+    status: 'done',
+    current_execution_ref: 'exec-3',
+    revision: 7,
+    completion_note: 'Kontrol edildi ve kabul edildi',
+    completion_evidence: 'Teslim edilen dosya incelendi',
+    completed_at_ms: 2_000,
+  });
+  const events = [
+    makeBacklogEvent({
+      event_id: 'blg_retry:2',
+      sequence: 20,
+      item_id: 'blg_retry',
+      revision: 2,
+      action: 'worker_outcome_recorded',
+      status: 'blocked',
+      execution_ref: 'exec-1',
+      outcome: 'success',
+      recorded_at_ms: 1_200,
+    }),
+    makeBacklogEvent({
+      event_id: 'blg_retry:4',
+      sequence: 22,
+      item_id: 'blg_retry',
+      revision: 4,
+      action: 'worker_outcome_recorded',
+      status: 'doing',
+      execution_ref: 'exec-2',
+      outcome: 'failure',
+      recorded_at_ms: 1_800,
+    }),
+    makeBacklogEvent({
+      event_id: 'blg_terminal:7',
+      sequence: 30,
+      item_id: 'blg_terminal',
+      revision: 7,
+      action: 'completed',
+      status: 'done',
+      execution_ref: 'exec-3',
+      recorded_at_ms: 2_000,
+    }),
+  ];
+  const selection = selectWorkspaceChatWork(
+    [
+      makeChatWork(identity, {
+        items: [rejectedItem, doneItem],
+        events,
+        worker_executions: [
+          makeExecution(identity.binding_id, {
+            item_id: 'blg_retry',
+            execution_ref: 'exec-1',
+            outcome: 'success',
+            worker_status: 'completed',
+            acceptance: 'rejected',
+            started_at_ms: 1_000,
+            finished_at_ms: 1_200,
+          }),
+          makeExecution(identity.binding_id, {
+            item_id: 'blg_retry',
+            execution_ref: 'exec-2',
+            outcome: 'failure',
+            worker_status: 'failed',
+            started_at_ms: 1_600,
+            finished_at_ms: 1_800,
+          }),
+          makeExecution(identity.binding_id, {
+            item_id: 'blg_terminal',
+            execution_ref: 'exec-3',
+            outcome: 'success',
+            worker_status: 'completed',
+            acceptance: 'accepted',
+            started_at_ms: 1_700,
+            finished_at_ms: 2_000,
+            duration_ms: 300,
+          }),
+        ],
+      }),
+    ],
+    identity,
+  );
+
+  const firstViews = buildChatWorkEventViews(selection);
+  assert.deepEqual(
+    firstViews.map((view) => view.workerExecution?.statusKey ?? null),
+    ['rejected', 'failed', 'completed'],
+  );
+  assert.equal(firstViews[0]!.workerExecution?.executionRef, 'exec-1');
+  assert.equal(firstViews[1]!.workerExecution?.executionRef, 'exec-2');
+  assert.equal(firstViews[2]!.workerExecution?.executionRef, 'exec-3');
+
+  // Rebuilding the same durable snapshot never reopens Done, adds a footer, or
+  // turns an execution into live Working.
+  const secondViews = buildChatWorkEventViews(selection);
+  assert.deepEqual(secondViews, firstViews);
+  assert.equal(
+    evaluateChatWorkLiveness(selection, null, { nowMs: CHAT_WORK_NOW_MS }).isWorking,
+    false,
+  );
+  assert.deepEqual(
+    buildChatWorkBacklogGroups(selection)
+      .find((group) => group.status === 'done')!
+      .items.map((item) => item.completionNote),
+    ['Kontrol edildi ve kabul edildi'],
+  );
+});
+
+test('old payloads default to no footers and duplicate executions keep one footer with terminal duration', () => {
+  const identity = makeIdentity('bnd_alpha_execution_duplicates', UUID_ALPHA);
+  const item = makeBacklogItem({
+    item_id: 'blg_duplicate',
+    binding_id: identity.binding_id,
+    kind: 'worker',
+    status: 'blocked',
+    blocked_reason: 'The attempt failed.',
+    current_execution_ref: 'exec-1',
+  });
+  const event = makeBacklogEvent({
+    event_id: 'blg_duplicate:2',
+    sequence: 2,
+    item_id: 'blg_duplicate',
+    revision: 2,
+    action: 'worker_outcome_recorded',
+    status: 'blocked',
+    execution_ref: 'exec-1',
+    outcome: 'failure',
+    recorded_at_ms: 1_200,
+  });
+  const legacySelection = selectWorkspaceChatWork(
+    [
+      makeChatWork(identity, {
+        items: [item],
+        events: [event],
+      }),
+    ],
+    identity,
+  );
+  assert.deepEqual(legacySelection.executions, []);
+  assert.equal(legacySelection.bounds.executionsOmitted, 0);
+  assert.equal(buildChatWorkEventViews(legacySelection)[0]!.workerExecution, null);
+
+  const staleDuplicate = makeExecution(identity.binding_id, {
+    item_id: 'blg_duplicate',
+    execution_ref: 'exec-1',
+    worker_status: 'running',
+    outcome: null,
+    started_at_ms: 1_000,
+  });
+  const terminalDuplicate = makeExecution(identity.binding_id, {
+    item_id: 'blg_duplicate',
+    execution_ref: 'exec-1',
+    worker_status: 'failed',
+    outcome: 'failure',
+    started_at_ms: 1_000,
+    finished_at_ms: 5_200,
+    duration_ms: 4_200,
+  });
+  const refreshSelection = selectWorkspaceChatWork(
+    [
+      makeChatWork(identity, {
+        items: [item],
+        events: [event, event],
+        worker_executions: [
+          staleDuplicate,
+          terminalDuplicate,
+          terminalDuplicate,
+        ],
+      }),
+    ],
+    identity,
+  );
+  assert.equal(refreshSelection.executions.length, 1);
+  assert.equal(refreshSelection.events.length, 1);
+  const views = buildChatWorkEventViews(refreshSelection);
+  assert.equal(views.length, 1);
+  assert.equal(views[0]!.workerExecution?.executionRef, 'exec-1');
+  const footer = views[0]!.workerExecution!;
+  assert.equal(footer.duration?.kind, 'final');
+  assert.equal(resolveChatWorkExecutionDurationLabel(footer, CHAT_WORK_NOW_MS), '4.2s');
+  assert.equal(resolveChatWorkExecutionDurationLabel(footer, 9_999_999), '4.2s');
+  assert.deepEqual(buildChatWorkEventViews(refreshSelection), views);
+});
+
+test('conflicting same-ref execution identities are quarantined instead of resurrecting a footer', () => {
+  const identity = makeIdentity('bnd_alpha_execution_identity_conflict', UUID_ALPHA);
+  const item = makeBacklogItem({
+    item_id: 'blg_identity_conflict',
+    binding_id: identity.binding_id,
+    kind: 'worker',
+    status: 'blocked',
+    blocked_reason: 'Attempt identity conflicts must stay quarantined.',
+    current_execution_ref: 'exec-1',
+  });
+  const event = makeBacklogEvent({
+    event_id: 'blg_identity_conflict:2',
+    sequence: 2,
+    item_id: item.item_id,
+    revision: 2,
+    action: 'worker_outcome_recorded',
+    status: 'blocked',
+    execution_ref: 'exec-1',
+    outcome: 'failure',
+    recorded_at_ms: 1_200,
+  });
+  const base = makeExecution(identity.binding_id, {
+    item_id: item.item_id,
+    execution_ref: 'exec-1',
+    session_binding_id: 'bnd_runtime_exact_attempt',
+    worker_status: 'running',
+    outcome: null,
+    started_at_ms: 9_000,
+  });
+  const terminal = makeExecution(identity.binding_id, {
+    item_id: item.item_id,
+    execution_ref: 'exec-1',
+    session_binding_id: 'bnd_runtime_exact_attempt',
+    worker_status: 'completed',
+    outcome: 'success',
+    acceptance: 'accepted',
+    observed_model: 'gemini-4-argon-high',
+    started_at_ms: 9_000,
+    finished_at_ms: 13_200,
+    duration_ms: 4_200,
+  });
+  const selectionFor = (executions: ChatWorkExecution[]) =>
+    selectWorkspaceChatWork(
+      [
+        makeChatWork(identity, {
+          items: [item],
+          events: [event],
+          worker_executions: executions,
+        }),
+      ],
+      identity,
+    );
+
+  const enriched = selectionFor([base, terminal, terminal]);
+  assert.equal(enriched.executions.length, 1);
+  assert.equal(enriched.executions[0]!.worker_status, 'completed');
+  assert.equal(enriched.executions[0]!.duration_ms, 4_200);
+  assert.equal(enriched.executions[0]!.observed_model, 'gemini-4-argon-high');
+  assert.equal(
+    enriched.executions[0]!.session_binding_id,
+    'bnd_runtime_exact_attempt',
+  );
+  assert.notEqual(enriched.executions[0]!.session_binding_id, identity.binding_id);
+  const enrichedFooter = buildChatWorkEventViews(enriched)[0]!.workerExecution!;
+  assert.equal(enrichedFooter.duration?.kind, 'final');
+  assert.equal(resolveChatWorkExecutionDurationLabel(enrichedFooter, CHAT_WORK_NOW_MS), '4.2s');
+
+  const conflictingOverrides: ChatWorkExecutionFixtureOverrides[] = [
+    { approval_id: 'approval-other' },
+    { task_id: 'task-other' },
+    { session_binding_id: 'bnd_runtime_other' },
+    { run_id: 'run-other' },
+    { worker_id: 'worker-other' },
+  ];
+  for (const override of conflictingOverrides) {
+    const conflicting = makeExecution(identity.binding_id, {
+      item_id: item.item_id,
+      execution_ref: 'exec-1',
+      session_binding_id: 'bnd_runtime_exact_attempt',
+      worker_status: 'completed',
+      outcome: 'success',
+      acceptance: 'accepted',
+      observed_model: 'gemini-4-argon-high',
+      started_at_ms: 9_000,
+      finished_at_ms: 13_200,
+      duration_ms: 4_200,
+      ...override,
+    });
+
+    const conflicted = selectionFor([base, conflicting]);
+    assert.deepEqual(
+      conflicted.executions,
+      [],
+      'a contradicting immutable identity must quarantine the whole same-ref group',
+    );
+    assert.equal(
+      conflicted.bounds.executionsOmitted,
+      2,
+      'both rows in the conflicting group must be counted as omitted',
+    );
+    assert.equal(
+      buildChatWorkEventViews(conflicted)[0]!.workerExecution,
+      null,
+      'quarantined metadata must not transfer Completed, model, or duration',
+    );
+
+    const resurrected = selectionFor([base, conflicting, terminal]);
+    assert.deepEqual(
+      resurrected.executions,
+      [],
+      'a later third row must not resurrect a quarantined group',
+    );
+    assert.equal(
+      resurrected.bounds.executionsOmitted,
+      3,
+      'the later row must also be counted as omitted',
+    );
+    assert.equal(buildChatWorkEventViews(resurrected)[0]!.workerExecution, null);
+  }
+});
+
+test('raw chat_work composition quarantines cross-entry execution identity conflicts in either order', () => {
+  const identity = makeIdentity('bnd_alpha_cross_entry_identity', UUID_ALPHA);
+  const item = makeBacklogItem({
+    item_id: 'blg_cross_entry_identity',
+    binding_id: identity.binding_id,
+    kind: 'worker',
+    status: 'blocked',
+    blocked_reason: 'Attempt identity conflicts must stay quarantined.',
+    current_execution_ref: 'exec-1',
+  });
+  const event = makeBacklogEvent({
+    event_id: 'blg_cross_entry_identity:2',
+    sequence: 2,
+    item_id: item.item_id,
+    revision: 2,
+    action: 'worker_outcome_recorded',
+    status: 'blocked',
+    execution_ref: 'exec-1',
+    outcome: 'failure',
+    recorded_at_ms: 1_200,
+  });
+  const base = makeExecution(identity.binding_id, {
+    item_id: item.item_id,
+    execution_ref: 'exec-1',
+    session_binding_id: 'bnd_runtime_cross_entry',
+    worker_status: 'running',
+    outcome: null,
+    started_at_ms: 9_000,
+  });
+  const terminal = makeExecution(identity.binding_id, {
+    item_id: item.item_id,
+    execution_ref: 'exec-1',
+    session_binding_id: 'bnd_runtime_cross_entry',
+    worker_status: 'completed',
+    outcome: 'success',
+    acceptance: 'accepted',
+    observed_model: 'gemini-4-argon-high',
+    started_at_ms: 9_000,
+    finished_at_ms: 13_200,
+    duration_ms: 4_200,
+  });
+  const workFor = (executions: ChatWorkExecution[]) =>
+    makeChatWork(identity, {
+      items: [item],
+      events: [event],
+      worker_executions: executions,
+    });
+  const selectionFor = (entries: WorkspaceChatWork[]) =>
+    selectWorkspaceChatWork(entries, identity);
+
+  const conflictingOverrides: ReadonlyArray<[string, ChatWorkExecutionFixtureOverrides]> = [
+    ['approval_id', { approval_id: 'approval-cross-entry-other' }],
+    ['task_id', { task_id: 'task-cross-entry-other' }],
+    ['session_binding_id', { session_binding_id: 'bnd_runtime_cross_entry_other' }],
+    ['run_id', { run_id: 'run-cross-entry-other' }],
+    ['worker_id', { worker_id: 'worker-cross-entry-other' }],
+  ];
+  for (const [field, override] of conflictingOverrides) {
+    const conflicting = makeExecution(identity.binding_id, {
+      item_id: item.item_id,
+      execution_ref: 'exec-1',
+      session_binding_id: 'bnd_runtime_cross_entry',
+      worker_status: 'completed',
+      outcome: 'success',
+      acceptance: 'accepted',
+      observed_model: 'gemini-4-argon-high',
+      started_at_ms: 9_000,
+      finished_at_ms: 13_200,
+      duration_ms: 4_200,
+      ...override,
+    });
+
+    for (const order of ['conflict_first', 'terminal_first'] as const) {
+      const entries =
+        order === 'conflict_first'
+          ? [workFor([base, conflicting]), workFor([terminal])]
+          : [workFor([terminal]), workFor([base, conflicting])];
+      const selection = selectionFor(entries);
+      assert.deepEqual(
+        selection.executions,
+        [],
+        `${field} contradiction must quarantine the whole group across ${order} entries`,
+      );
+      assert.equal(
+        selection.bounds.executionsOmitted,
+        3,
+        `${field} must count every omitted raw row once across ${order} entries`,
+      );
+      assert.equal(
+        buildChatWorkEventViews(selection)[0]!.workerExecution,
+        null,
+        `${field} contradiction must not transfer Completed, model, or duration`,
+      );
+
+      const liveness = evaluateChatWorkLiveness(
+        selection,
+        makeNativeSample(identity, 'idle'),
+        { nowMs: CHAT_WORK_NOW_MS },
+      );
+      assert.equal(liveness.isWorking, false);
+      assert.equal(liveness.waitingForHuman, false);
+      const indexEntry = buildChatWorkLivenessIndex(
+        entries,
+        [makeNativeSample(identity, 'idle')],
+        { nowMs: CHAT_WORK_NOW_MS },
+      ).get(resolveMessageScrollChatKey(identity))!;
+      assert.equal(indexEntry.isWorking, false);
+      assert.equal(indexEntry.waitingForHuman, false);
+    }
+  }
+
+  const unrelated = makeExecution(identity.binding_id, {
+    item_id: item.item_id,
+    execution_ref: 'exec-keep',
+    approval_id: 'approval-keep',
+    task_id: 'task-keep',
+    run_id: 'run-keep',
+    worker_id: 'worker-keep',
+    worker_status: 'failed',
+    outcome: 'failure',
+    started_at_ms: 9_100,
+    finished_at_ms: 9_600,
+    duration_ms: 500,
+  });
+  const mixed = selectionFor([
+    workFor([
+      base,
+      makeExecution(identity.binding_id, {
+        item_id: item.item_id,
+        execution_ref: 'exec-1',
+        approval_id: 'approval-cross-entry-other',
+        session_binding_id: 'bnd_runtime_cross_entry',
+      }),
+    ]),
+    workFor([terminal, unrelated]),
+  ]);
+  assert.deepEqual(
+    mixed.executions.map((execution) => execution.execution_ref),
+    ['exec-keep'],
+    'an unrelated exact execution in the same chat must survive the quarantined group',
+  );
+  assert.equal(mixed.bounds.executionsOmitted, 3);
+
+  const betaIdentity = makeIdentity('bnd_beta_cross_entry_identity', UUID_BETA);
+  const betaItem = makeBacklogItem({
+    item_id: 'blg_beta_cross_entry_identity',
+    binding_id: betaIdentity.binding_id,
+    kind: 'worker',
+    status: 'blocked',
+    blocked_reason: 'Independent chat work stays isolated.',
+    current_execution_ref: 'exec-beta',
+  });
+  const betaExecution = makeExecution(betaIdentity.binding_id, {
+    item_id: betaItem.item_id,
+    execution_ref: 'exec-beta',
+    approval_id: 'approval-beta',
+    task_id: 'task-beta',
+    run_id: 'run-beta',
+    worker_id: 'worker-beta',
+  });
+  const betaSelection = selectWorkspaceChatWork(
+    [
+      workFor([base]),
+      makeChatWork(betaIdentity, {
+        items: [betaItem],
+        events: [],
+        worker_executions: [betaExecution],
+      }),
+    ],
+    betaIdentity,
+  );
+  assert.deepEqual(
+    betaSelection.executions.map((execution) => execution.execution_ref),
+    ['exec-beta'],
+  );
+  assert.equal(betaSelection.bounds.executionsOmitted, 0);
+
+  const enriched = selectionFor([workFor([base]), workFor([terminal])]);
+  assert.equal(enriched.executions.length, 1);
+  assert.equal(enriched.executions[0]!.worker_status, 'completed');
+  assert.equal(enriched.executions[0]!.duration_ms, 4_200);
+  assert.equal(enriched.executions[0]!.observed_model, 'gemini-4-argon-high');
+  assert.equal(enriched.executions[0]!.session_binding_id, 'bnd_runtime_cross_entry');
+  assert.notEqual(enriched.executions[0]!.session_binding_id, identity.binding_id);
+  assert.equal(enriched.bounds.executionsOmitted, 0);
+  const enrichedFooter = buildChatWorkEventViews(enriched)[0]!.workerExecution!;
+  assert.equal(resolveChatWorkExecutionDurationLabel(enrichedFooter, CHAT_WORK_NOW_MS), '4.2s');
+});
+
+test('worker footer pairs presence only when every available immutable identity field matches', () => {
+  const identity = makeIdentity('bnd_alpha_execution_presence_identity', UUID_ALPHA);
+  const item = makeBacklogItem({
+    item_id: 'blg_presence_identity',
+    binding_id: identity.binding_id,
+    kind: 'worker',
+    status: 'doing',
+    current_execution_ref: 'exec-1',
+  });
+  const event = makeBacklogEvent({
+    event_id: 'blg_presence_identity:3',
+    sequence: 3,
+    item_id: item.item_id,
+    revision: 3,
+    status: 'doing',
+    execution_ref: 'exec-1',
+    recorded_at_ms: 1_300,
+  });
+  const execution = makeExecution(identity.binding_id, {
+    item_id: item.item_id,
+    execution_ref: 'exec-1',
+    session_binding_id: 'bnd_runtime_presence_identity',
+    worker_status: 'running',
+    outcome: null,
+    started_at_ms: 9_000,
+  });
+  const selectionFor = (presence: ChatWorkPresence) =>
+    selectWorkspaceChatWork(
+      [
+        makeChatWork(identity, {
+          items: [item],
+          events: [event],
+          worker_presence: [presence],
+          worker_executions: [execution],
+        }),
+      ],
+      identity,
+    );
+
+  const exact = selectionFor(
+    makePresence({ item_id: item.item_id, execution_ref: 'exec-1' }),
+  );
+  assert.equal(exact.executions[0]!.session_binding_id, 'bnd_runtime_presence_identity');
+  assert.notEqual(exact.executions[0]!.session_binding_id, identity.binding_id);
+  const exactFooter = buildChatWorkEventViews(exact)[0]!.workerExecution!;
+  assert.notEqual(exactFooter.presence, null);
+  const exactState = resolveChatWorkExecutionFooterState(exactFooter, CHAT_WORK_NOW_MS);
+  assert.equal(exactState.statusKey, 'working');
+  assert.equal(exactState.durationLabel, 'Elapsed 1.5s');
+
+  const manualConflict = {
+    ...exact,
+    executions: [
+      execution,
+      makeExecution(identity.binding_id, {
+        item_id: item.item_id,
+        execution_ref: 'exec-1',
+        session_binding_id: 'bnd_runtime_presence_identity',
+        approval_id: 'approval-other',
+        worker_status: 'completed',
+        outcome: 'success',
+        acceptance: 'accepted',
+        duration_ms: 4_200,
+      }),
+    ],
+  };
+  assert.deepEqual(
+    buildChatWorkExecutionSummaries(manualConflict),
+    [],
+    'a caller-constructed conflicting identity group must not transfer Completed, model, or duration',
+  );
+
+  for (const presence of [
+    makePresence({
+      item_id: item.item_id,
+      execution_ref: 'exec-1',
+      approval_id: 'approval-other',
+    }),
+    makePresence({
+      item_id: item.item_id,
+      execution_ref: 'exec-1',
+      task_id: 'task-other',
+    }),
+    makePresence({
+      item_id: item.item_id,
+      execution_ref: 'exec-1',
+      run_id: 'run-other',
+    }),
+    makePresence({
+      item_id: item.item_id,
+      execution_ref: 'exec-1',
+      worker_id: 'worker-other',
+    }),
+  ]) {
+    const selection = selectionFor(presence);
+    const footer = buildChatWorkEventViews(selection)[0]!.workerExecution!;
+    assert.equal(
+      footer.presence,
+      null,
+      'a mismatched immutable identity must not attach presence to the footer',
+    );
+    const state = resolveChatWorkExecutionFooterState(footer, CHAT_WORK_NOW_MS);
+    assert.equal(state.statusKey, 'dispatched');
+    assert.equal(state.duration, null);
+    assert.equal(state.durationLabel, null);
+  }
+});
+
+test('worker execution bounds retain at most 32 records per chat with truthful omissions', () => {
+  const identity = makeIdentity('bnd_alpha_execution_bounds', UUID_ALPHA);
+  const item = makeBacklogItem({
+    item_id: 'blg_bounded',
+    binding_id: identity.binding_id,
+    kind: 'worker',
+    status: 'blocked',
+    blocked_reason: 'Attempts are reconciled individually.',
+    current_execution_ref: 'exec-32',
+  });
+  const executions = Array.from({ length: MAX_CHAT_WORK_EXECUTIONS + 3 }, (_, index) =>
+    makeExecution(identity.binding_id, {
+      item_id: 'blg_bounded',
+      execution_ref: `exec-${index + 1}`,
+      worker_status: 'failed',
+      outcome: 'failure',
+      started_at_ms: 1_000 + index,
+      finished_at_ms: 1_100 + index,
+      duration_ms: 100,
+    }),
+  );
+  const selection = selectWorkspaceChatWork(
+    [
+      makeChatWork(identity, {
+        items: [item],
+        events: [
+          makeBacklogEvent({
+            event_id: 'blg_bounded:1',
+            sequence: 1,
+            item_id: 'blg_bounded',
+            revision: 1,
+            execution_ref: 'exec-32',
+            status: 'blocked',
+            recorded_at_ms: 1_200,
+          }),
+        ],
+        worker_executions: executions,
+        bounds: { items_omitted: 0, events_omitted: 0, presence_omitted: 0 },
+      }),
+    ],
+    identity,
+  );
+  assert.equal(selection.executions.length, MAX_CHAT_WORK_EXECUTIONS);
+  assert.equal(selection.bounds.executionsOmitted, 3);
+  assert.equal(selection.executions[0]!.execution_ref, 'exec-4');
+  assert.equal(selection.executions.at(-1)!.execution_ref, 'exec-35');
+});
+
+test('execution duration preserves terminal values and only verified Working presence advances elapsed time', () => {
+  const identity = makeIdentity('bnd_alpha_execution_duration', UUID_ALPHA);
+  const durationAt = (
+    nowMs: number,
+    itemOverrides: Partial<ChatWorkItem>,
+    executionOverrides: ChatWorkExecutionFixtureOverrides,
+  ) => {
+    const { summary } = selectExecutionFixture(identity, {
+      item: itemOverrides,
+      execution: executionOverrides,
+    });
+    return resolveChatWorkExecutionFooterState(summary, nowMs).durationLabel;
+  };
+
+  assert.equal(
+    durationAt(
+      CHAT_WORK_NOW_MS,
+      { item_id: 'blg_done_duration', status: 'done', current_execution_ref: 'exec-1' },
+      {
+        worker_status: 'completed',
+        outcome: 'success',
+        started_at_ms: 1_000,
+        finished_at_ms: 5_200,
+        duration_ms: 4_200,
+      },
+    ),
+    '4.2s',
+  );
+  assert.equal(
+    durationAt(
+      CHAT_WORK_NOW_MS,
+      { item_id: 'blg_derived_duration', status: 'done', current_execution_ref: 'exec-1' },
+      {
+        worker_status: 'completed',
+        outcome: 'success',
+        started_at_ms: 1_000,
+        finished_at_ms: 3_500,
+        duration_ms: -1,
+      },
+    ),
+    '2.5s',
+  );
+  assert.equal(
+    durationAt(
+      CHAT_WORK_NOW_MS,
+      { item_id: 'blg_zero_duration', status: 'done', current_execution_ref: 'exec-1' },
+      {
+        worker_status: 'completed',
+        outcome: 'success',
+        started_at_ms: 1_000,
+        finished_at_ms: 1_000,
+        duration_ms: 0,
+      },
+    ),
+    '0ms',
+  );
+
+  // A running record alone is only a dispatch receipt. It must not tick.
+  assert.equal(
+    durationAt(
+      CHAT_WORK_NOW_MS,
+      { item_id: 'blg_running_duration', current_execution_ref: 'exec-1' },
+      {
+        worker_status: 'running',
+        outcome: null,
+        started_at_ms: 9_000,
+        finished_at_ms: null,
+        duration_ms: null,
+      },
+    ),
+    null,
+  );
+  assert.equal(
+    durationAt(
+      12_000,
+      { item_id: 'blg_running_duration_later', current_execution_ref: 'exec-1' },
+      {
+        worker_status: 'running',
+        outcome: null,
+        started_at_ms: 9_000,
+      },
+    ),
+    null,
+  );
+
+  const working = selectExecutionFixture(identity, {
+    item: { item_id: 'blg_working_duration', current_execution_ref: 'exec-1' },
+    execution: {
+      worker_status: 'running',
+      outcome: null,
+      started_at_ms: 9_000,
+    },
+    presence: [
+      makePresence({ item_id: 'blg_working_duration', execution_ref: 'exec-1' }),
+    ],
+  });
+  assert.equal(
+    resolveChatWorkExecutionFooterState(working.summary, CHAT_WORK_NOW_MS).statusKey,
+    'working',
+  );
+  assert.equal(
+    resolveChatWorkExecutionFooterState(working.summary, CHAT_WORK_NOW_MS).durationLabel,
+    'Elapsed 1.5s',
+  );
+  assert.equal(
+    resolveChatWorkExecutionFooterState(working.summary, 12_000).durationLabel,
+    'Elapsed 3s',
+  );
+
+  assert.equal(
+    durationAt(
+      CHAT_WORK_NOW_MS,
+      { item_id: 'blg_future_duration', current_execution_ref: 'exec-1' },
+      {
+        worker_status: 'running',
+        outcome: null,
+        started_at_ms: CHAT_WORK_NOW_MS + 5_000,
+      },
+    ),
+    null,
+  );
+  assert.equal(
+    durationAt(
+      CHAT_WORK_NOW_MS,
+      { item_id: 'blg_missing_duration', current_execution_ref: 'exec-1' },
+      {
+        worker_status: 'running',
+        outcome: null,
+        started_at_ms: null,
+        finished_at_ms: null,
+        duration_ms: null,
+      },
+    ),
+    null,
+  );
+  assert.equal(
+    durationAt(
+      CHAT_WORK_NOW_MS,
+      { item_id: 'blg_invalid_duration', status: 'done', current_execution_ref: 'exec-1' },
+      {
+        worker_status: 'completed',
+        outcome: 'success',
+        started_at_ms: 2_000,
+        finished_at_ms: 1_000,
+        duration_ms: -5,
+      },
+    ),
+    null,
+  );
+
+  // Clock ticks only re-derive the Working label; the durable event view and its
+  // sample/event timestamps remain unchanged, so scroll anchors are unaffected.
+  const { selection, views, summary } = selectExecutionFixture(identity, {
+    item: { item_id: 'blg_clock_duration', current_execution_ref: 'exec-1' },
+    execution: {
+      worker_status: 'running',
+      outcome: null,
+      started_at_ms: 9_000,
+    },
+    presence: [
+      makePresence({ item_id: 'blg_clock_duration', execution_ref: 'exec-1' }),
+    ],
+  });
+  const firstLabel = resolveChatWorkExecutionFooterState(
+    summary,
+    CHAT_WORK_NOW_MS,
+  ).durationLabel;
+  const firstViews = buildChatWorkEventViews(selection);
+  const secondLabel = resolveChatWorkExecutionFooterState(
+    summary,
+    CHAT_WORK_NOW_MS + 2_000,
+  ).durationLabel;
+  assert.equal(firstLabel, 'Elapsed 1.5s');
+  assert.equal(secondLabel, 'Elapsed 3.5s');
+  assert.deepEqual(buildChatWorkEventViews(selection), firstViews);
+  assert.equal(views[0]!.recordedAtMs, 1_001);
+
+  let state = syncChatWorkEventScroll(
+    createMessageScrollState('wchat:execution-clock'),
+    firstViews,
+  ).state;
+  const layout = buildSimulatedLayout(
+    firstViews.map((view) => ({ item_id: view.eventId })),
+    new Map(),
+    60,
+    8,
+    12,
+    12,
+  );
+  const readingScrollTop = 0;
+  state = handleMessageViewportScroll(
+    state,
+    {
+      scrollTop: readingScrollTop,
+      clientHeight: 40,
+      scrollHeight: layout.scrollHeight,
+    },
+    measureItemsFromContentOffsets(layout.layoutItems, readingScrollTop),
+  );
+  const resync = syncChatWorkEventScroll(state, firstViews);
+  assert.equal(resync.action.kind, 'preserve_anchor');
+});
+
+test('worker footer shows Working only for exact fresh presence and removes the ticking timer when it expires', () => {
+  const identity = makeIdentity('bnd_alpha_execution_ttl', UUID_ALPHA);
+  const item = makeBacklogItem({
+    item_id: 'blg_alpha',
+    binding_id: identity.binding_id,
+    kind: 'worker',
+    status: 'doing',
+    current_execution_ref: 'exec-1',
+  });
+  const selection = selectWorkspaceChatWork(
+    [
+      makeChatWork(identity, {
+        items: [item],
+        events: [
+          makeBacklogEvent({
+            event_id: 'blg_alpha:3',
+            sequence: 3,
+            item_id: 'blg_alpha',
+            revision: 3,
+            status: 'doing',
+            execution_ref: 'exec-1',
+            recorded_at_ms: 1_300,
+          }),
+        ],
+        worker_presence: [makePresence({ item_id: 'blg_alpha' })],
+        worker_executions: [
+          makeExecution(identity.binding_id, {
+            item_id: 'blg_alpha',
+            execution_ref: 'exec-1',
+            worker_status: 'running',
+            outcome: null,
+            started_at_ms: 9_000,
+          }),
+        ],
+      }),
+    ],
+    identity,
+  );
+
+  const fresh = evaluateChatWorkLiveness(selection, null, { nowMs: CHAT_WORK_NOW_MS });
+  assert.equal(fresh.isWorking, true);
+  assert.equal(fresh.agents[0]!.role, 'worker');
+
+  const footer = buildChatWorkEventViews(selection)[0]!.workerExecution!;
+  const freshFooter = resolveChatWorkExecutionFooterState(footer, CHAT_WORK_NOW_MS);
+  assert.equal(freshFooter.statusKey, 'working');
+  assert.equal(freshFooter.statusLabel, 'Working');
+  assert.equal(freshFooter.durationLabel, 'Elapsed 1.5s');
+
+  const expiredAtMs = 10_000 + 5_000 + 1;
+  const expired = evaluateChatWorkLiveness(selection, null, {
+    nowMs: expiredAtMs,
+  });
+  assert.equal(expired.isWorking, false);
+  assert.deepEqual(expired.agents, []);
+
+  // The durable dispatch receipt remains, but expired presence cannot sustain
+  // Working or keep an independent footer timer advancing.
+  assert.equal(footer.statusKey, 'dispatched');
+  const expiredFooter = resolveChatWorkExecutionFooterState(footer, expiredAtMs);
+  assert.equal(expiredFooter.statusKey, 'unavailable');
+  assert.equal(expiredFooter.statusLabel, 'Status unavailable');
+  assert.equal(expiredFooter.duration, null);
+  assert.equal(expiredFooter.durationLabel, null);
+});
+
+test('worker footer becomes unavailable for stale, unavailable, future, or non-current presence', () => {
+  const identity = makeIdentity('bnd_alpha_execution_presence_failures', UUID_ALPHA);
+  const footerAt = (presence: ChatWorkPresence | null, nowMs = CHAT_WORK_NOW_MS) => {
+    const { summary } = selectExecutionFixture(identity, {
+      item: { item_id: 'blg_presence_failure', current_execution_ref: 'exec-1' },
+      execution: {
+        worker_status: 'running',
+        outcome: null,
+        started_at_ms: 9_000,
+      },
+      presence: presence !== null ? [presence] : [],
+    });
+    return resolveChatWorkExecutionFooterState(summary, nowMs);
+  };
+
+  const fresh = footerAt(
+    makePresence({ item_id: 'blg_presence_failure', execution_ref: 'exec-1' }),
+  );
+  assert.equal(fresh.statusKey, 'working');
+  assert.equal(fresh.durationLabel, 'Elapsed 1.5s');
+
+  for (const presence of [
+    makePresence({
+      item_id: 'blg_presence_failure',
+      execution_ref: 'exec-1',
+      freshness: 'stale',
+    }),
+    makePresence({
+      item_id: 'blg_presence_failure',
+      execution_ref: 'exec-1',
+      availability: 'unavailable',
+    }),
+    makePresence({
+      item_id: 'blg_presence_failure',
+      execution_ref: 'exec-1',
+      sampled_at_ms: CHAT_WORK_NOW_MS + 1,
+    }),
+    makePresence({
+      item_id: 'blg_presence_failure',
+      execution_ref: 'exec-1',
+      expires_at_ms: null,
+    }),
+  ]) {
+    const state = footerAt(presence);
+    assert.equal(state.statusKey, 'unavailable');
+    assert.equal(state.duration, null);
+    assert.equal(state.durationLabel, null);
+  }
+
+  // A presence record for another attempt is never attached to this execution.
+  const otherAttempt = footerAt(
+    makePresence({
+      item_id: 'blg_presence_failure',
+      execution_ref: 'exec-other',
+    }),
+  );
+  assert.equal(otherAttempt.statusKey, 'dispatched');
+  assert.equal(otherAttempt.duration, null);
+});
+
+test('worker footers key by item id plus execution ref and retain evidenced history after item eviction', () => {
+  const identity = makeIdentity('bnd_alpha_execution_composite', UUID_ALPHA);
+  const sharedRef = 'exec-shared';
+  const sharedItemA = makeBacklogItem({
+    item_id: 'blg_shared_a',
+    binding_id: identity.binding_id,
+    kind: 'worker',
+    status: 'doing',
+    current_execution_ref: sharedRef,
+  });
+  const sharedItemB = makeBacklogItem({
+    item_id: 'blg_shared_b',
+    binding_id: identity.binding_id,
+    kind: 'worker',
+    status: 'blocked',
+    blocked_reason: 'A different item reuses the same textual ref.',
+    current_execution_ref: sharedRef,
+  });
+  const selection = selectWorkspaceChatWork(
+    [
+      makeChatWork(identity, {
+        items: [sharedItemA, sharedItemB],
+        events: [
+          makeBacklogEvent({
+            event_id: 'blg_shared_a:2',
+            sequence: 2,
+            item_id: 'blg_shared_a',
+            revision: 2,
+            action: 'worker_outcome_recorded',
+            status: 'doing',
+            execution_ref: sharedRef,
+            outcome: 'failure',
+            recorded_at_ms: 1_200,
+          }),
+          makeBacklogEvent({
+            event_id: 'blg_shared_b:3',
+            sequence: 3,
+            item_id: 'blg_shared_b',
+            revision: 3,
+            action: 'worker_outcome_recorded',
+            status: 'blocked',
+            execution_ref: sharedRef,
+            outcome: null,
+            recorded_at_ms: 1_300,
+          }),
+          makeBacklogEvent({
+            event_id: 'blg_evicted:4',
+            sequence: 4,
+            item_id: 'blg_evicted',
+            revision: 4,
+            action: 'worker_outcome_recorded',
+            status: 'blocked',
+            execution_ref: 'exec-historical',
+            outcome: 'failure',
+            recorded_at_ms: 1_400,
+          }),
+        ],
+        worker_executions: [
+          makeExecution(identity.binding_id, {
+            item_id: 'blg_shared_a',
+            execution_ref: sharedRef,
+            worker_status: 'failed',
+            outcome: 'failure',
+            started_at_ms: 1_000,
+            finished_at_ms: 1_200,
+          }),
+          makeExecution(identity.binding_id, {
+            item_id: 'blg_shared_b',
+            execution_ref: sharedRef,
+            worker_status: 'cancelled',
+            outcome: null,
+            started_at_ms: 1_100,
+            finished_at_ms: 1_300,
+          }),
+          makeExecution(identity.binding_id, {
+            item_id: 'blg_evicted',
+            execution_ref: 'exec-historical',
+            session_binding_id: 'bnd_runtime_approved',
+            worker_status: 'failed',
+            outcome: 'failure',
+            started_at_ms: 1_250,
+            finished_at_ms: 1_400,
+          }),
+          makeExecution(identity.binding_id, {
+            item_id: 'blg_without_event',
+            execution_ref: 'exec-without-event',
+            worker_status: 'failed',
+            outcome: 'failure',
+          }),
+        ],
+      }),
+    ],
+    identity,
+  );
+
+  assert.deepEqual(
+    selection.executions.map((execution) => [execution.item_id, execution.execution_ref]),
+    [
+      ['blg_shared_a', sharedRef],
+      ['blg_shared_b', sharedRef],
+      ['blg_evicted', 'exec-historical'],
+    ],
+  );
+  assert.equal(selection.bounds.executionsOmitted, 1);
+
+  const views = buildChatWorkEventViews(selection);
+  const footerByItem = new Map(
+    views
+      .filter((view) => view.workerExecution !== null)
+      .map((view) => [view.itemId, view.workerExecution!] as const),
+  );
+  assert.equal(footerByItem.get('blg_shared_a')?.statusKey, 'failed');
+  assert.equal(footerByItem.get('blg_shared_b')?.statusKey, 'cancelled');
+  assert.equal(footerByItem.get('blg_evicted')?.statusKey, 'failed');
+  assert.equal(footerByItem.get('blg_evicted')?.itemId, 'blg_evicted');
+  assert.equal(
+    selection.executions.find((execution) => execution.item_id === 'blg_evicted')
+      ?.session_binding_id,
+    'bnd_runtime_approved',
+  );
+
+  const evictedFooter = footerByItem.get('blg_evicted')!;
+  const evictedState = resolveChatWorkExecutionFooterState(
+    evictedFooter,
+    CHAT_WORK_NOW_MS,
+  );
+  assert.equal(evictedState.statusKey, 'failed');
+  assert.equal(evictedState.durationLabel, '150ms');
+});
+
+test('retained accepted execution keeps guarded Done after its item leaves the item window', () => {
+  const identity = makeIdentity('bnd_alpha_execution_retained_done', UUID_ALPHA);
+  const selection = selectWorkspaceChatWork(
+    [
+      makeChatWork(identity, {
+        items: [],
+        events: [
+          makeBacklogEvent({
+            event_id: 'blg_retained_done:5',
+            sequence: 5,
+            item_id: 'blg_retained_done',
+            revision: 5,
+            action: 'completed',
+            status: 'done',
+            execution_ref: 'exec-retained-done',
+            recorded_at_ms: 1_500,
+          }),
+        ],
+        worker_executions: [
+          makeExecution(identity.binding_id, {
+            item_id: 'blg_retained_done',
+            execution_ref: 'exec-retained-done',
+            session_binding_id: 'bnd_runtime_approved',
+            worker_status: 'completed',
+            outcome: 'success',
+            acceptance: 'accepted',
+            started_at_ms: 1_000,
+            finished_at_ms: 1_450,
+            duration_ms: 450,
+          }),
+        ],
+      }),
+    ],
+    identity,
+  );
+
+  assert.deepEqual(selection.items, []);
+  assert.equal(selection.executions.length, 1);
+  const footer = buildChatWorkEventViews(selection)[0]!.workerExecution!;
+  assert.equal(footer.itemStatus, null);
+  const state = resolveChatWorkExecutionFooterState(footer, CHAT_WORK_NOW_MS);
+  assert.equal(state.statusKey, 'completed');
+  assert.equal(state.statusLabel, 'Completed');
+  assert.equal(state.durationLabel, '450ms');
+});
+
+test('raw duplicate chat_work rows reconcile item and presence identities before their bounded caps', () => {
+  const identity = makeIdentity('bnd_alpha_raw_duplicate_bounds', UUID_ALPHA);
+  const items = Array.from({ length: 11 }, (_, index) =>
+    makeBacklogItem({
+      item_id: `blg_raw_duplicate_${index}`,
+      binding_id: identity.binding_id,
+      kind: 'worker',
+      status: 'doing',
+      current_execution_ref: `exec-raw-${index}`,
+    }),
+  );
+  const firstItem = items[0]!;
+  const secondItem = items[1]!;
+  const repeatedPresence = Array.from({ length: 32 }, () =>
+    makePresence({
+      item_id: firstItem.item_id,
+      execution_ref: firstItem.current_execution_ref!,
+    }),
+  );
+  const independentPresence = makePresence({
+    item_id: secondItem.item_id,
+    execution_ref: secondItem.current_execution_ref!,
+  });
+  const work = makeChatWork(identity, {
+    items,
+    worker_presence: [...repeatedPresence, independentPresence],
+  });
+
+  const duplicated = selectWorkspaceChatWork([work, work], identity);
+  assert.equal(duplicated.items.length, 11);
+  assert.equal(new Set(duplicated.items.map((item) => item.item_id)).size, 11);
+  assert.equal(duplicated.bounds.itemsOmitted, 11);
+
+  const single = selectWorkspaceChatWork([work], identity);
+  assert.deepEqual(
+    single.presence.map((presence) => [presence.item_id, presence.execution_ref]),
+    [
+      [firstItem.item_id, firstItem.current_execution_ref],
+      [secondItem.item_id, secondItem.current_execution_ref],
+    ],
+  );
+  assert.equal(single.bounds.presenceOmitted, 31);
+  assert.equal(
+    evaluateChatWorkLiveness(single, null, { nowMs: CHAT_WORK_NOW_MS })
+      .workingAgentCount,
+    2,
+  );
+
+  const indexEntry = buildChatWorkLivenessIndex([work, work], [], {
+    nowMs: CHAT_WORK_NOW_MS,
+  }).get(resolveMessageScrollChatKey(identity))!;
+  assert.equal(indexEntry.workingAgentCount, 2);
+  assert.deepEqual(
+    indexEntry.presence.map((presence) => presence.item_id),
+    [firstItem.item_id, secondItem.item_id],
+  );
+});
+
+test('raw duplicate reconciliation keeps the newest item revision, fresh sample winner, and exact chats separate', () => {
+  const alphaIdentity = makeIdentity('bnd_alpha_raw_revision', UUID_ALPHA);
+  const betaIdentity = makeIdentity('bnd_beta_raw_revision', UUID_BETA);
+  const attempt = {
+    item_id: 'blg_raw_revision',
+    execution_ref: 'exec-raw-revision',
+  };
+  const staleNewer = makePresence({
+    ...attempt,
+    freshness: 'stale',
+    sampled_at_ms: 10_400,
+    sample_age_ms: 100,
+  });
+  const freshOlder = makePresence({
+    ...attempt,
+    freshness: 'fresh',
+    sampled_at_ms: 10_000,
+    sample_age_ms: 500,
+  });
+  const alphaWork = makeChatWork(alphaIdentity, {
+    items: [
+      makeBacklogItem({
+        item_id: attempt.item_id,
+        binding_id: alphaIdentity.binding_id,
+        kind: 'worker',
+        status: 'todo',
+        revision: 1,
+        current_execution_ref: null,
+      }),
+      makeBacklogItem({
+        item_id: attempt.item_id,
+        binding_id: alphaIdentity.binding_id,
+        kind: 'worker',
+        status: 'doing',
+        revision: 2,
+        current_execution_ref: attempt.execution_ref,
+      }),
+    ],
+    worker_presence: [staleNewer, freshOlder],
+  });
+  const betaWork = makeChatWork(betaIdentity, {
+    items: [
+      makeBacklogItem({
+        item_id: attempt.item_id,
+        binding_id: betaIdentity.binding_id,
+        kind: 'worker',
+        status: 'doing',
+        current_execution_ref: attempt.execution_ref,
+      }),
+    ],
+    worker_presence: [makePresence(attempt)],
+  });
+
+  const alpha = selectWorkspaceChatWork([alphaWork, betaWork], alphaIdentity);
+  assert.deepEqual(
+    alpha.items.map((item) => [
+      item.binding_id,
+      item.item_id,
+      item.revision,
+      item.status,
+    ]),
+    [[alphaIdentity.binding_id, attempt.item_id, 2, 'doing']],
+  );
+  assert.equal(alpha.bounds.itemsOmitted, 1);
+  assert.equal(alpha.presence.length, 1);
+  assert.equal(alpha.presence[0]!.freshness, 'fresh');
+  assert.equal(alpha.presence[0]!.sampled_at_ms, 10_000);
+  assert.equal(alpha.bounds.presenceOmitted, 1);
+  assert.equal(
+    evaluateChatWorkLiveness(alpha, null, { nowMs: CHAT_WORK_NOW_MS })
+      .workingAgentCount,
+    1,
+  );
+
+  const beta = selectWorkspaceChatWork([alphaWork, betaWork], betaIdentity);
+  assert.deepEqual(
+    beta.items.map((item) => [item.binding_id, item.item_id]),
+    [[betaIdentity.binding_id, attempt.item_id]],
+  );
+  assert.equal(beta.bounds.itemsOmitted, 0);
+  assert.equal(beta.presence.length, 1);
+  assert.equal(beta.bounds.presenceOmitted, 0);
+});
+
+test('raw duplicate reconciliation never resurrects a quarantined execution identity', () => {
+  const identity = makeIdentity('bnd_alpha_raw_quarantine', UUID_ALPHA);
+  const item = makeBacklogItem({
+    item_id: 'blg_raw_quarantine',
+    binding_id: identity.binding_id,
+    kind: 'worker',
+    status: 'blocked',
+    blocked_reason: 'The attempt identity conflicts.',
+    current_execution_ref: 'exec-raw-quarantine',
+  });
+  const event = makeBacklogEvent({
+    event_id: 'blg_raw_quarantine:2',
+    sequence: 2,
+    item_id: item.item_id,
+    revision: 2,
+    action: 'worker_outcome_recorded',
+    status: 'blocked',
+    execution_ref: 'exec-raw-quarantine',
+    outcome: 'failure',
+    recorded_at_ms: 1_200,
+  });
+  const base = makeExecution(identity.binding_id, {
+    item_id: item.item_id,
+    execution_ref: 'exec-raw-quarantine',
+    session_binding_id: 'bnd_runtime_raw_quarantine',
+    worker_status: 'running',
+    outcome: null,
+    started_at_ms: 9_000,
+  });
+  const conflicting = makeExecution(identity.binding_id, {
+    ...base,
+    approval_id: 'approval-raw-other',
+  });
+  const terminal = makeExecution(identity.binding_id, {
+    ...base,
+    worker_status: 'completed',
+    outcome: 'success',
+    acceptance: 'accepted',
+    finished_at_ms: 13_200,
+    duration_ms: 4_200,
+  });
+  const conflictWork = makeChatWork(identity, {
+    items: [item, item],
+    events: [event, event],
+    worker_presence: [
+      makePresence({
+        item_id: item.item_id,
+        execution_ref: 'exec-raw-quarantine',
+        approval_id: 'approval-raw-other',
+      }),
+      makePresence({
+        item_id: item.item_id,
+        execution_ref: 'exec-raw-quarantine',
+      }),
+    ],
+    worker_executions: [base, conflicting],
+  });
+  const terminalWork = makeChatWork(identity, {
+    items: [item],
+    events: [event],
+    worker_executions: [terminal],
+  });
+
+  const selection = selectWorkspaceChatWork([conflictWork, terminalWork], identity);
+  assert.equal(selection.items.length, 1);
+  assert.equal(selection.bounds.itemsOmitted, 2);
+  assert.equal(selection.events.length, 1);
+  assert.deepEqual(selection.executions, []);
+  assert.equal(selection.bounds.executionsOmitted, 3);
+  assert.equal(buildChatWorkEventViews(selection)[0]!.workerExecution, null);
+  assert.equal(
+    evaluateChatWorkLiveness(selection, null, { nowMs: CHAT_WORK_NOW_MS }).isWorking,
+    false,
+  );
+
+  const indexEntry = buildChatWorkLivenessIndex(
+    [conflictWork, terminalWork],
+    [makeNativeSample(identity, 'idle')],
+    { nowMs: CHAT_WORK_NOW_MS },
+  ).get(resolveMessageScrollChatKey(identity))!;
+  assert.equal(indexEntry.isWorking, false);
+  assert.equal(indexEntry.waitingForHuman, false);
 });

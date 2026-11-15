@@ -1347,6 +1347,61 @@ pub struct TaskLifecycleProjection {
     pub verification_detail: Option<String>,
 }
 
+/// Bounded, path-free summary of one verified running or terminal Worker execution.
+///
+/// Scoped to the exact frozen approval/task, sealed task receipt, runtime session binding, run,
+/// and worker. It carries only safe provider/model/effort/status/timing metadata and never exposes
+/// instructions, provider prose, worktree paths, credentials, or review acceptance. A running
+/// status is runtime metadata, not evidence of live process presence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskTerminalSummary {
+    /// Deterministic approval identifier.
+    pub approval_id: String,
+    /// 64-character lowercase hex SHA-256 digest of the frozen approval subject.
+    pub subject_digest: String,
+    /// Authoritative control-plane chat binding identifier.
+    pub binding_id: String,
+    /// Canonical lowercase hyphenated non-nil native Codex thread UUID.
+    pub thread_uuid: String,
+    /// Runtime session binding identifier owned by the host.
+    pub session_binding_id: String,
+    /// Approved task identifier.
+    pub task_id: String,
+    /// 64-character lowercase hex SHA-256 digest of the compiled task specification.
+    pub task_digest: String,
+    /// Actual software-generated run identifier from the sealed receipt.
+    pub run_id: String,
+    /// Actual software-generated worker identifier from the sealed receipt.
+    pub worker_id: String,
+    /// Provider fixed by the frozen execution profile, when non-empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// Exact model requested by the frozen execution profile, when non-empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_model: Option<String>,
+    /// Model actually reported by provider telemetry, when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_model: Option<String>,
+    /// Exact reasoning effort requested by the frozen execution profile, when non-empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_effort: Option<String>,
+    /// Reasoning effort actually reported by provider telemetry, when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_effort: Option<String>,
+    /// Verified runtime Worker status (running or terminal).
+    pub worker_status: WorkerStatus,
+    /// Actual runtime start timestamp in milliseconds since the Unix epoch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at_ms: Option<i64>,
+    /// Actual runtime finish timestamp in milliseconds since the Unix epoch, when terminal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at_ms: Option<i64>,
+    /// Actual measured terminal duration in milliseconds when proven.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+}
+
 /// Scoped, token-free snapshot of an approved task's execution state returned by
 /// [`crate::ApprovedHostClient::dispatch_task`], [`crate::ApprovedHostClient::get_task`], and
 /// [`crate::ApprovedHostClient::cancel_task`].

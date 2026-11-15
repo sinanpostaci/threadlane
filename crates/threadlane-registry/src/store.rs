@@ -348,9 +348,11 @@ impl Drop for StoreLockGuard<'_> {
 /// Resolves the [`ModelChoice`] for a given `profile_id`, `role`, and optional `difficulty`.
 ///
 /// Resolution checks for an exact `(role, Some(difficulty))` match first (when `difficulty` is
-/// `Some`), then falls back to the explicit role default `(role, None)`. It never substitutes
-/// another difficulty, another role, or an unapproved model. Returns an explicit error if the
-/// profile is missing, the assignment is missing, or the referenced model/effort is invalid.
+/// `Some`), then falls back to the explicit role default `(role, None)`. Role matching is
+/// semantic: current `advisor` requests resolve retained legacy `architect` assignments and vice
+/// versa without rewriting either raw identity. It never substitutes another difficulty, another
+/// role, or an unapproved model. Returns an explicit error if the profile is missing, the
+/// assignment is missing, or the referenced model/effort is invalid.
 pub fn resolve_choice(
     snapshot: &RegistrySnapshot,
     profile_id: &str,
@@ -369,21 +371,24 @@ pub fn resolve_choice(
 
     validate_unique_assignments(&profile.assignments)?;
 
+    let canonical_role = role.canonical();
     let assignment = match difficulty {
         Some(target_difficulty) => profile
             .assignments
             .iter()
-            .find(|entry| entry.role == role && entry.difficulty == Some(target_difficulty))
+            .find(|entry| {
+                entry.role.canonical() == canonical_role
+                    && entry.difficulty == Some(target_difficulty)
+            })
             .or_else(|| {
-                profile
-                    .assignments
-                    .iter()
-                    .find(|entry| entry.role == role && entry.difficulty.is_none())
+                profile.assignments.iter().find(|entry| {
+                    entry.role.canonical() == canonical_role && entry.difficulty.is_none()
+                })
             }),
         None => profile
             .assignments
             .iter()
-            .find(|entry| entry.role == role && entry.difficulty.is_none()),
+            .find(|entry| entry.role.canonical() == canonical_role && entry.difficulty.is_none()),
     }
     .ok_or(RegistryError::MissingAssignment(
         "No model assignment is configured for the requested role and difficulty.",
@@ -396,6 +401,11 @@ pub fn resolve_choice(
 impl ScopedProfileDependencySpec {
     /// Extracts the canonical, self-contained dependency specification for `profile_id` from
     /// `snapshot`.
+    ///
+    /// Advisory assignments are projected to the stable v1 advisory spelling (`architect`) so
+    /// equivalent current and legacy profile spellings produce identical dependency bytes and
+    /// digests. This is an internal proof representation only; the registry profile itself keeps
+    /// its raw current `advisor` identity.
     ///
     /// Fails closed if `snapshot` is invalid or `profile_id` does not exist in `snapshot`.
     pub fn from_snapshot(
@@ -417,7 +427,11 @@ impl ScopedProfileDependencySpec {
             .assignments
             .iter()
             .filter(|entry| entry.role.is_execution_role())
-            .cloned()
+            .map(|entry| RoleAssignment {
+                role: entry.role.v1_hash_role(),
+                difficulty: entry.difficulty,
+                choice: entry.choice.clone(),
+            })
             .collect();
         assignments.sort_by(|left, right| {
             (left.role.as_str(), left.difficulty.map(Difficulty::as_str)).cmp(&(
@@ -507,6 +521,15 @@ impl ScopedProfileDependencySpec {
         {
             return Err(RegistryError::InvalidInput(
                 "Scoped profile dependency assignments must contain only execution roles.",
+            ));
+        }
+        if self
+            .assignments
+            .iter()
+            .any(|entry| entry.role == WorkflowRole::Advisor)
+        {
+            return Err(RegistryError::InvalidInput(
+                "Scoped profile dependency assignments must use the stable v1 advisory spelling (architect); current advisor identities are stored outside this compatibility hash domain.",
             ));
         }
 
@@ -953,7 +976,9 @@ fn validate_decision_advisor(
 fn validate_unique_assignments(assignments: &[RoleAssignment]) -> Result<(), RegistryError> {
     let mut seen = BTreeSet::new();
     for assignment in assignments {
-        if !seen.insert((assignment.role, assignment.difficulty)) {
+        // Semantic duplicate detection: current `advisor` and retained `architect` are the same
+        // configurable advisory slot and must never silently overwrite or merge each other.
+        if !seen.insert((assignment.role.canonical(), assignment.difficulty)) {
             return Err(RegistryError::DuplicateAssignment(
                 "Workflow profile contains duplicate role and difficulty assignments.",
             ));

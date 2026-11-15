@@ -12,7 +12,8 @@
 //!   exclusively under an existing active [`PlanningAdviceGrant`]. `prepare_work` records or amends
 //!   a structured [`WorkBrief`] and applies holds on affected tasks without granting approval or
 //!   starting worker execution.
-//! - **Real dependency file blobs and prior advice records**: `consult_architect` computes exact
+//! - **Real dependency file blobs and prior advice records**: `consult_advisor` and the retained
+//!   legacy `consult_architect` compute exact
 //!   64-character SHA-256 file blob digests at `project_base.base_commit` via
 //!   [`CoworkerPlanningService::compute_dependency_file_blobs`], requires at least one real file
 //!   context path, resolves prior advice identifiers strictly against stored
@@ -232,7 +233,7 @@ pub struct ConsultArchitectParams {
     pub question: String,
     /// Non-empty list of repository-relative file paths (`>= 1` required) at `project_base.base_commit`.
     pub dependency_files: Vec<String>,
-    /// Optional difficulty tier (`easy`, `medium`, `hard`, or `extreme`) used to select the Architect worker.
+    /// Optional difficulty tier (`easy`, `medium`, `hard`, or `extreme`) used to select the advisory worker.
     #[serde(default)]
     #[schemars(with = "Option<GatewayDifficulty>")]
     pub difficulty: Option<Difficulty>,
@@ -243,6 +244,12 @@ pub struct ConsultArchitectParams {
     #[serde(default)]
     pub expected_ledger_revision: Option<u64>,
 }
+
+/// Parameters for the scoped canonical `consult_advisor` MCP tool.
+///
+/// The field shape is identical to the retained legacy [`ConsultArchitectParams`]; only the
+/// canonical tool name and persisted advisory role identity differ.
+pub type ConsultAdvisorParams = ConsultArchitectParams;
 
 /// Parameters for the scoped `request_technical_plan` MCP tool.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -1328,7 +1335,7 @@ pub struct CoworkerStatusCommandSummary {
     /// Target or published workflow `plan_id` when applicable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_id: Option<String>,
-    /// Primary planning role (`architect` or `orchestrator`).
+    /// Primary planning role (`advisor`, retained legacy `architect`, or `orchestrator`).
     pub role: WorkflowRole,
     /// Resolved headless worker choice verified against the grant profile and policy at enqueue.
     pub selected_choice: SelectedRoleChoice,
@@ -1618,7 +1625,7 @@ pub struct PlanningCommandSubmissionResponse {
     pub job_id: String,
     /// Deterministic planning command identifier (`pcm_<32hex>`).
     pub command_id: String,
-    /// Target planning role (`architect` or `orchestrator`).
+    /// Target planning role (`advisor`, retained legacy `architect`, or `orchestrator`).
     pub role: WorkflowRole,
     /// Current durable [`PlanningCommandStatus`] observed in the command ledger.
     pub status: PlanningCommandStatus,
@@ -1693,7 +1700,7 @@ pub struct PlanningCommandDetailResponse {
     /// Target [`CoworkerJobRecord::job_id`] when the command is an Orchestrator command.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub job_id: Option<String>,
-    /// Target planning role (`architect` or `orchestrator`).
+    /// Target planning role (`advisor`, retained legacy `architect`, or `orchestrator`).
     pub role: WorkflowRole,
     /// Current durable [`PlanningCommandStatus`].
     pub status: PlanningCommandStatus,
@@ -2399,6 +2406,30 @@ impl CoworkerPlanningGateway {
             .await
     }
 
+    /// Enqueues a dependency-bound canonical Advisor consultation command for `(grant_id, job_id)`
+    /// and triggers detached execution via the canonical same-package sibling `threadlane-flow` CLI.
+    pub async fn consult_advisor(
+        &self,
+        params: &ConsultAdvisorParams,
+    ) -> Result<PlanningCommandSubmissionResponse, NativeError> {
+        let gateway = self.clone();
+        let params_cloned = params.clone();
+        let (flow_exe, enqueue_req) = tokio::task::spawn_blocking(move || {
+            let flow_exe = gateway.resolve_sibling_flow_executable()?;
+            let enqueue_req = gateway.build_consult_advisor_enqueue_request(&params_cloned)?;
+            Ok::<_, NativeError>((flow_exe, enqueue_req))
+        })
+        .await
+        .map_err(|_| {
+            NativeError::new(
+                NativeErrorCode::IoError,
+                "consult_advisor background preparation task failed to complete",
+            )
+        })??;
+        self.enqueue_and_start_with_flow(&flow_exe, &params.job_id, enqueue_req)
+            .await
+    }
+
     /// Enqueues an Orchestrator technical planning command for `(grant_id, job_id)` and triggers
     /// detached execution via the canonical same-package sibling `threadlane-flow` CLI.
     pub async fn request_technical_plan(
@@ -2573,6 +2604,27 @@ impl CoworkerPlanningGateway {
         &self,
         params: &ConsultArchitectParams,
     ) -> Result<EnqueuePlanningCommandRequest, NativeError> {
+        self.build_consult_enqueue_request(params, WorkflowRole::Architect)
+    }
+
+    fn build_consult_advisor_enqueue_request(
+        &self,
+        params: &ConsultAdvisorParams,
+    ) -> Result<EnqueuePlanningCommandRequest, NativeError> {
+        self.build_consult_enqueue_request(params, WorkflowRole::Advisor)
+    }
+
+    fn build_consult_enqueue_request(
+        &self,
+        params: &ConsultArchitectParams,
+        role: WorkflowRole,
+    ) -> Result<EnqueuePlanningCommandRequest, NativeError> {
+        if !role.is_advisor() {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "consultation command requires the advisory role",
+            ));
+        }
         validate_bounded_identifier(&params.grant_id, "grant_id", MAX_COWORKER_ID_LEN)?;
         validate_bounded_identifier(&params.job_id, "job_id", MAX_COWORKER_ID_LEN)?;
         validate_bounded_identifier(&params.request_key, "request_key", MAX_COWORKER_ID_LEN)?;
@@ -2581,7 +2633,7 @@ impl CoworkerPlanningGateway {
         if params.dependency_files.is_empty() {
             return Err(NativeError::new(
                 NativeErrorCode::ValidationFailed,
-                "consult_architect requires at least one repository-relative path in dependency_files",
+                "consultation requires at least one repository-relative path in dependency_files",
             ));
         }
         validate_unique_text_list(
@@ -2605,6 +2657,12 @@ impl CoworkerPlanningGateway {
             &params.grant_id,
             now_ms,
         )?;
+        if role == WorkflowRole::Advisor && !grant.policy.explicitly_authorizes_advisor() {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "canonical Advisor consultation requires planning authority that explicitly names the advisor role; use consult_architect for a pre-transition architect-only grant",
+            ));
+        }
         let job = require_scoped_job(
             &wf_ledger,
             &self.binding_id,
@@ -2627,7 +2685,7 @@ impl CoworkerPlanningGateway {
         if dependency_file_blobs.is_empty() {
             return Err(NativeError::new(
                 NativeErrorCode::ValidationFailed,
-                "consult_architect requires at least one resolved dependency file blob at project_base",
+                "consultation requires at least one resolved dependency file blob at project_base",
             ));
         }
 
@@ -2676,7 +2734,11 @@ impl CoworkerPlanningGateway {
             current_time_ms: now_ms,
         };
 
-        Ok(EnqueuePlanningCommandRequest::from_architect(arch_req))
+        if role == WorkflowRole::Advisor {
+            Ok(EnqueuePlanningCommandRequest::from_advisor(arch_req))
+        } else {
+            Ok(EnqueuePlanningCommandRequest::from_architect(arch_req))
+        }
     }
 
     fn build_request_technical_plan_enqueue_request(
@@ -4002,7 +4064,6 @@ fn compute_default_max_architect_rounds(
     if !can_resolve_headless_architect_for_grant(registry_dir, grant, architect_difficulty) {
         return 0;
     }
-
     let max_by_architect = remaining_architect;
     let max_by_orchestrator = remaining_orchestrator.saturating_sub(1);
     let max_by_total = remaining_total.saturating_sub(1) / 2;
@@ -4029,7 +4090,7 @@ fn can_resolve_headless_architect_for_grant(
         &PreflightRequest {
             profile_id: Some(grant.profile_id.clone()),
             roles: vec![RolePreflightRequest::new(
-                WorkflowRole::Architect,
+                grant.policy.advisory_role(),
                 difficulty,
             )],
         },
@@ -4047,7 +4108,7 @@ fn can_resolve_headless_architect_for_grant(
         return false;
     };
     let Ok(selected) = crate::profile_flow::normalize_read_only_advisory_choice(
-        WorkflowRole::Architect,
+        grant.policy.advisory_role(),
         raw_selected,
     ) else {
         return false;
@@ -4060,7 +4121,7 @@ fn can_resolve_headless_architect_for_grant(
     {
         return false;
     }
-    if validate_non_native_worker_choice(WorkflowRole::Architect, &selected).is_err() {
+    if validate_non_native_worker_choice(grant.policy.advisory_role(), &selected).is_err() {
         return false;
     }
     let Some(tool_def) = reg_snapshot.tools.iter().find(|t| t.id == selected.tool_id) else {

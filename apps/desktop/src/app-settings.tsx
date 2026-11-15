@@ -25,6 +25,7 @@ import {
 } from 'lucide-react';
 import { useCallback, useEffect, useRef, useState } from 'react';
 
+import { readDesktopBuildIdentity } from './build-info.ts';
 import {
   applyCodexSetup,
   fetchCodexSetupStatus,
@@ -80,6 +81,9 @@ import {
 } from './types.ts';
 
 export const APPEARANCE_STORAGE_KEY = 'threadlane.desktop.appearance.v1';
+
+// The packaged frontend identity is fixed for the lifetime of the webview.
+const desktopBuildIdentity = readDesktopBuildIdentity();
 
 export function loadSavedAppearance(): AppearancePreferences {
   try {
@@ -749,6 +753,49 @@ export function SettingsPanel({
                   );
                 })}
               </div>
+            </Flex>
+          </Flex>
+        </Card>
+
+        {/* Packaged desktop source identity (read-only, frontend only) */}
+        <Card
+          size="2"
+          className="tl-settings-card"
+          role="group"
+          aria-label="Desktop build"
+        >
+          <Flex align="center" justify="between" gap="3" wrap="wrap">
+            <div>
+              <Text as="div" size="2" weight="medium">
+                Desktop build
+              </Text>
+              <Text as="div" size="1" color="gray">
+                Source identity embedded in this Desktop package only. Native
+                MCP and Host packages are separate observations and may differ.
+              </Text>
+            </div>
+            <Flex align="center" gap="2" wrap="wrap">
+              <Badge
+                size="1"
+                variant="soft"
+                color={
+                  desktopBuildIdentity.kind === 'revision'
+                    ? 'green'
+                    : desktopBuildIdentity.kind === 'dirty'
+                      ? 'amber'
+                      : 'gray'
+                }
+              >
+                {desktopBuildIdentity.statusLabel}
+              </Badge>
+              <Text
+                size="1"
+                style={{
+                  fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+                }}
+              >
+                {desktopBuildIdentity.displayValue}
+              </Text>
             </Flex>
           </Flex>
         </Card>

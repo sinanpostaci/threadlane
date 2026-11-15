@@ -95,8 +95,9 @@ import type {
 } from './registry/profile-advisor.ts';
 import {
   isApiToolAdapter,
-   isExecutionRole,
+  isExecutionRole,
   workflowRoleLabel,
+  type CanonicalExecutionWorkflowRole,
   type Difficulty,
   type ModelDefinition,
   type RegistryChange,
@@ -134,7 +135,7 @@ function resolveCellToolAdapter(
 function resolveRoleToolAdapter(
   index: RegistryIndex | null,
   table: AssignmentTable,
-  role: WorkflowRole
+  role: CanonicalExecutionWorkflowRole
 ): ToolAdapter | null {
   const defaultAdapter = resolveCellToolAdapter(index, table[role].default);
   if (defaultAdapter) {
@@ -275,7 +276,7 @@ interface EffortSelectConfig {
 function resolveEffortSelectState(
   index: RegistryIndex | null,
   table: AssignmentTable,
-  role: WorkflowRole,
+  role: CanonicalExecutionWorkflowRole,
   slot: Slot,
   busy: boolean
 ): EffortSelectConfig {

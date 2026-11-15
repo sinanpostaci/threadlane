@@ -12,10 +12,11 @@
 //! - **Structured [`WorkBrief`]**: Separates confirmed requirements, proposed additions,
 //!   assumptions, open questions, and accepted architect decisions, and explicitly distinguishes
 //!   [`WorkBriefKind::NewJob`] from [`WorkBriefKind::Amendment`].
-//! - **Separate read-only [`PlanningAdviceGrant`]**: Planning and architectural advice grants are
+//! - **Separate read-only [`PlanningAdviceGrant`]**: Planning and advisory grants are
 //!   distinct from code-execution [`ApprovalRecord`]s, require trusted-local operator attestation,
-//!   bind exact [`ExecutionPolicy`] rules restricted to [`WorkflowRole::Orchestrator`] and
-//!   [`WorkflowRole::Architect`], enforce read-only capabilities, and reserve finite call budgets
+//!   bind exact [`ExecutionPolicy`] rules restricted to [`WorkflowRole::Orchestrator`] and the
+//!   advisory role (current [`WorkflowRole::Advisor`] or retained legacy
+//!   [`WorkflowRole::Architect`]), enforce read-only capabilities, and reserve finite call budgets
 //!   durably before effect.
 //! - **Dependency-bound [`ArchitectAdviceRecord`] reuse**: Architectural advice may be reused only
 //!   when [`ArchitectContextDependencies`] (repository, base commit/tree, brief/plan/policy
@@ -565,7 +566,7 @@ pub struct PlanningCallBudget {
     pub max_total_calls: u32,
     /// Maximum `WorkflowRole::Orchestrator` calls permitted under this grant.
     pub max_orchestrator_calls: u32,
-    /// Maximum `WorkflowRole::Architect` calls permitted under this grant.
+    /// Maximum advisory-role calls permitted under this grant.
     pub max_architect_calls: u32,
     /// Maximum wall-clock timeout in milliseconds for any single call.
     pub max_timeout_ms_per_call: u64,
@@ -625,7 +626,7 @@ pub struct PlanningGrantUsage {
     pub refused_before_effect_calls: u32,
     /// Total `WorkflowRole::Orchestrator` calls reserved or consumed.
     pub reserved_orchestrator_calls: u32,
-    /// Total `WorkflowRole::Architect` calls reserved or consumed.
+    /// Total advisory-role calls reserved or consumed.
     pub reserved_architect_calls: u32,
 }
 
@@ -854,18 +855,19 @@ impl PlanningAdviceGrant {
         if self.policy.allow_rules.is_empty() {
             return Err(NativeError::new(
                 NativeErrorCode::ValidationFailed,
-                "PlanningAdviceGrant.policy must contain at least one explicit allow rule for Orchestrator or Architect",
+                "PlanningAdviceGrant.policy must contain at least one explicit allow rule for Orchestrator or Advisor",
             ));
         }
         for rule in &self.policy.allow_rules {
             if rule.roles.is_empty()
-                || rule.roles.iter().any(|role| {
-                    !matches!(role, WorkflowRole::Orchestrator | WorkflowRole::Architect)
-                })
+                || rule
+                    .roles
+                    .iter()
+                    .any(|role| !matches!(role, WorkflowRole::Orchestrator) && !role.is_advisor())
             {
                 return Err(NativeError::new(
                     NativeErrorCode::ValidationFailed,
-                    "PlanningAdviceGrant.policy rules must explicitly restrict roles to Orchestrator and/or Architect only",
+                    "PlanningAdviceGrant.policy rules must explicitly restrict roles to Orchestrator and/or the advisory role only",
                 ));
             }
         }
@@ -924,13 +926,10 @@ impl PlanningAdviceGrant {
                     "duplicate reservation_id or request_key in PlanningAdviceGrant",
                 ));
             }
-            if !matches!(
-                res.role,
-                WorkflowRole::Orchestrator | WorkflowRole::Architect
-            ) {
+            if !matches!(res.role, WorkflowRole::Orchestrator) && !res.role.is_advisor() {
                 return Err(NativeError::new(
                     NativeErrorCode::ValidationFailed,
-                    "PlanningCallReservation.role must be Orchestrator or Architect",
+                    "PlanningCallReservation.role must be Orchestrator or the advisory role",
                 ));
             }
             validate_non_native_worker_choice(res.role, &res.selected_choice)?;

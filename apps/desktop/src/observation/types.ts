@@ -198,9 +198,11 @@ export const MAX_WORKSPACE_RECORD_LINKS_PER_LIST = 64 as const;
 export const MAX_WORKSPACE_CHAT_WORK_ITEMS_PER_CHAT = 200 as const;
 export const MAX_WORKSPACE_CHAT_WORK_EVENTS_PER_CHAT = 500 as const;
 export const MAX_WORKSPACE_CHAT_WORK_PRESENCE_PER_CHAT = 32 as const;
+export const MAX_WORKSPACE_CHAT_WORK_EXECUTIONS_PER_CHAT = 32 as const;
 export const MAX_WORKSPACE_CHAT_WORK_ITEMS_TOTAL = 1_000 as const;
 export const MAX_WORKSPACE_CHAT_WORK_EVENTS_TOTAL = 2_000 as const;
 export const MAX_WORKSPACE_CHAT_WORK_PRESENCE_TOTAL = 64 as const;
+export const MAX_WORKSPACE_CHAT_WORK_EXECUTIONS_TOTAL = 128 as const;
 export const MAX_WORKSPACE_BACKLOG_PRESENCE_SAMPLE_AGE_MS = 5_000 as const;
 export const MAX_WORKSPACE_EXTERNAL_RESOLUTIONS_PER_JOB =
   MAX_WORKSPACE_RECORD_LINKS_PER_LIST;
@@ -670,10 +672,62 @@ export interface WorkspaceBacklogWorkerPresence {
   expires_at_ms: number | null;
 }
 
+/**
+ * Verified historical/runtime Worker execution metadata retained for the chat
+ * stream footer. Every required identity field is frozen at dispatch; optional
+ * metadata is present only when the record itself proved it.
+ */
+export type WorkspaceWorkerExecutionStatus =
+  | 'queued'
+  | 'claimed'
+  | 'running'
+  | 'cancel_requested'
+  | 'completed'
+  | 'failed'
+  | 'cancelled'
+  | 'timed_out'
+  | 'unknown'
+  | (string & {});
+
+export type WorkspaceWorkerExecutionOutcome = 'success' | 'failure' | 'unknown';
+
+export type WorkspaceWorkerExecutionAcceptance =
+  | 'pending_review'
+  | 'ready_for_review'
+  | 'accepted'
+  | 'rejected'
+  | 'rejected_by_diff_gate'
+  | 'execution_failed'
+  | 'unknown'
+  | (string & {});
+
+export interface WorkspaceWorkerExecution {
+  item_id: string;
+  execution_ref: string;
+  approval_id: string;
+  task_id: string;
+  session_binding_id: string;
+  run_id: string;
+  worker_id: string;
+  provider: string | null;
+  requested_model: string | null;
+  observed_model: string | null;
+  requested_effort: string | null;
+  observed_effort: string | null;
+  worker_status: WorkspaceWorkerExecutionStatus | null;
+  started_at_ms: number | null;
+  finished_at_ms: number | null;
+  duration_ms: number | null;
+  outcome: WorkspaceWorkerExecutionOutcome | null;
+  acceptance: WorkspaceWorkerExecutionAcceptance | null;
+}
+
 export interface WorkspaceChatWorkBounds {
   items_omitted: number;
   events_omitted: number;
   presence_omitted: number;
+  /** Present on newer payloads; older snapshots normalize it to `0`. */
+  executions_omitted?: number;
 }
 
 export interface WorkspaceChatWork {
@@ -682,6 +736,8 @@ export interface WorkspaceChatWork {
   items: BacklogItem[];
   events: WorkspaceBacklogEvent[];
   worker_presence: WorkspaceBacklogWorkerPresence[];
+  /** Additive bounded execution metadata; older payloads normalize to `[]`. */
+  worker_executions?: WorkspaceWorkerExecution[];
   bounds: WorkspaceChatWorkBounds;
 }
 

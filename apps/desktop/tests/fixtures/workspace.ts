@@ -74,6 +74,15 @@ export const CHAT_ALPHA_KEY = formatWorkspaceChatIdentityKey(CHAT_ALPHA_IDENTITY
 export const CHAT_BETA_KEY = formatWorkspaceChatIdentityKey(CHAT_BETA_SAME_PROJECT_IDENTITY)!;
 export const CHAT_GAMMA_KEY = formatWorkspaceChatIdentityKey(CHAT_GAMMA_IDENTITY)!;
 
+/**
+ * Controlled-host runtime binding prefixes carried by Worker execution metadata.
+ * Every fixture execution gets its own runtime binding: the host session and the
+ * enclosing control conversation are separate production scopes and must never
+ * be compared as equal or reused across exact executions.
+ */
+export const FIXTURE_ALPHA_HOST_SESSION_BINDING_PREFIX = 'sbx_host_alpha';
+export const FIXTURE_BETA_HOST_SESSION_BINDING_PREFIX = 'sbx_host_beta';
+
 export const FOUR_PART_COLLISION_SOURCE_ID = 'src_desktop_primary_shadow_02';
 export const FOUR_PART_COLLISION_BINDING_ID = 'bnd_alpha_shadow_02';
 export const FOUR_PART_COLLISION_PROJECT_SCOPE = FIXTURE_CANONICAL_PROJECT_LEGACY;
@@ -142,6 +151,18 @@ export const MINIMAL_CHAT_ALPHA_FAILED_ITEM_ID = 'blg_alpha_failed_01';
 export const MINIMAL_CHAT_ALPHA_PREPARING_ITEM_ID = 'blg_alpha_preparing_01';
 export const MINIMAL_CHAT_ALPHA_PREPARING_EXECUTION_REF = 'exec_alpha_worker_preparing_01';
 export const MINIMAL_CHAT_ALPHA_COWORKER_DOING_ITEM_ID = 'blg_alpha_coworker_doing_01';
+export const MINIMAL_CHAT_ALPHA_ACCEPTED_ITEM_ID = 'blg_alpha_accepted_01';
+export const MINIMAL_CHAT_ALPHA_CHECKING_ITEM_ID = 'blg_alpha_checking_01';
+export const MINIMAL_CHAT_ALPHA_CANCELLED_ITEM_ID = 'blg_alpha_cancelled_01';
+export const MINIMAL_CHAT_ALPHA_UNKNOWN_ITEM_ID = 'blg_alpha_unknown_01';
+export const MINIMAL_CHAT_ALPHA_ACCEPTED_EXECUTION_REF = 'exec_alpha_worker_accepted_01';
+export const MINIMAL_CHAT_ALPHA_CHECKING_EXECUTION_REF = 'exec_alpha_worker_checking_01';
+export const MINIMAL_CHAT_ALPHA_CANCELLED_EXECUTION_REF = 'exec_alpha_worker_cancelled_01';
+export const MINIMAL_CHAT_ALPHA_CANCELLED_PREVIOUS_EXECUTION_REF =
+  'exec_alpha_worker_cancelled_previous_01';
+export const MINIMAL_CHAT_ALPHA_UNKNOWN_EXECUTION_REF = 'exec_alpha_worker_unknown_01';
+export const MINIMAL_CHAT_BETA_WORKER_ITEM_ID = 'blg_beta_worker_done_01';
+export const MINIMAL_CHAT_BETA_WORKER_EXECUTION_REF = MINIMAL_CHAT_ALPHA_ACCEPTED_EXECUTION_REF;
 export const MINIMAL_CHAT_BETA_TODO_ITEM_ID = 'blg_beta_todo_01';
 export const MINIMAL_CHAT_BETA_DONE_ITEM_ID = 'blg_beta_done_01';
 export const MINIMAL_CHAT_GAMMA_TODO_ITEM_ID = 'blg_gamma_todo_01';
@@ -153,6 +174,37 @@ export const MINIMAL_CHAT_BLOCKED_TITLE = 'Investigate flaky browser harness';
 export const MINIMAL_CHAT_FAILED_TITLE = 'Attempted worker dispatch';
 export const MINIMAL_CHAT_PREPARING_TITLE = 'Prepare isolated worker launch';
 export const MINIMAL_CHAT_COWORKER_DOING_TITLE = 'Review conversation stream copy';
+export const MINIMAL_CHAT_ACCEPTED_TITLE = 'Verify accepted Worker delivery';
+export const MINIMAL_CHAT_CHECKING_TITLE = 'Check Worker delivery evidence';
+export const MINIMAL_CHAT_CANCELLED_TITLE = 'Cancel superseded Worker attempt';
+export const MINIMAL_CHAT_UNKNOWN_TITLE = 'Reconcile unknown Worker outcome';
+export const MINIMAL_CHAT_BETA_WORKER_TITLE = 'Beta scoped Worker delivery';
+export const MINIMAL_CHAT_ACCEPTED_COMPLETION_NOTE =
+  'Verified accepted delivery and recorded guarded completion.';
+export const MINIMAL_CHAT_ACCEPTED_COMPLETION_EVIDENCE =
+  'Exact terminal result, delivery digest, and item acceptance condition checked.';
+export const MINIMAL_CHAT_CANCELLED_REASON =
+  'Worker cancellation was verified; no human response was requested.';
+export const MINIMAL_CHAT_UNKNOWN_REASON =
+  'Worker outcome remains unknown and requires reconciliation.';
+export const MINIMAL_CHAT_BETA_WORKER_COMPLETION_NOTE =
+  'Beta scoped delivery checked and accepted.';
+export const MINIMAL_CHAT_DISPATCH_EVENT_TITLE =
+  'Worker dispatched for Prepare isolated worker launch';
+export const MINIMAL_CHAT_LIVE_PROGRESS_EVENT_TITLE =
+  `Worker progress reported for ${MINIMAL_CHAT_DOING_TITLE}`;
+export const MINIMAL_CHAT_ACCEPTED_COMPLETED_EVENT_TITLE =
+  `Committed Done: ${MINIMAL_CHAT_ACCEPTED_TITLE}`;
+export const MINIMAL_CHAT_CHECKING_EVENT_TITLE =
+  `Worker result recorded: Awaiting check for ${MINIMAL_CHAT_CHECKING_TITLE}`;
+export const MINIMAL_CHAT_CANCELLED_PREVIOUS_EVENT_TITLE =
+  `Worker result recorded: Failed for ${MINIMAL_CHAT_CANCELLED_TITLE}`;
+export const MINIMAL_CHAT_CANCELLED_EVENT_TITLE =
+  `Worker cancelled: ${MINIMAL_CHAT_CANCELLED_TITLE}`;
+export const MINIMAL_CHAT_UNKNOWN_EVENT_TITLE =
+  `Worker result recorded: Outcome unknown for ${MINIMAL_CHAT_UNKNOWN_TITLE}`;
+export const MINIMAL_CHAT_BETA_WORKER_COMPLETED_EVENT_TITLE =
+  `Committed Done: ${MINIMAL_CHAT_BETA_WORKER_TITLE}`;
 export const MINIMAL_CHAT_BLOCKED_REASON =
   'Blocked pending operator review of the failing browser harness.';
 export const MINIMAL_CHAT_BETA_BACKLOG_SENTINEL =
@@ -2412,36 +2464,168 @@ export function createBacklogWorkerPresence(
   };
 }
 
+/**
+ * Exact additive `WorkspaceChatWork.worker_executions` wire record consumed by
+ * the browser fixtures. The shared contract remains the normative type; this
+ * local shape keeps optional telemetry explicit and forbids invented defaults.
+ * `session_binding_id` is the controlled-host runtime session, never the
+ * enclosing control chat binding.
+ */
+export interface FixtureWorkerExecution {
+  item_id: string;
+  execution_ref: string;
+  approval_id: string;
+  task_id: string;
+  session_binding_id: string;
+  run_id: string;
+  worker_id: string;
+  provider: string | null;
+  requested_model: string | null;
+  observed_model: string | null;
+  requested_effort: string | null;
+  observed_effort: string | null;
+  worker_status: string | null;
+  started_at_ms: number | null;
+  finished_at_ms: number | null;
+  duration_ms: number | null;
+  outcome: string | null;
+  acceptance: string | null;
+}
+
+export type FixtureChatWork = WorkspaceChatWork & {
+  worker_executions: FixtureWorkerExecution[];
+  bounds: WorkspaceChatWork['bounds'] & { executions_omitted: number };
+};
+
+export interface WorkerExecutionFixtureParams {
+  identity: WorkspaceChatIdentity;
+  itemId: string;
+  executionRef: string;
+  approvalId?: string;
+  taskId?: string;
+  sessionBindingId?: string;
+  runId?: string;
+  workerId?: string;
+  provider?: string | null;
+  requestedModel?: string | null;
+  observedModel?: string | null;
+  requestedEffort?: string | null;
+  observedEffort?: string | null;
+  workerStatus?: string | null;
+  startedAtMs?: number | null;
+  finishedAtMs?: number | null;
+  durationMs?: number | null;
+  outcome?: string | null;
+  acceptance?: string | null;
+}
+
+function defaultHostSessionBindingId(
+  identity: WorkspaceChatIdentity,
+  executionRef: string,
+): string {
+  if (workspaceChatIdentitiesEqual(identity, CHAT_BETA_SAME_PROJECT_IDENTITY)) {
+    return `${FIXTURE_BETA_HOST_SESSION_BINDING_PREFIX}_${executionRef}`;
+  }
+  if (workspaceChatIdentitiesEqual(identity, CHAT_ALPHA_IDENTITY)) {
+    return `${FIXTURE_ALPHA_HOST_SESSION_BINDING_PREFIX}_${executionRef}`;
+  }
+  return `sbx_host_${identity.binding_id}_${executionRef}`;
+}
+
+/**
+ * Builds one frozen Worker execution metadata record. Optional telemetry
+ * defaults to `null` so a fixture cannot accidentally invent runtime proof.
+ * The runtime session binding is unique per execution and always differs from
+ * the enclosing control chat binding, matching real controlled-host metadata.
+ */
+export function createWorkerExecution(
+  params: WorkerExecutionFixtureParams,
+): FixtureWorkerExecution {
+  const {
+    identity,
+    itemId,
+    executionRef,
+    approvalId = `apr_${itemId}`,
+    taskId = `task_${itemId}`,
+    sessionBindingId = defaultHostSessionBindingId(identity, executionRef),
+    runId = `run_${executionRef}`,
+    workerId = `wrk_${executionRef}`,
+    provider = null,
+    requestedModel = null,
+    observedModel = null,
+    requestedEffort = null,
+    observedEffort = null,
+    workerStatus = null,
+    startedAtMs = null,
+    finishedAtMs = null,
+    durationMs = null,
+    outcome = null,
+    acceptance = null,
+  } = params;
+  if (sessionBindingId === identity.binding_id) {
+    throw new Error(
+      'Worker execution fixture runtime session binding must differ from the control chat binding.',
+    );
+  }
+  return {
+    item_id: itemId,
+    execution_ref: executionRef,
+    approval_id: approvalId,
+    task_id: taskId,
+    session_binding_id: sessionBindingId,
+    run_id: runId,
+    worker_id: workerId,
+    provider,
+    requested_model: requestedModel,
+    observed_model: observedModel,
+    requested_effort: requestedEffort,
+    observed_effort: observedEffort,
+    worker_status: workerStatus,
+    started_at_ms: startedAtMs,
+    finished_at_ms: finishedAtMs,
+    duration_ms: durationMs,
+    outcome,
+    acceptance,
+  };
+}
+
 export interface ChatWorkFixtureParams {
   identity: WorkspaceChatIdentity;
   availability?: WorkspaceChatWork['availability'];
   items?: FixtureBacklogItem[];
   events?: FixtureBacklogEvent[];
   workerPresence?: FixtureBacklogWorkerPresence[];
+  workerExecutions?: FixtureWorkerExecution[];
   bounds?: Partial<WorkspaceChatWork['bounds']>;
 }
 
-export function createChatWork(params: ChatWorkFixtureParams): WorkspaceChatWork {
+export function createChatWork(params: ChatWorkFixtureParams): FixtureChatWork {
   const {
     identity,
     availability = 'available',
     items = [],
     events = [],
     workerPresence = [],
+    workerExecutions = [],
     bounds = {},
   } = params;
+  const extendedBounds = bounds as Partial<WorkspaceChatWork['bounds']> & {
+    executions_omitted?: number;
+  };
   return {
     identity,
     availability,
     items,
     events,
     worker_presence: workerPresence,
+    worker_executions: workerExecutions,
     bounds: {
       items_omitted: bounds.items_omitted ?? 0,
       events_omitted: bounds.events_omitted ?? 0,
       presence_omitted: bounds.presence_omitted ?? 0,
+      executions_omitted: extendedBounds.executions_omitted ?? 0,
     },
-  };
+  } as unknown as FixtureChatWork;
 }
 
 /**
@@ -2708,12 +2892,71 @@ export function buildMinimalChatWorkspaceSnapshot(): WorkspaceSnapshot {
   const alphaNonLivePresence = createBacklogWorkerPresence({
     itemId: failedItem.item_id,
     executionRef: MINIMAL_CHAT_ALPHA_FAILED_EXECUTION_REF,
+    approvalId: 'apr_alpha_worker_failed_01',
+    taskId: 'task_alpha_worker_failed_01',
+    runId: 'run_alpha_worker_failed_01',
+    workerId: 'wrk_alpha_worker_failed_01',
     availability: 'non_live',
     freshness: 'not_applicable',
     live: false,
     sampledAtMs: FIXTURE_BASE_NOW_MS - 7_000,
     sampleAgeMs: null,
     expiresAtMs: null,
+  });
+
+  // These deterministic acceptance records mirror durable values already present
+  // in the events above; they never assert that a new native Worker executed.
+  // Each carries the controlled-host runtime session binding rather than the
+  // control chat binding. Human-readable `worker_status` values mirror the
+  // durable `WorkerStatus` wire strings; they never substitute for fresh host
+  // presence.
+  const alphaLiveExecution = createWorkerExecution({
+    identity: CHAT_ALPHA_IDENTITY,
+    itemId: doingItem.item_id,
+    executionRef: MINIMAL_CHAT_ALPHA_LIVE_EXECUTION_REF,
+    approvalId: 'apr_alpha_worker_01',
+    taskId: 'task_alpha_worker_01',
+    runId: 'run_alpha_worker_01',
+    workerId: 'wrk_alpha_worker_01',
+    provider: 'google',
+    requestedModel: 'gemini-4-argon-high',
+    observedModel: 'gemini-4-argon-high',
+    requestedEffort: 'high',
+    observedEffort: 'high',
+    workerStatus: 'running',
+    startedAtMs: FIXTURE_BASE_NOW_MS - 14_000,
+  });
+  const alphaFailedExecution = createWorkerExecution({
+    identity: CHAT_ALPHA_IDENTITY,
+    itemId: failedItem.item_id,
+    executionRef: MINIMAL_CHAT_ALPHA_FAILED_EXECUTION_REF,
+    approvalId: 'apr_alpha_worker_failed_01',
+    taskId: 'task_alpha_worker_failed_01',
+    runId: 'run_alpha_worker_failed_01',
+    workerId: 'wrk_alpha_worker_failed_01',
+    provider: 'google',
+    requestedModel: 'gemini-4-argon-high',
+    observedModel: 'gemini-4-argon-high',
+    requestedEffort: 'high',
+    observedEffort: 'high',
+    workerStatus: 'failed',
+    startedAtMs: FIXTURE_BASE_NOW_MS - 25_000,
+    finishedAtMs: FIXTURE_BASE_NOW_MS - 24_000,
+    durationMs: 1_000,
+    outcome: 'failure',
+  });
+  const alphaPreparingExecution = createWorkerExecution({
+    identity: CHAT_ALPHA_IDENTITY,
+    itemId: preparingItem.item_id,
+    executionRef: MINIMAL_CHAT_ALPHA_PREPARING_EXECUTION_REF,
+    approvalId: 'apr_alpha_worker_preparing_01',
+    taskId: 'task_alpha_worker_preparing_01',
+    runId: 'run_alpha_worker_preparing_01',
+    workerId: 'wrk_alpha_worker_preparing_01',
+    provider: 'google',
+    requestedModel: 'gemini-4-argon-high',
+    requestedEffort: 'high',
+    workerStatus: 'claimed',
   });
 
   const betaTodoItem = createBacklogItem({
@@ -2955,6 +3198,11 @@ export function buildMinimalChatWorkspaceSnapshot(): WorkspaceSnapshot {
         ],
         events: alphaEvents,
         workerPresence: [alphaLivePresence, alphaNonLivePresence],
+        workerExecutions: [
+          alphaLiveExecution,
+          alphaFailedExecution,
+          alphaPreparingExecution,
+        ],
       }),
       createChatWork({
         identity: CHAT_BETA_SAME_PROJECT_IDENTITY,
@@ -2975,6 +3223,548 @@ export function buildMinimalChatWorkspaceSnapshot(): WorkspaceSnapshot {
       requests_capped: false,
       jobs_capped: false,
     },
+  });
+}
+
+/**
+ * Extends the minimal chat fixture with additional verified Worker execution
+ * attempts: technical success awaiting acceptance, guarded accepted completion,
+ * cancellation after a failed attempt, an unknown outcome, an explicit dispatch
+ * without live presence, and a same-ref attempt in the sibling Beta chat. The
+ * live Doing attempt keeps nonterminal attached/progress history without a
+ * success outcome, so only fresh presence can make its footer Working.
+ *
+ * Every added item is a distinct durable item; no Done item is reopened.
+ */
+export function buildWorkerMetadataWorkspaceSnapshot(): WorkspaceSnapshot {
+  const base = buildMinimalChatWorkspaceSnapshot();
+  const alphaWork = readChatWork(base, CHAT_ALPHA_IDENTITY);
+  const betaWork = readChatWork(base, CHAT_BETA_SAME_PROJECT_IDENTITY);
+  const alphaExecutions = getChatWorkWorkerExecutionsFixture(base, CHAT_ALPHA_IDENTITY);
+  const betaExecutions = getChatWorkWorkerExecutionsFixture(
+    base,
+    CHAT_BETA_SAME_PROJECT_IDENTITY,
+  );
+  const liveItemForProgress: FixtureBacklogItem = {
+    ...alphaWork.items.find(
+      (item) => item.item_id === MINIMAL_CHAT_ALPHA_DOING_ITEM_ID,
+    )!,
+    updated_at_ms: FIXTURE_BASE_NOW_MS - 37_000,
+  };
+  // The fresh/live attempt stays nonterminal: a progress event replaces the
+  // base fixture's terminal awaiting-check event so live metadata cannot claim a
+  // success outcome that the exact running execution has not recorded.
+  const liveProgressEvent = createBacklogEvent({
+    item: liveItemForProgress,
+    sequence: 8,
+    revision: liveItemForProgress.revision,
+    action: 'worker_progress',
+    status: 'doing',
+    executionRef: MINIMAL_CHAT_ALPHA_LIVE_EXECUTION_REF,
+    title: MINIMAL_CHAT_LIVE_PROGRESS_EVENT_TITLE,
+    note: 'Live process progress recorded; no technical outcome yet.',
+    recordedAtMs: FIXTURE_BASE_NOW_MS - 37_000,
+  });
+  const preparingItemForDispatch = {
+    ...alphaWork.items.find(
+      (item) => item.item_id === MINIMAL_CHAT_ALPHA_PREPARING_ITEM_ID,
+    )!,
+    revision: 3,
+    updated_at_ms: FIXTURE_BASE_NOW_MS - 16_000,
+  };
+
+  const acceptedItem = createBacklogItem({
+    identity: CHAT_ALPHA_IDENTITY,
+    itemId: MINIMAL_CHAT_ALPHA_ACCEPTED_ITEM_ID,
+    title: MINIMAL_CHAT_ACCEPTED_TITLE,
+    revision: 4,
+    kind: 'worker',
+    status: 'done',
+    currentExecutionRef: MINIMAL_CHAT_ALPHA_ACCEPTED_EXECUTION_REF,
+    completionNote: MINIMAL_CHAT_ACCEPTED_COMPLETION_NOTE,
+    completionEvidence: MINIMAL_CHAT_ACCEPTED_COMPLETION_EVIDENCE,
+    completedAtMs: FIXTURE_BASE_NOW_MS - 12_000,
+    createdAtMs: FIXTURE_BASE_NOW_MS - 80_000,
+    updatedAtMs: FIXTURE_BASE_NOW_MS - 12_000,
+  });
+  const checkingItem = createBacklogItem({
+    identity: CHAT_ALPHA_IDENTITY,
+    itemId: MINIMAL_CHAT_ALPHA_CHECKING_ITEM_ID,
+    title: MINIMAL_CHAT_CHECKING_TITLE,
+    revision: 3,
+    kind: 'worker',
+    status: 'doing',
+    currentExecutionRef: MINIMAL_CHAT_ALPHA_CHECKING_EXECUTION_REF,
+    createdAtMs: FIXTURE_BASE_NOW_MS - 59_000,
+    updatedAtMs: FIXTURE_BASE_NOW_MS - 3_000,
+  });
+  const cancelledItem = createBacklogItem({
+    identity: CHAT_ALPHA_IDENTITY,
+    itemId: MINIMAL_CHAT_ALPHA_CANCELLED_ITEM_ID,
+    title: MINIMAL_CHAT_CANCELLED_TITLE,
+    revision: 5,
+    kind: 'worker',
+    status: 'blocked',
+    blockedReason: MINIMAL_CHAT_CANCELLED_REASON,
+    currentExecutionRef: MINIMAL_CHAT_ALPHA_CANCELLED_EXECUTION_REF,
+    createdAtMs: FIXTURE_BASE_NOW_MS - 52_000,
+    updatedAtMs: FIXTURE_BASE_NOW_MS - 30_000,
+  });
+  const unknownItem = createBacklogItem({
+    identity: CHAT_ALPHA_IDENTITY,
+    itemId: MINIMAL_CHAT_ALPHA_UNKNOWN_ITEM_ID,
+    title: MINIMAL_CHAT_UNKNOWN_TITLE,
+    revision: 3,
+    kind: 'worker',
+    status: 'blocked',
+    blockedReason: MINIMAL_CHAT_UNKNOWN_REASON,
+    currentExecutionRef: MINIMAL_CHAT_ALPHA_UNKNOWN_EXECUTION_REF,
+    createdAtMs: FIXTURE_BASE_NOW_MS - 62_000,
+    updatedAtMs: FIXTURE_BASE_NOW_MS - 55_000,
+  });
+
+  const acceptedEvents: FixtureBacklogEvent[] = [
+    createBacklogEvent({
+      item: acceptedItem,
+      sequence: 18,
+      revision: 1,
+      action: 'created',
+      status: 'todo',
+      title: `Backlog item created: ${acceptedItem.title}`,
+      recordedAtMs: FIXTURE_BASE_NOW_MS - 80_000,
+    }),
+    createBacklogEvent({
+      item: acceptedItem,
+      sequence: 19,
+      revision: 2,
+      action: 'worker_reserved',
+      status: 'doing',
+      executionRef: MINIMAL_CHAT_ALPHA_ACCEPTED_EXECUTION_REF,
+      title: `Preparing Worker execution for ${acceptedItem.title}`,
+      recordedAtMs: FIXTURE_BASE_NOW_MS - 70_000,
+    }),
+    createBacklogEvent({
+      item: acceptedItem,
+      sequence: 20,
+      revision: 3,
+      action: 'worker_outcome_recorded',
+      status: 'doing',
+      executionRef: MINIMAL_CHAT_ALPHA_ACCEPTED_EXECUTION_REF,
+      outcome: 'success',
+      title: `Worker result recorded: Awaiting check for ${acceptedItem.title}`,
+      recordedAtMs: FIXTURE_BASE_NOW_MS - 25_000,
+    }),
+    createBacklogEvent({
+      item: acceptedItem,
+      sequence: 21,
+      revision: 4,
+      action: 'completed',
+      status: 'done',
+      executionRef: MINIMAL_CHAT_ALPHA_ACCEPTED_EXECUTION_REF,
+      title: MINIMAL_CHAT_ACCEPTED_COMPLETED_EVENT_TITLE,
+      note: MINIMAL_CHAT_ACCEPTED_COMPLETION_NOTE,
+      recordedAtMs: FIXTURE_BASE_NOW_MS - 12_000,
+    }),
+  ];
+  const checkingEvents: FixtureBacklogEvent[] = [
+    createBacklogEvent({
+      item: checkingItem,
+      sequence: 22,
+      revision: 1,
+      action: 'created',
+      status: 'todo',
+      title: `Backlog item created: ${checkingItem.title}`,
+      recordedAtMs: FIXTURE_BASE_NOW_MS - 59_000,
+    }),
+    createBacklogEvent({
+      item: checkingItem,
+      sequence: 23,
+      revision: 2,
+      action: 'worker_reserved',
+      status: 'doing',
+      executionRef: MINIMAL_CHAT_ALPHA_CHECKING_EXECUTION_REF,
+      title: `Preparing Worker execution for ${checkingItem.title}`,
+      recordedAtMs: FIXTURE_BASE_NOW_MS - 58_000,
+    }),
+    createBacklogEvent({
+      item: checkingItem,
+      sequence: 24,
+      revision: 3,
+      action: 'worker_outcome_recorded',
+      status: 'doing',
+      executionRef: MINIMAL_CHAT_ALPHA_CHECKING_EXECUTION_REF,
+      outcome: 'success',
+      title: MINIMAL_CHAT_CHECKING_EVENT_TITLE,
+      note: 'Exact technical success is not acceptance completion.',
+      recordedAtMs: FIXTURE_BASE_NOW_MS - 3_000,
+    }),
+  ];
+  const cancelledEvents: FixtureBacklogEvent[] = [
+    createBacklogEvent({
+      item: cancelledItem,
+      sequence: 25,
+      revision: 1,
+      action: 'created',
+      status: 'todo',
+      title: `Backlog item created: ${cancelledItem.title}`,
+      recordedAtMs: FIXTURE_BASE_NOW_MS - 52_000,
+    }),
+    createBacklogEvent({
+      item: cancelledItem,
+      sequence: 26,
+      revision: 2,
+      action: 'worker_reserved',
+      status: 'doing',
+      executionRef: MINIMAL_CHAT_ALPHA_CANCELLED_PREVIOUS_EXECUTION_REF,
+      title: `Preparing Worker execution for ${cancelledItem.title}`,
+      recordedAtMs: FIXTURE_BASE_NOW_MS - 50_000,
+    }),
+    createBacklogEvent({
+      item: cancelledItem,
+      sequence: 27,
+      revision: 3,
+      action: 'worker_outcome_recorded',
+      status: 'blocked',
+      executionRef: MINIMAL_CHAT_ALPHA_CANCELLED_PREVIOUS_EXECUTION_REF,
+      outcome: 'failure',
+      title: MINIMAL_CHAT_CANCELLED_PREVIOUS_EVENT_TITLE,
+      note: 'First attempt failed before a fresh authorized retry.',
+      recordedAtMs: FIXTURE_BASE_NOW_MS - 45_000,
+    }),
+    createBacklogEvent({
+      item: cancelledItem,
+      sequence: 28,
+      revision: 4,
+      action: 'worker_reserved',
+      status: 'doing',
+      executionRef: MINIMAL_CHAT_ALPHA_CANCELLED_EXECUTION_REF,
+      title: `Preparing Worker execution for ${cancelledItem.title}`,
+      recordedAtMs: FIXTURE_BASE_NOW_MS - 40_000,
+    }),
+    createBacklogEvent({
+      item: cancelledItem,
+      sequence: 29,
+      revision: 5,
+      action: 'blocked',
+      status: 'blocked',
+      executionRef: MINIMAL_CHAT_ALPHA_CANCELLED_EXECUTION_REF,
+      title: MINIMAL_CHAT_CANCELLED_EVENT_TITLE,
+      note: MINIMAL_CHAT_CANCELLED_REASON,
+      recordedAtMs: FIXTURE_BASE_NOW_MS - 30_000,
+    }),
+  ];
+  const unknownEvents: FixtureBacklogEvent[] = [
+    createBacklogEvent({
+      item: unknownItem,
+      sequence: 30,
+      revision: 1,
+      action: 'created',
+      status: 'todo',
+      title: `Backlog item created: ${unknownItem.title}`,
+      recordedAtMs: FIXTURE_BASE_NOW_MS - 62_000,
+    }),
+    createBacklogEvent({
+      item: unknownItem,
+      sequence: 31,
+      revision: 2,
+      action: 'worker_reserved',
+      status: 'doing',
+      executionRef: MINIMAL_CHAT_ALPHA_UNKNOWN_EXECUTION_REF,
+      title: `Preparing Worker execution for ${unknownItem.title}`,
+      recordedAtMs: FIXTURE_BASE_NOW_MS - 60_000,
+    }),
+    createBacklogEvent({
+      item: unknownItem,
+      sequence: 32,
+      revision: 3,
+      action: 'worker_outcome_recorded',
+      status: 'blocked',
+      executionRef: MINIMAL_CHAT_ALPHA_UNKNOWN_EXECUTION_REF,
+      outcome: 'unknown',
+      title: MINIMAL_CHAT_UNKNOWN_EVENT_TITLE,
+      note: MINIMAL_CHAT_UNKNOWN_REASON,
+      recordedAtMs: FIXTURE_BASE_NOW_MS - 55_000,
+    }),
+  ];
+  const dispatchEvent = createBacklogEvent({
+    item: preparingItemForDispatch,
+    sequence: 33,
+    revision: 3,
+    action: 'worker_execution_attached',
+    status: 'doing',
+    executionRef: MINIMAL_CHAT_ALPHA_PREPARING_EXECUTION_REF,
+    title: MINIMAL_CHAT_DISPATCH_EVENT_TITLE,
+    note: 'Dispatch receipt attached; no live process proof.',
+    recordedAtMs: FIXTURE_BASE_NOW_MS - 16_000,
+  });
+
+  const acceptedExecution = createWorkerExecution({
+    identity: CHAT_ALPHA_IDENTITY,
+    itemId: acceptedItem.item_id,
+    executionRef: MINIMAL_CHAT_ALPHA_ACCEPTED_EXECUTION_REF,
+    approvalId: 'apr_alpha_worker_accepted_01',
+    taskId: 'task_alpha_worker_accepted_01',
+    provider: 'google',
+    requestedModel: 'gemini-4-argon-high',
+    observedModel: 'gemini-4-argon-high',
+    requestedEffort: 'high',
+    observedEffort: 'high',
+    workerStatus: 'completed',
+    startedAtMs: FIXTURE_BASE_NOW_MS - 70_000,
+    finishedAtMs: FIXTURE_BASE_NOW_MS - 25_000,
+    durationMs: 45_000,
+    outcome: 'success',
+    acceptance: 'accepted',
+  });
+  const checkingExecution = createWorkerExecution({
+    identity: CHAT_ALPHA_IDENTITY,
+    itemId: checkingItem.item_id,
+    executionRef: MINIMAL_CHAT_ALPHA_CHECKING_EXECUTION_REF,
+    approvalId: 'apr_alpha_worker_checking_01',
+    taskId: 'task_alpha_worker_checking_01',
+    provider: 'google',
+    requestedModel: 'gemini-4-argon-high',
+    observedModel: 'gemini-4-argon-high',
+    requestedEffort: 'high',
+    observedEffort: 'high',
+    workerStatus: 'completed',
+    startedAtMs: FIXTURE_BASE_NOW_MS - 58_000,
+    finishedAtMs: FIXTURE_BASE_NOW_MS - 3_000,
+    durationMs: 55_000,
+    outcome: 'success',
+    acceptance: 'pending',
+  });
+  const cancelledPreviousExecution = createWorkerExecution({
+    identity: CHAT_ALPHA_IDENTITY,
+    itemId: cancelledItem.item_id,
+    executionRef: MINIMAL_CHAT_ALPHA_CANCELLED_PREVIOUS_EXECUTION_REF,
+    approvalId: 'apr_alpha_worker_cancelled_previous_01',
+    taskId: 'task_alpha_worker_cancelled_previous_01',
+    provider: 'google',
+    requestedModel: 'gemini-4-argon-high',
+    observedModel: 'gemini-4-argon-high',
+    requestedEffort: 'high',
+    observedEffort: 'high',
+    workerStatus: 'failed',
+    startedAtMs: FIXTURE_BASE_NOW_MS - 50_000,
+    finishedAtMs: FIXTURE_BASE_NOW_MS - 45_000,
+    durationMs: 5_000,
+    outcome: 'failure',
+  });
+  const cancelledExecution = createWorkerExecution({
+    identity: CHAT_ALPHA_IDENTITY,
+    itemId: cancelledItem.item_id,
+    executionRef: MINIMAL_CHAT_ALPHA_CANCELLED_EXECUTION_REF,
+    approvalId: 'apr_alpha_worker_cancelled_01',
+    taskId: 'task_alpha_worker_cancelled_01',
+    provider: 'google',
+    requestedModel: 'gemini-4-argon-high',
+    requestedEffort: 'high',
+    workerStatus: 'cancelled',
+    startedAtMs: FIXTURE_BASE_NOW_MS - 40_000,
+    finishedAtMs: FIXTURE_BASE_NOW_MS - 30_000,
+    durationMs: 10_000,
+  });
+  const unknownExecution = createWorkerExecution({
+    identity: CHAT_ALPHA_IDENTITY,
+    itemId: unknownItem.item_id,
+    executionRef: MINIMAL_CHAT_ALPHA_UNKNOWN_EXECUTION_REF,
+    approvalId: 'apr_alpha_worker_unknown_01',
+    taskId: 'task_alpha_worker_unknown_01',
+    provider: 'google',
+    requestedModel: 'gemini-4-argon-high',
+    requestedEffort: 'high',
+    workerStatus: 'unknown',
+    startedAtMs: FIXTURE_BASE_NOW_MS - 60_000,
+    outcome: 'unknown',
+  });
+
+  const betaWorkerItem = createBacklogItem({
+    identity: CHAT_BETA_SAME_PROJECT_IDENTITY,
+    itemId: MINIMAL_CHAT_BETA_WORKER_ITEM_ID,
+    title: MINIMAL_CHAT_BETA_WORKER_TITLE,
+    revision: 4,
+    kind: 'worker',
+    status: 'done',
+    currentExecutionRef: MINIMAL_CHAT_BETA_WORKER_EXECUTION_REF,
+    completionNote: MINIMAL_CHAT_BETA_WORKER_COMPLETION_NOTE,
+    completionEvidence: 'Beta chat acceptance evidence checked in its own scope.',
+    completedAtMs: FIXTURE_BASE_NOW_MS - 8_000,
+    createdAtMs: FIXTURE_BASE_NOW_MS - 48_000,
+    updatedAtMs: FIXTURE_BASE_NOW_MS - 8_000,
+  });
+  const betaWorkerEvents: FixtureBacklogEvent[] = [
+    createBacklogEvent({
+      item: betaWorkerItem,
+      sequence: 6,
+      revision: 1,
+      action: 'created',
+      status: 'todo',
+      title: `Backlog item created: ${betaWorkerItem.title}`,
+      recordedAtMs: FIXTURE_BASE_NOW_MS - 48_000,
+    }),
+    createBacklogEvent({
+      item: betaWorkerItem,
+      sequence: 7,
+      revision: 2,
+      action: 'worker_reserved',
+      status: 'doing',
+      executionRef: MINIMAL_CHAT_BETA_WORKER_EXECUTION_REF,
+      title: `Preparing Worker execution for ${betaWorkerItem.title}`,
+      recordedAtMs: FIXTURE_BASE_NOW_MS - 45_000,
+    }),
+    createBacklogEvent({
+      item: betaWorkerItem,
+      sequence: 8,
+      revision: 3,
+      action: 'worker_outcome_recorded',
+      status: 'doing',
+      executionRef: MINIMAL_CHAT_BETA_WORKER_EXECUTION_REF,
+      outcome: 'success',
+      title: `Worker result recorded: Awaiting check for ${betaWorkerItem.title}`,
+      recordedAtMs: FIXTURE_BASE_NOW_MS - 33_000,
+    }),
+    createBacklogEvent({
+      item: betaWorkerItem,
+      sequence: 9,
+      revision: 4,
+      action: 'completed',
+      status: 'done',
+      executionRef: MINIMAL_CHAT_BETA_WORKER_EXECUTION_REF,
+      title: MINIMAL_CHAT_BETA_WORKER_COMPLETED_EVENT_TITLE,
+      note: MINIMAL_CHAT_BETA_WORKER_COMPLETION_NOTE,
+      recordedAtMs: FIXTURE_BASE_NOW_MS - 8_000,
+    }),
+  ];
+  const betaWorkerExecution = createWorkerExecution({
+    identity: CHAT_BETA_SAME_PROJECT_IDENTITY,
+    itemId: betaWorkerItem.item_id,
+    executionRef: MINIMAL_CHAT_BETA_WORKER_EXECUTION_REF,
+    approvalId: 'apr_beta_worker_accepted_01',
+    taskId: 'task_beta_worker_accepted_01',
+    runId: 'run_beta_worker_accepted_01',
+    workerId: 'wrk_beta_worker_accepted_01',
+    provider: 'openai',
+    requestedModel: 'gpt-5.4',
+    observedModel: 'gpt-5.4',
+    requestedEffort: 'high',
+    observedEffort: 'high',
+    workerStatus: 'completed',
+    startedAtMs: FIXTURE_BASE_NOW_MS - 45_000,
+    finishedAtMs: FIXTURE_BASE_NOW_MS - 33_000,
+    durationMs: 12_000,
+    outcome: 'success',
+    acceptance: 'accepted',
+  });
+
+  const withExecutions = (
+    work: WorkspaceChatWork,
+    items: FixtureBacklogItem[],
+    events: FixtureBacklogEvent[],
+    executions: FixtureWorkerExecution[],
+  ): WorkspaceChatWork => {
+    const extendedBounds = work.bounds as WorkspaceChatWork['bounds'] & {
+      executions_omitted?: number;
+    };
+    return {
+      ...work,
+      items,
+      events,
+      worker_executions: executions,
+      bounds: {
+        ...work.bounds,
+        executions_omitted: extendedBounds.executions_omitted ?? 0,
+      },
+    } as unknown as WorkspaceChatWork;
+  };
+
+  const works =
+    (base as unknown as { chat_work?: WorkspaceChatWork[] }).chat_work ?? [];
+  const nextAlpha = withExecutions(
+    alphaWork,
+    [
+      ...alphaWork.items.map((item) => {
+        if (item.item_id === MINIMAL_CHAT_ALPHA_PREPARING_ITEM_ID) {
+          return preparingItemForDispatch;
+        }
+        if (item.item_id === MINIMAL_CHAT_ALPHA_DOING_ITEM_ID) {
+          return liveItemForProgress;
+        }
+        return item;
+      }),
+      acceptedItem,
+      checkingItem,
+      cancelledItem,
+      unknownItem,
+    ],
+    [
+      ...alphaWork.events.map((event) =>
+        event.item_id === MINIMAL_CHAT_ALPHA_DOING_ITEM_ID &&
+        event.action === 'worker_outcome_recorded' &&
+        event.execution_ref === MINIMAL_CHAT_ALPHA_LIVE_EXECUTION_REF
+          ? liveProgressEvent
+          : event,
+      ),
+      ...acceptedEvents,
+      ...checkingEvents,
+      ...cancelledEvents,
+      ...unknownEvents,
+      dispatchEvent,
+    ],
+    [
+      ...alphaExecutions,
+      acceptedExecution,
+      checkingExecution,
+      cancelledPreviousExecution,
+      cancelledExecution,
+      unknownExecution,
+    ],
+  );
+  const nextBeta = withExecutions(
+    betaWork,
+    [...betaWork.items, betaWorkerItem],
+    [...betaWork.events, ...betaWorkerEvents],
+    [...betaExecutions, betaWorkerExecution],
+  );
+
+  return parseWorkspaceSnapshot({
+    ...base,
+    chat_work: works.map((work) => {
+      if (workspaceChatIdentitiesEqual(work.identity, CHAT_ALPHA_IDENTITY)) {
+        return nextAlpha;
+      }
+      if (
+        workspaceChatIdentitiesEqual(
+          work.identity,
+          CHAT_BETA_SAME_PROJECT_IDENTITY,
+        )
+      ) {
+        return nextBeta;
+      }
+      return work;
+    }),
+  });
+}
+
+/**
+ * Old payload compatibility: no `worker_executions` field and no execution
+ * bound, as emitted before the additive contract existed.
+ */
+export function buildMinimalChatWorkspaceSnapshotWithoutWorkerExecutions(): WorkspaceSnapshot {
+  const base = buildMinimalChatWorkspaceSnapshot();
+  const works =
+    (base as unknown as { chat_work?: WorkspaceChatWork[] }).chat_work ?? [];
+  const legacyWorks = works.map((work) => {
+    const raw = { ...(work as unknown as Record<string, unknown>) };
+    delete raw.worker_executions;
+    const bounds = { ...(raw.bounds as Record<string, unknown>) };
+    delete bounds.executions_omitted;
+    raw.bounds = bounds;
+    return raw;
+  });
+  return parseWorkspaceSnapshot({
+    ...base,
+    chat_work: legacyWorks,
   });
 }
 
@@ -3151,6 +3941,17 @@ export function getChatWorkFixture(
   return readChatWork(snapshot, identity);
 }
 
+/** Reads the additive Worker execution records for one exact canonical chat. */
+export function getChatWorkWorkerExecutionsFixture(
+  snapshot: WorkspaceSnapshot,
+  identity: WorkspaceChatIdentity,
+): FixtureWorkerExecution[] {
+  const work = readChatWork(snapshot, identity) as unknown as {
+    worker_executions?: FixtureWorkerExecution[];
+  };
+  return work.worker_executions ?? [];
+}
+
 /** Replaces one canonical chat's work while preserving every other chat entry. */
 export function updateChatWorkFixture(
   snapshot: WorkspaceSnapshot,
@@ -3167,6 +3968,36 @@ export function updateChatWorkFixture(
       nextWork,
     ],
   });
+}
+
+/** Replaces one canonical chat's Worker execution metadata projection. */
+export function updateChatWorkWorkerExecutionsFixture(
+  snapshot: WorkspaceSnapshot,
+  identity: WorkspaceChatIdentity,
+  workerExecutions: FixtureWorkerExecution[],
+): WorkspaceSnapshot {
+  return updateChatWorkFixture(snapshot, identity, {
+    worker_executions: workerExecutions,
+  } as unknown as Partial<WorkspaceChatWork>);
+}
+
+/** Updates one exact execution record while preserving every other attempt. */
+export function updateChatWorkWorkerExecutionFixture(
+  snapshot: WorkspaceSnapshot,
+  identity: WorkspaceChatIdentity,
+  executionRef: string,
+  patch: Partial<FixtureWorkerExecution>,
+): WorkspaceSnapshot {
+  const executions = getChatWorkWorkerExecutionsFixture(snapshot, identity);
+  return updateChatWorkWorkerExecutionsFixture(
+    snapshot,
+    identity,
+    executions.map((execution) =>
+      execution.execution_ref === executionRef
+        ? { ...execution, ...patch, execution_ref: executionRef }
+        : execution,
+    ),
+  );
 }
 
 /** Appends one already-built durable event to the selected chat's event window. */
@@ -3432,6 +4263,7 @@ export interface RecordedTauriInvocation {
 
 export interface InstallWorkspaceTauriOptions {
   workspaceSnapshot?: WorkspaceSnapshot;
+  registrySnapshot?: RegistrySnapshot;
   fixedNowMs?: number;
   windowLabel?: 'main' | 'tray';
   trayPreferences?: TrayPreferencesResponse;
@@ -3443,6 +4275,7 @@ interface BrowserHarnessWindow extends Window {
     getInvocations: () => RecordedTauriInvocation[];
     clearInvocations: () => void;
     getWorkspaceSnapshot: () => WorkspaceSnapshot;
+    getRegistrySnapshot: () => RegistrySnapshot;
     setWorkspaceSnapshot: (nextSnapshot: WorkspaceSnapshot) => void;
     stallNextWorkspaceSnapshotRead: () => void;
     failNextWorkspaceSnapshotRead: () => void;
@@ -3457,6 +4290,7 @@ export interface WorkspaceTauriController {
   getInvocations: () => Promise<RecordedTauriInvocation[]>;
   clearInvocations: () => Promise<void>;
   getWorkspaceSnapshot: () => Promise<WorkspaceSnapshot | null>;
+  getRegistrySnapshot: () => Promise<RegistrySnapshot | null>;
   setWorkspaceSnapshot: (nextSnapshot: WorkspaceSnapshot) => Promise<void>;
   stallNextWorkspaceSnapshotRead: () => Promise<void>;
   failNextWorkspaceSnapshotRead: () => Promise<void>;
@@ -3486,7 +4320,7 @@ export async function installWorkspaceTauriFixture(
     message: null,
   };
   const initialStorage = options.initialLocalStorage ?? {};
-  const registrySnapshot = buildDefaultRegistryFixture();
+  const registrySnapshot = options.registrySnapshot ?? buildDefaultRegistryFixture();
   const toolVersions = buildDefaultToolVersionsFixture();
   const toolStatus = buildDefaultToolStatusFixture();
   const codexSetup = buildDefaultCodexSetupFixture();
@@ -3532,6 +4366,112 @@ export async function installWorkspaceTauriFixture(
       const eventListeners = new Map<string, Map<number, number>>();
 
       const cloneJson = <T,>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
+      let currentRegistry: RegistrySnapshot = cloneJson(seed.registrySnapshot);
+
+      const applyRegistryChangeFixture = (safeArgs: Record<string, unknown>): unknown => {
+        const expectedRevision = Number(safeArgs.expectedRevision);
+        if (!Number.isSafeInteger(expectedRevision) || expectedRevision !== currentRegistry.revision) {
+          throw {
+            code: 'revision_conflict',
+            message: `Registry revision conflict: expected ${String(
+              safeArgs.expectedRevision,
+            )}, current is ${currentRegistry.revision}.`,
+          };
+        }
+        const rawChange = safeArgs.change;
+        if (!rawChange || typeof rawChange !== 'object' || Array.isArray(rawChange)) {
+          throw { code: 'invalid_registry_change', message: 'Registry change must be an object.' };
+        }
+        const change = rawChange as Record<string, unknown>;
+        const next = cloneJson(currentRegistry);
+        if (change.op === 'upsert_profile') {
+          const rawProfile = change.profile;
+          if (!rawProfile || typeof rawProfile !== 'object' || Array.isArray(rawProfile)) {
+            throw { code: 'invalid_profile', message: 'Profile must be an object.' };
+          }
+          const profile = rawProfile as Record<string, unknown>;
+          const profileId = typeof profile.id === 'string' ? profile.id : '';
+          const name = typeof profile.name === 'string' ? profile.name : '';
+          if (!profileId || !name) {
+            throw { code: 'invalid_profile', message: 'Profile id and name are required.' };
+          }
+          const rawAssignments = Array.isArray(profile.assignments) ? profile.assignments : [];
+          const seenSlots = new Set<string>();
+          const assignments = rawAssignments.map((rawAssignment) => {
+            const assignment = rawAssignment as Record<string, unknown>;
+            const rawRole = typeof assignment.role === 'string' ? assignment.role : '';
+            const role = rawRole === 'architect' ? 'advisor' : rawRole;
+            const difficulty =
+              typeof assignment.difficulty === 'string' ? assignment.difficulty : null;
+            const slotKey = `${role}:${difficulty ?? 'default'}`;
+            if (seenSlots.has(slotKey)) {
+              throw {
+                code: 'duplicate_assignment',
+                message: `Duplicate assignment for ${role} (${difficulty ?? 'default'}).`,
+              };
+            }
+            seenSlots.add(slotKey);
+            const rawChoice = assignment.choice;
+            const choice =
+              rawChoice && typeof rawChoice === 'object' && !Array.isArray(rawChoice)
+                ? (rawChoice as Record<string, unknown>)
+                : {};
+            return {
+              role,
+              difficulty,
+              choice: {
+                model_id: typeof choice.model_id === 'string' ? choice.model_id : '',
+                effort: typeof choice.effort === 'string' ? choice.effort : null,
+              },
+            };
+          });
+          const stored: Record<string, unknown> = {
+            id: profileId,
+            name,
+            assignments,
+          };
+          const advisor = profile.decision_advisor;
+          if (advisor && typeof advisor === 'object' && !Array.isArray(advisor)) {
+            stored.decision_advisor = cloneJson(advisor);
+          }
+          const existingIndex = next.profiles.findIndex((item) => item.id === profileId);
+          if (existingIndex >= 0) {
+            next.profiles[existingIndex] =
+              stored as unknown as RegistrySnapshot['profiles'][number];
+          } else {
+            next.profiles.push(
+              stored as unknown as RegistrySnapshot['profiles'][number],
+            );
+          }
+        } else if (change.op === 'delete_profile') {
+          const profileId = typeof change.profile_id === 'string' ? change.profile_id : '';
+          const existingIndex = next.profiles.findIndex((item) => item.id === profileId);
+          if (existingIndex < 0) {
+            throw { code: 'not_found', message: `Profile "${profileId}" was not found.` };
+          }
+          next.profiles.splice(existingIndex, 1);
+          if (next.default_profile_id === profileId) {
+            next.default_profile_id = null;
+          }
+        } else if (change.op === 'set_default_profile') {
+          const profileId =
+            typeof change.profile_id === 'string' && change.profile_id.length > 0
+              ? change.profile_id
+              : null;
+          if (profileId !== null && !next.profiles.some((item) => item.id === profileId)) {
+            throw { code: 'not_found', message: `Default profile "${profileId}" does not exist.` };
+          }
+          next.default_profile_id = profileId;
+        } else {
+          throw {
+            code: 'unsupported_test_command',
+            message: `Unhandled registry change in test fixture: ${String(change.op)}`,
+          };
+        }
+        next.revision = currentRegistry.revision + 1;
+        currentRegistry = next;
+        return cloneJson(currentRegistry);
+      };
 
       const projectFilteredWorkspace = (
         rawRequest: unknown,
@@ -3701,7 +4641,9 @@ export async function installWorkspaceTauriFixture(
             case 'desktop_observation_sources':
               return cloneJson(currentWorkspace.observation.sources);
             case 'desktop_registry_snapshot':
-              return cloneJson(seed.registrySnapshot);
+              return cloneJson(currentRegistry);
+            case 'desktop_registry_apply':
+              return applyRegistryChangeFixture(safeArgs);
             case 'desktop_tool_versions':
               return cloneJson(seed.toolVersions);
             case 'desktop_tool_status':
@@ -3793,6 +4735,7 @@ export async function installWorkspaceTauriFixture(
           invocations.length = 0;
         },
         getWorkspaceSnapshot: () => cloneJson(currentWorkspace),
+        getRegistrySnapshot: () => cloneJson(currentRegistry),
         setWorkspaceSnapshot: (nextSnapshot: WorkspaceSnapshot) => {
           currentWorkspace = cloneJson(nextSnapshot);
         },
@@ -3857,6 +4800,13 @@ export async function installWorkspaceTauriFixture(
             window as unknown as BrowserHarnessWindow
           ).__THREADLANE_TEST_HARNESS__?.getWorkspaceSnapshot() ?? null,
       ),
+    getRegistrySnapshot: () =>
+      page.evaluate(() => {
+        return (
+          (window as unknown as BrowserHarnessWindow).__THREADLANE_TEST_HARNESS__?.getRegistrySnapshot() ??
+          null
+        );
+      }),
     setWorkspaceSnapshot: async (nextSnapshot: WorkspaceSnapshot) => {
       await page.clock.setFixedTime(nextSnapshot.generated_at_ms);
       await page.evaluate((snap) => {

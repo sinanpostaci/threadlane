@@ -48,15 +48,51 @@ export interface ModelChoice {
   effort: string | null;
 }
 
-export type WorkflowRole =
+/**
+ * Canonical workflow roles. New configuration, drafts and writes use `advisor`.
+ * `architect` is retained only as a readable legacy input spelling for stored
+ * profiles, plans, policies and receipts; it is never emitted for new writes.
+ */
+export type CanonicalWorkflowRole =
   | 'follower'
   | 'orchestrator'
-  | 'architect'
+  | 'advisor'
   | 'coder'
   | 'reviewer'
   | 'closure';
 
-export const WORKFLOW_ROLES: readonly WorkflowRole[] = [
+/** Frozen legacy spelling accepted from older snapshots and command payloads. */
+export type LegacyWorkflowRole = 'architect';
+
+/** Workflow role accepted at configuration and record-reading boundaries. */
+export type WorkflowRole = CanonicalWorkflowRole | LegacyWorkflowRole;
+
+/**
+ * Current role list for new role selectors and drafts. Advisor appears exactly once.
+ */
+export const CANONICAL_WORKFLOW_ROLES: readonly CanonicalWorkflowRole[] = [
+  'follower',
+  'orchestrator',
+  'advisor',
+  'coder',
+  'reviewer',
+  'closure',
+] as const;
+
+/**
+ * Current workflow role order for new selectors, profile editors and writes.
+ * Advisor appears once; the frozen `architect` spelling is not a current role.
+ */
+export const WORKFLOW_ROLES: readonly CanonicalWorkflowRole[] = [
+  ...CANONICAL_WORKFLOW_ROLES,
+];
+
+/**
+ * Frozen historical workflow role order. Use this only to read raw legacy
+ * records and tests that model old snapshots; never key a current editor table
+ * or emit a new write from it.
+ */
+export const LEGACY_WORKFLOW_ROLES: readonly WorkflowRole[] = [
   'follower',
   'orchestrator',
   'architect',
@@ -65,11 +101,30 @@ export const WORKFLOW_ROLES: readonly WorkflowRole[] = [
   'closure',
 ] as const;
 
-export type ExecutionWorkflowRole = Exclude<WorkflowRole, 'follower'>;
+export type CanonicalExecutionWorkflowRole = Exclude<CanonicalWorkflowRole, 'follower'>;
+
+export type LegacyExecutionWorkflowRole = LegacyWorkflowRole;
+
+export type ExecutionWorkflowRole =
+  | CanonicalExecutionWorkflowRole
+  | LegacyExecutionWorkflowRole;
 
 export type ExecutionRole = ExecutionWorkflowRole;
 
-export const EXECUTION_ROLES: readonly ExecutionWorkflowRole[] = [
+/** Current five configurable execution roles. Advisor appears exactly once. */
+export const CANONICAL_EXECUTION_ROLES: readonly CanonicalExecutionWorkflowRole[] = [
+  'orchestrator',
+  'advisor',
+  'coder',
+  'reviewer',
+  'closure',
+] as const;
+
+/**
+ * Legacy execution role order for explicit raw-record compatibility. It is not
+ * the current editor key list and must never be used for new writes.
+ */
+export const LEGACY_EXECUTION_ROLES: readonly ExecutionWorkflowRole[] = [
   'orchestrator',
   'architect',
   'coder',
@@ -77,26 +132,90 @@ export const EXECUTION_ROLES: readonly ExecutionWorkflowRole[] = [
   'closure',
 ] as const;
 
-export const EXECUTION_WORKFLOW_ROLES = EXECUTION_ROLES;
+/** Current five configurable execution roles. Advisor appears exactly once. */
+export const EXECUTION_ROLES: readonly CanonicalExecutionWorkflowRole[] = [
+  ...CANONICAL_EXECUTION_ROLES,
+];
+
+/** Current execution roles for new role lists. */
+export const EXECUTION_WORKFLOW_ROLES = CANONICAL_EXECUTION_ROLES;
+
+const WORKFLOW_ROLE_INPUTS: readonly string[] = [
+  ...CANONICAL_WORKFLOW_ROLES,
+  ...LEGACY_WORKFLOW_ROLES,
+];
 
 export function isWorkflowRole(value: string): value is WorkflowRole {
-  return (WORKFLOW_ROLES as readonly string[]).includes(value);
+  return WORKFLOW_ROLE_INPUTS.includes(value);
 }
 
 export function isExecutionRole(value: string): value is ExecutionWorkflowRole {
-  return (EXECUTION_ROLES as readonly string[]).includes(value);
+  return isWorkflowRole(value) && value !== 'follower';
 }
 
 export const isExecutionWorkflowRole = isExecutionRole;
 
+/** Canonicalizes both accepted spellings to the current Advisor identity. */
+export function canonicalWorkflowRole(role: WorkflowRole): CanonicalWorkflowRole {
+  return role === 'architect' ? 'advisor' : role;
+}
+
+/** Canonical execution key, or null for the non-execution follower role. */
+export function canonicalExecutionWorkflowRole(
+  role: WorkflowRole
+): CanonicalExecutionWorkflowRole | null {
+  const canonical = canonicalWorkflowRole(role);
+  return canonical === 'follower' ? null : canonical;
+}
+
+/** Configuration key emitted for new profile/default/override writes. */
+export function workflowRoleConfigValue(role: WorkflowRole): CanonicalWorkflowRole {
+  return canonicalWorkflowRole(role);
+}
+
 /**
- * Presentation-only labels for canonical workflow roles. These labels never
- * change persisted workflow role values, IPC payloads, digests, or validation.
+ * Returns the semantic duplicate key for a role/difficulty slot after alias canonicalization.
+ * Both `architect` and `advisor` select the same slot and are never last-write-wins aliases.
+ */
+export function workflowRoleSlotKey(
+  role: WorkflowRole,
+  difficulty: Difficulty | null
+): string {
+  return `${canonicalWorkflowRole(role)}:${difficulty ?? 'default'}`;
+}
+
+export interface DuplicateWorkflowAssignment {
+  role: CanonicalWorkflowRole;
+  difficulty: Difficulty | null;
+}
+
+/** Finds a duplicate semantic role/difficulty slot across both configuration aliases. */
+export function findDuplicateWorkflowAssignment(
+  assignments: readonly Pick<RoleAssignment, 'role' | 'difficulty'>[]
+): DuplicateWorkflowAssignment | null {
+  const seen = new Set<string>();
+  for (const assignment of assignments) {
+    const key = workflowRoleSlotKey(assignment.role, assignment.difficulty);
+    if (seen.has(key)) {
+      return {
+        role: canonicalWorkflowRole(assignment.role),
+        difficulty: assignment.difficulty,
+      };
+    }
+    seen.add(key);
+  }
+  return null;
+}
+
+/**
+ * Presentation-only labels for workflow roles. Both accepted spellings display as Advisor;
+ * these labels never change persisted workflow role values, IPC payloads, digests, or validation.
  */
 const WORKFLOW_ROLE_PRESENTATION_LABELS: Record<WorkflowRole, string> = {
   follower: 'Follower',
   orchestrator: 'Orchestrator',
-  architect: 'Architect',
+  architect: 'Advisor',
+  advisor: 'Advisor',
   coder: 'Worker',
   reviewer: 'Reviewer',
   closure: 'Closure',
@@ -116,6 +235,7 @@ export const DIFFICULTIES: readonly Difficulty[] = [
 ] as const;
 
 export interface RoleAssignment {
+  /** Configuration accepts both `advisor` and legacy `architect`; resolve by canonical key. */
   role: WorkflowRole;
   difficulty: Difficulty | null;
   choice: ModelChoice;
@@ -216,6 +336,10 @@ export interface PlanTask {
   id: string;
   title: string;
   instruction: string;
+  /**
+   * New draft input accepts `advisor` and legacy `architect` and persists `advisor`.
+   * Stored historical plan revisions retain their original raw spelling.
+   */
   role: WorkflowRole;
   difficulty: Difficulty;
   depends_on: string[];
@@ -342,7 +466,9 @@ export function createEmptyRegistrySnapshot(): RegistrySnapshot {
 /**
  * Resolves a role/difficulty assignment from a profile in the snapshot.
  * Exact difficulty match takes precedence, followed by explicit role default (`difficulty: null`).
- * Never substitutes another role or unconfigured model.
+ * Both `advisor` and legacy `architect` select the same semantic slot. Ambiguous
+ * duplicate slots fail closed instead of choosing an arbitrary assignment. Never
+ * substitutes another role or unconfigured model.
  */
 export function resolve_choice(
   snapshot: RegistrySnapshot,
@@ -358,18 +484,34 @@ export function resolve_choice(
     } satisfies AppError;
   }
 
+  const canonicalRole = canonicalWorkflowRole(role);
+  const matchingRole = profile.assignments.filter(
+    (assignment) => canonicalWorkflowRole(assignment.role) === canonicalRole
+  );
+  const seenDifficulties = new Set<Difficulty | null>();
+  for (const assignment of matchingRole) {
+    if (seenDifficulties.has(assignment.difficulty)) {
+      const diffLabel = assignment.difficulty ?? 'default';
+      throw {
+        code: 'duplicate_assignment',
+        message: `Profile "${profile.name}" has ambiguous duplicate assignments for role "${canonicalRole}" (${diffLabel}).`,
+      } satisfies AppError;
+    }
+    seenDifficulties.add(assignment.difficulty);
+  }
+
   let matched: RoleAssignment | undefined;
   if (difficulty !== null) {
-    matched = profile.assignments.find((a) => a.role === role && a.difficulty === difficulty);
+    matched = matchingRole.find((assignment) => assignment.difficulty === difficulty);
   }
   if (!matched) {
-    matched = profile.assignments.find((a) => a.role === role && a.difficulty === null);
+    matched = matchingRole.find((assignment) => assignment.difficulty === null);
   }
   if (!matched) {
     const diffLabel = difficulty ? ` (${difficulty})` : '';
     throw {
       code: 'missing_assignment',
-      message: `Profile "${profile.name}" has no model assignment for role "${role}"${diffLabel}.`,
+      message: `Profile "${profile.name}" has no model assignment for role "${canonicalRole}"${diffLabel}.`,
     } satisfies AppError;
   }
 

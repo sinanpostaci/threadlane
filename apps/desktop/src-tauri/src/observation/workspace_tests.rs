@@ -11,10 +11,10 @@ mod unix_workspace_tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use threadlane_authority::{
-        compute_authority_core_digest, compute_record_subject_digest, derive_approval_id,
-        derive_command_key, derive_profile_id, verify_approval_record_integrity, ApprovalRecord,
-        ApprovedTaskRecord, APPROVALS_FILE_NAME, AUTHORITY_POLICY_VERSION,
-        AUTHORITY_SCHEMA_VERSION,
+        compute_authority_core_digest, compute_record_subject_digest,
+        compute_recorded_history_worker_profile_digest, derive_approval_id, derive_command_key,
+        derive_profile_id, verify_approval_record_integrity, ApprovalRecord, ApprovedTaskRecord,
+        APPROVALS_FILE_NAME, AUTHORITY_POLICY_VERSION, AUTHORITY_SCHEMA_VERSION,
     };
     use threadlane_core::observation::{
         current_observation_time_ms, serialize_workspace_native_sample_sidecar,
@@ -28,6 +28,7 @@ mod unix_workspace_tests {
         WorkspaceExternalResolutionApplicability, WorkspaceExternalResolutionScope,
         WorkspaceFreshnessState, WorkspaceMessageSourceKind, WorkspaceNativeCapabilities,
         WorkspaceNativeSample, WorkspaceSampleConnection, WorkspaceSelectionEvidence,
+        WorkspaceSnapshot, WorkspaceWorkerExecutionAcceptance, WorkspaceWorkerExecutionStatus,
         WORKSPACE_SNAPSHOT_SCHEMA_VERSION,
     };
     use threadlane_core::{
@@ -35,8 +36,9 @@ mod unix_workspace_tests {
         WorkerOutcomeSummary, WorkerStatus, WorkerWorktreeUpdate,
     };
     use threadlane_host::{
-        write_host_manifest, HostPhase, HostSessionManifest, TaskDispatchIntent, TaskRunReceipt,
-        RUNTIME_STATE_SUBDIR, TASK_RECEIPTS_FILENAME, TASK_RECEIPTS_SCHEMA_VERSION,
+        write_host_manifest, ApprovedHostClient, HostError, HostPhase, HostSessionManifest,
+        TaskDispatchIntent, TaskRunReceipt, HOST_LOCK_FILENAME, RUNTIME_STATE_SUBDIR,
+        TASK_RECEIPTS_FILENAME, TASK_RECEIPTS_SCHEMA_VERSION, WORK_AREA_SUBDIR,
     };
     use threadlane_native::coworker_observation::{
         read_scoped_workspace_job_histories, WorkspaceHistoryDiagnosticKind, WorkspaceHistoryStores,
@@ -788,6 +790,8 @@ mod unix_workspace_tests {
     enum LegacyWorkerOutcome {
         ReadyForReview,
         Failed,
+        Cancelled,
+        Unknown,
     }
 
     fn make_private_dir(path: &Path) {
@@ -949,16 +953,35 @@ mod unix_workspace_tests {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn record_legacy_worker(
-        core: &mut Core,
-        session_binding_id: &str,
-        task: &ApprovedTaskRecord,
-        session_dir: &Path,
+    fn compact_worktree_tag_for_test(id: &str, prefix: &str) -> String {
+        let digest = sha256_hex(id.as_bytes());
+        format!("{prefix}_{}", &digest[..12])
+    }
+
+    struct LegacyWorkerRunFixture<'a> {
+        task: &'a ApprovedTaskRecord,
+        session_dir: &'a Path,
         sequence: usize,
         outcome: LegacyWorkerOutcome,
         started_at_ms: i64,
+        observed_telemetry: bool,
+        profile_digest: &'a str,
+    }
+
+    fn record_legacy_worker(
+        core: &mut Core,
+        session_binding_id: &str,
+        fixture: LegacyWorkerRunFixture<'_>,
     ) -> (TaskDispatchIntent, TaskRunReceipt) {
-        let profile_digest = "c".repeat(64);
+        let LegacyWorkerRunFixture {
+            task,
+            session_dir,
+            sequence,
+            outcome,
+            started_at_ms,
+            observed_telemetry,
+            profile_digest,
+        } = fixture;
         let command_key = task.command_key.clone().expect("worker command key");
         let profile_id = task.profile_id.clone().expect("worker profile id");
         let started = match core
@@ -967,7 +990,7 @@ mod unix_workspace_tests {
                 Command::StartWorker {
                     command_key: command_key.clone(),
                     profile_id: profile_id.clone(),
-                    profile_digest: profile_digest.clone(),
+                    profile_digest: profile_digest.to_string(),
                     provider: "antigravity".to_string(),
                     requested_model: task.base_model.clone(),
                     requested_effort: task.effort.clone().unwrap_or_default(),
@@ -987,25 +1010,29 @@ mod unix_workspace_tests {
                 session_binding_id,
                 &started.run_id,
                 started.revision,
-                &profile_digest,
+                profile_digest,
                 started_at_ms + 10,
             )
             .expect("claim legacy worker");
+        let run_tag = compact_worktree_tag_for_test(&started.run_id, "r");
+        let worker_tag = compact_worktree_tag_for_test(&started.worker_id, "w");
         core.record_worker_running(
             &claim,
             WorkerWorktreeUpdate {
-                run_worktree_id: format!("wt-run-legacy-{sequence}"),
+                run_worktree_id: format!("wt-run-{run_tag}-{sequence}"),
                 run_worktree_path: session_dir
-                    .join(format!("work-area/runs/wt-run-legacy-{sequence}"))
+                    .join(format!("work-area/runs/wt-run-{run_tag}-{sequence}"))
                     .to_string_lossy()
                     .into_owned(),
-                run_branch_name: format!("tl/run/wt-run-legacy-{sequence}"),
-                task_worktree_id: format!("wt-task-legacy-{sequence}"),
+                run_branch_name: format!("tl/run/{run_tag}-{sequence}"),
+                task_worktree_id: format!("wt-task-{run_tag}-{worker_tag}-{sequence}"),
                 task_worktree_path: session_dir
-                    .join(format!("work-area/tasks/wt-task-legacy-{sequence}"))
+                    .join(format!(
+                        "work-area/tasks/wt-task-{run_tag}-{worker_tag}-{sequence}"
+                    ))
                     .to_string_lossy()
                     .into_owned(),
-                task_branch_name: format!("tl/task/wt-task-legacy-{sequence}"),
+                task_branch_name: format!("tl/task/{worker_tag}-{sequence}"),
                 base_commit: "1111111111111111111111111111111111111111".to_string(),
             },
             started_at_ms + 20,
@@ -1029,13 +1056,29 @@ mod unix_workspace_tests {
                     None,
                     Some("Legacy worker fixture failure.".to_string()),
                 ),
+                LegacyWorkerOutcome::Cancelled => (
+                    WorkerStatus::Cancelled,
+                    WorkerAcceptanceState::ExecutionFailed,
+                    None,
+                    None,
+                    None,
+                    Some("Legacy worker fixture cancellation.".to_string()),
+                ),
+                LegacyWorkerOutcome::Unknown => (
+                    WorkerStatus::Unknown,
+                    WorkerAcceptanceState::Unknown,
+                    None,
+                    None,
+                    None,
+                    Some("Legacy worker fixture unknown outcome.".to_string()),
+                ),
             };
         core.record_worker_outcome(
             &claim,
             WorkerCompletionRecord {
                 status,
-                observed_model: Some(task.base_model.clone()),
-                observed_effort: task.effort.clone(),
+                observed_model: observed_telemetry.then(|| task.base_model.clone()),
+                observed_effort: observed_telemetry.then(|| task.effort.clone()).flatten(),
                 head_commit,
                 dropped_live_events: 0,
                 outcome: WorkerOutcomeSummary {
@@ -1181,11 +1224,15 @@ mod unix_workspace_tests {
             let (intent, receipt) = record_legacy_worker(
                 &mut core,
                 &session_binding_id,
-                task,
-                &session_dir,
-                sequence,
-                *outcome,
-                1_700_000_500_000 + (sequence as i64) * 1_000,
+                LegacyWorkerRunFixture {
+                    task,
+                    session_dir: &session_dir,
+                    sequence,
+                    outcome: *outcome,
+                    started_at_ms: 1_700_000_500_000 + (sequence as i64) * 1_000,
+                    observed_telemetry: true,
+                    profile_digest: &"c".repeat(64),
+                },
             );
             intents.push(intent);
             receipts.push(receipt);
@@ -1214,6 +1261,243 @@ mod unix_workspace_tests {
         );
         write_host_manifest(&session_dir, &manifest).expect("write legacy worker host manifest");
         (plan, approval)
+    }
+
+    struct BacklogTerminalHostFixture {
+        approval: ApprovalRecord,
+        task: ApprovedTaskRecord,
+        session_binding_id: String,
+        run_id: String,
+        worker_id: String,
+    }
+
+    struct TerminalHostFixtureRequest<'a> {
+        stores: &'a TestStores,
+        binding_id: &'a str,
+        thread_uuid: &'a str,
+        project: &'a Path,
+        plan_id: &'a str,
+        task_id: &'a str,
+        outcome: LegacyWorkerOutcome,
+        observed_telemetry: bool,
+    }
+
+    fn write_backlog_terminal_host_fixture(
+        request: TerminalHostFixtureRequest<'_>,
+    ) -> BacklogTerminalHostFixture {
+        let TerminalHostFixtureRequest {
+            stores,
+            binding_id,
+            thread_uuid,
+            project,
+            plan_id,
+            task_id,
+            outcome,
+            observed_telemetry,
+        } = request;
+        let plan_tasks = vec![legacy_plan_task(task_id, "Terminal history task")];
+        let approved_task_ids = vec![task_id.to_string()];
+        let (_, approval) = write_legacy_worker_plan_and_approval_with_tasks(
+            stores,
+            (binding_id, thread_uuid),
+            project,
+            plan_id,
+            plan_tasks,
+            &approved_task_ids,
+            1_700_000_321_500,
+        );
+        let git_marker = project.join(".git");
+        if !git_marker.exists() {
+            fs::write(&git_marker, b"gitdir: disposable fixture\n")
+                .expect("write terminal repository marker");
+            set_mode(&git_marker, 0o600);
+        }
+        let fake_executable = stores
+            .sessions
+            .parent()
+            .expect("terminal stores root")
+            .join("fake-antigravity");
+        fs::write(&fake_executable, b"#!/bin/sh\nexit 0\n")
+            .expect("write terminal host fake executable");
+        set_mode(&fake_executable, 0o700);
+        let mut approval = approval;
+        for task in &mut approval.tasks {
+            task.canonical_executable = Some(fake_executable.clone());
+        }
+        let core_digest =
+            compute_authority_core_digest(&approval).expect("terminal approval core digest");
+        for task in &mut approval.tasks {
+            task.profile_id = Some(derive_profile_id(
+                &core_digest,
+                &task.task_id,
+                &task.task_digest,
+            ));
+            task.command_key = Some(derive_command_key(
+                &core_digest,
+                &task.task_id,
+                &task.task_digest,
+            ));
+        }
+        approval.subject_digest =
+            compute_record_subject_digest(&approval).expect("terminal approval subject digest");
+        approval.approval_id = derive_approval_id(&approval.subject_digest);
+        write_legacy_approvals_ledger(stores, std::slice::from_ref(&approval));
+        let task = approval
+            .tasks
+            .iter()
+            .find(|task| task.task_id == task_id)
+            .expect("terminal host task")
+            .clone();
+
+        let session_dir = stores.sessions.join(&approval.approval_id);
+        make_private_dir(&session_dir);
+        let runtime_dir = session_dir.join(RUNTIME_STATE_SUBDIR);
+        make_private_dir(&runtime_dir);
+        let work_area_dir = session_dir.join(WORK_AREA_SUBDIR);
+        make_private_dir(&work_area_dir);
+        let mut core =
+            Core::open(runtime_dir.join("state.db")).expect("open terminal worker runtime DB");
+        let binding = core
+            .create_binding(thread_uuid, "Backlog terminal host fixture")
+            .expect("create terminal runtime binding");
+        let session_binding_id = binding.binding_id.clone();
+        let profile_digest = compute_recorded_history_worker_profile_digest(
+            &approval,
+            &task,
+            &session_binding_id,
+            &work_area_dir,
+            &work_area_dir,
+        )
+        .expect("terminal worker profile digest");
+        let (intent, receipt) = record_legacy_worker(
+            &mut core,
+            &session_binding_id,
+            LegacyWorkerRunFixture {
+                task: &task,
+                session_dir: &session_dir,
+                sequence: 0,
+                outcome,
+                started_at_ms: 1_700_000_500_000,
+                observed_telemetry,
+                profile_digest: &profile_digest,
+            },
+        );
+        drop(core);
+
+        let payload = serde_json::json!({
+            "schema_version": TASK_RECEIPTS_SCHEMA_VERSION,
+            "approval_id": approval.approval_id,
+            "subject_digest": approval.subject_digest,
+            "session_binding_id": session_binding_id,
+            "pending_intents": [intent],
+            "receipts": [receipt],
+        });
+        write_private_json(&session_dir.join(TASK_RECEIPTS_FILENAME), &payload);
+        let manifest = HostSessionManifest::from_approval_record(
+            &approval,
+            Some(session_binding_id.clone()),
+            HostPhase::Stopped,
+            None,
+            None,
+            1_700_000_330_500,
+            1_700_000_600_500,
+        );
+        write_host_manifest(&session_dir, &manifest).expect("write terminal host manifest");
+        let host_lock = session_dir.join(HOST_LOCK_FILENAME);
+        fs::write(&host_lock, b"").expect("write empty host.lock");
+        set_mode(&host_lock, 0o600);
+
+        BacklogTerminalHostFixture {
+            approval,
+            task,
+            session_binding_id,
+            run_id: receipt.run_id,
+            worker_id: receipt.worker_id,
+        }
+    }
+
+    struct BacklogWorkerExecutionSeed<'a> {
+        binding_id: &'a str,
+        item_id: &'a str,
+        fixture: &'a BacklogTerminalHostFixture,
+        command_prefix: &'a str,
+        outcome: threadlane_core::WorkerBacklogOutcome,
+        result_digest: Option<String>,
+        now_ms: i64,
+    }
+
+    fn seed_backlog_worker_execution(
+        core: &mut Core,
+        seed: BacklogWorkerExecutionSeed<'_>,
+    ) -> threadlane_core::WorkerBacklogExecution {
+        let BacklogWorkerExecutionSeed {
+            binding_id,
+            item_id,
+            fixture,
+            command_prefix,
+            outcome,
+            result_digest,
+            now_ms,
+        } = seed;
+        let current = core
+            .get_backlog_item(binding_id, item_id)
+            .expect("current backlog item before reservation");
+        let reserved = core
+            .reserve_worker_backlog_execution_operator_attested(
+                binding_id,
+                &format!("{command_prefix}-reserve"),
+                item_id,
+                current.revision,
+                threadlane_core::WorkerBacklogAuthority {
+                    approval_id: fixture.approval.approval_id.clone(),
+                    subject_digest: fixture.approval.subject_digest.clone(),
+                    task_id: fixture.task.task_id.clone(),
+                    task_digest: fixture.task.task_digest.clone(),
+                },
+                now_ms,
+            )
+            .expect("reserve seeded backlog execution");
+        let current = core
+            .get_backlog_item(binding_id, item_id)
+            .expect("current backlog item before receipt attachment");
+        core.attach_worker_backlog_dispatch_receipt_operator_attested(
+            binding_id,
+            &format!("{command_prefix}-attach"),
+            item_id,
+            &reserved.execution_ref,
+            current.revision,
+            threadlane_core::WorkerBacklogDispatchReceipt {
+                session_binding_id: fixture.session_binding_id.clone(),
+                run_id: fixture.run_id.clone(),
+                worker_id: fixture.worker_id.clone(),
+                profile_id: fixture
+                    .task
+                    .profile_id
+                    .clone()
+                    .expect("seeded worker profile id"),
+                execution_binding_digest: None,
+            },
+            now_ms + 10,
+        )
+        .expect("attach seeded dispatch receipt");
+        let current = core
+            .get_backlog_item(binding_id, item_id)
+            .expect("current backlog item before outcome");
+        core.record_worker_backlog_outcome_operator_attested(
+            binding_id,
+            &format!("{command_prefix}-outcome"),
+            item_id,
+            &reserved.execution_ref,
+            current.revision,
+            threadlane_core::WorkerBacklogOutcomeReport {
+                outcome,
+                note: "Seeded terminal evidence".to_string(),
+                result_digest,
+            },
+            now_ms + 20,
+        )
+        .expect("record seeded outcome");
+        reserved
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1302,17 +1586,21 @@ mod unix_workspace_tests {
             expected_session_binding_id: "bnd_presence_session".to_string(),
             expected_run_id: "run_presence_test".to_string(),
             expected_worker_id: "wrk_presence_test".to_string(),
+            expected_subject_digest: None,
+            expected_task_digest: None,
             authority_dir: authority_dir.to_path_buf(),
             sessions_dir: sessions_dir.to_path_buf(),
             binding_id: "bnd_presence_control".to_string(),
             thread_uuid: "0196ed00-0000-7000-8000-000000000901".to_string(),
+            lookup_presence: true,
+            lookup_terminal_history: false,
         }
     }
 
     fn test_presence_result(query: &WorkspacePresenceQuery) -> WorkspacePresenceResult {
         WorkspacePresenceResult {
             chat_key: query.chat_key.clone(),
-            presence: WorkspaceBacklogWorkerPresence {
+            presence: Some(WorkspaceBacklogWorkerPresence {
                 item_id: query.item_id.clone(),
                 execution_ref: query.execution_ref.clone(),
                 approval_id: query.approval_id.clone(),
@@ -1330,8 +1618,17 @@ mod unix_workspace_tests {
                 sample_age_ms: Some(42),
                 max_sample_age_ms: 5_000,
                 expires_at_ms: Some(1_700_000_005_000),
-            },
+            }),
+            execution: None,
         }
+    }
+
+    async fn refreshed_workspace_snapshot(service: &ObservationService) -> WorkspaceSnapshot {
+        let mut bundle = service
+            .workspace_snapshot_bundle(None)
+            .expect("workspace snapshot bundle");
+        let results = refresh_workspace_backlog_presence(bundle.presence_queries).await;
+        apply_workspace_presence_results(&mut bundle.snapshot, results)
     }
 
     #[test]
@@ -2712,6 +3009,15 @@ mod unix_workspace_tests {
             work.worker_presence.is_empty(),
             "the synchronous snapshot never invents presence"
         );
+        assert_eq!(work.worker_executions.len(), 2);
+        assert!(
+            work.worker_executions.iter().all(|execution| {
+                execution.provider.is_none()
+                    && execution.worker_status.is_none()
+                    && execution.duration_ms.is_none()
+            }),
+            "the synchronous snapshot projects durable execution identity without host telemetry"
+        );
 
         let chat = snap
             .chats
@@ -2741,6 +3047,579 @@ mod unix_workspace_tests {
                 .map(|event| event.recorded_at_ms),
             work.events.first().map(|event| event.recorded_at_ms),
             "projection must not rewrite durable history timestamps"
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_snapshot_enriches_terminal_worker_history_and_reopen_preserves_original_metadata(
+    ) {
+        let tree = TestTree::new("terminal-history-success");
+        let stores = TestStores::new(&tree, "stores");
+        let app_data = tree.dir("app-data");
+        let project = tree.dir("repo-terminal-success");
+        let thread_uuid = "0196ed00-0000-7000-8000-0000000006a1";
+        let source_id = stores.canonical_source_id();
+
+        let mut core = Core::open(stores.state.join("state.db")).expect("open main state");
+        let binding = core
+            .create_binding(thread_uuid, "Terminal success chat")
+            .expect("terminal success binding");
+        let item = core
+            .create_backlog_item(
+                &binding.binding_id,
+                "create-terminal-success-item",
+                threadlane_core::NewBacklogItem {
+                    title: "Ship verified terminal history".to_string(),
+                    acceptance_condition: "The verified metadata is visible".to_string(),
+                    delivery_description: "Deliver the verified metadata".to_string(),
+                    kind: threadlane_core::BacklogItemKind::Worker,
+                },
+                2_000,
+            )
+            .expect("create terminal success item");
+        let fixture = write_backlog_terminal_host_fixture(TerminalHostFixtureRequest {
+            stores: &stores,
+            binding_id: &binding.binding_id,
+            thread_uuid,
+            project: &project,
+            plan_id: "plan_terminal_success",
+            task_id: "task-terminal-success",
+            outcome: LegacyWorkerOutcome::ReadyForReview,
+            observed_telemetry: true,
+        });
+        let seeded = seed_backlog_worker_execution(
+            &mut core,
+            BacklogWorkerExecutionSeed {
+                binding_id: &binding.binding_id,
+                item_id: &item.item_id,
+                fixture: &fixture,
+                command_prefix: "terminal-success",
+                outcome: threadlane_core::WorkerBacklogOutcome::Success,
+                result_digest: Some("a".repeat(64)),
+                now_ms: 2_010,
+            },
+        );
+        assert_eq!(
+            core.get_backlog_item(&binding.binding_id, &item.item_id)
+                .expect("success item")
+                .status,
+            threadlane_core::BacklogStatus::Doing,
+            "technical success remains Doing until Coworker acceptance"
+        );
+        drop(core);
+
+        let identity = write_verified_chat_sample(
+            &stores,
+            &source_id,
+            &binding.binding_id,
+            thread_uuid,
+            &project,
+            "epoch_terminal_success",
+        );
+        let before = snapshot_tree_fingerprints(tree.path());
+        let service = ObservationService::new(stores.config(&app_data));
+        let snapshot = refreshed_workspace_snapshot(&service).await;
+        assert_eq!(
+            snapshot_tree_fingerprints(tree.path()),
+            before,
+            "terminal-history reads must not create, migrate, ACK, or rewrite durable state"
+        );
+
+        let work = snapshot
+            .chat_work
+            .iter()
+            .find(|work| work.identity == identity)
+            .expect("terminal success chat work");
+        assert_eq!(work.worker_executions.len(), 1);
+        let execution = work.worker_executions[0].clone();
+        assert_eq!(execution.item_id, item.item_id);
+        assert_eq!(execution.execution_ref, seeded.execution_ref);
+        assert_eq!(execution.approval_id, fixture.approval.approval_id);
+        assert_eq!(execution.task_id, fixture.task.task_id);
+        assert_eq!(execution.session_binding_id, fixture.session_binding_id);
+        assert_eq!(execution.run_id, fixture.run_id);
+        assert_eq!(execution.worker_id, fixture.worker_id);
+        assert_eq!(execution.provider.as_deref(), Some("antigravity"));
+        assert_eq!(
+            execution.requested_model.as_deref(),
+            Some(fixture.task.base_model.as_str())
+        );
+        assert_eq!(
+            execution.observed_model.as_deref(),
+            Some(fixture.task.base_model.as_str())
+        );
+        assert_eq!(
+            execution.requested_effort.as_deref(),
+            fixture.task.effort.as_deref()
+        );
+        assert_eq!(
+            execution.observed_effort.as_deref(),
+            fixture.task.effort.as_deref()
+        );
+        assert_eq!(
+            execution.worker_status,
+            Some(WorkspaceWorkerExecutionStatus::Completed)
+        );
+        assert_eq!(execution.started_at_ms, Some(1_700_000_500_020));
+        assert_eq!(execution.finished_at_ms, Some(1_700_000_500_100));
+        assert_eq!(
+            execution.duration_ms,
+            Some(100),
+            "the measured runtime terminal duration is preferred"
+        );
+        assert_eq!(
+            execution.outcome,
+            Some(threadlane_core::WorkerBacklogOutcome::Success)
+        );
+        assert_eq!(
+            execution.acceptance,
+            Some(WorkspaceWorkerExecutionAcceptance::Pending)
+        );
+        assert!(
+            work.worker_presence.is_empty(),
+            "terminal history is never converted into live presence"
+        );
+        let chat = snapshot
+            .chats
+            .iter()
+            .find(|chat| chat.identity == identity)
+            .expect("terminal success chat summary");
+        assert_eq!(chat.activity, WorkspaceActivityState::Idle);
+
+        let mut reopened = snapshot.clone();
+        let second_results = {
+            let bundle = service
+                .workspace_snapshot_bundle(None)
+                .expect("second terminal history bundle");
+            refresh_workspace_backlog_presence(bundle.presence_queries).await
+        };
+        let reopened = apply_workspace_presence_results(&mut reopened, second_results);
+        let reopened_work = reopened
+            .chat_work
+            .iter()
+            .find(|work| work.identity == identity)
+            .expect("reopened terminal chat work");
+        assert_eq!(
+            reopened_work.worker_executions,
+            work.worker_executions,
+            "reopening the read-only observation preserves the original terminal identity and metadata"
+        );
+
+        let mut core = Core::open(stores.state.join("state.db")).expect("reopen main state");
+        let current = core
+            .get_backlog_item(&binding.binding_id, &item.item_id)
+            .expect("current success item");
+        core.complete_worker_backlog_item_operator_attested(
+            &binding.binding_id,
+            "complete-terminal-success-item",
+            &item.item_id,
+            current.revision,
+            threadlane_core::WorkerBacklogCompletion {
+                execution_ref: execution.execution_ref.clone(),
+                result_digest: "a".repeat(64),
+                acceptance_note: "Checked the terminal delivery".to_string(),
+                acceptance_evidence: "Inspected the actual artifact".to_string(),
+                delivery_digest: "b".repeat(64),
+            },
+            2_050,
+        )
+        .expect("complete terminal success item");
+        drop(core);
+
+        let accepted = refreshed_workspace_snapshot(&service).await;
+        let accepted_work = accepted
+            .chat_work
+            .iter()
+            .find(|work| work.identity == identity)
+            .expect("accepted terminal chat work");
+        assert_eq!(
+            accepted_work.items[0].status,
+            threadlane_core::BacklogStatus::Done
+        );
+        assert_eq!(
+            accepted_work.worker_executions.len(),
+            1,
+            "guarded Done is terminal and never creates another execution"
+        );
+        let accepted_execution = &accepted_work.worker_executions[0];
+        assert_eq!(
+            accepted_execution.execution_ref, execution.execution_ref,
+            "accepted Done keeps the original terminal execution identity"
+        );
+        assert_eq!(
+            accepted_execution.acceptance,
+            Some(WorkspaceWorkerExecutionAcceptance::Accepted)
+        );
+        assert_eq!(
+            accepted_execution.worker_status,
+            Some(WorkspaceWorkerExecutionStatus::Completed)
+        );
+        assert_eq!(
+            accepted_execution.requested_model,
+            execution.requested_model
+        );
+        assert_eq!(accepted_execution.duration_ms, execution.duration_ms);
+    }
+
+    #[tokio::test]
+    async fn workspace_snapshot_keeps_failed_cancelled_unknown_and_rejected_executions_distinct() {
+        let tree = TestTree::new("terminal-history-outcomes");
+        let stores = TestStores::new(&tree, "stores");
+        let app_data = tree.dir("app-data");
+        let project = tree.dir("repo-terminal-outcomes");
+        let thread_uuid = "0196ed00-0000-7000-8000-0000000006b1";
+        let source_id = stores.canonical_source_id();
+
+        let mut core = Core::open(stores.state.join("state.db")).expect("open main state");
+        let binding = core
+            .create_binding(thread_uuid, "Terminal outcomes chat")
+            .expect("terminal outcomes binding");
+
+        let create_worker_item = |core: &mut Core, key: &str, title: &str| {
+            core.create_backlog_item(
+                &binding.binding_id,
+                key,
+                threadlane_core::NewBacklogItem {
+                    title: title.to_string(),
+                    acceptance_condition: "The outcome is verified".to_string(),
+                    delivery_description: "Deliver the outcome evidence".to_string(),
+                    kind: threadlane_core::BacklogItemKind::Worker,
+                },
+                3_000,
+            )
+            .expect("create outcome item")
+        };
+        let failed_item = create_worker_item(&mut core, "create-outcome-failed", "Failed attempt");
+        let cancelled_item =
+            create_worker_item(&mut core, "create-outcome-cancelled", "Cancelled attempt");
+        let unknown_item =
+            create_worker_item(&mut core, "create-outcome-unknown", "Unknown attempt");
+        let rejected_item =
+            create_worker_item(&mut core, "create-outcome-rejected", "Rejected attempt");
+        let tampered_item =
+            create_worker_item(&mut core, "create-outcome-tampered", "Tampered attempt");
+
+        let failed_fixture = write_backlog_terminal_host_fixture(TerminalHostFixtureRequest {
+            stores: &stores,
+            binding_id: &binding.binding_id,
+            thread_uuid,
+            project: &project,
+            plan_id: "plan_terminal_failed",
+            task_id: "task-terminal-failed",
+            outcome: LegacyWorkerOutcome::Failed,
+            observed_telemetry: true,
+        });
+        let cancelled_fixture = write_backlog_terminal_host_fixture(TerminalHostFixtureRequest {
+            stores: &stores,
+            binding_id: &binding.binding_id,
+            thread_uuid,
+            project: &project,
+            plan_id: "plan_terminal_cancelled",
+            task_id: "task-terminal-cancelled",
+            outcome: LegacyWorkerOutcome::Cancelled,
+            observed_telemetry: true,
+        });
+        let unknown_fixture = write_backlog_terminal_host_fixture(TerminalHostFixtureRequest {
+            stores: &stores,
+            binding_id: &binding.binding_id,
+            thread_uuid,
+            project: &project,
+            plan_id: "plan_terminal_unknown",
+            task_id: "task-terminal-unknown",
+            outcome: LegacyWorkerOutcome::Unknown,
+            observed_telemetry: true,
+        });
+        let rejected_fixture = write_backlog_terminal_host_fixture(TerminalHostFixtureRequest {
+            stores: &stores,
+            binding_id: &binding.binding_id,
+            thread_uuid,
+            project: &project,
+            plan_id: "plan_terminal_rejected",
+            task_id: "task-terminal-rejected",
+            outcome: LegacyWorkerOutcome::ReadyForReview,
+            observed_telemetry: true,
+        });
+        let retry_fixture = write_backlog_terminal_host_fixture(TerminalHostFixtureRequest {
+            stores: &stores,
+            binding_id: &binding.binding_id,
+            thread_uuid,
+            project: &project,
+            plan_id: "plan_terminal_retry",
+            task_id: "task-terminal-retry",
+            outcome: LegacyWorkerOutcome::ReadyForReview,
+            observed_telemetry: false,
+        });
+        let tampered_fixture = write_backlog_terminal_host_fixture(TerminalHostFixtureRequest {
+            stores: &stores,
+            binding_id: &binding.binding_id,
+            thread_uuid,
+            project: &project,
+            plan_id: "plan_terminal_tampered",
+            task_id: "task-terminal-tampered",
+            outcome: LegacyWorkerOutcome::ReadyForReview,
+            observed_telemetry: true,
+        });
+        write_legacy_approvals_ledger(
+            &stores,
+            &[
+                failed_fixture.approval.clone(),
+                cancelled_fixture.approval.clone(),
+                unknown_fixture.approval.clone(),
+                rejected_fixture.approval.clone(),
+                retry_fixture.approval.clone(),
+                tampered_fixture.approval.clone(),
+            ],
+        );
+
+        let failed_execution = seed_backlog_worker_execution(
+            &mut core,
+            BacklogWorkerExecutionSeed {
+                binding_id: &binding.binding_id,
+                item_id: &failed_item.item_id,
+                fixture: &failed_fixture,
+                command_prefix: "outcome-failed",
+                outcome: threadlane_core::WorkerBacklogOutcome::Failure,
+                result_digest: Some("1".repeat(64)),
+                now_ms: 3_010,
+            },
+        );
+        let cancelled_execution = seed_backlog_worker_execution(
+            &mut core,
+            BacklogWorkerExecutionSeed {
+                binding_id: &binding.binding_id,
+                item_id: &cancelled_item.item_id,
+                fixture: &cancelled_fixture,
+                command_prefix: "outcome-cancelled",
+                outcome: threadlane_core::WorkerBacklogOutcome::Failure,
+                result_digest: Some("2".repeat(64)),
+                now_ms: 3_020,
+            },
+        );
+        let unknown_execution = seed_backlog_worker_execution(
+            &mut core,
+            BacklogWorkerExecutionSeed {
+                binding_id: &binding.binding_id,
+                item_id: &unknown_item.item_id,
+                fixture: &unknown_fixture,
+                command_prefix: "outcome-unknown",
+                outcome: threadlane_core::WorkerBacklogOutcome::Unknown,
+                result_digest: None,
+                now_ms: 3_030,
+            },
+        );
+        let rejected_execution = seed_backlog_worker_execution(
+            &mut core,
+            BacklogWorkerExecutionSeed {
+                binding_id: &binding.binding_id,
+                item_id: &rejected_item.item_id,
+                fixture: &rejected_fixture,
+                command_prefix: "outcome-rejected",
+                outcome: threadlane_core::WorkerBacklogOutcome::Success,
+                result_digest: Some("3".repeat(64)),
+                now_ms: 3_040,
+            },
+        );
+        let rejected_current = core
+            .get_backlog_item(&binding.binding_id, &rejected_item.item_id)
+            .expect("rejected item before rejection");
+        core.reject_worker_backlog_acceptance_operator_attested(
+            &binding.binding_id,
+            "reject-outcome-item",
+            &rejected_item.item_id,
+            rejected_current.revision,
+            threadlane_core::WorkerBacklogAcceptanceRejection {
+                execution_ref: rejected_execution.execution_ref.clone(),
+                result_digest: "3".repeat(64),
+                delivery_digest: "4".repeat(64),
+                reason: "The delivery failed acceptance".to_string(),
+                evidence: "Checked the complete artifact".to_string(),
+            },
+            3_050,
+        )
+        .expect("reject technically successful delivery");
+        let retry_execution = seed_backlog_worker_execution(
+            &mut core,
+            BacklogWorkerExecutionSeed {
+                binding_id: &binding.binding_id,
+                item_id: &rejected_item.item_id,
+                fixture: &retry_fixture,
+                command_prefix: "outcome-retry",
+                outcome: threadlane_core::WorkerBacklogOutcome::Success,
+                result_digest: Some("5".repeat(64)),
+                now_ms: 3_060,
+            },
+        );
+        let tampered_execution = seed_backlog_worker_execution(
+            &mut core,
+            BacklogWorkerExecutionSeed {
+                binding_id: &binding.binding_id,
+                item_id: &tampered_item.item_id,
+                fixture: &tampered_fixture,
+                command_prefix: "outcome-tampered",
+                outcome: threadlane_core::WorkerBacklogOutcome::Success,
+                result_digest: Some("6".repeat(64)),
+                now_ms: 3_070,
+            },
+        );
+        drop(core);
+
+        let tampered_session_dir = stores.sessions.join(&tampered_fixture.approval.approval_id);
+        let receipts_path = tampered_session_dir.join(TASK_RECEIPTS_FILENAME);
+        let mut receipts: serde_json::Value = serde_json::from_slice(
+            &fs::read(&receipts_path).expect("read tampered fixture receipts"),
+        )
+        .expect("parse tampered fixture receipts");
+        receipts["receipts"][0]["run_id"] =
+            serde_json::Value::String("run_ffffffffffffffffffffffffffffffff".to_string());
+        write_private_json(&receipts_path, &receipts);
+
+        let identity = write_verified_chat_sample(
+            &stores,
+            &source_id,
+            &binding.binding_id,
+            thread_uuid,
+            &project,
+            "epoch_terminal_outcomes",
+        );
+        let service = ObservationService::new(stores.config(&app_data));
+        let snapshot = refreshed_workspace_snapshot(&service).await;
+        let work = snapshot
+            .chat_work
+            .iter()
+            .find(|work| work.identity == identity)
+            .expect("terminal outcomes chat work");
+        assert_eq!(work.worker_executions.len(), 6);
+        assert!(work.worker_presence.is_empty());
+
+        let find_execution = |execution_ref: &str| {
+            work.worker_executions
+                .iter()
+                .find(|execution| execution.execution_ref == execution_ref)
+                .expect("projected execution")
+        };
+        let failed = find_execution(&failed_execution.execution_ref);
+        assert_eq!(
+            failed.worker_status,
+            Some(WorkspaceWorkerExecutionStatus::Failed)
+        );
+        assert_eq!(
+            failed.outcome,
+            Some(threadlane_core::WorkerBacklogOutcome::Failure)
+        );
+        assert_eq!(failed.acceptance, None);
+
+        let cancelled = find_execution(&cancelled_execution.execution_ref);
+        assert_eq!(
+            cancelled.worker_status,
+            Some(WorkspaceWorkerExecutionStatus::Cancelled)
+        );
+        assert_eq!(
+            cancelled.outcome,
+            Some(threadlane_core::WorkerBacklogOutcome::Failure)
+        );
+        assert_eq!(cancelled.acceptance, None);
+
+        let unknown = find_execution(&unknown_execution.execution_ref);
+        assert_eq!(
+            unknown.worker_status,
+            Some(WorkspaceWorkerExecutionStatus::Unknown)
+        );
+        assert_eq!(
+            unknown.outcome,
+            Some(threadlane_core::WorkerBacklogOutcome::Unknown)
+        );
+        assert_eq!(unknown.acceptance, None);
+
+        let rejected = find_execution(&rejected_execution.execution_ref);
+        assert_eq!(
+            rejected.worker_status,
+            Some(WorkspaceWorkerExecutionStatus::Completed)
+        );
+        assert_eq!(
+            rejected.outcome,
+            Some(threadlane_core::WorkerBacklogOutcome::Success)
+        );
+        assert_eq!(
+            rejected.acceptance,
+            Some(WorkspaceWorkerExecutionAcceptance::Rejected)
+        );
+
+        let retry = find_execution(&retry_execution.execution_ref);
+        assert_ne!(retry.execution_ref, rejected.execution_ref);
+        assert_eq!(
+            retry.worker_status,
+            Some(WorkspaceWorkerExecutionStatus::Completed)
+        );
+        assert_eq!(
+            retry.outcome,
+            Some(threadlane_core::WorkerBacklogOutcome::Success)
+        );
+        assert_eq!(
+            retry.acceptance,
+            Some(WorkspaceWorkerExecutionAcceptance::Pending)
+        );
+        assert_eq!(
+            retry.observed_model, None,
+            "missing observed telemetry stays absent instead of using a profile assignment"
+        );
+        assert!(retry.requested_model.is_some());
+
+        let tampered = find_execution(&tampered_execution.execution_ref);
+        assert_eq!(tampered.provider, None);
+        assert_eq!(tampered.requested_model, None);
+        assert_eq!(tampered.worker_status, None);
+        assert_eq!(tampered.duration_ms, None);
+        assert_eq!(
+            tampered.outcome,
+            Some(threadlane_core::WorkerBacklogOutcome::Success),
+            "an unavailable host read never erases the durable technical outcome"
+        );
+        assert_eq!(
+            tampered.acceptance,
+            Some(WorkspaceWorkerExecutionAcceptance::Pending)
+        );
+
+        let item_status = |item_id: &str| {
+            work.items
+                .iter()
+                .find(|item| item.item_id == item_id)
+                .expect("projected outcome item")
+                .status
+        };
+        assert_eq!(
+            item_status(&failed_item.item_id),
+            threadlane_core::BacklogStatus::Blocked
+        );
+        assert_eq!(
+            item_status(&cancelled_item.item_id),
+            threadlane_core::BacklogStatus::Blocked
+        );
+        assert_eq!(
+            item_status(&unknown_item.item_id),
+            threadlane_core::BacklogStatus::Blocked
+        );
+        assert_eq!(
+            item_status(&rejected_item.item_id),
+            threadlane_core::BacklogStatus::Doing,
+            "a fresh authorized attempt after rejection is a separate execution"
+        );
+        assert_eq!(
+            item_status(&tampered_item.item_id),
+            threadlane_core::BacklogStatus::Doing
+        );
+
+        let wrong_scope = ApprovedHostClient::get_task_terminal_summary_readonly_at(
+            &stores.authority,
+            &stores.sessions,
+            "bnd_wrong_terminal_chat",
+            thread_uuid,
+            &failed_fixture.approval.approval_id,
+            &failed_fixture.task.task_id,
+        )
+        .await;
+        assert!(
+            matches!(wrong_scope, Err(HostError::ScopeMismatch { .. })),
+            "a wrong chat must not read another chat's terminal history"
         );
     }
 
@@ -5795,9 +6674,10 @@ mod unix_workspace_tests {
         .await;
         let elapsed = started.elapsed();
         assert_eq!(results.len(), 2);
-        assert!(results
-            .iter()
-            .all(|result| result.presence.execution_ref.starts_with("exec-fast-")));
+        assert!(results.iter().all(|result| result
+            .presence
+            .as_ref()
+            .is_some_and(|presence| presence.execution_ref.starts_with("exec-fast-"))));
         assert!(elapsed >= Duration::from_millis(150));
         assert!(elapsed < Duration::from_secs(2));
         assert_eq!(
@@ -5805,6 +6685,129 @@ mod unix_workspace_tests {
             2,
             "pending acquisition futures must be dropped before refresh returns"
         );
+    }
+
+    #[tokio::test]
+    async fn workspace_presence_refresh_keeps_completed_presence_when_metadata_is_slow() {
+        let mut merged =
+            test_presence_query("chat-mixed", "exec-mixed", "task-mixed", "item-mixed");
+        merged.lookup_terminal_history = true;
+
+        let acquire = |query: WorkspacePresenceQuery| async move {
+            if query.lookup_presence {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            } else {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+            Some(test_presence_result(&query))
+        };
+        let started = Instant::now();
+        let results = collect_bounded_workspace_presence(
+            vec![merged],
+            started + Duration::from_millis(200),
+            Duration::from_millis(750),
+            8,
+            acquire,
+        )
+        .await;
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the single shared deadline must still bound the split acquisitions"
+        );
+        assert_eq!(
+            results.len(),
+            1,
+            "a completed presence sample must not be discarded with the slow metadata part"
+        );
+        let presence = results[0]
+            .presence
+            .as_ref()
+            .expect("completed presence sample retained");
+        assert_eq!(presence.sampled_at_ms, Some(1_700_000_000_000));
+        assert_eq!(presence.sample_age_ms, Some(42));
+        assert_eq!(presence.expires_at_ms, Some(1_700_000_005_000));
+        assert!(
+            results[0].execution.is_none(),
+            "the timed-out metadata part must not invent an execution"
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_presence_refresh_starts_later_live_presence_before_prior_slow_metadata() {
+        // 32 earlier metadata-only jobs would consume all eight slots in a single FIFO. The later
+        // live presence lookup must still start and complete under the unchanged per-call, total,
+        // and concurrency budgets.
+        let mut queries: Vec<WorkspacePresenceQuery> = (0..32)
+            .map(|index| {
+                let mut query = test_presence_query(
+                    "chat-metadata",
+                    &format!("exec-metadata-{index:02}"),
+                    &format!("task-metadata-{index:02}"),
+                    &format!("item-metadata-{index:02}"),
+                );
+                query.lookup_presence = false;
+                query.lookup_terminal_history = true;
+                query
+            })
+            .collect();
+        queries.push(test_presence_query(
+            "chat-later-live",
+            "exec-later-live",
+            "task-later-live",
+            "item-later-live",
+        ));
+
+        let presence_started = Arc::new(AtomicUsize::new(0));
+        let metadata_started = Arc::new(AtomicUsize::new(0));
+        let acquire = {
+            let presence_started = Arc::clone(&presence_started);
+            let metadata_started = Arc::clone(&metadata_started);
+            move |query: WorkspacePresenceQuery| {
+                let presence_started = Arc::clone(&presence_started);
+                let metadata_started = Arc::clone(&metadata_started);
+                async move {
+                    if query.lookup_presence {
+                        presence_started.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    } else {
+                        metadata_started.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_secs(60)).await;
+                    }
+                    Some(test_presence_result(&query))
+                }
+            }
+        };
+        let started = Instant::now();
+        let results = collect_bounded_workspace_presence(
+            queries,
+            started + Duration::from_millis(250),
+            Duration::from_millis(750),
+            8,
+            acquire,
+        )
+        .await;
+        assert_eq!(
+            presence_started.load(Ordering::SeqCst),
+            1,
+            "the later live presence lookup must start before the shared deadline"
+        );
+        assert!(
+            metadata_started.load(Ordering::SeqCst) >= 8,
+            "metadata enrichment must still run in the remaining slots"
+        );
+        assert_eq!(
+            results.len(),
+            1,
+            "only the completed fast presence sample is retained at the deadline"
+        );
+        assert_eq!(
+            results[0]
+                .presence
+                .as_ref()
+                .map(|presence| presence.execution_ref.as_str()),
+            Some("exec-later-live")
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[tokio::test]

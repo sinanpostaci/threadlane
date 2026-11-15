@@ -4,6 +4,7 @@ import { describe, it } from 'node:test';
 import {
   acknowledgeActiveDraftOverwrite,
   analyzeDraft,
+  assignmentsFromTable,
   beginAsyncOperation,
   beginCloneProfile,
   beginCreateProfile,
@@ -12,6 +13,7 @@ import {
   clearDraftRoleOverrides,
   countProfileDifficultyOverrides,
   countRoleDifficultyOverrides,
+  createEditDraftFromProfile,
   createProfilesPanelState,
   discardActiveDraft,
   discardDraftAndSwitch,
@@ -20,6 +22,7 @@ import {
   keepDraftAndSwitch,
   loadLatestIntoActiveDraft,
   needsAcknowledgement,
+  PROFILE_EXECUTION_ROLES,
   profileFromDraft,
   profileSignature,
   resolveOperationError,
@@ -179,6 +182,96 @@ function makeSnapshot(
 }
 
 describe('app-profile-state transitions and invariants', () => {
+  it('uses advisor as the current editor identity while reading legacy architect input without rewriting it', () => {
+    const legacyProfile: WorkflowProfile = {
+      id: 'profile-legacy-advisor',
+      name: 'Legacy Advisor Input',
+      assignments: [
+        {
+          role: 'architect',
+          difficulty: null,
+          choice: { model_id: 'gpt-5.4', effort: 'high' },
+        },
+        {
+          role: 'architect',
+          difficulty: 'hard',
+          choice: { model_id: 'deepseek-v4.1-flash', effort: 'max' },
+        },
+        {
+          role: 'coder',
+          difficulty: null,
+          choice: { model_id: 'gpt-5.4', effort: 'xhigh' },
+        },
+      ],
+    };
+    const rawBefore = JSON.stringify(legacyProfile);
+    const snapshot = makeSnapshot([legacyProfile]);
+    const draft = createEditDraftFromProfile(snapshot, legacyProfile);
+
+    assert.deepEqual(Object.keys(draft.assignments), [...PROFILE_EXECUTION_ROLES]);
+    assert.equal('architect' in draft.assignments, false);
+    assert.deepEqual(draft.assignments.advisor.default, {
+      model_id: 'gpt-5.4',
+      effort: 'high',
+      pending_family: null,
+    });
+    assert.deepEqual(draft.assignments.advisor.hard, {
+      model_id: 'deepseek-v4.1-flash',
+      effort: 'max',
+      pending_family: null,
+    });
+    assert.equal(isDraftDirty(draft), false);
+    assert.equal(JSON.stringify(legacyProfile), rawBefore);
+    assert.equal(legacyProfile.assignments[0]?.role, 'architect');
+
+    const savedAssignments = assignmentsFromTable(draft.assignments);
+    assert.deepEqual(
+      savedAssignments.map(
+        (assignment) => `${assignment.role}:${assignment.difficulty ?? 'default'}`
+      ),
+      ['advisor:default', 'advisor:hard', 'coder:default']
+    );
+    assert.equal(
+      savedAssignments.some((assignment) => assignment.role === 'architect'),
+      false
+    );
+    assert.deepEqual(
+      savedAssignments.find((assignment) => assignment.role === 'advisor')?.choice,
+      { model_id: 'gpt-5.4', effort: 'high' }
+    );
+
+    const advisorProfile: WorkflowProfile = {
+      ...legacyProfile,
+      assignments: legacyProfile.assignments.map((assignment) => ({
+        ...assignment,
+        role: assignment.role === 'architect' ? 'advisor' : assignment.role,
+      })),
+    };
+    assert.equal(profileSignature(legacyProfile), profileSignature(advisorProfile));
+
+    assert.throws(
+      () =>
+        tableFromProfile({
+          id: 'profile-dual-advisor',
+          name: 'Dual Advisor Input',
+          assignments: [
+            {
+              role: 'architect',
+              difficulty: 'hard',
+              choice: { model_id: 'gpt-5.4', effort: 'high' },
+            },
+            {
+              role: 'advisor',
+              difficulty: 'hard',
+              choice: { model_id: 'deepseek-v4.1-flash', effort: 'max' },
+            },
+          ],
+        }),
+      (error: unknown) =>
+        (error as { code?: string }).code === 'duplicate_assignment'
+    );
+  });
+
   it('ignores stale async save results, blocks duplicate submissions, and preserves dirty drafts on stale_revision conflict', () => {
     const profileA = makeProfile('profile-a', 'Primary Profile');
     const snapshot = makeSnapshot([profileA], 5);

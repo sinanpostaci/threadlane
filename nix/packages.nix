@@ -4,6 +4,26 @@ let
   lib = pkgs.lib;
   version = "0.1.0";
 
+  # Read the source identity from the original flake metadata before source
+  # filtering. A dirty checkout can still carry its old HEAD in `rev`, so the
+  # dirty marker must win. No Git or network command is run in the derivation.
+  sourceMetadata = if builtins.isAttrs src then src else { };
+  sourceRevision = sourceMetadata.rev or null;
+  sourceDirtyRevision = sourceMetadata.dirtyRev or null;
+  hasFullCleanRevision =
+    builtins.isString sourceRevision
+    && (
+      builtins.match "[0-9a-f]{40}" sourceRevision != null
+      || builtins.match "[0-9a-f]{64}" sourceRevision != null
+    );
+  desktopBuildIdentity =
+    if sourceDirtyRevision != null then
+      "dirty"
+    else if hasFullCleanRevision then
+      sourceRevision
+    else
+      "unknown";
+
   source = import ./source.nix { inherit lib src; };
 
   # Embed only the helper text in the runtime closure. The source checkout is
@@ -41,6 +61,15 @@ let
     src = source + "/apps/desktop";
     npmDepsHash = desktopNpmDepsHash;
     npmBuildScript = "build";
+
+    # One narrowly scoped Vite-visible value carries the packaged source
+    # identity into the frontend. Keep the name in sync with
+    # DESKTOP_BUILD_IDENTITY_ENV in apps/desktop/src/build-info.ts.
+    # The frontend parser treats a missing value, a dirty source, or malformed
+    # metadata as explicitly dirty or unknown.
+    env = {
+      VITE_THREADLANE_DESKTOP_BUILD_IDENTITY = desktopBuildIdentity;
+    };
 
     # The package only supplies the embedded web assets for the Tauri binary;
     # no Node install tree is needed in the final Nix output.

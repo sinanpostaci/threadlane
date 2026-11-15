@@ -55,16 +55,18 @@ fn workflow_role_display_label_from_str_and_no_global_serde_map_key_alias() {
     // 1. Canonical wire/storage strings and Display stay unchanged.
     assert_eq!(WorkflowRole::Follower.as_str(), "follower");
     assert_eq!(WorkflowRole::Orchestrator.as_str(), "orchestrator");
+    assert_eq!(WorkflowRole::Advisor.as_str(), "advisor");
     assert_eq!(WorkflowRole::Architect.as_str(), "architect");
     assert_eq!(WorkflowRole::Coder.as_str(), "coder");
     assert_eq!(WorkflowRole::Reviewer.as_str(), "reviewer");
     assert_eq!(WorkflowRole::Closure.as_str(), "closure");
     assert_eq!(WorkflowRole::Coder.to_string(), "coder");
 
-    // 2. Central display_label() maps Coder -> Worker and leaves other roles unchanged.
+    // 2. Central display_label() maps Coder -> Worker and both advisory spellings -> Advisor.
     assert_eq!(WorkflowRole::Follower.display_label(), "Follower");
     assert_eq!(WorkflowRole::Orchestrator.display_label(), "Orchestrator");
-    assert_eq!(WorkflowRole::Architect.display_label(), "Architect");
+    assert_eq!(WorkflowRole::Advisor.display_label(), "Advisor");
+    assert_eq!(WorkflowRole::Architect.display_label(), "Advisor");
     assert_eq!(WorkflowRole::Coder.display_label(), "Worker");
     assert_eq!(WorkflowRole::Reviewer.display_label(), "Reviewer");
     assert_eq!(WorkflowRole::Closure.display_label(), "Closure");
@@ -271,7 +273,7 @@ async fn mcp_plan_task_params_schema_and_deserializer_normalize_worker_to_canoni
     // 1. Verify the current combined paired MCP tool count and that `save_draft`
     //    schema and `PlanTaskParams` deserializer agree.
     let tools = mcp.list_tools();
-    assert_eq!(tools.len(), 52);
+    assert_eq!(tools.len(), 53);
     let save_draft_tool = tools
         .iter()
         .find(|t| t.name == "save_draft")
@@ -281,6 +283,7 @@ async fn mcp_plan_task_params_schema_and_deserializer_normalize_worker_to_canoni
     for advertised_role in [
         "follower",
         "orchestrator",
+        "advisor",
         "architect",
         "coder",
         "worker",
@@ -306,6 +309,14 @@ async fn mcp_plan_task_params_schema_and_deserializer_normalize_worker_to_canoni
             assert_eq!(parsed.role, WorkflowRole::Coder);
             let reserialized = serde_json::to_value(&parsed).expect("reserialize PlanTaskParams");
             assert_eq!(reserialized["role"], "coder");
+        } else if advertised_role == "advisor" {
+            assert_eq!(parsed.role, WorkflowRole::Advisor);
+            let reserialized = serde_json::to_value(&parsed).expect("reserialize PlanTaskParams");
+            assert_eq!(reserialized["role"], "advisor");
+        } else if advertised_role == "architect" {
+            assert_eq!(parsed.role, WorkflowRole::Architect);
+            let reserialized = serde_json::to_value(&parsed).expect("reserialize PlanTaskParams");
+            assert_eq!(reserialized["role"], "architect");
         }
     }
 
@@ -470,6 +481,62 @@ async fn mcp_plan_task_params_schema_and_deserializer_normalize_worker_to_canoni
     );
     assert!(!raw_plans_file.contains("\"worker\""));
 
+    // Current advisor task input persists the actual current advisor identity.
+    let advisor_draft_args = json!({
+        "command_key": "cmd-advisor-plan",
+        "plan_id": "plan-advisor-input",
+        "expected_revision": 0,
+        "profile_id": "default-profile",
+        "profile_revision": reg_rev,
+        "summary": "Advisor identity plan",
+        "tasks": [
+            {
+                "id": "task-advisor",
+                "title": "Consult the advisor",
+                "role": "advisor",
+                "difficulty": "hard",
+                "instruction": "Read-only advisory task.",
+                "depends_on": [],
+                "allowed_write_paths": ["README.md"]
+            }
+        ]
+    });
+    let _saved_advisor: PlanSummary = serde_json::from_value(
+        mcp.invoke_tool_json("save_draft", advisor_draft_args, None)
+            .await
+            .expect("save_draft with advisor role")
+            .structured_content
+            .expect("structured")["data"]
+            .clone(),
+    )
+    .expect("decode advisor PlanSummary");
+    let advisor_page_res = mcp
+        .get_plan(Parameters(GetPlanParams {
+            plan_id: "plan-advisor-input".to_string(),
+            revision: Some(1),
+            task_cursor: None,
+            task_limit: None,
+        }))
+        .await
+        .expect("get_plan advisor")
+        .structured_content
+        .expect("advisor get_plan structured content");
+    assert_eq!(advisor_page_res["data"]["tasks"][0]["role"], "advisor");
+    let advisor_page: PlanPage =
+        serde_json::from_value(advisor_page_res["data"].clone()).expect("decode advisor PlanPage");
+    assert_eq!(advisor_page.tasks[0].role, WorkflowRole::Advisor);
+    let persisted_advisor = plans
+        .get_revision("plan-advisor-input", 1)
+        .expect("read advisor revision")
+        .expect("advisor revision exists");
+    assert_eq!(persisted_advisor.tasks[0].role, WorkflowRole::Advisor);
+    let raw_plans_file =
+        std::fs::read_to_string(plans.dir().join("plans.json")).expect("read plans.json");
+    assert!(
+        raw_plans_file.contains("\"role\": \"advisor\"")
+            || raw_plans_file.contains("\"role\":\"advisor\"")
+    );
+
     let pub_worker: PublishedPlanView = serde_json::from_value(
         mcp.publish(Parameters(PublishParams {
             plan_id: "plan-worker-input".to_string(),
@@ -629,8 +696,8 @@ async fn operating_guide_and_startup_instructions_report_current_version_and_wor
     let paired_server =
         PairedMcpServer::new(&state_dir, pairing_store.clone()).expect("paired server");
     let paired_tools = paired_server.list_tools();
-    // Current combined paired surface: 52 registered tools.
-    assert_eq!(paired_tools.len(), 52);
+    // Current combined paired surface: 53 registered tools.
+    assert_eq!(paired_tools.len(), 53);
     let paired_guide_tool = paired_tools
         .iter()
         .find(|t| t.name == OPERATING_GUIDE_TOOL)

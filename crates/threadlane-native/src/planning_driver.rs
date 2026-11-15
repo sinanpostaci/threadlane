@@ -85,7 +85,7 @@ pub struct PlanningCommandSummary {
     /// Target or published workflow `plan_id` when applicable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_id: Option<String>,
-    /// Primary planning role (`Architect` or `Orchestrator`).
+    /// Primary planning role (`Advisor`, retained legacy `Architect`, or `Orchestrator`).
     pub role: WorkflowRole,
     /// Resolved headless worker choice verified against the grant profile and policy at enqueue.
     pub selected_choice: SelectedRoleChoice,
@@ -140,7 +140,7 @@ impl PlanningCommandSummary {
     #[must_use]
     pub fn from_record(record: &PlanningCommandRecord) -> Self {
         let job_id = match &record.payload {
-            PlanningCommandPayload::Architect(_) => None,
+            PlanningCommandPayload::Advisor(_) | PlanningCommandPayload::Architect(_) => None,
             PlanningCommandPayload::Orchestrator(req) => Some(req.job_id.clone()),
         };
         let plan_id = match &record.result_ref {
@@ -149,7 +149,7 @@ impl PlanningCommandSummary {
             }) => Some(planning_result.plan_id.clone()),
             _ => match &record.payload {
                 PlanningCommandPayload::Orchestrator(req) => req.plan_id.clone(),
-                PlanningCommandPayload::Architect(_) => None,
+                PlanningCommandPayload::Advisor(_) | PlanningCommandPayload::Architect(_) => None,
             },
         };
         Self {
@@ -786,15 +786,22 @@ async fn execute_queued_command(
         crate::provider_health::PlanningHealthOwner::new(command_store, &guard, &running_cmd)?;
     let call_now_ms = current_wall_clock_ms()?;
     match &running_cmd.payload {
-        PlanningCommandPayload::Architect(stored_req) => {
+        PlanningCommandPayload::Advisor(stored_req)
+        | PlanningCommandPayload::Architect(stored_req) => {
             let mut req = stored_req.clone();
             req.request_key = running_cmd.service_request_key.clone();
             req.current_time_ms = call_now_ms;
 
-            match service
-                .obtain_architect_advice_with_health(&req, Some(&health_owner))
-                .await
-            {
+            let advice_result = if running_cmd.role == WorkflowRole::Advisor {
+                service
+                    .obtain_advisor_advice_with_health(&req, Some(&health_owner))
+                    .await
+            } else {
+                service
+                    .obtain_architect_advice_with_health(&req, Some(&health_owner))
+                    .await
+            };
+            match advice_result {
                 Ok(outcome) => {
                     guard.validate_summary_before_effect(&key, &recorded_owner)?;
                     let report_artifact_id =
@@ -1286,7 +1293,7 @@ fn discover_reconcilable_result_ref(
     }
 
     let candidate = match &cmd.payload {
-        PlanningCommandPayload::Architect(_) => {
+        PlanningCommandPayload::Advisor(_) | PlanningCommandPayload::Architect(_) => {
             let Some(adv) = wf_ledger.architect_advice.iter().find(|a| {
                 a.binding_id == cmd.binding_id
                     && a.thread_uuid == cmd.thread_uuid
@@ -2078,7 +2085,7 @@ fn verify_completed_command_ledger_linkage_for_status<'a>(
 
     match (&cmd.payload, result_ref) {
         (
-            PlanningCommandPayload::Architect(req),
+            PlanningCommandPayload::Advisor(req) | PlanningCommandPayload::Architect(req),
             PlanningCommandResultRef::ArchitectAdvice {
                 advice_id,
                 reservation_id,
@@ -2147,7 +2154,7 @@ fn verify_completed_command_ledger_linkage_for_status<'a>(
                         "PlanningCallReservation referenced by ArchitectAdvice result was not found",
                     )
                 })?;
-            if res.role != WorkflowRole::Architect
+            if res.role != cmd.role
                 || res.status != PlanningReservationStatus::Completed
                 || res.selected_choice != cmd.selected_choice
                 || res.call_project_base.as_ref() != Some(&cmd.call_project_base)
@@ -2650,7 +2657,7 @@ fn validate_queued_command_ready_for_launch(
         || now_ms >= grant.expires_at_ms
         || now_ms < grant.created_at_ms
         || grant.usage.reserved_total_calls >= grant.budget.max_total_calls
-        || (cmd.role == WorkflowRole::Architect
+        || (cmd.role.is_advisor()
             && grant.usage.reserved_architect_calls >= grant.budget.max_architect_calls)
         || (cmd.role == WorkflowRole::Orchestrator
             && grant.usage.reserved_orchestrator_calls >= grant.budget.max_orchestrator_calls)

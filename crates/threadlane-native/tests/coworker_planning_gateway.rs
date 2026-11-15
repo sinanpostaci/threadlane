@@ -1,8 +1,8 @@
 #![cfg(unix)]
 #![allow(clippy::expect_used, clippy::unwrap_used)]
-//! Behavioral integration tests for [`CoworkerPlanningGateway`] and the five Paired MCP
-//! Coworker planning tools (`coworker_status`, `prepare_work`, `consult_architect`,
-//! `request_technical_plan`, and `planning_command`).
+//! Behavioral integration tests for [`CoworkerPlanningGateway`] and the six Paired MCP
+//! Coworker planning tools (`coworker_status`, `prepare_work`, `consult_advisor`,
+//! retained `consult_architect`, `request_technical_plan`, and `planning_command`).
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -15,19 +15,19 @@ use serde_json::{json, Value};
 use tempfile::TempDir;
 use threadlane::{Supervisor, SupervisorClient, SupervisorConfig, SupervisorHandle};
 use threadlane_native::coworker_workflow::{
-    ArchitectContextDependencies, CanonicalProjectBaseRef, CoworkerJobOwnershipStore,
-    CoworkerJobPhase, CoworkerPlanningService, CoworkerWorkflowStore, CreatePlanningGrantRequest,
-    PlanningCallBudget, PlanningReadOnlyCapabilities, RevokePlanningGrantRequest,
-    RunArchitectAdviceRequest, WorkBriefKind,
+    ArchitectContextDependencies, ArchitectDecisionStatus, CanonicalProjectBaseRef,
+    CoworkerJobOwnershipStore, CoworkerJobPhase, CoworkerPlanningService, CoworkerWorkflowStore,
+    CreatePlanningGrantRequest, PlanningCallBudget, PlanningReadOnlyCapabilities,
+    RevokePlanningGrantRequest, RunArchitectAdviceRequest, WorkBriefKind,
 };
 use threadlane_native::{
-    current_wall_clock_ms, planning_commands_dir, ConsultArchitectParams, CoworkerPlanningGateway,
-    CoworkerStatusParams, CoworkerStatusResponse, Difficulty, EnqueuePlanningCommandRequest,
-    ExecutionPolicy, NativeErrorCode, OperatorEnrollRequest, PairedMcpServer, PairingStore,
-    PlanStatus, PlanningCommandDetailResponse, PlanningCommandResultRef,
-    PlanningCommandStartStatus, PlanningCommandStatus, PlanningCommandStore,
-    PlanningCommandSubmissionResponse, PolicyAllowRule, PrepareWorkResponse, RegistryStore,
-    ToolAdapter, WorkflowProfile, WorkflowRole, EXECUTION_POLICY_SCHEMA_VERSION,
+    current_wall_clock_ms, planning_artifacts_dir, planning_commands_dir, ConsultArchitectParams,
+    CoworkerPlanningGateway, CoworkerStatusParams, CoworkerStatusResponse, Difficulty,
+    EnqueuePlanningCommandRequest, ExecutionPolicy, NativeErrorCode, OperatorEnrollRequest,
+    PairedMcpServer, PairingStore, PlanStatus, PlanningCommandDetailResponse,
+    PlanningCommandResultRef, PlanningCommandStartStatus, PlanningCommandStatus,
+    PlanningCommandStore, PlanningCommandSubmissionResponse, PolicyAllowRule, PrepareWorkResponse,
+    RegistryStore, ToolAdapter, WorkflowProfile, WorkflowRole, EXECUTION_POLICY_SCHEMA_VERSION,
 };
 use threadlane_workers::{
     resolve_exact_commit_sha, resolve_exact_tree_sha, run_sanitized_git,
@@ -251,6 +251,16 @@ impl GatewayFixture {
     }
 
     fn create_grant(&self, request_key: &str, created_at_ms: u64, expires_at_ms: u64) -> String {
+        self.create_grant_with_policy(request_key, default_policy(), created_at_ms, expires_at_ms)
+    }
+
+    fn create_grant_with_policy(
+        &self,
+        request_key: &str,
+        policy: ExecutionPolicy,
+        created_at_ms: u64,
+        expires_at_ms: u64,
+    ) -> String {
         let workflow_store =
             CoworkerWorkflowStore::new(&self.plans_dir).expect("open CoworkerWorkflowStore");
         workflow_store
@@ -262,7 +272,7 @@ impl GatewayFixture {
                 project_base: self.project_base.clone(),
                 profile_id: PROFILE_ID.to_string(),
                 registry_revision: 3,
-                policy: default_policy(),
+                policy,
                 capabilities: PlanningReadOnlyCapabilities::strict_read_only(),
                 budget: PlanningCallBudget {
                     max_total_calls: 6,
@@ -296,6 +306,20 @@ fn default_policy() -> ExecutionPolicy {
             efforts: vec!["high".to_string()],
             allow_no_effort: false,
             roles: vec![WorkflowRole::Orchestrator, WorkflowRole::Architect],
+        }],
+    }
+}
+
+fn advisor_policy() -> ExecutionPolicy {
+    ExecutionPolicy {
+        schema_version: EXECUTION_POLICY_SCHEMA_VERSION,
+        policy_id: "policy-gateway-advisor-test".to_string(),
+        allow_rules: vec![PolicyAllowRule {
+            tool_id: TOOL_ID.to_string(),
+            model_id: MODEL_ID.to_string(),
+            efforts: vec!["high".to_string()],
+            allow_no_effort: false,
+            roles: vec![WorkflowRole::Orchestrator, WorkflowRole::Advisor],
         }],
     }
 }
@@ -434,6 +458,12 @@ async fn invoke_mcp_ok<T: DeserializeOwned>(mcp: &PairedMcpServer, tool: &str, a
     serde_json::from_value(payload["data"].clone()).expect("deserialize tool data")
 }
 
+fn provider_invocation_count(path: &Path) -> usize {
+    fs::read_to_string(path)
+        .map(|text| text.lines().count())
+        .unwrap_or(0)
+}
+
 async fn invoke_mcp_err_code(mcp: &PairedMcpServer, tool: &str, args: Value) -> String {
     let err = mcp
         .invoke_tool_json(tool, args, None)
@@ -485,15 +515,16 @@ async fn coworker_planning_tools_advertised_routing_guards_and_readonly_status_a
     assert_eq!(directory_entries(&fixture.plans_dir), plans_before);
     assert_eq!(directory_entries(&fixture.registry_dir), registry_before);
 
-    // 2. PairedMcpServer advertises all 5 Coworker planning tools (52 tools total, including ordinary and guarded backlog tools) and blocks unbound calls.
+    // 2. PairedMcpServer advertises all 6 Coworker planning tools (53 tools total, including ordinary and guarded backlog tools) and blocks unbound calls.
     let pairing_store = PairingStore::open(&fixture.pairing_dir).expect("open pairing store");
     let mcp_unbound =
         PairedMcpServer::new(&fixture.state_dir, pairing_store.clone()).expect("new unbound mcp");
     let tools = mcp_unbound.list_tools();
-    assert_eq!(tools.len(), 52);
+    assert_eq!(tools.len(), 53);
     for (name, expected_ro) in [
         ("coworker_status", true),
         ("prepare_work", false),
+        ("consult_advisor", false),
         ("consult_architect", false),
         ("request_technical_plan", false),
         ("planning_command", true),
@@ -2445,4 +2476,208 @@ async fn planning_first_closed_lost_or_truncated_hint_is_history_while_cleanup_i
             fixture.shutdown().await;
         }
     }
+}
+
+#[tokio::test]
+async fn consult_advisor_persists_canonical_identity_refuses_legacy_authority_and_replays_without_redispatch(
+) {
+    let mut fixture = GatewayFixture::start().await;
+    let mcp = fixture.enrolled_mcp();
+    let now_ms = current_wall_clock_ms().expect("wall clock");
+    let advisor_grant = fixture.create_grant_with_policy(
+        "req-grant-advisor",
+        advisor_policy(),
+        now_ms.saturating_sub(5_000),
+        now_ms + 3_600_000,
+    );
+    let legacy_grant = fixture.create_grant(
+        "req-grant-legacy-architect",
+        now_ms.saturating_sub(5_000),
+        now_ms + 3_600_000,
+    );
+
+    let prep: PrepareWorkResponse = invoke_mcp_ok(
+        &mcp,
+        "prepare_work",
+        json!({
+            "grant_id": advisor_grant.clone(),
+            "request_key": "req-prep-advisor",
+            "summary": "Advisor canonical identity check",
+            "confirmed_requirements": ["Persist the current advisor identity"]
+        }),
+    )
+    .await;
+    assert!(prep.ready_for_execution_planning);
+
+    let consult_args = |grant_id: &str, request_key: &str| {
+        json!({
+            "grant_id": grant_id,
+            "job_id": prep.job_id.clone(),
+            "request_key": request_key,
+            "question": "Which advisory identity must the canonical path store?",
+            "dependency_files": ["src/lib.rs"],
+            "difficulty": "hard"
+        })
+    };
+
+    // A pre-transition architect-only grant is never silently retargeted into the canonical
+    // advisor identity; the caller must use the retained legacy entrypoint.
+    let legacy_err = invoke_mcp_err_code(
+        &mcp,
+        "consult_advisor",
+        consult_args(&legacy_grant, "req-consult-advisor-legacy"),
+    )
+    .await;
+    assert_eq!(legacy_err, "validation_failed");
+    assert_eq!(provider_invocation_count(&fixture.worker_marker), 0);
+
+    // A stale caller revision is refused before any provider effect.
+    let mut stale_args = consult_args(&advisor_grant, "req-consult-advisor-stale");
+    stale_args["expected_ledger_revision"] = json!(9_999);
+    let stale_err = invoke_mcp_err_code(&mcp, "consult_advisor", stale_args).await;
+    assert_eq!(stale_err, "validation_failed");
+    assert_eq!(provider_invocation_count(&fixture.worker_marker), 0);
+
+    // Canonical path stores the current Advisor identity in the command, reservation, and
+    // private artifact while retaining the compatibility result/record type names.
+    let submit: PlanningCommandSubmissionResponse = invoke_mcp_ok(
+        &mcp,
+        "consult_advisor",
+        consult_args(&advisor_grant, "req-consult-advisor"),
+    )
+    .await;
+    assert_eq!(submit.role, WorkflowRole::Advisor);
+    let detail = wait_for_command_completion(&mcp, &submit.command_id).await;
+    assert_eq!(
+        detail.status,
+        PlanningCommandStatus::Completed,
+        "advisor_detail did not complete cleanly: {}",
+        format_command_detail_context(&detail)
+    );
+    assert_eq!(detail.role, WorkflowRole::Advisor);
+    assert_eq!(
+        detail
+            .structured_architect_advice
+            .as_ref()
+            .expect("structured advisor advice")
+            .decision_summary,
+        "Keep strict planning command boundary"
+    );
+    let (advice_id, reservation_id, report_artifact_id) = match detail.result_ref.as_ref() {
+        Some(PlanningCommandResultRef::ArchitectAdvice {
+            advice_id,
+            reservation_id,
+            report_artifact_id,
+            ..
+        }) => (
+            advice_id.clone(),
+            reservation_id.clone(),
+            report_artifact_id.clone(),
+        ),
+        other => panic!("unexpected advisor result_ref: {other:?}"),
+    };
+
+    let store = CoworkerWorkflowStore::new(&fixture.plans_dir).expect("reopen workflow store");
+    let ledger = store
+        .read_binding_ledger(&fixture.binding_id)
+        .expect("read workflow ledger");
+    let grant = ledger
+        .planning_grants
+        .iter()
+        .find(|grant| grant.grant_id == advisor_grant)
+        .expect("advisor grant");
+    assert!(
+        grant.policy.explicitly_authorizes_advisor(),
+        "the new grant policy must explicitly name the advisor role"
+    );
+    assert_eq!(grant.reservations.len(), 1);
+    assert_eq!(grant.reservations[0].role, WorkflowRole::Advisor);
+    assert_eq!(grant.reservations[0].reservation_id, reservation_id);
+    assert_eq!(grant.usage.reserved_architect_calls, 1);
+    assert_eq!(grant.usage.reserved_total_calls, 1);
+    let advice = ledger
+        .architect_advice
+        .iter()
+        .find(|advice| advice.advice_id == advice_id)
+        .expect("stored advisor advice record");
+    assert_eq!(advice.status, ArchitectDecisionStatus::Proposed);
+
+    let service = CoworkerPlanningService::new(
+        store.clone(),
+        &fixture.registry_dir,
+        planning_artifacts_dir(&fixture.plans_dir),
+    )
+    .expect("open planning service for artifact inspection");
+    let artifact = service
+        .read_planning_artifact(&report_artifact_id)
+        .expect("read canonical advisor artifact");
+    assert_eq!(artifact.role, WorkflowRole::Advisor);
+    assert_eq!(artifact.reservation_id, reservation_id);
+    assert_eq!(artifact.request_key, submit.command.service_request_key);
+    assert!(matches!(
+        artifact.outcome,
+        threadlane_native::coworker_workflow::PlanningArtifactOutcomeKind::ArchitectAdvice { .. }
+    ));
+
+    // Exact replay returns the immutable completed receipt without another provider call.
+    let calls_before_replay = provider_invocation_count(&fixture.worker_marker);
+    assert_eq!(calls_before_replay, 1);
+    let repeat: PlanningCommandSubmissionResponse = invoke_mcp_ok(
+        &mcp,
+        "consult_advisor",
+        consult_args(&advisor_grant, "req-consult-advisor"),
+    )
+    .await;
+    assert_eq!(repeat.command_id, submit.command_id);
+    assert_eq!(repeat.status, PlanningCommandStatus::Completed);
+    assert_eq!(
+        repeat.submission_status,
+        PlanningCommandStartStatus::AlreadyCompleted
+    );
+    assert!(!repeat.launched);
+    assert_eq!(
+        provider_invocation_count(&fixture.worker_marker),
+        calls_before_replay
+    );
+
+    // A different chat/thread scope cannot replay the stored command or reach the provider.
+    let other_scope_gateway = CoworkerPlanningGateway::new(
+        &fixture.state_dir,
+        &fixture.registry_dir,
+        &fixture.plans_dir,
+        &fixture.authority_dir,
+        &fixture.sessions_dir,
+        &fixture.binding_id,
+        "0196ed00-0000-7000-8000-0000000000b2",
+    )
+    .expect("create cross-thread planning gateway")
+    .with_sibling_anchor_exe(PathBuf::from(env!("CARGO_BIN_EXE_threadlane-flow")));
+    let scope_err = other_scope_gateway
+        .consult_advisor(&ConsultArchitectParams {
+            grant_id: advisor_grant.clone(),
+            job_id: prep.job_id.clone(),
+            request_key: "req-consult-advisor-cross-scope".to_string(),
+            question: "Cross-scope advisor attempt".to_string(),
+            dependency_files: vec!["src/lib.rs".to_string()],
+            difficulty: Some(Difficulty::Hard),
+            prior_advice_ids: Vec::new(),
+            expected_ledger_revision: None,
+        })
+        .await
+        .expect_err("cross-thread advisor scope must be refused");
+    assert!(
+        [
+            NativeErrorCode::ValidationFailed.as_str(),
+            NativeErrorCode::SecurityViolation.as_str(),
+        ]
+        .contains(&scope_err.code()),
+        "cross-thread advisor scope must fail closed, got {:?}",
+        scope_err.code()
+    );
+    assert_eq!(
+        provider_invocation_count(&fixture.worker_marker),
+        calls_before_replay
+    );
+
+    fixture.shutdown().await;
 }

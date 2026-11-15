@@ -7,7 +7,9 @@ handoffs, explicit unknown-outcome reconciliation, and single-closure package
 reservations.
 
 For the trusted-local operator CLI wrapper (`threadlane-flow`), see
-[`docs/ROLE-FLOW-CLI.md`](ROLE-FLOW-CLI.md).
+[`docs/ROLE-FLOW-CLI.md`](ROLE-FLOW-CLI.md). For the current `advisor` identity,
+the retained frozen `architect` identity, and the internal v1 digest domains, see
+[`docs/ADVISOR-COMPATIBILITY.md`](ADVISOR-COMPATIBILITY.md).
 
 ## Architecture Overview
 
@@ -19,7 +21,9 @@ For the trusted-local operator CLI wrapper (`threadlane-flow`), see
   - Deterministic role/difficulty choice resolution ([`resolve_choice`]) that
     checks an exact `(role, Some(difficulty))` match first and falls back only
     to an explicit role default `(role, None)` without substituting another
-    role, difficulty, or unapproved fallback model.
+    role, difficulty, or unapproved fallback model. Role matching is semantic:
+    current `advisor` requests resolve retained `architect` assignments and vice
+    versa, while the selected raw identity is never rewritten.
   - Pure, lock-free read-only preflight over a [`RegistrySnapshot`]
     ([`preflight`]), an existing [`RegistryStore`] ([`preflight_from_store`]),
     or a private registry directory ([`preflight_from_dir_readonly`]) via
@@ -101,9 +105,12 @@ For the trusted-local operator CLI wrapper (`threadlane-flow`), see
      `resolve_advisory_tool_executable`) runs **after** normal exact `RegistrySnapshot` +
      [`ExecutionPolicy`] preflight succeeds and converts a `ToolAdapter::CodexCli` choice into
      `RoleExecutionRoute::HeadlessWorker` **only** for read-only advisory roles
-     (`WorkflowRole::Orchestrator`, `WorkflowRole::Architect`, `WorkflowRole::Reviewer`, and
+     (`WorkflowRole::Orchestrator`, current `WorkflowRole::Advisor`, retained frozen
+     `WorkflowRole::Architect`, `WorkflowRole::Reviewer`, and
      `WorkflowRole::Closure`) when an explicit reasoning effort is configured and validated by
-     `threadlane_workers::resolve_model_target(WorkerProvider::CodexCli, ...)`.
+     `threadlane_workers::resolve_model_target(WorkerProvider::CodexCli, ...)`. Role lookup is
+     semantic, so either advisory spelling resolves the same exact model/effort without
+     rewriting a frozen raw identity.
    - The approved Coworker controller path separately uses `normalize_coder_choice` after exact
      role/policy preflight for the user-facing **Worker** execution role (canonical
      `WorkflowRole::Coder`, wire/storage identifier `"coder"`). User-facing surfaces call this

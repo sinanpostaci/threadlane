@@ -75,7 +75,10 @@ mod tests {
         PlanStore, PlanTask, RoleAssignment, ToolAdapter, ToolDefinition, WorkflowProfile,
         WorkflowRole,
     };
-    use threadlane_registry::{RegistryChange, RegistryStore};
+    use threadlane_registry::{
+        RegistryChange, RegistryStore, ScopedModelDependency, ScopedProfileDependencySpec,
+        ScopedToolDependency,
+    };
     use threadlane_workers::{
         resolve_exact_commit_sha, run_sanitized_git, ExecutionBudgets, WorkerFilePermissions,
         WorkerProvider, DEFAULT_GIT_COMMAND_TIMEOUT_MS,
@@ -2636,6 +2639,198 @@ mod tests {
         assert!(native.workers.is_none());
         assert!(native.task_dispatch.is_empty());
         assert_eq!(native.native_routes.len(), 1);
+    }
+
+    #[test]
+    fn frozen_architect_approval_roundtrip_keeps_v1_bytes_and_subject_digest() {
+        let fixture = setup_fixture();
+        let current = fixture.registry.snapshot().expect("registry snapshot");
+        let mut profile = current.profiles[0].clone();
+        profile.assignments.push(RoleAssignment {
+            role: WorkflowRole::Architect,
+            difficulty: None,
+            choice: ModelChoice {
+                model_id: "model-codex-native".to_string(),
+                effort: Some("high".to_string()),
+            },
+        });
+        let updated = fixture
+            .registry
+            .apply(current.revision, RegistryChange::UpsertProfile { profile })
+            .expect("upsert profile with architect");
+        let registry_revision = updated.revision;
+
+        let (plan_revision, plan_digest) = save_and_publish_plan(
+            &fixture,
+            "plan-frozen-architect",
+            "binding-1",
+            registry_revision,
+            vec![PlanTask {
+                id: "task-architect".to_string(),
+                title: "Frozen advisor task".to_string(),
+                instruction: "Read-only advisory task retained under the frozen v1 role key."
+                    .to_string(),
+                role: WorkflowRole::Architect,
+                difficulty: Difficulty::Easy,
+                depends_on: vec![],
+                allowed_write_paths: vec!["src/lib.rs".to_string()],
+            }],
+        );
+
+        let summary = fixture
+            .authority
+            .approve(OperatorApprovalRequest {
+                binding_id: "binding-1".to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                plan_id: "plan-frozen-architect".to_string(),
+                plan_revision,
+                expected_registry_revision: registry_revision,
+                expected_plan_digest: plan_digest,
+                repository_path: fixture.repo_dir.clone(),
+                base_commit: fixture.base_commit.clone(),
+                approved_task_ids: vec!["task-architect".to_string()],
+                approved_write_paths: vec!["src/lib.rs".to_string()],
+                max_parallel: 1,
+                budgets: ExecutionBudgets::default(),
+            })
+            .expect("approve frozen architect plan");
+        let record = fixture
+            .authority
+            .get_for_operator(&summary.approval_id)
+            .expect("load frozen approval");
+        assert_eq!(record.tasks[0].role, WorkflowRole::Architect);
+
+        let bytes = serde_json::to_vec(&record).expect("serialize frozen approval");
+        let text = String::from_utf8(bytes.clone()).expect("approval JSON is UTF-8");
+        assert!(text.contains(r#""role":"architect""#));
+        assert!(!text.contains(r#""role":"advisor""#));
+
+        let decoded: ApprovalRecord =
+            serde_json::from_slice(&bytes).expect("deserialize frozen approval");
+        assert_eq!(decoded, record);
+        validation::verify_approval_record_integrity(&decoded, fixture.authority.approvals_path())
+            .expect("frozen approval integrity");
+        assert_eq!(
+            compute_record_subject_digest(&decoded).expect("subject digest"),
+            record.subject_digest
+        );
+    }
+
+    #[test]
+    fn scoped_profile_dependency_spec_golden_bytes_and_digest_remain_unchanged() {
+        let spec = ScopedProfileDependencySpec {
+            profile_id: "profile-main".to_string(),
+            assignments: vec![
+                RoleAssignment {
+                    role: WorkflowRole::Architect,
+                    difficulty: None,
+                    choice: ModelChoice {
+                        model_id: "model-codex-native".to_string(),
+                        effort: Some("high".to_string()),
+                    },
+                },
+                RoleAssignment {
+                    role: WorkflowRole::Coder,
+                    difficulty: Some(Difficulty::Hard),
+                    choice: ModelChoice {
+                        model_id: "model-argon".to_string(),
+                        effort: Some("high".to_string()),
+                    },
+                },
+            ],
+            models: vec![
+                ScopedModelDependency {
+                    id: "model-argon".to_string(),
+                    tool_id: "tool-agy".to_string(),
+                    model_arg: "gemini-4-argon-high".to_string(),
+                    efforts: vec!["medium".to_string(), "high".to_string()],
+                    allow_no_effort: false,
+                },
+                ScopedModelDependency {
+                    id: "model-codex-native".to_string(),
+                    tool_id: "tool-codex".to_string(),
+                    model_arg: "gpt-5-codex".to_string(),
+                    efforts: vec!["high".to_string()],
+                    allow_no_effort: true,
+                },
+            ],
+            tools: vec![
+                ScopedToolDependency {
+                    id: "tool-agy".to_string(),
+                    adapter: ToolAdapter::Antigravity,
+                    executable_path: Some(PathBuf::from("/opt/threadlane/bin/agy")),
+                    enabled: true,
+                },
+                ScopedToolDependency {
+                    id: "tool-codex".to_string(),
+                    adapter: ToolAdapter::CodexCli,
+                    executable_path: None,
+                    enabled: true,
+                },
+            ],
+        };
+        spec.validate().expect("golden scoped spec validates");
+
+        let expected_json = r#"{"profile_id":"profile-main","assignments":[{"role":"architect","difficulty":null,"choice":{"model_id":"model-codex-native","effort":"high"}},{"role":"coder","difficulty":"hard","choice":{"model_id":"model-argon","effort":"high"}}],"models":[{"id":"model-argon","tool_id":"tool-agy","model_arg":"gemini-4-argon-high","efforts":["medium","high"],"allow_no_effort":false},{"id":"model-codex-native","tool_id":"tool-codex","model_arg":"gpt-5-codex","efforts":["high"],"allow_no_effort":true}],"tools":[{"id":"tool-agy","adapter":"antigravity","executable_path":"/opt/threadlane/bin/agy","enabled":true},{"id":"tool-codex","adapter":"codex_cli","executable_path":null,"enabled":true}]}"#;
+        let actual_json = serde_json::to_string(&spec).expect("serialize golden scoped spec");
+        assert_eq!(
+            actual_json, expected_json,
+            "frozen scoped profile dependency bytes must keep architect and canonical ordering"
+        );
+
+        // Pre-transition global role and RoleAssignment bytes are exact v1 compatibility
+        // goldens: a legacy Architect assignment still round-trips as `architect`.
+        let golden_global_role = r#""architect""#;
+        let golden_assignment = r#"{"role":"architect","difficulty":null,"choice":{"model_id":"model-codex-native","effort":"high"}}"#;
+        assert_eq!(
+            serde_json::to_string(&WorkflowRole::Architect).expect("serialize golden role"),
+            golden_global_role
+        );
+        assert_eq!(
+            serde_json::to_string(&spec.assignments[0]).expect("serialize golden assignment"),
+            golden_assignment
+        );
+        let decoded_assignment: RoleAssignment = serde_json::from_str(golden_assignment)
+            .expect("deserialize pre-transition RoleAssignment");
+        assert_eq!(decoded_assignment.role, WorkflowRole::Architect);
+        assert_eq!(
+            serde_json::to_string(&decoded_assignment).expect("reserialize legacy assignment"),
+            golden_assignment,
+            "a deserialized legacy architect role must serialize back to architect"
+        );
+
+        fn sha256_hex(bytes: &[u8]) -> String {
+            use sha2::{Digest, Sha256};
+            use std::fmt::Write as _;
+
+            let digest = Sha256::digest(bytes);
+            let mut hex = String::with_capacity(64);
+            for byte in digest {
+                let _ = write!(&mut hex, "{byte:02x}");
+            }
+            hex
+        }
+
+        assert_eq!(
+            sha256_hex(actual_json.as_bytes()),
+            sha256_hex(expected_json.as_bytes())
+        );
+        assert_eq!(
+            sha256_hex(
+                serde_json::to_string(&WorkflowRole::Architect)
+                    .expect("serialize role for digest")
+                    .as_bytes()
+            ),
+            sha256_hex(golden_global_role.as_bytes())
+        );
+        assert_eq!(
+            sha256_hex(
+                serde_json::to_string(&spec.assignments[0])
+                    .expect("serialize assignment for digest")
+                    .as_bytes()
+            ),
+            sha256_hex(golden_assignment.as_bytes())
+        );
     }
 
     #[test]

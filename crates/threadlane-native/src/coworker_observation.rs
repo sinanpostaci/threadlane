@@ -65,7 +65,10 @@ pub use workspace_history::{
 /// Canonical observation operation name for headless `Orchestrator` technical planning calls.
 pub const COWORKER_OBS_OP_PLANNING_ORCHESTRATOR: &str = "coworker.planning.orchestrator";
 
-/// Canonical observation operation name for read-only `Architect` consultation calls.
+/// Canonical observation operation name for current read-only `Advisor` consultation calls.
+pub const COWORKER_OBS_OP_PLANNING_ADVISOR: &str = "coworker.planning.advisor";
+
+/// Canonical observation operation name for retained legacy read-only `Architect` consultation calls.
 pub const COWORKER_OBS_OP_PLANNING_ARCHITECT: &str = "coworker.planning.architect";
 
 /// Canonical observation operation name for per-task frozen verification check commands.
@@ -96,6 +99,7 @@ pub fn is_coworker_workflow_operation(operation: &str) -> bool {
     matches!(
         operation.trim(),
         COWORKER_OBS_OP_PLANNING_ORCHESTRATOR
+            | COWORKER_OBS_OP_PLANNING_ADVISOR
             | COWORKER_OBS_OP_PLANNING_ARCHITECT
             | COWORKER_OBS_OP_CHECKS_TASK
             | COWORKER_OBS_OP_REVIEW_TASK
@@ -157,7 +161,7 @@ pub struct CoworkerObservationExecutorSpec {
     pub tool: Option<String>,
     /// Execution provider or subsystem label (e.g. `antigravity`, `opencode_v2`, `local_check`, `local_git`).
     pub provider: Option<String>,
-    /// Canonical lowercase workflow role or stage role (`orchestrator`, `architect`, `coder`, `reviewer`, `closure`, `verification`, `integration`).
+    /// Canonical lowercase workflow role or stage role (`orchestrator`, `advisor`, legacy `architect`, `coder`, `reviewer`, `closure`, `verification`, `integration`).
     pub role: Option<String>,
     /// Frozen requested model identifier or CLI model argument (`None` for non-model checks/Git).
     pub requested_model: Option<String>,
@@ -334,6 +338,7 @@ const fn role_name(role: WorkflowRole) -> &'static str {
     match role {
         WorkflowRole::Follower => "follower",
         WorkflowRole::Orchestrator => "orchestrator",
+        WorkflowRole::Advisor => "advisor",
         WorkflowRole::Architect => "architect",
         WorkflowRole::Coder => "coder",
         WorkflowRole::Reviewer => "reviewer",

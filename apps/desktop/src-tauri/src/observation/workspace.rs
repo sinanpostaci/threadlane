@@ -23,8 +23,9 @@ use threadlane_core::observation::{
     WorkspaceMessageScope, WorkspaceMessageSourceOrder, WorkspaceMessagesWindow,
     WorkspaceNativeSample, WorkspaceRecordLinks, WorkspaceSampleReconcileDecision,
     WorkspaceSamplingPolicy, WorkspaceSnapshot, WorkspaceSnapshotBounds, WorkspaceTaskHistory,
-    MAX_OBSERVATION_JOBS, MAX_WORKSPACE_CHAT_WORK_PRESENCE_TOTAL,
-    MAX_WORKSPACE_NATIVE_SAMPLES_PER_SOURCE, WORKSPACE_SNAPSHOT_SCHEMA_VERSION,
+    WorkspaceWorkerExecution, MAX_OBSERVATION_JOBS, MAX_WORKSPACE_CHAT_WORK_EXECUTIONS_TOTAL,
+    MAX_WORKSPACE_CHAT_WORK_PRESENCE_TOTAL, MAX_WORKSPACE_NATIVE_SAMPLES_PER_SOURCE,
+    WORKSPACE_SNAPSHOT_SCHEMA_VERSION,
 };
 use threadlane_core::MAX_WORKER_PATH_BYTES;
 use threadlane_host::ApprovedHostClient;
@@ -71,7 +72,11 @@ const WORKSPACE_PRESENCE_REFRESH_PER_CALL_TIMEOUT_MS: u64 = 750;
 /// Total host presence refresh timeout in milliseconds.
 const WORKSPACE_PRESENCE_REFRESH_TOTAL_TIMEOUT_MS: u64 = 2_500;
 
-/// One internal presence refresh request for a current nonterminal Worker execution.
+/// One internal enrichment request for a current Worker execution or a known Worker execution
+/// history row.
+///
+/// A query may request live presence, bounded runtime metadata, or both. Presence is the only
+/// source of liveness; execution metadata never implies a live process.
 #[derive(Debug, Clone)]
 pub(crate) struct WorkspacePresenceQuery {
     pub(crate) chat_key: String,
@@ -82,22 +87,29 @@ pub(crate) struct WorkspacePresenceQuery {
     pub(crate) expected_session_binding_id: String,
     pub(crate) expected_run_id: String,
     pub(crate) expected_worker_id: String,
+    pub(crate) expected_subject_digest: Option<String>,
+    pub(crate) expected_task_digest: Option<String>,
     pub(crate) authority_dir: PathBuf,
     pub(crate) sessions_dir: PathBuf,
     pub(crate) binding_id: String,
     pub(crate) thread_uuid: String,
+    pub(crate) lookup_presence: bool,
+    pub(crate) lookup_terminal_history: bool,
 }
 
-/// Synchronous workspace projection plus the bounded host presence work that needs async refresh.
+/// Synchronous workspace projection plus bounded host presence and Worker execution-metadata work
+/// that needs async refresh.
 pub(crate) struct WorkspaceSnapshotBundle {
     pub(crate) snapshot: WorkspaceSnapshot,
     pub(crate) presence_queries: Vec<WorkspacePresenceQuery>,
 }
 
-/// One actual host presence row keyed by the canonical chat that owns the execution.
+/// One actual host presence row and/or verified runtime execution summary keyed by the canonical
+/// chat that owns the execution.
 pub(crate) struct WorkspacePresenceResult {
     pub(crate) chat_key: String,
-    pub(crate) presence: WorkspaceBacklogWorkerPresence,
+    pub(crate) presence: Option<WorkspaceBacklogWorkerPresence>,
+    pub(crate) execution: Option<WorkspaceWorkerExecution>,
 }
 
 const VERIFIED_PENDING_PLAN_ATTENTION_REASON: &str =
@@ -417,7 +429,8 @@ impl ObservationService {
         Ok(self.workspace_snapshot_bundle(request)?.snapshot)
     }
 
-    /// Projects the synchronous workspace snapshot plus bounded presence work for async refresh.
+    /// Projects the synchronous workspace snapshot plus bounded presence and Worker execution
+    /// metadata work for async refresh.
     pub(crate) fn workspace_snapshot_bundle(
         &self,
         request: Option<ObservationSnapshotRequest>,
@@ -525,7 +538,7 @@ impl ObservationService {
 
         // If `query.job_id` is active, scope chats, chat work, and native samples to the target job's
         // verified chat.
-        let (retained_chats, mut retained_chat_work, retained_samples) = if query.job_id.is_some() {
+        let (retained_chats, retained_chat_work, retained_samples) = if query.job_id.is_some() {
             let allowed_chat_keys: BTreeSet<String> = bounded_histories
                 .iter()
                 .filter_map(|h| h.job.chat_identity.as_ref()?.canonical_key())
@@ -566,23 +579,6 @@ impl ObservationService {
             &mut warning_collector,
         );
 
-        let retained_chat_keys: BTreeSet<String> = retained_chat_work
-            .iter()
-            .filter_map(|work| work.identity.canonical_key())
-            .collect();
-        presence_queries.retain(|query| retained_chat_keys.contains(&query.chat_key));
-        let prepared_presence = prepare_workspace_presence_queries(presence_queries);
-        for (chat_key, omitted) in &prepared_presence.omitted_by_chat {
-            if let Some(work) = retained_chat_work
-                .iter_mut()
-                .find(|work| work.identity.canonical_key().as_deref() == Some(chat_key.as_str()))
-            {
-                work.bounds.presence_omitted =
-                    work.bounds.presence_omitted.saturating_add(*omitted);
-            }
-        }
-        let presence_queries = prepared_presence.retained;
-
         let (warnings, warning_contexts) = warning_collector.finish();
         observation.warnings = warnings;
         observation.warning_contexts = warning_contexts;
@@ -611,11 +607,56 @@ impl ObservationService {
             },
             messages,
             chat_work: retained_chat_work,
-        };
+        }
+        .normalized();
+
+        // Enrichment work is prepared only for records that survived job filtering and the
+        // per-chat/all-chat bounds. Dropped records are already counted in their truthful bounds.
+        let mut retained_presence_keys: BTreeSet<(String, String)> = BTreeSet::new();
+        let mut retained_execution_keys: BTreeSet<(String, String, String)> = BTreeSet::new();
+        for work in &snapshot.chat_work {
+            let Some(chat_key) = work.identity.canonical_key() else {
+                continue;
+            };
+            for item in &work.items {
+                retained_presence_keys.insert((chat_key.clone(), item.item_id.clone()));
+            }
+            for execution in &work.worker_executions {
+                retained_execution_keys.insert((
+                    chat_key.clone(),
+                    execution.item_id.clone(),
+                    execution.execution_ref.clone(),
+                ));
+            }
+        }
+        presence_queries.retain(|query| {
+            (query.lookup_presence
+                && retained_presence_keys
+                    .contains(&(query.chat_key.clone(), query.item_id.clone())))
+                || (query.lookup_terminal_history
+                    && retained_execution_keys.contains(&(
+                        query.chat_key.clone(),
+                        query.item_id.clone(),
+                        query.execution_ref.clone(),
+                    )))
+        });
+        let prepared_presence = prepare_workspace_presence_queries(presence_queries);
+        let mut snapshot = snapshot;
+        for (chat_key, omitted) in &prepared_presence.omitted_by_chat {
+            if let Some(work) = snapshot
+                .chat_work
+                .iter_mut()
+                .find(|work| work.identity.canonical_key().as_deref() == Some(chat_key.as_str()))
+            {
+                work.bounds.presence_omitted =
+                    work.bounds.presence_omitted.saturating_add(*omitted);
+            }
+        }
+        let snapshot = snapshot.normalized();
 
         Ok(WorkspaceSnapshotBundle {
-            snapshot: snapshot.normalized(),
-            presence_queries,
+            snapshot,
+            presence_queries: prepared_presence.retained,
         })
     }
 }
@@ -930,13 +971,55 @@ fn project_single_source_workspace(
                     expected_session_binding_id: candidate.session_binding_id,
                     expected_run_id: candidate.run_id,
                     expected_worker_id: candidate.worker_id,
+                    expected_subject_digest: None,
+                    expected_task_digest: None,
                     authority_dir: spec.authority_dir.clone(),
                     sessions_dir: spec.sessions_dir.clone(),
                     binding_id: identity.binding_id.clone(),
                     thread_uuid: identity.thread_uuid.clone(),
+                    lookup_presence: true,
+                    lookup_terminal_history: false,
                 });
             }
         }
+
+        for execution in &chat_work.worker_executions {
+            let authority = core_states
+                .iter()
+                .filter(|state| {
+                    state.bindings.iter().any(|binding| {
+                        binding.binding_id == identity.binding_id
+                            && binding.thread_uuid == identity.thread_uuid
+                    })
+                })
+                .flat_map(|state| state.backlog_worker_executions.iter())
+                .find(|candidate| {
+                    candidate.binding_id == identity.binding_id
+                        && candidate.item_id == execution.item_id
+                        && candidate.execution_ref == execution.execution_ref
+                })
+                .map(|candidate| &candidate.authority);
+            presence_queries.push(WorkspacePresenceQuery {
+                chat_key: chat_key.clone(),
+                item_id: execution.item_id.clone(),
+                execution_ref: execution.execution_ref.clone(),
+                approval_id: execution.approval_id.clone(),
+                task_id: execution.task_id.clone(),
+                expected_session_binding_id: execution.session_binding_id.clone(),
+                expected_run_id: execution.run_id.clone(),
+                expected_worker_id: execution.worker_id.clone(),
+                expected_subject_digest: authority
+                    .map(|authority| authority.subject_digest.clone()),
+                expected_task_digest: authority.map(|authority| authority.task_digest.clone()),
+                authority_dir: spec.authority_dir.clone(),
+                sessions_dir: spec.sessions_dir.clone(),
+                binding_id: identity.binding_id.clone(),
+                thread_uuid: identity.thread_uuid.clone(),
+                lookup_presence: false,
+                lookup_terminal_history: true,
+            });
+        }
+
         all_chat_work.push(chat_work);
 
         let thread_label = resolve_verified_chat_thread_label(
@@ -1417,11 +1500,14 @@ struct PreparedWorkspacePresenceQueries {
     omitted_by_chat: BTreeMap<String, usize>,
 }
 
-/// Deduplicates and globally bounds presence work before any host acquisition is prepared.
+/// Deduplicates and globally bounds presence and execution-metadata work before any host
+/// acquisition is prepared.
 ///
 /// The retention key is the canonical four-part chat identity (`chat_key`) plus the exact
-/// execution and task. Duplicate rows are not omissions because the same execution remains
-/// represented; only candidates dropped by the global bound are counted per chat.
+/// execution and task. Duplicate rows are merged so one acquisition can refresh presence and
+/// execution metadata for the same execution. Only presence rows dropped by the frozen `64` global
+/// bound are counted as per-chat omissions; execution metadata dropped by its own `128` bound never
+/// removes the corresponding execution record.
 fn prepare_workspace_presence_queries(
     mut queries: Vec<WorkspacePresenceQuery>,
 ) -> PreparedWorkspacePresenceQueries {
@@ -1440,29 +1526,84 @@ fn prepare_workspace_presence_queries(
             })
             .then_with(|| left.expected_run_id.cmp(&right.expected_run_id))
             .then_with(|| left.expected_worker_id.cmp(&right.expected_worker_id))
-    });
-    queries.dedup_by(|left, right| {
-        left.chat_key == right.chat_key
-            && left.execution_ref == right.execution_ref
-            && left.task_id == right.task_id
+            .then_with(|| {
+                left.expected_subject_digest
+                    .cmp(&right.expected_subject_digest)
+            })
+            .then_with(|| left.expected_task_digest.cmp(&right.expected_task_digest))
     });
 
-    if queries.len() <= MAX_WORKSPACE_CHAT_WORK_PRESENCE_TOTAL {
-        return PreparedWorkspacePresenceQueries {
-            retained: queries,
-            omitted_by_chat: BTreeMap::new(),
-        };
+    let mut merged: Vec<WorkspacePresenceQuery> = Vec::with_capacity(queries.len());
+    for query in queries {
+        if let Some(last) = merged.last_mut() {
+            if last.chat_key == query.chat_key
+                && last.execution_ref == query.execution_ref
+                && last.task_id == query.task_id
+            {
+                last.lookup_presence |= query.lookup_presence;
+                last.lookup_terminal_history |= query.lookup_terminal_history;
+                if last.expected_subject_digest.is_none() {
+                    last.expected_subject_digest = query.expected_subject_digest;
+                }
+                if last.expected_task_digest.is_none() {
+                    last.expected_task_digest = query.expected_task_digest;
+                }
+                continue;
+            }
+        }
+        merged.push(query);
     }
 
-    let dropped = queries.split_off(MAX_WORKSPACE_CHAT_WORK_PRESENCE_TOTAL);
     let mut omitted_by_chat: BTreeMap<String, usize> = BTreeMap::new();
-    for query in dropped {
-        let count = omitted_by_chat.entry(query.chat_key).or_default();
-        *count = count.saturating_add(1);
+    let mut presence_seen = 0usize;
+    for query in merged.iter_mut() {
+        if !query.lookup_presence {
+            continue;
+        }
+        presence_seen = presence_seen.saturating_add(1);
+        if presence_seen > MAX_WORKSPACE_CHAT_WORK_PRESENCE_TOTAL {
+            query.lookup_presence = false;
+            let count = omitted_by_chat.entry(query.chat_key.clone()).or_default();
+            *count = count.saturating_add(1);
+        }
     }
+
+    let mut terminal_seen = 0usize;
+    for query in merged.iter_mut() {
+        if !query.lookup_terminal_history {
+            continue;
+        }
+        terminal_seen = terminal_seen.saturating_add(1);
+        if terminal_seen > MAX_WORKSPACE_CHAT_WORK_EXECUTIONS_TOTAL {
+            query.lookup_terminal_history = false;
+        }
+    }
+
+    let retained = merged
+        .into_iter()
+        .filter(|query| query.lookup_presence || query.lookup_terminal_history)
+        .collect();
     PreparedWorkspacePresenceQueries {
-        retained: queries,
+        retained,
         omitted_by_chat,
+    }
+}
+
+/// Splits one prepared query that requests both presence and execution metadata into two
+/// independent acquisitions.
+///
+/// A slow or unavailable metadata read must never discard a presence sample that already completed
+/// under the shared refresh deadline. Each part keeps the same absolute deadline and per-call
+/// timeout, so this does not double any budget.
+fn split_workspace_presence_query(query: WorkspacePresenceQuery) -> Vec<WorkspacePresenceQuery> {
+    if query.lookup_presence && query.lookup_terminal_history {
+        let mut presence = query.clone();
+        presence.lookup_terminal_history = false;
+        let mut metadata = query;
+        metadata.lookup_presence = false;
+        vec![presence, metadata]
+    } else {
+        vec![query]
     }
 }
 
@@ -1485,12 +1626,30 @@ fn spawn_workspace_presence_acquisition<F, Fut>(
     });
 }
 
+/// Pops the next acquisition job, preferring every presence lookup over metadata-only enrichment.
+///
+/// Presence is the only source of liveness. A shared FIFO would let earlier slow metadata jobs that
+/// consume every concurrency slot starve a later fast presence lookup for the whole refresh
+/// deadline, so presence jobs are drained first while metadata keeps its relative order.
+fn pop_next_workspace_presence_query(
+    presence_pending: &mut VecDeque<WorkspacePresenceQuery>,
+    metadata_pending: &mut VecDeque<WorkspacePresenceQuery>,
+) -> Option<WorkspacePresenceQuery> {
+    presence_pending
+        .pop_front()
+        .or_else(|| metadata_pending.pop_front())
+}
+
 /// Runs bounded presence acquisitions under one absolute deadline.
 ///
-/// The caller computes the deadline before preparation. At most `max_concurrency` calls are
-/// active. Every call is independently cancelled at its per-call deadline or the total deadline,
-/// whichever comes first. Results already completed at the total deadline are retained, while
-/// pending join handles are aborted and drained so no detached acquisition survives the refresh.
+/// The caller computes the deadline before preparation. A query that requests both presence and
+/// execution metadata is split into independent acquisitions so a slow metadata read never
+/// discards an already completed presence sample. Every presence lookup is scheduled before any
+/// metadata-only enrichment while metadata keeps its relative order. At most `max_concurrency`
+/// calls are active. Every call is independently cancelled at its per-call deadline or the total
+/// deadline, whichever comes first. Results already completed at the total deadline are retained,
+/// while pending join handles are aborted and drained so no detached acquisition survives the
+/// refresh.
 async fn collect_bounded_workspace_presence<F, Fut>(
     queries: Vec<WorkspacePresenceQuery>,
     total_deadline: Instant,
@@ -1502,14 +1661,24 @@ where
     F: Fn(WorkspacePresenceQuery) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Option<WorkspacePresenceResult>> + Send + 'static,
 {
-    let mut pending: VecDeque<WorkspacePresenceQuery> = queries.into();
+    let mut presence_pending: VecDeque<WorkspacePresenceQuery> = VecDeque::new();
+    let mut metadata_pending: VecDeque<WorkspacePresenceQuery> = VecDeque::new();
+    for query in queries.into_iter().flat_map(split_workspace_presence_query) {
+        if query.lookup_presence {
+            presence_pending.push_back(query);
+        } else {
+            metadata_pending.push_back(query);
+        }
+    }
     let mut in_flight: JoinSet<Option<WorkspacePresenceResult>> = JoinSet::new();
     let acquire = Arc::new(acquire);
     let max_concurrency = max_concurrency.max(1);
     let mut results = Vec::new();
 
     while in_flight.len() < max_concurrency && Instant::now() < total_deadline {
-        let Some(query) = pending.pop_front() else {
+        let Some(query) =
+            pop_next_workspace_presence_query(&mut presence_pending, &mut metadata_pending)
+        else {
             break;
         };
         spawn_workspace_presence_acquisition(
@@ -1531,7 +1700,7 @@ where
                     results.push(result);
                 }
                 let next = if Instant::now() < total_deadline {
-                    pending.pop_front()
+                    pop_next_workspace_presence_query(&mut presence_pending, &mut metadata_pending)
                 } else {
                     None
                 };
@@ -1564,24 +1733,50 @@ where
     }
 
     results.sort_by(|left, right| {
+        let left_presence = left.presence.as_ref().map(|presence| {
+            (
+                &presence.item_id,
+                &presence.execution_ref,
+                &presence.task_id,
+            )
+        });
+        let right_presence = right.presence.as_ref().map(|presence| {
+            (
+                &presence.item_id,
+                &presence.execution_ref,
+                &presence.task_id,
+            )
+        });
+        let left_execution = left.execution.as_ref().map(|execution| {
+            (
+                &execution.item_id,
+                &execution.execution_ref,
+                &execution.task_id,
+            )
+        });
+        let right_execution = right.execution.as_ref().map(|execution| {
+            (
+                &execution.item_id,
+                &execution.execution_ref,
+                &execution.task_id,
+            )
+        });
         left.chat_key
             .cmp(&right.chat_key)
-            .then_with(|| left.presence.item_id.cmp(&right.presence.item_id))
-            .then_with(|| {
-                left.presence
-                    .execution_ref
-                    .cmp(&right.presence.execution_ref)
-            })
-            .then_with(|| left.presence.task_id.cmp(&right.presence.task_id))
+            .then_with(|| left_presence.cmp(&right_presence))
+            .then_with(|| left_execution.cmp(&right_execution))
     });
     results
 }
 
-/// Refreshes actual host presence for at most eight current Worker executions concurrently.
+/// Refreshes actual host presence and verified running/terminal Worker metadata for at most eight
+/// bounded acquisitions concurrently.
 ///
 /// The total `2.5 s` deadline starts before candidate preparation. Each call is bounded to
 /// `750 ms`, and a timeout, missing store/session, scope mismatch, or failed call produces no
-/// presence row. The host is never started, and only the read-only static presence route is used.
+/// presence row and no invented execution metadata. Presence and execution metadata are acquired
+/// independently, so a completed presence sample survives a slow metadata read. The host is never
+/// started, and only read-only presence/execution-metadata routes are used.
 pub(crate) async fn refresh_workspace_backlog_presence(
     queries: Vec<WorkspacePresenceQuery>,
 ) -> Vec<WorkspacePresenceResult> {
@@ -1598,103 +1793,183 @@ pub(crate) async fn refresh_workspace_backlog_presence(
         Duration::from_millis(WORKSPACE_PRESENCE_REFRESH_PER_CALL_TIMEOUT_MS),
         MAX_WORKSPACE_PRESENCE_REFRESH_CONCURRENCY,
         |query: WorkspacePresenceQuery| async move {
-            let presence = ApprovedHostClient::get_task_presence_readonly_at(
-                &query.authority_dir,
-                &query.sessions_dir,
-                &query.binding_id,
-                &query.thread_uuid,
-                &query.approval_id,
-                &query.task_id,
-            )
-            .await
-            .ok()
-            .flatten()?;
+            let mut presence_row = None;
+            let mut execution_row = None;
 
-            let owner = presence.owner.as_ref()?;
-            if owner.approval_id != query.approval_id
-                || owner.control_binding_id != query.binding_id
-                || owner.thread_uuid != query.thread_uuid
-                || owner.session_binding_id != query.expected_session_binding_id
-                || presence.binding_id != query.expected_session_binding_id
-                || presence.run_id != query.expected_run_id
-                || presence.worker_id != query.expected_worker_id
-            {
-                return None;
+            if query.lookup_presence {
+                if let Ok(Some(presence)) = ApprovedHostClient::get_task_presence_readonly_at(
+                    &query.authority_dir,
+                    &query.sessions_dir,
+                    &query.binding_id,
+                    &query.thread_uuid,
+                    &query.approval_id,
+                    &query.task_id,
+                )
+                .await
+                {
+                    if let Some(owner) = presence.owner.as_ref() {
+                        if owner.approval_id == query.approval_id
+                            && owner.control_binding_id == query.binding_id
+                            && owner.thread_uuid == query.thread_uuid
+                            && owner.session_binding_id == query.expected_session_binding_id
+                            && presence.binding_id == query.expected_session_binding_id
+                            && presence.run_id == query.expected_run_id
+                            && presence.worker_id == query.expected_worker_id
+                        {
+                            let availability_token = serde_json::to_value(presence.availability)
+                                .ok()
+                                .and_then(|value| value.as_str().map(str::to_string));
+                            let freshness_token = serde_json::to_value(presence.freshness)
+                                .ok()
+                                .and_then(|value| value.as_str().map(str::to_string));
+                            let availability = match availability_token.as_deref() {
+                                Some("live") => WorkspaceBacklogPresenceAvailability::Live,
+                                Some("non_live") => WorkspaceBacklogPresenceAvailability::NonLive,
+                                _ => WorkspaceBacklogPresenceAvailability::Unavailable,
+                            };
+                            let freshness = match freshness_token.as_deref() {
+                                Some("fresh") => WorkspaceBacklogPresenceFreshness::Fresh,
+                                Some("stale") => WorkspaceBacklogPresenceFreshness::Stale,
+                                _ => WorkspaceBacklogPresenceFreshness::NotApplicable,
+                            };
+                            // The current clock only evaluates expiry below; the original sample
+                            // timestamps, measured age, and host-computed expiry are copied
+                            // verbatim and never renewed.
+                            let now_ms = current_observation_time_ms();
+                            let process = presence.process.as_ref();
+                            let live = presence.live
+                                && availability == WorkspaceBacklogPresenceAvailability::Live
+                                && freshness == WorkspaceBacklogPresenceFreshness::Fresh
+                                && process.is_some()
+                                && presence
+                                    .expires_at_ms
+                                    .is_some_and(|expires_at_ms| expires_at_ms > now_ms);
+
+                            presence_row = Some(WorkspaceBacklogWorkerPresence {
+                                item_id: query.item_id.clone(),
+                                execution_ref: query.execution_ref.clone(),
+                                approval_id: query.approval_id.clone(),
+                                task_id: query.task_id.clone(),
+                                run_id: query.expected_run_id.clone(),
+                                worker_id: query.expected_worker_id.clone(),
+                                claim_id: presence.claim_id.clone(),
+                                host_instance_id: Some(owner.instance_id.clone()),
+                                invocation_id: process.map(|process| process.invocation_id.clone()),
+                                sequence: process.map(|process| process.sequence),
+                                availability,
+                                freshness,
+                                live,
+                                sampled_at_ms: presence.sampled_at_ms,
+                                sample_age_ms: presence.sample_age_ms,
+                                max_sample_age_ms: presence.max_sample_age_ms,
+                                expires_at_ms: presence.expires_at_ms,
+                            });
+                        }
+                    }
+                }
             }
 
-            let availability_token = serde_json::to_value(presence.availability)
-                .ok()
-                .and_then(|value| value.as_str().map(str::to_string));
-            let freshness_token = serde_json::to_value(presence.freshness)
-                .ok()
-                .and_then(|value| value.as_str().map(str::to_string));
-            let availability = match availability_token.as_deref() {
-                Some("live") => WorkspaceBacklogPresenceAvailability::Live,
-                Some("non_live") => WorkspaceBacklogPresenceAvailability::NonLive,
-                _ => WorkspaceBacklogPresenceAvailability::Unavailable,
-            };
-            let freshness = match freshness_token.as_deref() {
-                Some("fresh") => WorkspaceBacklogPresenceFreshness::Fresh,
-                Some("stale") => WorkspaceBacklogPresenceFreshness::Stale,
-                _ => WorkspaceBacklogPresenceFreshness::NotApplicable,
-            };
-            // The current clock only evaluates expiry below; the original sample timestamps,
-            // measured age, and host-computed expiry are copied verbatim and never renewed.
-            let now_ms = current_observation_time_ms();
-            let process = presence.process.as_ref();
-            let live = presence.live
-                && availability == WorkspaceBacklogPresenceAvailability::Live
-                && freshness == WorkspaceBacklogPresenceFreshness::Fresh
-                && process.is_some()
-                && presence
-                    .expires_at_ms
-                    .is_some_and(|expires_at_ms| expires_at_ms > now_ms);
+            if query.lookup_terminal_history {
+                if let Ok(Some(summary)) =
+                    ApprovedHostClient::get_task_terminal_summary_readonly_at(
+                        &query.authority_dir,
+                        &query.sessions_dir,
+                        &query.binding_id,
+                        &query.thread_uuid,
+                        &query.approval_id,
+                        &query.task_id,
+                    )
+                    .await
+                {
+                    let expected_subject = query.expected_subject_digest.as_deref();
+                    let expected_task = query.expected_task_digest.as_deref();
+                    if summary.approval_id == query.approval_id
+                        && summary.binding_id == query.binding_id
+                        && summary.thread_uuid == query.thread_uuid
+                        && summary.task_id == query.task_id
+                        && summary.session_binding_id == query.expected_session_binding_id
+                        && summary.run_id == query.expected_run_id
+                        && summary.worker_id == query.expected_worker_id
+                        && expected_subject
+                            .is_none_or(|expected| summary.subject_digest == expected)
+                        && expected_task.is_none_or(|expected| summary.task_digest == expected)
+                    {
+                        execution_row = Some(WorkspaceWorkerExecution {
+                            item_id: query.item_id.clone(),
+                            execution_ref: query.execution_ref.clone(),
+                            approval_id: query.approval_id.clone(),
+                            task_id: query.task_id.clone(),
+                            session_binding_id: query.expected_session_binding_id.clone(),
+                            run_id: query.expected_run_id.clone(),
+                            worker_id: query.expected_worker_id.clone(),
+                            provider: summary.provider,
+                            requested_model: summary.requested_model,
+                            observed_model: summary.observed_model,
+                            requested_effort: summary.requested_effort,
+                            observed_effort: summary.observed_effort,
+                            worker_status: Some(summary.worker_status.into()),
+                            started_at_ms: summary.started_at_ms,
+                            finished_at_ms: summary.finished_at_ms,
+                            duration_ms: summary.duration_ms,
+                            outcome: None,
+                            acceptance: None,
+                        });
+                    }
+                }
+            }
 
-            Some(WorkspacePresenceResult {
-                chat_key: query.chat_key.clone(),
-                presence: WorkspaceBacklogWorkerPresence {
-                    item_id: query.item_id.clone(),
-                    execution_ref: query.execution_ref.clone(),
-                    approval_id: query.approval_id.clone(),
-                    task_id: query.task_id.clone(),
-                    run_id: query.expected_run_id.clone(),
-                    worker_id: query.expected_worker_id.clone(),
-                    claim_id: presence.claim_id.clone(),
-                    host_instance_id: Some(owner.instance_id.clone()),
-                    invocation_id: process.map(|process| process.invocation_id.clone()),
-                    sequence: process.map(|process| process.sequence),
-                    availability,
-                    freshness,
-                    live,
-                    sampled_at_ms: presence.sampled_at_ms,
-                    sample_age_ms: presence.sample_age_ms,
-                    max_sample_age_ms: presence.max_sample_age_ms,
-                    expires_at_ms: presence.expires_at_ms,
-                },
-            })
+            if presence_row.is_none() && execution_row.is_none() {
+                None
+            } else {
+                Some(WorkspacePresenceResult {
+                    chat_key: query.chat_key,
+                    presence: presence_row,
+                    execution: execution_row,
+                })
+            }
         },
     )
     .await
 }
 
-/// Applies actual host presence rows to the matching canonical chat work and re-normalizes bounds.
+/// Applies actual host presence rows and verified execution metadata to the matching canonical
+/// chat work, then re-normalizes bounds.
+///
+/// Execution metadata is merged only into an already projected execution with the exact required
+/// identity. A duplicate or unavailable observation never creates a new execution attempt, and a
+/// running status is never converted into presence or liveness.
 pub(crate) fn apply_workspace_presence_results(
     snapshot: &mut WorkspaceSnapshot,
     results: Vec<WorkspacePresenceResult>,
 ) -> WorkspaceSnapshot {
-    let mut by_chat: BTreeMap<String, Vec<WorkspaceBacklogWorkerPresence>> = BTreeMap::new();
+    let mut presence_by_chat: BTreeMap<String, Vec<WorkspaceBacklogWorkerPresence>> =
+        BTreeMap::new();
+    let mut execution_by_chat: BTreeMap<String, Vec<WorkspaceWorkerExecution>> = BTreeMap::new();
     for result in results {
-        by_chat
-            .entry(result.chat_key)
-            .or_default()
-            .push(result.presence);
+        if let Some(presence) = result.presence {
+            presence_by_chat
+                .entry(result.chat_key.clone())
+                .or_default()
+                .push(presence);
+        }
+        if let Some(execution) = result.execution {
+            execution_by_chat
+                .entry(result.chat_key)
+                .or_default()
+                .push(execution);
+        }
     }
     for work in &mut snapshot.chat_work {
         let Some(chat_key) = work.identity.canonical_key() else {
             continue;
         };
-        if let Some(rows) = by_chat.remove(&chat_key) {
+        if let Some(rows) = presence_by_chat.remove(&chat_key) {
             work.worker_presence.extend(rows);
+        }
+        if let Some(rows) = execution_by_chat.remove(&chat_key) {
+            for execution in rows {
+                work.apply_worker_execution_metadata(&execution);
+            }
         }
     }
     snapshot.normalized()

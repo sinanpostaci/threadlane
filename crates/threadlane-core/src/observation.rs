@@ -2226,6 +2226,8 @@ pub struct ReadonlyBacklogBindingCounts {
     pub history_count: usize,
     /// Total current nonterminal Worker execution references before the read-only bound.
     pub current_worker_execution_count: usize,
+    /// Total durable Worker executions with an attached dispatch receipt for the binding.
+    pub worker_execution_count: usize,
 }
 
 /// Complete read-only structural snapshot of `state.db`.
@@ -3068,6 +3070,16 @@ fn read_readonly_backlog_tables(
             .map_err(|err| {
                 sqlite_readonly_error("count current Worker backlog executions failed", err)
             })?;
+        let worker_execution_count_raw: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM backlog_worker_executions
+                 WHERE binding_id = ?1 AND session_binding_id IS NOT NULL",
+                [&binding_id],
+                |row| row.get(0),
+            )
+            .map_err(|err| {
+                sqlite_readonly_error("count dispatched Worker backlog executions failed", err)
+            })?;
         snap.backlog_binding_counts
             .push(ReadonlyBacklogBindingCounts {
                 binding_id: binding_id.clone(),
@@ -3077,6 +3089,11 @@ fn read_readonly_backlog_tables(
                     "backlog_items",
                     "current_worker_execution_count",
                     current_worker_execution_count_raw,
+                )?,
+                worker_execution_count: convert_usize_column(
+                    "backlog_worker_executions",
+                    "worker_execution_count",
+                    worker_execution_count_raw,
                 )?,
             });
 
@@ -3106,21 +3123,12 @@ fn read_readonly_backlog_tables(
             item_ids
         };
 
-        let mut execution_keys: BTreeSet<(String, String)> = BTreeSet::new();
+        let mut binding_items: Vec<crate::backlog::BacklogItem> =
+            Vec::with_capacity(item_ids.len());
         for item_id in item_ids {
             let item = crate::backlog::load_backlog_item_conn(tx, &binding_id, &item_id)
                 .map_err(|err| sqlite_readonly_core_error("load backlog item failed", err))?;
-            if item.kind == crate::backlog::BacklogItemKind::Worker
-                && matches!(
-                    item.status,
-                    crate::backlog::BacklogStatus::Doing | crate::backlog::BacklogStatus::Blocked
-                )
-            {
-                if let Some(execution_ref) = item.current_execution_ref.clone() {
-                    execution_keys.insert((item.item_id.clone(), execution_ref));
-                }
-            }
-            snap.backlog_items.push(item);
+            binding_items.push(item);
         }
 
         let history_rows: Vec<(i64, i64, String, String, i64)> = {
@@ -3161,6 +3169,7 @@ fn read_readonly_backlog_tables(
             history_rows
         };
 
+        let mut history_execution_keys: Vec<(String, String)> = Vec::new();
         for (rowid, revision_raw, action, item_json, recorded_at_ms) in history_rows {
             let sequence = convert_u64_column("backlog_history", "rowid", rowid)?;
             let revision = convert_u64_column("backlog_history", "revision", revision_raw)?;
@@ -3179,7 +3188,7 @@ fn read_readonly_backlog_tables(
             }
             if item.kind == crate::backlog::BacklogItemKind::Worker {
                 if let Some(execution_ref) = item.current_execution_ref.clone() {
-                    execution_keys.insert((item.item_id.clone(), execution_ref));
+                    history_execution_keys.push((item.item_id.clone(), execution_ref));
                 }
             }
             snap.backlog_history.push(ReadonlyBacklogHistoryRecord {
@@ -3193,10 +3202,50 @@ fn read_readonly_backlog_tables(
             });
         }
 
-        for (item_id, execution_ref) in execution_keys
-            .into_iter()
-            .take(MAX_READONLY_BACKLOG_EXECUTIONS_PER_BINDING)
-        {
+        // Current active work first (newest item first), then the exact retained history
+        // references (newest history row first), then any remaining retained item references such
+        // as a `Done` Worker item that keeps its current execution reference after guarded
+        // completion. That ordering preserves outcome metadata for retained history rows while
+        // still including a retained `Done` reference whose own history row was trimmed. The
+        // deterministic order is applied before the bound so the most relevant attempts survive.
+        let mut execution_keys: Vec<(String, String)> = Vec::new();
+        let mut seen_execution_keys: BTreeSet<(String, String)> = BTreeSet::new();
+        for item in binding_items.iter().rev().filter(|item| {
+            matches!(
+                item.status,
+                crate::backlog::BacklogStatus::Doing | crate::backlog::BacklogStatus::Blocked
+            )
+        }) {
+            if item.kind != crate::backlog::BacklogItemKind::Worker {
+                continue;
+            }
+            let Some(execution_ref) = item.current_execution_ref.clone() else {
+                continue;
+            };
+            let key = (item.item_id.clone(), execution_ref);
+            if seen_execution_keys.insert(key.clone()) {
+                execution_keys.push(key);
+            }
+        }
+        for key in history_execution_keys.into_iter().rev() {
+            if seen_execution_keys.insert(key.clone()) {
+                execution_keys.push(key);
+            }
+        }
+        for item in binding_items.iter().rev() {
+            if item.kind != crate::backlog::BacklogItemKind::Worker {
+                continue;
+            }
+            let Some(execution_ref) = item.current_execution_ref.clone() else {
+                continue;
+            };
+            let key = (item.item_id.clone(), execution_ref);
+            if seen_execution_keys.insert(key.clone()) {
+                execution_keys.push(key);
+            }
+        }
+        execution_keys.truncate(MAX_READONLY_BACKLOG_EXECUTIONS_PER_BINDING);
+        for (item_id, execution_ref) in execution_keys {
             if let Some(execution) = read_readonly_worker_execution(
                 tx,
                 &binding_id,
@@ -3207,6 +3256,7 @@ fn read_readonly_backlog_tables(
                 snap.backlog_worker_executions.push(execution);
             }
         }
+        snap.backlog_items.extend(binding_items);
     }
 
     Ok(())
@@ -3808,6 +3858,14 @@ pub const MAX_WORKSPACE_CHAT_WORK_EVENTS_TOTAL: usize = 2_000;
 /// Maximum Worker presence rows retained across all chats in [`WorkspaceSnapshot::chat_work`]
 /// (`64`).
 pub const MAX_WORKSPACE_CHAT_WORK_PRESENCE_TOTAL: usize = 64;
+
+/// Maximum Worker execution metadata rows retained per canonical chat in [`WorkspaceChatWork`]
+/// (`32`).
+pub const MAX_WORKSPACE_CHAT_WORK_EXECUTIONS_PER_CHAT: usize = 32;
+
+/// Maximum Worker execution metadata rows retained across all chats in
+/// [`WorkspaceSnapshot::chat_work`] (`128`).
+pub const MAX_WORKSPACE_CHAT_WORK_EXECUTIONS_TOTAL: usize = 128;
 
 /// Maximum Worker executions retained per binding while reading backlog evidence (`500`).
 pub const MAX_READONLY_BACKLOG_EXECUTIONS_PER_BINDING: usize = 500;
@@ -7182,6 +7240,220 @@ fn default_workspace_backlog_presence_max_sample_age_ms() -> u64 {
     MAX_WORKSPACE_BACKLOG_PRESENCE_SAMPLE_AGE_MS
 }
 
+/// Lifecycle status of one verified Worker execution attempt projected into workspace work.
+///
+/// This mirrors the durable runtime [`crate::worker::WorkerStatus`] exactly. A reservation or
+/// dispatch receipt alone never produces `Running`; only an actual runtime record can.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceWorkerExecutionStatus {
+    /// Worker run is queued but not yet claimed by the dispatcher.
+    Queued,
+    /// Worker run has been claimed before process launch.
+    Claimed,
+    /// Worker process is actually running.
+    Running,
+    /// Revision-checked cancellation has been requested.
+    CancelRequested,
+    /// Worker process completed successfully and awaits Coworker acceptance.
+    Completed,
+    /// Worker execution failed.
+    Failed,
+    /// Worker execution was cancelled.
+    Cancelled,
+    /// Worker execution exceeded its timeout budget.
+    TimedOut,
+    /// Worker execution outcome is uncertain.
+    Unknown,
+}
+
+impl WorkspaceWorkerExecutionStatus {
+    /// Returns the canonical `snake_case` wire representation.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Claimed => "claimed",
+            Self::Running => "running",
+            Self::CancelRequested => "cancel_requested",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+            Self::TimedOut => "timed_out",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl From<crate::worker::WorkerStatus> for WorkspaceWorkerExecutionStatus {
+    fn from(status: crate::worker::WorkerStatus) -> Self {
+        match status {
+            crate::worker::WorkerStatus::Queued => Self::Queued,
+            crate::worker::WorkerStatus::Claimed => Self::Claimed,
+            crate::worker::WorkerStatus::Running => Self::Running,
+            crate::worker::WorkerStatus::CancelRequested => Self::CancelRequested,
+            crate::worker::WorkerStatus::Completed => Self::Completed,
+            crate::worker::WorkerStatus::Failed => Self::Failed,
+            crate::worker::WorkerStatus::Cancelled => Self::Cancelled,
+            crate::worker::WorkerStatus::TimedOut => Self::TimedOut,
+            crate::worker::WorkerStatus::Unknown => Self::Unknown,
+        }
+    }
+}
+
+/// Coworker acceptance state of a technically successful Worker execution.
+///
+/// A successful result remains [`Self::Pending`] until the guarded completion or rejection record
+/// is committed. `None` on the execution record means acceptance is not applicable to that
+/// outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceWorkerExecutionAcceptance {
+    /// Technical success exists but Coworker acceptance has not been recorded.
+    Pending,
+    /// Guarded completion recorded an immutable Coworker acceptance.
+    Accepted,
+    /// A separate failed-acceptance rejection was recorded.
+    Rejected,
+}
+
+impl WorkspaceWorkerExecutionAcceptance {
+    /// Returns the canonical `snake_case` wire representation.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Accepted => "accepted",
+            Self::Rejected => "rejected",
+        }
+    }
+}
+
+/// One bounded, read-only Worker execution attempt projected for a canonical chat.
+///
+/// The required identity fields always describe the exact durable backlog execution and its
+/// dispatch receipt. Optional metadata is populated only from verified runtime records; absent
+/// values stay `None` and are never inferred from notes, profile assignments, or current model
+/// configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct WorkspaceWorkerExecution {
+    /// Backlog item that owns this execution attempt.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub item_id: String,
+    /// Software-generated guarded execution reference (`wbe_<uuid>`).
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub execution_ref: String,
+    /// Frozen approval identifier.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub approval_id: String,
+    /// Frozen approved task identifier.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub task_id: String,
+    /// Exact dispatched runtime session binding identifier.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub session_binding_id: String,
+    /// Exact dispatched run identifier.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub run_id: String,
+    /// Exact dispatched worker identifier.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub worker_id: String,
+    /// Verified worker provider when observed.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub provider: Option<String>,
+    /// Exact model requested by the frozen execution profile.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub requested_model: Option<String>,
+    /// Model actually reported by provider telemetry, when available.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub observed_model: Option<String>,
+    /// Exact reasoning effort requested by the frozen execution profile.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub requested_effort: Option<String>,
+    /// Reasoning effort actually reported by provider telemetry, when available.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub observed_effort: Option<String>,
+    /// Verified runtime Worker status (running or terminal) when a record exists.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub worker_status: Option<WorkspaceWorkerExecutionStatus>,
+    /// Actual runtime start timestamp in milliseconds since the Unix epoch.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub started_at_ms: Option<i64>,
+    /// Actual runtime finish timestamp in milliseconds since the Unix epoch.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub finished_at_ms: Option<i64>,
+    /// Actual measured terminal duration in milliseconds when proven.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub duration_ms: Option<u64>,
+    /// Frozen technical backlog outcome when recorded.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub outcome: Option<crate::backlog_worker::WorkerBacklogOutcome>,
+    /// Separate Coworker acceptance state for a successful outcome.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub acceptance: Option<WorkspaceWorkerExecutionAcceptance>,
+}
+
+impl WorkspaceWorkerExecution {
+    /// Returns a sanitized copy when all required execution identities are valid and bounded.
+    fn normalized_safe(&self) -> Option<Self> {
+        let item_id = validate_correlation_id(&self.item_id)?;
+        let execution_ref = validate_correlation_id(&self.execution_ref)?;
+        let approval_id = validate_correlation_id(&self.approval_id)?;
+        let task_id = validate_correlation_id(&self.task_id)?;
+        let session_binding_id = validate_correlation_id(&self.session_binding_id)?;
+        let run_id = validate_correlation_id(&self.run_id)?;
+        let worker_id = validate_correlation_id(&self.worker_id)?;
+
+        let outcome = self.outcome;
+        let acceptance = match (outcome, self.acceptance) {
+            (Some(crate::backlog_worker::WorkerBacklogOutcome::Success), Some(acceptance)) => {
+                Some(acceptance)
+            }
+            _ => None,
+        };
+
+        // Timestamps are optional measured telemetry. A non-positive value is not a valid Unix
+        // epoch timestamp, and a finish earlier than its start is not a usable elapsed interval.
+        // Reject those contradictory values instead of subtracting them; an explicitly measured
+        // terminal duration is preserved independently.
+        let raw_started_at_ms = self.started_at_ms.filter(|&value| value > 0);
+        let raw_finished_at_ms = self.finished_at_ms.filter(|&value| value > 0);
+        let (started_at_ms, finished_at_ms, derived_duration_ms) =
+            match (raw_started_at_ms, raw_finished_at_ms) {
+                (Some(started), Some(finished)) if finished >= started => {
+                    let derived = finished
+                        .checked_sub(started)
+                        .and_then(|elapsed| u64::try_from(elapsed).ok());
+                    (Some(started), Some(finished), derived)
+                }
+                (Some(_), Some(_)) => (None, None, None),
+                (started, finished) => (started, finished, None),
+            };
+        let duration_ms = self.duration_ms.or(derived_duration_ms);
+
+        Some(Self {
+            item_id,
+            execution_ref,
+            approval_id,
+            task_id,
+            session_binding_id,
+            run_id,
+            worker_id,
+            provider: sanitize_observation_selection_token(self.provider.as_deref()),
+            requested_model: sanitize_observation_selection_token(self.requested_model.as_deref()),
+            observed_model: sanitize_observation_selection_token(self.observed_model.as_deref()),
+            requested_effort: sanitize_observation_selection_token(
+                self.requested_effort.as_deref(),
+            ),
+            observed_effort: sanitize_observation_selection_token(self.observed_effort.as_deref()),
+            worker_status: self.worker_status,
+            started_at_ms,
+            finished_at_ms,
+            duration_ms,
+            outcome,
+            acceptance,
+        })
+    }
+}
+
 /// Per-chat truthful omission accounting for [`WorkspaceChatWork`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct WorkspaceChatWorkBounds {
@@ -7194,6 +7466,10 @@ pub struct WorkspaceChatWorkBounds {
     /// Worker presence rows omitted by validity, per-chat, or all-chat bounds.
     #[serde(default, deserialize_with = "deserialize_null_default")]
     pub presence_omitted: usize,
+    /// Worker execution metadata rows omitted by validity, duplicate/conflicting identity, per-chat,
+    /// or all-chat bounds.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub executions_omitted: usize,
 }
 
 /// Bounded read-only backlog work for one canonical chat identity.
@@ -7213,6 +7489,13 @@ pub struct WorkspaceChatWork {
     /// Actual host-adapter Worker presence rows correlated to current executions.
     #[serde(default, deserialize_with = "deserialize_null_default")]
     pub worker_presence: Vec<WorkspaceBacklogWorkerPresence>,
+    /// Worker execution attempts in current/recent-first order, bounded to `<= 32` per chat.
+    ///
+    /// The projection preserves the durable read priority (current retained work first, then the
+    /// newest retained history references) and rejects conflicting or duplicate identities instead
+    /// of inventing an attempt.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub worker_executions: Vec<WorkspaceWorkerExecution>,
     /// Truthful per-chat omission accounting.
     #[serde(default, deserialize_with = "deserialize_null_default")]
     pub bounds: WorkspaceChatWorkBounds,
@@ -7386,14 +7669,131 @@ impl WorkspaceChatWork {
             bounds.presence_omitted = bounds.presence_omitted.saturating_add(overflow);
         }
 
+        let mut execution_groups: BTreeMap<String, Vec<WorkspaceWorkerExecution>> = BTreeMap::new();
+        let mut execution_order: Vec<String> = Vec::new();
+        for raw in &self.worker_executions {
+            match raw.normalized_safe() {
+                Some(clean) => {
+                    if !execution_groups.contains_key(&clean.execution_ref) {
+                        execution_order.push(clean.execution_ref.clone());
+                    }
+                    execution_groups
+                        .entry(clean.execution_ref.clone())
+                        .or_default()
+                        .push(clean);
+                }
+                None => {
+                    bounds.executions_omitted = bounds.executions_omitted.saturating_add(1);
+                }
+            }
+        }
+
+        // Deduplicate by the full stable attempt identity and reject conflicting observations of
+        // the same execution reference instead of selecting an arbitrary row. The input order is
+        // preserved because the durable projection already orders current/recent work first.
+        let mut executions: Vec<WorkspaceWorkerExecution> = Vec::new();
+        for execution_ref in execution_order {
+            let Some(group) = execution_groups.remove(&execution_ref) else {
+                continue;
+            };
+            let group_len = group.len();
+            let mut unique: BTreeMap<String, WorkspaceWorkerExecution> = BTreeMap::new();
+            for execution in group {
+                unique
+                    .entry(workspace_worker_execution_identity(&execution))
+                    .or_insert(execution);
+            }
+            if unique.len() == 1 {
+                bounds.executions_omitted = bounds
+                    .executions_omitted
+                    .saturating_add(group_len.saturating_sub(1));
+                if let Some(execution) = unique.into_values().next() {
+                    executions.push(execution);
+                }
+            } else {
+                bounds.executions_omitted = bounds.executions_omitted.saturating_add(group_len);
+            }
+        }
+
+        let mut retained_executions: Vec<WorkspaceWorkerExecution> =
+            Vec::with_capacity(executions.len());
+        for execution in executions {
+            let Some(owner) = items.iter().find(|item| item.item_id == execution.item_id) else {
+                bounds.executions_omitted = bounds.executions_omitted.saturating_add(1);
+                continue;
+            };
+            if owner.kind != crate::backlog::BacklogItemKind::Worker {
+                bounds.executions_omitted = bounds.executions_omitted.saturating_add(1);
+                continue;
+            }
+            retained_executions.push(execution);
+        }
+        if retained_executions.len() > MAX_WORKSPACE_CHAT_WORK_EXECUTIONS_PER_CHAT {
+            let overflow = retained_executions.len() - MAX_WORKSPACE_CHAT_WORK_EXECUTIONS_PER_CHAT;
+            retained_executions.truncate(MAX_WORKSPACE_CHAT_WORK_EXECUTIONS_PER_CHAT);
+            bounds.executions_omitted = bounds.executions_omitted.saturating_add(overflow);
+        }
+
         Self {
             identity,
             availability: self.availability,
             items,
             events,
             worker_presence,
+            worker_executions: retained_executions,
             bounds,
         }
+    }
+
+    /// Fills missing metadata fields on the exact matching execution attempt.
+    ///
+    /// The required execution identity must match in full. Existing metadata is never overwritten,
+    /// so a duplicate, stale, or later observation cannot rewrite the original terminal identity,
+    /// model, effort, status, or duration. Returns `true` only when at least one field was filled.
+    pub fn apply_worker_execution_metadata(&mut self, observed: &WorkspaceWorkerExecution) -> bool {
+        let Some(clean) = observed.normalized_safe() else {
+            return false;
+        };
+        let Some(target) = self.worker_executions.iter_mut().find(|existing| {
+            existing.item_id == clean.item_id
+                && existing.execution_ref == clean.execution_ref
+                && existing.approval_id == clean.approval_id
+                && existing.task_id == clean.task_id
+                && existing.session_binding_id == clean.session_binding_id
+                && existing.run_id == clean.run_id
+                && existing.worker_id == clean.worker_id
+        }) else {
+            return false;
+        };
+
+        let mut changed = false;
+        macro_rules! fill_metadata {
+            ($field:ident) => {
+                if target.$field.is_none() && clean.$field.is_some() {
+                    target.$field = clean.$field;
+                    changed = true;
+                }
+            };
+        }
+        fill_metadata!(provider);
+        fill_metadata!(requested_model);
+        fill_metadata!(observed_model);
+        fill_metadata!(requested_effort);
+        fill_metadata!(observed_effort);
+        fill_metadata!(worker_status);
+        if target.started_at_ms.is_none()
+            && target.finished_at_ms.is_none()
+            && target.duration_ms.is_none()
+            && (clean.started_at_ms.is_some()
+                || clean.finished_at_ms.is_some()
+                || clean.duration_ms.is_some())
+        {
+            target.started_at_ms = clean.started_at_ms;
+            target.finished_at_ms = clean.finished_at_ms;
+            target.duration_ms = clean.duration_ms;
+            changed = true;
+        }
+        changed
     }
 
     fn merge_from(&mut self, other: &Self) {
@@ -7404,6 +7804,8 @@ impl WorkspaceChatWork {
         self.events.extend(other.events.iter().cloned());
         self.worker_presence
             .extend(other.worker_presence.iter().cloned());
+        self.worker_executions
+            .extend(other.worker_executions.iter().cloned());
         self.bounds.items_omitted = self
             .bounds
             .items_omitted
@@ -7416,7 +7818,60 @@ impl WorkspaceChatWork {
             .bounds
             .presence_omitted
             .saturating_add(other.bounds.presence_omitted);
+        self.bounds.executions_omitted = self
+            .bounds
+            .executions_omitted
+            .saturating_add(other.bounds.executions_omitted);
     }
+}
+
+/// Stable attempt identity used to deduplicate projected Worker executions.
+///
+/// Only immutable identity fields participate; mutable runtime metadata (status, telemetry,
+/// timing) may legitimately differ between two observations of the same attempt.
+fn workspace_worker_execution_identity(execution: &WorkspaceWorkerExecution) -> String {
+    format!(
+        "{}|{}|{}|{}|{}|{}|{}",
+        execution.item_id,
+        execution.execution_ref,
+        execution.approval_id,
+        execution.task_id,
+        execution.session_binding_id,
+        execution.run_id,
+        execution.worker_id,
+    )
+}
+
+/// Stable durable attempt identity used to reject conflicting Worker execution observations.
+fn workspace_backlog_execution_identity(
+    execution: &crate::backlog_worker::WorkerBacklogExecution,
+) -> String {
+    let receipt = execution.dispatch_receipt.as_ref();
+    format!(
+        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+        execution.binding_id,
+        execution.item_id,
+        execution.execution_ref,
+        execution.authority.approval_id,
+        execution.authority.subject_digest,
+        execution.authority.task_id,
+        execution.authority.task_digest,
+        receipt
+            .map(|receipt| receipt.session_binding_id.as_str())
+            .unwrap_or_default(),
+        receipt
+            .map(|receipt| receipt.run_id.as_str())
+            .unwrap_or_default(),
+        receipt
+            .map(|receipt| receipt.worker_id.as_str())
+            .unwrap_or_default(),
+        receipt
+            .map(|receipt| receipt.profile_id.as_str())
+            .unwrap_or_default(),
+        receipt
+            .and_then(|receipt| receipt.execution_binding_digest.as_deref())
+            .unwrap_or_default(),
+    )
 }
 
 fn presence_sort_key(
@@ -7464,7 +7919,7 @@ pub struct WorkspaceSnapshot {
     #[serde(default, deserialize_with = "deserialize_null_default")]
     pub messages: WorkspaceMessagesWindow,
     /// Bounded read-only backlog work per canonical chat (`<= 1,000` items, `<= 2,000` events,
-    /// `<= 64` presence rows across all chats).
+    /// `<= 32` Worker executions per chat / `<= 128` total, `<= 64` presence rows across all chats).
     #[serde(default, deserialize_with = "deserialize_null_default")]
     pub chat_work: Vec<WorkspaceChatWork>,
     /// Explicit truncation and bound accounting across all projected windows.
@@ -7731,6 +8186,10 @@ impl WorkspaceSnapshot {
             .iter()
             .map(|work| work.worker_presence.len())
             .sum();
+        let mut total_executions: usize = chat_work
+            .iter()
+            .map(|work| work.worker_executions.len())
+            .sum();
         if total_items > MAX_WORKSPACE_CHAT_WORK_ITEMS_TOTAL {
             for work in chat_work.iter_mut().rev() {
                 if total_items <= MAX_WORKSPACE_CHAT_WORK_ITEMS_TOTAL {
@@ -7755,6 +8214,18 @@ impl WorkspaceSnapshot {
                             .presence_omitted
                             .saturating_add(removed_presence);
                         total_presence = total_presence.saturating_sub(removed_presence);
+                    }
+                    let executions_before = work.worker_executions.len();
+                    work.worker_executions
+                        .retain(|execution| remaining_item_ids.contains(&execution.item_id));
+                    let removed_executions =
+                        executions_before.saturating_sub(work.worker_executions.len());
+                    if removed_executions > 0 {
+                        work.bounds.executions_omitted = work
+                            .bounds
+                            .executions_omitted
+                            .saturating_add(removed_executions);
+                        total_executions = total_executions.saturating_sub(removed_executions);
                     }
                 }
             }
@@ -7788,6 +8259,25 @@ impl WorkspaceSnapshot {
                     work.bounds.presence_omitted =
                         work.bounds.presence_omitted.saturating_add(remove);
                     total_presence -= remove;
+                }
+            }
+        }
+
+        if total_executions > MAX_WORKSPACE_CHAT_WORK_EXECUTIONS_TOTAL {
+            for work in chat_work.iter_mut().rev() {
+                if total_executions <= MAX_WORKSPACE_CHAT_WORK_EXECUTIONS_TOTAL {
+                    break;
+                }
+                let overflow = total_executions - MAX_WORKSPACE_CHAT_WORK_EXECUTIONS_TOTAL;
+                let remove = overflow.min(work.worker_executions.len());
+                if remove > 0 {
+                    // Executions are retained in current/recent-first order, so the global bound
+                    // drops the oldest tail instead of rewinding the retained work.
+                    let keep = work.worker_executions.len() - remove;
+                    work.worker_executions.truncate(keep);
+                    work.bounds.executions_omitted =
+                        work.bounds.executions_omitted.saturating_add(remove);
+                    total_executions -= remove;
                 }
             }
         }
@@ -7831,6 +8321,14 @@ impl WorkspaceSnapshot {
     }
 }
 
+/// First-seen ordered observations grouped by execution reference and full durable identity.
+type BacklogExecutionIdentityGroups<'a> =
+    BTreeMap<String, BTreeMap<String, &'a crate::backlog_worker::WorkerBacklogExecution>>;
+
+/// Execution references whose observations agree on exactly one full durable identity.
+type ResolvedBacklogExecutions<'a> =
+    BTreeMap<String, &'a crate::backlog_worker::WorkerBacklogExecution>;
+
 /// Projects one bounded read-only [`WorkspaceChatWork`] from verified core snapshots.
 ///
 /// The identity is matched strictly by `source_id`-owned caller scope plus exact
@@ -7859,10 +8357,45 @@ pub fn project_workspace_chat_work(
         })
         .collect();
 
-    let mut executions_by_key: BTreeMap<
-        (String, String),
-        &crate::backlog_worker::WorkerBacklogExecution,
-    > = BTreeMap::new();
+    let mut execution_groups: BacklogExecutionIdentityGroups<'_> = BTreeMap::new();
+    let mut execution_order: Vec<String> = Vec::new();
+    for state in &matching_states {
+        for execution in &state.backlog_worker_executions {
+            if execution.binding_id != identity.binding_id || execution.dispatch_receipt.is_none() {
+                // A reservation without a dispatch receipt has no session/run/worker identity and
+                // is never represented as an execution record.
+                continue;
+            }
+            if !execution_groups.contains_key(&execution.execution_ref) {
+                execution_order.push(execution.execution_ref.clone());
+            }
+            execution_groups
+                .entry(execution.execution_ref.clone())
+                .or_default()
+                .entry(workspace_backlog_execution_identity(execution))
+                .or_insert(execution);
+        }
+    }
+
+    // A single execution reference is projected only when every observation agrees on the full
+    // item/authority/receipt identity. Conflicting identities are rejected instead of silently
+    // selecting one row; the durable execution total keeps the omission truthful.
+    let mut resolved_executions: ResolvedBacklogExecutions<'_> = BTreeMap::new();
+    let mut resolved_execution_order: Vec<String> = Vec::new();
+    for execution_ref in execution_order {
+        let Some(group) = execution_groups.remove(&execution_ref) else {
+            continue;
+        };
+        if group.len() != 1 {
+            continue;
+        }
+        let Some(execution) = group.into_values().next() else {
+            continue;
+        };
+        resolved_execution_order.push(execution_ref.clone());
+        resolved_executions.insert(execution_ref, execution);
+    }
+
     for state in &matching_states {
         if state.backlog_available {
             work.availability = WorkspaceChatWorkAvailability::Available;
@@ -7884,14 +8417,6 @@ pub fn project_workspace_chat_work(
                 .items_omitted
                 .saturating_add(counts.item_count.saturating_sub(retained_items));
         }
-        for execution in &state.backlog_worker_executions {
-            if execution.binding_id == identity.binding_id {
-                executions_by_key.insert(
-                    (execution.item_id.clone(), execution.execution_ref.clone()),
-                    execution,
-                );
-            }
-        }
     }
 
     for state in &matching_states {
@@ -7904,9 +8429,8 @@ pub fn project_workspace_chat_work(
                 .item
                 .current_execution_ref
                 .as_ref()
-                .and_then(|execution_ref| {
-                    executions_by_key.get(&(history.item_id.clone(), execution_ref.clone()))
-                });
+                .and_then(|execution_ref| resolved_executions.get(execution_ref))
+                .filter(|execution| execution.item_id == history.item_id);
             let (outcome, note) = match history.action.as_str() {
                 "worker_outcome_recorded" => match execution.and_then(|exec| exec.outcome.as_ref())
                 {
@@ -7945,6 +8469,64 @@ pub fn project_workspace_chat_work(
                 .saturating_add(counts.history_count.saturating_sub(retained_events));
         }
     }
+
+    for execution_ref in resolved_execution_order {
+        let Some(execution) = resolved_executions.remove(&execution_ref) else {
+            continue;
+        };
+        let Some(receipt) = execution.dispatch_receipt.as_ref() else {
+            continue;
+        };
+        let outcome = execution.outcome.as_ref().map(|recorded| recorded.outcome);
+        let acceptance = match (outcome, execution.completion.as_ref()) {
+            (Some(crate::backlog_worker::WorkerBacklogOutcome::Success), Some(_)) => {
+                Some(WorkspaceWorkerExecutionAcceptance::Accepted)
+            }
+            (Some(crate::backlog_worker::WorkerBacklogOutcome::Success), None)
+                if execution.acceptance_rejection.is_some() =>
+            {
+                Some(WorkspaceWorkerExecutionAcceptance::Rejected)
+            }
+            (Some(crate::backlog_worker::WorkerBacklogOutcome::Success), None) => {
+                Some(WorkspaceWorkerExecutionAcceptance::Pending)
+            }
+            _ => None,
+        };
+        work.worker_executions.push(WorkspaceWorkerExecution {
+            item_id: execution.item_id.clone(),
+            execution_ref: execution.execution_ref.clone(),
+            approval_id: execution.authority.approval_id.clone(),
+            task_id: execution.authority.task_id.clone(),
+            session_binding_id: receipt.session_binding_id.clone(),
+            run_id: receipt.run_id.clone(),
+            worker_id: receipt.worker_id.clone(),
+            provider: None,
+            requested_model: None,
+            observed_model: None,
+            requested_effort: None,
+            observed_effort: None,
+            worker_status: None,
+            started_at_ms: None,
+            finished_at_ms: None,
+            duration_ms: None,
+            outcome,
+            acceptance,
+        });
+    }
+    let total_dispatched_executions: usize = matching_states
+        .iter()
+        .filter_map(|state| {
+            state
+                .backlog_binding_counts
+                .iter()
+                .find(|counts| counts.binding_id == identity.binding_id)
+        })
+        .map(|counts| counts.worker_execution_count)
+        .sum();
+    work.bounds.executions_omitted = work
+        .bounds
+        .executions_omitted
+        .saturating_add(total_dispatched_executions.saturating_sub(work.worker_executions.len()));
 
     let mut normalized = work.normalized();
     let presence_candidates =
@@ -8388,6 +8970,31 @@ mod tests {
             Some("Accepted after checking delivery")
         );
 
+        assert_eq!(work_a.worker_executions.len(), 1);
+        let execution = &work_a.worker_executions[0];
+        assert_eq!(execution.item_id, worker_item.item_id);
+        assert_eq!(execution.execution_ref, reserved.execution_ref);
+        assert_eq!(execution.approval_id, "apr_projection");
+        assert_eq!(execution.task_id, "tsk_projection");
+        assert_eq!(execution.session_binding_id, "sbx_projection");
+        assert_eq!(execution.run_id, "run_projection");
+        assert_eq!(execution.worker_id, "wrk_projection");
+        assert_eq!(
+            execution.outcome,
+            Some(crate::backlog_worker::WorkerBacklogOutcome::Success)
+        );
+        assert_eq!(
+            execution.acceptance,
+            Some(WorkspaceWorkerExecutionAcceptance::Accepted)
+        );
+        assert!(
+            execution.provider.is_none()
+                && execution.requested_model.is_none()
+                && execution.worker_status.is_none()
+                && execution.duration_ms.is_none(),
+            "core projection never invents runtime metadata"
+        );
+
         let mut duplicated = work_a.clone();
         duplicated.events.push(work_a.events[0].clone());
         let normalized = duplicated.normalized();
@@ -8408,6 +9015,880 @@ mod tests {
             .events
             .iter()
             .all(|event| event.item_id != worker_item.item_id));
+    }
+
+    #[test]
+    fn project_workspace_chat_work_ignores_reservations_without_dispatch_identity() {
+        let thread_uuid = "0196ed00-0000-7000-8000-0000000000e2";
+        let identity = WorkspaceChatIdentity::new(
+            "default",
+            "bnd_exec_reservation",
+            thread_uuid,
+            "/home/dev/repos/exec-reservation",
+        )
+        .expect("reservation identity");
+        let item = crate::backlog::BacklogItem {
+            item_id: "blg_exec_reservation".to_string(),
+            binding_id: identity.binding_id.clone(),
+            revision: 2,
+            title: "Reserved but not dispatched".to_string(),
+            acceptance_condition: "Execution is dispatched".to_string(),
+            delivery_description: "Deliver the reserved attempt".to_string(),
+            kind: crate::backlog::BacklogItemKind::Worker,
+            status: crate::backlog::BacklogStatus::Doing,
+            blocked_reason: None,
+            current_execution_ref: Some("wbe_22222222222222222222222222222222".to_string()),
+            completion_note: None,
+            completion_evidence: None,
+            completed_at_ms: None,
+            created_at_ms: 1,
+            updated_at_ms: 2,
+        };
+        let reserved = crate::backlog_worker::WorkerBacklogExecution {
+            execution_ref: "wbe_22222222222222222222222222222222".to_string(),
+            binding_id: identity.binding_id.clone(),
+            item_id: item.item_id.clone(),
+            authority: crate::backlog_worker::WorkerBacklogAuthority {
+                approval_id: "apr_reservation_only".to_string(),
+                subject_digest: "a".repeat(64),
+                task_id: "tsk_reservation_only".to_string(),
+                task_digest: "b".repeat(64),
+            },
+            acceptance_condition_digest: "c".repeat(64),
+            delivery_description_digest: "d".repeat(64),
+            reservation_revision: 2,
+            reserved_at_ms: 1_000,
+            dispatch_receipt: None,
+            attached_at_ms: None,
+            outcome: None,
+            completion: None,
+            acceptance_rejection: None,
+        };
+        let state = ReadonlyCoreStateSnapshot {
+            bindings: vec![ReadonlyBindingRecord {
+                binding_id: identity.binding_id.clone(),
+                thread_uuid: thread_uuid.to_string(),
+                label: "Reservation chat".to_string(),
+                delivered_seq: 0,
+                acked_seq: 0,
+            }],
+            backlog_available: true,
+            backlog_items: vec![item],
+            backlog_worker_executions: vec![reserved],
+            ..ReadonlyCoreStateSnapshot::default()
+        };
+
+        let work = project_workspace_chat_work(&identity, &[state]);
+        assert_eq!(work.items.len(), 1);
+        assert!(
+            work.worker_executions.is_empty(),
+            "a reservation without a dispatch receipt has no run/worker identity and is never Working"
+        );
+        assert!(work.worker_presence.is_empty());
+    }
+
+    #[test]
+    fn workspace_worker_execution_projection_is_bounded_idempotent_and_never_creates_attempts() {
+        let identity = WorkspaceChatIdentity::new(
+            "default",
+            "bnd_exec_cap",
+            "0196ed00-0000-7000-8000-0000000000e1",
+            "/home/dev/repos/exec-cap",
+        )
+        .expect("execution cap identity");
+        let item = crate::backlog::BacklogItem {
+            item_id: "blg_exec_cap".to_string(),
+            binding_id: identity.binding_id.clone(),
+            revision: 2,
+            title: "Bounded execution projection".to_string(),
+            acceptance_condition: "Execution metadata is verified".to_string(),
+            delivery_description: "Deliver bounded execution metadata".to_string(),
+            kind: crate::backlog::BacklogItemKind::Worker,
+            status: crate::backlog::BacklogStatus::Doing,
+            blocked_reason: None,
+            current_execution_ref: Some("wbe_00000000000000000000000000000000".to_string()),
+            completion_note: None,
+            completion_evidence: None,
+            completed_at_ms: None,
+            created_at_ms: 1,
+            updated_at_ms: 2,
+        };
+        let mut work = WorkspaceChatWork {
+            identity: identity.clone(),
+            availability: WorkspaceChatWorkAvailability::Available,
+            items: vec![item],
+            ..WorkspaceChatWork::default()
+        };
+        for index in 0..40u32 {
+            work.worker_executions.push(WorkspaceWorkerExecution {
+                item_id: "blg_exec_cap".to_string(),
+                execution_ref: format!("wbe_{index:032x}"),
+                approval_id: format!("apr_{index:032x}"),
+                task_id: format!("tsk_{index:032x}"),
+                session_binding_id: format!("sbx_{index:032x}"),
+                run_id: format!("run_{index:032x}"),
+                worker_id: format!("wrk_{index:032x}"),
+                provider: Some("p".repeat(300)),
+                requested_model: Some("requested-model".to_string()),
+                observed_model: None,
+                requested_effort: Some("high".to_string()),
+                observed_effort: None,
+                worker_status: None,
+                started_at_ms: None,
+                finished_at_ms: None,
+                duration_ms: None,
+                outcome: None,
+                acceptance: None,
+            });
+        }
+        work.worker_executions.push(WorkspaceWorkerExecution {
+            item_id: "blg_exec_cap".to_string(),
+            execution_ref: "wbe_00000000000000000000000000000000".to_string(),
+            approval_id: "apr_00000000000000000000000000000000".to_string(),
+            task_id: "tsk_00000000000000000000000000000000".to_string(),
+            session_binding_id: "sbx_00000000000000000000000000000000".to_string(),
+            run_id: "run_00000000000000000000000000000000".to_string(),
+            worker_id: "wrk_00000000000000000000000000000000".to_string(),
+            provider: None,
+            requested_model: None,
+            observed_model: None,
+            requested_effort: None,
+            observed_effort: None,
+            worker_status: None,
+            started_at_ms: None,
+            finished_at_ms: None,
+            duration_ms: None,
+            outcome: None,
+            acceptance: None,
+        });
+
+        let normalized = work.normalized();
+        assert_eq!(
+            normalized.worker_executions.len(),
+            MAX_WORKSPACE_CHAT_WORK_EXECUTIONS_PER_CHAT
+        );
+        assert_eq!(
+            normalized.bounds.executions_omitted,
+            41 - MAX_WORKSPACE_CHAT_WORK_EXECUTIONS_PER_CHAT
+        );
+        assert_eq!(
+            normalized.worker_executions[0].execution_ref, "wbe_00000000000000000000000000000000",
+            "the retained bound keeps the current/recent-first input order"
+        );
+        assert_eq!(
+            normalized.worker_executions[0]
+                .provider
+                .as_deref()
+                .map(str::len),
+            Some(128),
+            "metadata strings are bounded to 128 UTF-8 bytes"
+        );
+        let idempotent = normalized.normalized();
+        assert_eq!(
+            idempotent.worker_executions, normalized.worker_executions,
+            "normalizing an already bounded projection must preserve the original metadata"
+        );
+        assert_eq!(
+            idempotent.bounds.executions_omitted,
+            normalized.bounds.executions_omitted
+        );
+
+        let target = normalized.worker_executions[0].clone();
+        let mut enriched = normalized.clone();
+        {
+            let target_index = enriched
+                .worker_executions
+                .iter()
+                .position(|execution| execution.execution_ref == target.execution_ref)
+                .expect("target execution remains present");
+            let entry = &mut enriched.worker_executions[target_index];
+            entry.provider = None;
+            entry.requested_model = None;
+            entry.observed_model = None;
+            entry.requested_effort = None;
+            entry.observed_effort = None;
+            entry.worker_status = None;
+            entry.started_at_ms = None;
+            entry.finished_at_ms = None;
+            entry.duration_ms = None;
+        }
+        let observed = WorkspaceWorkerExecution {
+            item_id: target.item_id.clone(),
+            execution_ref: target.execution_ref.clone(),
+            approval_id: target.approval_id.clone(),
+            task_id: target.task_id.clone(),
+            session_binding_id: target.session_binding_id.clone(),
+            run_id: target.run_id.clone(),
+            worker_id: target.worker_id.clone(),
+            provider: Some("opencode-go".to_string()),
+            requested_model: Some("deepseek-v4.1-flash".to_string()),
+            observed_model: Some("deepseek-v4.1-flash".to_string()),
+            requested_effort: Some("max".to_string()),
+            observed_effort: None,
+            worker_status: Some(WorkspaceWorkerExecutionStatus::Completed),
+            started_at_ms: Some(1_000),
+            finished_at_ms: Some(4_500),
+            duration_ms: Some(3_500),
+            outcome: target.outcome,
+            acceptance: target.acceptance,
+        };
+
+        assert!(enriched.apply_worker_execution_metadata(&observed));
+        let enriched_target = enriched
+            .worker_executions
+            .iter()
+            .find(|execution| execution.execution_ref == target.execution_ref)
+            .expect("enriched execution remains present");
+        assert_eq!(enriched_target.provider.as_deref(), Some("opencode-go"));
+        assert_eq!(
+            enriched_target.worker_status,
+            Some(WorkspaceWorkerExecutionStatus::Completed)
+        );
+        assert_eq!(enriched_target.duration_ms, Some(3_500));
+
+        let before_replay = enriched.clone();
+        let mut divergent = observed.clone();
+        divergent.provider = Some("a-different-provider".to_string());
+        divergent.observed_model = Some("a-different-model".to_string());
+        divergent.duration_ms = Some(1);
+        assert!(
+            !enriched.apply_worker_execution_metadata(&divergent),
+            "a replay that changes no missing field must not rewrite original terminal metadata"
+        );
+        assert_eq!(enriched.worker_executions, before_replay.worker_executions);
+
+        let mut wrong_identity = observed.clone();
+        wrong_identity.session_binding_id = "sbx_ffffffffffffffffffffffffffffffff".to_string();
+        assert!(!enriched.apply_worker_execution_metadata(&wrong_identity));
+        assert_eq!(
+            enriched.worker_executions.len(),
+            before_replay.worker_executions.len(),
+            "an unavailable or wrong-identity observation never creates a new execution"
+        );
+
+        let legacy_payload = serde_json::json!({
+            "identity": identity,
+            "availability": "unavailable",
+            "items": [],
+            "events": [],
+            "worker_presence": [],
+            "bounds": {},
+        });
+        let legacy: WorkspaceChatWork =
+            serde_json::from_value(legacy_payload).expect("old payload without execution fields");
+        assert!(legacy.worker_executions.is_empty());
+        assert_eq!(legacy.bounds.executions_omitted, 0);
+    }
+
+    #[test]
+    fn workspace_snapshot_caps_total_worker_executions_at_128_with_truthful_omissions() {
+        let mut chats = Vec::new();
+        for chat_index in 0..5u32 {
+            let binding_id = format!("bnd_exec_total_{chat_index}");
+            let item_id = format!("blg_exec_total_{chat_index}");
+            let identity = WorkspaceChatIdentity::new(
+                "default",
+                &binding_id,
+                &format!("0196ed00-0000-7000-8000-00000000{chat_index:04}"),
+                &format!("/home/dev/repos/exec-total-{chat_index}"),
+            )
+            .expect("total cap identity");
+            let item = crate::backlog::BacklogItem {
+                item_id: item_id.clone(),
+                binding_id: binding_id.clone(),
+                revision: 1,
+                title: "Total execution cap".to_string(),
+                acceptance_condition: "Metadata is bounded".to_string(),
+                delivery_description: "Deliver bounded metadata".to_string(),
+                kind: crate::backlog::BacklogItemKind::Worker,
+                status: crate::backlog::BacklogStatus::Doing,
+                blocked_reason: None,
+                current_execution_ref: None,
+                completion_note: None,
+                completion_evidence: None,
+                completed_at_ms: None,
+                created_at_ms: 1,
+                updated_at_ms: 1,
+            };
+            let executions = (0..MAX_WORKSPACE_CHAT_WORK_EXECUTIONS_PER_CHAT)
+                .map(|execution_index| WorkspaceWorkerExecution {
+                    item_id: item_id.clone(),
+                    execution_ref: format!("wbe_{chat_index:04}{execution_index:028x}"),
+                    approval_id: format!("apr_{chat_index:04}{execution_index:028x}"),
+                    task_id: format!("tsk_{chat_index:04}{execution_index:028x}"),
+                    session_binding_id: format!("sbx_{chat_index:04}{execution_index:028x}"),
+                    run_id: format!("run_{chat_index:04}{execution_index:028x}"),
+                    worker_id: format!("wrk_{chat_index:04}{execution_index:028x}"),
+                    ..WorkspaceWorkerExecution::default()
+                })
+                .collect();
+            chats.push(WorkspaceChatWork {
+                identity,
+                availability: WorkspaceChatWorkAvailability::Available,
+                items: vec![item],
+                worker_executions: executions,
+                ..WorkspaceChatWork::default()
+            });
+        }
+        let snapshot = WorkspaceSnapshot {
+            schema_version: WORKSPACE_SNAPSHOT_SCHEMA_VERSION,
+            generated_at_ms: 0,
+            sampling_policy: WorkspaceSamplingPolicy::default(),
+            observation: default_empty_observation_snapshot(),
+            chats: Vec::new(),
+            native_samples: Vec::new(),
+            job_histories: Vec::new(),
+            messages: WorkspaceMessagesWindow::default(),
+            chat_work: chats,
+            bounds: WorkspaceSnapshotBounds::default(),
+        }
+        .normalized();
+
+        let retained: usize = snapshot
+            .chat_work
+            .iter()
+            .map(|work| work.worker_executions.len())
+            .sum();
+        let omitted: usize = snapshot
+            .chat_work
+            .iter()
+            .map(|work| work.bounds.executions_omitted)
+            .sum();
+        assert_eq!(retained, MAX_WORKSPACE_CHAT_WORK_EXECUTIONS_TOTAL);
+        assert_eq!(
+            omitted,
+            5 * MAX_WORKSPACE_CHAT_WORK_EXECUTIONS_PER_CHAT
+                - MAX_WORKSPACE_CHAT_WORK_EXECUTIONS_TOTAL
+        );
+    }
+
+    fn base_workspace_execution_for_timing() -> WorkspaceWorkerExecution {
+        WorkspaceWorkerExecution {
+            item_id: "blg_timing".to_string(),
+            execution_ref: "wbe_00000000000000000000000000000001".to_string(),
+            approval_id: "apr_00000000000000000000000000000001".to_string(),
+            task_id: "tsk_00000000000000000000000000000001".to_string(),
+            session_binding_id: "sbx_00000000000000000000000000000001".to_string(),
+            run_id: "run_00000000000000000000000000000001".to_string(),
+            worker_id: "wrk_00000000000000000000000000000001".to_string(),
+            ..WorkspaceWorkerExecution::default()
+        }
+    }
+
+    #[test]
+    fn workspace_worker_execution_rejects_negative_and_unchecked_timing_without_panicking() {
+        let mut minimum = base_workspace_execution_for_timing();
+        minimum.started_at_ms = Some(i64::MIN);
+        minimum.finished_at_ms = Some(0);
+        let normalized = minimum.normalized_safe().expect("valid identity");
+        assert_eq!(normalized.started_at_ms, None);
+        assert_eq!(normalized.finished_at_ms, None);
+        assert_eq!(normalized.duration_ms, None);
+
+        let mut extreme = base_workspace_execution_for_timing();
+        extreme.started_at_ms = Some(i64::MIN);
+        extreme.finished_at_ms = Some(i64::MAX);
+        let normalized = extreme.normalized_safe().expect("valid identity");
+        assert_eq!(normalized.started_at_ms, None);
+        assert_eq!(normalized.finished_at_ms, Some(i64::MAX));
+        assert_eq!(normalized.duration_ms, None);
+
+        let mut reversed_extreme = base_workspace_execution_for_timing();
+        reversed_extreme.started_at_ms = Some(i64::MAX);
+        reversed_extreme.finished_at_ms = Some(i64::MIN);
+        let normalized = reversed_extreme.normalized_safe().expect("valid identity");
+        assert_eq!(normalized.started_at_ms, Some(i64::MAX));
+        assert_eq!(normalized.finished_at_ms, None);
+        assert_eq!(normalized.duration_ms, None);
+
+        let mut negative_start = base_workspace_execution_for_timing();
+        negative_start.started_at_ms = Some(-1);
+        negative_start.finished_at_ms = Some(5);
+        let normalized = negative_start.normalized_safe().expect("valid identity");
+        assert_eq!(normalized.started_at_ms, None);
+        assert_eq!(normalized.finished_at_ms, Some(5));
+        assert_eq!(normalized.duration_ms, None);
+
+        let mut reversed = base_workspace_execution_for_timing();
+        reversed.started_at_ms = Some(10);
+        reversed.finished_at_ms = Some(5);
+        let normalized = reversed.normalized_safe().expect("valid identity");
+        assert_eq!(normalized.started_at_ms, None);
+        assert_eq!(normalized.finished_at_ms, None);
+        assert_eq!(normalized.duration_ms, None);
+
+        let mut absent = base_workspace_execution_for_timing();
+        absent.duration_ms = Some(777);
+        let normalized = absent.normalized_safe().expect("valid identity");
+        assert_eq!(normalized.started_at_ms, None);
+        assert_eq!(normalized.finished_at_ms, None);
+        assert_eq!(
+            normalized.duration_ms,
+            Some(777),
+            "measured terminal duration is preserved independently of timestamps"
+        );
+
+        let mut measured = base_workspace_execution_for_timing();
+        measured.started_at_ms = Some(2_000);
+        measured.finished_at_ms = Some(1_500);
+        measured.duration_ms = Some(321);
+        let normalized = measured.normalized_safe().expect("valid identity");
+        assert_eq!(normalized.duration_ms, Some(321));
+
+        let mut normal = base_workspace_execution_for_timing();
+        normal.started_at_ms = Some(1_000);
+        normal.finished_at_ms = Some(4_500);
+        let normalized = normal.normalized_safe().expect("valid identity");
+        assert_eq!(normalized.started_at_ms, Some(1_000));
+        assert_eq!(normalized.finished_at_ms, Some(4_500));
+        assert_eq!(normalized.duration_ms, Some(3_500));
+    }
+
+    #[test]
+    fn workspace_worker_execution_bounds_nullable_strings_to_128_utf8_bytes() {
+        let mut execution = base_workspace_execution_for_timing();
+        execution.provider = Some("é".repeat(100));
+        execution.requested_model = Some(format!("{}é", "a".repeat(127)));
+        execution.observed_model = Some("x".repeat(300));
+        execution.requested_effort = Some("  max\n ".to_string());
+        execution.observed_effort = Some("sk-secret-effort".to_string());
+        let normalized = execution.normalized_safe().expect("valid identity");
+
+        let provider = normalized.provider.expect("provider preserved");
+        assert_eq!(provider, "é".repeat(64));
+        assert_eq!(provider.len(), 128);
+        assert!(provider.is_char_boundary(provider.len()));
+
+        let requested_model = normalized.requested_model.expect("model preserved");
+        assert_eq!(requested_model, "a".repeat(127));
+        assert!(requested_model.len() <= crate::MAX_LABEL_LEN);
+
+        let observed_model = normalized.observed_model.expect("model preserved");
+        assert_eq!(observed_model.len(), 128);
+
+        assert_eq!(normalized.requested_effort.as_deref(), Some("max"));
+        assert_eq!(
+            normalized.observed_effort, None,
+            "secret-like nullable telemetry must not be kept"
+        );
+
+        let mut empty = base_workspace_execution_for_timing();
+        empty.provider = Some("   \n\t ".to_string());
+        let normalized = empty.normalized_safe().expect("valid identity");
+        assert_eq!(normalized.provider, None);
+    }
+
+    #[test]
+    fn workspace_worker_execution_running_metadata_never_creates_presence_or_liveness() {
+        let identity = WorkspaceChatIdentity::new(
+            "default",
+            "bnd_running_metadata",
+            "0196ed00-0000-7000-8000-0000000000f4",
+            "/home/dev/repos/running-metadata",
+        )
+        .expect("identity");
+        let item = crate::backlog::BacklogItem {
+            item_id: "blg_running_metadata".to_string(),
+            binding_id: identity.binding_id.clone(),
+            revision: 2,
+            title: "Running attempt".to_string(),
+            acceptance_condition: "The attempt is checked".to_string(),
+            delivery_description: "Deliver the running attempt".to_string(),
+            kind: crate::backlog::BacklogItemKind::Worker,
+            status: crate::backlog::BacklogStatus::Doing,
+            blocked_reason: None,
+            current_execution_ref: Some("wbe_0000000000000000000000000000000e".to_string()),
+            completion_note: None,
+            completion_evidence: None,
+            completed_at_ms: None,
+            created_at_ms: 1,
+            updated_at_ms: 2,
+        };
+        let mut work = WorkspaceChatWork {
+            identity,
+            availability: WorkspaceChatWorkAvailability::Available,
+            items: vec![item],
+            worker_executions: vec![WorkspaceWorkerExecution {
+                item_id: "blg_running_metadata".to_string(),
+                execution_ref: "wbe_0000000000000000000000000000000e".to_string(),
+                approval_id: "apr_running_metadata".to_string(),
+                task_id: "tsk_running_metadata".to_string(),
+                session_binding_id: "sbx_running_metadata".to_string(),
+                run_id: "run_running_metadata".to_string(),
+                worker_id: "wrk_running_metadata".to_string(),
+                ..WorkspaceWorkerExecution::default()
+            }],
+            ..WorkspaceChatWork::default()
+        };
+        let observed = WorkspaceWorkerExecution {
+            worker_status: Some(WorkspaceWorkerExecutionStatus::Running),
+            started_at_ms: Some(1_000),
+            ..work.worker_executions[0].clone()
+        };
+
+        assert!(work.apply_worker_execution_metadata(&observed));
+        assert_eq!(
+            work.worker_executions[0].worker_status,
+            Some(WorkspaceWorkerExecutionStatus::Running)
+        );
+        assert_eq!(work.worker_executions[0].started_at_ms, Some(1_000));
+        assert!(
+            work.worker_presence.is_empty(),
+            "a running runtime record is metadata, never a presence sample"
+        );
+
+        let normalized = work.normalized();
+        assert_eq!(normalized.worker_executions.len(), 1);
+        assert!(normalized.worker_presence.is_empty());
+        assert!(
+            !work.apply_worker_execution_metadata(&observed),
+            "a duplicate observation never rewrites the retained attempt"
+        );
+        assert_eq!(work.worker_executions.len(), 1);
+    }
+
+    #[test]
+    fn read_core_state_readonly_keeps_retained_done_worker_reference_without_history() {
+        let dir = ScopedPrivateDir::new("done-worker-without-history");
+        let db_path = dir.path.join("state.db");
+        let thread = "0196ed00-0000-7000-8000-0000000000f1";
+        let result_digest = "7".repeat(64);
+        let delivery_digest = "8".repeat(64);
+
+        let mut core = crate::Core::open(&db_path).expect("open Core");
+        let binding = core
+            .create_binding(thread, "Done without history")
+            .expect("create binding");
+        let item = core
+            .create_backlog_item(
+                &binding.binding_id,
+                "create-done-no-history",
+                crate::backlog::NewBacklogItem {
+                    title: "Ship the done item".to_string(),
+                    acceptance_condition: "The done item is checked".to_string(),
+                    delivery_description: "Deliver the done item".to_string(),
+                    kind: crate::backlog::BacklogItemKind::Worker,
+                },
+                1_000,
+            )
+            .expect("create Worker item");
+        let reserved = core
+            .reserve_worker_backlog_execution_operator_attested(
+                &binding.binding_id,
+                "reserve-done-no-history",
+                &item.item_id,
+                1,
+                crate::backlog_worker::WorkerBacklogAuthority {
+                    approval_id: "apr_done_no_history".to_string(),
+                    subject_digest: "a".repeat(64),
+                    task_id: "tsk_done_no_history".to_string(),
+                    task_digest: "b".repeat(64),
+                },
+                1_010,
+            )
+            .expect("reserve Worker execution");
+        core.attach_worker_backlog_dispatch_receipt_operator_attested(
+            &binding.binding_id,
+            "attach-done-no-history",
+            &item.item_id,
+            &reserved.execution_ref,
+            2,
+            crate::backlog_worker::WorkerBacklogDispatchReceipt {
+                session_binding_id: "sbx_done_no_history".to_string(),
+                run_id: "run_done_no_history".to_string(),
+                worker_id: "wrk_done_no_history".to_string(),
+                profile_id: "profile_done_no_history".to_string(),
+                execution_binding_digest: None,
+            },
+            1_020,
+        )
+        .expect("attach dispatch receipt");
+        core.record_worker_backlog_outcome_operator_attested(
+            &binding.binding_id,
+            "outcome-done-no-history",
+            &item.item_id,
+            &reserved.execution_ref,
+            3,
+            crate::backlog_worker::WorkerBacklogOutcomeReport {
+                outcome: crate::backlog_worker::WorkerBacklogOutcome::Success,
+                note: "Verified success".to_string(),
+                result_digest: Some(result_digest.clone()),
+            },
+            1_030,
+        )
+        .expect("record outcome");
+        core.complete_worker_backlog_item_operator_attested(
+            &binding.binding_id,
+            "complete-done-no-history",
+            &item.item_id,
+            4,
+            crate::backlog_worker::WorkerBacklogCompletion {
+                execution_ref: reserved.execution_ref.clone(),
+                result_digest,
+                acceptance_note: "Accepted".to_string(),
+                acceptance_evidence: "Checked the delivered artifact".to_string(),
+                delivery_digest,
+            },
+            1_040,
+        )
+        .expect("complete Worker item");
+        drop(core);
+
+        {
+            let conn = rusqlite::Connection::open(&db_path).expect("open raw sqlite");
+            conn.execute(
+                "DELETE FROM backlog_history WHERE binding_id = ?1",
+                [&binding.binding_id],
+            )
+            .expect("simulate trimmed history");
+        }
+
+        let snapshot = read_core_state_readonly(&db_path).expect("read retained Done execution");
+        assert!(snapshot.backlog_history.is_empty());
+        assert_eq!(snapshot.backlog_items.len(), 1);
+        assert_eq!(
+            snapshot.backlog_items[0].status,
+            crate::backlog::BacklogStatus::Done
+        );
+        assert_eq!(snapshot.backlog_worker_executions.len(), 1);
+        assert_eq!(
+            snapshot.backlog_worker_executions[0].execution_ref,
+            reserved.execution_ref
+        );
+
+        let identity = WorkspaceChatIdentity::new(
+            "default",
+            &binding.binding_id,
+            thread,
+            "/home/dev/repos/done-no-history",
+        )
+        .expect("identity");
+        let work = project_workspace_chat_work(&identity, &[snapshot]);
+        assert_eq!(work.items.len(), 1);
+        assert_eq!(work.worker_executions.len(), 1);
+        assert_eq!(
+            work.worker_executions[0].execution_ref,
+            reserved.execution_ref
+        );
+        assert_eq!(
+            work.worker_executions[0].acceptance,
+            Some(WorkspaceWorkerExecutionAcceptance::Accepted)
+        );
+    }
+
+    #[test]
+    fn project_workspace_chat_work_rejects_conflicting_execution_identities() {
+        let thread = "0196ed00-0000-7000-8000-0000000000f2";
+        let identity = WorkspaceChatIdentity::new(
+            "default",
+            "bnd_conflicting_execution",
+            thread,
+            "/home/dev/repos/conflicting-execution",
+        )
+        .expect("identity");
+        let item = crate::backlog::BacklogItem {
+            item_id: "blg_conflicting_execution".to_string(),
+            binding_id: identity.binding_id.clone(),
+            revision: 2,
+            title: "Conflicting execution".to_string(),
+            acceptance_condition: "The execution identity is exact".to_string(),
+            delivery_description: "Deliver one exact execution".to_string(),
+            kind: crate::backlog::BacklogItemKind::Worker,
+            status: crate::backlog::BacklogStatus::Doing,
+            blocked_reason: None,
+            current_execution_ref: Some("wbe_0000000000000000000000000000000c".to_string()),
+            completion_note: None,
+            completion_evidence: None,
+            completed_at_ms: None,
+            created_at_ms: 1,
+            updated_at_ms: 2,
+        };
+        let execution = crate::backlog_worker::WorkerBacklogExecution {
+            execution_ref: "wbe_0000000000000000000000000000000c".to_string(),
+            binding_id: identity.binding_id.clone(),
+            item_id: item.item_id.clone(),
+            authority: crate::backlog_worker::WorkerBacklogAuthority {
+                approval_id: "apr_conflicting_execution".to_string(),
+                subject_digest: "a".repeat(64),
+                task_id: "tsk_conflicting_execution".to_string(),
+                task_digest: "b".repeat(64),
+            },
+            acceptance_condition_digest: "c".repeat(64),
+            delivery_description_digest: "d".repeat(64),
+            reservation_revision: 2,
+            reserved_at_ms: 1_000,
+            dispatch_receipt: Some(crate::backlog_worker::WorkerBacklogDispatchReceipt {
+                session_binding_id: "sbx_conflicting_execution".to_string(),
+                run_id: "run_conflicting_execution".to_string(),
+                worker_id: "wrk_conflicting_execution".to_string(),
+                profile_id: "profile_conflicting_execution".to_string(),
+                execution_binding_digest: None,
+            }),
+            attached_at_ms: Some(1_010),
+            outcome: None,
+            completion: None,
+            acceptance_rejection: None,
+        };
+        let mut conflicting = execution.clone();
+        conflicting.dispatch_receipt = Some(crate::backlog_worker::WorkerBacklogDispatchReceipt {
+            session_binding_id: "sbx_conflicting_execution".to_string(),
+            run_id: "run_conflicting_execution_other".to_string(),
+            worker_id: "wrk_conflicting_execution".to_string(),
+            profile_id: "profile_conflicting_execution".to_string(),
+            execution_binding_digest: None,
+        });
+        let state = ReadonlyCoreStateSnapshot {
+            bindings: vec![ReadonlyBindingRecord {
+                binding_id: identity.binding_id.clone(),
+                thread_uuid: thread.to_string(),
+                label: "Conflicting execution chat".to_string(),
+                delivered_seq: 0,
+                acked_seq: 0,
+            }],
+            backlog_available: true,
+            backlog_items: vec![item],
+            backlog_worker_executions: vec![execution, conflicting],
+            backlog_binding_counts: vec![ReadonlyBacklogBindingCounts {
+                binding_id: identity.binding_id.clone(),
+                item_count: 1,
+                history_count: 0,
+                current_worker_execution_count: 1,
+                worker_execution_count: 2,
+            }],
+            ..ReadonlyCoreStateSnapshot::default()
+        };
+
+        let work = project_workspace_chat_work(&identity, &[state]);
+        assert!(
+            work.worker_executions.is_empty(),
+            "conflicting execution identities must never be projected as one attempt"
+        );
+        assert!(
+            work.bounds.executions_omitted >= 2,
+            "both conflicting observations must remain truthfully omitted"
+        );
+    }
+
+    #[test]
+    fn project_workspace_chat_work_preserves_history_outside_the_item_window_with_exact_outcome() {
+        let thread = "0196ed00-0000-7000-8000-0000000000f3";
+        let identity = WorkspaceChatIdentity::new(
+            "default",
+            "bnd_history_outside",
+            thread,
+            "/home/dev/repos/history-outside",
+        )
+        .expect("identity");
+        let retained_item = crate::backlog::BacklogItem {
+            item_id: "blg_newer_item".to_string(),
+            binding_id: identity.binding_id.clone(),
+            revision: 1,
+            title: "Newer retained item".to_string(),
+            acceptance_condition: "The newer item is retained".to_string(),
+            delivery_description: "Deliver the newer item".to_string(),
+            kind: crate::backlog::BacklogItemKind::Coworker,
+            status: crate::backlog::BacklogStatus::Todo,
+            blocked_reason: None,
+            current_execution_ref: None,
+            completion_note: None,
+            completion_evidence: None,
+            completed_at_ms: None,
+            created_at_ms: 2_000,
+            updated_at_ms: 2_000,
+        };
+        let historical_item = crate::backlog::BacklogItem {
+            item_id: "blg_older_item".to_string(),
+            binding_id: identity.binding_id.clone(),
+            revision: 2,
+            title: "Older historical item".to_string(),
+            acceptance_condition: "The older item is checked".to_string(),
+            delivery_description: "Deliver the older item".to_string(),
+            kind: crate::backlog::BacklogItemKind::Worker,
+            status: crate::backlog::BacklogStatus::Doing,
+            blocked_reason: None,
+            current_execution_ref: Some("wbe_0000000000000000000000000000000d".to_string()),
+            completion_note: None,
+            completion_evidence: None,
+            completed_at_ms: None,
+            created_at_ms: 1_000,
+            updated_at_ms: 1_500,
+        };
+        let execution = crate::backlog_worker::WorkerBacklogExecution {
+            execution_ref: "wbe_0000000000000000000000000000000d".to_string(),
+            binding_id: identity.binding_id.clone(),
+            item_id: historical_item.item_id.clone(),
+            authority: crate::backlog_worker::WorkerBacklogAuthority {
+                approval_id: "apr_history_outside".to_string(),
+                subject_digest: "a".repeat(64),
+                task_id: "tsk_history_outside".to_string(),
+                task_digest: "b".repeat(64),
+            },
+            acceptance_condition_digest: "c".repeat(64),
+            delivery_description_digest: "d".repeat(64),
+            reservation_revision: 1,
+            reserved_at_ms: 1_100,
+            dispatch_receipt: Some(crate::backlog_worker::WorkerBacklogDispatchReceipt {
+                session_binding_id: "sbx_history_outside".to_string(),
+                run_id: "run_history_outside".to_string(),
+                worker_id: "wrk_history_outside".to_string(),
+                profile_id: "profile_history_outside".to_string(),
+                execution_binding_digest: None,
+            }),
+            attached_at_ms: Some(1_110),
+            outcome: Some(crate::backlog_worker::WorkerBacklogRecordedOutcome {
+                outcome: crate::backlog_worker::WorkerBacklogOutcome::Success,
+                note: "Preserved historical outcome".to_string(),
+                result_digest: Some("e".repeat(64)),
+                recorded_at_ms: 1_500,
+            }),
+            completion: None,
+            acceptance_rejection: None,
+        };
+        let state = ReadonlyCoreStateSnapshot {
+            bindings: vec![ReadonlyBindingRecord {
+                binding_id: identity.binding_id.clone(),
+                thread_uuid: thread.to_string(),
+                label: "History outside window chat".to_string(),
+                delivered_seq: 0,
+                acked_seq: 0,
+            }],
+            backlog_available: true,
+            backlog_items: vec![retained_item],
+            backlog_history: vec![ReadonlyBacklogHistoryRecord {
+                binding_id: identity.binding_id.clone(),
+                item_id: historical_item.item_id.clone(),
+                revision: historical_item.revision,
+                action: "worker_outcome_recorded".to_string(),
+                item: historical_item,
+                recorded_at_ms: 1_500,
+                sequence: 7,
+            }],
+            backlog_worker_executions: vec![execution],
+            backlog_binding_counts: vec![ReadonlyBacklogBindingCounts {
+                binding_id: identity.binding_id.clone(),
+                item_count: 2,
+                history_count: 1,
+                current_worker_execution_count: 1,
+                worker_execution_count: 1,
+            }],
+            ..ReadonlyCoreStateSnapshot::default()
+        };
+
+        let work = project_workspace_chat_work(&identity, &[state]);
+        assert_eq!(work.items.len(), 1, "only the retained item is projected");
+        assert_eq!(work.items[0].item_id, "blg_newer_item");
+        assert_eq!(work.events.len(), 1);
+        assert_eq!(work.events[0].item_id, "blg_older_item");
+        assert_eq!(work.events[0].action, "worker_outcome_recorded");
+        assert_eq!(work.events[0].recorded_at_ms, 1_500);
+        assert_eq!(
+            work.events[0].outcome,
+            Some(crate::backlog_worker::WorkerBacklogOutcome::Success)
+        );
+        assert_eq!(
+            work.events[0].note.as_deref(),
+            Some("Preserved historical outcome")
+        );
     }
 
     #[test]

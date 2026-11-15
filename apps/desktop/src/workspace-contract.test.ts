@@ -43,6 +43,8 @@ import {
   MAX_WORKSPACE_ATTEMPTS_PER_TASK,
   MAX_WORKSPACE_CANDIDATES_PER_TASK,
   MAX_WORKSPACE_CHAT_WORK_ITEMS_PER_CHAT,
+  MAX_WORKSPACE_CHAT_WORK_EXECUTIONS_PER_CHAT,
+  MAX_WORKSPACE_CHAT_WORK_EXECUTIONS_TOTAL,
   MAX_WORKSPACE_CHAT_WORK_PRESENCE_PER_CHAT,
   MAX_WORKSPACE_COMBINED_CANDIDATES_PER_JOB,
   MAX_WORKSPACE_COVERED_ATTENTION_PER_RESOLUTION,
@@ -90,6 +92,7 @@ import {
   utf8ByteLength,
   validateSafeWorkspaceMessageSource,
   validateWorkspaceChatIdentity,
+  workspaceChatIdentitiesEqual,
 } from './workspace-contract.ts';
 import type {
   ObservationProcessInstance,
@@ -652,6 +655,659 @@ test('chat_work defaults empty, rejects malformed scope/status, dedupes by sourc
   assert.ok(tooManyItems);
   assert.equal(tooManyItems.items.length, MAX_WORKSPACE_CHAT_WORK_ITEMS_PER_CHAT);
   assert.equal(tooManyItems.bounds.items_omitted, 2);
+});
+
+test('chat_work worker executions default empty, join exact scope, dedupe by item/execution ref, and enforce 32/128 bounds', () => {
+  const identity = sampleIdentity();
+  const itemId = 'blg_worker_execution';
+  const item = {
+    item_id: itemId,
+    binding_id: identity.binding_id,
+    revision: 4,
+    title: 'Run the verified attempt',
+    acceptance_condition: 'The attempt is checked.',
+    delivery_description: 'Deliver the checked attempt.',
+    kind: 'worker',
+    status: 'blocked',
+    blocked_reason: 'The first attempt was not accepted.',
+    current_execution_ref: 'wbe_2',
+    completion_note: null,
+    completion_evidence: null,
+    completed_at_ms: null,
+    created_at_ms: 1_700_000_000_100,
+    updated_at_ms: 1_700_000_000_900,
+  };
+  const execution = (overrides: Record<string, unknown> = {}) => ({
+    item_id: itemId,
+    execution_ref: 'wbe_1',
+    approval_id: 'apr_worker_execution',
+    task_id: 'tsk_worker_execution',
+    session_binding_id: identity.binding_id,
+    run_id: 'run_worker_execution',
+    worker_id: 'wrk_worker_execution',
+    provider: 'opencode',
+    requested_model: 'deepseek-v4.1-flash',
+    observed_model: null,
+    requested_effort: 'max',
+    observed_effort: null,
+    worker_status: 'completed',
+    started_at_ms: 1_700_000_000_200,
+    finished_at_ms: 1_700_000_000_700,
+    duration_ms: 500,
+    outcome: 'success',
+    acceptance: 'rejected',
+    ...overrides,
+  });
+
+  const legacy = normalizeWorkspaceChatWork({
+    identity,
+    availability: 'available',
+    items: [item],
+    events: [],
+    worker_presence: [],
+    bounds: { items_omitted: 0, events_omitted: 0, presence_omitted: 0 },
+  });
+  assert.ok(legacy);
+  assert.deepEqual(legacy.worker_executions, []);
+  assert.equal(legacy.bounds.executions_omitted, 0);
+
+  const normalized = normalizeWorkspaceChatWork({
+    identity,
+    availability: 'available',
+    items: [item],
+    events: [],
+    worker_presence: [],
+    worker_executions: [
+      // A refresh may repeat the same immutable attempt. The terminal record
+      // wins so proven timing and metadata are never reset to a sparse copy.
+      execution({ worker_status: 'running', outcome: null, duration_ms: null }),
+      execution(),
+      execution(),
+      execution({ execution_ref: 'wbe_orphan', item_id: 'blg_missing' }),
+      execution({
+        execution_ref: 'wbe_runtime_binding',
+        session_binding_id: 'bnd_runtime_approved',
+        approval_id: 'apr_runtime',
+        task_id: 'tsk_runtime',
+        run_id: 'run_runtime',
+        worker_id: 'wrk_runtime',
+      }),
+      execution({ execution_ref: 'wbe_cross_chat', item_id: 'blg_other_chat' }),
+      execution({ execution_ref: 'wbe_bad_worker', worker_id: '' }),
+      execution({
+        execution_ref: 'wbe_2',
+        worker_status: 'failed',
+        outcome: 'failure',
+        acceptance: null,
+        started_at_ms: 1_700_000_000_800,
+        finished_at_ms: 1_700_000_000_950,
+        duration_ms: 150,
+        provider: 'x'.repeat(300),
+        observed_model: 'deepseek-v4.1-flash',
+        observed_effort: 'max',
+      }),
+    ],
+    bounds: { items_omitted: 0, events_omitted: 0, presence_omitted: 0 },
+  });
+  assert.ok(normalized);
+  assert.deepEqual(
+    normalized.worker_executions?.map((entry) => entry.execution_ref),
+    ['wbe_1', 'wbe_runtime_binding', 'wbe_2'],
+  );
+  assert.equal(normalized.worker_executions?.[0]?.duration_ms, 500);
+  assert.equal(normalized.worker_executions?.[0]?.finished_at_ms, 1_700_000_000_700);
+  const runtimeBindingExecution = normalized.worker_executions?.find(
+    (entry) => entry.execution_ref === 'wbe_runtime_binding',
+  );
+  assert.equal(runtimeBindingExecution?.session_binding_id, 'bnd_runtime_approved');
+  assert.equal(runtimeBindingExecution?.approval_id, 'apr_runtime');
+  assert.equal(runtimeBindingExecution?.task_id, 'tsk_runtime');
+  assert.equal(runtimeBindingExecution?.run_id, 'run_runtime');
+  assert.equal(runtimeBindingExecution?.worker_id, 'wrk_runtime');
+  assert.equal(normalized.worker_executions?.[2]?.outcome, 'failure');
+  assert.ok((normalized.worker_executions?.[2]?.provider?.length ?? 0) <= 128);
+  assert.equal(normalized.worker_executions?.[2]?.observed_model, 'deepseek-v4.1-flash');
+  assert.equal(normalized.worker_executions?.[2]?.observed_effort, 'max');
+  assert.equal(normalized.bounds.executions_omitted, 3);
+
+  const tooMany = normalizeWorkspaceChatWork({
+    identity,
+    availability: 'available',
+    items: [item],
+    events: [],
+    worker_presence: [],
+    worker_executions: Array.from(
+      { length: MAX_WORKSPACE_CHAT_WORK_EXECUTIONS_PER_CHAT + 2 },
+      (_, index) =>
+        execution({
+          execution_ref: `wbe_cap_${index}`,
+          started_at_ms: 1_700_000_000_200 + index,
+          finished_at_ms: 1_700_000_000_700 + index,
+        }),
+    ),
+    bounds: { items_omitted: 0, events_omitted: 0, presence_omitted: 0 },
+  });
+  assert.ok(tooMany);
+  assert.equal(
+    tooMany.worker_executions?.length,
+    MAX_WORKSPACE_CHAT_WORK_EXECUTIONS_PER_CHAT,
+  );
+  assert.equal(tooMany.bounds.executions_omitted, 2);
+
+  const chats = Array.from({ length: 5 }, (_, chatIndex) => {
+    const chatIdentity = validateWorkspaceChatIdentity({
+      source_id: identity.source_id,
+      binding_id: `bnd_execution_chat_${chatIndex}`,
+      thread_uuid: VALID_UUID_A,
+      canonical_project_scope: `/home/dev/repos/execution-${chatIndex}`,
+    });
+    const chatItem = {
+      ...item,
+      item_id: `blg_execution_chat_${chatIndex}`,
+      binding_id: chatIdentity.binding_id,
+      current_execution_ref: `wbe_chat_${chatIndex}_31`,
+    };
+    return {
+      identity: chatIdentity,
+      availability: 'available' as const,
+      items: [chatItem],
+      events: [],
+      worker_presence: [],
+      worker_executions: Array.from(
+        { length: MAX_WORKSPACE_CHAT_WORK_EXECUTIONS_PER_CHAT },
+        (_, executionIndex) =>
+          execution({
+            item_id: chatItem.item_id,
+            execution_ref: `wbe_chat_${chatIndex}_${executionIndex}`,
+            session_binding_id: chatIdentity.binding_id,
+            started_at_ms: 1_700_000_000_200 + executionIndex,
+            finished_at_ms: 1_700_000_000_700 + executionIndex,
+          }),
+      ),
+      bounds: { items_omitted: 0, events_omitted: 0, presence_omitted: 0 },
+    };
+  });
+  const snapshot = normalizeWorkspaceSnapshot({
+    schema_version: 1,
+    generated_at_ms: 1_700_000_001_000,
+    chat_work: chats,
+  });
+  const retainedExecutions = snapshot.chat_work.reduce(
+    (sum, work) => sum + (work.worker_executions?.length ?? 0),
+    0,
+  );
+  const omittedExecutions = snapshot.chat_work.reduce(
+    (sum, work) => sum + (work.bounds.executions_omitted ?? 0),
+    0,
+  );
+  assert.equal(retainedExecutions, MAX_WORKSPACE_CHAT_WORK_EXECUTIONS_TOTAL);
+  assert.equal(
+    omittedExecutions,
+    5 * MAX_WORKSPACE_CHAT_WORK_EXECUTIONS_PER_CHAT -
+      MAX_WORKSPACE_CHAT_WORK_EXECUTIONS_TOTAL,
+  );
+});
+
+test('chat_work worker executions quarantine every conflicting immutable identity instead of ranking one row', () => {
+  const identity = sampleIdentity();
+  const itemId = 'blg_execution_identity';
+  const item = {
+    item_id: itemId,
+    binding_id: identity.binding_id,
+    revision: 5,
+    title: 'Run the exact attempt',
+    acceptance_condition: 'The attempt is checked.',
+    delivery_description: 'Deliver the checked attempt.',
+    kind: 'worker' as const,
+    status: 'doing' as const,
+    blocked_reason: null,
+    current_execution_ref: 'wbe_identity',
+    completion_note: null,
+    completion_evidence: null,
+    completed_at_ms: null,
+    created_at_ms: 1_700_000_000_100,
+    updated_at_ms: 1_700_000_000_900,
+  };
+  const execution = (overrides: Record<string, unknown> = {}) => ({
+    item_id: itemId,
+    execution_ref: 'wbe_identity',
+    approval_id: 'apr_identity',
+    task_id: 'tsk_identity',
+    session_binding_id: 'bnd_runtime_identity',
+    run_id: 'run_identity',
+    worker_id: 'wrk_identity',
+    provider: 'opencode',
+    requested_model: 'deepseek-v4.1-flash',
+    observed_model: null,
+    requested_effort: 'max',
+    observed_effort: null,
+    worker_status: 'running',
+    started_at_ms: 1_700_000_000_200,
+    finished_at_ms: null,
+    duration_ms: null,
+    outcome: null,
+    acceptance: null,
+    ...overrides,
+  });
+  const normalize = (executions: Array<Record<string, unknown>>) => {
+    const work = normalizeWorkspaceChatWork({
+      identity,
+      availability: 'available',
+      items: [item],
+      events: [],
+      worker_presence: [],
+      worker_executions: executions,
+      bounds: { items_omitted: 0, events_omitted: 0, presence_omitted: 0 },
+    });
+    assert.ok(work);
+    return work;
+  };
+
+  const running = execution();
+  const terminal = execution({
+    provider: 'google',
+    requested_model: 'gemini-4-argon-high',
+    observed_model: 'gemini-4-argon-high',
+    worker_status: 'completed',
+    finished_at_ms: 1_700_000_000_700,
+    duration_ms: 500,
+    outcome: 'success',
+    acceptance: 'accepted',
+  });
+  const enriched = normalize([running, terminal, terminal]);
+  assert.equal(enriched.worker_executions?.length, 1);
+  assert.equal(enriched.worker_executions?.[0]?.worker_status, 'completed');
+  assert.equal(enriched.worker_executions?.[0]?.duration_ms, 500);
+  assert.equal(enriched.worker_executions?.[0]?.observed_model, 'gemini-4-argon-high');
+  assert.equal(
+    enriched.worker_executions?.[0]?.session_binding_id,
+    'bnd_runtime_identity',
+  );
+  assert.notEqual(
+    enriched.worker_executions?.[0]?.session_binding_id,
+    identity.binding_id,
+  );
+  assert.equal(enriched.bounds.executions_omitted, 0);
+
+  const conflictingFields: ReadonlyArray<[string, Record<string, unknown>]> = [
+    ['approval_id', { approval_id: 'apr_other' }],
+    ['task_id', { task_id: 'tsk_other' }],
+    ['session_binding_id', { session_binding_id: 'bnd_runtime_other' }],
+    ['run_id', { run_id: 'run_other' }],
+    ['worker_id', { worker_id: 'wrk_other' }],
+  ];
+  for (const [field, override] of conflictingFields) {
+    const conflicted = normalize([running, execution(override)]);
+    assert.deepEqual(
+      conflicted.worker_executions,
+      [],
+      `${field} contradiction must quarantine the whole same-ref group`,
+    );
+    assert.equal(
+      conflicted.bounds.executions_omitted,
+      2,
+      `${field} contradiction must count both omitted rows`,
+    );
+
+    const resurrected = normalize([running, execution(override), terminal]);
+    assert.deepEqual(
+      resurrected.worker_executions,
+      [],
+      `${field} contradiction must not be resurrected by a later third row`,
+    );
+    assert.equal(
+      resurrected.bounds.executions_omitted,
+      3,
+      `${field} contradiction must count the later omitted row`,
+    );
+  }
+});
+
+test('chat_work composition quarantines execution identity conflicts split across exact-identity entries', () => {
+  const identity = sampleIdentity();
+  const itemId = 'blg_cross_entry_identity';
+  const item = {
+    item_id: itemId,
+    binding_id: identity.binding_id,
+    revision: 6,
+    title: 'Run the split attempt',
+    acceptance_condition: 'The attempt is checked.',
+    delivery_description: 'Deliver the split attempt.',
+    kind: 'worker',
+    status: 'doing',
+    blocked_reason: null,
+    current_execution_ref: 'wbe_cross_entry',
+    completion_note: null,
+    completion_evidence: null,
+    completed_at_ms: null,
+    created_at_ms: 1_700_000_000_100,
+    updated_at_ms: 1_700_000_000_900,
+  };
+  const execution = (overrides: Record<string, unknown> = {}) => ({
+    item_id: itemId,
+    execution_ref: 'wbe_cross_entry',
+    approval_id: 'apr_cross_entry',
+    task_id: 'tsk_cross_entry',
+    session_binding_id: 'bnd_runtime_cross_entry',
+    run_id: 'run_cross_entry',
+    worker_id: 'wrk_cross_entry',
+    provider: 'opencode',
+    requested_model: 'deepseek-v4.1-flash',
+    observed_model: null,
+    requested_effort: 'max',
+    observed_effort: null,
+    worker_status: 'running',
+    started_at_ms: 1_700_000_000_200,
+    finished_at_ms: null,
+    duration_ms: null,
+    outcome: null,
+    acceptance: null,
+    ...overrides,
+  });
+  const running = execution();
+  const terminal = execution({
+    provider: 'google',
+    requested_model: 'gemini-4-argon-high',
+    observed_model: 'gemini-4-argon-high',
+    observed_effort: 'high',
+    worker_status: 'completed',
+    finished_at_ms: 1_700_000_000_700,
+    duration_ms: 500,
+    outcome: 'success',
+    acceptance: 'accepted',
+  });
+  const workEntry = (
+    workIdentity: WorkspaceChatIdentity,
+    workItem: Record<string, unknown>,
+    workerExecutions: Array<Record<string, unknown>>,
+  ) => ({
+    identity: workIdentity,
+    availability: 'available' as const,
+    items: [workItem],
+    events: [],
+    worker_presence: [],
+    worker_executions: workerExecutions,
+    bounds: {
+      items_omitted: 0,
+      events_omitted: 0,
+      presence_omitted: 0,
+      executions_omitted: 0,
+    },
+  });
+  const snapshot = (chatWork: Array<Record<string, unknown>>) => ({
+    schema_version: 1,
+    generated_at_ms: 1_700_000_001_000,
+    chat_work: chatWork,
+  });
+  const compositions = [
+    ['normalizeWorkspaceSnapshot', (value: unknown) => normalizeWorkspaceSnapshot(value)],
+    ['parseWorkspaceSnapshot', (value: unknown) => parseWorkspaceSnapshot(JSON.stringify(value))],
+  ] as const;
+  const conflictingFields: ReadonlyArray<[string, Record<string, unknown>]> = [
+    ['approval_id', { approval_id: 'apr_cross_entry_other' }],
+    ['task_id', { task_id: 'tsk_cross_entry_other' }],
+    ['session_binding_id', { session_binding_id: 'bnd_runtime_cross_entry_other' }],
+    ['run_id', { run_id: 'run_cross_entry_other' }],
+    ['worker_id', { worker_id: 'wrk_cross_entry_other' }],
+  ];
+
+  for (const [field, override] of conflictingFields) {
+    const conflicting = execution(override);
+    for (const order of ['conflict_first', 'terminal_first'] as const) {
+      const chatWork =
+        order === 'conflict_first'
+          ? [
+              workEntry(identity, item, [running, conflicting]),
+              workEntry(identity, item, [terminal]),
+            ]
+          : [
+              workEntry(identity, item, [terminal]),
+              workEntry(identity, item, [running, conflicting]),
+            ];
+      for (const [label, compose] of compositions) {
+        const work = compose(snapshot(chatWork)).chat_work[0]!;
+        assert.deepEqual(
+          work.worker_executions,
+          [],
+          `${field} contradiction must quarantine the whole group across ${order} entries via ${label}`,
+        );
+        assert.equal(
+          work.bounds.executions_omitted,
+          3,
+          `${field} must count every omitted raw row once via ${label}`,
+        );
+      }
+    }
+  }
+
+  const conflictedSnapshot = snapshot([
+    workEntry(identity, item, [running, execution({ approval_id: 'apr_cross_entry_other' })]),
+    workEntry(identity, item, [terminal]),
+  ]);
+  for (const [label, compose] of compositions) {
+    const composed = compose(conflictedSnapshot);
+    const recomposed = compose(composed);
+    const stable = recomposed.chat_work[0]!;
+    assert.deepEqual(
+      stable.worker_executions,
+      [],
+      `recomposing a quarantined chat must never resurrect an execution via ${label}`,
+    );
+    assert.equal(
+      stable.bounds.executions_omitted,
+      3,
+      `recomposing a quarantined chat must not double-count or lose omissions via ${label}`,
+    );
+  }
+
+  const otherIdentity = validateWorkspaceChatIdentity({
+    source_id: identity.source_id,
+    binding_id: 'bnd_cross_entry_other_chat',
+    thread_uuid: VALID_UUID_B,
+    canonical_project_scope: '/home/dev/repos/cross-entry-other',
+  });
+  const otherItem = {
+    ...item,
+    item_id: 'blg_cross_entry_other_chat',
+    binding_id: otherIdentity.binding_id,
+    current_execution_ref: 'wbe_cross_entry_other_chat',
+  };
+  const unrelatedExecution = execution({
+    execution_ref: 'wbe_cross_entry_unrelated',
+    approval_id: 'apr_cross_entry_unrelated',
+    task_id: 'tsk_cross_entry_unrelated',
+    run_id: 'run_cross_entry_unrelated',
+    worker_id: 'wrk_cross_entry_unrelated',
+  });
+  const otherExecution = execution({
+    item_id: otherItem.item_id,
+    execution_ref: 'wbe_cross_entry_other_chat',
+    approval_id: 'apr_cross_entry_other_chat',
+    task_id: 'tsk_cross_entry_other_chat',
+    session_binding_id: otherIdentity.binding_id,
+    run_id: 'run_cross_entry_other_chat',
+    worker_id: 'wrk_cross_entry_other_chat',
+  });
+  const mixedChatWork = [
+    workEntry(identity, item, [running, execution({ approval_id: 'apr_cross_entry_other' })]),
+    workEntry(identity, item, [terminal, unrelatedExecution]),
+    workEntry(otherIdentity, otherItem, [otherExecution]),
+  ];
+  for (const [, compose] of compositions) {
+    const normalized = compose(snapshot(mixedChatWork));
+    const conflictedChat = normalized.chat_work.find((work) =>
+      workspaceChatIdentitiesEqual(work.identity, identity),
+    )!;
+    assert.deepEqual(
+      conflictedChat.worker_executions?.map((entry) => entry.execution_ref),
+      ['wbe_cross_entry_unrelated'],
+      'only the unrelated exact execution may survive the conflicted chat',
+    );
+    assert.equal(conflictedChat.bounds.executions_omitted, 3);
+    const otherChat = normalized.chat_work.find((work) =>
+      workspaceChatIdentitiesEqual(work.identity, otherIdentity),
+    )!;
+    assert.deepEqual(
+      otherChat.worker_executions?.map((entry) => entry.execution_ref),
+      ['wbe_cross_entry_other_chat'],
+      'an independent chat keeps its unrelated valid execution',
+    );
+    assert.equal(otherChat.bounds.executions_omitted, 0);
+  }
+
+  for (const [label, compose] of compositions) {
+    const enriched = compose(
+      snapshot([workEntry(identity, item, [running]), workEntry(identity, item, [terminal])]),
+    );
+    assert.equal(
+      enriched.chat_work[0]!.worker_executions?.length,
+      1,
+      `valid duplicate-chat enrichment must merge across entries via ${label}`,
+    );
+    assert.equal(enriched.chat_work[0]!.worker_executions?.[0]?.worker_status, 'completed');
+    assert.equal(enriched.chat_work[0]!.worker_executions?.[0]?.duration_ms, 500);
+    assert.equal(
+      enriched.chat_work[0]!.worker_executions?.[0]?.observed_model,
+      'gemini-4-argon-high',
+    );
+    assert.equal(
+      enriched.chat_work[0]!.worker_executions?.[0]?.session_binding_id,
+      'bnd_runtime_cross_entry',
+    );
+    assert.equal(enriched.chat_work[0]!.bounds.executions_omitted, 0);
+  }
+});
+
+test('chat_work execution normalization keeps distinct runtime bindings and exact item/execution-ref history', () => {
+  const identity = sampleIdentity();
+  const sharedRef = 'wbe_shared';
+  const baseItem = {
+    binding_id: identity.binding_id,
+    revision: 2,
+    title: 'Run the isolated attempt',
+    acceptance_condition: 'The attempt is checked.',
+    delivery_description: 'Deliver the checked attempt.',
+    kind: 'worker' as const,
+    status: 'doing' as const,
+    blocked_reason: null,
+    current_execution_ref: sharedRef,
+    completion_note: null,
+    completion_evidence: null,
+    completed_at_ms: null,
+    created_at_ms: 1_700_000_000_100,
+    updated_at_ms: 1_700_000_000_900,
+  };
+  const runtimeBindingId = 'bnd_runtime_approved';
+  const execution = (overrides: Record<string, unknown> = {}) => ({
+    item_id: 'blg_shared_a',
+    execution_ref: sharedRef,
+    approval_id: 'apr_shared',
+    task_id: 'tsk_shared',
+    session_binding_id: runtimeBindingId,
+    run_id: 'run_shared',
+    worker_id: 'wrk_shared',
+    provider: 'opencode',
+    requested_model: null,
+    observed_model: null,
+    requested_effort: null,
+    observed_effort: null,
+    worker_status: 'failed',
+    started_at_ms: 1_700_000_000_200,
+    finished_at_ms: 1_700_000_000_700,
+    duration_ms: null,
+    outcome: 'failure',
+    acceptance: null,
+    ...overrides,
+  });
+  const work = normalizeWorkspaceChatWork({
+    identity,
+    availability: 'available',
+    items: [
+      { ...baseItem, item_id: 'blg_shared_a' },
+      {
+        ...baseItem,
+        item_id: 'blg_shared_b',
+        status: 'blocked',
+        blocked_reason: 'A different item reuses the same textual ref.',
+      },
+    ],
+    events: [
+      {
+        event_id: 'blg_shared_a:2',
+        sequence: 2,
+        item_id: 'blg_shared_a',
+        revision: 2,
+        action: 'worker_outcome_recorded',
+        recorded_at_ms: 1_700_000_000_700,
+        title: 'Run the isolated attempt',
+        status: 'doing',
+        execution_ref: sharedRef,
+        outcome: 'failure',
+        note: null,
+      },
+      {
+        event_id: 'blg_shared_b:2',
+        sequence: 3,
+        item_id: 'blg_shared_b',
+        revision: 2,
+        action: 'worker_outcome_recorded',
+        recorded_at_ms: 1_700_000_000_800,
+        title: 'Run the isolated attempt',
+        status: 'blocked',
+        execution_ref: sharedRef,
+        outcome: null,
+        note: null,
+      },
+      {
+        event_id: 'blg_evicted:4',
+        sequence: 4,
+        item_id: 'blg_evicted',
+        revision: 4,
+        action: 'worker_outcome_recorded',
+        recorded_at_ms: 1_700_000_000_900,
+        title: 'Historical attempt',
+        status: 'blocked',
+        execution_ref: 'wbe_historical',
+        outcome: 'failure',
+        note: null,
+      },
+    ],
+    worker_presence: [],
+    worker_executions: [
+      execution(),
+      execution({
+        item_id: 'blg_shared_b',
+        started_at_ms: 1_700_000_000_300,
+      }),
+      execution({
+        item_id: 'blg_evicted',
+        execution_ref: 'wbe_historical',
+        started_at_ms: 1_700_000_000_400,
+      }),
+      execution({
+        item_id: 'blg_foreign',
+        execution_ref: 'wbe_foreign',
+        started_at_ms: 1_700_000_000_500,
+      }),
+    ],
+    bounds: { items_omitted: 0, events_omitted: 0, presence_omitted: 0 },
+  });
+
+  assert.ok(work);
+  assert.deepEqual(
+    work.worker_executions?.map((entry) => [entry.item_id, entry.execution_ref]),
+    [
+      ['blg_shared_a', sharedRef],
+      ['blg_shared_b', sharedRef],
+      ['blg_evicted', 'wbe_historical'],
+    ],
+  );
+  assert.ok(
+    work.worker_executions?.every(
+      (entry) => entry.session_binding_id === runtimeBindingId,
+    ),
+  );
+  assert.equal(work.bounds.executions_omitted, 1);
 });
 
 test('legacy ObservationSnapshot and ObservationActor remain backward-compatible and sparse payloads degrade safely', () => {

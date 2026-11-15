@@ -194,8 +194,8 @@ pub use coworker_observation::{
     COWORKER_OBS_OP_CHECKS_CANDIDATE, COWORKER_OBS_OP_CHECKS_TASK,
     COWORKER_OBS_OP_CLOSURE_CANDIDATE, COWORKER_OBS_OP_CODER_CORRECTION,
     COWORKER_OBS_OP_INTEGRATION_JOB_AGGREGATION, COWORKER_OBS_OP_INTEGRATION_TASK,
-    COWORKER_OBS_OP_PLANNING_ARCHITECT, COWORKER_OBS_OP_PLANNING_ORCHESTRATOR,
-    COWORKER_OBS_OP_REVIEW_TASK,
+    COWORKER_OBS_OP_PLANNING_ADVISOR, COWORKER_OBS_OP_PLANNING_ARCHITECT,
+    COWORKER_OBS_OP_PLANNING_ORCHESTRATOR, COWORKER_OBS_OP_REVIEW_TASK,
 };
 pub use dispatch_guard::{
     dispatch_approved_task_guarded, verify_no_blocking_conversation_changes,
@@ -273,12 +273,12 @@ pub use planning_driver::{
     PlanningCommandSummary, PLANNING_ARTIFACTS_DIR_NAME, PLANNING_COMMANDS_DIR_NAME,
 };
 pub use planning_gateway::{
-    resolve_sibling_flow_executable, resolve_sibling_flow_executable_from, ConsultArchitectParams,
-    CoworkerArchitectAdviceSummary, CoworkerJobSummary, CoworkerOrchestratorPlanDetail,
-    CoworkerPlanningGateway, CoworkerStatusParams, CoworkerStatusResponse,
-    CoworkerWorkBriefSummary, GatewayDifficulty, PlanningCommandDetailResponse,
-    PlanningCommandParams, PlanningCommandSubmissionResponse, PrepareWorkAmendmentParams,
-    PrepareWorkParams, PrepareWorkResponse, RequestTechnicalPlanParams,
+    resolve_sibling_flow_executable, resolve_sibling_flow_executable_from, ConsultAdvisorParams,
+    ConsultArchitectParams, CoworkerArchitectAdviceSummary, CoworkerJobSummary,
+    CoworkerOrchestratorPlanDetail, CoworkerPlanningGateway, CoworkerStatusParams,
+    CoworkerStatusResponse, CoworkerWorkBriefSummary, GatewayDifficulty,
+    PlanningCommandDetailResponse, PlanningCommandParams, PlanningCommandSubmissionResponse,
+    PrepareWorkAmendmentParams, PrepareWorkParams, PrepareWorkResponse, RequestTechnicalPlanParams,
     DEFAULT_COWORKER_STATUS_LIMIT, DEFAULT_FLOW_EXECUTABLE_NAME,
     DEFAULT_FLOW_START_COMMAND_TIMEOUT_MS, MAX_COWORKER_STATUS_LIMIT,
 };
@@ -1070,9 +1070,9 @@ fi
         let mcp_a = PairedMcpServer::new(&state_dir, pairing_store.clone()).expect("create mcp A");
         let mcp_b = PairedMcpServer::new(&state_dir, pairing_store.clone()).expect("create mcp B");
 
-        // Two connection tools, sixteen runtime tools, eight ordinary backlog tools, four guarded Worker backlog tools, five workflow tools, eight approved-task tools, five Coworker planning tools, and four Coworker execution tools.
+        // Two connection tools, sixteen runtime tools, eight ordinary backlog tools, four guarded Worker backlog tools, five workflow tools, eight approved-task tools, six Coworker planning tools, and four Coworker execution tools.
         let tools = mcp_a.list_tools();
-        assert_eq!(tools.len(), 52, "PairedMcpServer must expose 52 tools");
+        assert_eq!(tools.len(), 53, "PairedMcpServer must expose 53 tools");
         let list_activity_tool = tools
             .iter()
             .find(|tool| tool.name == "list_activity")
@@ -1407,7 +1407,7 @@ fi
         let mcp = PairedMcpServer::new(&state_dir, pairing_store).expect("create mcp");
 
         let tools = mcp.list_tools();
-        assert_eq!(tools.len(), 52);
+        assert_eq!(tools.len(), 53);
 
         for (tool_name, expected_read_only, expected_props) in [
             ("catalog", true, &["cursor", "limit"][..]),
@@ -1499,6 +1499,7 @@ fi
                 for enum_val in [
                     "follower",
                     "orchestrator",
+                    "advisor",
                     "architect",
                     "coder",
                     "reviewer",

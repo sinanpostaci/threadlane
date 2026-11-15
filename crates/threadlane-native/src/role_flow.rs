@@ -1798,7 +1798,7 @@ fn verify_and_freeze_cycle_tasks(
                 )
             })?;
         approved_tasks.push(task);
-        if unique_roles.insert((task.role, task.difficulty)) {
+        if unique_roles.insert((task.role.canonical(), task.difficulty)) {
             role_requests.push(RolePreflightRequest {
                 role: task.role,
                 difficulty: Some(task.difficulty),
@@ -1830,14 +1830,14 @@ fn verify_and_freeze_cycle_tasks(
     let mut outcome_by_role = BTreeMap::new();
     for outcome in &report.roles {
         if let Some(diff) = outcome.requested_difficulty {
-            outcome_by_role.insert((outcome.role, diff), outcome);
+            outcome_by_role.insert((outcome.role.canonical(), diff), outcome);
         }
     }
 
     let mut frozen_tasks = Vec::with_capacity(approved_tasks.len());
     for task in approved_tasks {
         let outcome = outcome_by_role
-            .get(&(task.role, task.difficulty))
+            .get(&(task.role.canonical(), task.difficulty))
             .ok_or_else(|| {
                 NativeError::new(
                     NativeErrorCode::ValidationFailed,

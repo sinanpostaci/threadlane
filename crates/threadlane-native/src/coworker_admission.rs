@@ -745,13 +745,17 @@ impl CoworkerAdmissionService {
             .ok_or_else(|| invalid("Planning profile disappeared"))?;
         let mut planning_roles: Vec<_> = planning_profile
             .execution_assignments()
-            .filter(|a| matches!(a.role, WorkflowRole::Orchestrator | WorkflowRole::Architect))
+            .filter(|a| matches!(a.role, WorkflowRole::Orchestrator) || a.role.is_advisor())
             .map(|a| RolePreflightRequest::new(a.role, a.difficulty))
             .collect();
-        for role in [WorkflowRole::Orchestrator, WorkflowRole::Architect] {
-            if !planning_roles.iter().any(|r| r.role == role) {
-                planning_roles.push(RolePreflightRequest::new(role, None));
-            }
+        if !planning_roles
+            .iter()
+            .any(|r| r.role == WorkflowRole::Orchestrator)
+        {
+            planning_roles.push(RolePreflightRequest::new(WorkflowRole::Orchestrator, None));
+        }
+        if !planning_roles.iter().any(|r| r.role.is_advisor()) {
+            planning_roles.push(RolePreflightRequest::new(WorkflowRole::Advisor, None));
         }
         let planning_configuration = preflight(
             &registry,
@@ -766,7 +770,7 @@ impl CoworkerAdmissionService {
             .iter()
             .filter(|m| {
                 planning_profile.assignments.iter().any(|a| {
-                    matches!(a.role, WorkflowRole::Orchestrator | WorkflowRole::Architect)
+                    (matches!(a.role, WorkflowRole::Orchestrator) || a.role.is_advisor())
                         && a.choice.model_id == m.id
                 })
             })

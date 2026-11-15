@@ -59,9 +59,15 @@ pub struct PolicyAllowRule {
 }
 
 impl PolicyAllowRule {
-    /// Returns `true` if this rule applies to `role` (`roles` is empty or contains `role`).
+    /// Returns `true` if this rule applies to `role` (`roles` is empty or contains the same
+    /// semantic role in either advisory spelling).
     pub fn allows_role(&self, role: WorkflowRole) -> bool {
-        self.roles.is_empty() || self.roles.contains(&role)
+        self.roles.is_empty()
+            || self.roles.contains(&role)
+            || self
+                .roles
+                .iter()
+                .any(|candidate| candidate.canonical() == role.canonical())
     }
 
     /// Returns `true` if this rule permits `effort`.
@@ -138,6 +144,9 @@ impl ExecutionPolicy {
     }
 
     /// Validates the policy and returns `true` if `(role, tool_id, model_id, effort)` is permitted.
+    ///
+    /// Role matching is semantic: a legacy `architect` rule also authorizes the current `advisor`
+    /// identity and vice versa. The frozen policy remains unchanged.
     pub fn allows(
         &self,
         role: WorkflowRole,
@@ -149,6 +158,28 @@ impl ExecutionPolicy {
         Ok(self
             .find_matching_rule(role, tool_id, model_id)
             .is_some_and(|rule| rule.allows_effort(effort)))
+    }
+
+    /// Returns `true` when at least one rule explicitly names the current `advisor` role (never
+    /// merely a role-equivalent legacy `architect` spelling).
+    ///
+    /// This is used only by the canonical advisory entrypoint boundary so a pre-transition grant
+    /// that only named `architect` is never silently retargeted into the new advisory identity;
+    /// such grants keep working through the retained legacy entrypoint.
+    pub fn explicitly_authorizes_advisor(&self) -> bool {
+        self.allow_rules
+            .iter()
+            .any(|rule| rule.roles.contains(&WorkflowRole::Advisor))
+    }
+
+    /// Returns the advisory role spelled by this policy: current [`WorkflowRole::Advisor`] when
+    /// any rule explicitly names it, otherwise the retained legacy [`WorkflowRole::Architect`].
+    pub fn advisory_role(&self) -> WorkflowRole {
+        if self.explicitly_authorizes_advisor() {
+            WorkflowRole::Advisor
+        } else {
+            WorkflowRole::Architect
+        }
     }
 
     fn find_matching_rule(
@@ -224,9 +255,13 @@ impl ExecutionPolicy {
                 ));
             }
 
+            // The v1 policy digest domain intentionally projects the current `advisor` identity
+            // to the retained `architect` spelling. Equivalent pre/post-transition policies then
+            // keep the exact same digest, while semantic duplicate detection still refuses a rule
+            // that names both spellings.
             let mut role_set = BTreeSet::new();
             for &role in &rule.roles {
-                if !role_set.insert(role) {
+                if !role_set.insert(role.v1_hash_role()) {
                     return Err(NativeError::new(
                         NativeErrorCode::ValidationFailed,
                         "policy allow rule contains duplicate workflow roles",
@@ -235,12 +270,16 @@ impl ExecutionPolicy {
             }
 
             let effective_roles: &[WorkflowRole] = if rule.roles.is_empty() {
-                &WorkflowRole::ALL
+                &WorkflowRole::V1_HASH_ROLES
             } else {
                 &rule.roles
             };
             for &role in effective_roles {
-                if !covered_targets.insert((rule.tool_id.as_str(), rule.model_id.as_str(), role)) {
+                if !covered_targets.insert((
+                    rule.tool_id.as_str(),
+                    rule.model_id.as_str(),
+                    role.v1_hash_role(),
+                )) {
                     return Err(NativeError::new(
                         NativeErrorCode::ValidationFailed,
                         "execution policy contains duplicate or overlapping allow rules for the same tool, model, and role",
@@ -307,8 +346,8 @@ impl RoleExecutionRoute {
     }
 }
 
-/// Returns `true` if `role` is a read-only advisory worker role (`Orchestrator`, `Architect`,
-/// `Reviewer`, or `Closure`).
+/// Returns `true` if `role` is a read-only advisory worker role (`Orchestrator`, current
+/// `Advisor` or retained legacy `Architect`, `Reviewer`, or `Closure`).
 ///
 /// Conversational [`WorkflowRole::Follower`] and mutating [`WorkflowRole::Coder`] are never
 /// read-only advisory worker roles.
@@ -316,6 +355,7 @@ pub const fn is_read_only_advisory_worker_role(role: WorkflowRole) -> bool {
     matches!(
         role,
         WorkflowRole::Orchestrator
+            | WorkflowRole::Advisor
             | WorkflowRole::Architect
             | WorkflowRole::Reviewer
             | WorkflowRole::Closure
@@ -373,8 +413,9 @@ pub fn normalize_coder_choice(
 /// remains [`RoleExecutionRoute::NativeHandoff`] in general preflight and manual role-flow
 /// handoffs). After normal registry + [`ExecutionPolicy`] preflight succeeds, this helper converts
 /// a [`ToolAdapter::CodexCli`] choice into [`RoleExecutionRoute::HeadlessWorker`] **only** for
-/// read-only advisory roles ([`WorkflowRole::Orchestrator`], [`WorkflowRole::Architect`],
-/// [`WorkflowRole::Reviewer`], and [`WorkflowRole::Closure`]) after validating the exact model and
+/// read-only advisory roles ([`WorkflowRole::Orchestrator`], current [`WorkflowRole::Advisor`],
+/// retained legacy [`WorkflowRole::Architect`], [`WorkflowRole::Reviewer`], and
+/// [`WorkflowRole::Closure`]) after validating the exact model and
 /// explicit reasoning effort through [`resolve_model_target`] (`WorkerProvider::CodexCli`).
 ///
 /// Already-headless [`ToolAdapter::Antigravity`] and [`ToolAdapter::OpencodeV2`] choices are
@@ -1073,18 +1114,22 @@ fn find_role_assignment(
     role: WorkflowRole,
     difficulty: Option<Difficulty>,
 ) -> Option<&RoleAssignment> {
+    let canonical_role = role.canonical();
     match difficulty {
         Some(target_difficulty) => assignments
             .iter()
-            .find(|entry| entry.role == role && entry.difficulty == Some(target_difficulty))
+            .find(|entry| {
+                entry.role.canonical() == canonical_role
+                    && entry.difficulty == Some(target_difficulty)
+            })
             .or_else(|| {
-                assignments
-                    .iter()
-                    .find(|entry| entry.role == role && entry.difficulty.is_none())
+                assignments.iter().find(|entry| {
+                    entry.role.canonical() == canonical_role && entry.difficulty.is_none()
+                })
             }),
         None => assignments
             .iter()
-            .find(|entry| entry.role == role && entry.difficulty.is_none()),
+            .find(|entry| entry.role.canonical() == canonical_role && entry.difficulty.is_none()),
     }
 }
 
@@ -1124,7 +1169,7 @@ fn validate_preflight_request(request: &PreflightRequest) -> Result<(), NativeEr
 
     let mut seen = BTreeSet::new();
     for entry in &request.roles {
-        if !seen.insert((entry.role, entry.difficulty)) {
+        if !seen.insert((entry.role.canonical(), entry.difficulty)) {
             return Err(NativeError::new(
                 NativeErrorCode::ValidationFailed,
                 "preflight request contains duplicate (role, difficulty) entries",
@@ -1223,7 +1268,7 @@ fn validate_tool_definition_structure(tool: &ToolDefinition) -> Result<(), Nativ
 fn validate_unique_assignments(assignments: &[RoleAssignment]) -> Result<(), RegistryError> {
     let mut seen = BTreeSet::new();
     for assignment in assignments {
-        if !seen.insert((assignment.role, assignment.difficulty)) {
+        if !seen.insert((assignment.role.canonical(), assignment.difficulty)) {
             return Err(RegistryError::DuplicateAssignment(
                 "Workflow profile contains duplicate role and difficulty assignments.",
             ));

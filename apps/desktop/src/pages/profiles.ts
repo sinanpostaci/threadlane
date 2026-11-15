@@ -19,10 +19,14 @@ import {
   type DecisionAdvisorValidation,
 } from '../registry/profile-advisor.ts';
 import {
-  EXECUTION_ROLES,
+  CANONICAL_EXECUTION_ROLES,
   WORKFLOW_ROLES,
+  canonicalExecutionWorkflowRole,
+  findDuplicateWorkflowAssignment,
   isApiToolAdapter,
+  workflowRoleConfigValue,
   workflowRoleLabel,
+  type CanonicalExecutionWorkflowRole,
   type DecisionAdvisor,
   type Difficulty,
   type ModelDefinition,
@@ -31,13 +35,14 @@ import {
   type RoleAssignment,
   type ToolDefinition,
   type WorkflowProfile,
-  type WorkflowRole,
 } from '../registry/types.ts';
 import { createButton, h } from '../ui/dom.ts';
 
-export const PROFILE_EXECUTION_ROLES: readonly WorkflowRole[] = [...EXECUTION_ROLES];
+export const PROFILE_EXECUTION_ROLES: readonly CanonicalExecutionWorkflowRole[] = [
+  ...CANONICAL_EXECUTION_ROLES,
+];
 
-const ROLES: readonly WorkflowRole[] = PROFILE_EXECUTION_ROLES;
+const ROLES: readonly CanonicalExecutionWorkflowRole[] = PROFILE_EXECUTION_ROLES;
 
 const DIFFICULTIES: readonly Difficulty[] = ['easy', 'medium', 'hard', 'extreme'];
 
@@ -58,10 +63,13 @@ export interface Choice {
   pending_family?: string | null;
 }
 
-export type AssignmentTable = Record<WorkflowRole, Record<Slot, Choice>>;
+export type AssignmentTable = Record<
+  CanonicalExecutionWorkflowRole,
+  Record<Slot, Choice>
+>;
 
 export interface AssignmentIssue {
-  role: WorkflowRole;
+  role: CanonicalExecutionWorkflowRole;
   slot: Slot;
   message: string;
 }
@@ -70,8 +78,8 @@ export interface DraftAnalysis {
   errors: string[];
   issues: AssignmentIssue[];
   advisor: DecisionAdvisorValidation;
-  missingDefaults: WorkflowRole[];
-  unassignedRoles: WorkflowRole[];
+  missingDefaults: CanonicalExecutionWorkflowRole[];
+  unassignedRoles: CanonicalExecutionWorkflowRole[];
   assignmentCount: number;
   defaultCount: number;
   overrideCount: number;
@@ -81,7 +89,7 @@ export interface ProfileSummary {
   assignmentCount: number;
   defaultCount: number;
   overrideCount: number;
-  missingDefaults: WorkflowRole[];
+  missingDefaults: CanonicalExecutionWorkflowRole[];
   issues: AssignmentIssue[];
   advisor: DecisionAdvisorValidation;
 }
@@ -177,16 +185,25 @@ function cloneTable(table: AssignmentTable): AssignmentTable {
 }
 
 export function tableFromProfile(profile: WorkflowProfile): AssignmentTable {
+  const duplicate = findDuplicateWorkflowAssignment(profile.assignments);
+  if (duplicate) {
+    const error = new Error(
+      `Duplicate assignment for ${duplicate.role} (${duplicate.difficulty ?? 'default'}).`
+    ) as Error & { code?: string };
+    error.code = 'duplicate_assignment';
+    throw error;
+  }
   const table = createEmptyTable();
   for (const assignment of profile.assignments) {
-    if (!ROLES.includes(assignment.role)) {
+    const role = canonicalExecutionWorkflowRole(assignment.role);
+    if (!role) {
       continue;
     }
     const slot: Slot = assignment.difficulty ?? 'default';
     if (!SLOTS.includes(slot)) {
       continue;
     }
-    table[assignment.role][slot] = {
+    table[role][slot] = {
       model_id: assignment.choice.model_id,
       effort: assignment.choice.effort ?? null,
       pending_family: null,
@@ -204,7 +221,7 @@ export function assignmentsFromTable(table: AssignmentTable): RoleAssignment[] {
         continue;
       }
       assignments.push({
-        role,
+        role: workflowRoleConfigValue(role),
         difficulty: slot === 'default' ? null : slot,
         choice: { model_id: cell.model_id, effort: cell.effort },
       });
@@ -478,7 +495,8 @@ function hasDifficultyOverride(cell: Choice): boolean {
 }
 
 function analyzeWithIndex(index: RegistryIndex, draft: ProfileDraft): DraftAnalysis {
-  const issues = validateTable(index, draft.assignments);
+  const assignments = draft.assignments;
+  const issues = validateTable(index, assignments);
   const advisor = validateDecisionAdvisor(
     { tools: index.toolList, models: index.modelList },
     draft.decisionAdvisor
@@ -502,19 +520,19 @@ function analyzeWithIndex(index: RegistryIndex, draft: ProfileDraft): DraftAnaly
     errors.unshift(`Profile identifier must be ${MAX_PROFILE_ID_LENGTH} characters or fewer.`);
   }
 
-  const missingDefaults = ROLES.filter((role) => !draft.assignments[role].default.model_id);
+  const missingDefaults = ROLES.filter((role) => !assignments[role].default.model_id);
   const unassignedRoles = ROLES.filter((role) =>
-    SLOTS.every((slot) => !hasDifficultyOverride(draft.assignments[role][slot]))
+    SLOTS.every((slot) => !hasDifficultyOverride(assignments[role][slot]))
   );
   let assignmentCount = 0;
   let overrideCount = 0;
 
   for (const role of ROLES) {
     for (const slot of SLOTS) {
-      if (draft.assignments[role][slot].model_id) {
+      if (assignments[role][slot].model_id) {
         assignmentCount += 1;
       }
-      if (slot !== 'default' && hasDifficultyOverride(draft.assignments[role][slot])) {
+      if (slot !== 'default' && hasDifficultyOverride(assignments[role][slot])) {
         overrideCount += 1;
       }
     }
@@ -572,12 +590,28 @@ export function summarizeProfile(
 
 export function profileSignature(profile: WorkflowProfile): string {
   const assignments = profile.assignments
-    .map((assignment) => ({
-      role: assignment.role,
-      difficulty: assignment.difficulty ?? null,
-      model_id: assignment.choice.model_id,
-      effort: assignment.choice.effort ?? null,
-    }))
+    .map((assignment) => {
+      const role = canonicalExecutionWorkflowRole(assignment.role);
+      if (!role) {
+        return null;
+      }
+      return {
+        role,
+        difficulty: assignment.difficulty ?? null,
+        model_id: assignment.choice.model_id,
+        effort: assignment.choice.effort ?? null,
+      };
+    })
+    .filter(
+      (
+        assignment
+      ): assignment is {
+        role: CanonicalExecutionWorkflowRole;
+        difficulty: Difficulty | null;
+        model_id: string;
+        effort: string | null;
+      } => assignment !== null
+    )
     .sort((left, right) => {
       const roleDelta = WORKFLOW_ROLES.indexOf(left.role) - WORKFLOW_ROLES.indexOf(right.role);
       if (roleDelta !== 0) {
@@ -780,7 +814,7 @@ function needsAcknowledgement(draft: ProfileDraft): boolean {
 function roleState(
   analysis: DraftAnalysis,
   table: AssignmentTable,
-  role: WorkflowRole
+  role: CanonicalExecutionWorkflowRole
 ): { tone: 'accent' | 'warn' | 'error' | 'muted'; label: string } {
   const issues = analysis.issues.filter((issue) => issue.role === role).length;
   if (issues > 0) {
@@ -1650,7 +1684,7 @@ export class ProfilesPage {
   }
 
   private buildRoleEditor(
-    role: WorkflowRole,
+    role: CanonicalExecutionWorkflowRole,
     draft: ProfileDraft,
     analysis: DraftAnalysis,
     busy: boolean
@@ -1734,7 +1768,7 @@ export class ProfilesPage {
     );
   }
 
-  private buildChoiceRow(role: WorkflowRole, slot: Slot, busy: boolean): HTMLElement {
+  private buildChoiceRow(role: CanonicalExecutionWorkflowRole, slot: Slot, busy: boolean): HTMLElement {
     if (!this.index || !this.draft) {
       return h('div', {});
     }
@@ -1772,7 +1806,7 @@ export class ProfilesPage {
   }
 
   private buildModelSelect(
-    role: WorkflowRole,
+    role: CanonicalExecutionWorkflowRole,
     slot: Slot,
     cell: Choice,
     busy: boolean
@@ -1869,7 +1903,7 @@ export class ProfilesPage {
   }
 
   private buildEffortSelect(
-    role: WorkflowRole,
+    role: CanonicalExecutionWorkflowRole,
     slot: Slot,
     cell: Choice,
     busy: boolean
@@ -1992,7 +2026,7 @@ export class ProfilesPage {
     return select;
   }
 
-  private syncEffort(role: WorkflowRole, slot: Slot): void {
+  private syncEffort(role: CanonicalExecutionWorkflowRole, slot: Slot): void {
     if (!this.root || !this.draft) {
       return;
     }
@@ -2069,7 +2103,7 @@ export class ProfilesPage {
     }
   }
 
-  private clearRow(role: WorkflowRole, slot: Slot): void {
+  private clearRow(role: CanonicalExecutionWorkflowRole, slot: Slot): void {
     if (!this.root || !this.draft || this.pending !== null) {
       return;
     }
@@ -2087,7 +2121,7 @@ export class ProfilesPage {
     this.refreshDraftStatus();
   }
 
-  private clearOverrides(role: WorkflowRole): void {
+  private clearOverrides(role: CanonicalExecutionWorkflowRole): void {
     if (!this.root || !this.draft || this.pending !== null) {
       return;
     }

@@ -8,9 +8,11 @@ import {
   hasTauriRuntime,
   isAppError,
   isDevPreviewFixtureMode,
+  canonicalWorkflowRole,
   resolve_choice,
   validatePlanTasksDag,
-  WORKFLOW_ROLES,
+  CANONICAL_WORKFLOW_ROLES,
+  workflowRoleConfigValue,
   workflowRoleLabel,
   type DeliveryReceipt,
   type Difficulty,
@@ -149,7 +151,9 @@ export function toPlanTaskDto(draft: PlanTaskDraft): PlanTask {
     id: draft.id.trim(),
     title: draft.title.trim(),
     instruction: draft.instruction.trim(),
-    role: draft.role,
+    // New draft payloads use the current Advisor key; loaded historical revisions
+    // keep their raw spelling until they are explicitly saved as a new revision.
+    role: workflowRoleConfigValue(draft.role),
     difficulty: draft.difficulty,
     depends_on: draft.dependsOnText
       .split(',')
@@ -1439,6 +1443,7 @@ export class PlansPage {
       this.draft.dirty = true;
     });
 
+    const taskRole = canonicalWorkflowRole(task.role);
     const roleSelect = h(
       'select',
       {
@@ -1447,9 +1452,17 @@ export class PlansPage {
         'data-focus': `plan-task-${idx}-role`,
         disabled: busy,
       },
-      ...WORKFLOW_ROLES.map((r) =>
-        h('option', { value: r, selected: r === task.role }, workflowRoleLabel(r))
-      )
+      ...CANONICAL_WORKFLOW_ROLES.map((role) => {
+        const canonical = canonicalWorkflowRole(role);
+        return h(
+          'option',
+          {
+            value: workflowRoleConfigValue(role),
+            selected: canonical === taskRole,
+          },
+          workflowRoleLabel(role)
+        );
+      })
     );
     roleSelect.addEventListener('change', () => {
       task.role = roleSelect.value as WorkflowRole;

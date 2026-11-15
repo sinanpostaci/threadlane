@@ -1,5 +1,6 @@
-//! Durable per-binding planning command ledger (`Architect` and `Orchestrator` requests),
-//! live [`CoworkerJobOwnershipGuard`] claim/transition enforcement, and read-only status queries.
+//! Durable per-binding planning command ledger (canonical `Advisor`, retained legacy `Architect`,
+//! and `Orchestrator` requests), live [`CoworkerJobOwnershipGuard`] claim/transition enforcement,
+//! and read-only status queries.
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
@@ -86,12 +87,16 @@ impl PlanningCommandStatus {
     }
 }
 
-/// Typed planning command request payload for either a read-only `Architect` advice call or an
+/// Typed planning command request payload for either a read-only advisory call or an
 /// `Orchestrator` work-brief planning call.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum PlanningCommandPayload {
-    /// Read-only `WorkflowRole::Architect` advice request.
+    /// Current canonical read-only `WorkflowRole::Advisor` consultation request.
+    ///
+    /// The request type name is a retained compatibility identifier.
+    Advisor(RunArchitectAdviceRequest),
+    /// Retained legacy read-only `WorkflowRole::Architect` advice request for exact replay.
     Architect(RunArchitectAdviceRequest),
     /// Read-only `WorkflowRole::Orchestrator` work-brief planning request.
     Orchestrator(OrchestrateWorkBriefPlanRequest),
@@ -101,6 +106,7 @@ impl PlanningCommandPayload {
     /// Returns the [`WorkflowRole`] executed by this command payload.
     pub const fn role(&self) -> WorkflowRole {
         match self {
+            Self::Advisor(_) => WorkflowRole::Advisor,
             Self::Architect(_) => WorkflowRole::Architect,
             Self::Orchestrator(_) => WorkflowRole::Orchestrator,
         }
@@ -109,7 +115,7 @@ impl PlanningCommandPayload {
     /// Returns the control-plane `binding_id` inside the payload.
     pub fn binding_id(&self) -> &str {
         match self {
-            Self::Architect(req) => &req.binding_id,
+            Self::Advisor(req) | Self::Architect(req) => &req.binding_id,
             Self::Orchestrator(req) => &req.binding_id,
         }
     }
@@ -117,7 +123,7 @@ impl PlanningCommandPayload {
     /// Returns the native `thread_uuid` inside the payload.
     pub fn thread_uuid(&self) -> &str {
         match self {
-            Self::Architect(req) => &req.thread_uuid,
+            Self::Advisor(req) | Self::Architect(req) => &req.thread_uuid,
             Self::Orchestrator(req) => &req.thread_uuid,
         }
     }
@@ -125,7 +131,7 @@ impl PlanningCommandPayload {
     /// Returns the standing `grant_id` inside the payload.
     pub fn grant_id(&self) -> &str {
         match self {
-            Self::Architect(req) => &req.grant_id,
+            Self::Advisor(req) | Self::Architect(req) => &req.grant_id,
             Self::Orchestrator(req) => &req.grant_id,
         }
     }
@@ -133,7 +139,7 @@ impl PlanningCommandPayload {
     /// Returns the `request_key` inside the payload.
     pub fn request_key(&self) -> &str {
         match self {
-            Self::Architect(req) => &req.request_key,
+            Self::Advisor(req) | Self::Architect(req) => &req.request_key,
             Self::Orchestrator(req) => &req.request_key,
         }
     }
@@ -141,7 +147,7 @@ impl PlanningCommandPayload {
     /// Returns the optional difficulty tier requested for the primary planning role.
     pub const fn difficulty(&self) -> Option<Difficulty> {
         match self {
-            Self::Architect(req) => req.difficulty,
+            Self::Advisor(req) | Self::Architect(req) => req.difficulty,
             Self::Orchestrator(req) => req.difficulty,
         }
     }
@@ -150,6 +156,19 @@ impl PlanningCommandPayload {
     /// request body (independent of local wall-clock timestamp and frozen internal service key).
     pub fn compute_request_body_digest(&self, caller_key: &str) -> Result<String, NativeError> {
         let bytes = match self {
+            Self::Advisor(req) => serde_json::to_vec(&(
+                "threadlane-native:planning-command-body:advisor:v1",
+                &req.binding_id,
+                &req.thread_uuid,
+                &req.grant_id,
+                caller_key,
+                req.expected_ledger_revision,
+                req.difficulty,
+                &req.context_dependencies,
+                &req.question_summary,
+                &req.prior_advice_context,
+                req.accept_into_brief,
+            )),
             Self::Architect(req) => serde_json::to_vec(&(
                 "threadlane-native:planning-command-body:architect:v1",
                 &req.binding_id,
@@ -196,6 +215,12 @@ impl PlanningCommandPayload {
 
     fn freeze_for_record(&self, service_request_key: &str, enqueued_at_ms: u64) -> Self {
         match self {
+            Self::Advisor(req) => {
+                let mut frozen = req.clone();
+                frozen.request_key = service_request_key.to_string();
+                frozen.current_time_ms = enqueued_at_ms;
+                Self::Advisor(frozen)
+            }
             Self::Architect(req) => {
                 let mut frozen = req.clone();
                 frozen.request_key = service_request_key.to_string();
@@ -412,7 +437,7 @@ pub struct PlanningCommandRecord {
     pub thread_uuid: String,
     /// Standing [`PlanningAdviceGrant::grant_id`] authorizing this command.
     pub grant_id: String,
-    /// Primary planning role (`Architect` or `Orchestrator`).
+    /// Primary planning role (`Advisor`, retained legacy `Architect`, or `Orchestrator`).
     pub role: WorkflowRole,
     /// Resolved headless worker choice verified against the grant profile and policy at enqueue.
     pub selected_choice: SelectedRoleChoice,
@@ -557,11 +582,11 @@ impl PlanningCommandRecord {
         validate_bounded_identifier(&self.grant_id, "grant_id", MAX_COWORKER_ID_LEN)?;
         if !matches!(
             self.role,
-            WorkflowRole::Architect | WorkflowRole::Orchestrator
+            WorkflowRole::Advisor | WorkflowRole::Architect | WorkflowRole::Orchestrator
         ) {
             return Err(NativeError::new(
                 NativeErrorCode::ValidationFailed,
-                "PlanningCommandRecord.role must be Architect or Orchestrator",
+                "PlanningCommandRecord.role must be Advisor, retained legacy Architect, or Orchestrator",
             ));
         }
         validate_non_native_worker_choice(self.role, &self.selected_choice)?;
@@ -856,7 +881,7 @@ pub struct EnqueuePlanningCommandRequest {
     pub command_key: String,
     /// Optional expected current planning command ledger revision (CAS check).
     pub expected_revision: Option<u64>,
-    /// Typed Architect or Orchestrator planning request payload.
+    /// Typed advisory or Orchestrator planning request payload.
     pub payload: PlanningCommandPayload,
 }
 
@@ -877,6 +902,11 @@ impl EnqueuePlanningCommandRequest {
     /// Constructs an [`EnqueuePlanningCommandRequest`] for [`RunArchitectAdviceRequest`].
     pub fn from_architect(request: RunArchitectAdviceRequest) -> Self {
         Self::from_payload(PlanningCommandPayload::Architect(request))
+    }
+
+    /// Constructs an [`EnqueuePlanningCommandRequest`] for the canonical current Advisor path.
+    pub fn from_advisor(request: RunArchitectAdviceRequest) -> Self {
+        Self::from_payload(PlanningCommandPayload::Advisor(request))
     }
 
     /// Constructs an [`EnqueuePlanningCommandRequest`] for [`OrchestrateWorkBriefPlanRequest`].
@@ -2115,7 +2145,15 @@ impl PlanningCommandStore {
         )?;
 
         match &request.payload {
-            PlanningCommandPayload::Architect(req) => {
+            PlanningCommandPayload::Advisor(req) | PlanningCommandPayload::Architect(req) => {
+                if request.payload.role() == WorkflowRole::Advisor
+                    && !grant.policy.explicitly_authorizes_advisor()
+                {
+                    return Err(NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        "canonical Advisor consultation requires planning authority that explicitly names the advisor role; use consult_architect for a pre-transition architect-only grant",
+                    ));
+                }
                 if let Some(exp_rev) = req.expected_ledger_revision {
                     if wf_ledger.ledger_revision != exp_rev {
                         return Err(NativeError::new(
@@ -2198,13 +2236,13 @@ impl PlanningCommandStore {
                     if grant.usage.reserved_architect_calls >= grant.budget.max_architect_calls {
                         return Err(NativeError::new(
                             NativeErrorCode::ValidationFailed,
-                            "planning grant architect call budget is exhausted for max_architect_rounds > 0",
+                            "planning grant advisory call budget is exhausted for max_architect_rounds > 0",
                         ));
                     }
                     let _ = resolve_headless_choice(
                         &reg_snapshot,
                         grant,
-                        WorkflowRole::Architect,
+                        grant.policy.advisory_role(),
                         req.architect_difficulty.or(req.difficulty),
                     )?;
                 }
@@ -2371,7 +2409,7 @@ impl PlanningCommandStore {
 
         match (&cmd.payload, &mut result_ref) {
             (
-                PlanningCommandPayload::Architect(req),
+                PlanningCommandPayload::Advisor(req) | PlanningCommandPayload::Architect(req),
                 PlanningCommandResultRef::ArchitectAdvice {
                     advice_id,
                     reservation_id,
@@ -2438,7 +2476,7 @@ impl PlanningCommandStore {
                             "PlanningCallReservation referenced by ArchitectAdvice result was not found",
                         )
                     })?;
-                if res.role != WorkflowRole::Architect
+                if res.role != cmd.role
                     || res.status != PlanningReservationStatus::Completed
                     || res.selected_choice != cmd.selected_choice
                     || res.call_project_base.as_ref() != Some(&cmd.call_project_base)
@@ -2490,7 +2528,7 @@ impl PlanningCommandStore {
                     || artifact.reservation_id != res.reservation_id
                     || res.run_id.as_deref() != Some(artifact.run_id.as_str())
                     || artifact.request_key != res.request_key
-                    || artifact.role != WorkflowRole::Architect
+                    || artifact.role != cmd.role
                     || artifact.selected_choice != cmd.selected_choice
                     || artifact.call_project_base != cmd.call_project_base
                     || !constant_time_str_eq(&artifact.context_digest, &cmd.context_digest)
@@ -3094,11 +3132,11 @@ fn find_active_grant<'a>(
         ));
     }
     match role {
-        WorkflowRole::Architect => {
+        WorkflowRole::Architect | WorkflowRole::Advisor => {
             if grant.usage.reserved_architect_calls >= grant.budget.max_architect_calls {
                 return Err(NativeError::new(
                     NativeErrorCode::ValidationFailed,
-                    "planning grant architect call budget is exhausted",
+                    "planning grant advisory call budget is exhausted",
                 ));
             }
         }
@@ -3914,6 +3952,9 @@ fn planning_health_belongs_to_command(
         return false;
     }
     match &command.payload {
+        PlanningCommandPayload::Advisor(_) => {
+            *role == WorkflowRole::Advisor && *request_key == command.service_request_key
+        }
         PlanningCommandPayload::Architect(_) => {
             *role == WorkflowRole::Architect && *request_key == command.service_request_key
         }
@@ -3923,7 +3964,7 @@ fn planning_health_belongs_to_command(
                 &command.service_request_key,
                 request.max_architect_rounds,
             ),
-            WorkflowRole::Architect => (1..=request
+            role if role.is_advisor() => (1..=request
                 .max_architect_rounds
                 .min(MAX_ORCHESTRATOR_ARCHITECT_ROUNDS))
                 .any(|round| {

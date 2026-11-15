@@ -1126,6 +1126,75 @@ mod tests {
     }
 
     #[test]
+    fn advisor_and_retained_architect_plan_tasks_resolve_semantically_without_rewriting_identity() {
+        let advisor_snapshot = {
+            let mut snapshot = sample_registry_snapshot(7);
+            snapshot.profiles[0].assignments = vec![RoleAssignment {
+                role: WorkflowRole::Advisor,
+                difficulty: Some(Difficulty::Hard),
+                choice: ModelChoice {
+                    model_id: "model-argon".to_string(),
+                    effort: Some("high".to_string()),
+                },
+            }];
+            snapshot
+        };
+        let legacy_snapshot = {
+            let mut snapshot = sample_registry_snapshot(7);
+            snapshot.profiles[0].assignments = vec![RoleAssignment {
+                role: WorkflowRole::Architect,
+                difficulty: Some(Difficulty::Hard),
+                choice: ModelChoice {
+                    model_id: "model-argon".to_string(),
+                    effort: Some("high".to_string()),
+                },
+            }];
+            snapshot
+        };
+        let plan_with = |role: WorkflowRole| PlanRevision {
+            plan_id: "plan-advisor-resolution".to_string(),
+            binding_id: "binding-1".to_string(),
+            revision: 1,
+            profile_id: "profile-default".to_string(),
+            profile_revision: 7,
+            summary: "Advisor role resolution".to_string(),
+            tasks: vec![sample_task(
+                "advisor-task",
+                role,
+                Difficulty::Hard,
+                vec![],
+                vec!["crates/threadlane-plans/src/lib.rs"],
+            )],
+            status: PlanStatus::Published,
+            created_at_ms: 10_000,
+        };
+
+        let current_task =
+            compile_plan_revision(&plan_with(WorkflowRole::Advisor), &advisor_snapshot)
+                .expect("compile current advisor task against current advisor assignment");
+        assert_eq!(current_task.tasks[0].role, WorkflowRole::Advisor);
+        assert_eq!(current_task.tasks[0].choice.model_id, "model-argon");
+
+        let advisor_task_on_legacy_profile =
+            compile_plan_revision(&plan_with(WorkflowRole::Advisor), &legacy_snapshot)
+                .expect("current advisor task resolves retained legacy assignment");
+        assert_eq!(
+            advisor_task_on_legacy_profile.tasks[0].role,
+            WorkflowRole::Advisor
+        );
+        assert_eq!(
+            advisor_task_on_legacy_profile.tasks[0].choice,
+            current_task.tasks[0].choice
+        );
+
+        let legacy_task =
+            compile_plan_revision(&plan_with(WorkflowRole::Architect), &legacy_snapshot)
+                .expect("compile retained legacy architect task");
+        assert_eq!(legacy_task.tasks[0].role, WorkflowRole::Architect);
+        assert_eq!(legacy_task.tasks[0].choice, current_task.tasks[0].choice);
+    }
+
+    #[test]
     fn corrupt_store_is_preserved_and_rejected_on_open() {
         let tmp = TempDir::new().expect("tempdir");
         let store_dir = tmp.path().join("corrupt-plans");

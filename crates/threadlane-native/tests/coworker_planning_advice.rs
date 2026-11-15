@@ -1,5 +1,6 @@
-//! Focused behavioral tests for [`CoworkerPlanningService`] Architect advice semantic guards,
-//! verified `prior_advice_context` resolution and cache identity, cross-instance reservation
+//! Focused behavioral tests for [`CoworkerPlanningService`] advisory semantic guards,
+//! current Advisor and retained legacy Architect role storage, verified
+//! `prior_advice_context` resolution and cache identity, cross-instance reservation
 //! acquisition (`FreshlyReserved` vs `ExistingTerminal`), artifact/budget tamper rejection, and
 //! `FailedAfterEffect` terminal accounting.
 //!
@@ -303,6 +304,52 @@ impl AdviceTestFixture {
                 operator_attested: true,
             })
             .expect("create planning grant")
+    }
+
+    fn create_advisor_grant(
+        &self,
+        request_key: &str,
+        max_output_bytes_per_call: usize,
+    ) -> PlanningAdviceGrant {
+        let reg_rev = self
+            .registry
+            .snapshot()
+            .expect("registry snapshot")
+            .revision;
+        let policy = ExecutionPolicy {
+            schema_version: EXECUTION_POLICY_SCHEMA_VERSION,
+            policy_id: "pol-advisor-canonical".to_string(),
+            allow_rules: vec![PolicyAllowRule {
+                tool_id: "tool-agy".to_string(),
+                model_id: "model-argon".to_string(),
+                efforts: vec!["high".to_string()],
+                allow_no_effort: false,
+                roles: vec![WorkflowRole::Orchestrator, WorkflowRole::Advisor],
+            }],
+        };
+        self.store
+            .create_planning_grant(&CreatePlanningGrantRequest {
+                binding_id: BINDING_ID.to_string(),
+                thread_uuid: THREAD_UUID.to_string(),
+                request_key: request_key.to_string(),
+                expected_ledger_revision: None,
+                project_base: self.project_base.clone(),
+                profile_id: "profile-main".to_string(),
+                registry_revision: reg_rev,
+                policy,
+                capabilities: PlanningReadOnlyCapabilities::strict_read_only(),
+                budget: PlanningCallBudget {
+                    max_total_calls: 8,
+                    max_orchestrator_calls: 4,
+                    max_architect_calls: 8,
+                    max_timeout_ms_per_call: 30_000,
+                    max_output_bytes_per_call,
+                },
+                created_at_ms: 1_000,
+                expires_at_ms: 900_000,
+                operator_attested: true,
+            })
+            .expect("create canonical advisor grant")
     }
 
     fn context_dependencies(&self, grant: &PlanningAdviceGrant) -> ArchitectContextDependencies {
@@ -833,6 +880,148 @@ async fn persisted_artifact_tampering_or_lower_frozen_output_cap_fails_closed_wi
         .expect_err("tampered artifact must fail closed");
     assert_eq!(tamper_err.code, NativeErrorCode::ProtocolError);
     assert_eq!(fx.invocation_count(), 1);
+}
+
+#[tokio::test]
+async fn canonical_advisor_service_persists_advisor_identity_and_refuses_architect_only_authority()
+{
+    let fx = AdviceTestFixture::new();
+    let legacy_grant = fx.create_grant_with_output_cap("req_grant_legacy_authority", 32_768);
+    let legacy_deps = fx.context_dependencies(&legacy_grant);
+    let legacy_request = RunArchitectAdviceRequest {
+        binding_id: BINDING_ID.to_string(),
+        thread_uuid: THREAD_UUID.to_string(),
+        grant_id: legacy_grant.grant_id.clone(),
+        request_key: "req_advisor_on_legacy_grant".to_string(),
+        expected_ledger_revision: None,
+        difficulty: None,
+        context_dependencies: legacy_deps.clone(),
+        question_summary:
+            "Should a legacy architect-only grant authorize a canonical advisor call?".to_string(),
+        prior_advice_context: Vec::new(),
+        accept_into_brief: false,
+        current_time_ms: 2_000,
+    };
+
+    let refusal = fx
+        .service
+        .obtain_advisor_advice(&legacy_request)
+        .await
+        .expect_err("legacy architect-only authority must not be retargeted");
+    assert_eq!(refusal.code(), NativeErrorCode::ValidationFailed.as_str());
+    assert_eq!(fx.invocation_count(), 0);
+
+    let advisor_grant = fx.create_advisor_grant("req_grant_canonical_advisor", 32_768);
+    let advisor_deps = fx.context_dependencies(&advisor_grant);
+    let advisor_request = RunArchitectAdviceRequest {
+        binding_id: BINDING_ID.to_string(),
+        thread_uuid: THREAD_UUID.to_string(),
+        grant_id: advisor_grant.grant_id.clone(),
+        request_key: "req_advisor_canonical_call".to_string(),
+        expected_ledger_revision: None,
+        difficulty: None,
+        context_dependencies: advisor_deps.clone(),
+        question_summary: "Which canonical advisory identity is stored by the new path?"
+            .to_string(),
+        prior_advice_context: Vec::new(),
+        accept_into_brief: true,
+        current_time_ms: 2_100,
+    };
+
+    let outcome = fx
+        .service
+        .obtain_advisor_advice(&advisor_request)
+        .await
+        .expect("canonical advisor advice");
+    assert!(!outcome.reused_existing);
+    assert_eq!(fx.invocation_count(), 1);
+    assert_eq!(
+        outcome.record.status,
+        ArchitectDecisionStatus::AcceptedIntoBrief
+    );
+    let artifact_id = outcome
+        .record
+        .report_artifact_id
+        .clone()
+        .expect("advisor artifact id");
+    let artifact = fx
+        .service
+        .read_planning_artifact(&artifact_id)
+        .expect("read advisor artifact");
+    assert_eq!(artifact.role, WorkflowRole::Advisor);
+    assert_eq!(artifact.reservation_id, outcome.reservation_id);
+    assert!(matches!(
+        artifact.outcome,
+        threadlane_native::coworker_workflow::PlanningArtifactOutcomeKind::ArchitectAdvice { .. }
+    ));
+
+    let ledger = fx
+        .store
+        .read_binding_ledger(BINDING_ID)
+        .expect("read ledger");
+    let stored_grant = ledger
+        .planning_grants
+        .iter()
+        .find(|grant| grant.grant_id == advisor_grant.grant_id)
+        .expect("stored advisor grant");
+    assert_eq!(stored_grant.reservations.len(), 1);
+    assert_eq!(stored_grant.reservations[0].role, WorkflowRole::Advisor);
+    assert_eq!(
+        stored_grant.reservations[0].reservation_id,
+        outcome.reservation_id
+    );
+    assert_eq!(stored_grant.usage.reserved_architect_calls, 1);
+
+    // Exact replay and a clean service reopen reuse the verified advice without provider effect.
+    let replay = fx
+        .service
+        .obtain_advisor_advice(&advisor_request)
+        .await
+        .expect("advisor replay");
+    assert!(replay.reused_existing);
+    assert_eq!(replay.record.advice_id, outcome.record.advice_id);
+    assert_eq!(fx.invocation_count(), 1);
+
+    let (_reopened_store, reopened_service) = fx.reopen_service();
+    let reopened = reopened_service
+        .obtain_advisor_advice(&advisor_request)
+        .await
+        .expect("advisor replay after reopen");
+    assert!(reopened.reused_existing);
+    assert_eq!(reopened.record.advice_id, outcome.record.advice_id);
+    assert_eq!(fx.invocation_count(), 1);
+
+    // The retained legacy entrypoint still stores the frozen Architect identity.
+    let legacy_outcome = fx
+        .service
+        .obtain_architect_advice(&legacy_request)
+        .await
+        .expect("legacy architect advice");
+    let legacy_artifact_id = legacy_outcome
+        .record
+        .report_artifact_id
+        .clone()
+        .expect("legacy artifact id");
+    let legacy_artifact = fx
+        .service
+        .read_planning_artifact(&legacy_artifact_id)
+        .expect("read legacy artifact");
+    assert_eq!(legacy_artifact.role, WorkflowRole::Architect);
+    assert_eq!(fx.invocation_count(), 2);
+
+    let final_ledger = fx
+        .store
+        .read_binding_ledger(BINDING_ID)
+        .expect("read final ledger");
+    let legacy_stored_grant = final_ledger
+        .planning_grants
+        .iter()
+        .find(|grant| grant.grant_id == legacy_grant.grant_id)
+        .expect("stored legacy grant");
+    assert_eq!(
+        legacy_stored_grant.reservations[0].role,
+        WorkflowRole::Architect
+    );
 }
 
 #[tokio::test]

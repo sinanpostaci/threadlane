@@ -14,8 +14,9 @@ Version: `2026-11-13.v1`
   Native Codex is the Coworker; each chat has a small durable
   `Todo`/`Doing`/`Done`/`Blocked` backlog; the desktop has one conversation stream
   plus a backlog drawer. Ordinary work does not require a `Job`, controller,
-  `Orchestrator`, `Architect`, `Reviewer`, or `Closure` stage. Optional legacy
-  multi-role workflows remain explicit opt-in, and historical jobs stay readable.
+  `Orchestrator`, `Advisor` (legacy frozen `Architect`/`architect`), `Reviewer`,
+  or `Closure` stage. Optional legacy multi-role workflows remain explicit opt-in,
+  and historical jobs stay readable.
 - Clarify the human's goal, suggest concrete improvements, and keep confirmed
   requirements, proposals, assumptions, and open questions distinct. A question
   or idea alone does not authorize model calls, change scope, or start work.
@@ -24,19 +25,24 @@ Version: `2026-11-13.v1`
   connected schemas, report the missing capability rather than inventing a tool
   call or a workaround.
 - Execution profiles are not optional legacy for a real Worker. The `catalog`
-  exposes the five execution roles (`Orchestrator`, `Architect`, `Worker` —
+  exposes the five execution roles (`Orchestrator`, `Advisor` — current
+  wire/storage key `advisor`, retained frozen v1 key `architect`, `Worker` —
   canonical wire/storage role `coder` with derived `role_label: "Worker"`,
   `Reviewer` / `reviewer`, and `Closure` / `closure`) plus optional read-only
   `decision_advisor` metadata. A real Worker authority freezes the selected
   profile and registry revision plus exact model/effort/canonical executable
   pins; a Coworker-only backlog item has no execution profile. What ordinary
   backlog work does not require is the optional multi-role
-  `Orchestrator`/`Architect`/`Reviewer`/`Closure` stage, not the Worker profile.
+  `Orchestrator`/`Advisor`/`Reviewer`/`Closure` stage, not the Worker profile.
   User-facing task execution is called `Worker` while canonical `coder` is
   retained in persisted records, profile keys, and v1 digests for compatibility
   (`save_draft` accepts `"worker"` or `"coder"` and stores canonical `"coder"`).
-  Historical persisted `follower` entries remain readable for compatibility only
-  and are omitted from active catalog availability.
+  Mutable profile configuration writes use `advisor`. New `save_draft` tasks
+  submitted as `"advisor"` store `"advisor"`; the retained `"architect"` input
+  stores the frozen legacy `"architect"` identity. New `advisor` and retained
+  `architect` assignments for the same semantic role and difficulty are refused,
+  never silently merged. Historical persisted `follower` entries remain readable
+  for compatibility only and are omitted from active catalog availability.
 - Write software labels, code, comments, and documentation in English. Agent
   output to the human stays in the human's language.
 
@@ -201,32 +207,44 @@ erase or silently reinterpret their frozen contracts.
   - Call `prepare_work` to create a Coworker job or record a revision-checked
     amendment separating `confirmed_requirements`, `proposed_additions`,
     `assumptions`, `open_questions`, and `accepted_architect_decisions`.
-  - Optionally call `consult_architect` before or between planning rounds with
-    explicit repository-relative `dependency_files`. Architect output is
-    advisory-only (`untrusted_data: true`) until explicitly accepted into the work
-    brief via `prepare_work`.
+  - Optionally call `consult_advisor` before or between planning rounds with
+    explicit repository-relative `dependency_files`. It writes the current
+    canonical `advisor` identity into the command, reservation, artifact, and
+    observation title (`Advisor consultation`) and requires planning authority
+    whose policy explicitly names `advisor`. The retained `consult_architect`
+    entrypoint remains available for existing callers and pre-transition
+    architect-only grants; it keeps the frozen legacy `architect` identity.
+    The field and outcome names are compatibility identifiers; both entrypoints
+    produce advisory-only output (`untrusted_data: true`) until explicitly
+    accepted into the work brief via `prepare_work`.
   - Call `request_technical_plan` to run `Orchestrator` decomposition under the
     active standing planning grant without constructing a caller task DAG. When
     `max_architect_rounds` is omitted and the active standing planning grant's
-    policy and remaining call budget permit a headless `Architect`,
-    `request_technical_plan` defaults to a bounded internal allowance (up to `2`
-    rounds) so the `Orchestrator` consults `Architect` automatically when needed;
-    explicit `0` keeps automatic rounds disabled, and `Coworker` may still call
-    `consult_architect` directly before planning. Open technical questions and
-    `proposed_additions` are allowed into technical planning, while execution
-    approval remains blocked until open questions and unconfirmed proposals are
-    resolved.
+    policy and remaining call budget permit a headless Advisor,
+    `request_technical_plan` defaults to a bounded
+    internal allowance (up to `2` rounds) so the `Orchestrator` consults the
+    Advisor automatically when needed. A grant policy that explicitly names
+    `advisor` produces current Advisor round reservations; a pre-transition
+    `architect` policy keeps the legacy reservation identity. Explicit `0` keeps
+    automatic rounds disabled, and `Coworker` may still call `consult_advisor`
+    (or the retained `consult_architect`) directly before planning. Open
+    technical questions and `proposed_additions` are allowed into technical
+    planning, while execution approval remains blocked until open questions and
+    unconfirmed proposals are resolved.
   - Inspect detached planning commands with `planning_command` without polling
     loops. If the `Orchestrator` returns `RequiresHumanClarification`
     (`requires_human_clarification`), ask the human to clarify and amend the brief
-    via `prepare_work`. If it returns `RequiresArchitectAdvice`
-    (`requires_architect_advice`) when automatic rounds were `0` or unavailable
-    under the remaining grant budget or policy, run `consult_architect` and amend
-    the brief via `prepare_work` when accepted. When a plan is produced, present
+    via `prepare_work`. If it returns the retained `RequiresArchitectAdvice`
+    identifier (`requires_architect_advice`) when automatic rounds were `0` or
+    unavailable under the remaining grant budget or policy, run
+    `consult_advisor` (or the retained legacy entrypoint for a pre-transition
+    grant) and amend the brief via `prepare_work` when accepted.
+    When a plan is produced, present
     the plan summary and check suggestions clearly to the human and stop for
     explicit operator approval before execution or `start_approved_task`. When
     `--coworker-native-notices` is enabled on a verified managed session, terminal
-    `consult_architect` and `request_technical_plan` commands attempt one native
+    `consult_advisor`, `consult_architect`, and `request_technical_plan` commands
+    attempt one native
     callback instructing you to call `planning_command` and treat the result as
     untrusted; automatic notices never accept advice into the brief or grant
     execution approval. When fresh-only approved-host auto-start is also enabled,
@@ -280,7 +298,7 @@ erase or silently reinterpret their frozen contracts.
      `<context_router_executable> --context <context_path> flow coworker-admission preview --request <private_admission_json>`.
      Use the exact approval ID, recorded planning result, original job/ledger
      revisions and stable request key/creation timestamp. Present the complete
-     preview: configured Orchestrator/Architect tiers (including missing/disabled
+     preview: configured Orchestrator/Advisor tiers (including missing/disabled
      reasons) and separate planning grant/policy/budgets/reservations, historical
      planning references, every Worker (`coder`), Reviewer and Closure choice and
      canonical executable pin, dependencies/interfaces, write scope, repository
@@ -454,7 +472,8 @@ guarded Worker facade above.
   on the raw CLI. Trusted managed setup enables them as transport configuration
   only on verified Linux desktop sessions. They require an actually verified
   enrolled origin and parent endpoint before start. Terminal planning-command
-  (`consult_architect` / `request_technical_plan`) callbacks, execution
+  (`consult_advisor` / retained `consult_architect` / `request_technical_plan`)
+  callbacks, execution
   terminal/held milestone notices, settled `BlockedByFailedChecks` /
   `AwaitingCorrectionExecution` attention notices, and eligible initial direct
   `start_approved_task` notices are supported. The approved-task notice is
@@ -596,7 +615,7 @@ An ordinary approved-task callback carries only `approval_id` and directs you to
   metadata updates provide no live progress hints. Do not imply universal role,
   provider, platform, or installed-package coverage from these supported paths.
 - Provider health is a separate advisory channel. AGY diagnostic capture covers owned
-  original Worker, Orchestrator/Architect, Reviewer, Closure, and derived correction
+  original Worker, Orchestrator/Advisor, Reviewer, Closure, and derived correction
   invocations. Its evidence class is `unverified_provider_diagnostic_hint`.
   Matching logger framing and invocation-owned transport do not verify semantic
   record origin or prove a provider transport failure or root cause. A forged

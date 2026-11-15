@@ -4,7 +4,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use threadlane_native::OPERATING_GUIDE_VERSION;
+use threadlane_native::{PlanTaskParams, WorkflowRole, OPERATING_GUIDE_VERSION};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
@@ -121,4 +121,44 @@ async fn paired_server_rejects_stateless_requests_and_negotiates_a_session_hands
     let _ = tokio::time::timeout(Duration::from_secs(5), server.wait())
         .await
         .expect("owned server exits after EOF");
+}
+
+#[test]
+fn mcp_plan_task_role_schema_accepts_advisor_and_retains_architect() {
+    let schema = serde_json::to_value(schemars::schema_for!(PlanTaskParams))
+        .expect("serialize PlanTaskParams schema");
+    let schema_text = serde_json::to_string(&schema).expect("schema JSON");
+    assert!(
+        schema_text.contains("\"advisor\""),
+        "MCP role schema must accept the mutable Advisor alias"
+    );
+    assert!(
+        schema_text.contains("\"architect\""),
+        "MCP role schema must retain the frozen architect input"
+    );
+    assert!(
+        schema_text.contains("\"worker\""),
+        "MCP role schema must retain the Worker input alias"
+    );
+
+    let base = json!({
+        "id": "task-advisor",
+        "title": "Advisor task",
+        "difficulty": "hard",
+        "instruction": "Read-only advisory task input.",
+        "depends_on": [],
+        "allowed_write_paths": ["src/lib.rs"]
+    });
+
+    for (role, expected) in [
+        ("architect", WorkflowRole::Architect),
+        ("advisor", WorkflowRole::Advisor),
+    ] {
+        let mut payload = base.clone();
+        payload["role"] = Value::String(role.to_string());
+        let task: PlanTaskParams =
+            serde_json::from_value(payload).expect("deserialize MCP plan task role");
+        assert_eq!(task.role, expected);
+        assert_eq!(task.difficulty, threadlane_native::Difficulty::Hard);
+    }
 }

@@ -1435,6 +1435,22 @@ fn codex_advisory_normalization_preserves_native_preflight_and_restricts_to_read
         assert!(validate_non_native_worker_choice(readonly_role, &missing_effort).is_err());
     }
 
+    // Current Advisor is the same read-only advisory boundary even when the profile retains the
+    // legacy architect assignment spelling.
+    assert!(is_read_only_advisory_worker_role(WorkflowRole::Advisor));
+    let legacy_advisory_choice = report
+        .roles
+        .iter()
+        .find(|r| r.role == WorkflowRole::Architect)
+        .and_then(|r| r.selected.as_ref())
+        .expect("legacy advisory choice");
+    let advisor_normalized =
+        normalize_read_only_advisory_choice(WorkflowRole::Advisor, legacy_advisory_choice)
+            .expect("current Advisor normalizes a legacy advisory choice");
+    assert_eq!(advisor_normalized.route, RoleExecutionRoute::HeadlessWorker);
+    validate_non_native_worker_choice(WorkflowRole::Advisor, &advisor_normalized)
+        .expect("current Advisor passes non-native worker validation");
+
     // 3. Follower and Coder remain outside advisory normalization. Only the separate
     //    exactly-admitted controller Coder route normalizes a Coder choice.
     for non_advisory_role in [WorkflowRole::Follower, WorkflowRole::Coder] {
@@ -1502,4 +1518,56 @@ fn codex_advisory_normalization_preserves_native_preflight_and_restricts_to_read
     let agy_normalized = normalize_read_only_advisory_choice(WorkflowRole::Reviewer, agy_choice)
         .expect("normalize agy reviewer");
     assert_eq!(&agy_normalized, agy_choice);
+}
+
+#[test]
+fn advisor_and_architect_aliases_share_policy_semantics_but_duplicate_roles_fail_closed() {
+    let mut policy = ExecutionPolicy {
+        schema_version: EXECUTION_POLICY_SCHEMA_VERSION,
+        policy_id: "policy-advisor-semantic".to_string(),
+        allow_rules: vec![PolicyAllowRule {
+            tool_id: "tool-agy".to_string(),
+            model_id: "model-headless-alpha".to_string(),
+            efforts: vec!["high".to_string()],
+            allow_no_effort: false,
+            roles: vec![WorkflowRole::Orchestrator, WorkflowRole::Architect],
+        }],
+    };
+
+    // A retained legacy policy authorizes the current advisor identity semantically.
+    for role in [WorkflowRole::Advisor, WorkflowRole::Architect] {
+        assert!(policy
+            .allows(role, "tool-agy", "model-headless-alpha", Some("high"))
+            .expect("policy semantic match"));
+    }
+    assert!(!policy.explicitly_authorizes_advisor());
+    assert_eq!(
+        policy.advisory_role(),
+        WorkflowRole::Architect,
+        "an architect-only policy keeps the retained legacy advisory identity"
+    );
+
+    // Explicit current advisor authority is distinct at the new-entrypoint boundary.
+    policy.allow_rules[0].roles = vec![WorkflowRole::Orchestrator, WorkflowRole::Advisor];
+    assert!(policy
+        .allows(
+            WorkflowRole::Architect,
+            "tool-agy",
+            "model-headless-alpha",
+            Some("high")
+        )
+        .expect("legacy request semantic match"));
+    assert!(policy.explicitly_authorizes_advisor());
+    assert_eq!(policy.advisory_role(), WorkflowRole::Advisor);
+
+    // Naming both spellings for the same semantic role is a duplicate, not a merge.
+    policy.allow_rules[0].roles = vec![
+        WorkflowRole::Orchestrator,
+        WorkflowRole::Advisor,
+        WorkflowRole::Architect,
+    ];
+    let err = policy
+        .digest()
+        .expect_err("dual advisory spellings in one policy rule must fail closed");
+    assert_eq!(err.error_code(), NativeErrorCode::ValidationFailed);
 }

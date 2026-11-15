@@ -1624,6 +1624,73 @@
   overflow-wrap: anywhere;
 }
 
+.tl-cw-execution {
+  min-width: 0;
+  max-width: 100%;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 2px 7px;
+  margin-top: 1px;
+  color: var(--cw-fg-subtle);
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.tl-cw-execution .tl-brand-badge {
+  flex: none;
+}
+
+.tl-cw-execution-model {
+  min-width: 0;
+  color: var(--cw-fg-muted);
+  font-weight: 500;
+  overflow-wrap: anywhere;
+}
+
+.tl-cw-execution-effort {
+  min-width: 0;
+  color: var(--cw-fg-subtle);
+  overflow-wrap: anywhere;
+}
+
+.tl-cw-execution-status {
+  flex: none;
+  font-weight: 600;
+  color: var(--cw-fg-secondary);
+}
+
+.tl-cw-execution-duration {
+  flex: none;
+  margin-left: auto;
+  color: var(--cw-fg-subtle);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.tl-cw-execution[data-worker-status="completed"] .tl-cw-execution-status {
+  color: var(--cw-success);
+}
+
+.tl-cw-execution[data-worker-status="working"] .tl-cw-execution-status {
+  color: var(--cw-working);
+}
+
+.tl-cw-execution[data-worker-status="unavailable"] .tl-cw-execution-status {
+  color: var(--cw-fg-subtle);
+}
+
+.tl-cw-execution[data-worker-status="checking"] .tl-cw-execution-status,
+.tl-cw-execution[data-worker-status="cancelling"] .tl-cw-execution-status {
+  color: var(--cw-attention);
+}
+
+.tl-cw-execution[data-worker-status="rejected"] .tl-cw-execution-status,
+.tl-cw-execution[data-worker-status="failed"] .tl-cw-execution-status,
+.tl-cw-execution[data-worker-status="timed_out"] .tl-cw-execution-status {
+  color: var(--cw-danger);
+}
+
 .tl-cw-empty {
   margin: auto;
   display: flex;
@@ -1905,6 +1972,12 @@
 
   .tl-cw-status {
     white-space: normal;
+  }
+
+  .tl-cw-execution-duration {
+    margin-left: 0;
+    white-space: normal;
+    overflow-wrap: anywhere;
   }
 
   .rt-BaseDialogContent.tl-cw-drawer-dialog {
