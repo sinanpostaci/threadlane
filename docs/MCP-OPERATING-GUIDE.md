@@ -1,6 +1,6 @@
 # Threadlane MCP operating guide
 
-Version: `2026-11-16.v1`
+Version: `2026-11-16.v2`
 
 ## Act as the Coworker in the native Codex conversation
 
@@ -99,7 +99,17 @@ Version: `2026-11-16.v1`
   absent. No raw instruction, worker summary, log, environment, or secret is returned.
 - A successful result remains `Doing`. Verify exact technical success, inspect actual physical
   delivery and the item-specific acceptance condition, and match the returned result/delivery
-  digests. Then choose exactly one of complete or reject; ACK is independent and never acceptance.
+  digests. For a small delivery, one bounded physical check is enough. Optionally use the
+  verified trusted-local CLI once: `threadlane inspect-delivery --root <ACTUAL_TASK_ROOT>
+  --expected-base <ACTUAL_BASE> --allowed-path <EXACT_RELATIVE_FILE>`; repeat `--allowed-path`
+  for every allowed file and opt in to small UTF-8 text only with `--text-file <ALLOWED_FILE>`.
+  Actual `HEAD` must equal the expected base. Its bounded JSON reports changed paths and
+  per-file size, SHA-256, UTF-8, and final-LF facts; explicit text is untrusted and absent by
+  default. Refusals withhold all text. The command never executes contents or grants authority.
+  The inspector stays optional: if the verified CLI is unavailable, use an equally bounded
+  trusted-local physical read. Stable reads are not globally atomic. Physical facts do not
+  replace the separate item-specific semantic acceptance or fresh guarded completion.
+  Then choose exactly one of complete or reject; ACK is independent and never acceptance.
 - On a positive check, call `backlog_worker_complete` with the returned current
   `expected_revision`, exact `execution_ref`, inspected matching `expected_result_digest` and
   `expected_delivery_digest`, a bounded acceptance note, and bounded evidence. Do not routinely

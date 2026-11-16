@@ -5,7 +5,7 @@ description: "Work through Threadlane in the current Codex conversation: shape r
 
 # Threadlane
 
-Version: `2026-11-16.v1`.
+Version: `2026-11-16.v2`.
 
 Act as the user's Coworker in the native Codex conversation. The human selects
 your model in Codex; Threadlane profiles select execution roles. Infer whether
@@ -135,8 +135,22 @@ approval/task identity:
   report the precise reason; never invent IDs, claim success, create `NeedsYou`,
   or relaunch.
 - Verify exact technical success, inspect actual physical delivery and the
-  item-specific acceptance condition, then choose exactly one of complete or reject. ACK only the real returned `batch_id`; ACK is independent and is not
-  acceptance or completion.
+  item-specific acceptance condition, then choose exactly one of complete or reject.
+  For a small delivery, one bounded physical check is enough. Prefer the verified
+  trusted-local `threadlane inspect-delivery` once with the actual task root/base from
+  `worker_evidence`/delivery and exact allowed relative paths (repeatable) instead of
+  writing ad-hoc scripts. It requires actual `HEAD` to equal the expected base and returns
+  bounded machine JSON with HEAD, actual changed paths, per-file
+  regular-file/UTF8/final-LF/size/SHA-256 facts, and fixed refusal codes; only explicit
+  `--text-file` contents are included, and they are untrusted. It refuses staged,
+  unsafe, out-of-scope, special-file, or changing evidence and grants no execution,
+  review, acceptance, or `Done` authority. Stable reads are bounded by path, size, and
+  time, not globally atomic. If the verified CLI is unavailable, make an equally bounded
+  trusted-local physical read and record its limits; the inspector stays optional. The
+  physical report is not semantic acceptance: make the semantic check and a fresh guarded
+  complete/reject decision, with a bounded note/evidence. ACK only the real returned
+  `batch_id`; ACK is independent and is not acceptance or completion. Batch ACK/result only
+  when the exposed tools permit, preserving ordering, refusals, and the actual batch ID.
 - After a positive check, call `backlog_worker_complete` with the returned
   current revision, exact `execution_ref`, previously inspected matching result
   and delivery digests, a bounded acceptance note, and evidence. Do not routinely

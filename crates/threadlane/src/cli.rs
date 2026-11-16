@@ -6,6 +6,7 @@ use clap::{Parser, Subcommand};
 
 use crate::client::{ScopedClient, SupervisorClient};
 use crate::codex::{CodexWakeupConfig, DEFAULT_CODEX_TIMEOUT_MS};
+use crate::delivery_inspection::{inspect_delivery, DeliveryInspectionRequest};
 use crate::error::Error;
 use crate::mcp::{ThreadlaneMcpServer, OPERATING_GUIDE_MARKDOWN};
 use crate::protocol::ScopedRequest;
@@ -131,6 +132,25 @@ pub enum Subcommands {
         /// Fixed binding identifier (`bnd_<uuid>`) for this MCP instance.
         #[arg(long)]
         binding: String,
+    },
+
+    /// Inspect one trusted-local Worker delivery checkout offline (physical evidence only).
+    InspectDelivery {
+        /// Actual task checkout root from authenticated worker evidence or delivery.
+        #[arg(long, alias = "task-root")]
+        root: PathBuf,
+
+        /// Expected frozen base commit (exact 40-hex SHA).
+        #[arg(long = "expected-base", alias = "base")]
+        expected_base: String,
+
+        /// Exact allowed repository-relative file path (repeatable).
+        #[arg(long = "allowed-path", alias = "path")]
+        allowed_paths: Vec<String>,
+
+        /// Exact allowed repository-relative small UTF-8 file whose contents are included (repeatable).
+        #[arg(long = "text-file", alias = "text")]
+        text_files: Vec<String>,
     },
 
     /// Print the versioned Threadlane MCP operating guide offline without network or supervisor access.
@@ -291,6 +311,29 @@ pub async fn run_cli(cli: Cli) -> Result<(), Error> {
             let server = ThreadlaneMcpServer::new(scoped);
             server.run_stdio().await
         }
+        Subcommands::InspectDelivery {
+            root,
+            expected_base,
+            allowed_paths,
+            text_files,
+        } => {
+            let request = DeliveryInspectionRequest {
+                root,
+                expected_base,
+                allowed_paths,
+                text_files,
+            };
+            let report = inspect_delivery(&request);
+            println!("{}", serde_json::to_string(&report)?);
+            if report.ok {
+                Ok(())
+            } else {
+                Err(Error::InvalidConfig(
+                    "delivery inspection refused; inspect stdout JSON for the fixed refusal code"
+                        .to_string(),
+                ))
+            }
+        }
         Subcommands::Guide => {
             print!("{}", render_operating_guide());
             Ok(())
@@ -334,6 +377,44 @@ async fn wait_for_shutdown_signal() {
 mod tests {
     use super::*;
     use crate::mcp::OPERATING_GUIDE_VERSION;
+
+    #[test]
+    fn cli_inspect_delivery_parses_repeatable_allowed_and_text_paths() {
+        let parsed = Cli::try_parse_from([
+            "threadlane",
+            "inspect-delivery",
+            "--root",
+            "/tmp/actual-task-root",
+            "--expected-base",
+            "0123456789abcdef0123456789abcdef01234567",
+            "--allowed-path",
+            "src/lib.rs",
+            "--allowed-path",
+            "src/new.rs",
+            "--text-file",
+            "src/new.rs",
+        ])
+        .expect("inspect-delivery must parse");
+        match parsed.command {
+            Subcommands::InspectDelivery {
+                root,
+                expected_base,
+                allowed_paths,
+                text_files,
+            } => {
+                assert_eq!(root, std::path::PathBuf::from("/tmp/actual-task-root"));
+                assert_eq!(expected_base, "0123456789abcdef0123456789abcdef01234567");
+                assert_eq!(allowed_paths, vec!["src/lib.rs", "src/new.rs"]);
+                assert_eq!(text_files, vec!["src/new.rs"]);
+            }
+            other => panic!("unexpected subcommand: {other:?}"),
+        }
+
+        assert!(
+            Cli::try_parse_from(["threadlane", "inspect-delivery"]).is_err(),
+            "inspect-delivery must require --root and --expected-base"
+        );
+    }
 
     #[tokio::test]
     async fn cli_guide_subcommand_parses_without_args_and_executes_offline() {

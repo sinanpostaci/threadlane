@@ -15,6 +15,8 @@ pub mod codex;
 pub mod coworker_planning_wakeup;
 /// Typed Coworker job status wake-up context and bounded native Unix WebSocket notification API.
 pub mod coworker_wakeup;
+/// Read-only, offline physical delivery inspection for trusted-local Worker checkouts.
+pub mod delivery_inspection;
 /// Runtime descriptor, process-lifetime state lock, and filesystem security checks.
 pub mod descriptor;
 /// Stable error codes, wire error envelopes, and runtime error conversions.
@@ -52,6 +54,17 @@ pub use coworker_wakeup::{
     validate_coworker_notification_id, validate_coworker_transition_id, CoworkerJobNotification,
     CoworkerJobWakeupAttempt, CoworkerJobWakeupContext, COWORKER_JOB_ID_HEX_LEN,
     COWORKER_JOB_ID_PREFIX, MAX_COWORKER_NOTIFICATION_ID_LEN, MAX_COWORKER_TRANSITION_ID_LEN,
+};
+pub use delivery_inspection::{
+    inspect_delivery, inspect_delivery_with_limits, DeliveryChangeKind, DeliveryChangedPath,
+    DeliveryFileInspection, DeliveryFilePhysicalCode, DeliveryInspectionLimits,
+    DeliveryInspectionRefusalCode, DeliveryInspectionReport, DeliveryInspectionRequest,
+    DeliveryTextStatus, DELIVERY_INSPECTION_GIT_TIMEOUT_MS, DELIVERY_INSPECTION_SCHEMA_VERSION,
+    DELIVERY_INSPECTION_TOOL, MAX_DELIVERY_INSPECTION_CHANGED_PATHS,
+    MAX_DELIVERY_INSPECTION_DURATION, MAX_DELIVERY_INSPECTION_FILE_BYTES,
+    MAX_DELIVERY_INSPECTION_GIT_OUTPUT_BYTES, MAX_DELIVERY_INSPECTION_OUTPUT_BYTES,
+    MAX_DELIVERY_INSPECTION_PATHS, MAX_DELIVERY_INSPECTION_TEXT_FILE_BYTES,
+    MAX_DELIVERY_INSPECTION_TOTAL_READ_BYTES, MAX_DELIVERY_INSPECTION_TOTAL_TEXT_BYTES,
 };
 pub use descriptor::{
     prepare_state_dir, RuntimeDescriptor, SecretToken, StateLock, DATABASE_FILENAME,
