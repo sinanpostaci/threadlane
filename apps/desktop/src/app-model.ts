@@ -990,22 +990,13 @@ function buildSidebarChatItem(
   };
 }
 
+// Navigation order follows durable content recency only; current liveness and
+// blockers stay in badges instead of promoting older chats or projects.
 function compareSidebarChats(left: SidebarChatItem, right: SidebarChatItem): number {
-  const leftActive = left.hasWorking || left.hasNeedsHuman;
-  const rightActive = right.hasWorking || right.hasNeedsHuman;
-  if (leftActive !== rightActive) {
-    return leftActive ? -1 : 1;
-  }
   const leftTime = left.updatedAtMs ?? -1;
   const rightTime = right.updatedAtMs ?? -1;
   if (leftTime !== rightTime) {
     return rightTime - leftTime;
-  }
-  if (left.hasNeedsHuman !== right.hasNeedsHuman) {
-    return left.hasNeedsHuman ? -1 : 1;
-  }
-  if (left.hasWorking !== right.hasWorking) {
-    return left.hasWorking ? -1 : 1;
   }
   const byLabel = left.label.localeCompare(right.label);
   if (byLabel !== 0) {
@@ -1018,11 +1009,6 @@ function compareSidebarProjects(
   left: SidebarProjectGroup,
   right: SidebarProjectGroup
 ): number {
-  const leftActive = left.hasWorking || left.hasNeedsHuman;
-  const rightActive = right.hasWorking || right.hasNeedsHuman;
-  if (leftActive !== rightActive) {
-    return leftActive ? -1 : 1;
-  }
   const leftTime = left.latestUpdatedAtMs ?? -1;
   const rightTime = right.latestUpdatedAtMs ?? -1;
   if (leftTime !== rightTime) {
@@ -4351,26 +4337,12 @@ interface DiscoveredChatAccumulator {
   obsJobs: ObservationJob[];
 }
 
+// Chat/project navigation is timestamp-first. Blockers, worker activity, and
+// job state remain separate badge/liveness signals.
 function compareWorkspaceChatSidebarItems(
   left: WorkspaceChatSidebarItem,
   right: WorkspaceChatSidebarItem,
 ): number {
-  if (left.hasCurrentBlocker !== right.hasCurrentBlocker) {
-    return left.hasCurrentBlocker ? -1 : 1;
-  }
-  const leftWorking =
-    (left.nativeState.availability === 'available' &&
-      left.nativeState.activity === 'working') ||
-    left.workerSummary.hasActiveWorkers ||
-    left.jobSummary.activeJobCount > 0;
-  const rightWorking =
-    (right.nativeState.availability === 'available' &&
-      right.nativeState.activity === 'working') ||
-    right.workerSummary.hasActiveWorkers ||
-    right.jobSummary.activeJobCount > 0;
-  if (leftWorking !== rightWorking) {
-    return leftWorking ? -1 : 1;
-  }
   const leftTs = left.updatedAtMs ?? Number.MIN_SAFE_INTEGER;
   const rightTs = right.updatedAtMs ?? Number.MIN_SAFE_INTEGER;
   if (rightTs !== leftTs) {
@@ -4383,12 +4355,6 @@ function compareWorkspaceProjectGroups(
   left: WorkspaceProjectGroupView,
   right: WorkspaceProjectGroupView,
 ): number {
-  if (left.hasNeedsHuman !== right.hasNeedsHuman) {
-    return left.hasNeedsHuman ? -1 : 1;
-  }
-  if (left.hasActiveWork !== right.hasActiveWork) {
-    return left.hasActiveWork ? -1 : 1;
-  }
   const leftTs = left.latestUpdatedAtMs ?? Number.MIN_SAFE_INTEGER;
   const rightTs = right.latestUpdatedAtMs ?? Number.MIN_SAFE_INTEGER;
   if (rightTs !== leftTs) {
@@ -4940,7 +4906,8 @@ export function projectWorkspaceSnapshot(
         }
       }
     };
-    considerTs(acc.nativeSample?.observed_at_ms);
+    // Only durable content timestamps determine recency. Native sample
+    // `observed_at_ms` reports acquisition time and never counts as activity.
     for (const jv of jobViews) {
       considerTs(jv.updatedAtMs);
       for (const res of jv.externalResolutions) {

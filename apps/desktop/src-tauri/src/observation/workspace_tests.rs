@@ -22,14 +22,15 @@ mod unix_workspace_tests {
         ObservationJob, ObservationJobState, ObservationSnapshotRequest,
         ObservationSourceAvailability, ObservationTask, WorkspaceAcceptanceStatus,
         WorkspaceActivityState, WorkspaceAttentionKind, WorkspaceAvailabilityState,
-        WorkspaceBacklogPresenceAvailability, WorkspaceBacklogPresenceFreshness,
-        WorkspaceBacklogWorkerPresence, WorkspaceCapabilityState, WorkspaceChatIdentity,
-        WorkspaceChatWorkAvailability, WorkspaceConfiguredSelection, WorkspaceConnectionState,
-        WorkspaceExternalResolutionApplicability, WorkspaceExternalResolutionScope,
-        WorkspaceFreshnessState, WorkspaceMessageSourceKind, WorkspaceNativeCapabilities,
-        WorkspaceNativeSample, WorkspaceSampleConnection, WorkspaceSelectionEvidence,
-        WorkspaceSnapshot, WorkspaceWorkerExecutionAcceptance, WorkspaceWorkerExecutionStatus,
-        WORKSPACE_SNAPSHOT_SCHEMA_VERSION,
+        WorkspaceBacklogEvent, WorkspaceBacklogPresenceAvailability,
+        WorkspaceBacklogPresenceFreshness, WorkspaceBacklogWorkerPresence,
+        WorkspaceCapabilityState, WorkspaceChatIdentity, WorkspaceChatWork,
+        WorkspaceChatWorkAvailability, WorkspaceChatWorkBounds, WorkspaceConfiguredSelection,
+        WorkspaceConnectionState, WorkspaceExternalResolutionApplicability,
+        WorkspaceExternalResolutionScope, WorkspaceFreshnessState, WorkspaceMessageSourceKind,
+        WorkspaceNativeCapabilities, WorkspaceNativeSample, WorkspaceSampleConnection,
+        WorkspaceSelectionEvidence, WorkspaceSnapshot, WorkspaceWorkerExecutionAcceptance,
+        WorkspaceWorkerExecutionStatus, WORKSPACE_SNAPSHOT_SCHEMA_VERSION,
     };
     use threadlane_core::{
         Command, CommandOutput, Core, WorkerAcceptanceState, WorkerCompletionRecord,
@@ -75,8 +76,9 @@ mod unix_workspace_tests {
     use tokio::time::{Duration, Instant};
 
     use super::super::{
-        collect_bounded_workspace_presence, prepare_workspace_presence_queries,
-        refresh_workspace_backlog_presence, WorkspacePresenceQuery, WorkspacePresenceResult,
+        chat_summary_updated_at_ms, collect_bounded_workspace_presence,
+        prepare_workspace_presence_queries, refresh_workspace_backlog_presence,
+        WorkspacePresenceQuery, WorkspacePresenceResult,
     };
     use crate::observation::workspace::apply_workspace_presence_results;
     use crate::observation::{ObservationService, ObservationSourceConfig};
@@ -3029,6 +3031,11 @@ mod unix_workspace_tests {
             chat.attention_count, 0,
             "a failed backlog item is not an attention request"
         );
+        assert_eq!(
+            chat.updated_at_ms,
+            Some(1_130),
+            "durable backlog activity, not the later native observation, must drive chat recency"
+        );
 
         let regenerated = snap.regenerate_at(snap.generated_at_ms + 60_000);
         assert_eq!(
@@ -3047,6 +3054,506 @@ mod unix_workspace_tests {
                 .map(|event| event.recorded_at_ms),
             work.events.first().map(|event| event.recorded_at_ms),
             "projection must not rewrite durable history timestamps"
+        );
+    }
+
+    #[test]
+    fn chat_summary_recency_ignores_durable_chat_work_from_another_identity() {
+        let identity = WorkspaceChatIdentity::new(
+            "src_recency_scope",
+            "bnd_recency_scope",
+            "0196ed00-0000-7000-8000-0000000007c1",
+            "/tmp/threadlane-recency-scope",
+        )
+        .expect("scope identity");
+
+        let item = |binding_id: &str, updated_at_ms: i64| threadlane_core::BacklogItem {
+            item_id: "blg_recency_scope".to_string(),
+            binding_id: binding_id.to_string(),
+            revision: 1,
+            title: "Durable recency scope item".to_string(),
+            acceptance_condition: "The chat scope matches exactly".to_string(),
+            delivery_description: "Prove durable recency scope isolation".to_string(),
+            kind: threadlane_core::BacklogItemKind::Coworker,
+            status: threadlane_core::BacklogStatus::Todo,
+            blocked_reason: None,
+            current_execution_ref: None,
+            completion_note: None,
+            completion_evidence: None,
+            completed_at_ms: None,
+            created_at_ms: updated_at_ms.saturating_sub(1),
+            updated_at_ms,
+        };
+        let event = |recorded_at_ms: i64| WorkspaceBacklogEvent {
+            event_id: "blg_recency_scope:1".to_string(),
+            sequence: 1,
+            item_id: "blg_recency_scope".to_string(),
+            revision: 1,
+            action: "created".to_string(),
+            recorded_at_ms,
+            title: "Durable recency scope item".to_string(),
+            status: threadlane_core::BacklogStatus::Todo,
+            execution_ref: None,
+            outcome: None,
+            note: None,
+        };
+        let work = |identity: WorkspaceChatIdentity, item_binding: &str| WorkspaceChatWork {
+            identity,
+            availability: WorkspaceChatWorkAvailability::Available,
+            items: vec![item(item_binding, 9_000)],
+            events: vec![event(10_000)],
+            ..WorkspaceChatWork::default()
+        };
+
+        assert_eq!(
+            chat_summary_updated_at_ms(
+                Some(5_000),
+                &identity,
+                &work(identity.clone(), &identity.binding_id)
+            ),
+            Some(10_000),
+            "the exact identity folds durable items and history events"
+        );
+
+        let item_newer = WorkspaceChatWork {
+            identity: identity.clone(),
+            availability: WorkspaceChatWorkAvailability::Available,
+            items: vec![item(&identity.binding_id, 12_000)],
+            events: vec![event(10_000)],
+            ..WorkspaceChatWork::default()
+        };
+        assert_eq!(
+            chat_summary_updated_at_ms(Some(5_000), &identity, &item_newer),
+            Some(12_000),
+            "a matching durable item advances recency independently of event order"
+        );
+        assert_eq!(
+            chat_summary_updated_at_ms(
+                Some(20_000),
+                &identity,
+                &work(identity.clone(), &identity.binding_id)
+            ),
+            Some(20_000),
+            "older durable rows must not rewind a newer summary"
+        );
+
+        // An upstream projector retains history events whose items fall outside the currently
+        // loaded item page, so a matching identity with empty items and truthful omissions must
+        // still fold valid event recency.
+        let history_only_out_of_window = WorkspaceChatWork {
+            identity: identity.clone(),
+            availability: WorkspaceChatWorkAvailability::Available,
+            items: Vec::new(),
+            events: vec![event(10_000)],
+            bounds: WorkspaceChatWorkBounds {
+                items_omitted: 1,
+                ..WorkspaceChatWorkBounds::default()
+            },
+            ..WorkspaceChatWork::default()
+        };
+        assert_eq!(
+            chat_summary_updated_at_ms(Some(5_000), &identity, &history_only_out_of_window),
+            Some(10_000),
+            "history-only work keeps event recency when its item is outside the loaded page"
+        );
+
+        let mixed_items = WorkspaceChatWork {
+            identity: identity.clone(),
+            availability: WorkspaceChatWorkAvailability::Available,
+            items: vec![
+                item(&identity.binding_id, 6_000),
+                item("bnd_recency_scope_other", 9_000),
+            ],
+            events: Vec::new(),
+            ..WorkspaceChatWork::default()
+        };
+        assert_eq!(
+            chat_summary_updated_at_ms(Some(5_000), &identity, &mixed_items),
+            Some(6_000),
+            "each durable item row is filtered by binding instead of invalidating the page"
+        );
+
+        let empty = WorkspaceChatWork {
+            identity: identity.clone(),
+            availability: WorkspaceChatWorkAvailability::Available,
+            ..WorkspaceChatWork::default()
+        };
+        assert_eq!(
+            chat_summary_updated_at_ms(None, &identity, &empty),
+            None,
+            "readable durable work without activity retains an honest None"
+        );
+        assert_eq!(
+            chat_summary_updated_at_ms(Some(15_000), &identity, &empty),
+            Some(15_000),
+            "an existing meaningful job-history timestamp must be preserved"
+        );
+
+        let mut other_source = identity.clone();
+        other_source.source_id = "src_recency_scope_other".to_string();
+        assert_eq!(
+            chat_summary_updated_at_ms(
+                Some(5_000),
+                &identity,
+                &work(other_source, &identity.binding_id)
+            ),
+            Some(5_000),
+            "durable work from another source must not contaminate this chat"
+        );
+
+        let mut other_binding = identity.clone();
+        other_binding.binding_id = "bnd_recency_scope_other".to_string();
+        assert_eq!(
+            chat_summary_updated_at_ms(
+                Some(5_000),
+                &identity,
+                &work(other_binding.clone(), &other_binding.binding_id)
+            ),
+            Some(5_000),
+            "durable work from another binding must not contaminate this chat"
+        );
+
+        let mut other_thread = identity.clone();
+        other_thread.thread_uuid = "0196ed00-0000-7000-8000-0000000007c2".to_string();
+        assert_eq!(
+            chat_summary_updated_at_ms(
+                Some(5_000),
+                &identity,
+                &work(other_thread, &identity.binding_id)
+            ),
+            Some(5_000),
+            "durable work from another native thread must not contaminate this chat"
+        );
+
+        // The foreign-item case carries no events so the assertion isolates item binding filtering
+        // rather than mixing in a valid event owned by the matching chat identity.
+        let foreign_item_only = WorkspaceChatWork {
+            identity: identity.clone(),
+            availability: WorkspaceChatWorkAvailability::Available,
+            items: vec![item("bnd_recency_scope_other", 9_000)],
+            events: Vec::new(),
+            ..WorkspaceChatWork::default()
+        };
+        assert_eq!(
+            chat_summary_updated_at_ms(Some(5_000), &identity, &foreign_item_only),
+            Some(5_000),
+            "an item bound to another chat must not contribute recency"
+        );
+
+        let mut unavailable = work(identity.clone(), &identity.binding_id);
+        unavailable.availability = WorkspaceChatWorkAvailability::Unavailable;
+        assert_eq!(
+            chat_summary_updated_at_ms(Some(5_000), &identity, &unavailable),
+            Some(5_000),
+            "unreadable durable work must not invent recency"
+        );
+    }
+
+    #[test]
+    fn workspace_chat_recency_tracks_matching_durable_activity_not_observation_freshness() {
+        let tree = TestTree::new("chat-recency");
+        let stores = TestStores::new(&tree, "stores");
+        let app_data = tree.dir("app-data");
+        let project = tree.dir("repo-chat-recency");
+        let idle_project = tree.dir("repo-chat-recency-idle");
+        let thread_uuid = "0196ed00-0000-7000-8000-0000000007a1";
+        let idle_thread_uuid = "0196ed00-0000-7000-8000-0000000007a2";
+        let durable_ms = 1_700_000_400_000;
+        let newer_durable_ms = durable_ms + 10_000;
+        let old_durable_ms = durable_ms - 10_000;
+
+        let mut core = Core::open(stores.state.join("state.db")).expect("open chat recency Core");
+        let binding = core
+            .create_binding(thread_uuid, "Durable recency chat")
+            .expect("create durable recency binding");
+        let idle_binding = core
+            .create_binding(idle_thread_uuid, "Observation-only recency chat")
+            .expect("create observation-only recency binding");
+        let item = core
+            .create_backlog_item(
+                &binding.binding_id,
+                "create-recency-item",
+                threadlane_core::NewBacklogItem {
+                    title: "Durable recency item".to_string(),
+                    acceptance_condition: "Durable mutations define recency".to_string(),
+                    delivery_description: "Exercise chat summary recency".to_string(),
+                    kind: threadlane_core::BacklogItemKind::Coworker,
+                },
+                durable_ms,
+            )
+            .expect("create recency item");
+        drop(core);
+
+        let source_id = stores.canonical_source_id();
+        let identity = WorkspaceChatIdentity::new(
+            &source_id,
+            &binding.binding_id,
+            thread_uuid,
+            &path_text(&project),
+        )
+        .expect("durable chat identity");
+        let idle_identity = WorkspaceChatIdentity::new(
+            &source_id,
+            &idle_binding.binding_id,
+            idle_thread_uuid,
+            &path_text(&idle_project),
+        )
+        .expect("observation-only chat identity");
+
+        let now_ms = current_observation_time_ms();
+        write_workspace_native_sample_sidecar(
+            &stores.state,
+            &make_native_sample(
+                identity.clone(),
+                "epoch_recency",
+                SampleTiming {
+                    sequence: 1,
+                    observed_at_ms: now_ms - 500,
+                    last_success_at_ms: now_ms - 500,
+                },
+                WorkspaceAvailabilityState::Available,
+                WorkspaceActivityState::Idle,
+                WorkspaceConfiguredSelection::verified(Some("gpt-6-astra"), Some("high")),
+                None,
+            ),
+        )
+        .expect("write durable chat sample");
+        write_workspace_native_sample_sidecar(
+            &stores.state,
+            &make_native_sample(
+                idle_identity.clone(),
+                "epoch_recency_idle",
+                SampleTiming {
+                    sequence: 1,
+                    observed_at_ms: now_ms - 100,
+                    last_success_at_ms: now_ms - 100,
+                },
+                WorkspaceAvailabilityState::Available,
+                WorkspaceActivityState::Idle,
+                WorkspaceConfiguredSelection::verified(Some("gpt-6-astra"), Some("high")),
+                None,
+            ),
+        )
+        .expect("write observation-only chat sample");
+
+        let service = ObservationService::new(stores.config(&app_data));
+        let initial = service
+            .workspace_snapshot(None)
+            .expect("initial recency snapshot");
+        let initial_sample_ms = initial
+            .native_samples
+            .iter()
+            .find(|sample| sample.chat_identity == identity)
+            .and_then(|sample| sample.observed_at_ms)
+            .expect("initial sample observation time");
+        let durable_chat = initial
+            .chats
+            .iter()
+            .find(|chat| chat.identity == identity)
+            .expect("durable chat summary");
+        assert_eq!(
+            durable_chat.updated_at_ms,
+            Some(durable_ms),
+            "the summary must preserve the matching durable item timestamp"
+        );
+        assert!(
+            durable_chat
+                .updated_at_ms
+                .is_some_and(|updated| updated < initial_sample_ms),
+            "a later observation timestamp must not become conversation recency"
+        );
+        assert_eq!(
+            durable_chat.availability,
+            WorkspaceAvailabilityState::Available
+        );
+        assert_eq!(durable_chat.activity, WorkspaceActivityState::Idle);
+        assert_eq!(
+            durable_chat.configured_selection.evidence,
+            WorkspaceSelectionEvidence::VerifiedConfiguration
+        );
+        let idle_chat = initial
+            .chats
+            .iter()
+            .find(|chat| chat.identity == idle_identity)
+            .expect("observation-only chat summary");
+        assert_eq!(
+            idle_chat.updated_at_ms, None,
+            "an observation-only chat without durable activity must retain an honest None"
+        );
+        assert_eq!(
+            idle_chat.availability,
+            WorkspaceAvailabilityState::Available,
+            "recency must not perturb availability"
+        );
+
+        let mut presence_applied = initial.clone();
+        let presence_applied = apply_workspace_presence_results(&mut presence_applied, Vec::new());
+        assert_eq!(
+            presence_applied
+                .chats
+                .iter()
+                .find(|chat| chat.identity == identity)
+                .expect("presence-applied durable chat summary")
+                .updated_at_ms,
+            Some(durable_ms),
+            "presence enrichment must not reintroduce observation freshness as recency"
+        );
+        assert_eq!(
+            presence_applied
+                .chats
+                .iter()
+                .find(|chat| chat.identity == idle_identity)
+                .expect("presence-applied observation-only chat summary")
+                .updated_at_ms,
+            None
+        );
+
+        write_workspace_native_sample_sidecar(
+            &stores.state,
+            &make_native_sample(
+                identity.clone(),
+                "epoch_recency",
+                SampleTiming {
+                    sequence: 2,
+                    observed_at_ms: now_ms - 250,
+                    last_success_at_ms: now_ms - 250,
+                },
+                WorkspaceAvailabilityState::Available,
+                WorkspaceActivityState::Idle,
+                WorkspaceConfiguredSelection::verified(Some("gpt-6-astra"), Some("high")),
+                None,
+            ),
+        )
+        .expect("refresh durable chat sample");
+        write_workspace_native_sample_sidecar(
+            &stores.state,
+            &make_native_sample(
+                idle_identity.clone(),
+                "epoch_recency_idle",
+                SampleTiming {
+                    sequence: 2,
+                    observed_at_ms: now_ms - 50,
+                    last_success_at_ms: now_ms - 50,
+                },
+                WorkspaceAvailabilityState::Available,
+                WorkspaceActivityState::Idle,
+                WorkspaceConfiguredSelection::verified(Some("gpt-6-astra"), Some("high")),
+                None,
+            ),
+        )
+        .expect("refresh observation-only chat sample");
+
+        let refreshed = service
+            .workspace_snapshot(None)
+            .expect("refreshed recency snapshot");
+        let refreshed_sample_ms = refreshed
+            .native_samples
+            .iter()
+            .find(|sample| sample.chat_identity == identity)
+            .and_then(|sample| sample.observed_at_ms)
+            .expect("refreshed sample observation time");
+        assert!(
+            refreshed_sample_ms > initial_sample_ms,
+            "the refreshed fixture must carry a genuinely later observation time"
+        );
+        assert_eq!(
+            refreshed
+                .chats
+                .iter()
+                .find(|chat| chat.identity == identity)
+                .expect("refreshed durable chat summary")
+                .updated_at_ms,
+            Some(durable_ms),
+            "an idle observation refresh with unchanged content must not advance recency"
+        );
+        assert_eq!(
+            refreshed
+                .chats
+                .iter()
+                .find(|chat| chat.identity == idle_identity)
+                .expect("refreshed observation-only chat summary")
+                .updated_at_ms,
+            None
+        );
+
+        let mut core = Core::open(stores.state.join("state.db")).expect("reopen chat recency Core");
+        let current = core
+            .get_backlog_item(&binding.binding_id, &item.item_id)
+            .expect("current recency item");
+        let edited = core
+            .edit_backlog_item(
+                &binding.binding_id,
+                "edit-recency-item",
+                &item.item_id,
+                current.revision,
+                threadlane_core::BacklogItemEdit {
+                    title: Some("Durable recency item edited".to_string()),
+                    acceptance_condition: None,
+                    delivery_description: None,
+                },
+                newer_durable_ms,
+            )
+            .expect("edit recency item");
+        assert_eq!(edited.updated_at_ms, newer_durable_ms);
+        let old_item = core
+            .create_backlog_item(
+                &binding.binding_id,
+                "create-old-recency-item",
+                threadlane_core::NewBacklogItem {
+                    title: "Older durable recency item".to_string(),
+                    acceptance_condition: "Older rows never rewind recency".to_string(),
+                    delivery_description: "Exercise old durable timestamps".to_string(),
+                    kind: threadlane_core::BacklogItemKind::Coworker,
+                },
+                old_durable_ms,
+            )
+            .expect("create older recency item");
+        assert_eq!(old_item.updated_at_ms, old_durable_ms);
+        drop(core);
+
+        let advanced = service
+            .workspace_snapshot(None)
+            .expect("advanced recency snapshot");
+        let advanced_work = advanced
+            .chat_work
+            .iter()
+            .find(|work| work.identity == identity)
+            .expect("advanced durable chat work");
+        let newest_event_ms = advanced_work
+            .events
+            .iter()
+            .map(|event| event.recorded_at_ms)
+            .max();
+        assert_eq!(newest_event_ms, Some(newer_durable_ms));
+        let advanced_chat = advanced
+            .chats
+            .iter()
+            .find(|chat| chat.identity == identity)
+            .expect("advanced durable chat summary");
+        assert_eq!(
+            advanced_chat.updated_at_ms,
+            Some(newer_durable_ms),
+            "matching durable item and history activity must advance recency despite a newer observation"
+        );
+        assert_eq!(
+            advanced_chat.updated_at_ms, newest_event_ms,
+            "the summary must fold the durable history event timestamp"
+        );
+        assert!(
+            advanced_chat
+                .updated_at_ms
+                .is_some_and(|updated| updated > old_item.updated_at_ms),
+            "older item and event times must not rewind the newer summary"
+        );
+        assert_eq!(
+            advanced
+                .chats
+                .iter()
+                .find(|chat| chat.identity == idle_identity)
+                .expect("advanced observation-only chat summary")
+                .updated_at_ms,
+            None,
+            "another chat must not inherit this chat's durable activity"
         );
     }
 

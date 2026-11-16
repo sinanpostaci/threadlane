@@ -449,6 +449,7 @@ impl ObservationService {
         let mut all_native_samples: Vec<WorkspaceNativeSample> = Vec::new();
         let mut native_samples_omitted = 0usize;
         let mut all_chats: BTreeMap<String, WorkspaceChatSummary> = BTreeMap::new();
+        let mut all_chat_recency: BTreeMap<String, Option<i64>> = BTreeMap::new();
         let mut all_chat_work: Vec<WorkspaceChatWork> = Vec::new();
         let mut presence_queries: Vec<WorkspacePresenceQuery> = Vec::new();
         let mut all_job_histories: Vec<WorkspaceJobHistory> = Vec::new();
@@ -504,6 +505,7 @@ impl ObservationService {
                 &mut all_native_samples,
                 &mut native_samples_omitted,
                 &mut all_chats,
+                &mut all_chat_recency,
                 &mut all_chat_work,
                 &mut presence_queries,
                 &mut all_job_histories,
@@ -652,7 +654,8 @@ impl ObservationService {
                     work.bounds.presence_omitted.saturating_add(*omitted);
             }
         }
-        let snapshot = snapshot.normalized();
+        let mut snapshot = snapshot.normalized();
+        restore_durable_chat_recency(&mut snapshot, &all_chat_recency);
 
         Ok(WorkspaceSnapshotBundle {
             snapshot,
@@ -673,6 +676,7 @@ fn project_single_source_workspace(
     all_native_samples: &mut Vec<WorkspaceNativeSample>,
     native_samples_omitted: &mut usize,
     all_chats: &mut BTreeMap<String, WorkspaceChatSummary>,
+    all_chat_recency: &mut BTreeMap<String, Option<i64>>,
     all_chat_work: &mut Vec<WorkspaceChatWork>,
     presence_queries: &mut Vec<WorkspacePresenceQuery>,
     all_job_histories: &mut Vec<WorkspaceJobHistory>,
@@ -1020,6 +1024,9 @@ fn project_single_source_workspace(
             });
         }
 
+        let updated_at_ms =
+            chat_summary_updated_at_ms(stats.max_updated_at_ms, &identity, &chat_work);
+        all_chat_recency.insert(chat_key.clone(), updated_at_ms);
         all_chat_work.push(chat_work);
 
         let thread_label = resolve_verified_chat_thread_label(
@@ -1030,13 +1037,6 @@ fn project_single_source_workspace(
             projected_requests,
         );
         let project_label = derive_project_label(&identity.canonical_project_scope);
-
-        let mut updated_at_ms = stats.max_updated_at_ms;
-        if let Some(sample_obs_ms) = native_sample.and_then(|s| s.observed_at_ms) {
-            if updated_at_ms.is_none_or(|prev| sample_obs_ms > prev) {
-                updated_at_ms = Some(sample_obs_ms);
-            }
-        }
 
         let (availability, activity, configured_selection) = match native_sample {
             Some(sample) => {
@@ -1123,6 +1123,59 @@ impl ChatJobStats {
                 self.max_updated_at_ms = Some(ts);
             }
         }
+    }
+}
+
+/// Folds durable conversation activity into one chat summary timestamp.
+///
+/// Native sample observation times describe collector freshness, not conversation activity, so they
+/// never contribute here. Only the already-scoped job-history timestamp plus durable backlog items
+/// and history events from the exact same source/binding/thread identity may advance the summary.
+/// Older durable timestamps never rewind an already newer summary, and a chat without durable
+/// activity keeps an honest `None`.
+fn chat_summary_updated_at_ms(
+    current: Option<i64>,
+    identity: &WorkspaceChatIdentity,
+    chat_work: &WorkspaceChatWork,
+) -> Option<i64> {
+    if chat_work.availability != WorkspaceChatWorkAvailability::Available
+        || chat_work.identity != *identity
+    {
+        return current;
+    }
+
+    let mut updated_at_ms = current;
+    for item in &chat_work.items {
+        if item.binding_id != identity.binding_id {
+            continue;
+        }
+        updated_at_ms = updated_at_ms.max(Some(item.updated_at_ms));
+    }
+    for event in &chat_work.events {
+        updated_at_ms = updated_at_ms.max(Some(event.recorded_at_ms));
+    }
+    updated_at_ms
+}
+
+/// Restores durable conversation recency after general snapshot normalization.
+///
+/// General normalization re-derives live chat fields from native samples and may also seed sample-
+/// only chats. That pass must not turn observation freshness into conversation activity, so the
+/// already-computed durable timestamp map is authoritative here. Chats absent from the map were
+/// observed without durable activity and keep an honest `None`.
+fn restore_durable_chat_recency(
+    snapshot: &mut WorkspaceSnapshot,
+    durable_recency_by_chat: &BTreeMap<String, Option<i64>>,
+) {
+    for chat in &mut snapshot.chats {
+        let Some(chat_key) = chat.identity.canonical_key() else {
+            continue;
+        };
+        chat.updated_at_ms = durable_recency_by_chat
+            .get(&chat_key)
+            .copied()
+            .flatten()
+            .filter(|&updated_at_ms| updated_at_ms > 0);
     }
 }
 
@@ -1972,7 +2025,17 @@ pub(crate) fn apply_workspace_presence_results(
             }
         }
     }
-    snapshot.normalized()
+    // Presence and execution metadata are liveness inputs, never conversation activity. Preserve
+    // the already-durable chat recency across re-normalization instead of letting sample freshness
+    // re-enter the summary timestamp.
+    let durable_recency_by_chat: BTreeMap<String, Option<i64>> = snapshot
+        .chats
+        .iter()
+        .filter_map(|chat| Some((chat.identity.canonical_key()?, chat.updated_at_ms)))
+        .collect();
+    let mut normalized = snapshot.normalized();
+    restore_durable_chat_recency(&mut normalized, &durable_recency_by_chat);
+    normalized
 }
 
 /// Returns the sanitized display title from the accepted ordered title cache for this exact chat.

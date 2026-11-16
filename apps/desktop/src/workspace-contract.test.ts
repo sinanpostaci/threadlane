@@ -1679,6 +1679,82 @@ test('sampling policy enforces 2s/750ms/10s defaults and regenerateWorkspaceSnap
   assert.equal(snapStale.chats[0]!.configured_selection.evidence, 'unavailable');
 });
 
+test('native sample acquisition ticks never become durable chat recency', () => {
+  const sampleOnlyId = validateWorkspaceChatIdentity({
+    source_id: 'default',
+    binding_id: 'bnd_chat_beta',
+    thread_uuid: VALID_UUID_B,
+    canonical_project_scope: '/home/dev/repos/alpha-app',
+  });
+  const process = sampleProcessInstance(77, 88);
+  const firstSample: WorkspaceNativeSample = {
+    ...sampleNativeLive(sampleOnlyId, 'epoch_recency_01', process, 1, 50_000),
+    activity: 'idle',
+  };
+
+  const sampleOnly = normalizeWorkspaceSnapshot({
+    generated_at_ms: 55_000,
+    native_samples: [firstSample],
+  });
+  assert.equal(sampleOnly.chats.length, 1);
+  assert.equal(sampleOnly.chats[0]!.availability, 'available');
+  assert.equal(sampleOnly.chats[0]!.activity, 'idle');
+  assert.equal(sampleOnly.chats[0]!.updated_at_ms, null);
+
+  const laterTick = normalizeWorkspaceSnapshot({
+    generated_at_ms: 60_000,
+    native_samples: [
+      {
+        ...firstSample,
+        sequence: 2,
+        observed_at_ms: 59_000,
+        last_success_at_ms: 59_000,
+        activity: 'waiting_for_input',
+      },
+    ],
+  });
+  assert.equal(laterTick.chats[0]!.activity, 'waiting_for_input');
+  assert.equal(laterTick.chats[0]!.updated_at_ms, null);
+  assert.equal(
+    regenerateWorkspaceSnapshotAt(laterTick, 70_000).chats[0]!.updated_at_ms,
+    null,
+  );
+
+  const durableMs = 40_000;
+  const durableChat = {
+    identity: sampleOnlyId,
+    thread_label: 'Durable chat',
+    project_label: 'alpha-app',
+    availability: 'available' as const,
+    activity: 'idle' as const,
+    configured_selection: createVerifiedConfiguredSelection('gpt-5.4', 'high'),
+    active_job_count: 0,
+    attention_count: 0,
+    updated_at_ms: durableMs,
+  };
+  const durable = normalizeWorkspaceSnapshot({
+    generated_at_ms: 55_000,
+    chats: [durableChat],
+    native_samples: [firstSample],
+  });
+  assert.equal(durable.chats[0]!.updated_at_ms, durableMs);
+
+  const durableAfterNewerTick = normalizeWorkspaceSnapshot({
+    generated_at_ms: 60_000,
+    chats: [durableChat],
+    native_samples: [
+      {
+        ...firstSample,
+        sequence: 3,
+        observed_at_ms: 59_500,
+        last_success_at_ms: 59_500,
+        activity: 'working',
+      },
+    ],
+  });
+  assert.equal(durableAfterNewerTick.chats[0]!.updated_at_ms, durableMs);
+});
+
 test('job history separates attempts/runs/outbox/candidates/links/failure/attention and requires receipt proof for verified_accepted', () => {
   const unbacked = normalizeWorkspaceJobHistory({
     job: {

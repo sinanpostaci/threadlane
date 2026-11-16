@@ -3684,19 +3684,15 @@ export function normalizeWorkspaceSnapshot(raw: unknown): WorkspaceSnapshot {
         configured_selection: evaluated.effective_configured_selection,
         active_job_count: 0,
         attention_count: 0,
-        updated_at_ms: sample.observed_at_ms,
+        // `observed_at_ms` is sample acquisition time, not conversation activity.
+        // A sample-only chat therefore has no durable content timestamp.
+        updated_at_ms: null,
       };
       chatsByKey.set(chatKey, entry);
     } else {
       entry.availability = evaluated.effective_availability;
       entry.activity = evaluated.effective_activity;
       entry.configured_selection = evaluated.effective_configured_selection;
-      if (
-        sample.observed_at_ms !== null &&
-        (entry.updated_at_ms === null || sample.observed_at_ms > entry.updated_at_ms)
-      ) {
-        entry.updated_at_ms = sample.observed_at_ms;
-      }
     }
   }
 

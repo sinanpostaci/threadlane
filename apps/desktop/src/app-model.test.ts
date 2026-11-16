@@ -195,7 +195,7 @@ describe('app-model workspace and journal projection', () => {
     assert.equal(projected.selectedJournal?.attentionBanner, null);
   });
 
-  it('sorts projects and chats by active/recent timestamps and displays working and needs-human independently', () => {
+  it('sorts projects and chats by recent durable timestamps and displays working and needs-human independently', () => {
     const snapshot = makeSnapshot({
       sources: [
         makeSource({
@@ -256,7 +256,7 @@ describe('app-model workspace and journal projection', () => {
     assert.equal(projection.status, 'ready');
     assert.equal(projection.projects.length, 2);
 
-    // ZZZ Active Project must sort before AAA Older Project despite alphabetical order
+    // The newer ZZZ project must sort before the older AAA project despite alphabetical order.
     const firstProject = projection.projects[0]!;
     assert.equal(firstProject.label, 'ZZZ Active Project');
     assert.equal(firstProject.hasWorking, true);
@@ -273,7 +273,7 @@ describe('app-model workspace and journal projection', () => {
     assert.equal(activeChat.primaryDotTone, 'attention');
     assert.equal(activeChat.secondaryDotTone, 'working');
 
-    // Default selection picks the most active/recent chat
+    // Default selection picks the most recent chat.
     assert.equal(projection.selectedChatKey, activeChat.key);
   });
 
@@ -329,6 +329,43 @@ describe('app-model workspace and journal projection', () => {
     });
     assert.equal(refreshed.selectedChatKey, alphaChat.key);
     assert.equal(refreshed.selectedJournal?.chatLabel, 'Chat Alpha');
+  });
+
+  it('sorts legacy sidebar chats by durable recency instead of older needs-human status', () => {
+    const snapshot = makeSnapshot({
+      jobs: [
+        makeJob({
+          id: 'job-old-needs-user',
+          thread_uuid: UUID_CHAT_A,
+          thread_label: 'Old needs-you chat',
+          state: 'needs_user',
+          execution_status: 'held',
+          active_call_count: 0,
+          updated_at_ms: NOW_MS - 60_000,
+        }),
+        makeJob({
+          id: 'job-new-settled',
+          thread_uuid: UUID_CHAT_B,
+          thread_label: 'New settled chat',
+          state: 'completed',
+          execution_status: 'completed',
+          active_call_count: 0,
+          updated_at_ms: NOW_MS - 1_000,
+        }),
+      ],
+    });
+
+    const projection = projectDesktopWorkspace(snapshot, { nowMs: NOW_MS });
+    const chats = projection.projects[0]!.chats;
+    assert.deepEqual(
+      chats.map((chat) => chat.label),
+      ['New settled chat', 'Old needs-you chat'],
+    );
+    const oldChat = chats.find((chat) => chat.label === 'Old needs-you chat')!;
+    assert.equal(oldChat.hasNeedsHuman, true);
+    assert.equal(oldChat.primaryDotTone, 'attention');
+    assert.equal(oldChat.updatedAtMs, NOW_MS - 60_000);
+    assert.equal(projection.selectedChatKey, chats[0]!.key);
   });
 
   it('distinguishes finished Worker calls from authoritative Job Done completion', () => {
@@ -1879,6 +1916,398 @@ describe('projectWorkspaceSnapshot production projection', () => {
       // Historical request actor metadata stays strictly on the activity item, never backfilling chat configuredSelection.
       assert.equal(sc.activity.items[0]?.historicalActorSelectedModel, 'gpt-5.4');
     }
+  });
+
+  it('keeps sample-only chat recency null and ignores sample ticks when ordering projects', () => {
+    const idDurable = makeChatIdentity({
+      source_id: 'src-a',
+      binding_id: 'bnd_recency_durable',
+      thread_uuid: UUID_CHAT_A,
+      canonical_project_scope: '/work/recency-durable',
+    });
+    const idSampleOnly = makeChatIdentity({
+      source_id: 'src-a',
+      binding_id: 'bnd_recency_sample',
+      thread_uuid: UUID_CHAT_B,
+      canonical_project_scope: '/work/recency-sample',
+    });
+    const durableProjectKey = formatWorkspaceProjectGroupKey(
+      'src-a',
+      '/work/recency-durable',
+    );
+    const sampleProjectKey = formatWorkspaceProjectGroupKey(
+      'src-a',
+      '/work/recency-sample',
+    );
+    const durableUpdatedAtMs = NOW_MS - 5_000;
+
+    const buildProjection = (
+      sampleObservedAtMs: number,
+      sampleActivity: WorkspaceNativeSample['activity'],
+      sampleDurableUpdatedAtMs: number | null = null,
+    ) => {
+      const chats: WorkspaceSnapshot['chats'] = [
+        {
+          identity: idDurable,
+          thread_label: 'Durable chat',
+          project_label: 'Durable project',
+          availability: 'available',
+          activity: 'idle',
+          configured_selection: createVerifiedConfiguredSelection('gpt-5.4', 'high'),
+          active_job_count: 0,
+          attention_count: 0,
+          updated_at_ms: durableUpdatedAtMs,
+        },
+      ];
+      if (sampleDurableUpdatedAtMs !== null) {
+        chats.push({
+          identity: idSampleOnly,
+          thread_label: 'Later durable chat',
+          project_label: 'Sample project',
+          availability: 'available',
+          activity: 'idle',
+          configured_selection: createVerifiedConfiguredSelection('gpt-5.4', 'high'),
+          active_job_count: 0,
+          attention_count: 0,
+          updated_at_ms: sampleDurableUpdatedAtMs,
+        });
+      }
+      const ws = makeWorkspaceSnapshotFixture({
+        chats,
+        native_samples: [
+          makeLiveNativeSample(idDurable, {
+            observed_at_ms: NOW_MS - 1_000,
+            last_success_at_ms: NOW_MS - 1_000,
+            activity: 'working',
+          }),
+          makeLiveNativeSample(idSampleOnly, {
+            observed_at_ms: sampleObservedAtMs,
+            last_success_at_ms: sampleObservedAtMs,
+            activity: sampleActivity,
+          }),
+        ],
+      });
+      return projectWorkspaceSnapshot(ws, { nowMs: NOW_MS });
+    };
+
+    const idleSample = buildProjection(NOW_MS - 1_000, 'idle');
+    const waitingSample = buildProjection(NOW_MS - 50, 'waiting_for_input');
+    const durableKey = formatWorkspaceChatIdentityKey(idDurable);
+
+    for (const projected of [idleSample, waitingSample]) {
+      assert.deepEqual(
+        projected.visibleProjects.map((p) => p.projectKey),
+        [durableProjectKey, sampleProjectKey],
+      );
+      assert.equal(projected.selectedChatKey, durableKey);
+
+      const durableProject = projected.visibleProjects.find(
+        (p) => p.projectKey === durableProjectKey,
+      )!;
+      assert.equal(durableProject.latestUpdatedAtMs, durableUpdatedAtMs);
+      assert.equal(durableProject.chats[0]?.updatedAtMs, durableUpdatedAtMs);
+      assert.equal(durableProject.chats[0]?.nativeState.activity, 'working');
+
+      const sampleProject = projected.visibleProjects.find(
+        (p) => p.projectKey === sampleProjectKey,
+      )!;
+      assert.equal(sampleProject.latestUpdatedAtMs, null);
+      assert.equal(sampleProject.chats[0]?.updatedAtMs, null);
+      assert.equal(sampleProject.chats[0]?.ageLabel, 'Time not reported');
+    }
+
+    const idleSampleChat = idleSample.visibleProjects.find(
+      (p) => p.projectKey === sampleProjectKey,
+    )!.chats[0]!;
+    assert.equal(idleSampleChat.nativeState.activity, 'idle');
+    assert.equal(idleSampleChat.hasCurrentBlocker, false);
+
+    const waitingSampleChat = waitingSample.visibleProjects.find(
+      (p) => p.projectKey === sampleProjectKey,
+    )!.chats[0]!;
+    assert.equal(waitingSampleChat.nativeState.activity, 'waiting_for_input');
+    assert.equal(waitingSampleChat.hasCurrentBlocker, true);
+    assert.equal(waitingSampleChat.primaryDotTone, 'attention');
+    assert.equal(waitingSampleChat.updatedAtMs, null);
+
+    const advancedSampleProject = buildProjection(
+      NOW_MS - 50,
+      'idle',
+      NOW_MS - 1_000,
+    );
+    assert.deepEqual(
+      advancedSampleProject.visibleProjects.map((p) => p.projectKey),
+      [sampleProjectKey, durableProjectKey],
+    );
+    assert.equal(
+      advancedSampleProject.visibleProjects[0]?.latestUpdatedAtMs,
+      NOW_MS - 1_000,
+    );
+  });
+
+  it('sorts by durable activity instead of historical failed or active job status and reorders on newer durable updates', () => {
+    const idNeutral = makeChatIdentity({
+      source_id: 'src-a',
+      binding_id: 'bnd_status_neutral',
+      thread_uuid: UUID_CHAT_A,
+      canonical_project_scope: '/work/status-neutral',
+    });
+    const idRunning = makeChatIdentity({
+      source_id: 'src-a',
+      binding_id: 'bnd_status_running',
+      thread_uuid: UUID_CHAT_B,
+      canonical_project_scope: '/work/status-neutral',
+    });
+    const idFailed = makeChatIdentity({
+      source_id: 'src-a',
+      binding_id: 'bnd_status_failed',
+      thread_uuid: UUID_CHAT_C,
+      canonical_project_scope: '/work/status-neutral',
+    });
+
+    const buildProjection = (runningUpdatedAtMs: number) => {
+      const runningJob = makeWorkspaceJobHistoryRecord(idRunning, {
+        job: {
+          source_id: idRunning.source_id,
+          job_id: 'job_status_running',
+          binding_id: idRunning.binding_id,
+          chat_identity: idRunning,
+          title: 'Historical running job',
+          job_revision: 1,
+          state: 'running',
+          phase: 'execution',
+          approval_status: 'approved',
+          execution_status: 'running',
+          review_state: null,
+          created_at_ms: NOW_MS - 60_000,
+          updated_at_ms: runningUpdatedAtMs,
+          summary: 'Running job whose current chat liveness is neutral.',
+        },
+      });
+      const failedJob = makeWorkspaceJobHistoryRecord(idFailed, {
+        job: {
+          source_id: idFailed.source_id,
+          job_id: 'job_status_failed',
+          binding_id: idFailed.binding_id,
+          chat_identity: idFailed,
+          title: 'Historical failed job',
+          job_revision: 1,
+          state: 'failed',
+          phase: 'completed',
+          approval_status: 'approved',
+          execution_status: 'failed',
+          review_state: null,
+          created_at_ms: NOW_MS - 70_000,
+          updated_at_ms: NOW_MS - 6_000,
+          summary: 'Old failed job.',
+        },
+      });
+      const ws = makeWorkspaceSnapshotFixture({
+        chats: [
+          {
+            identity: idNeutral,
+            thread_label: 'Neutral chat',
+            project_label: 'Status project',
+            availability: 'available',
+            activity: 'idle',
+            configured_selection: createVerifiedConfiguredSelection('gpt-5.4', 'high'),
+            active_job_count: 0,
+            attention_count: 0,
+            updated_at_ms: NOW_MS - 1_000,
+          },
+          {
+            identity: idRunning,
+            thread_label: 'Running job chat',
+            project_label: 'Status project',
+            availability: 'available',
+            activity: 'idle',
+            configured_selection: createVerifiedConfiguredSelection('gpt-5.4', 'high'),
+            active_job_count: 1,
+            attention_count: 0,
+            updated_at_ms: runningUpdatedAtMs,
+          },
+          {
+            identity: idFailed,
+            thread_label: 'Failed job chat',
+            project_label: 'Status project',
+            availability: 'available',
+            activity: 'idle',
+            configured_selection: createVerifiedConfiguredSelection('gpt-5.4', 'high'),
+            active_job_count: 0,
+            attention_count: 0,
+            updated_at_ms: NOW_MS - 6_000,
+          },
+        ],
+        native_samples: [
+          makeLiveNativeSample(idNeutral, {
+            observed_at_ms: NOW_MS - 9_000,
+            last_success_at_ms: NOW_MS - 9_000,
+            activity: 'idle',
+          }),
+          makeLiveNativeSample(idRunning, {
+            observed_at_ms: NOW_MS - 50,
+            last_success_at_ms: NOW_MS - 50,
+            activity: 'idle',
+          }),
+          makeLiveNativeSample(idFailed, {
+            observed_at_ms: NOW_MS - 40,
+            last_success_at_ms: NOW_MS - 40,
+            activity: 'idle',
+          }),
+        ],
+        job_histories: [runningJob, failedJob],
+      });
+      return projectWorkspaceSnapshot(ws, { nowMs: NOW_MS });
+    };
+
+    const neutralKey = formatWorkspaceChatIdentityKey(idNeutral);
+    const runningKey = formatWorkspaceChatIdentityKey(idRunning);
+    const failedKey = formatWorkspaceChatIdentityKey(idFailed);
+
+    const initial = buildProjection(NOW_MS - 5_000);
+    const initialChats = initial.visibleProjects[0]!.chats;
+    assert.deepEqual(
+      initialChats.map((c) => c.chatKey),
+      [neutralKey, runningKey, failedKey],
+    );
+    const runningChat = initialChats.find((c) => c.chatKey === runningKey)!;
+    assert.equal(runningChat.updatedAtMs, NOW_MS - 5_000);
+    assert.equal(runningChat.jobSummary.activeJobCount, 1);
+    assert.equal(runningChat.nativeState.activity, 'idle');
+    assert.equal(runningChat.primaryDotTone, 'neutral');
+    const failedChat = initialChats.find((c) => c.chatKey === failedKey)!;
+    assert.equal(failedChat.updatedAtMs, NOW_MS - 6_000);
+    assert.equal(failedChat.jobSummary.failedJobCount, 1);
+    assert.equal(failedChat.primaryDotTone, 'neutral');
+    assert.ok(initialChats.indexOf(failedChat) > initialChats.indexOf(runningChat));
+
+    const advanced = buildProjection(NOW_MS - 500);
+    const advancedChats = advanced.visibleProjects[0]!.chats;
+    assert.deepEqual(
+      advancedChats.map((c) => c.chatKey),
+      [runningKey, neutralKey, failedKey],
+    );
+    assert.equal(advancedChats[0]?.updatedAtMs, NOW_MS - 500);
+  });
+
+  it('keeps canonical timestamp ties stable without status priority', () => {
+    const idNeutralProject = makeChatIdentity({
+      source_id: 'src-a',
+      binding_id: 'bnd_tie_a',
+      thread_uuid: UUID_CHAT_A,
+      canonical_project_scope: '/work/tie-a',
+    });
+    const idBlocked = makeChatIdentity({
+      source_id: 'src-a',
+      binding_id: 'bnd_tie_z',
+      thread_uuid: UUID_CHAT_B,
+      canonical_project_scope: '/work/tie-zeta',
+    });
+    const idTiedNeutral = makeChatIdentity({
+      source_id: 'src-a',
+      binding_id: 'bnd_tie_m',
+      thread_uuid: UUID_CHAT_C,
+      canonical_project_scope: '/work/tie-zeta',
+    });
+    const tiedUpdatedAtMs = NOW_MS - 3_000;
+
+    const blockedJob = makeWorkspaceJobHistoryRecord(idBlocked, {
+      job: {
+        source_id: idBlocked.source_id,
+        job_id: 'job_tie_blocked',
+        binding_id: idBlocked.binding_id,
+        chat_identity: idBlocked,
+        title: 'Blocked job',
+        job_revision: 1,
+        state: 'needs_user',
+        phase: 'held',
+        approval_status: 'approved',
+        execution_status: 'held',
+        review_state: null,
+        created_at_ms: NOW_MS - 10_000,
+        updated_at_ms: tiedUpdatedAtMs,
+        summary: 'Waiting for user input.',
+      },
+      current_attention: makeAttentionState(
+        'needs_user_input',
+        'Waiting for user input.',
+        { updated_at_ms: tiedUpdatedAtMs },
+      ),
+    });
+
+    const ws = makeWorkspaceSnapshotFixture({
+      chats: [
+        {
+          identity: idNeutralProject,
+          thread_label: 'Neutral project chat',
+          project_label: 'Neutral project',
+          availability: 'available',
+          activity: 'idle',
+          configured_selection: createVerifiedConfiguredSelection('gpt-5.4', 'high'),
+          active_job_count: 0,
+          attention_count: 0,
+          updated_at_ms: tiedUpdatedAtMs,
+        },
+        {
+          identity: idBlocked,
+          thread_label: 'Blocked chat',
+          project_label: 'Blocked project',
+          availability: 'available',
+          activity: 'waiting_for_input',
+          configured_selection: createVerifiedConfiguredSelection('gpt-5.4', 'high'),
+          active_job_count: 1,
+          attention_count: 1,
+          updated_at_ms: tiedUpdatedAtMs,
+        },
+        {
+          identity: idTiedNeutral,
+          thread_label: 'Tied neutral chat',
+          project_label: 'Blocked project',
+          availability: 'available',
+          activity: 'idle',
+          configured_selection: createVerifiedConfiguredSelection('gpt-5.4', 'high'),
+          active_job_count: 0,
+          attention_count: 0,
+          updated_at_ms: tiedUpdatedAtMs,
+        },
+      ],
+      native_samples: [
+        makeLiveNativeSample(idBlocked, {
+          observed_at_ms: NOW_MS - 100,
+          last_success_at_ms: NOW_MS - 100,
+          activity: 'waiting_for_input',
+        }),
+      ],
+      job_histories: [blockedJob],
+    });
+
+    const projected = projectWorkspaceSnapshot(ws, { nowMs: NOW_MS });
+    const neutralProjectKey = formatWorkspaceProjectGroupKey('src-a', '/work/tie-a');
+    const blockedProjectKey = formatWorkspaceProjectGroupKey('src-a', '/work/tie-zeta');
+    assert.deepEqual(
+      projected.visibleProjects.map((p) => p.projectKey),
+      [neutralProjectKey, blockedProjectKey],
+    );
+    assert.equal(projected.visibleProjects[0]?.latestUpdatedAtMs, tiedUpdatedAtMs);
+    assert.equal(projected.visibleProjects[1]?.latestUpdatedAtMs, tiedUpdatedAtMs);
+
+    const blockedProjectChats = projected.visibleProjects[1]!.chats;
+    const expectedTiedKeys = [
+      formatWorkspaceChatIdentityKey(idTiedNeutral)!,
+      formatWorkspaceChatIdentityKey(idBlocked)!,
+    ].sort();
+    assert.deepEqual(
+      blockedProjectChats.map((c) => c.chatKey),
+      expectedTiedKeys,
+    );
+
+    const blockedChat = blockedProjectChats.find(
+      (c) => c.chatKey === formatWorkspaceChatIdentityKey(idBlocked),
+    )!;
+    assert.equal(blockedChat.updatedAtMs, tiedUpdatedAtMs);
+    assert.equal(blockedChat.hasCurrentBlocker, true);
+    assert.equal(blockedChat.needsHumanCount, 2);
+    assert.equal(blockedChat.primaryDotTone, 'attention');
   });
 
   it('preserves current attempt vs past attempts, candidates, historical failure vs current attention, and rejects unverified ID-format acceptance', () => {
