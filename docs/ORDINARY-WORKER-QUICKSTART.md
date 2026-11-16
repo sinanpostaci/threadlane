@@ -54,7 +54,8 @@ Any changed scope/model/effort/quota/repository/base/task identity needs a fresh
 
 5. Run the guarded Worker: create a `worker` item, call `backlog_worker_start` with the
    actual `expected_revision`, approval ID, and task ID; wait for the callback; pull and ACK
-   the returned batch; call `backlog_worker_result`; make one bounded physical and semantic
+   the returned batch and bounded `has_more` pages before waiting; call `backlog_worker_result`;
+   make one bounded physical and semantic
    check; then complete or reject with the returned `item_snapshot.revision`, `execution_ref`,
    and matching digests.
 

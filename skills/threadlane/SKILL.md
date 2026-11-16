@@ -106,6 +106,12 @@ missing notice or reply uses the original receipt/result; possible effects or
 binding, readiness, revision, and digest refusals. `Doing` is not liveness;
 `NeedsYou` only for an actual open human decision or question.
 
+When `approved_pull_events` returns `has_more: true`, process and ACK that actual batch,
+then pull the next bounded page for the same approval before waiting. Drain advertised
+pages through `has_more: false`; a progress-only first page is not current Worker status.
+Then reconcile the original execution. This is pagination, not status polling, and never
+new authority or permission to redispatch. Keep batch IDs, scope and refusal checks intact.
+
 Use the guarded paired tools only with real enrollment and the exact frozen
 approval/task identity:
 
