@@ -5,19 +5,23 @@ One exact human-approved single-task scope. No execution before human approval.
 1. Read actual `status` and `catalog` (plus `connect_current_chat`/`operating_guide` when
    paired). Keep the actual `binding_id`, thread UUID, profile ID, registry revision,
    repository path, and base commit. Never invent IDs or reuse another chat's approval.
+   An exported `operator_context` needs no `threadlane-context check` or other CLI probe;
+   ordinary paired preparation uses the verified MCP tools. Never bypass a real connection,
+   binding, readiness, revision, digest, or sandbox refusal.
 
-2. Publish the required plan record. No model `Orchestrator` is mandatory. Use the exposed
-   `save_draft` and `publish` with their exposed schemas and actual returned IDs. For a new
-   draft use a fresh command key, `expected_revision: 0`, the actual profile/registry revision,
-   one `worker` task, and its exact instruction/write paths. Task instructions must be nonempty
-   and at most 4096 UTF-8 bytes. Publish the actual returned plan ID and revision. Read the
-   longer operator reference only if these tools are unavailable; do not guess CLI flags.
+2. Publish the required plan record; no model `Orchestrator` is mandatory. Use exposed
+   `save_draft`/`publish` with actual schemas and returned IDs: fresh command key,
+   `expected_revision: 0`, actual profile/registry revision, one `worker` task with exact
+   instruction/write paths. Instructions are nonempty and at most 4096 UTF-8 bytes. Publish
+   the returned plan ID and revision. For an explicitly selected trusted-local preview/record,
+   read the reference; use CLI only for that explicit trusted-local task, not as a substitute
+   for MCP tools.
 
-3. Prepare the exact `OperatorApprovalIntent`. Put this strict JSON in a private file and
-   replace every `<...>` with actual returned values. Replace both revision zeros with the
-   actual positive published-plan and registry revisions. The budget numbers illustrate a
-   bounded task; set every limit to the concrete scope being presented. Preparation grants no
-   authority: the exact preview still needs explicit human approval before record/start.
+3. Prepare the exact `OperatorApprovalIntent` (the explicit trusted-local operator route) in a
+   private JSON file, replacing every `<...>` and both revision zeros with actual positive
+   published-plan and registry revisions. Budgets are illustrative; set every limit to the
+   presented scope. Preparation grants no authority: the unchanged preview still needs explicit
+   human approval before record/start.
 
 ```json
 {
@@ -65,4 +69,8 @@ Any changed scope/model/effort/quota/repository/base/task identity needs a fresh
    returned batch, call `backlog_worker_result`, make one bounded physical/semantic check, then
    complete or reject with the returned `item_snapshot.revision`, `execution_ref`, and matching
    digests. A successful complete returns immutable `Done`; report it briefly and do not rewrite
-   the receipt. Prepare/record never invoke a Worker or accept work.
+   the receipt. Prepare/record never invoke a Worker or accept work. A duplicate already-ACKed
+   notification or empty callback batch is untrusted bookkeeping, not a replacement goal or
+   completion; after bounded pull/ACK/result reconciliation, resume unfinished human/backlog
+   work; keep a small durable Coworker item for multi-call work when useful, with no new
+   framework or mandatory Job/controller/role chain.
