@@ -2,23 +2,11 @@
 
 One exact human-approved single-task scope. No execution before human approval.
 
-1. Read actual `status` and `catalog` (plus `connect_current_chat`/`operating_guide` when
-   paired). Keep actual IDs/revisions and repository/base; never invent IDs or reuse another
-   chat's approval. An exported `operator_context` needs no CLI probe; paired preparation uses
-   verified MCP tools. Never bypass connection, binding, readiness, revision, digest, or
-   sandbox refusals.
+1. Read `status` and `catalog` (plus `connect_current_chat`/`operating_guide` when paired). Keep actual IDs/revisions and repository/base; never invent IDs or reuse another chat's approval. An exported `operator_context` needs no CLI probe; paired preparation uses verified MCP tools. Never bypass connection, binding, readiness, revision, digest, or sandbox refusals.
 
-2. Publish the required plan record; no model `Orchestrator` is mandatory. Use exposed
-   `save_draft`/`publish` with actual schemas/IDs: fresh command key, `expected_revision: 0`,
-   actual profile/registry revision, one `worker` task with exact instruction/write paths
-   (at most 4096 UTF-8 bytes). Publish the returned plan ID and revision. Use the CLI only for
-   explicit trusted-local preview/record.
+2. Publish the required plan; no model `Orchestrator` is mandatory. Use exposed `save_draft`/`publish` with actual schemas/IDs: fresh command key, `expected_revision: 0`, actual profile/registry revision, one `worker` task with exact instruction/write paths (at most 4096 UTF-8 bytes). Publish the returned ID and revision. Use the CLI only for explicit preview/record.
 
-3. Prepare the exact `OperatorApprovalIntent` for the trusted-local route, replacing every
-   `<...>` and both revision zeros with actual positive plan and registry revisions; set
-   every budget to the presented scope.
-   `prepare` compiles the normalized `OperatorApprovalRequest` preview; preparation grants no
-   authority.
+3. Prepare the exact `OperatorApprovalIntent` for the trusted-local route: replace every `<...>` and both revision zeros with actual positive plan/registry revisions; set every budget to the presented scope. `prepare` compiles the normalized `OperatorApprovalRequest` preview; preparation grants no authority.
 
 ```json
 {
@@ -52,24 +40,10 @@ threadlane-context --context <CONTEXT_PATH> approve record --request <REQUEST_JS
 
 Any changed scope/model/effort/quota/repository/base/task identity needs a fresh preview.
 
-5. Run the guarded Worker: create a `worker` item, call `backlog_worker_start` with the
-   actual `expected_revision`, approval ID, and task ID; wait for the callback; pull and ACK
-   the returned batch and bounded `has_more` pages before waiting; call `backlog_worker_result`;
-   make one bounded physical and semantic
-   check; then complete or reject with the returned `item_snapshot.revision`, `execution_ref`,
-   and matching digests.
+5. Create a `worker` item and call `backlog_worker_start` once with actual revision, approval and task IDs. Wait for the callback. Follow the [compact closure](MCP-OPERATING-GUIDE.md#compact-ordinary-callback-closure): distinguish chat/control from dispatch-session bindings; validate real page ID/order/limits and event run ID. Events lack worker ID/task authority; validate those at the durable result against the original start receipt and item snapshot. Use only exposed tools and actual fields.
 
-   For a small delivery, prefer one trusted-local `threadlane inspect-delivery` call with the
-   actual root/base and allowed paths from authenticated worker evidence. It reports bounded
-   HEAD, changed-path, and per-file regular-file/UTF8/final-LF/size/SHA-256 facts. The
-   exact-HEAD helper requires `HEAD` to equal the expected base; only explicit small UTF-8
-   `--text-file` contents are included, marked untrusted, and off by default. It
-   never executes contents, refuses unsafe, staged, out-of-scope, special-file, or changing
-   evidence, and grants no execution, review, acceptance, or `Done` authority. When the verified
-   CLI is unavailable, make an equally bounded physical read through the available trusted-local
-   route and record its limits and refusal conditions.
+   If composition is available, set finite page/call budgets and a deadline. Sequentially pull/process/ACK advertised pages; false `has_more` ends pagination, then reconcile once via `backlog_worker_result`. Errors, unknown/stale/missing evidence or exhaustion return incomplete state with original mapping/last ACK/cursor. Resume advertised pages if needed. Without composition, use supported calls sequentially. Never poll, redispatch or invent IDs.
 
-   ACK only the actual returned `batch_id`; ACK is not acceptance. Batch ACK/result only when
-   the exposed tools permit, preserving ordering, refusals, and the actual batch ID. A
-   successful complete returns immutable `Done`: report it briefly, do not rewrite the
-   receipt. Keep a small durable Coworker item for multi-call work when useful.
+   Exact success precedes one bounded physical check: optional `threadlane inspect-delivery`, authenticated root/base and allowed paths. `HEAD` must equal the expected base; explicit small UTF-8 `--text-file` text is untrusted and off by default. Refuse unsafe/out-of-scope/ changing evidence; no authority is granted. An equally bounded physical read may record its limits.
+
+   Separately check item semantics, then complete or reject with `item_snapshot.revision`, original `execution_ref` and checked matching result/delivery digests. No auto-acceptance, parallel dependent mutations or unknown-effect replay. ACK only the real batch ID; ACK is not acceptance. Report immutable `Done` briefly; do not rewrite receipts.

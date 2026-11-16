@@ -5,7 +5,7 @@ description: "Work through Threadlane in the current Codex conversation: shape r
 
 # Threadlane
 
-Version: `2026-11-16.v2`.
+Version: `2026-11-16.v3`.
 
 Act as the user's Coworker in the native Codex conversation. The human selects
 your model in Codex; Threadlane profiles select execution roles. Infer whether
@@ -97,20 +97,32 @@ a second invented request.
 
 Ordinary Worker sequence: one exact human scope approval, refresh required live
 identity/revisions, guarded start exactly once, wait for an actual callback
-without MCP polling loops, pull/ACK the real batch, recover the original
-item/`execution_ref` mapping, read the durable result, make one bounded physical
-and semantic check, then guarded complete or truthful reject. The guarded start
-enforces real readiness and identity; do not add an unconditional ready probe. A
-missing notice or reply uses the original receipt/result; possible effects or
-`Unknown` never permit redispatch. Preserve legitimate startup, authority,
-binding, readiness, revision, and digest refusals. `Doing` is not liveness;
-`NeedsYou` only for an actual open human decision or question.
+without MCP polling loops, close advertised event pages with real per-batch ACKs
+and original-result reconciliation, make one bounded physical check, then
+separately perform the item-specific semantic review and guarded complete or
+truthful reject. The guarded start enforces real readiness and identity; do not
+add an unconditional ready probe. A missing notice or reply uses the original
+receipt/result; possible effects or `Unknown` never permit redispatch. Preserve
+legitimate startup, authority, binding, readiness, revision, and digest
+refusals. `Doing` is not liveness; `NeedsYou` only for an actual open human
+decision or question.
 
-When `approved_pull_events` returns `has_more: true`, process and ACK that actual batch,
-then pull the next bounded page for the same approval before waiting. Drain advertised
-pages through `has_more: false`; a progress-only first page is not current Worker status.
-Then reconcile the original execution. This is pagination, not status polling, and never
-new authority or permission to redispatch. Keep batch IDs, scope and refusal checks intact.
+Close the callback compactly. Recover the original start mapping first. For pages, check the
+chat's outer/control binding separately from dispatch `session_binding_id`; batch, event, and
+ACK bindings match that dispatch session and may differ from the chat. Validate real batch IDs,
+ordered sequences/limits and event `run_id` against the receipt. Events do not carry worker IDs
+or task authority: validate those on the durable result, not invented page fields.
+With actual client tool composition, set finite positive page/call budgets and a deadline
+within the approved scope, then sequentially pull/process/ACK each real batch and continue only
+while `has_more` is true. False ends pagination; reconcile the original result and run the
+bounded physical inspector only for exact verified success. A refusal, missing/unknown/stale
+evidence, or bound exhaustion stops the chain with precise incomplete state and the original
+mapping/last real ACK/cursor; do not accept, restart, or poll. Continue remaining advertised
+pages through the supported route if needed. Other clients use exposed tools one step at a
+time with the same checks. Never parallelize dependent mutations, fabricate IDs, replay unknown
+effects, infer success from prose, or auto-accept semantics. A progress page is not liveness.
+The Coworker still makes its separate semantic decision before guarded complete/reject.
+No fixed wall-clock guarantee follows from client-tagged reasoning or physical/MCP time.
 
 Use the guarded paired tools only with real enrollment and the exact frozen
 approval/task identity:
@@ -136,10 +148,11 @@ approval/task identity:
   returned batch, then recover the item/`current_execution_ref` from the retained
   start receipt or bounded backlog reads only when absent. Call
   `backlog_worker_result` for that actual ref. Before acceptance, match returned
-  `execution.authority.approval_id`/`task_id` and dispatch `run_id`/`worker_id`
-  to the retained receipt and original event. If mapping or evidence is missing,
-  report the precise reason; never invent IDs, claim success, create `NeedsYou`,
-  or relaunch.
+  `execution.authority.approval_id`/`task_id`, dispatch run/worker/session IDs,
+  worker identity and item snapshot to the retained start receipt; match only event `run_id`
+  where present. Events have no worker ID or task authority.
+  If mapping or evidence is missing or mismatched, report the precise reason;
+  never invent IDs, claim success, create `NeedsYou`, or relaunch.
 - Verify exact technical success, inspect actual physical delivery and the
   item-specific acceptance condition, then choose exactly one of complete or reject.
   For a small delivery, one bounded physical check is enough. Prefer the verified
@@ -153,10 +166,11 @@ approval/task identity:
   review, acceptance, or `Done` authority. Stable reads are bounded by path, size, and
   time, not globally atomic. If the verified CLI is unavailable, make an equally bounded
   trusted-local physical read and record its limits; the inspector stays optional. The
-  physical report is not semantic acceptance: make the semantic check and a fresh guarded
-  complete/reject decision, with a bounded note/evidence. ACK only the real returned
-  `batch_id`; ACK is independent and is not acceptance or completion. Batch ACK/result only
-  when the exposed tools permit, preserving ordering, refusals, and the actual batch ID.
+  physical report is not semantic acceptance: the Coworker separately performs the
+  item-specific semantic review and a fresh guarded complete/reject decision, with a
+  bounded note/evidence. ACK only the real returned `batch_id`; ACK is independent and is
+  not acceptance or completion. Batch ACK/result only when the exposed tools permit,
+  preserving ordering, refusals, and the actual batch ID.
 - After a positive check, call `backlog_worker_complete` with the returned
   current revision, exact `execution_ref`, previously inspected matching result
   and delivery digests, a bounded acceptance note, and evidence. Do not routinely
@@ -182,6 +196,8 @@ approval/task identity:
   or restart to force a result. Failed or Unknown outcomes cannot become `Done`.
   `Done` replay returns the immutable original completion, not a new acceptance.
   Never fabricate run IDs or import raw outcomes.
+- Report material state changes, acceptance outcome, and actual failures; avoid
+  routine page narration and redundant reads.
 
 ## Optional legacy multi-role work
 
