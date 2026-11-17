@@ -46,7 +46,7 @@ fn join_path_env(dirs: &[PathBuf]) -> OsString {
 }
 
 #[test]
-fn version_command_templates_are_fixed_and_preserve_catalog_probe_templates() {
+fn version_command_templates_are_separate_from_fixed_catalog_probe_templates() {
     assert_eq!(
         version_command_template(&ToolAdapter::CodexCli),
         Some(&["--version"][..])
@@ -77,10 +77,10 @@ fn version_command_templates_are_fixed_and_preserve_catalog_probe_templates() {
         None
     );
 
-    // Full catalog probe templates remain untouched.
+    // Full catalog probes are explicit and use their own fixed arguments.
     assert_eq!(
         probe_command_template(&ToolAdapter::CodexCli),
-        Some(&["debug", "models", "--bundled"][..])
+        Some(&["debug", "models"][..])
     );
     assert_eq!(
         probe_command_template(&ToolAdapter::OpencodeV2),

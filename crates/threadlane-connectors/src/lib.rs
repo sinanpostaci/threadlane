@@ -11,7 +11,7 @@
 //!   - **Explicit full catalog/login probes** ([`probe_tool`], [`probe_tool_with_options`]) only
 //!     execute when explicitly requested by the operator, never on passive UI page load, and never
 //!     invoke a shell or model inference:
-//!     - `codex_cli`: `debug models --bundled` and `login status`
+//!     - `codex_cli`: `debug models` (Codex-managed refresh and bundled fallback) and `login status`
 //!     - `opencode_v2`: `api --standalone model.list` (standalone v2.2 catalog with per-model
 //!       variants; never v1 `--verbose`/`--provider`)
 //!     - `antigravity`: `models`
@@ -34,7 +34,7 @@
 //!   subprocess.
 //! - **Distinct availability vs authentication and runtime entitlement**: `availability == "found"`
 //!   proves only that a valid executable exists on disk, and discovered catalog models/efforts
-//!   reflect installed CLI metadata rather than verified account routes or runtime subscription
+//!   reflect CLI-reported metadata rather than verified account routes or runtime subscription
 //!   entitlement. Unverified CLI authentication states remain `"unknown"`, and models without
 //!   evidenced catalog efforts leave `efforts` empty with `allow_no_effort: true`.
 //! - **Bounded process-group supervision**: Enforces bounded timeouts (10s for full probes, 3s for
@@ -44,7 +44,7 @@
 //!   with zero plaintext fallback, zero ambient token migration, and zero secret exposure in
 //!   `Debug`, `Display`, or serialized errors.
 
-/// Trusted native-launcher XDG environment restoration for external CLI child processes.
+/// Trusted native-launcher environment restoration for external CLI child processes.
 pub mod cli_environment;
 /// Static current-Codex-desktop bundle and stable Nix profile CLI discovery.
 pub mod codex_installation;
@@ -592,15 +592,19 @@ gemini-4-argon-labelonly\tGemini 4 Argon LabelOnly (High)
     }
 
     #[tokio::test]
-    async fn probe_codex_cli_runs_fixed_templates_and_redacts_raw_output() {
+    async fn probe_codex_cli_loads_current_visible_models_and_redacts_raw_output() {
         let temp = TempDir::new().expect("tempdir");
         let script = write_executable_script(
             temp.path(),
             "fake-codex",
             r#"#!/bin/sh
-if [ "$1" = "debug" ] && [ "$2" = "models" ] && [ "$3" = "--bundled" ] && [ $# -eq 3 ]; then
+if [ "$1" = "debug" ] && [ "$2" = "models" ] && [ $# -eq 2 ]; then
   cat <<'EOF'
-{"models":[{"slug":"gpt-5.4","display_name":"GPT-5.4","supported_reasoning_levels":[{"effort":"high"}],"default_reasoning_level":"high","visibility":"list"},{"slug":"hidden-model","display_name":"Hidden","supported_reasoning_levels":[],"default_reasoning_level":null,"visibility":"hide"}]}
+{"models":[
+  {"slug":"gpt-6.2-sol","display_name":"GPT-6.2-Sol","supported_reasoning_levels":[{"effort":"low"},{"effort":"max"},{"effort":"ultra"}],"default_reasoning_level":"low","visibility":"list"},
+  {"slug":"gpt-6.2-astra","display_name":"GPT-6.2-Astra","supported_reasoning_levels":[{"effort":"low"},{"effort":"max"},{"effort":"ultra"}],"default_reasoning_level":"low","visibility":"list"},
+  {"slug":"hidden-model","display_name":"Hidden","supported_reasoning_levels":[],"default_reasoning_level":null,"visibility":"hide"}
+]}
 EOF
   exit 0
 fi
@@ -618,8 +622,12 @@ exit 2
         assert_eq!(probe.tool_id, "codex");
         assert_eq!(probe.availability, AVAILABILITY_FOUND);
         assert_eq!(probe.auth_status, AUTH_STATUS_AUTHENTICATED);
-        assert_eq!(probe.models.len(), 1);
-        assert_eq!(probe.models[0].id, "gpt-5.4");
+        assert_eq!(probe.models.len(), 2);
+        for (model, id) in probe.models.iter().zip(["gpt-6.2-sol", "gpt-6.2-astra"]) {
+            assert_eq!(model.id, id);
+            assert_eq!(model.model_arg, id);
+            assert_eq!(model.efforts, ["low", "max", "ultra"]);
+        }
         assert!(!probe.message.contains("user@example.com"));
         assert!(!probe.message.contains("bearer-secret-token-xyz"));
     }

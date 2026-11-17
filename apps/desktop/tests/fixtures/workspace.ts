@@ -13,6 +13,7 @@ import type {
 import type {
   DesktopToolVersionsSnapshot,
   RegistrySnapshot,
+  ToolProbe,
 } from '../../src/registry/types.ts';
 import type { TrayCloseBehavior, TrayPreferencesResponse } from '../../src/tray-model.ts';
 import type { DesktopSnapshot, ToolStatus } from '../../src/types.ts';
@@ -4261,6 +4262,8 @@ export interface RecordedTauriInvocation {
   atMs: number;
 }
 
+type ToolProbeFixtureReply = ToolProbe | { error: { code: string; message: string } };
+
 export interface InstallWorkspaceTauriOptions {
   workspaceSnapshot?: WorkspaceSnapshot;
   registrySnapshot?: RegistrySnapshot;
@@ -4268,6 +4271,7 @@ export interface InstallWorkspaceTauriOptions {
   windowLabel?: 'main' | 'tray';
   trayPreferences?: TrayPreferencesResponse;
   initialLocalStorage?: Record<string, string>;
+  toolProbeReplies?: Record<string, ToolProbeFixtureReply[]>;
 }
 
 interface BrowserHarnessWindow extends Window {
@@ -4341,6 +4345,7 @@ export async function installWorkspaceTauriFixture(
       toolStatus: ToolStatus[];
       codexSetup: CodexSetupReport;
       desktopBridge: DesktopSnapshot;
+      toolProbeReplies: Record<string, ToolProbeFixtureReply[]>;
     }) => {
       const storageInitMarker = '__threadlane_test_storage_seeded__';
       try {
@@ -4367,6 +4372,7 @@ export async function installWorkspaceTauriFixture(
 
       const cloneJson = <T,>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
       let currentRegistry: RegistrySnapshot = cloneJson(seed.registrySnapshot);
+      const toolProbeReplies = cloneJson(seed.toolProbeReplies);
 
       const applyRegistryChangeFixture = (safeArgs: Record<string, unknown>): unknown => {
         const expectedRevision = Number(safeArgs.expectedRevision);
@@ -4644,6 +4650,14 @@ export async function installWorkspaceTauriFixture(
               return cloneJson(currentRegistry);
             case 'desktop_registry_apply':
               return applyRegistryChangeFixture(safeArgs);
+            case 'desktop_probe_tool': {
+              const reply = toolProbeReplies[String(safeArgs.toolId)]?.shift();
+              if (!reply) {
+                throw { code: 'unsupported_test_command', message: 'Unexpected tool catalog probe.' };
+              }
+              if ('error' in reply) throw reply.error;
+              return reply;
+            }
             case 'desktop_tool_versions':
               return cloneJson(seed.toolVersions);
             case 'desktop_tool_status':
@@ -4779,6 +4793,7 @@ export async function installWorkspaceTauriFixture(
       toolStatus,
       codexSetup,
       desktopBridge,
+      toolProbeReplies: options.toolProbeReplies ?? {},
     },
   );
 

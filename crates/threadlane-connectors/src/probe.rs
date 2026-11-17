@@ -97,7 +97,7 @@ impl AdapterKind {
 
     const fn primary_probe_args(self) -> Option<&'static [&'static str]> {
         match self {
-            Self::CodexCli => Some(&["debug", "models", "--bundled"]),
+            Self::CodexCli => Some(CODEX_CATALOG_ARGS),
             Self::OpencodeV2 => Some(&["api", "--standalone", "model.list"]),
             Self::Antigravity => Some(&["models"]),
             Self::Git => Some(&["--version"]),
@@ -107,6 +107,8 @@ impl AdapterKind {
         }
     }
 }
+
+const CODEX_CATALOG_ARGS: &[&str] = &["debug", "models"];
 
 /// Returns the fixed, shell-free CLI argument template used to probe a [`ToolAdapter`],
 /// or `None` for API adapters that never spawn a CLI process.
@@ -198,11 +200,12 @@ async fn probe_codex_cli(
     executable: &Path,
     timeout: Duration,
 ) -> Result<ToolProbe, ConnectorError> {
-    let catalog_out =
-        run_bounded_probe_command(executable, &["debug", "models", "--bundled"], timeout).await?;
+    // Codex refreshes its account catalog on this explicit probe and can fall back
+    // to its bundled catalog when live metadata is unavailable.
+    let catalog_out = run_bounded_probe_command(executable, CODEX_CATALOG_ARGS, timeout).await?;
     if catalog_out.exit_code != Some(0) {
         return Err(ConnectorError::ProbeFailed(
-            "Codex bundled model catalog command exited with a non-zero status.",
+            "Codex model catalog command exited with a non-zero status.",
         ));
     }
     let models = parse_codex_bundled_models(tool_id, &catalog_out.stdout)?;
@@ -213,13 +216,13 @@ async fn probe_codex_cli(
 
     let message = match auth_status {
         AUTH_STATUS_AUTHENTICATED => {
-            "Codex CLI executable found and bundled catalog metadata parsed; login status is authenticated (does not prove runtime model entitlement)."
+            "Codex CLI executable found and model catalog metadata parsed; login status is authenticated (does not prove runtime model entitlement)."
         }
         AUTH_STATUS_UNAUTHENTICATED => {
-            "Codex CLI executable found and bundled catalog metadata parsed; login status is unauthenticated."
+            "Codex CLI executable found and model catalog metadata parsed; login status is unauthenticated."
         }
         _ => {
-            "Codex CLI executable found and bundled catalog metadata parsed; authentication status and runtime model entitlement are unknown."
+            "Codex CLI executable found and model catalog metadata parsed; authentication status and runtime model entitlement are unknown."
         }
     };
 

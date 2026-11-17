@@ -197,7 +197,7 @@ fn extract_effort_from_value(val: &Value) -> Result<Option<String>, ConnectorErr
     }
 }
 
-/// Parses `codex debug models --bundled` JSON output into [`ModelDefinition`] items.
+/// Parses the JSON catalog from `codex debug models` (live or bundled) into [`ModelDefinition`] items.
 ///
 /// Reads `models[].slug`, `display_name`, `supported_reasoning_levels[].effort`,
 /// `default_reasoning_level`, and `visibility`, filtering out hidden catalog entries
@@ -210,12 +210,12 @@ pub fn parse_codex_bundled_models(
     let trimmed = raw_json.trim();
     if trimmed.is_empty() {
         return Err(ConnectorError::ParseError(
-            "Codex bundled model catalog output was empty.",
+            "Codex model catalog output was empty.",
         ));
     }
 
     let parsed: Value = serde_json::from_str(trimmed).map_err(|_| {
-        ConnectorError::ParseError("Codex bundled model catalog output was not valid JSON.")
+        ConnectorError::ParseError("Codex model catalog output was not valid JSON.")
     })?;
 
     let items = match &parsed {
@@ -223,13 +223,13 @@ pub fn parse_codex_bundled_models(
             map.get("models")
                 .and_then(Value::as_array)
                 .ok_or(ConnectorError::ParseError(
-                    "Codex bundled model catalog JSON did not contain a 'models' array.",
+                    "Codex model catalog JSON did not contain a 'models' array.",
                 ))?
         }
         Value::Array(arr) => arr,
         _ => {
             return Err(ConnectorError::ParseError(
-                "Codex bundled model catalog JSON root must be an object or array.",
+                "Codex model catalog JSON root must be an object or array.",
             ));
         }
     };

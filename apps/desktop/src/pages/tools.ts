@@ -1330,8 +1330,12 @@ export class ToolsPage {
     const refreshBtn = this.button(
       this.discoveryLoading ? 'Refreshing…' : 'Refresh tools',
       () => {
-        if (this.onRefreshDiscovery) {
-          this.onRefreshDiscovery();
+        this.onRefreshDiscovery?.();
+        this.onRecheckVersions?.();
+        for (const tool of snapshot.tools) {
+          if (tool.enabled && providerFor(tool.adapter) === null && this.openPickers.has(tool.id)) {
+            void this.probe(tool);
+          }
         }
       },
       'discovery-refresh',
@@ -1340,7 +1344,7 @@ export class ToolsPage {
     );
     refreshBtn.dataset.action = 'refresh-tools';
     refreshBtn.dataset.focus = 'discovery-refresh';
-    refreshBtn.setAttribute('aria-label', 'Refresh discovery');
+    refreshBtn.setAttribute('aria-label', 'Refresh tools');
 
     const { tools: primaryTools, duplicates: duplicateGroups } = projectToolRegistrations(
       snapshot.tools,
@@ -1413,7 +1417,7 @@ export class ToolsPage {
             { className: 'aq-note aq-tools-empty' },
             this.discoveryLoading
               ? 'Checking local PATH for supported CLIs…'
-              : 'No tools are registered yet. Refresh discovery to check local PATH or click Add custom or API tool.'
+              : 'No tools are registered yet. Refresh tools to check local PATH or click Add custom or API tool.'
           )
         : h(
             'div',
@@ -4111,23 +4115,23 @@ export class ToolsPage {
   }
 
   private async probe(tool: ToolDefinition): Promise<void> {
-    if (this.disposed || this.pending.has(`probe:${tool.id}`)) return;
+    const key = `probe:${tool.id}`;
+    if (this.disposed || this.pending.has(key)) return;
     this.openPickers.add(tool.id);
     const state = this.probeState(tool.id);
     state.loading = true;
     state.error = null;
     state.result = null;
-    this.selections.delete(`probe:${tool.id}`);
-    this.pending.add(`probe:${tool.id}`);
+    this.pending.add(key);
     this.refresh();
     try {
       const result = await desktop_probe_tool({ toolId: tool.id });
-      if (!this.disposed) {
+      if (!this.disposed && this.probes.get(tool.id) === state) {
         state.result = result;
         if (this.openPickers.has(tool.id)) {
-          this.selections.set(`probe:${tool.id}`, new Set());
+          this.selection(key, result.models);
         } else {
-          this.selections.delete(`probe:${tool.id}`);
+          this.selections.delete(key);
         }
       }
     } catch (err) {
@@ -4137,7 +4141,7 @@ export class ToolsPage {
     } finally {
       if (!this.disposed) {
         state.loading = false;
-        this.pending.delete(`probe:${tool.id}`);
+        this.pending.delete(key);
         this.refresh();
       }
     }

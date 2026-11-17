@@ -166,6 +166,7 @@ let
 
     postFixup = ''
       wrapProgram "$out/bin/threadlane-desktop" \
+        --run 'export THREADLANE_CLI_LD_LIBRARY_PATH="''${LD_LIBRARY_PATH-}"' \
         --prefix PATH : "${lib.makeBinPath [ threadlane ]}" \
         --prefix LD_LIBRARY_PATH : "${lib.makeLibraryPath desktopLibs}" \
         --prefix GIO_EXTRA_MODULES : "${pkgs.glib-networking}/lib/gio/modules" \

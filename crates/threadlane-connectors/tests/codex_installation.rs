@@ -106,7 +106,7 @@ if [ "$1" = "--version" ] && [ $# -eq 1 ]; then
   echo "codex-cli {cli_version}"
   exit 0
 fi
-if [ "$1" = "debug" ] && [ "$2" = "models" ] && [ "$3" = "--bundled" ] && [ $# -eq 3 ]; then
+if [ "$1" = "debug" ] && [ "$2" = "models" ] && [ $# -eq 2 ]; then
   printf '{{"models":[{{"slug":"{model_slug}","display_name":"Model {model_slug}","supported_reasoning_levels":[{{"effort":"high"}}],"default_reasoning_level":"high","visibility":"list"}}]}}'
   exit 0
 fi
@@ -435,9 +435,10 @@ async fn automatic_full_probe_and_version_resolver_agree_on_none_target() {
     assert_eq!(probe.models[0].id, "gpt-5.4-active");
 
     let recorded_calls = fs::read_to_string(&active_bundle.cli_args_log).expect("read args log");
-    assert!(recorded_calls.contains("--version"));
-    assert!(recorded_calls.contains("debug models --bundled"));
-    assert!(recorded_calls.contains("login status"));
+    assert_eq!(
+        recorded_calls.lines().collect::<Vec<_>>(),
+        ["--version", "debug models", "login status"]
+    );
     assert!(!stale_bundle.cli_args_log.exists());
 }
 

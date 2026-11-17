@@ -1,4 +1,4 @@
-//! Trusted native-launcher XDG environment restoration for external CLI child processes.
+//! Trusted native-launcher environment restoration for external CLI child processes.
 //!
 //! When Threadlane's native preview launcher isolates the desktop GUI with private
 //! `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_CACHE_HOME`, and `XDG_STATE_HOME` directories,
@@ -9,9 +9,12 @@
 //! - [`THREADLANE_CLI_XDG_CACHE_HOME`]
 //! - [`THREADLANE_CLI_XDG_STATE_HOME`]
 //!
-//! [`restore_cli_environment`] applies only this four-variable whitelist to a child
-//! [`std::process::Command`] without mutating the parent process environment or touching
-//! unrelated variables (`HOME`, `CODEX_HOME`, `PATH`, Git settings, or credentials).
+//! The Nix desktop wrapper also saves the original `LD_LIBRARY_PATH` before adding
+//! desktop libraries. CLI children use their own packaged libraries and the caller's
+//! original search path.
+//!
+//! [`restore_cli_environment`] applies only these launcher markers to a child
+//! [`std::process::Command`], leaving the parent and unrelated variables alone.
 
 use std::ffi::OsString;
 use std::process::Command;
@@ -28,22 +31,25 @@ pub const THREADLANE_CLI_XDG_CACHE_HOME: &str = "THREADLANE_CLI_XDG_CACHE_HOME";
 /// Native launcher marker capturing the caller's original `XDG_STATE_HOME`.
 pub const THREADLANE_CLI_XDG_STATE_HOME: &str = "THREADLANE_CLI_XDG_STATE_HOME";
 
-const XDG_MARKER_WHITELIST: [(&str, &str); 4] = [
+/// Nix desktop wrapper marker capturing the caller's original `LD_LIBRARY_PATH`.
+pub const THREADLANE_CLI_LD_LIBRARY_PATH: &str = "THREADLANE_CLI_LD_LIBRARY_PATH";
+
+const CLI_ENV_MARKERS: [(&str, &str); 5] = [
     (THREADLANE_CLI_XDG_CONFIG_HOME, "XDG_CONFIG_HOME"),
     (THREADLANE_CLI_XDG_DATA_HOME, "XDG_DATA_HOME"),
     (THREADLANE_CLI_XDG_CACHE_HOME, "XDG_CACHE_HOME"),
     (THREADLANE_CLI_XDG_STATE_HOME, "XDG_STATE_HOME"),
+    (THREADLANE_CLI_LD_LIBRARY_PATH, "LD_LIBRARY_PATH"),
 ];
 
-/// Restores the caller's original XDG base-directory environment variables on a child
-/// [`Command`] using the four trusted `THREADLANE_CLI_XDG_*` native-launcher markers,
-/// and removes all four marker variables from the child environment.
+/// Restores the caller's original XDG base directories and library search path on
+/// a child [`Command`] using the trusted launcher markers.
 ///
-/// For each whitelisted `(marker, xdg_var)` pair:
-/// - **Marker absent** (`None`): leaves `xdg_var` unchanged in the child command.
-/// - **Marker present and empty**: removes `xdg_var` from the child command so the spawned
+/// For each whitelisted `(marker, variable)` pair:
+/// - **Marker absent** (`None`): leaves the variable unchanged in the child command.
+/// - **Marker present and empty**: removes the variable from the child command so the spawned
 ///   process falls back to its normal user default.
-/// - **Marker present and non-empty**: sets `xdg_var` in the child command to the exact
+/// - **Marker present and non-empty**: sets the variable in the child command to the exact
 ///   original [`OsString`] value.
 /// - Always removes `marker` from the child command environment (even when absent in the
 ///   parent) for defense-in-depth.
@@ -58,12 +64,12 @@ fn restore_cli_environment_with<F>(command: &mut Command, mut lookup_marker: F)
 where
     F: FnMut(&str) -> Option<OsString>,
 {
-    for (marker_key, xdg_key) in XDG_MARKER_WHITELIST {
+    for (marker_key, variable) in CLI_ENV_MARKERS {
         if let Some(original_value) = lookup_marker(marker_key) {
             if original_value.is_empty() {
-                command.env_remove(xdg_key);
+                command.env_remove(variable);
             } else {
-                command.env(xdg_key, original_value);
+                command.env(variable, original_value);
             }
         }
         command.env_remove(marker_key);
@@ -129,7 +135,7 @@ mod tests {
             Some(&Some(OsString::from("/home/user/.local/state-original")))
         );
 
-        for (marker_key, _) in XDG_MARKER_WHITELIST {
+        for (marker_key, _) in CLI_ENV_MARKERS {
             assert_eq!(
                 envs.get(OsStr::new(marker_key)),
                 Some(&None),
@@ -141,7 +147,7 @@ mod tests {
     #[test]
     fn removes_child_xdg_vars_when_markers_are_present_and_empty() {
         let mut markers = BTreeMap::new();
-        for (marker_key, _) in XDG_MARKER_WHITELIST {
+        for (marker_key, _) in CLI_ENV_MARKERS {
             markers.insert(marker_key, OsString::new());
         }
 
@@ -154,7 +160,7 @@ mod tests {
         restore_cli_environment_with(&mut cmd, |key| markers.get(key).cloned());
 
         let envs = collect_command_envs(&cmd);
-        for (marker_key, xdg_key) in XDG_MARKER_WHITELIST {
+        for (marker_key, xdg_key) in CLI_ENV_MARKERS {
             assert_eq!(
                 envs.get(OsStr::new(xdg_key)),
                 Some(&None),
@@ -184,11 +190,42 @@ mod tests {
         assert_eq!(envs.get(OsStr::new("XDG_CACHE_HOME")), None);
         assert_eq!(envs.get(OsStr::new("XDG_STATE_HOME")), None);
 
-        for (marker_key, _) in XDG_MARKER_WHITELIST {
+        for (marker_key, _) in CLI_ENV_MARKERS {
             assert_eq!(
                 envs.get(OsStr::new(marker_key)),
                 Some(&None),
                 "absent marker {marker_key} must still be removed from child env"
+            );
+        }
+    }
+
+    #[test]
+    fn restores_or_removes_desktop_library_path_only_when_the_wrapper_saved_it() {
+        for (saved, expected) in [
+            (None, Some("/explicit/child/lib")),
+            (Some(""), None),
+            (
+                Some("/original/lib:/another/lib"),
+                Some("/original/lib:/another/lib"),
+            ),
+        ] {
+            let mut cmd = Command::new("codex");
+            cmd.env("LD_LIBRARY_PATH", "/explicit/child/lib");
+            restore_cli_environment_with(&mut cmd, |key| {
+                if key == THREADLANE_CLI_LD_LIBRARY_PATH {
+                    saved.map(OsString::from)
+                } else {
+                    None
+                }
+            });
+            let envs = collect_command_envs(&cmd);
+            assert_eq!(
+                envs.get(OsStr::new("LD_LIBRARY_PATH")),
+                Some(&expected.map(OsString::from))
+            );
+            assert_eq!(
+                envs.get(OsStr::new(THREADLANE_CLI_LD_LIBRARY_PATH)),
+                Some(&None)
             );
         }
     }
@@ -206,6 +243,8 @@ mod tests {
             THREADLANE_CLI_XDG_DATA_HOME,
             THREADLANE_CLI_XDG_CACHE_HOME,
             THREADLANE_CLI_XDG_STATE_HOME,
+            "LD_LIBRARY_PATH",
+            THREADLANE_CLI_LD_LIBRARY_PATH,
         ];
         let parent_before: Vec<(&str, Option<OsString>)> = parent_keys
             .into_iter()
@@ -245,6 +284,7 @@ mod tests {
                 THREADLANE_CLI_XDG_DATA_HOME.to_owned(),
                 THREADLANE_CLI_XDG_CACHE_HOME.to_owned(),
                 THREADLANE_CLI_XDG_STATE_HOME.to_owned(),
+                THREADLANE_CLI_LD_LIBRARY_PATH.to_owned(),
             ]
         );
 
