@@ -2275,7 +2275,8 @@ test('worker execution status keeps dispatch, checking, guarded Done, rejection,
     },
   });
   assert.equal(checking.summary.statusKey, 'checking');
-  assert.equal(checking.summary.statusLabel, 'Checking');
+  assert.equal(checking.summary.statusLabel, 'Awaiting check');
+  assert.equal(checking.summary.tone, 'neutral');
 
   const completed = selectExecutionFixture(identity, {
     item: {
@@ -3746,4 +3747,388 @@ test('raw duplicate reconciliation never resurrects a quarantined execution iden
   ).get(resolveMessageScrollChatKey(identity))!;
   assert.equal(indexEntry.isWorking, false);
   assert.equal(indexEntry.waitingForHuman, false);
+});
+
+test('passive technical-success pending acceptance renders as Awaiting check/neutral until matching guarded Done, rejection, or cancellation', () => {
+  const identity = makeIdentity('bnd_alpha_awaiting_check', UUID_ALPHA);
+  const itemId = 'blg_awaiting_check';
+  const execRef = 'exec-awaiting-1';
+  const reservedEvent = makeBacklogEvent({
+    event_id: `${itemId}:2`,
+    sequence: 2,
+    item_id: itemId,
+    revision: 2,
+    action: 'worker_reserved',
+    status: 'doing',
+    execution_ref: execRef,
+    recorded_at_ms: 1_100,
+  });
+  const attachedEvent = makeBacklogEvent({
+    event_id: `${itemId}:3`,
+    sequence: 3,
+    item_id: itemId,
+    revision: 3,
+    action: 'worker_execution_attached',
+    status: 'doing',
+    execution_ref: execRef,
+    recorded_at_ms: 1_200,
+  });
+  const outcomeEvent = makeBacklogEvent({
+    event_id: `${itemId}:4`,
+    sequence: 4,
+    item_id: itemId,
+    revision: 4,
+    action: 'worker_outcome_recorded',
+    status: 'doing',
+    execution_ref: execRef,
+    outcome: 'success',
+    recorded_at_ms: 4_500,
+  });
+
+  for (const acceptance of ['pending_review', 'ready_for_review', null] as const) {
+    const pendingSelection = selectWorkspaceChatWork(
+      [
+        makeChatWork(identity, {
+          items: [
+            makeBacklogItem({
+              item_id: itemId,
+              binding_id: identity.binding_id,
+              kind: 'worker',
+              status: 'doing',
+              revision: 4,
+              current_execution_ref: execRef,
+            }),
+          ],
+          events: [reservedEvent, attachedEvent, outcomeEvent],
+          worker_presence: [
+            makePresence({ item_id: itemId, execution_ref: execRef }),
+          ],
+          worker_executions: [
+            makeExecution(identity.binding_id, {
+              item_id: itemId,
+              execution_ref: execRef,
+              worker_status: 'completed',
+              outcome: 'success',
+              acceptance,
+              started_at_ms: 1_000,
+              finished_at_ms: 4_500,
+              duration_ms: 3_500,
+            }),
+          ],
+        }),
+      ],
+      identity,
+    );
+
+    const pendingViews = buildChatWorkEventViews(pendingSelection);
+    assert.equal(pendingViews.length, 3);
+    assert.equal(pendingViews[0]!.workerExecution, null);
+    assert.equal(pendingViews[1]!.workerExecution, null);
+    const pendingSummary = pendingViews[2]!.workerExecution!;
+    assert.equal(pendingSummary.statusKey, 'checking');
+    assert.equal(pendingSummary.statusLabel, 'Awaiting check');
+    assert.equal(pendingSummary.tone, 'neutral');
+    assert.deepEqual(pendingSummary.duration, { kind: 'final', durationMs: 3_500 });
+
+    // Passive awaiting-check keeps terminal duration and never turns into active Working.
+    for (const nowMs of [CHAT_WORK_NOW_MS, CHAT_WORK_NOW_MS + 60_000]) {
+      const footer = resolveChatWorkExecutionFooterState(pendingSummary, nowMs);
+      assert.equal(footer.statusKey, 'checking');
+      assert.equal(footer.statusLabel, 'Awaiting check');
+      assert.equal(footer.tone, 'neutral');
+      assert.equal(footer.durationLabel, '3.5s');
+    }
+  }
+
+  // Transition to matching guarded Done updates only the current footer while preserving immutable history.
+  const completedEvent = makeBacklogEvent({
+    event_id: `${itemId}:5`,
+    sequence: 5,
+    item_id: itemId,
+    revision: 5,
+    action: 'completed',
+    status: 'done',
+    execution_ref: execRef,
+    recorded_at_ms: 5_000,
+  });
+  const doneSelection = selectWorkspaceChatWork(
+    [
+      makeChatWork(identity, {
+        items: [
+          makeBacklogItem({
+            item_id: itemId,
+            binding_id: identity.binding_id,
+            kind: 'worker',
+            status: 'done',
+            revision: 5,
+            current_execution_ref: execRef,
+            completion_note: 'Verified delivery and acceptance condition.',
+            completion_evidence: 'SHA-256 matched expected artifact.',
+            completed_at_ms: 5_000,
+          }),
+        ],
+        events: [reservedEvent, attachedEvent, outcomeEvent, completedEvent],
+        worker_executions: [
+          makeExecution(identity.binding_id, {
+            item_id: itemId,
+            execution_ref: execRef,
+            worker_status: 'completed',
+            outcome: 'success',
+            acceptance: 'accepted',
+            started_at_ms: 1_000,
+            finished_at_ms: 4_500,
+            duration_ms: 3_500,
+          }),
+        ],
+      }),
+    ],
+    identity,
+  );
+  const doneViews = buildChatWorkEventViews(doneSelection);
+  assert.deepEqual(
+    doneViews.map((view) => [
+      view.eventId,
+      view.actionLabel,
+      view.recordedAtMs,
+      view.outcome,
+      view.workerExecution !== null,
+    ]),
+    [
+      [`${itemId}:2`, 'Preparing', 1_100, null, false],
+      [`${itemId}:3`, 'Worker dispatched', 1_200, null, false],
+      [`${itemId}:4`, 'Awaiting check', 4_500, 'success', false],
+      [`${itemId}:5`, 'Done', 5_000, null, true],
+    ],
+  );
+  const doneFooter = resolveChatWorkExecutionFooterState(
+    doneViews[3]!.workerExecution!,
+    CHAT_WORK_NOW_MS,
+  );
+  assert.equal(doneFooter.statusKey, 'completed');
+  assert.equal(doneFooter.statusLabel, 'Completed');
+  assert.equal(doneFooter.tone, 'success');
+  assert.equal(doneFooter.durationLabel, '3.5s');
+
+  // Rejection and cancellation never auto-promote to Completed even if item status is marked done.
+  const rejectedSelection = selectWorkspaceChatWork(
+    [
+      makeChatWork(identity, {
+        items: [
+          makeBacklogItem({
+            item_id: itemId,
+            binding_id: identity.binding_id,
+            kind: 'worker',
+            status: 'done',
+            revision: 5,
+            current_execution_ref: execRef,
+          }),
+        ],
+        events: [outcomeEvent],
+        worker_executions: [
+          makeExecution(identity.binding_id, {
+            item_id: itemId,
+            execution_ref: execRef,
+            worker_status: 'completed',
+            outcome: 'success',
+            acceptance: 'rejected',
+            started_at_ms: 1_000,
+            finished_at_ms: 3_200,
+            duration_ms: 2_200,
+          }),
+        ],
+      }),
+    ],
+    identity,
+  );
+  const rejectedFooter = resolveChatWorkExecutionFooterState(
+    buildChatWorkEventViews(rejectedSelection)[0]!.workerExecution!,
+    CHAT_WORK_NOW_MS,
+  );
+  assert.equal(rejectedFooter.statusKey, 'rejected');
+  assert.equal(rejectedFooter.statusLabel, 'Rejected');
+  assert.equal(rejectedFooter.tone, 'danger');
+  assert.equal(rejectedFooter.durationLabel, '2.2s');
+
+  const cancelledSelection = selectWorkspaceChatWork(
+    [
+      makeChatWork(identity, {
+        items: [
+          makeBacklogItem({
+            item_id: itemId,
+            binding_id: identity.binding_id,
+            kind: 'worker',
+            status: 'done',
+            revision: 5,
+            current_execution_ref: execRef,
+          }),
+        ],
+        events: [outcomeEvent],
+        worker_executions: [
+          makeExecution(identity.binding_id, {
+            item_id: itemId,
+            execution_ref: execRef,
+            worker_status: 'cancelled',
+            outcome: null,
+            acceptance: null,
+            started_at_ms: 1_000,
+            finished_at_ms: 2_800,
+            duration_ms: 1_800,
+          }),
+        ],
+      }),
+    ],
+    identity,
+  );
+  const cancelledFooter = resolveChatWorkExecutionFooterState(
+    buildChatWorkEventViews(cancelledSelection)[0]!.workerExecution!,
+    CHAT_WORK_NOW_MS,
+  );
+  assert.equal(cancelledFooter.statusKey, 'cancelled');
+  assert.equal(cancelledFooter.statusLabel, 'Cancelled');
+  assert.equal(cancelledFooter.tone, 'neutral');
+  assert.equal(cancelledFooter.durationLabel, '1.8s');
+});
+
+test('mismatched execution ref never auto-completes on item Done and keeps human-input/liveness separation', () => {
+  const identity = makeIdentity('bnd_alpha_mismatch_guard', UUID_ALPHA);
+  const item = makeBacklogItem({
+    item_id: 'blg_mismatch_guard',
+    binding_id: identity.binding_id,
+    kind: 'worker',
+    status: 'done',
+    revision: 6,
+    current_execution_ref: 'exec-current',
+    completion_note: 'Accepted current attempt.',
+    completion_evidence: 'Verified current execution.',
+    completed_at_ms: 6_000,
+  });
+  const blockedItem = makeBacklogItem({
+    item_id: 'blg_blocked_passive',
+    binding_id: identity.binding_id,
+    kind: 'worker',
+    status: 'blocked',
+    revision: 2,
+    blocked_reason: 'Acceptance failed on earlier attempt.',
+    current_execution_ref: 'exec-blocked',
+  });
+  const doingItem = makeBacklogItem({
+    item_id: 'blg_doing_no_presence',
+    binding_id: identity.binding_id,
+    kind: 'worker',
+    status: 'doing',
+    revision: 3,
+    current_execution_ref: 'exec-doing-no-presence',
+  });
+
+  const selection = selectWorkspaceChatWork(
+    [
+      makeChatWork(identity, {
+        items: [item, blockedItem, doingItem],
+        events: [
+          makeBacklogEvent({
+            event_id: 'blg_mismatch_guard:3',
+            sequence: 3,
+            item_id: item.item_id,
+            revision: 3,
+            action: 'worker_outcome_recorded',
+            status: 'doing',
+            execution_ref: 'exec-prior',
+            outcome: 'success',
+            recorded_at_ms: 2_500,
+          }),
+          makeBacklogEvent({
+            event_id: 'blg_mismatch_guard:6',
+            sequence: 6,
+            item_id: item.item_id,
+            revision: 6,
+            action: 'completed',
+            status: 'done',
+            execution_ref: 'exec-current',
+            recorded_at_ms: 6_000,
+          }),
+        ],
+        worker_executions: [
+          makeExecution(identity.binding_id, {
+            item_id: item.item_id,
+            execution_ref: 'exec-prior',
+            worker_status: 'completed',
+            outcome: 'success',
+            acceptance: 'pending_review',
+            started_at_ms: 1_000,
+            finished_at_ms: 2_500,
+            duration_ms: 1_500,
+          }),
+          makeExecution(identity.binding_id, {
+            item_id: item.item_id,
+            execution_ref: 'exec-current',
+            worker_status: 'completed',
+            outcome: 'success',
+            acceptance: 'accepted',
+            started_at_ms: 4_000,
+            finished_at_ms: 5_900,
+            duration_ms: 1_900,
+          }),
+        ],
+      }),
+    ],
+    identity,
+  );
+
+  const views = buildChatWorkEventViews(selection);
+  const priorFooter = resolveChatWorkExecutionFooterState(
+    views[0]!.workerExecution!,
+    CHAT_WORK_NOW_MS,
+  );
+  assert.equal(priorFooter.statusKey, 'checking');
+  assert.equal(priorFooter.statusLabel, 'Awaiting check');
+  assert.equal(priorFooter.tone, 'neutral');
+  assert.equal(priorFooter.durationLabel, '1.5s');
+
+  const currentFooter = resolveChatWorkExecutionFooterState(
+    views[1]!.workerExecution!,
+    CHAT_WORK_NOW_MS,
+  );
+  assert.equal(currentFooter.statusKey, 'completed');
+  assert.equal(currentFooter.statusLabel, 'Completed');
+  assert.equal(currentFooter.tone, 'success');
+  assert.equal(currentFooter.durationLabel, '1.9s');
+
+  // Doing without fresh Worker presence and Blocked/awaiting-check never infer Working or NeedsYou.
+  const withoutSample = evaluateChatWorkLiveness(selection, null, {
+    nowMs: CHAT_WORK_NOW_MS,
+  });
+  assert.equal(withoutSample.isWorking, false);
+  assert.equal(withoutSample.workingAgentCount, 0);
+  assert.equal(withoutSample.waitingForHuman, false);
+  assert.equal(withoutSample.statusLabel, null);
+  assert.equal(withoutSample.statusTone, 'neutral');
+
+  const idleSample = evaluateChatWorkLiveness(
+    selection,
+    makeNativeSample(identity, 'idle'),
+    { nowMs: CHAT_WORK_NOW_MS },
+  );
+  assert.equal(idleSample.isWorking, false);
+  assert.equal(idleSample.waitingForHuman, false);
+  assert.equal(idleSample.statusLabel, 'Codex chat');
+  assert.equal(idleSample.statusTone, 'neutral');
+
+  // Only a fresh native waiting sample produces NeedsYou; stale samples clear it.
+  const freshWaiting = evaluateChatWorkLiveness(
+    selection,
+    makeNativeSample(identity, 'waiting_for_input'),
+    { nowMs: CHAT_WORK_NOW_MS },
+  );
+  assert.equal(freshWaiting.waitingForHuman, true);
+  assert.equal(freshWaiting.isWorking, false);
+  assert.equal(freshWaiting.statusLabel, 'Waiting for you in Codex');
+  assert.equal(freshWaiting.statusTone, 'attention');
+
+  const staleWaiting = evaluateChatWorkLiveness(
+    selection,
+    makeNativeSample(identity, 'waiting_for_input'),
+    { nowMs: CHAT_WORK_NOW_MS + 60_000 },
+  );
+  assert.equal(staleWaiting.waitingForHuman, false);
+  assert.equal(staleWaiting.isWorking, false);
 });

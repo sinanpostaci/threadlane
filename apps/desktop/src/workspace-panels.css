@@ -1680,7 +1680,6 @@
   color: var(--cw-fg-subtle);
 }
 
-.tl-cw-execution[data-worker-status="checking"] .tl-cw-execution-status,
 .tl-cw-execution[data-worker-status="cancelling"] .tl-cw-execution-status {
   color: var(--cw-attention);
 }

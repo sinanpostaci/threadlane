@@ -2598,7 +2598,7 @@ test.describe('Compact Worker execution metadata footer', () => {
     await closeBacklogWithEscape(page);
   });
 
-  test('shows technical success as Checking and only accepted guarded completion as Completed with the recorded duration and model', async ({
+  test('shows technical success as Awaiting check and only accepted guarded completion as Completed with the recorded duration and model', async ({
     page,
   }) => {
     await installWorkerMetadata(page);
@@ -2619,10 +2619,46 @@ test.describe('Compact Worker execution metadata footer', () => {
       model: /^Argon$/i,
       effort: /^High$/i,
       status: 'checking',
-      label: 'Checking',
+      label: 'Awaiting check',
       duration: { kind: 'final', text: /^55s$/i },
     });
     expect(checkingStatus).toBe('checking');
+
+    // Awaiting check is neutral pending work, never an attention warning color.
+    const checkingStatusEl = checkingFooter.locator(
+      '[data-worker-execution-status="checking"]',
+    );
+    await expect(checkingStatusEl).toHaveCount(1);
+    const checkingStatusColors = await checkingStatusEl.evaluate((element) => {
+      const actualColor = getComputedStyle(element).color;
+      const surfaceRoot = element.closest('.tl-cw-root') ?? document.body;
+      const probe = document.createElement('span');
+      probe.setAttribute('aria-hidden', 'true');
+      probe.style.position = 'fixed';
+      probe.style.visibility = 'hidden';
+      probe.style.pointerEvents = 'none';
+      probe.style.color = 'var(--cw-fg-secondary)';
+      surfaceRoot.appendChild(probe);
+      try {
+        const neutralSecondaryColor = getComputedStyle(probe).color;
+        probe.style.color = 'var(--cw-attention)';
+        const attentionColor = getComputedStyle(probe).color;
+        return {
+          actualColor,
+          neutralSecondaryColor,
+          attentionColor,
+        };
+      } finally {
+        probe.remove();
+      }
+    });
+    expect(checkingStatusColors.neutralSecondaryColor).not.toBe('');
+    expect(checkingStatusColors.neutralSecondaryColor).not.toBe(
+      checkingStatusColors.attentionColor,
+    );
+    expect(checkingStatusColors.actualColor).toBe(
+      checkingStatusColors.neutralSecondaryColor,
+    );
 
     const acceptedRow = await resolveStreamEventRow(
       page,
@@ -2664,7 +2700,7 @@ test.describe('Compact Worker execution metadata footer', () => {
     await closeBacklogWithEscape(page);
     await expectNoNeedsYou(page);
 
-    // The accepted Done item stays terminal: the Checking attempt is a separate
+    // The accepted Done item stays terminal: the Awaiting check attempt is a separate
     // item and is not rendered as a Done or accepted result.
     await expect(
       checkingRow.getByText(MINIMAL_CHAT_ACCEPTED_COMPLETION_NOTE, { exact: true }),
@@ -3049,7 +3085,7 @@ test.describe('Compact Worker execution metadata footer', () => {
       model: /^Argon$/i,
       effort: /^High$/i,
       status: 'checking',
-      label: 'Checking',
+      label: 'Awaiting check',
       duration: { kind: 'final', text: /^55s$/i },
     });
     await expectNoNeedsYou(page);
@@ -3163,7 +3199,7 @@ test.describe('Compact Worker execution metadata footer', () => {
       model: /^Argon$/i,
       effort: /^High$/i,
       status: 'checking',
-      label: 'Checking',
+      label: 'Awaiting check',
       duration: { kind: 'final', text: /^55s$/i },
     });
     await expectNoNeedsYou(page);

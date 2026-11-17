@@ -1058,7 +1058,7 @@ const EXECUTION_STATUS_PRESENTATION: Readonly<
   Record<ChatWorkExecutionStatusKey, { label: string; tone: ChatWorkTone }>
 > = {
   completed: { label: 'Completed', tone: 'success' },
-  checking: { label: 'Checking', tone: 'attention' },
+  checking: { label: 'Awaiting check', tone: 'neutral' },
   rejected: { label: 'Rejected', tone: 'danger' },
   failed: { label: 'Failed', tone: 'danger' },
   timed_out: { label: 'Timed out', tone: 'danger' },
