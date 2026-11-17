@@ -1843,14 +1843,17 @@ async fn codex_advisory_intermediate_completed_agent_message_with_designated_out
     }))
     .expect("serialize final agent_message event");
 
+    let blank_line =
+        r#"{"type":"item.completed","item":{"id":"msg_empty","type":"agent_message","text":""}}"#;
+    let thread_start =
+        r#"{"type":"thread.started","thread_id":"01972d12-3456-7000-8000-000000000901"}"#;
+    let turn_start = r#"{"type":"turn.started"}"#;
+    let turn_end = r#"{"type":"turn.completed","usage":{"input_tokens":320,"cached_input_tokens":64,"output_tokens":95}}"#;
     let stream_file = temp.path().join("designated_final_stream.jsonl");
     fs::write(
         &stream_file,
         format!(
-            "{}\n{}\n{intermediate_line}\n{final_line}\n{}\n",
-            r#"{"type":"thread.started","thread_id":"01972d12-3456-7000-8000-000000000901"}"#,
-            r#"{"type":"turn.started"}"#,
-            r#"{"type":"turn.completed","usage":{"input_tokens":320,"cached_input_tokens":64,"output_tokens":95}}"#,
+            "{thread_start}\n{turn_start}\n{intermediate_line}\n{blank_line}\n{final_line}\n{turn_end}\n"
         ),
     )
     .expect("write stream fixture");
@@ -1926,8 +1929,8 @@ exit 0
         response.source,
         AdvisoryResponseSource::CodexAgentMessageTurnCompleted
     );
-    assert_eq!(response.framing.response_line_number, 4);
-    assert_eq!(response.framing.terminal_line_number, 5);
+    assert_eq!(response.framing.response_line_number, 5);
+    assert_eq!(response.framing.terminal_line_number, 6);
     assert_eq!(response.framing.item_id.as_deref(), Some("msg_final_2"));
     assert_eq!(
         response.framing.session_id.as_deref(),
@@ -1939,6 +1942,26 @@ exit 0
     assert_eq!(
         parsed_obj.get("outcome").and_then(|v| v.as_str()),
         Some("plan")
+    );
+
+    fs::write(
+        &stream_file,
+        format!(
+            "{thread_start}\n{turn_start}\n{intermediate_line}\n{final_line}\n{blank_line}\n{turn_end}\n"
+        ),
+    )
+    .expect("write blank terminal stream fixture");
+    let blank_terminal =
+        run_advisory_worker_with_structured_result(&spec, AdvisoryResponseBudget::default())
+            .await
+            .expect("run CodexCli advisory worker with blank terminal agent_message");
+    assert!(!blank_terminal.has_verified_response());
+    assert_eq!(
+        blank_terminal
+            .response_error
+            .as_ref()
+            .map(|error| error.code),
+        Some(AdvisoryResponseErrorCode::ConflictingTerminalOutput)
     );
 }
 

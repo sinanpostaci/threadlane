@@ -2131,12 +2131,13 @@ impl AdvisoryResponseCollector {
                             return;
                         };
                         if raw_text.trim().is_empty() {
-                            self.latch_error(AdvisoryResponseError::at_line(
+                            // Keep blank items in stream order. A later captured final
+                            // item can match, while a blank terminal item still fails.
+                            self.record_codex_legacy_stream_error(AdvisoryResponseError::at_line(
                                 AdvisoryResponseErrorCode::MissingResponseOutput,
                                 line_number,
                                 "Codex `item.text` is empty",
                             ));
-                            return;
                         }
 
                         let byte_count = raw_text.len();
