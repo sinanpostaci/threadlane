@@ -973,7 +973,19 @@ export function formatFriendlyTool(executor: ObservationExecutor | null): string
   return capitalizeLabel(humanizeRecordedLabel(tool));
 }
 
-/** Choose one evidence source for the compact value; never combine mismatched receipts. */
+/** Choose the model and effort from the same recorded evidence source. */
+export function resolveRecordedExecutorSelection(
+  executor: ObservationExecutor | null | undefined
+): { model: string | null; effort: string | null } {
+  const observed = trimOrNull(executor?.observed_model);
+  return {
+    model: observed ?? trimOrNull(executor?.requested_model),
+    effort: observed !== null
+      ? trimOrNull(executor?.observed_effort)
+      : trimOrNull(executor?.requested_effort),
+  };
+}
+
 export function projectExecutorDisplay(
   executor: ObservationExecutor | null | undefined
 ): ActivityExecutorDisplay {
@@ -985,12 +997,7 @@ export function projectExecutorDisplay(
         'Executor: Threadlane MCP · local. Local MCP operation; model and effort are not applicable.',
     };
   }
-  const observed = trimOrNull(executor?.observed_model);
-  const requested = trimOrNull(executor?.requested_model);
-  const model = observed ?? requested;
-  const effort = observed !== null
-    ? trimOrNull(executor?.observed_effort)
-    : trimOrNull(executor?.requested_effort);
+  const { model, effort } = resolveRecordedExecutorSelection(executor);
   const detail = `${formatExecutorSummary(executor)}. Model ${formatRequestedObserved(
     executor?.requested_model, executor?.observed_model
   )}. Effort ${formatRequestedObserved(

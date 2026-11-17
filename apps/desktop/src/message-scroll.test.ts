@@ -4,6 +4,7 @@ import test from 'node:test';
 import {
   DEFAULT_BOTTOM_FOLLOW_THRESHOLD_PX,
   MAX_CHAT_WORK_EXECUTIONS,
+  buildChatActivityEventViews,
   buildChatWorkBacklogGroups,
   buildChatWorkEventViews,
   buildChatWorkExecutionSummaries,
@@ -1484,6 +1485,125 @@ test('chat_work events order by actual history sequence, keep stable scoped keys
   assert.equal(views[3]!.outcome, null);
   assert.equal(new Set(views.map((event) => event.key)).size, views.length);
   assert.ok(views.every((event) => event.key.startsWith(`${resolveMessageScrollChatKey(identity)}\u0000`)));
+});
+
+test('scoped planning requests update the same stream row without changing backlog order', () => {
+  const identity = makeIdentity('bnd_planning', UUID_ALPHA);
+  const chat = makeChatSummary(identity);
+  const selection = selectWorkspaceChatWork(
+    [makeChatWork(identity, {
+      events: [
+        makeBacklogEvent({ event_id: 'backlog-created', sequence: 1, recorded_at_ms: 1_000 }),
+        makeBacklogEvent({ event_id: 'backlog-done', sequence: 2, recorded_at_ms: 3_000 }),
+      ],
+    })],
+    identity,
+  );
+  const advisor = makeObservationRequest({
+    id: 'advisor-completed',
+    operation: 'coworker.planning.advisor',
+    job_id: 'planning-job',
+    binding_id: identity.binding_id,
+    thread_uuid: identity.thread_uuid,
+    started_at_ms: 1_500,
+    finished_at_ms: 3_500,
+    updated_at_ms: 3_500,
+    duration_ms: 2_000,
+  });
+  const advisorStart: ObservationRequest = {
+    ...advisor,
+    state: 'unknown',
+    finished_at_ms: null,
+    updated_at_ms: 1_500,
+    duration_ms: null,
+  };
+  const orchestrator = {
+    ...advisor,
+    id: 'orchestrator-completed',
+    operation: 'coworker.planning.orchestrator',
+    started_at_ms: 4_000,
+    finished_at_ms: null,
+    updated_at_ms: 4_500,
+    duration_ms: null,
+  };
+  const observation: ObservationSnapshot = {
+    schema_version: 1,
+    generated_at_ms: 5_000,
+    sources: [{
+      id: identity.source_id,
+      label: 'Threadlane',
+      project_path: identity.canonical_project_scope,
+      availability: 'available',
+      message: null,
+    }],
+    jobs: [
+      makeObservationJob({
+        id: 'planning-job',
+        binding_id: identity.binding_id,
+        thread_uuid: identity.thread_uuid,
+        project_path: identity.canonical_project_scope,
+      }),
+      makeObservationJob({
+        id: 'other-project-job',
+        binding_id: identity.binding_id,
+        thread_uuid: identity.thread_uuid,
+        project_path: '/home/dev/repos/other-worktree',
+      }),
+    ],
+    requests: [
+      orchestrator,
+      advisorStart,
+      advisor,
+      advisorStart,
+      { ...advisorStart, id: 'no-start', started_at_ms: null },
+      {
+        ...advisorStart,
+        id: 'outcome-unknown',
+        started_at_ms: 4_800,
+        finished_at_ms: 4_900,
+        updated_at_ms: 4_900,
+      },
+      { ...advisor, id: 'wrong-chat', thread_uuid: UUID_BETA },
+      { ...advisor, id: 'wrong-project', job_id: 'other-project-job' },
+      { ...advisor, id: 'wrong-source', source_id: 'other-source' },
+      { ...advisor, id: 'unscoped', job_id: null, binding_id: null },
+      { ...advisor, id: 'cli-bookkeeping', operation: 'flow.coworker-planning.start-command' },
+    ],
+    next_cursor: null,
+    has_more: false,
+    jobs_has_more: false,
+    warnings: [],
+  };
+
+  const views = buildChatActivityEventViews(selection, chat, { observation, job_histories: [] });
+  assert.deepEqual(views.map((view) => view.eventId), [
+    'backlog-created',
+    'planning:advisor-completed',
+    'backlog-done',
+    'planning:orchestrator-completed',
+    'planning:outcome-unknown',
+  ]);
+  const [completed, olderRecord, unknown] = views.filter((view) => 'planningRole' in view);
+  assert.equal(completed?.status, 'completed');
+  assert.equal(completed?.recordedAtMs, 3_500);
+  assert.equal(completed?.durationLabel, '2s');
+  assert.equal(olderRecord?.recordedAtMs, 4_500);
+  assert.equal(olderRecord?.durationLabel, null);
+  assert.equal(unknown?.actionLabel, 'Outcome unknown');
+  assert.equal(unknown?.durationLabel, '100ms');
+
+  const started = buildChatActivityEventViews(selection, chat, {
+    observation: { ...observation, requests: [advisorStart] },
+    job_histories: [],
+  }).find((view) => 'planningRole' in view);
+  assert.equal(started?.key, completed?.key);
+  assert.equal(started?.status, 'started');
+  assert.equal(started?.tone, 'neutral');
+  assert.equal(started?.durationLabel, null);
+  assert.deepEqual(
+    views.filter((view) => !('planningRole' in view)),
+    buildChatWorkEventViews(selection),
+  );
 });
 
 test('chat_work liveness requires exact fresh worker presence and never uses Doing, Blocked, failure, or awaiting-check as Working/NeedsYou', () => {

@@ -52,8 +52,8 @@ import {
   BACKLOG_STATUS_LABELS,
   DEFAULT_BOTTOM_FOLLOW_THRESHOLD_PX,
   backlogStatusTone,
+  buildChatActivityEventViews,
   buildChatWorkBacklogGroups,
-  buildChatWorkEventViews,
   computeAnchorScrollTop,
   createMessageScrollStore,
   doesJobBelongToChat,
@@ -108,6 +108,7 @@ import {
   projectActivityFeed,
   projectRequestExecutorDisplay,
   projectVisibleTimeline,
+  resolveRecordedExecutorSelection,
 } from './pages/activity-feed-model.ts';
 import type {
   ActivityFeedScope,
@@ -3492,8 +3493,8 @@ export function WorkspaceChatWorkSurface({
     [error, isStale, nativeSample, referenceNowMs, selection, snapshot],
   );
   const eventViews = useMemo(
-    () => buildChatWorkEventViews(selection),
-    [selection],
+    () => buildChatActivityEventViews(selection, chat, snapshot),
+    [selection, chat, snapshot],
   );
   const backlogGroups = useMemo(
     () => buildChatWorkBacklogGroups(selection),
@@ -3863,6 +3864,46 @@ export function WorkspaceChatWorkSurface({
         >
           <ol ref={listRef} className="tl-cw-stream-list">
             {eventViews.map((event) => {
+              if ('planningRole' in event) {
+                const { model, effort } = resolveRecordedExecutorSelection(event.executor);
+                const showExecutor = model !== null || effort !== null;
+                return (
+                  <li
+                    key={event.key}
+                    className="tl-cw-event"
+                    data-tone={event.tone}
+                    data-item-id={event.eventId}
+                    data-chat-event-key={event.key}
+                    data-chat-event-id={event.eventId}
+                    data-planning-role={event.planningRole}
+                    data-planning-status={event.status}
+                  >
+                    <div className="tl-cw-event-meta">
+                      <ChatWorkStatusDot tone={event.tone} />
+                      <span className="tl-cw-event-action">{event.actionLabel}</span>
+                      <span className="tl-cw-event-time">
+                        {formatRelativeTimestamp(event.recordedAtMs, referenceNowMs)}
+                      </span>
+                    </div>
+                    <p className="tl-cw-event-title">{event.title}</p>
+                    {showExecutor || event.durationLabel !== null ? (
+                      <div className="tl-cw-execution">
+                        {showExecutor ? (
+                          <ProviderBrandBadge
+                            brand={resolveProviderBrandKey(event.executor?.tool ?? event.executor?.provider, model)}
+                            size={12}
+                          />
+                        ) : null}
+                        {model !== null ? <span className="tl-cw-execution-model">{model}</span> : null}
+                        {effort !== null ? <span className="tl-cw-execution-effort">{effort}</span> : null}
+                        {event.durationLabel !== null ? (
+                          <span className="tl-cw-execution-duration">{event.durationLabel}</span>
+                        ) : null}
+                      </div>
+                    ) : null}
+                  </li>
+                );
+              }
               const note =
                 event.note !== null && event.note.trim() !== event.title.trim()
                   ? event.note
@@ -3958,7 +3999,7 @@ export function WorkspaceChatWorkSurface({
                   {selection.unavailableReason ?? 'Chat activity is unavailable.'}
                 </span>
               ) : (
-                <span>No backlog activity is recorded for this chat yet.</span>
+                <span>No activity is recorded for this chat yet.</span>
               )}
             </div>
           ) : null}

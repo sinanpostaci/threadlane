@@ -1,5 +1,6 @@
 import { expect, test, type Locator, type Page } from '@playwright/test';
 
+import type { ObservationRequest } from '../src/observation/types.ts';
 import {
   advanceWorkspaceGeneratedAtFixture,
   appendChatWorkEventFixture,
@@ -1631,6 +1632,108 @@ test.describe('Minimal chat stream, archive, scroll, and read-only backlog drawe
       0,
     );
   });
+});
+
+test('keeps scoped planning rows and Active chats consistent across refresh and reopen', async ({ page }) => {
+  const base = buildMinimalChatWorkspaceSnapshot();
+  const startedAt = FIXTURE_BASE_NOW_MS - 3_000;
+  const advisor: ObservationRequest = {
+    source_id: CHAT_ALPHA_IDENTITY.source_id,
+    id: 'obsreq_advisor_fixture',
+    job_id: null,
+    parent_request_id: null,
+    title: 'Advisor consultation',
+    operation: 'coworker.planning.advisor',
+    project_label: 'Threadlane',
+    binding_id: CHAT_ALPHA_IDENTITY.binding_id,
+    thread_uuid: CHAT_ALPHA_IDENTITY.thread_uuid,
+    thread_label: null,
+    state: 'unknown',
+    started_at_ms: startedAt,
+    finished_at_ms: null,
+    updated_at_ms: startedAt,
+    duration_ms: null,
+    actor: { label: null, role: 'coworker', source: null, model: null, effort: null, evidence: 'unknown' },
+    executor: {
+      tool: 'codex-cli', provider: 'codex_cli', role: 'advisor',
+      requested_model: 'gpt-6.2-astra', observed_model: null,
+      requested_effort: 'max', observed_effort: null,
+    },
+    usage: null,
+    delivery: [],
+    children: [],
+    children_count: 0,
+    summary: null,
+  };
+  const orchestrator: ObservationRequest = {
+    ...advisor,
+    id: 'obsreq_orchestrator_fixture',
+    operation: 'coworker.planning.orchestrator',
+    executor: { ...advisor.executor!, role: 'orchestrator', requested_model: 'gpt-6.2-sol', requested_effort: 'xhigh' },
+    started_at_ms: startedAt + 1_000,
+    updated_at_ms: startedAt + 1_000,
+    state: 'running',
+  };
+  const snapshotWithRequests = (atMs: number, requests: ObservationRequest[]) => ({
+    ...base,
+    generated_at_ms: atMs,
+    observation: { ...base.observation, generated_at_ms: atMs, requests },
+  });
+  const started = snapshotWithRequests(FIXTURE_BASE_NOW_MS, [advisor, orchestrator]);
+  const controller = await installMinimal(page, undefined, { workspaceSnapshot: started });
+  const stream = streamScroller(page);
+  const planning = stream.locator('[data-planning-role]');
+  const advisorRow = planning.filter({ hasText: 'Advisor consultation' });
+  const advisorKey = await advisorRow.getAttribute('data-chat-event-key');
+  expect(advisorKey).toBeTruthy();
+  await expect(planning.locator('.tl-cw-event-action')).toHaveText(['Started', 'Started']);
+  await expect(planning.locator('.tl-cw-execution-duration')).toHaveCount(0);
+  await expect(workspaceSection(page).locator('[data-agent-role="advisor"], [data-agent-role="orchestrator"]')).toHaveCount(0);
+
+  const finishedAt = FIXTURE_BASE_NOW_MS + 3_000;
+  const finished = snapshotWithRequests(finishedAt, [
+    advisor,
+    { ...advisor, state: 'completed', finished_at_ms: finishedAt, updated_at_ms: finishedAt, duration_ms: 6_000 },
+    { ...orchestrator, state: 'failed', finished_at_ms: finishedAt, updated_at_ms: finishedAt },
+    {
+      ...orchestrator,
+      id: 'obsreq_cancelled_fixture',
+      state: 'cancelled',
+      operation: 'coworker.planning.architect',
+      started_at_ms: finishedAt - 2_000,
+      finished_at_ms: finishedAt,
+      updated_at_ms: finishedAt,
+      executor: null,
+    },
+  ]);
+  await controller.setWorkspaceSnapshot(finished);
+  await triggerWorkspaceRefresh(page);
+  await expect(planning.locator('.tl-cw-event-action')).toHaveText(['Completed', 'Failed', 'Cancelled']);
+  await expect(planning.locator('.tl-cw-execution-duration')).toHaveText(['6s', '5s', '2s']);
+  await expect(planning.first()).toHaveAttribute('data-chat-event-key', advisorKey!);
+  await expect(planning.first().getByText('gpt-6.2-astra', { exact: true })).toBeVisible();
+  await expect(planning.nth(1).getByText('xhigh', { exact: true })).toBeVisible();
+  await expectNoNeedsYouInScope(workspaceSection(page));
+
+  await selectChat(page, 'Release Verification Gate');
+  await expect(planning).toHaveCount(0);
+  await lifecycleFilterControl(page, 'archived').click();
+  await expect(sidebar(page).getByText('Workspace UI Contract', { exact: true })).toHaveCount(0);
+  await lifecycleFilterControl(page, 'active').click();
+  await selectChat(page, 'Workspace UI Contract');
+  await expect(planning).toHaveCount(3);
+  expect(await controller.readArchivePreferencesRaw()).toBeNull();
+
+  const reopened = await page.context().newPage();
+  const reloadedController = await installMinimal(reopened, { width: 520, height: 750 }, {
+    workspaceSnapshot: finished,
+  });
+  const reopenedRows = streamScroller(reopened).locator('[data-planning-role]');
+  await expect(reopenedRows.locator('.tl-cw-event-action')).toHaveText(['Completed', 'Failed', 'Cancelled']);
+  await expect(reopenedRows.first()).toHaveAttribute('data-chat-event-key', advisorKey!);
+  await expectNoHorizontalOverflow(reopened);
+  expect(await reloadedController.readArchivePreferencesRaw()).toBeNull();
+  await reopened.close();
 });
 
 test.describe('Workspace liveness, attention, and committed completion', () => {

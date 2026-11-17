@@ -1,4 +1,5 @@
 import type {
+  ObservationExecutor,
   ObservationJob,
   ObservationRequest,
   ObservationSnapshot,
@@ -7,6 +8,7 @@ import type { ActivityFeedScope } from './pages/activity-feed-model.ts';
 import {
   formatDurationMs,
   formatFriendlyModel,
+  projectDuration,
 } from './pages/activity-feed-model.ts';
 import {
   WORKSPACE_SAMPLE_STALE_THRESHOLD_MS,
@@ -23,6 +25,7 @@ import type {
   WorkspaceJobHistory,
   WorkspaceMessageItem,
   WorkspaceNativeSample,
+  WorkspaceSnapshot,
   WorkspaceWorkerExecution,
 } from './workspace-contract.ts';
 
@@ -966,6 +969,39 @@ export interface ChatWorkEventView {
   workerExecution: ChatWorkExecutionSummaryView | null;
 }
 
+type PlanningRole = 'advisor' | 'orchestrator';
+type PlanningEventStatus = 'started' | 'completed' | 'failed' | 'cancelled' | 'unknown';
+
+const PLANNING_OPERATION_ROLES = new Map<string, PlanningRole>([
+  ['coworker.planning.advisor', 'advisor'],
+  ['coworker.planning.architect', 'advisor'],
+  ['coworker.planning.orchestrator', 'orchestrator'],
+]);
+
+const PLANNING_EVENT_STATUS: Readonly<Record<PlanningEventStatus, { label: string; tone: ChatWorkTone }>> = {
+  started: { label: 'Started', tone: 'neutral' },
+  completed: { label: 'Completed', tone: 'success' },
+  failed: { label: 'Failed', tone: 'danger' },
+  cancelled: { label: 'Cancelled', tone: 'neutral' },
+  unknown: { label: 'Outcome unknown', tone: 'neutral' },
+};
+
+interface PlanningEventView {
+  key: string;
+  eventId: string;
+  sortAtMs: number;
+  recordedAtMs: number;
+  planningRole: PlanningRole;
+  title: string;
+  status: PlanningEventStatus;
+  actionLabel: string;
+  tone: ChatWorkTone;
+  executor: ObservationExecutor | null;
+  durationLabel: string | null;
+}
+
+type ChatActivityEventView = ChatWorkEventView | PlanningEventView;
+
 function humanizeChatWorkAction(action: string): string {
   const words = action.replace(/[_-]+/g, ' ').trim();
   if (words.length === 0) {
@@ -1456,6 +1492,96 @@ export function buildChatWorkEventViews(
     }
   }
   return views;
+}
+
+/** Merge recorded planning activity without changing the backlog sequence. */
+export function buildChatActivityEventViews(
+  selection: WorkspaceChatWorkSelection,
+  chat: WorkspaceChatSummary | null,
+  snapshot: Pick<WorkspaceSnapshot, 'observation' | 'job_histories'> | null,
+): ChatActivityEventView[] {
+  const backlogEvents = buildChatWorkEventViews(selection);
+  if (!chat || !snapshot || selection.chatKey === null) {
+    return backlogEvents;
+  }
+
+  const context = { observation: snapshot.observation, jobHistories: snapshot.job_histories };
+  const planningEvents = new Map<string, PlanningEventView>();
+  for (const request of snapshot.observation.requests) {
+    const planningRole = PLANNING_OPERATION_ROLES.get(request.operation);
+    if (
+      planningRole === undefined ||
+      !doesObservationRequestMatchChat(request, chat, context)
+    ) {
+      continue;
+    }
+
+    const startedAtMs = cleanOptionalPositiveTimestamp(request.started_at_ms);
+    const finishedAtMs = cleanOptionalPositiveTimestamp(request.finished_at_ms);
+    const state = request.state;
+    let status: PlanningEventStatus;
+    if (state === 'completed' || state === 'failed' || state === 'cancelled') {
+      status = state;
+    } else if (finishedAtMs !== null) {
+      status = 'unknown';
+    } else if (startedAtMs !== null) {
+      // A journal entry records a start. It does not keep the process live.
+      status = 'started';
+    } else {
+      continue;
+    }
+
+    const eventId = `planning:${request.id}`;
+    const isTerminal = status !== 'started';
+    const recordedAtMs = (isTerminal ? finishedAtMs : startedAtMs) ??
+      cleanOptionalPositiveTimestamp(request.updated_at_ms) ?? 0;
+    const previous = planningEvents.get(eventId);
+    if (previous) {
+      const previousIsTerminal = previous.status !== 'started';
+      if (previousIsTerminal && !isTerminal) {
+        continue;
+      }
+      if (previousIsTerminal === isTerminal && previous.recordedAtMs >= recordedAtMs) {
+        continue;
+      }
+    }
+
+    const duration = isTerminal ? projectDuration(request) : null;
+    planningEvents.set(eventId, {
+      key: `${selection.chatKey}\u0000${eventId}`,
+      eventId,
+      // A terminal update keeps the original row position when the start is known.
+      sortAtMs: startedAtMs ?? recordedAtMs,
+      recordedAtMs,
+      planningRole,
+      title: planningRole === 'advisor' ? 'Advisor consultation' : 'Orchestrator technical planning',
+      status,
+      actionLabel: PLANNING_EVENT_STATUS[status].label,
+      tone: PLANNING_EVENT_STATUS[status].tone,
+      executor: request.executor,
+      durationLabel: duration && duration.kind !== 'unknown' ? duration.text : null,
+    });
+  }
+
+  if (planningEvents.size === 0) {
+    return backlogEvents;
+  }
+  const orderedPlanningEvents = [...planningEvents.values()].sort(
+    (a, b) => a.sortAtMs - b.sortAtMs || compareStringsUtf8(a.eventId, b.eventId),
+  );
+  const events: ChatActivityEventView[] = [];
+  let nextPlanningEvent = 0;
+  for (const event of backlogEvents) {
+    while (
+      nextPlanningEvent < orderedPlanningEvents.length &&
+      orderedPlanningEvents[nextPlanningEvent]!.sortAtMs < event.recordedAtMs
+    ) {
+      events.push(orderedPlanningEvents[nextPlanningEvent]!);
+      nextPlanningEvent += 1;
+    }
+    events.push(event);
+  }
+  return events.concat(orderedPlanningEvents.slice(nextPlanningEvent));
 }
 
 export interface ChatWorkBacklogItemView {
