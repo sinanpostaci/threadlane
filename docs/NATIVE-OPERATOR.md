@@ -28,7 +28,7 @@ Run `threadlane guide` to print the canonical versioned operating guide
 ([`docs/MCP-OPERATING-GUIDE.md`](MCP-OPERATING-GUIDE.md)) offline without network
 or supervisor access. When connected over MCP (`threadlane mcp` or enrolled
 `threadlane-native-mcp`), call the read-only `operating_guide` (`{}`) tool to
-fetch the same shared guide and version (`2026-11-15.v2`).
+fetch the same shared guide and version (`2026-11-16.v4`).
 
 Compaction detection and memory retention are not automatic. On initial
 connection, session resume, context uncertainty, or before external effects when
@@ -47,6 +47,39 @@ explicit readback test requires it. Legacy jobs additionally use
 a polling loop. The detailed legacy contracts are preserved in
 [`docs/MCP-LEGACY-OPERATING-GUIDE.md`](MCP-LEGACY-OPERATING-GUIDE.md) and are
 opt-in only.
+
+`threadlane closure-template` prints the opt-in ordinary callback helper as
+offline JSON (schema/version, source SHA-256, and the packaged JavaScript factory
+source). It needs no state directory, supervisor, provider, or network. Create the
+storage-only `worker` backlog item first with `backlog_create`; creation grants no
+authority. Prepare and privately retain its serializable capsule before
+`backlog_worker_start` without printing the JavaScript. Evaluate only that immutable
+packaged source in a fresh client JavaScript isolate with injected
+load/store/pull/ACK/result/inspect and optional complete callbacks; never evaluate
+event, provider, or filesystem text. The capsule keeps the legacy `read`/`doneView`
+core and adds the small `createOrdinaryClosureClient` helper. COPY the literal
+recipes and bind only their one typed object (`APPROVED_TASK_CONTEXT` before start,
+`ACCEPTANCE_CONTEXT` after the separate semantic decision); the callback recipe binds
+nothing. Never parse, compile, or evaluate Markdown or fences, and do not repeatedly
+inspect declarations. The runnable recipe parses the actual `exec_command`
+`{exit_code, output, session_id?}` wrapper; `text`/`store` return undefined, and `load`
+restores serialized data in a fresh isolate. The capsule JavaScript is never printed.
+`readStored()` rejects stale, mixed, or failed-prep state before any effect, retains
+every actual returned DTO in private evidence, checks cross-page cursor continuity,
+rejects an inner EventBatch above 49152 UTF-8 bytes or an invalid event `step_seq`
+before ACK, and returns only a compact view with identity, guard facts, verified event
+counts/ACK cursor, and exact physical text. `completeStored` repeats every current
+correlation/revision/ref/digest check before one guarded complete, retains completion
+intent and the exact receipt, and reuses only a matching validated retained Done.
+It accepts only a clean `exec_command` wrapper (exit `0`, no live session, complete
+output). Its read result is only `ready_for_semantic_review`; inspect the
+item-specific semantics separately, then use the existing guarded complete or reject.
+Its pure `doneView` formats a separately obtained Done receipt. After a validated Done,
+finish briefly without raw SDK introspection or repeat pull/ACK of the original notice;
+a genuinely new notice still needs supported actual recovery. The runnable client
+recipe is in the [MCP operating guide](MCP-OPERATING-GUIDE.md) and
+[`docs/ORDINARY-WORKER-CLOSURE.md`](ORDINARY-WORKER-CLOSURE.md). The ordinary
+supported-tool fallback remains valid.
 
 ## Setup and planning
 

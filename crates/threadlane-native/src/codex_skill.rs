@@ -23,7 +23,7 @@ use crate::error::{NativeError, NativeErrorCode};
 use crate::fs_safety::validate_absolute_no_symlink_components;
 
 /// Bundled Threadlane Codex skill version identifier.
-pub const THREADLANE_SKILL_VERSION: &str = "2026-11-16.v3";
+pub const THREADLANE_SKILL_VERSION: &str = "2026-11-16.v4";
 
 /// Directory and skill name for the bundled Threadlane Codex skill.
 pub const THREADLANE_SKILL_NAME: &str = "threadlane";
@@ -1901,6 +1901,8 @@ mod tests {
         assert_eq!(installed_skill_md, BUNDLED_SKILL_MD);
         assert!(installed_skill_md.contains("backlog_worker_reject"));
         assert!(installed_skill_md.contains("one of complete or reject"));
+        assert!(installed_skill_md.contains("49152"));
+        assert!(installed_skill_md.contains("step_seq"));
         assert_eq!(
             fs::read_to_string(&openai_yaml_path).expect("read openai.yaml"),
             BUNDLED_OPENAI_YAML

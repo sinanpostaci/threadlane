@@ -5,6 +5,7 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 
 use crate::client::{ScopedClient, SupervisorClient};
+use crate::closure_template::render_closure_template_json;
 use crate::codex::{CodexWakeupConfig, DEFAULT_CODEX_TIMEOUT_MS};
 use crate::delivery_inspection::{inspect_delivery, DeliveryInspectionRequest};
 use crate::error::Error;
@@ -152,6 +153,12 @@ pub enum Subcommands {
         #[arg(long = "text-file", alias = "text")]
         text_files: Vec<String>,
     },
+
+    /// Print the opt-in ordinary Worker callback closure template as offline JSON.
+    ///
+    /// Retain the returned serializable capsule privately before starting a Worker and never print
+    /// its packaged JavaScript into the human conversation.
+    ClosureTemplate,
 
     /// Print the versioned Threadlane MCP operating guide offline without network or supervisor access.
     Guide,
@@ -334,6 +341,10 @@ pub async fn run_cli(cli: Cli) -> Result<(), Error> {
                 ))
             }
         }
+        Subcommands::ClosureTemplate => {
+            println!("{}", render_closure_template_json()?);
+            Ok(())
+        }
         Subcommands::Guide => {
             print!("{}", render_operating_guide());
             Ok(())
@@ -414,6 +425,26 @@ mod tests {
             Cli::try_parse_from(["threadlane", "inspect-delivery"]).is_err(),
             "inspect-delivery must require --root and --expected-base"
         );
+    }
+
+    #[test]
+    fn cli_closure_template_parses_without_args_and_rejects_extra_arguments() {
+        let parsed = Cli::try_parse_from(["threadlane", "closure-template"])
+            .expect("`threadlane closure-template` must parse with no arguments");
+        assert!(matches!(parsed.command, Subcommands::ClosureTemplate));
+        assert!(
+            Cli::try_parse_from(["threadlane", "closure-template", "--unexpected"]).is_err(),
+            "`threadlane closure-template` must reject unexpected arguments"
+        );
+    }
+
+    #[tokio::test]
+    async fn cli_closure_template_executes_offline_without_state_dir() {
+        let parsed = Cli::try_parse_from(["threadlane", "closure-template"])
+            .expect("`threadlane closure-template` must parse");
+        run_cli(parsed)
+            .await
+            .expect("`threadlane closure-template` must succeed offline without state_dir");
     }
 
     #[tokio::test]

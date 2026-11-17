@@ -9,6 +9,8 @@
 pub mod cli;
 /// Authenticated local HTTP client and single-binding scoped client.
 pub mod client;
+/// Offline packaging for the opt-in ordinary Worker callback closure template.
+pub mod closure_template;
 /// Optional Codex queue wake-up bridge and argument construction.
 pub mod codex;
 /// Typed Coworker planning command wake-up context and bounded native Unix WebSocket notification API.
@@ -39,6 +41,12 @@ pub mod supervisor;
 pub mod workers;
 
 pub use client::{ScopedClient, SupervisorClient, MAX_CLIENT_RESPONSE_BYTES};
+pub use closure_template::{
+    closure_template_source_sha256, render_closure_template, render_closure_template_json,
+    ClosureTemplate, CLOSURE_TEMPLATE_FACTORY_NAME, CLOSURE_TEMPLATE_JAVASCRIPT,
+    CLOSURE_TEMPLATE_SCHEMA_VERSION, CLOSURE_TEMPLATE_SOURCE_PATH, CLOSURE_TEMPLATE_TOOL,
+    CLOSURE_TEMPLATE_VERSION,
+};
 pub use codex::{
     build_codex_queue_args, invoke_codex_wakeup, ApprovedSessionWakeupContext, CodexWakeupConfig,
     DEFAULT_CODEX_TIMEOUT_MS, MAX_CODEX_TIMEOUT_MS,

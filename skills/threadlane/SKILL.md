@@ -5,7 +5,7 @@ description: "Work through Threadlane in the current Codex conversation: shape r
 
 # Threadlane
 
-Version: `2026-11-16.v3`.
+Version: `2026-11-16.v4`.
 
 Act as the user's Coworker in the native Codex conversation. The human selects
 your model in Codex; Threadlane profiles select execution roles. Infer whether
@@ -110,19 +110,49 @@ decision or question.
 Close the callback compactly. Recover the original start mapping first. For pages, check the
 chat's outer/control binding separately from dispatch `session_binding_id`; batch, event, and
 ACK bindings match that dispatch session and may differ from the chat. Validate real batch IDs,
-ordered sequences/limits and event `run_id` against the receipt. Events do not carry worker IDs
-or task authority: validate those on the durable result, not invented page fields.
+ordered sequences/limits, cross-page continuity against the retained verified ACK cursor,
+duplicate event IDs, and event `run_id` against the receipt. Reject skipped/repeated ranges
+before ACK; a valid empty batch at the retained cursor remains processable. Events do not carry
+worker IDs or task authority: validate those on the durable result, not invented page fields.
 With actual client tool composition, set finite positive page/call budgets and a deadline
 within the approved scope, then sequentially pull/process/ACK each real batch and continue only
-while `has_more` is true. False ends pagination; reconcile the original result and run the
-bounded physical inspector only for exact verified success. A refusal, missing/unknown/stale
-evidence, or bound exhaustion stops the chain with precise incomplete state and the original
-mapping/last real ACK/cursor; do not accept, restart, or poll. Continue remaining advertised
-pages through the supported route if needed. Other clients use exposed tools one step at a
-time with the same checks. Never parallelize dependent mutations, fabricate IDs, replay unknown
-effects, infer success from prose, or auto-accept semantics. A progress page is not liveness.
-The Coworker still makes its separate semantic decision before guarded complete/reject.
-No fixed wall-clock guarantee follows from client-tagged reasoning or physical/MCP time.
+while `has_more` is true. Retain every actual start/page/ACK/result/inspect DTO in private
+evidence before validation; malformed ACK or callback failure keeps the original
+mapping/pending batch/last verified ACK/cursor. Check the deadline before and after awaited
+callbacks, including final inspection: keep late receipts, stop new effects, and never report
+ready after expiry. False ends pagination; reconcile the original result and run the bounded
+physical inspector only for exact verified success. Its actual `exec_command` wrapper requires
+exit `0`, no live session, and no truncated/omitted output. A refusal, transport `isError`,
+conflicting envelope copies, missing/unknown/stale evidence, or bound exhaustion stops the
+chain with precise incomplete state; do not accept, restart, or poll. Many clients expose the
+runnable `functions.exec` recipe in `docs/MCP-OPERATING-GUIDE.md`; other clients use exposed
+tools one step at a time with the same checks. Never parallelize dependent mutations, fabricate
+IDs, replay unknown effects, infer success from prose, or auto-accept semantics. A progress page
+is not liveness. The Coworker still makes its separate semantic decision before guarded
+complete/reject. No fixed wall-clock guarantee follows from client-tagged reasoning or
+physical/MCP time. An opt-in audited helper is packaged as `threadlane closure-template` (offline
+JSON with source SHA-256 and a pure JavaScript factory); create the storage-only
+`worker` backlog item first with `backlog_create` (creation grants no authority),
+prepare and retain its serializable capsule before `backlog_worker_start`, evaluate only
+that trusted source in a fresh isolate, and use the small `createOrdinaryClosureClient`
+helper around the preserved `read`/`doneView` core. Its `readStored()` revalidates the
+exact current context, raw start, and prep binding before any effect, keeps full raw
+evidence/report/correlation private, and returns a compact view with current identity,
+technical guard facts, verified event counts/ACK cursor, and the exact physical text.
+Its `completeStored(ACCEPTANCE_CONTEXT)` moves all current correlation/revision/ref/digest
+checks before one guarded complete, retains completion intent and the exact receipt, and
+reuses only a matching validated retained Done; missing, error, or unknown replies never
+retry or fabricate `Done`. COPY the literal recipes and bind only their one typed object
+(`APPROVED_TASK_CONTEXT` before start, `ACCEPTANCE_CONTEXT` after the separate semantic
+decision); the callback binds nothing. Never parse, compile, or evaluate Markdown or
+fences, and do not repeatedly inspect declarations. `exec_command` returns
+`{exit_code, output, session_id?}`; `text`/`store` return undefined; `load` restores
+serialized data in a fresh isolate; ambient logging is absent. Never print the capsule
+JavaScript, and reject changed immutable execution fields, an inner EventBatch above
+49152 UTF-8 bytes, or an invalid `step_seq` before ACK. After a validated Done, finish
+briefly without raw SDK introspection or repeat pull/ACK of the original notice; a
+genuinely new notice still needs supported actual recovery. See
+`docs/ORDINARY-WORKER-CLOSURE.md`.
 
 Use the guarded paired tools only with real enrollment and the exact frozen
 approval/task identity:
