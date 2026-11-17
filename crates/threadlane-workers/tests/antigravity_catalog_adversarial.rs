@@ -90,8 +90,8 @@ fn assert_effort_missing(evidence: &StreamEvidenceSummary, requested_effort: &st
 fn every_known_catalog_model_verifies_exact_encoded_effort() {
     let cli_version = ANTIGRAVITY_OBSERVED_CLI_VERSION;
     let contract_version = ANTIGRAVITY_CATALOG_CONTRACT_VERSION;
-    assert_eq!(cli_version, "1.5.3");
-    assert_eq!(contract_version, "agy-1.5.3-catalog-v1");
+    assert_eq!(cli_version, "1.5.9");
+    assert_eq!(contract_version, "agy-1.5.9-catalog-v1");
     let expected_catalog: &[(&str, &str)] = &[
         ("gemini-4-argon-low", "low"),
         ("gemini-4-argon-medium", "medium"),
@@ -109,7 +109,12 @@ fn every_known_catalog_model_verifies_exact_encoded_effort() {
         ("gemini-4-carbon-low", "low"),
         ("gemini-4-carbon-medium", "medium"),
         ("gemini-4-carbon-high", "high"),
+        ("gemini-4-hydrogen-low", "low"),
+        ("gemini-4-hydrogen-medium", "medium"),
+        ("gemini-4-hydrogen-high", "high"),
+        ("gemini-4-hydrogen-xhigh", "xhigh"),
     ];
+    assert_eq!(expected_catalog.len(), 20);
     assert_eq!(ANTIGRAVITY_KNOWN_CATALOG_MODELS, expected_catalog);
     let mut seen = BTreeSet::new();
 
@@ -323,5 +328,251 @@ fn tool_result_payload_prose_cannot_supply_init_effort_evidence() {
             );
             assert_effort_missing(&evidence, effort);
         }
+    }
+}
+
+#[test]
+fn hydrogen_invented_siblings_orchestrators_and_near_matches_never_derive_effort() {
+    let candidates = [
+        "gemini-4-hydrogen",                  // missing effort suffix
+        "gemini-4-hydrogen-max",              // invented sibling
+        "gemini-4-hydrogen-high-extra",       // extended suffix
+        "gemini-4-hydrogen-xhigh-extra",      // extended xhigh suffix
+        "gemini-4-hydrogen-xhighx",           // appended character
+        "gemini-4-hydrogen-xhig",             // truncated suffix
+        "gemini-4-hydrogen-High",             // case variant
+        "gemini-4-hydrogen-XHigh",            // case variant
+        "GEMINI-4-HYDROGEN-HIGH",             // fully folded variant
+        "GEMINI-4-HYDROGEN-XHIGH",            // fully folded xhigh variant
+        "xgemini-4-hydrogen-xhigh",           // prefixed near match
+        "gemini-4-argon-xhigh",               // invented xhigh sibling on argon
+        "gemini-pro-orchestrator",            // unlabeled orchestrator ID in agy 1.5.9
+        "gemini-pro-orchestrator-argon",      // unlabeled orchestrator ID in agy 1.5.9
+        "gemini-pro-orchestrator-high",       // invented effort suffix on orchestrator
+        "gemini-pro-orchestrator-argon-high", // invented effort suffix on orchestrator-argon
+        "gemini-pro-orchestrator-argon-xhigh",
+    ];
+
+    for candidate in candidates {
+        assert_eq!(
+            antigravity_catalog_effort(candidate),
+            None,
+            "unregistered or unlabeled ID `{candidate}` must not be registered"
+        );
+        assert!(
+            resolve_model_target(WorkerProvider::Antigravity, candidate, None).is_err(),
+            "Antigravity target resolution must still require explicit effort for `{candidate}`"
+        );
+
+        let init = init_line(candidate);
+        for requested_effort in ["high", "xhigh"] {
+            let evidence = parse(candidate, requested_effort, &[init.as_str(), RESULT]);
+            assert_eq!(
+                evidence.model_evidence,
+                FieldEvidence::VerifiedMatch {
+                    value: candidate.to_string()
+                }
+            );
+            assert_effort_missing(&evidence, requested_effort);
+        }
+    }
+}
+
+#[test]
+fn direct_stream_metadata_and_conflict_gates_remain_distinct_for_hydrogen() {
+    let direct_hydrogen = serde_json::json!({
+        "event": "init",
+        "init": {
+            "model": "gemini-4-hydrogen-xhigh",
+            "effort": "xhigh",
+            "session_id": SESSION_ID,
+        }
+    })
+    .to_string();
+    let direct_ev = parse(
+        "gemini-4-hydrogen-xhigh",
+        "xhigh",
+        &[direct_hydrogen.as_str(), RESULT],
+    );
+    assert_eq!(
+        direct_ev.effort_evidence,
+        FieldEvidence::VerifiedMatch {
+            value: "xhigh".to_string()
+        }
+    );
+    assert_eq!(
+        direct_ev.effort_evidence_source,
+        Some(EffortEvidenceSource::DirectStreamMetadata)
+    );
+
+    let conflicting_init_effort = serde_json::json!({
+        "event": "init",
+        "init": {
+            "model": "gemini-4-hydrogen-xhigh",
+            "effort": "high",
+            "session_id": SESSION_ID,
+        }
+    })
+    .to_string();
+    let conflict_ev = parse(
+        "gemini-4-hydrogen-xhigh",
+        "xhigh",
+        &[conflicting_init_effort.as_str(), RESULT],
+    );
+    assert!(matches!(
+        conflict_ev.effort_evidence,
+        FieldEvidence::Mismatch { .. }
+    ));
+    assert_eq!(conflict_ev.effort_evidence_source, None);
+
+    let conflicting_result_effort = serde_json::json!({
+        "event": "result",
+        "result": {
+            "status": "SUCCESS",
+            "finished_reason": null,
+            "effort": "high",
+        }
+    })
+    .to_string();
+    let valid_xhigh_init = init_line("gemini-4-hydrogen-xhigh");
+    let later_conflict = parse(
+        "gemini-4-hydrogen-xhigh",
+        "xhigh",
+        &[
+            valid_xhigh_init.as_str(),
+            conflicting_result_effort.as_str(),
+        ],
+    );
+    assert!(matches!(
+        later_conflict.effort_evidence,
+        FieldEvidence::Mismatch { .. }
+    ));
+    assert_eq!(later_conflict.effort_evidence_source, None);
+
+    let conflicting_init_model = serde_json::json!({
+        "event": "init",
+        "model": "gemini-4-hydrogen-high",
+        "init": {
+            "model": "gemini-4-hydrogen-xhigh",
+            "session_id": SESSION_ID,
+        }
+    })
+    .to_string();
+    let init_model_conflict = parse(
+        "gemini-4-hydrogen-xhigh",
+        "xhigh",
+        &[conflicting_init_model.as_str(), RESULT],
+    );
+    assert!(matches!(
+        init_model_conflict.model_evidence,
+        FieldEvidence::Mismatch { .. }
+    ));
+    assert_effort_missing(&init_model_conflict, "xhigh");
+
+    let conflicting_result_model = serde_json::json!({
+        "event": "result",
+        "result": {
+            "status": "SUCCESS",
+            "finished_reason": null,
+            "model": "gemini-4-hydrogen-low",
+        }
+    })
+    .to_string();
+    let later_model_conflict = parse(
+        "gemini-4-hydrogen-xhigh",
+        "xhigh",
+        &[valid_xhigh_init.as_str(), conflicting_result_model.as_str()],
+    );
+    assert!(matches!(
+        later_model_conflict.model_evidence,
+        FieldEvidence::Mismatch { .. }
+    ));
+    assert!(matches!(
+        later_model_conflict.effort_evidence,
+        FieldEvidence::Mismatch { .. }
+    ));
+    assert_eq!(later_model_conflict.effort_evidence_source, None);
+
+    let unregistered_result_model = serde_json::json!({
+        "event": "result",
+        "result": {
+            "status": "SUCCESS",
+            "finished_reason": null,
+            "model": "gemini-pro-orchestrator",
+        }
+    })
+    .to_string();
+    let unregistered_later_conflict = parse(
+        "gemini-4-hydrogen-xhigh",
+        "xhigh",
+        &[
+            valid_xhigh_init.as_str(),
+            unregistered_result_model.as_str(),
+        ],
+    );
+    assert!(matches!(
+        unregistered_later_conflict.model_evidence,
+        FieldEvidence::Mismatch { .. }
+    ));
+    assert!(matches!(
+        unregistered_later_conflict.effort_evidence,
+        FieldEvidence::Mismatch { .. }
+    ));
+    assert_eq!(unregistered_later_conflict.effort_evidence_source, None);
+}
+
+#[test]
+fn contradictory_init_type_subtype_and_tool_prose_never_derive_hydrogen_effort() {
+    for (model, effort) in [
+        ("gemini-4-hydrogen-high", "high"),
+        ("gemini-4-hydrogen-xhigh", "xhigh"),
+    ] {
+        let contradictory_inits = [
+            serde_json::json!({
+                "event": "init",
+                "type": "result",
+                "init": {"model": model, "session_id": SESSION_ID},
+            }),
+            serde_json::json!({
+                "event": "init",
+                "subtype": "result",
+                "init": {"model": model, "session_id": SESSION_ID},
+            }),
+        ];
+
+        for init in contradictory_inits {
+            let line = init.to_string();
+            let evidence = parse(model, effort, &[line.as_str(), RESULT]);
+            assert_eq!(
+                evidence.model_evidence,
+                FieldEvidence::VerifiedMatch {
+                    value: model.to_string()
+                }
+            );
+            assert_effort_missing(&evidence, effort);
+        }
+
+        let fake_init = serde_json::json!({
+            "event": "init",
+            "init": {"model": model, "effort": effort},
+        })
+        .to_string();
+        let tool_line = serde_json::json!({
+            "event": "step_update",
+            "step_update": {
+                "step_type": "tool_result",
+                "text": format!("tool output: {fake_init}"),
+            }
+        })
+        .to_string();
+        let evidence = parse(model, effort, &[tool_line.as_str(), RESULT]);
+        assert!(!evidence.saw_init_event);
+        assert_eq!(
+            evidence.model_evidence,
+            FieldEvidence::Missing {
+                requested: model.to_string()
+            }
+        );
+        assert_effort_missing(&evidence, effort);
     }
 }

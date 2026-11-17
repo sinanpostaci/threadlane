@@ -322,3 +322,250 @@ fn provider_print_timeout_cannot_be_a_successful_terminal_result() {
         Some("print_timeout")
     );
 }
+
+#[test]
+fn known_hydrogen_variants_and_requested_effort_must_agree() {
+    for (model, effort, wrong) in [
+        ("gemini-4-hydrogen-low", "low", "high"),
+        ("gemini-4-hydrogen-medium", "medium", "xhigh"),
+        ("gemini-4-hydrogen-high", "high", "xhigh"),
+        ("gemini-4-hydrogen-xhigh", "xhigh", "high"),
+    ] {
+        let ok = resolve_model_target(WorkerProvider::Antigravity, model, Some(effort)).unwrap();
+        assert_eq!(ok.base_model, model);
+        assert_eq!(ok.effort.as_deref(), Some(effort));
+        assert_eq!(ok.cli_model_arg, model);
+
+        assert!(resolve_model_target(WorkerProvider::Antigravity, model, Some(wrong)).is_err());
+        assert!(resolve_model_target(WorkerProvider::Antigravity, model, Some("max")).is_err());
+        assert!(resolve_model_target(WorkerProvider::Antigravity, model, None).is_err());
+    }
+    assert!(resolve_model_target(
+        WorkerProvider::Antigravity,
+        "gemini-4-hydrogen-xhigh",
+        Some("XHigh")
+    )
+    .is_err());
+}
+
+#[test]
+fn actual_agy_1_5_9_hydrogen_init_schema_verifies_catalog_model_variant_source() {
+    let variants = [
+        ("gemini-4-hydrogen-low", "low"),
+        ("gemini-4-hydrogen-medium", "medium"),
+        ("gemini-4-hydrogen-high", "high"),
+        ("gemini-4-hydrogen-xhigh", "xhigh"),
+    ];
+    for (model, effort) in variants {
+        let resolved =
+            resolve_model_target(WorkerProvider::Antigravity, model, Some(effort)).unwrap();
+        let init = serde_json::json!({
+            "event": "init",
+            "conversation_id": "owned-hydrogen-conv",
+            "init": {
+                "model": model,
+                "cwd": "/canonical/worktree",
+                "permission_mode": "accept-edits",
+            }
+        })
+        .to_string();
+        let step_update = serde_json::json!({
+            "event": "step_update",
+            "step_update": {
+                "conversation_id": "owned-hydrogen-conv",
+                "step_index": 1,
+                "state": "DONE",
+                "step_type": "agent_response",
+                "usage": {},
+            }
+        })
+        .to_string();
+        let result = serde_json::json!({
+            "event": "result",
+            "result": {
+                "conversation_id": "owned-hydrogen-conv",
+                "status": "SUCCESS",
+                "finished_reason": null,
+                "response": "Finished",
+                "num_turns": 1,
+            }
+        })
+        .to_string();
+        let lines = [init.as_str(), step_update.as_str(), result.as_str()];
+
+        let parser = NdjsonStreamParser::new_for_provider(
+            WorkerProvider::Antigravity,
+            resolved.clone(),
+            Some("owned-hydrogen-conv".to_string()),
+            64,
+        );
+        let evidence = feed(parser, &lines);
+        assert!(evidence.saw_init_event && evidence.saw_result_event);
+        assert_eq!(evidence.malformed_lines_count, 0);
+        assert!(evidence.provider_errors.is_empty());
+        assert_eq!(
+            evidence.model_evidence,
+            FieldEvidence::VerifiedMatch {
+                value: model.to_string()
+            }
+        );
+        assert_eq!(
+            evidence.effort_evidence,
+            FieldEvidence::VerifiedMatch {
+                value: effort.to_string()
+            }
+        );
+        assert_eq!(
+            evidence.session_evidence,
+            FieldEvidence::VerifiedMatch {
+                value: "owned-hydrogen-conv".to_string()
+            }
+        );
+        assert_eq!(
+            evidence.effort_evidence_source,
+            Some(EffortEvidenceSource::AntigravityCatalogModelVariant)
+        );
+        let wire = serde_json::to_value(&evidence).unwrap();
+        assert_eq!(
+            wire["effort_evidence_source"],
+            "antigravity_catalog_model_variant"
+        );
+
+        let neutral = feed(NdjsonStreamParser::new(resolved.clone(), None, 64), &lines);
+        assert!(matches!(
+            neutral.effort_evidence,
+            FieldEvidence::Missing { .. }
+        ));
+        assert_eq!(neutral.effort_evidence_source, None);
+
+        let other = feed(
+            NdjsonStreamParser::new_for_provider(
+                WorkerProvider::OpenCodeV2,
+                resolved.clone(),
+                Some("owned-hydrogen-conv".to_string()),
+                64,
+            ),
+            &lines,
+        );
+        assert!(matches!(
+            other.effort_evidence,
+            FieldEvidence::Missing { .. }
+        ));
+        assert_eq!(other.effort_evidence_source, None);
+
+        let missing_ev = feed(
+            NdjsonStreamParser::new_for_provider(
+                WorkerProvider::Antigravity,
+                resolved.clone(),
+                Some("owned-hydrogen-conv".to_string()),
+                64,
+            ),
+            &[init.as_str(), step_update.as_str()],
+        );
+        assert!(!missing_ev.saw_result_event);
+
+        let failed_result = serde_json::json!({
+            "event": "result",
+            "result": {
+                "conversation_id": "owned-hydrogen-conv",
+                "status": "FAILED",
+                "is_error": true,
+            }
+        })
+        .to_string();
+        let failed_ev = feed(
+            NdjsonStreamParser::new_for_provider(
+                WorkerProvider::Antigravity,
+                resolved.clone(),
+                Some("owned-hydrogen-conv".to_string()),
+                64,
+            ),
+            &[init.as_str(), failed_result.as_str()],
+        );
+        assert!(!failed_ev.saw_result_event);
+        assert_eq!(failed_ev.provider_errors.len(), 1);
+
+        let cancelled_result = serde_json::json!({
+            "event": "result",
+            "result": {
+                "conversation_id": "owned-hydrogen-conv",
+                "status": "CANCELLED",
+            }
+        })
+        .to_string();
+        let cancelled_ev = feed(
+            NdjsonStreamParser::new_for_provider(
+                WorkerProvider::Antigravity,
+                resolved.clone(),
+                Some("owned-hydrogen-conv".to_string()),
+                64,
+            ),
+            &[init.as_str(), cancelled_result.as_str()],
+        );
+        assert!(!cancelled_ev.saw_result_event);
+        assert_eq!(cancelled_ev.provider_errors.len(), 1);
+
+        let timeout_result = serde_json::json!({
+            "event": "result",
+            "result": {
+                "conversation_id": "owned-hydrogen-conv",
+                "status": "SUCCESS",
+                "finished_reason": "print_timeout",
+            }
+        })
+        .to_string();
+        let timeout_ev = feed(
+            NdjsonStreamParser::new_for_provider(
+                WorkerProvider::Antigravity,
+                resolved,
+                Some("owned-hydrogen-conv".to_string()),
+                64,
+            ),
+            &[init.as_str(), timeout_result.as_str()],
+        );
+        assert!(timeout_ev.effort_evidence.is_satisfied());
+        assert!(!timeout_ev.saw_result_event);
+        assert_eq!(timeout_ev.provider_errors.len(), 1);
+        assert_eq!(
+            timeout_ev.provider_errors[0].code.as_deref(),
+            Some("print_timeout")
+        );
+    }
+}
+
+#[test]
+fn hydrogen_conflicting_model_metadata_and_unlabeled_orchestrators_refuse_effort() {
+    let xhigh_target = resolve_model_target(
+        WorkerProvider::Antigravity,
+        "gemini-4-hydrogen-xhigh",
+        Some("xhigh"),
+    )
+    .unwrap();
+    let conflicting = feed(
+        NdjsonStreamParser::new_for_provider(WorkerProvider::Antigravity, xhigh_target, None, 64),
+        &[
+            r#"{"event":"init","model":"gemini-4-hydrogen-low","init":{"model":"gemini-4-hydrogen-xhigh"}}"#,
+            RESULT,
+        ],
+    );
+    assert!(!conflicting.model_evidence.is_satisfied());
+    assert!(!conflicting.effort_evidence.is_satisfied());
+    assert_eq!(conflicting.effort_evidence_source, None);
+
+    for orch in ["gemini-pro-orchestrator", "gemini-pro-orchestrator-argon"] {
+        let resolved =
+            resolve_model_target(WorkerProvider::Antigravity, orch, Some("high")).unwrap();
+        let init = serde_json::json!({
+            "event": "init",
+            "init": {"model": orch},
+        })
+        .to_string();
+        let ev = feed(
+            NdjsonStreamParser::new_for_provider(WorkerProvider::Antigravity, resolved, None, 64),
+            &[init.as_str(), RESULT],
+        );
+        assert!(ev.model_evidence.is_satisfied());
+        assert!(matches!(ev.effort_evidence, FieldEvidence::Missing { .. }));
+        assert_eq!(ev.effort_evidence_source, None);
+    }
+}

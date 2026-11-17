@@ -52,17 +52,32 @@ current milestone contract before editing.
   diagnostics until a trusted operator connects it. Once connected, on resume or context uncertainty,
   fetch the shared operating guide (`operating_guide` over MCP or offline `threadlane guide`
   on the trusted-local CLI route; canonical source `docs/MCP-OPERATING-GUIDE.md`),
-  then refresh live scoped state and revisions (`status`, `get_plan`,
-  `approved_session`, `approved_task`) without a polling loop.
-- When the operator supplies a private Threadlane context, use
-  `threadlane-workflow` for plans, `threadlane-flow` for profile/policy admission
-  and durable role handoffs, and `threadlane-session` for approved tasks, events
-  and conversational changes. Read `docs/NATIVE-OPERATOR.md`; preserve the
-  supplied store/binding scope.
-- Read `docs/PROFILE-FLOW.md` before advancing a role cycle. Require an exact
-  execution policy; saved model assignments are not permission to use a model.
-  Unknown handoff outcomes require receipt reconciliation, not redispatch.
+  then refresh bounded live scoped state (`status`, `catalog`, `backlog_list`)
+  as needed without a polling loop, and query plans, approvals, or tasks only
+  with actual known IDs.
+- Ordinary tasks follow `docs/ORDINARY-WORKER-QUICKSTART.md` (published
+  one-task plan, exact human scope consent, `approve prepare` preview with
+  unchanged `preview.request` saved to a private `0600` file via client JSON
+  and private-file tools without `python3`/`node`/`jq` or ad hoc scripts,
+  `approve record`, storage-only `worker` backlog item, and one guarded start).
+  Ordinary commands already covered by the quickstart (including normalized
+  preview/request recording and bounded `inspect-delivery`) plus a freshly
+  exported `operator_context` require only the current live guide and
+  quickstart; an exported context alone selects no legacy contract or CLI probe.
+  Read `docs/NATIVE-OPERATOR.md` only for selected setup, recovery, or operator
+  workflows not covered by the ordinary quickstart (using `threadlane-workflow`,
+  `threadlane-flow`, and `threadlane-session` for their corresponding scopes
+  while preserving the supplied store/binding scope and exact refusals).
+- Read `docs/PROFILE-FLOW.md` and `docs/MCP-LEGACY-OPERATING-GUIDE.md` only for
+  an actually selected real legacy role cycle or handoff. Require an exact
+  execution policy and human authority (package-scope reuse only where actually
+  authorized); saved model assignments are not permission to use a model.
+  Unknown execution or handoff outcomes require original-receipt
+  reconciliation, not redispatch or retry.
 - Existing approval, host startup and review/integration steps stay explicit.
+  Never run an unconditional `approved_task`/readiness/host probe before
+  guarded `backlog_worker_start` (which owns eligible automatic host startup;
+  `host_not_ready` on an optional pre-start read is not an attempted launch).
   A context, CLI flag or worker response is not new human authorization.
 - Do not start a second Codex app-server or install a universal fixed-binding MCP
   configuration to work around unavailable native routing.

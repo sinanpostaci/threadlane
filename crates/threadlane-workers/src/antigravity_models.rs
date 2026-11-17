@@ -1,20 +1,24 @@
 //! Versioned Antigravity (`agy`) CLI catalog model variant contract.
 //!
-//! Antigravity 1.5.3 advertises 16 concrete model identifiers in `agy models` (the 13 identifiers
-//! previously recorded in Antigravity 1.4.12 plus `gemini-4-carbon-low`, `gemini-4-carbon-medium`,
-//! and `gemini-4-carbon-high`) where each model identifier is bound to a single reasoning-effort
-//! label (`(Low)`, `(Medium)`, or `(High)`), while `--output-format stream-json` emits the
-//! selected concrete model identifier in `{"event":"init","init":{"model":"<id>",...}}` without a
-//! separate `effort` field.
+//! Antigravity 1.5.9 advertises 20 concrete effort-encoded model identifiers in `agy models` (the
+//! 16 identifiers previously recorded in Antigravity 1.5.3 plus `gemini-4-hydrogen-low`,
+//! `gemini-4-hydrogen-medium`, `gemini-4-hydrogen-high`, and `gemini-4-hydrogen-xhigh`) where each
+//! model identifier is bound to a single reasoning-effort label (`(Low)`, `(Medium)`, `(High)`, or
+//! `(XHigh)`), while `--output-format stream-json` emits the selected concrete model identifier in
+//! `{"event":"init","init":{"model":"<id>",...}}` without a separate `effort` field.
 //!
-//! This module defines the finite, versioned exact-match lookup table for those 16 observed
-//! Antigravity 1.5.3 catalog model identifiers.
+//! Unlabeled orchestrator identifiers listed by `agy models` (such as `gemini-pro-orchestrator`
+//! and `gemini-pro-orchestrator-argon`) carry no encoded effort label and are intentionally
+//! omitted from this catalog table.
+//!
+//! This module defines the finite, versioned exact-match lookup table for those 20 observed
+//! Antigravity 1.5.9 catalog model identifiers.
 //!
 //! ## Security and Verification Invariants
 //!
-//! - **Exact allowlist only**: Only the 16 observed Antigravity 1.5.3 catalog identifiers match.
-//!   Never performs suffix guessing (such as `*-high`), substring matching, case folding, or
-//!   family fallback.
+//! - **Exact allowlist only**: Only the 20 observed Antigravity 1.5.9 catalog identifiers match.
+//!   Never performs suffix guessing (such as `*-high` or `*-xhigh`), substring matching, case
+//!   folding, or family fallback.
 //! - **Pure and offline**: Performs no filesystem, process, or network I/O and never falls back
 //!   to caller-requested `WorkerSpec::effort`.
 //! - **Provenance boundary**: Evidence derived from this table records CLI-reported concrete
@@ -22,12 +26,12 @@
 //!   cloud or reasoning-budget attestation.
 
 /// Version identifier for the bounded Antigravity catalog model-variant evidence contract.
-pub const ANTIGRAVITY_CATALOG_CONTRACT_VERSION: &str = "agy-1.5.3-catalog-v1";
+pub const ANTIGRAVITY_CATALOG_CONTRACT_VERSION: &str = "agy-1.5.9-catalog-v1";
 
-/// Observed Antigravity CLI version from which the 16 concrete catalog model variants were recorded.
-pub const ANTIGRAVITY_OBSERVED_CLI_VERSION: &str = "1.5.3";
+/// Observed Antigravity CLI version from which the 20 concrete catalog model variants were recorded.
+pub const ANTIGRAVITY_OBSERVED_CLI_VERSION: &str = "1.5.9";
 
-/// Exhaustive table of the 16 observed `(model_id, effort)` pairs from Antigravity 1.5.3 `models`.
+/// Exhaustive table of the 20 observed `(model_id, effort)` pairs from Antigravity 1.5.9 `models`.
 pub const ANTIGRAVITY_KNOWN_CATALOG_MODELS: &[(&str, &str)] = &[
     ("gemini-4-argon-low", "low"),
     ("gemini-4-argon-medium", "medium"),
@@ -45,15 +49,19 @@ pub const ANTIGRAVITY_KNOWN_CATALOG_MODELS: &[(&str, &str)] = &[
     ("gemini-4-carbon-low", "low"),
     ("gemini-4-carbon-medium", "medium"),
     ("gemini-4-carbon-high", "high"),
+    ("gemini-4-hydrogen-low", "low"),
+    ("gemini-4-hydrogen-medium", "medium"),
+    ("gemini-4-hydrogen-high", "high"),
+    ("gemini-4-hydrogen-xhigh", "xhigh"),
 ];
 
-/// Returns the canonical encoded effort (`"low"`, `"medium"`, or `"high"`) for an exact known
-/// Antigravity 1.5.3 catalog model identifier, or `None` for any unknown identifier.
+/// Returns the canonical encoded effort (`"low"`, `"medium"`, `"high"`, or `"xhigh"`) for an
+/// exact known Antigravity 1.5.9 catalog model identifier, or `None` for any unknown identifier.
 ///
-/// This function is a pure exact-match lookup over the 16 observed Antigravity 1.5.3 catalog
-/// model IDs. It never infers effort from arbitrary `*-low` / `*-medium` / `*-high` suffixes,
-/// never consults requested spec values, and represents CLI-reported model variant selection
-/// rather than independent reasoning-budget attestation.
+/// This function is a pure exact-match lookup over the 20 observed Antigravity 1.5.9 catalog
+/// model IDs. It never infers effort from arbitrary `*-low` / `*-medium` / `*-high` / `*-xhigh`
+/// suffixes, never consults requested spec values, and represents CLI-reported model variant
+/// selection rather than independent reasoning-budget attestation.
 #[must_use]
 pub fn antigravity_catalog_effort(model_id: &str) -> Option<&'static str> {
     ANTIGRAVITY_KNOWN_CATALOG_MODELS

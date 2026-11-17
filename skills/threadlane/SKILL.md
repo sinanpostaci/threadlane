@@ -5,7 +5,7 @@ description: "Work through Threadlane in the current Codex conversation: shape r
 
 # Threadlane
 
-Version: `2026-11-16.v4`.
+Version: `2026-11-17.v1`.
 
 Act as the user's Coworker in the native Codex conversation. The human selects
 your model in Codex; Threadlane profiles select execution roles. Infer whether
@@ -26,25 +26,33 @@ protocol IDs; do not add locale configuration.
 
 ## Connect and recover context
 
-On first use, call `connect_current_chat` with `{}`, then `operating_guide` with
+On first use, call `connect_current_chat` with `{}` once, then `operating_guide` with
 `{}`. Use only the tools actually exposed by this connection. If connection
 fails, explain the returned error; do not guess identities, create another
-backend, or replace pairing with a fixed global binding.
+backend, bypass existing-state/revision/identity checks, or replace pairing with
+a fixed global binding.
 
 The live guide is the source of detailed rules; refetch it after context loss or
-when uncertain. Batch independent scoped reads (`status`, `coworker_status` when
-available, and `backlog_list`/`backlog_get`/`backlog_history`). Query plans,
-approvals, or tasks only with actual returned IDs. Never poll.
+when uncertain. Batch independent bounded scoped reads (`status`, `catalog`,
+`backlog_list`/`backlog_get`/`backlog_history`, and `coworker_status` when
+needed). Query plans, approvals, or tasks only with actual returned IDs. Never
+poll.
 
 An exported `operator_context` field is not a reason to run
-`threadlane-context check` or another local CLI probe. Ordinary paired preparation
-uses the verified MCP tools; the CLI route is only for an explicitly selected
-trusted-local operator task such as actual preview/record. Never bypass real
+`threadlane-context check`, read `docs/NATIVE-OPERATOR.md` or
+`docs/PROFILE-FLOW.md`, or run local CLI probes. Ordinary paired preparation
+uses the verified MCP tools and `docs/ORDINARY-WORKER-QUICKSTART.md`; ordinary
+commands covered by the quickstart (including normalized preview/request
+recording and bounded `inspect-delivery`) need only the current live guide and
+quickstart, while the CLI route handles only those covered commands or an
+explicitly selected trusted-local operator workflow. Never bypass real
 connection, binding, readiness, revision, digest, or sandbox refusals.
 
-The minimal ordinary recipe is in `docs/ORDINARY-WORKER-QUICKSTART.md`. Detailed
-optional legacy contracts are in `docs/MCP-LEGACY-OPERATING-GUIDE.md`; read that
-only for an explicitly selected legacy job.
+The minimal ordinary recipe is in `docs/ORDINARY-WORKER-QUICKSTART.md`. Read
+`docs/NATIVE-OPERATOR.md` only for selected setup, recovery, or operator
+workflows not covered there, and `docs/PROFILE-FLOW.md` or
+`docs/MCP-LEGACY-OPERATING-GUIDE.md` only for an actually selected legacy role
+cycle (source editing still reads `docs/ROADMAP.md` and the current milestone).
 
 ## Selecting a profile
 
@@ -84,28 +92,40 @@ are optional, not the Worker profile.
 
 ## Approved Worker execution
 
-A published technical plan record is still required. An operator may save and
-publish it directly; a model Orchestrator or `prepare_work` is not mandatory.
-Present the concrete single-task scope and obtain one explicit human
-authorization. Within that unchanged scope, reuse the exact existing
+A published one-task technical plan record is still required. Publish it
+directly with `save_draft`/`publish`; a model Orchestrator or `prepare_work` is
+not mandatory. Present the concrete single-task scope and obtain one explicit
+human authorization. Within that unchanged scope, reuse the exact existing
 scope/profile/plan/approval; changed scope, model, effort, quota, repository,
 base, or task identity needs a fresh preview. Never self-approve or treat a
-profile, backlog edit, worker prose, or CLI flag as authority. The quickstart
-shows the strict `OperatorApprovalIntent` and the existing `approve prepare` /
-`approve record` route; `OperatorApprovalRequest` is the normalized preview, not
-a second invented request.
+profile, advice/planning, backlog edit, worker prose, or CLI flag as authority.
+The quickstart writes private `0600` `OperatorApprovalIntent` JSON in a private
+directory, runs `approve prepare` to obtain `OperatorApprovalPreview`, retains
+its DTO/`subject_digest`/tasks, parses stdout with built-in JSON tools, and saves
+ONLY the exact unchanged normalized `preview.request` (`OperatorApprovalRequest`)
+to a private `0600` file via existing private-file tools for `approve record`
+(no `python3`, `node`, `jq`, subprocess JSON extractor, or ad hoc per-task
+script; never rebuild from `OperatorApprovalIntent`, invent
+`expected_plan_digest`, or retype model/scope/digest facts, and keep all
+source/binding/identity/revision/digest checks). `OperatorApprovalRequest` is
+the normalized preview, not a second invented request.
 
-Ordinary Worker sequence: one exact human scope approval, refresh required live
-identity/revisions, guarded start exactly once, wait for an actual callback
-without MCP polling loops, close advertised event pages with real per-batch ACKs
-and original-result reconciliation, make one bounded physical check, then
-separately perform the item-specific semantic review and guarded complete or
-truthful reject. The guarded start enforces real readiness and identity; do not
-add an unconditional ready probe. A missing notice or reply uses the original
-receipt/result; possible effects or `Unknown` never permit redispatch. Preserve
-legitimate startup, authority, binding, readiness, revision, and digest
-refusals. `Doing` is not liveness; `NeedsYou` only for an actual open human
-decision or question.
+Ordinary Worker sequence: bounded `status`/`catalog`/`backlog_list` as needed,
+published one-task plan, one exact human scope approval, `approve prepare`/
+`approve record` actual authority, storage-only `worker` backlog item
+(`backlog_create`), guarded `backlog_worker_start` once, wait for an actual
+callback without MCP polling loops, close advertised event pages with real
+per-batch ACKs and original-result reconciliation, make one bounded physical
+check, then separately perform the item-specific semantic review and guarded
+complete or truthful reject. Never run an unconditional `approved_task`/ready/
+host probe before guarded start: `backlog_worker_start` owns eligible automatic
+host startup, and `host_not_ready` from an optional pre-start read is not
+evidence of an attempted launch. Do not turn a genuine start, refusal, or
+unknown effect into retries; preserve original receipts and real startup errors.
+A missing notice or reply uses the original receipt/result; possible effects or
+`Unknown` never permit redispatch. Preserve legitimate startup, authority,
+binding, readiness, revision, and digest refusals. `Doing` is not liveness;
+`NeedsYou` only for an actual open human decision or question.
 
 Close the callback compactly. Recover the original start mapping first. For pages, check the
 chat's outer/control binding separately from dispatch `session_binding_id`; batch, event, and
