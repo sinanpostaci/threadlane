@@ -882,7 +882,11 @@ export function ThreadlaneDesktopShell() {
         workspaceChatIdentitiesEqual(entry.identity, activeSelectedChat.identity)
       ) ?? null;
     if (matchingSummary !== null) {
-      return matchingSummary;
+      return {
+        ...matchingSummary,
+        thread_label: activeSelectedChat.threadLabel,
+        project_label: activeSelectedChat.projectLabel,
+      };
     }
     // A verified chat_work entry can be the first visible record for a chat
     // before a chat summary exists. Keep the selected chat usable without
