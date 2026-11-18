@@ -1,11 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use threadlane_core::observation::{
-    sanitize_observation_selection_token, sanitize_observation_summary, ObservationActor,
-    ObservationCall, ObservationCallState, ObservationDelivery, ObservationDeliveryStage,
-    ObservationExecutor, ObservationJob, ObservationJournalRecord, ObservationRecordPhase,
-    ObservationRequest, ObservationUsage, ReadonlyBindingRecord, ReadonlyCoreStateSnapshot,
-    ReadonlyEventBatchRecord, ReadonlyEventRecord, ReadonlyRunRecord, ReadonlyWakeupRecord,
+    sanitize_observation_selection_token, sanitize_observation_summary,
+    validate_canonical_project_scope, ObservationActor, ObservationCall, ObservationCallState,
+    ObservationDelivery, ObservationDeliveryStage, ObservationExecutor, ObservationJob,
+    ObservationJournalRecord, ObservationRecordPhase, ObservationRequest, ObservationUsage,
+    ReadonlyBindingRecord, ReadonlyCoreStateSnapshot, ReadonlyEventBatchRecord,
+    ReadonlyEventRecord, ReadonlyRunRecord, ReadonlyWakeupRecord,
 };
 
 const MAX_REQUEST_CHILDREN: usize = 64;
@@ -125,6 +126,11 @@ impl<T: PartialEq + Clone> ScopedField<T> {
         }
     }
 
+    fn mark_conflicted(&mut self) {
+        self.value = None;
+        self.conflicted = true;
+    }
+
     fn resolved(&self) -> Option<&T> {
         if self.conflicted {
             None
@@ -147,6 +153,7 @@ struct VerifiedWorkerLink {
     role: Option<String>,
     live: bool,
     job_project_label: String,
+    job_project_path: Option<String>,
     job_thread_label: Option<String>,
     job_plan_id: Option<String>,
     task_status: String,
@@ -160,6 +167,8 @@ struct CollapsedJournalGroup<'a> {
     parent_request_id: ScopedField<String>,
     binding_id: ScopedField<String>,
     thread_uuid: ScopedField<String>,
+    project_path: ScopedField<String>,
+    has_invalid_project_path: bool,
     raw_job_id: ScopedField<String>,
     finish_job_id: ScopedField<String>,
     raw_plan_id: ScopedField<String>,
@@ -192,10 +201,15 @@ struct CollapsedJournalGroup<'a> {
 }
 
 impl<'a> CollapsedJournalGroup<'a> {
+    fn has_project_scope_conflict(&self) -> bool {
+        self.project_path.conflicted || self.has_invalid_project_path
+    }
+
     fn has_scope_conflict(&self) -> bool {
         self.parent_request_id.conflicted
             || self.binding_id.conflicted
             || self.thread_uuid.conflicted
+            || self.has_project_scope_conflict()
             || self.raw_job_id.conflicted
             || self.finish_job_id.conflicted
             || self.raw_plan_id.conflicted
@@ -423,6 +437,7 @@ fn project_requests_with_views(
             title: historical_title,
             operation: "worker.historical".to_string(),
             project_label: vlink.job_project_label.clone(),
+            project_path: None,
             binding_id: Some(vlink.session_binding_id.clone()),
             thread_uuid: Some(vlink.thread_uuid.clone()),
             thread_label: vlink.job_thread_label.clone(),
@@ -457,24 +472,33 @@ fn project_requests_with_views(
         let started_at_ms = root.min_entry_at_ms;
         let finished_at_ms = root.max_finish_at_ms;
         let duration_ms = compute_duration(started_at_ms, finished_at_ms);
+        let scope_compromised = root.has_scope_conflict();
+        let project_scope_compromised = root.has_project_scope_conflict();
 
-        let project_label = root
-            .project_label
-            .clone()
-            .or_else(|| {
+        let project_label = if project_scope_compromised {
+            UNSCOPED_PROJECT_LABEL.to_string()
+        } else {
+            root.project_label
+                .clone()
+                .or_else(|| {
+                    root.verified_job_id
+                        .as_ref()
+                        .and_then(|jid| jobs_by_id.get(jid))
+                        .and_then(|job| sanitize_non_empty(&job.project_label))
+                })
+                .unwrap_or_else(|| UNSCOPED_PROJECT_LABEL.to_string())
+        };
+
+        let thread_label = if scope_compromised {
+            None
+        } else {
+            root.thread_label.clone().or_else(|| {
                 root.verified_job_id
                     .as_ref()
                     .and_then(|jid| jobs_by_id.get(jid))
-                    .and_then(|job| sanitize_non_empty(&job.project_label))
+                    .and_then(|job| sanitize_opt(job.thread_label.as_deref()))
             })
-            .unwrap_or_else(|| UNSCOPED_PROJECT_LABEL.to_string());
-
-        let thread_label = root.thread_label.clone().or_else(|| {
-            root.verified_job_id
-                .as_ref()
-                .and_then(|jid| jobs_by_id.get(jid))
-                .and_then(|job| sanitize_opt(job.thread_label.as_deref()))
-        });
+        };
 
         dedup_and_sort_deliveries(&mut root.delivery);
         if let Some(latest_ts) =
@@ -484,17 +508,28 @@ fn project_requests_with_views(
         }
 
         let (children, children_count) = finalize_children(root.folded_children, &mut warnings);
+        let (job_id, project_path, binding_id, thread_uuid) = if scope_compromised {
+            (None, None, None, None)
+        } else {
+            (
+                root.verified_job_id,
+                root.project_path.resolved().cloned(),
+                root.binding_id.resolved().cloned(),
+                root.thread_uuid.resolved().cloned(),
+            )
+        };
 
         requests.push(ObservationRequest {
             source_id: effective_source_id.to_string(),
             id: root.request_id,
-            job_id: root.verified_job_id,
+            job_id,
             parent_request_id: None,
             title: root.title,
             operation: root.operation,
             project_label,
-            binding_id: root.binding_id.resolved().cloned(),
-            thread_uuid: root.thread_uuid.resolved().cloned(),
+            project_path,
+            binding_id,
+            thread_uuid,
             thread_label,
             state,
             started_at_ms,
@@ -668,6 +703,7 @@ fn verify_worker_links(
 
         let job_project_label = sanitize_non_empty(&job.project_label)
             .unwrap_or_else(|| UNSCOPED_PROJECT_LABEL.to_string());
+        let job_project_path = job.project_path.clone();
         let job_thread_label = sanitize_opt(job.thread_label.as_deref());
         let job_plan_id = clean_opt_id(job.plan_id.as_deref());
         let task_status = matched_task.status.trim().to_string();
@@ -691,6 +727,7 @@ fn verify_worker_links(
             role: sanitize_opt(link.role.as_deref()),
             live: link.live,
             job_project_label,
+            job_project_path,
             job_thread_label,
             job_plan_id,
             task_status,
@@ -736,6 +773,8 @@ fn collapse_journal_records<'a>(
         let mut parent_request_id = ScopedField::new();
         let mut binding_id = ScopedField::new();
         let mut thread_uuid = ScopedField::new();
+        let mut project_path = ScopedField::new();
+        let mut has_invalid_project_path = false;
         let mut raw_job_id = ScopedField::new();
         let mut finish_job_id = ScopedField::new();
         let mut raw_plan_id = ScopedField::new();
@@ -804,6 +843,14 @@ fn collapse_journal_records<'a>(
             parent_request_id.observe(normalized_parent_id);
             binding_id.observe(clean_opt_id(record.binding_id.as_deref()));
             thread_uuid.observe(clean_opt_id(record.thread_uuid.as_deref()));
+            if let Some(raw_project_path) = record.project_path.as_deref() {
+                match validate_canonical_project_scope(raw_project_path) {
+                    Ok(canonical_path) => project_path.observe(Some(canonical_path)),
+                    Err(_) => {
+                        has_invalid_project_path = true;
+                    }
+                }
+            }
             raw_job_id.observe(clean_opt_id(record.job_id.as_deref()));
             raw_plan_id.observe(clean_opt_id(record.plan_id.as_deref()));
             raw_task_id.observe(clean_opt_id(record.task_id.as_deref()));
@@ -845,6 +892,10 @@ fn collapse_journal_records<'a>(
             }
         }
 
+        if has_invalid_project_path {
+            project_path = ScopedField::new();
+        }
+
         let resolved_operation = operation.unwrap_or_else(|| "unknown".to_string());
         let resolved_title = title.unwrap_or_else(|| resolved_operation.clone());
 
@@ -854,6 +905,8 @@ fn collapse_journal_records<'a>(
             parent_request_id,
             binding_id,
             thread_uuid,
+            project_path,
+            has_invalid_project_path,
             raw_job_id,
             finish_job_id,
             raw_plan_id,
@@ -891,6 +944,12 @@ fn collapse_journal_records<'a>(
                 "Detected conflicting scope fields across journal phases for a request.",
             );
         }
+        if group.has_invalid_project_path {
+            push_warning(
+                warnings,
+                "Rejected invalid canonical project path on journal record.",
+            );
+        }
 
         collapsed.insert((request_id, call_id), group);
     }
@@ -923,6 +982,7 @@ fn resolve_group_job_scope(
     ) {
         let mut plan_mismatch = false;
         let mut matching_links = Vec::new();
+        let mut project_mismatched_links = Vec::new();
 
         for vlink in verified_links {
             if vlink.control_binding_id != *binding_id
@@ -946,6 +1006,18 @@ fn resolve_group_job_scope(
             {
                 if job_plan != rec_plan {
                     plan_mismatch = true;
+                    continue;
+                }
+            }
+            if let (Some(req_path), Some(raw_job_path)) = (
+                group.project_path.resolved(),
+                vlink.job_project_path.as_deref(),
+            ) {
+                let Ok(job_path) = validate_canonical_project_scope(raw_job_path) else {
+                    continue;
+                };
+                if &job_path != req_path {
+                    project_mismatched_links.push(vlink);
                     continue;
                 }
             }
@@ -980,13 +1052,27 @@ fn resolve_group_job_scope(
             }
             return;
         }
+
+        if !plan_mismatch
+            && !project_mismatched_links.is_empty()
+            && project_mismatched_links
+                .iter()
+                .all(|l| l.job_id == project_mismatched_links[0].job_id)
+        {
+            group.project_path.mark_conflicted();
+            push_warning(
+                warnings,
+                "Rejected job link due to mismatched project path between job and journal record.",
+            );
+            return;
+        }
     }
 
     if try_resolve_plan_result_job_scope(group, jobs_by_id, core_states, warnings) {
         return;
     }
 
-    if has_hints {
+    if has_hints && !group.has_scope_conflict() {
         push_warning(
             warnings,
             "Ignored unverified job, plan, task, or approval hint on journal record.",
@@ -1079,6 +1165,22 @@ fn try_resolve_plan_result_job_scope(
         return false;
     }
 
+    if let (Some(req_path), Some(raw_job_path)) =
+        (group.project_path.resolved(), job.project_path.as_deref())
+    {
+        let Ok(job_path) = validate_canonical_project_scope(raw_job_path) else {
+            return false;
+        };
+        if &job_path != req_path {
+            group.project_path.mark_conflicted();
+            push_warning(
+                warnings,
+                "Rejected plan request link due to mismatched project path between job and journal record.",
+            );
+            return false;
+        }
+    }
+
     group.verified_job_id = Some(finish_job_id.clone());
     true
 }
@@ -1141,6 +1243,11 @@ fn fold_journal_groups<'a>(
                 if let Some(parent) = root_groups.get_mut(&pid) {
                     if is_approved_plan_wrapper_child {
                         parent.verified_job_id = child.verified_job_id.clone();
+                        if parent.project_path.resolved().is_none()
+                            && child.project_path.resolved().is_some()
+                        {
+                            parent.project_path = child.project_path.clone();
+                        }
                     }
                     if is_same_root_dispatch_wrapper(parent, &child) {
                         merge_dispatch_wrapper_into_root(parent, child);
@@ -1222,6 +1329,10 @@ fn select_unique_workflow_plan_wrapper_children(
                     && is_context_workflow_plan_pair(&parent.operation, &child.operation)
                     && child.binding_id.resolved() == Some(p_bind)
                     && child.thread_uuid.resolved() == Some(p_thread)
+                    && compatible_optional_project_scope(
+                        parent.project_path.resolved(),
+                        child.project_path.resolved(),
+                    )
                     && is_verified_workflow_plan_child(child)
                 {
                     Some(idx)
@@ -1323,6 +1434,13 @@ fn is_verified_workflow_plan_child(child: &CollapsedJournalGroup<'_>) -> bool {
         && child.raw_job_id.resolved() == Some(verified_job_id)
 }
 
+fn compatible_optional_project_scope(parent: Option<&String>, child: Option<&String>) -> bool {
+    match (parent, child) {
+        (Some(p), Some(c)) => p == c,
+        _ => true,
+    }
+}
+
 fn can_fold_workflow_plan_child_into_context_parent(
     parent: &CollapsedJournalGroup<'_>,
     child: &CollapsedJournalGroup<'_>,
@@ -1333,6 +1451,10 @@ fn can_fold_workflow_plan_child_into_context_parent(
         || parent.request_id != child.request_id
         || parent.binding_id.resolved() != child.binding_id.resolved()
         || parent.thread_uuid.resolved() != child.thread_uuid.resolved()
+        || !compatible_optional_project_scope(
+            parent.project_path.resolved(),
+            child.project_path.resolved(),
+        )
     {
         return false;
     }
@@ -1414,7 +1536,8 @@ fn can_fold_child_into_parent(
         return false;
     }
 
-    if parent.raw_job_id.resolved() != child.raw_job_id.resolved()
+    if parent.project_path.resolved() != child.project_path.resolved()
+        || parent.raw_job_id.resolved() != child.raw_job_id.resolved()
         || parent.raw_task_id.resolved() != child.raw_task_id.resolved()
         || parent.raw_approval_id.resolved() != child.raw_approval_id.resolved()
         || parent.raw_plan_id.resolved() != child.raw_plan_id.resolved()
@@ -1629,6 +1752,14 @@ fn root_matches_link_scope(root: &CollapsedJournalGroup<'_>, vlink: &VerifiedWor
         (vlink.job_plan_id.as_ref(), root.raw_plan_id.resolved())
     {
         if job_plan != rec_plan {
+            return false;
+        }
+    }
+    if let (Some(req_path), Some(job_path)) = (
+        root.project_path.resolved(),
+        vlink.job_project_path.as_ref(),
+    ) {
+        if req_path != job_path {
             return false;
         }
     }
@@ -4034,5 +4165,314 @@ mod tests {
             .expect("ambiguous outer context wrapper should remain standalone");
         assert_eq!(wrapper_row.job_id, None);
         assert!(wrapper_row.children.is_empty());
+    }
+
+    #[test]
+    fn jobless_advisor_request_carries_validated_project_path_and_absent_scope_stays_compatible() {
+        let mut advisor_entry = base_journal_record(
+            "rec-adv-e",
+            "req-advisor-exact",
+            ObservationRecordPhase::Entry,
+            1_000,
+            "coworker.planning.advisor",
+            ObservationCallState::Running,
+        );
+        advisor_entry.job_id = None;
+        advisor_entry.project_path = Some("/workspace/threadlane".to_string());
+        advisor_entry.executor = Some(ObservationExecutor {
+            tool: Some("codex-cli".to_string()),
+            provider: Some("codex_cli".to_string()),
+            role: Some("advisor".to_string()),
+            requested_model: Some("gpt-6.2-astra".to_string()),
+            observed_model: None,
+            requested_effort: Some("max".to_string()),
+            observed_effort: None,
+        });
+
+        let mut advisor_finish = advisor_entry.clone();
+        advisor_finish.record_id = "rec-adv-f".to_string();
+        advisor_finish.phase = ObservationRecordPhase::Finish;
+        advisor_finish.at_ms = 1_500;
+        advisor_finish.state = ObservationCallState::Completed;
+        advisor_finish.summary = Some("Advisor consultation completed.".to_string());
+
+        let mut legacy_absent_finish = base_journal_record(
+            "rec-old-f",
+            "req-old-absent",
+            ObservationRecordPhase::Finish,
+            2_000,
+            "mcp.paired.status",
+            ObservationCallState::Completed,
+        );
+        legacy_absent_finish.project_path = None;
+
+        let projection = project_requests(
+            SOURCE_ID,
+            &[],
+            &[advisor_entry, advisor_finish, legacy_absent_finish],
+            &[ReadonlyCoreStateSnapshot::default()],
+            &[],
+        );
+
+        assert!(
+            projection.warnings.is_empty(),
+            "unexpected warnings: {:?}",
+            projection.warnings
+        );
+        assert_eq!(projection.requests.len(), 2);
+
+        let advisor_row = projection
+            .requests
+            .iter()
+            .find(|r| r.id == "req-advisor-exact")
+            .expect("jobless Advisor request should be projected");
+        assert_eq!(advisor_row.job_id, None);
+        assert_eq!(
+            advisor_row.project_path.as_deref(),
+            Some("/workspace/threadlane")
+        );
+        assert_eq!(advisor_row.binding_id.as_deref(), Some("bnd-1"));
+        assert_eq!(advisor_row.thread_uuid.as_deref(), Some(THREAD_UUID_A));
+        assert_eq!(advisor_row.state, ObservationCallState::Completed);
+        assert_eq!(advisor_row.duration_ms, Some(500));
+
+        let legacy_row = projection
+            .requests
+            .iter()
+            .find(|r| r.id == "req-old-absent")
+            .expect("legacy request without project_path should remain compatible");
+        assert_eq!(legacy_row.project_path, None);
+        assert_eq!(legacy_row.binding_id.as_deref(), Some("bnd-1"));
+        assert_eq!(legacy_row.thread_uuid.as_deref(), Some(THREAD_UUID_A));
+        assert_eq!(legacy_row.state, ObservationCallState::Completed);
+    }
+
+    #[test]
+    fn entry_finish_project_path_disagreement_or_invalid_path_refuses_chat_fallback() {
+        let job = sample_job("job-1", "bnd-1", THREAD_UUID_A, "plan-1", "task-1");
+        let link = sample_link(
+            "wrk-1",
+            "job-1",
+            "task-1",
+            "apr-1",
+            "bnd-1",
+            "bnd-sess-1",
+            THREAD_UUID_A,
+            false,
+        );
+
+        let mut disagree_entry = base_journal_record(
+            "rec-dis-e",
+            "req-disagree-path",
+            ObservationRecordPhase::Entry,
+            1_000,
+            "coworker.planning.advisor",
+            ObservationCallState::Running,
+        );
+        disagree_entry.project_path = Some("/workspace/threadlane".to_string());
+        disagree_entry.job_id = Some("job-1".to_string());
+        disagree_entry.plan_id = Some("plan-1".to_string());
+        disagree_entry.task_id = Some("task-1".to_string());
+        disagree_entry.approval_id = Some("apr-1".to_string());
+
+        let mut disagree_finish = disagree_entry.clone();
+        disagree_finish.record_id = "rec-dis-f".to_string();
+        disagree_finish.phase = ObservationRecordPhase::Finish;
+        disagree_finish.at_ms = 1_500;
+        disagree_finish.state = ObservationCallState::Completed;
+        disagree_finish.project_path = Some("/workspace/other-repo".to_string());
+
+        let mut mixed_invalid_entry = disagree_entry.clone();
+        mixed_invalid_entry.record_id = "rec-inv-e".to_string();
+        mixed_invalid_entry.request_id = "req-invalid-path".to_string();
+        mixed_invalid_entry.at_ms = 2_000;
+
+        let mut mixed_invalid_finish = disagree_finish.clone();
+        mixed_invalid_finish.record_id = "rec-inv-f".to_string();
+        mixed_invalid_finish.request_id = "req-invalid-path".to_string();
+        mixed_invalid_finish.at_ms = 2_400;
+        mixed_invalid_finish.project_path = Some("relative/../bad/".to_string());
+
+        let mut traversal_only = base_journal_record(
+            "rec-trav",
+            "req-traversal-path",
+            ObservationRecordPhase::Finish,
+            3_000,
+            "coworker.planning.advisor",
+            ObservationCallState::Completed,
+        );
+        traversal_only.project_path = Some("/workspace/threadlane/../secret".to_string());
+
+        let projection = project_requests(
+            SOURCE_ID,
+            &[job],
+            &[
+                disagree_entry,
+                disagree_finish,
+                mixed_invalid_entry,
+                mixed_invalid_finish,
+                traversal_only,
+            ],
+            &[ReadonlyCoreStateSnapshot::default()],
+            &[link],
+        );
+
+        for req_id in [
+            "req-disagree-path",
+            "req-invalid-path",
+            "req-traversal-path",
+        ] {
+            let row = projection
+                .requests
+                .iter()
+                .find(|r| r.id == req_id)
+                .expect("compromised request should preserve non-scoped status row");
+            assert_eq!(
+                row.state,
+                ObservationCallState::Completed,
+                "{req_id} must preserve recorded completion status"
+            );
+            assert_eq!(row.project_path, None, "{req_id} must clear project_path");
+            assert_eq!(row.job_id, None, "{req_id} must clear job_id");
+            assert_eq!(
+                row.binding_id, None,
+                "{req_id} must clear binding_id to prevent unscoped chat fallback"
+            );
+            assert_eq!(
+                row.thread_uuid, None,
+                "{req_id} must clear thread_uuid to prevent unscoped chat fallback"
+            );
+            assert_eq!(row.project_label, UNSCOPED_PROJECT_LABEL);
+            assert_eq!(row.thread_label, None);
+        }
+
+        assert!(projection
+            .warnings
+            .iter()
+            .any(|w| w.contains("conflicting scope fields")));
+        assert!(projection
+            .warnings
+            .iter()
+            .any(|w| w.contains("invalid canonical project path")));
+    }
+
+    #[test]
+    fn mismatched_request_and_job_project_path_refuses_job_association() {
+        let dispatch_job = sample_job("job-1", "bnd-1", THREAD_UUID_A, "plan-1", "task-1");
+        let dispatch_link = sample_link(
+            "wrk-1",
+            "job-1",
+            "task-1",
+            "apr-1",
+            "bnd-1",
+            "bnd-sess-1",
+            THREAD_UUID_A,
+            false,
+        );
+        let mut plan_job = sample_job("plan-100", "bnd-1", THREAD_UUID_A, "plan-100", "task-p");
+        plan_job.approval_status = "pending".to_string();
+
+        let mut mismatched_dispatch = base_journal_record(
+            "rec-disp-mismatch",
+            "req-disp-mismatch",
+            ObservationRecordPhase::Finish,
+            1_500,
+            "session.dispatch",
+            ObservationCallState::Completed,
+        );
+        mismatched_dispatch.project_path = Some("/workspace/other-worktree".to_string());
+        mismatched_dispatch.job_id = Some("job-1".to_string());
+        mismatched_dispatch.plan_id = Some("plan-1".to_string());
+        mismatched_dispatch.task_id = Some("task-1".to_string());
+        mismatched_dispatch.approval_id = Some("apr-1".to_string());
+
+        let mut mismatched_plan = base_journal_record(
+            "rec-plan-mismatch",
+            "req-plan-mismatch",
+            ObservationRecordPhase::Finish,
+            2_500,
+            "workflow.save-draft",
+            ObservationCallState::Completed,
+        );
+        mismatched_plan.project_path = Some("/workspace/other-worktree".to_string());
+        mismatched_plan.job_id = Some("plan-100".to_string());
+        mismatched_plan.plan_id = Some("plan-100".to_string());
+
+        let mut unverified_hint = base_journal_record(
+            "rec-unverified-hint",
+            "req-unverified-hint",
+            ObservationRecordPhase::Finish,
+            3_500,
+            "coworker.planning.advisor",
+            ObservationCallState::Completed,
+        );
+        unverified_hint.project_path = Some("/workspace/other-worktree".to_string());
+        unverified_hint.job_id = Some("job-unverified".to_string());
+        unverified_hint.approval_id = Some("apr-unverified".to_string());
+
+        let mut unverified_plan_hint = base_journal_record(
+            "rec-unverified-plan-hint",
+            "req-unverified-plan-hint",
+            ObservationRecordPhase::Finish,
+            4_000,
+            "workflow.save-draft",
+            ObservationCallState::Completed,
+        );
+        unverified_plan_hint.project_path = Some("/workspace/other-worktree".to_string());
+        unverified_plan_hint.job_id = Some("plan-unverified".to_string());
+        unverified_plan_hint.plan_id = Some("plan-unverified".to_string());
+
+        let projection = project_requests(
+            SOURCE_ID,
+            &[dispatch_job, plan_job],
+            &[
+                mismatched_dispatch,
+                mismatched_plan,
+                unverified_hint,
+                unverified_plan_hint,
+            ],
+            &[ReadonlyCoreStateSnapshot::default()],
+            &[dispatch_link],
+        );
+
+        for req_id in ["req-disp-mismatch", "req-plan-mismatch"] {
+            let row = projection
+                .requests
+                .iter()
+                .find(|r| r.id == req_id)
+                .expect("mismatched verified request should retain diagnostic row");
+            assert_eq!(row.state, ObservationCallState::Completed);
+            assert_eq!(row.job_id, None);
+            assert_eq!(row.project_path, None);
+            assert_eq!(row.binding_id, None);
+            assert_eq!(row.thread_uuid, None);
+            assert_eq!(row.project_label, UNSCOPED_PROJECT_LABEL);
+            assert_eq!(row.thread_label, None);
+        }
+
+        for req_id in ["req-unverified-hint", "req-unverified-plan-hint"] {
+            let row = projection
+                .requests
+                .iter()
+                .find(|r| r.id == req_id)
+                .expect("standalone request with unverified hint should remain scoped");
+            assert_eq!(row.state, ObservationCallState::Completed);
+            assert_eq!(row.job_id, None);
+            assert_eq!(
+                row.project_path.as_deref(),
+                Some("/workspace/other-worktree")
+            );
+            assert_eq!(row.binding_id.as_deref(), Some("bnd-1"));
+            assert_eq!(row.thread_uuid.as_deref(), Some(THREAD_UUID_A));
+        }
+
+        assert!(projection
+            .warnings
+            .iter()
+            .any(|w| w.contains("Rejected job link due to mismatched project path")));
+        assert!(projection
+            .warnings
+            .iter()
+            .any(|w| w.contains("Rejected plan request link due to mismatched project path")));
     }
 }

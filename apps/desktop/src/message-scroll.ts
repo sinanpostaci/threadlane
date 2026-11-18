@@ -14,6 +14,7 @@ import {
   WORKSPACE_SAMPLE_STALE_THRESHOLD_MS,
   evaluateWorkspaceNativeSampleAt,
   formatWorkspaceChatIdentityKey,
+  isValidCanonicalProjectScope,
   isValidWorkspaceChatIdentity,
   sanitizeWorkspaceSelectionToken,
   workspaceChatIdentitiesEqual,
@@ -2756,7 +2757,7 @@ function resolveUnambiguousSourceProjectScope(
     return null;
   }
   const rawPath = matchingSources[0]?.project_path ?? null;
-  if (typeof rawPath !== 'string' || rawPath.length === 0 || rawPath.trim() !== rawPath) {
+  if (!isValidCanonicalProjectScope(rawPath)) {
     return null;
   }
 
@@ -2863,11 +2864,7 @@ export function resolveVerifiedChatJobIds(
   }
 
   if (observation) {
-    const unambiguousSourcePath = resolveUnambiguousSourceProjectScope(
-      chat.identity.source_id,
-      observation,
-      jobHistories,
-    );
+    let unambiguousSourcePath: string | null | undefined;
     for (const obsJob of observation.jobs) {
       if (obsJob.source_id !== chat.identity.source_id) {
         continue;
@@ -2879,7 +2876,14 @@ export function resolveVerifiedChatJobIds(
         conflicted.add(obsJob.id);
         continue;
       }
-      const resolvedScopePath = obsJob.project_path ?? unambiguousSourcePath;
+      if (obsJob.project_path === null && unambiguousSourcePath === undefined) {
+        unambiguousSourcePath = resolveUnambiguousSourceProjectScope(
+          chat.identity.source_id,
+          observation,
+          jobHistories,
+        );
+      }
+      const resolvedScopePath = obsJob.project_path ?? unambiguousSourcePath ?? null;
       if (
         obsJob.binding_id !== null &&
         obsJob.thread_uuid !== null &&
@@ -3110,6 +3114,17 @@ export function doesObservationRequestMatchChat(
     return false;
   }
 
+  let requestProjectScope: string | null = null;
+  if (request.project_path !== undefined && request.project_path !== null) {
+    if (!isValidCanonicalProjectScope(request.project_path)) {
+      return false;
+    }
+    if (request.project_path !== chat.identity.canonical_project_scope) {
+      return false;
+    }
+    requestProjectScope = request.project_path;
+  }
+
   const jobId = isUsableJobId(request.job_id) ? request.job_id : null;
   let linkedObsJob: ObservationJob | null = null;
 
@@ -3152,13 +3167,16 @@ export function doesObservationRequestMatchChat(
 
   const effectiveBindingId = request.binding_id ?? linkedObsJob?.binding_id ?? null;
   const effectiveThreadUuid = request.thread_uuid ?? linkedObsJob?.thread_uuid ?? null;
+  const fallbackSourceScope =
+    requestProjectScope === null && (linkedObsJob?.project_path ?? null) === null
+      ? resolveUnambiguousSourceProjectScope(
+          request.source_id,
+          context?.observation,
+          context?.jobHistories,
+        )
+      : null;
   const effectiveProjectScope =
-    linkedObsJob?.project_path ??
-    resolveUnambiguousSourceProjectScope(
-      request.source_id,
-      context?.observation,
-      context?.jobHistories,
-    );
+    requestProjectScope ?? linkedObsJob?.project_path ?? fallbackSourceScope;
 
   if (
     effectiveBindingId !== null &&

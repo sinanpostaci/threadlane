@@ -511,6 +511,9 @@ pub struct ObservationRequest {
     pub operation: String,
     /// Project label for display.
     pub project_label: String,
+    /// Validated canonical project path for this request when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_path: Option<String>,
     /// Scoped software `binding_id` when bound.
     pub binding_id: Option<String>,
     /// Validated `thread_uuid` when bound.
@@ -4198,7 +4201,9 @@ fn validate_workspace_thread_uuid(raw: &str) -> Result<String, WorkspaceContract
     Ok(raw.to_string())
 }
 
-fn validate_canonical_project_scope(raw: &str) -> Result<String, WorkspaceContractError> {
+/// Validates that `raw` is a canonical trimmed absolute project path up to 512 UTF-8 bytes
+/// without `//` / `.` / `..` segments, trailing slashes, control characters, or secret-like markers.
+pub fn validate_canonical_project_scope(raw: &str) -> Result<String, WorkspaceContractError> {
     if raw.is_empty()
         || raw.len() > crate::MAX_WORKER_PATH_BYTES
         || raw.trim() != raw

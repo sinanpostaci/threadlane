@@ -1759,6 +1759,7 @@ mod tests {
                 title: "Legacy request".to_string(),
                 operation: "mcp.workflow.status".to_string(),
                 project_label: "Local".to_string(),
+                project_path: None,
                 binding_id: Some("bnd_1".to_string()),
                 thread_uuid: Some(VALID_UUID_1.to_string()),
                 thread_label: Some("Main".to_string()),

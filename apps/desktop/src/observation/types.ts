@@ -93,6 +93,7 @@ export interface ObservationRequest {
   title: string;
   operation: string;
   project_label: string;
+  project_path?: string | null;
   binding_id: string | null;
   thread_uuid: string | null;
   thread_label: string | null;

@@ -837,7 +837,7 @@ function validateWorkspaceThreadUuid(raw: unknown): string {
   return raw;
 }
 
-function validateCanonicalProjectScope(raw: unknown): string {
+export function validateCanonicalProjectScope(raw: unknown): string {
   if (typeof raw !== 'string' || raw.length === 0 || raw.trim() !== raw || !raw.startsWith('/')) {
     throw new WorkspaceContractError(
       'invalid_chat_identity',
@@ -885,6 +885,15 @@ function validateCanonicalProjectScope(raw: unknown): string {
     );
   }
   return raw;
+}
+
+export function isValidCanonicalProjectScope(raw: unknown): raw is string {
+  try {
+    validateCanonicalProjectScope(raw);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export function validateWorkspaceChatIdentity(input: unknown): WorkspaceChatIdentity {

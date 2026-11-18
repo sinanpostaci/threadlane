@@ -78,6 +78,7 @@ fn sample_legacy_observation_snapshot() -> ObservationSnapshot {
         title: "workflow get_plan".to_string(),
         operation: "mcp.get_plan".to_string(),
         project_label: "alpha-app".to_string(),
+        project_path: None,
         binding_id: Some("bnd_chat_alpha".to_string()),
         thread_uuid: Some(VALID_UUID_A.to_string()),
         thread_label: Some("Alpha Chat".to_string()),
@@ -146,7 +147,10 @@ fn legacy_observation_snapshot_and_actor_preserve_struct_literals_and_wire_compa
     let legacy = sample_legacy_observation_snapshot();
     let legacy_json = serde_json::to_string(&legacy).expect("serialize legacy ObservationSnapshot");
 
-    // Optional selection fields are omitted when None so existing consumers see unchanged JSON.
+    // Optional selection and per-request project fields are omitted when None so existing consumers see unchanged JSON.
+    let request_json =
+        serde_json::to_string(&legacy.requests[0]).expect("serialize legacy ObservationRequest");
+    assert!(!request_json.contains("project_path"));
     assert!(!legacy_json.contains("selected_model"));
     assert!(!legacy_json.contains("selected_effort"));
     assert!(!legacy_json.contains("native_samples"));
@@ -2138,4 +2142,86 @@ fn external_resolution_covered_attention_preserves_job_row_and_maximum_task_rows
         oversized_links.source_request_ids.len(),
         MAX_WORKSPACE_RECORD_LINKS_PER_LIST
     );
+}
+
+#[test]
+fn observation_request_project_path_round_trips_and_remains_wire_compatible_when_omitted() {
+    let mut snapshot = sample_legacy_observation_snapshot();
+    snapshot.sources[0].project_path = None;
+    snapshot.jobs.clear();
+    snapshot.requests[0].job_id = None;
+    snapshot.requests[0].project_path = Some("/home/dev/repos/alpha-app".to_string());
+
+    let encoded = serde_json::to_string(&snapshot).expect("serialize ObservationSnapshot");
+    assert!(encoded.contains("\"project_path\":\"/home/dev/repos/alpha-app\""));
+
+    let decoded: ObservationSnapshot =
+        serde_json::from_str(&encoded).expect("deserialize ObservationSnapshot");
+    assert_eq!(
+        decoded.requests[0].project_path.as_deref(),
+        Some("/home/dev/repos/alpha-app")
+    );
+
+    let upgraded = parse_workspace_snapshot_json(&encoded)
+        .expect("upgrade ObservationSnapshot with request.project_path");
+    assert_eq!(
+        upgraded.observation.requests[0].project_path.as_deref(),
+        Some("/home/dev/repos/alpha-app")
+    );
+
+    // Omitted `project_path` on older serialized `ObservationRequest` payloads decodes to `None`.
+    let legacy_request_value = serde_json::json!({
+        "source_id": "default",
+        "id": "obsreq_old",
+        "job_id": null,
+        "parent_request_id": null,
+        "title": "Legacy Advisor consultation",
+        "operation": "coworker.planning.advisor",
+        "project_label": "alpha-app",
+        "binding_id": "bnd_chat_alpha",
+        "thread_uuid": VALID_UUID_A,
+        "thread_label": "Alpha Chat",
+        "state": "completed",
+        "started_at_ms": 1_700_000_000_000_i64,
+        "finished_at_ms": 1_700_000_000_500_i64,
+        "updated_at_ms": 1_700_000_000_500_i64,
+        "duration_ms": 500_i64,
+        "actor": {
+            "label": "Advisor",
+            "role": "advisor",
+            "source": "journal",
+            "model": null,
+            "effort": null,
+            "evidence": "unknown"
+        },
+        "executor": null,
+        "usage": null,
+        "delivery": [],
+        "children": [],
+        "children_count": 0,
+        "summary": null
+    });
+    let legacy_request: ObservationRequest = serde_json::from_value(legacy_request_value)
+        .expect("deserialize legacy ObservationRequest without project_path key");
+    assert_eq!(legacy_request.project_path, None);
+
+    assert_eq!(
+        validate_canonical_project_scope("/home/dev/repos/alpha-app"),
+        Ok("/home/dev/repos/alpha-app".to_string())
+    );
+    for invalid in [
+        "",
+        "   ",
+        "relative/path",
+        " /home/dev/repos/alpha-app",
+        "/home/dev/repos/alpha-app/",
+        "/home/dev/repos/../alpha-app",
+        "/home/dev//repos/alpha-app",
+        "/tmp/sk-secret123456",
+    ] {
+        assert!(
+            validate_canonical_project_scope(invalid).is_err(),
+            "expected canonical path validator to reject {invalid:?}"
+        );
+    }
 }

@@ -1,6 +1,10 @@
 import { expect, test, type Locator, type Page } from '@playwright/test';
 
-import type { ObservationRequest } from '../src/observation/types.ts';
+import type {
+  ObservationJob,
+  ObservationRequest,
+  ObservationSource,
+} from '../src/observation/types.ts';
 import {
   advanceWorkspaceGeneratedAtFixture,
   appendChatWorkEventFixture,
@@ -1734,6 +1738,212 @@ test('keeps scoped planning rows and Active chats consistent across refresh and 
   await expectNoHorizontalOverflow(reopened);
   expect(await reloadedController.readArchivePreferencesRaw()).toBeNull();
   await reopened.close();
+});
+
+test('keeps jobless Advisor completion on default source (project_path=null) in matching chat and refuses wrong-project or conflicting scopes', async ({
+  page,
+}) => {
+  const base = buildMinimalChatWorkspaceSnapshot();
+  const baseSource = base.observation.sources[0]!;
+  const nullPathSource: ObservationSource = {
+    ...baseSource,
+    project_path: null,
+  };
+  const wrongProject = '/workspace/threadlane-other';
+  const startedAt = FIXTURE_BASE_NOW_MS - 6_000;
+  const finishedAt = FIXTURE_BASE_NOW_MS;
+
+  const conflictingOtherJob: ObservationJob = {
+    source_id: CHAT_ALPHA_IDENTITY.source_id,
+    id: 'job_conflicting_other_project',
+    project_label: 'threadlane-other',
+    project_path: wrongProject,
+    title: 'Wrong Project Job',
+    thread_uuid: CHAT_ALPHA_IDENTITY.thread_uuid,
+    thread_label: 'Other Project Scope',
+    binding_id: CHAT_ALPHA_IDENTITY.binding_id,
+    plan_id: 'plan_other_project',
+    plan_revision: 1,
+    state: 'completed',
+    approval_status: 'approved',
+    execution_status: 'completed',
+    review_state: 'accepted',
+    updated_at_ms: finishedAt - 1_000,
+    active_call_count: 0,
+    tasks: [],
+    summary: null,
+  };
+
+  const legitimateAdvisor: ObservationRequest = {
+    source_id: CHAT_ALPHA_IDENTITY.source_id,
+    id: 'obsreq_advisor_jobless_exact_scope',
+    job_id: null,
+    parent_request_id: null,
+    title: 'Advisor consultation',
+    operation: 'coworker.planning.advisor',
+    project_label: 'threadlane-alpha',
+    project_path: CHAT_ALPHA_IDENTITY.canonical_project_scope,
+    binding_id: CHAT_ALPHA_IDENTITY.binding_id,
+    thread_uuid: CHAT_ALPHA_IDENTITY.thread_uuid,
+    thread_label: null,
+    state: 'completed',
+    started_at_ms: startedAt,
+    finished_at_ms: finishedAt,
+    updated_at_ms: finishedAt,
+    duration_ms: 6_000,
+    actor: {
+      label: null,
+      role: 'coworker',
+      source: null,
+      model: null,
+      effort: null,
+      evidence: 'unknown',
+    },
+    executor: {
+      tool: 'codex-cli',
+      provider: 'codex_cli',
+      role: 'advisor',
+      requested_model: 'gpt-6.2-astra',
+      observed_model: null,
+      requested_effort: 'max',
+      observed_effort: null,
+    },
+    usage: null,
+    delivery: [],
+    children: [],
+    children_count: 0,
+    summary: null,
+  };
+
+  const wrongProjectSameBindingThread: ObservationRequest = {
+    ...legitimateAdvisor,
+    id: 'obsreq_wrong_project_same_binding_thread',
+    operation: 'coworker.planning.orchestrator',
+    project_path: wrongProject,
+    executor: {
+      ...legitimateAdvisor.executor!,
+      role: 'orchestrator',
+      requested_model: 'gpt-6.2-sol',
+      requested_effort: 'xhigh',
+    },
+  };
+
+  const invalidProjectScope: ObservationRequest = {
+    ...legitimateAdvisor,
+    id: 'obsreq_invalid_relative_project_scope',
+    operation: 'coworker.planning.architect',
+    project_path: 'relative/invalid-path',
+    executor: null,
+  };
+
+  const conflictingJobScope: ObservationRequest = {
+    ...wrongProjectSameBindingThread,
+    id: 'obsreq_conflicting_job_scope',
+    job_id: conflictingOtherJob.id,
+    project_path: CHAT_ALPHA_IDENTITY.canonical_project_scope,
+  };
+
+  const buildSnapshot = (
+    source: ObservationSource,
+    requests: ObservationRequest[],
+    jobs: ObservationJob[] = [conflictingOtherJob],
+  ) => ({
+    ...base,
+    generated_at_ms: finishedAt,
+    observation: {
+      ...base.observation,
+      generated_at_ms: finishedAt,
+      sources: [source],
+      jobs,
+      requests,
+    },
+  });
+
+  const controller = await installMinimal(page, undefined, {
+    workspaceSnapshot: buildSnapshot(nullPathSource, [
+      legitimateAdvisor,
+      wrongProjectSameBindingThread,
+      invalidProjectScope,
+      conflictingJobScope,
+    ]),
+  });
+  await selectChat(page, 'Workspace UI Contract');
+
+  const stream = streamScroller(page);
+  const planning = stream.locator('[data-planning-role]');
+  await expect(planning).toHaveCount(1);
+  await expect(planning.first()).toBeVisible();
+  await expect(planning.first()).toHaveAttribute('data-planning-role', 'advisor');
+  await expect(planning.first().locator('.tl-cw-event-action')).toBeVisible();
+  await expect(planning.first().locator('.tl-cw-event-action')).toHaveText('Completed');
+  await expect(planning.first().locator('.tl-cw-execution-duration')).toBeVisible();
+  await expect(planning.first().locator('.tl-cw-execution-duration')).toHaveText('6s');
+  await expect(planning.first().getByText('gpt-6.2-astra', { exact: true })).toBeVisible();
+  await expect(
+    stream.locator('[data-planning-role="orchestrator"], [data-planning-role="architect"]'),
+  ).toHaveCount(0);
+  await expect(stream.getByText('Orchestrator technical planning', { exact: true })).toHaveCount(0);
+  await expect(stream.getByText('gpt-6.2-sol', { exact: true })).toHaveCount(0);
+  await expect(
+    workspaceSection(page).locator('[data-agent-role="advisor"], [data-agent-role="orchestrator"]'),
+  ).toHaveCount(0);
+  await expectNoNeedsYouInScope(workspaceSection(page));
+  await expectNoHorizontalOverflow(page);
+
+  // Verify isolation across chats and refresh persistence.
+  await selectChat(page, 'Release Verification Gate');
+  await expect(planning).toHaveCount(0);
+  await selectChat(page, 'Workspace UI Contract');
+  await expect(planning).toHaveCount(1);
+  await expect(planning.first()).toHaveAttribute('data-planning-role', 'advisor');
+  await triggerWorkspaceRefresh(page);
+  await expect(planning).toHaveCount(1);
+  await expect(planning.first()).toHaveAttribute('data-planning-role', 'advisor');
+  await expect(planning.first().locator('.tl-cw-event-action')).toHaveText('Completed');
+  await expect(planning.first().locator('.tl-cw-execution-duration')).toHaveText('6s');
+  await expect(planning.first().getByText('gpt-6.2-astra', { exact: true })).toBeVisible();
+
+  // Shared source project_path hint must not override explicit canonical project_path or verified job,
+  // while still refusing omitted-project_path jobless requests.
+  const sharedHintSource: ObservationSource = {
+    ...nullPathSource,
+    project_path: wrongProject,
+  };
+  const alphaVerifiedJob: ObservationJob = {
+    ...conflictingOtherJob,
+    id: 'job_alpha_verified',
+    project_label: 'threadlane-alpha',
+    project_path: CHAT_ALPHA_IDENTITY.canonical_project_scope,
+    plan_id: 'plan_alpha_verified',
+  };
+  const verifiedAdvisorWithSharedSource: ObservationRequest = {
+    ...legitimateAdvisor,
+    id: 'obsreq_advisor_verified_job_shared_source',
+    job_id: alphaVerifiedJob.id,
+  };
+  const omittedScopeJoblessOrchestrator: ObservationRequest = {
+    ...wrongProjectSameBindingThread,
+    id: 'obsreq_omitted_scope_jobless',
+    job_id: null,
+    project_path: null,
+  };
+  await controller.setWorkspaceSnapshot(
+    buildSnapshot(
+      sharedHintSource,
+      [verifiedAdvisorWithSharedSource, omittedScopeJoblessOrchestrator],
+      [alphaVerifiedJob, conflictingOtherJob],
+    ),
+  );
+  await triggerWorkspaceRefresh(page);
+  await expect(planning).toHaveCount(1);
+  await expect(planning.first()).toBeVisible();
+  await expect(planning.first()).toHaveAttribute('data-planning-role', 'advisor');
+  await expect(planning.first().locator('.tl-cw-event-action')).toHaveText('Completed');
+  await expect(planning.first().locator('.tl-cw-execution-duration')).toHaveText('6s');
+  await expect(planning.first().getByText('gpt-6.2-astra', { exact: true })).toBeVisible();
+  await expect(stream.locator('[data-planning-role="orchestrator"]')).toHaveCount(0);
+  await expect(stream.getByText('gpt-6.2-sol', { exact: true })).toHaveCount(0);
+  await expectNoHorizontalOverflow(page);
 });
 
 test.describe('Workspace liveness, attention, and committed completion', () => {

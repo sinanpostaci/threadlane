@@ -756,6 +756,7 @@ function makeObservationRequest(
     title: overrides.title ?? `Request ${overrides.id}`,
     operation: overrides.operation ?? 'task.execute',
     project_label: overrides.project_label ?? 'threadlane',
+    ...(overrides.project_path !== undefined ? { project_path: overrides.project_path } : {}),
     binding_id: overrides.binding_id === undefined ? null : overrides.binding_id,
     thread_uuid: overrides.thread_uuid === undefined ? null : overrides.thread_uuid,
     thread_label: overrides.thread_label === undefined ? null : overrides.thread_label,
@@ -1604,6 +1605,366 @@ test('scoped planning requests update the same stream row without changing backl
     views.filter((view) => !('planningRole' in view)),
     buildChatWorkEventViews(selection),
   );
+});
+
+test('jobless planning requests match exact canonical request.project_path on default source (project_path=null) while refusing mismatch, invalid, and conflicting scopes', () => {
+  const alphaProject = '/home/dev/repos/alpha-app';
+  const otherProject = '/home/dev/repos/other-app';
+  const identity = makeIdentity('bnd_advisor_alpha', UUID_ALPHA, alphaProject);
+  const chat = makeChatSummary(identity, 'Shared Chat Label');
+  const selection = selectWorkspaceChatWork([makeChatWork(identity)], identity);
+
+  const defaultSourceWithNullPath: ObservationSnapshot['sources'][number] = {
+    id: identity.source_id,
+    label: 'Threadlane local',
+    project_path: null,
+    availability: 'available',
+    message: null,
+  };
+  const alphaJobHistory = normalizeWorkspaceJobHistory({
+    job: {
+      source_id: identity.source_id,
+      job_id: 'job_alpha_verified',
+      binding_id: identity.binding_id,
+      chat_identity: identity,
+      title: 'Alpha Job',
+      state: 'completed',
+      approval_status: 'approved',
+      execution_status: 'completed',
+    },
+  });
+  const otherProjectJob = makeObservationJob({
+    id: 'job_other_project',
+    source_id: identity.source_id,
+    binding_id: identity.binding_id,
+    thread_uuid: identity.thread_uuid,
+    project_path: otherProject,
+  });
+  const alphaProjectJob = makeObservationJob({
+    id: 'job_alpha_verified',
+    source_id: identity.source_id,
+    binding_id: identity.binding_id,
+    thread_uuid: identity.thread_uuid,
+    project_path: alphaProject,
+  });
+
+  const validAdvisorCompletion = makeObservationRequest({
+    id: 'advisor-jobless-exact-scope',
+    operation: 'coworker.planning.advisor',
+    job_id: null,
+    project_label: 'Unrelated Label',
+    project_path: alphaProject,
+    binding_id: identity.binding_id,
+    thread_uuid: identity.thread_uuid,
+    thread_label: 'Shared Chat Label',
+    state: 'completed',
+    started_at_ms: 2_000,
+    finished_at_ms: 4_000,
+    updated_at_ms: 4_000,
+    duration_ms: 2_000,
+  });
+
+  const wrongProjectSameBindingThread = makeObservationRequest({
+    ...validAdvisorCompletion,
+    id: 'advisor-wrong-project',
+    project_label: 'alpha-app',
+    project_path: otherProject,
+  });
+
+  const wrongProjectEvenWithMatchingJob = makeObservationRequest({
+    ...validAdvisorCompletion,
+    id: 'advisor-wrong-project-with-alpha-job',
+    job_id: 'job_alpha_verified',
+    project_path: otherProject,
+  });
+
+  const matchingProjectConflictingJob = makeObservationRequest({
+    ...validAdvisorCompletion,
+    id: 'advisor-conflicting-job',
+    job_id: 'job_other_project',
+    project_path: alphaProject,
+  });
+
+  const wrongThreadSameBindingProject = makeObservationRequest({
+    ...validAdvisorCompletion,
+    id: 'advisor-wrong-thread',
+    thread_uuid: UUID_BETA,
+  });
+
+  const wrongBindingSameThreadProject = makeObservationRequest({
+    ...validAdvisorCompletion,
+    id: 'advisor-wrong-binding',
+    binding_id: 'bnd_other',
+  });
+
+  const threadOnlyMissingBinding = makeObservationRequest({
+    ...validAdvisorCompletion,
+    id: 'advisor-missing-binding',
+    binding_id: null,
+  });
+
+  const wrongSourceSameFields = makeObservationRequest({
+    ...validAdvisorCompletion,
+    id: 'advisor-wrong-source',
+    source_id: 'src_other',
+  });
+
+  const omittedScopeNoJobOnNullSource = makeObservationRequest({
+    ...validAdvisorCompletion,
+    id: 'advisor-omitted-scope-unverified',
+    project_label: 'alpha-app',
+    project_path: null,
+  });
+
+  const defaultObs: ObservationSnapshot = {
+    schema_version: 1,
+    generated_at_ms: 5_000,
+    sources: [defaultSourceWithNullPath],
+    jobs: [alphaProjectJob, otherProjectJob],
+    requests: [
+      validAdvisorCompletion,
+      wrongProjectSameBindingThread,
+      wrongProjectEvenWithMatchingJob,
+      matchingProjectConflictingJob,
+      wrongThreadSameBindingProject,
+      wrongBindingSameThreadProject,
+      threadOnlyMissingBinding,
+      wrongSourceSameFields,
+      omittedScopeNoJobOnNullSource,
+    ],
+    next_cursor: null,
+    has_more: false,
+    jobs_has_more: false,
+    warnings: [],
+  };
+
+  assert.equal(
+    doesObservationRequestMatchChat(validAdvisorCompletion, chat, {
+      observation: defaultObs,
+      jobHistories: [alphaJobHistory],
+      knownChatJobIds: new Set(['job_alpha_verified']),
+    }),
+    true,
+  );
+  assert.equal(
+    doesObservationRequestMatchChat(wrongProjectSameBindingThread, chat, {
+      observation: defaultObs,
+      jobHistories: [alphaJobHistory],
+    }),
+    false,
+  );
+  assert.equal(
+    doesObservationRequestMatchChat(wrongProjectEvenWithMatchingJob, chat, {
+      observation: defaultObs,
+      jobHistories: [alphaJobHistory],
+      knownChatJobIds: new Set(['job_alpha_verified']),
+    }),
+    false,
+  );
+  assert.equal(
+    doesObservationRequestMatchChat(matchingProjectConflictingJob, chat, {
+      observation: defaultObs,
+      jobHistories: [alphaJobHistory],
+    }),
+    false,
+  );
+
+  // Non-canonical explicit `request.project_path` must be refused even when source or job matches.
+  const linkedMatchingSource: ObservationSnapshot = {
+    ...defaultObs,
+    sources: [{ ...defaultSourceWithNullPath, project_path: alphaProject }],
+  };
+  for (const invalidPath of [
+    '',
+    '   ',
+    'relative/alpha-app',
+    ' /home/dev/repos/alpha-app',
+    '/home/dev/repos/alpha-app/',
+    '/home/dev/repos/../alpha-app',
+    '/home/dev//repos/alpha-app',
+    '/tmp/sk-secret123456',
+  ]) {
+    const invalidScopeReq = makeObservationRequest({
+      ...validAdvisorCompletion,
+      id: `advisor-invalid-${invalidPath.length}`,
+      job_id: 'job_alpha_verified',
+      project_path: invalidPath,
+    });
+    assert.equal(
+      doesObservationRequestMatchChat(invalidScopeReq, chat, {
+        observation: linkedMatchingSource,
+        jobHistories: [alphaJobHistory],
+        knownChatJobIds: new Set(['job_alpha_verified']),
+      }),
+      false,
+      `expected invalid request.project_path=${JSON.stringify(invalidPath)} to be refused`,
+    );
+  }
+
+  // `source.project_path` is only a fallback hint for multi-project sources: it must not override
+  // explicit canonical `request.project_path` or verified job/history identity.
+  const conflictingSourceObs: ObservationSnapshot = {
+    ...defaultObs,
+    sources: [{ ...defaultSourceWithNullPath, project_path: otherProject }],
+  };
+  assert.equal(
+    doesObservationRequestMatchChat(validAdvisorCompletion, chat, {
+      observation: conflictingSourceObs,
+      jobHistories: [alphaJobHistory],
+    }),
+    true,
+  );
+  assert.equal(
+    doesObservationRequestMatchChat(omittedScopeNoJobOnNullSource, chat, {
+      observation: conflictingSourceObs,
+      jobHistories: [alphaJobHistory],
+    }),
+    false,
+  );
+
+  // Conflicting unambiguous source.project_path without request.project_path must also refuse.
+  const conflictingUnambiguousSourceObs: ObservationSnapshot = {
+    ...defaultObs,
+    sources: [{ ...defaultSourceWithNullPath, project_path: otherProject }],
+    jobs: [otherProjectJob],
+  };
+  assert.equal(
+    doesObservationRequestMatchChat(omittedScopeNoJobOnNullSource, chat, {
+      observation: conflictingUnambiguousSourceObs,
+      jobHistories: [],
+    }),
+    false,
+  );
+
+  // Legacy omitted `request.project_path` on a matching unambiguous source keeps backward compatibility.
+  const unambiguousMatchingSource: ObservationSnapshot = {
+    ...defaultObs,
+    sources: [{ ...defaultSourceWithNullPath, project_path: alphaProject }],
+    jobs: [alphaProjectJob],
+  };
+  assert.equal(
+    doesObservationRequestMatchChat(omittedScopeNoJobOnNullSource, chat, {
+      observation: unambiguousMatchingSource,
+      jobHistories: [alphaJobHistory],
+    }),
+    true,
+  );
+
+  const views = buildChatActivityEventViews(selection, chat, {
+    observation: defaultObs,
+    job_histories: [alphaJobHistory],
+  });
+  const planningViews = views.filter((view) => 'planningRole' in view);
+  assert.deepEqual(
+    planningViews.map((view) => view.eventId),
+    ['planning:advisor-jobless-exact-scope'],
+  );
+  assert.equal(planningViews[0]?.status, 'completed');
+  assert.equal(planningViews[0]?.durationLabel, '2s');
+});
+
+test('multi-project source.project_path=/repo/a hint does not override canonical /repo/b request and verified job', () => {
+  const repoA = '/repo/a';
+  const repoB = '/repo/b';
+  const chatBIdentity = makeIdentity('bnd_repo_b', UUID_BETA, repoB);
+  const chatB = makeChatSummary(chatBIdentity, 'Repo B Thread');
+
+  const verifiedJobBHistory = normalizeWorkspaceJobHistory({
+    job: {
+      source_id: chatBIdentity.source_id,
+      job_id: 'job_repo_b',
+      binding_id: chatBIdentity.binding_id,
+      chat_identity: chatBIdentity,
+      title: 'Repo B Verified Job',
+      state: 'completed',
+      approval_status: 'approved',
+      execution_status: 'completed',
+    },
+  });
+  const verifiedJobB = makeObservationJob({
+    id: 'job_repo_b',
+    source_id: chatBIdentity.source_id,
+    binding_id: chatBIdentity.binding_id,
+    thread_uuid: chatBIdentity.thread_uuid,
+    project_path: repoB,
+  });
+  const sharedSourceHintObs: ObservationSnapshot = {
+    schema_version: 1,
+    generated_at_ms: 8_000,
+    sources: [
+      {
+        id: chatBIdentity.source_id,
+        label: 'Shared Multi-Repo Source',
+        project_path: repoA,
+        availability: 'available',
+        message: null,
+      },
+    ],
+    jobs: [verifiedJobB],
+    requests: [],
+    next_cursor: null,
+    has_more: false,
+    jobs_has_more: false,
+    warnings: [],
+  };
+
+  const repoBCanonicalWithJob = makeObservationRequest({
+    id: 'req-repo-b-job',
+    operation: 'coworker.planning.advisor',
+    job_id: 'job_repo_b',
+    project_path: repoB,
+    binding_id: chatBIdentity.binding_id,
+    thread_uuid: chatBIdentity.thread_uuid,
+    state: 'completed',
+  });
+  const repoBOmittedPathWithJob = makeObservationRequest({
+    ...repoBCanonicalWithJob,
+    id: 'req-repo-b-omitted-path-with-job',
+    project_path: null,
+    binding_id: null,
+    thread_uuid: null,
+  });
+  const repoBCanonicalJobless = makeObservationRequest({
+    ...repoBCanonicalWithJob,
+    id: 'req-repo-b-jobless',
+    job_id: null,
+  });
+  const omittedPathJoblessOnSharedHint = makeObservationRequest({
+    ...repoBCanonicalJobless,
+    id: 'req-omitted-path-jobless',
+    project_path: null,
+  });
+
+  for (const ctx of [
+    { observation: sharedSourceHintObs, jobHistories: [verifiedJobBHistory] },
+    { observation: sharedSourceHintObs, jobHistories: [] },
+  ]) {
+    assert.equal(doesObservationRequestMatchChat(repoBCanonicalWithJob, chatB, ctx), true);
+    assert.equal(doesObservationRequestMatchChat(repoBOmittedPathWithJob, chatB, ctx), true);
+    assert.equal(doesObservationRequestMatchChat(repoBCanonicalJobless, chatB, ctx), true);
+    assert.equal(
+      doesObservationRequestMatchChat(omittedPathJoblessOnSharedHint, chatB, ctx),
+      false,
+    );
+  }
+
+  for (const rejectedReq of [
+    { ...repoBCanonicalWithJob, id: 'req-bad-path', project_path: 'relative/repo-b' },
+    { ...repoBCanonicalWithJob, id: 'req-wrong-path', project_path: repoA },
+    { ...repoBCanonicalWithJob, id: 'req-wrong-source', source_id: 'src_other' },
+    { ...repoBCanonicalWithJob, id: 'req-wrong-binding', binding_id: 'bnd_other' },
+    { ...repoBCanonicalWithJob, id: 'req-wrong-thread', thread_uuid: UUID_ALPHA },
+  ]) {
+    assert.equal(
+      doesObservationRequestMatchChat(rejectedReq, chatB, {
+        observation: sharedSourceHintObs,
+        jobHistories: [verifiedJobBHistory],
+        knownChatJobIds: new Set(['job_repo_b']),
+      }),
+      false,
+      `expected ${rejectedReq.id} to be refused`,
+    );
+  }
 });
 
 test('chat_work liveness requires exact fresh worker presence and never uses Doing, Blocked, failure, or awaiting-check as Working/NeedsYou', () => {

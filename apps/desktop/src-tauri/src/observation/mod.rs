@@ -738,6 +738,7 @@ mod tests {
             title: format!("Request {id}"),
             operation: "context.workflow.status".to_string(),
             project_label: "Threadlane local".to_string(),
+            project_path: None,
             binding_id: Some("bnd_1".to_string()),
             thread_uuid: Some("550e8400-e29b-41d4-a716-446655440000".to_string()),
             thread_label: Some("Main Thread".to_string()),
