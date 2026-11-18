@@ -13,6 +13,12 @@
 //! (`0700`) temp directory and returns a bounded `{preview_path, preview}` receipt. It writes no
 //! approval ledger entry and dispatches no work.
 //!
+//! `prepare-task` is the scoped single-task fast path: it accepts one bounded strict JSON request
+//! on stdin (never argv), creates and publishes exactly one ordinary worker task through
+//! `ScopedWorkflow`, and then runs the same authoritative private preview flow. It creates only
+//! the draft/publication and private preview; it never records authority, reserves execution, or
+//! starts a worker.
+//!
 //! `record` accepts exactly one private input: the unchanged normalized
 //! [`threadlane_authority::OperatorApprovalRequest`] (`--request`) or the complete typed
 //! [`threadlane_authority::OperatorApprovalPreview`] returned by `prepare` (`--preview`). The preview
@@ -52,6 +58,9 @@ use threadlane_native::fs_safety::{
     ensure_platform_supported, read_private_file_bounded, validate_absolute_no_symlink_components,
 };
 use threadlane_native::{open_workflow_stores, NativeError, NativeErrorCode};
+
+/// Scoped single-task fast path implementation.
+mod ordinary_task;
 
 /// Maximum byte size (`1 MiB`) permitted for private JSON request files, bounded stdin JSON, and
 /// bounded stdout JSON responses (including the trailing newline).
@@ -109,6 +118,13 @@ enum ApproveCommand {
     /// private `0700` temp directory and returns `{preview_path, preview}`. This route accepts no
     /// output path argument and writes no authority ledger entry.
     PreparePrivate,
+    /// Create and publish one ordinary single-task plan, then write its private operator preview.
+    ///
+    /// Requires the complete fixed `--binding`, `--thread`, and `--project-root` scope forwarded
+    /// by `threadlane-context`, accepts one bounded strict JSON request on stdin (never argv),
+    /// and creates only the draft/publication and private preview. It never records approval
+    /// authority, reserves execution, or starts a worker.
+    PrepareTask,
     /// Validate and persist a confirmed operator approval into `approvals.json`.
     ///
     /// Requires exactly one input: `--request` (unchanged normalized `OperatorApprovalRequest`)
@@ -571,6 +587,13 @@ async fn run(cli: Cli) -> Result<(), CliError> {
             let _kept_path = directory.keep();
             Ok(())
         }
+        ApproveCommand::PrepareTask => {
+            let dirs =
+                validate_four_store_dirs(&state_dir, &registry_dir, &plans_dir, &authority_dir)?;
+            let fixed_scope =
+                resolve_complete_fixed_scope(raw_binding, raw_thread, raw_project_root, &dirs)?;
+            ordinary_task::run_prepare_task(&dirs, &fixed_scope).await
+        }
         ApproveCommand::Record {
             request,
             preview,
@@ -728,6 +751,26 @@ fn resolve_fixed_scope(
         thread_uuid,
         project_root: clean_project_root,
     }))
+}
+
+/// Resolves the complete fixed context scope required by the `prepare-task` fast path.
+fn resolve_complete_fixed_scope(
+    binding: Option<&str>,
+    thread: Option<&str>,
+    project_root: Option<&Path>,
+    dirs: &ValidatedStoreDirs,
+) -> Result<FixedApprovalScope, CliError> {
+    let fixed = resolve_fixed_scope(binding, thread, project_root, dirs)?.ok_or_else(|| {
+        CliError::invalid_input(
+            "prepare-task requires --binding, --thread, and --project-root scope flags",
+        )
+    })?;
+    if fixed.project_root.is_none() {
+        return Err(CliError::invalid_input(
+            "prepare-task requires --project-root together with --binding and --thread",
+        ));
+    }
+    Ok(fixed)
 }
 
 #[cfg(unix)]
@@ -1568,6 +1611,48 @@ mod tests {
         assert!(
             legacy_without_request.is_err(),
             "prepare must keep requiring --request"
+        );
+    }
+
+    #[test]
+    fn prepare_task_parses_as_stdin_only_subcommand_and_rejects_argv_json() {
+        let cli = Cli::try_parse_from([
+            "threadlane-approve",
+            "--state-dir",
+            "/abs/state",
+            "--registry-dir",
+            "/abs/registry",
+            "--plans-dir",
+            "/abs/plans",
+            "--authority-dir",
+            "/abs/authority",
+            "--binding",
+            "bnd_test_1",
+            "--thread",
+            "550e8400-e29b-41d4-a716-446655440000",
+            "--project-root",
+            "/abs/repo",
+            "prepare-task",
+        ])
+        .expect("parse prepare-task with fixed context scope");
+        assert!(matches!(cli.command, ApproveCommand::PrepareTask));
+
+        let argv_json = Cli::try_parse_from([
+            "threadlane-approve",
+            "prepare-task",
+            "--request",
+            "/abs/req.json",
+        ]);
+        assert!(
+            argv_json.is_err(),
+            "prepare-task must reject argv request paths"
+        );
+
+        let positional_json =
+            Cli::try_parse_from(["threadlane-approve", "prepare-task", "{}"]);
+        assert!(
+            positional_json.is_err(),
+            "prepare-task must reject positional JSON on argv"
         );
     }
 

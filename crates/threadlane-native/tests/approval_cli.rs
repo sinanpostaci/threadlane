@@ -757,6 +757,106 @@ fn prepare_private_fixed_args(
     args
 }
 
+fn prepare_task_args(fx: &ApprovalFixture) -> Vec<String> {
+    prepare_task_args_with_scope(
+        fx,
+        Some(fx.binding_id.as_str()),
+        Some(THREAD_UUID),
+        Some(fx.repo.as_path()),
+    )
+}
+
+fn prepare_task_args_with_scope(
+    fx: &ApprovalFixture,
+    binding: Option<&str>,
+    thread: Option<&str>,
+    project_root: Option<&Path>,
+) -> Vec<String> {
+    let mut args = vec!["prepare-task".to_string()];
+    args.extend(fx.store_args());
+    if let Some(binding) = binding {
+        args.push("--binding".to_string());
+        args.push(binding.to_string());
+    }
+    if let Some(thread) = thread {
+        args.push("--thread".to_string());
+        args.push(thread.to_string());
+    }
+    if let Some(project_root) = project_root {
+        args.push("--project-root".to_string());
+        args.push(project_root.display().to_string());
+    }
+    args
+}
+
+fn prepare_task_request(fx: &ApprovalFixture, command_key: &str) -> Value {
+    serde_json::json!({
+        "binding_id": fx.binding_id.clone(),
+        "thread_uuid": THREAD_UUID,
+        "repository_path": fx.repo.clone(),
+        "base_commit": fx.base_commit.clone(),
+        "profile_id": PROFILE_ID,
+        "profile_revision": fx.registry_revision,
+        "command_key": command_key,
+        "summary": "Ordinary single-task fast path",
+        "task": {
+            "id": "task-fast",
+            "title": "Ordinary fast-path task",
+            "instruction": "Implement the ordinary fast-path task.",
+            "role": "coder",
+            "difficulty": "easy",
+            "depends_on": [],
+            "allowed_write_paths": ["src/lib.rs"]
+        },
+        "budgets": {"timeout_ms": 90_000}
+    })
+}
+
+fn prepare_task_bytes(request: &Value) -> Vec<u8> {
+    serde_json::to_vec(request).expect("serialize strict prepare-task request")
+}
+
+fn prepare_task_plan_revision_count(fx: &ApprovalFixture, plan_id: &str) -> usize {
+    fx.plans
+        .plan_revisions(plan_id)
+        .expect("read fast-path plan revisions")
+        .len()
+}
+
+fn total_plan_revision_count(fx: &ApprovalFixture) -> usize {
+    fx.plans
+        .snapshot()
+        .expect("read all plan revisions")
+        .len()
+}
+
+fn write_prepare_task_context(fx: &ApprovalFixture, name: &str) -> PathBuf {
+    let sessions_dir = fx.root.join("sessions");
+    fs::create_dir_all(&sessions_dir).expect("create prepare-task router sessions directory");
+    fs::set_permissions(&sessions_dir, fs::Permissions::from_mode(0o700))
+        .expect("chmod prepare-task router sessions directory 0700");
+    fs::create_dir_all(&fx.authority_dir).expect("create prepare-task router authority directory");
+    fs::set_permissions(&fx.authority_dir, fs::Permissions::from_mode(0o700))
+        .expect("chmod prepare-task router authority directory 0700");
+
+    let context = serde_json::json!({
+        "schema_version": 1,
+        "project_root": fx.repo.clone(),
+        "binding_id": fx.binding_id.clone(),
+        "thread_uuid": THREAD_UUID,
+        "route": "trusted_local_operator",
+        "native_per_call_identity_verified": false,
+        "stores": {
+            "state_dir": fx.state_dir.clone(),
+            "registry_dir": fx.registry_dir.clone(),
+            "plans_dir": fx.plans_dir.clone(),
+            "authority_dir": fx.authority_dir.clone(),
+            "sessions_dir": sessions_dir,
+        }
+    });
+    fx.write_request(name, &context)
+}
+
 fn parse_success<T: DeserializeOwned>(output: &Output, context: &str) -> T {
     assert!(
         output.status.success(),
@@ -2299,6 +2399,516 @@ async fn fixed_scope_flags_enforce_binding_thread_and_project_root_before_ledger
     );
     assert_eq!(summary.subject_digest, preview.subject_digest);
     assert_eq!(fx.approval_count(), 1);
+    fx.assert_no_worker_invocation();
+
+    fx.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prepare_task_context_route_publishes_one_plan_and_preview_and_record_stays_separate() {
+    let mut fx = ApprovalFixture::start().await;
+    let temp_dir = fx.private_preview_temp_dir();
+    let context_path = write_prepare_task_context(&fx, "prepare-task-context.json");
+    let request = prepare_task_request(&fx, "fast-context-1");
+    let stdin = prepare_task_bytes(&request);
+    let args = vec![
+        "--context".to_string(),
+        context_path.display().to_string(),
+        "approve".to_string(),
+        "prepare-task".to_string(),
+    ];
+
+    let output = run_command_with_stdin(context_command(), &args, &stdin, Some(&temp_dir)).await;
+    let receipt: PrivatePreviewReceipt = parse_success(&output, "context-routed prepare-task");
+
+    let plan_id = receipt.preview.request.plan_id.clone();
+    assert!(plan_id.starts_with("plan_"));
+    assert_eq!(receipt.preview.request.plan_revision, 1);
+    assert_eq!(receipt.preview.request.binding_id, fx.binding_id);
+    assert_eq!(receipt.preview.request.thread_uuid, THREAD_UUID);
+    assert_eq!(receipt.preview.request.repository_path, fx.repo);
+    assert_eq!(receipt.preview.request.base_commit, fx.base_commit);
+    assert_eq!(
+        receipt.preview.request.expected_registry_revision,
+        fx.registry_revision
+    );
+    assert_eq!(
+        receipt.preview.request.approved_task_ids,
+        vec!["task-fast".to_string()]
+    );
+    assert_eq!(
+        receipt.preview.request.approved_write_paths,
+        vec!["src/lib.rs".to_string()]
+    );
+    assert_eq!(receipt.preview.request.max_parallel, 1);
+    assert_eq!(receipt.preview.request.budgets.timeout_ms, 90_000);
+    assert_eq!(receipt.preview.tasks.len(), 1);
+    assert_eq!(receipt.preview.tasks[0].task_id, "task-fast");
+    assert_eq!(
+        receipt.preview.tasks[0].instruction,
+        "Implement the ordinary fast-path task."
+    );
+    assert_sha256(
+        &receipt.preview.subject_digest,
+        "fast-path preview subject_digest",
+    );
+
+    let revisions = fx
+        .plans
+        .plan_revisions(&plan_id)
+        .expect("read fast-path plan revisions");
+    assert_eq!(revisions.len(), 1);
+    assert_eq!(revisions[0].status, PlanStatus::Published);
+    assert_eq!(revisions[0].profile_id, PROFILE_ID);
+    assert_eq!(revisions[0].profile_revision, fx.registry_revision);
+    assert_eq!(revisions[0].summary, "Ordinary single-task fast path");
+    assert_eq!(revisions[0].tasks.len(), 1);
+    assert_eq!(revisions[0].tasks[0].id, "task-fast");
+    assert_eq!(revisions[0].tasks[0].role, WorkflowRole::Coder);
+    assert!(revisions[0].tasks[0].depends_on.is_empty());
+    assert_eq!(
+        revisions[0].tasks[0].allowed_write_paths,
+        vec!["src/lib.rs".to_string()]
+    );
+
+    assert!(receipt.preview_path.starts_with(&temp_dir));
+    assert_mode(
+        receipt
+            .preview_path
+            .parent()
+            .expect("fast-path preview path parent"),
+        0o700,
+        "fast-path private preview directory",
+    );
+    assert_mode(
+        &receipt.preview_path,
+        0o600,
+        "fast-path private preview file",
+    );
+    assert_eq!(directory_entries(&temp_dir).len(), 1);
+    assert_eq!(fx.approval_count(), 0);
+    fx.assert_no_approval_artifacts();
+
+    // An exact replay after publication adopts the original plan and preview scope instead of
+    // creating a second plan. A new private preview is allowed; no authority is recorded.
+    let replay_output =
+        run_command_with_stdin(context_command(), &args, &stdin, Some(&temp_dir)).await;
+    let replay: PrivatePreviewReceipt =
+        parse_success(&replay_output, "context-routed prepare-task replay");
+    assert_eq!(replay.preview.request.plan_id, plan_id);
+    assert_eq!(replay.preview.request.plan_revision, 1);
+    assert_eq!(
+        replay.preview.subject_digest,
+        receipt.preview.subject_digest,
+        "an exact replay must reproduce the same frozen subject"
+    );
+    assert_eq!(prepare_task_plan_revision_count(&fx, &plan_id), 1);
+    assert_eq!(fx.approval_count(), 0);
+    assert_eq!(directory_entries(&temp_dir).len(), 2);
+
+    // Recording remains a separate explicit operation.
+    let summary: ApprovalSummary = parse_success(
+        &fx.run_record_preview(
+            &receipt.preview_path,
+            &receipt.preview.subject_digest,
+            THREAD_UUID,
+            true,
+        )
+        .await,
+        "record the fast-path private preview",
+    );
+    assert_eq!(summary.subject_digest, receipt.preview.subject_digest);
+    assert_eq!(summary.plan_id, plan_id);
+    assert_eq!(summary.plan_revision, 1);
+    assert_eq!(summary.thread_uuid, THREAD_UUID);
+    assert_eq!(fx.approval_count(), 1);
+    fx.assert_no_worker_invocation();
+    assert_eq!(fx.head(), fx.base_commit);
+    assert!(fx.worktree_names().is_empty());
+
+    // Replaying the fast path after record must not add a second plan or approval.
+    let after_record =
+        run_command_with_stdin(context_command(), &args, &stdin, Some(&temp_dir)).await;
+    let after_record_receipt: PrivatePreviewReceipt =
+        parse_success(&after_record, "prepare-task replay after record");
+    assert_eq!(after_record_receipt.preview.request.plan_id, plan_id);
+    assert_eq!(prepare_task_plan_revision_count(&fx, &plan_id), 1);
+    assert_eq!(fx.approval_count(), 1);
+    fx.assert_no_worker_invocation();
+    assert_eq!(fx.head(), fx.base_commit);
+    assert!(fx.worktree_names().is_empty());
+
+    fx.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prepare_task_requires_complete_exact_scope_and_current_registry_before_mutation() {
+    let mut fx = ApprovalFixture::start().await;
+    let temp_dir = fx.private_preview_temp_dir();
+    let request = prepare_task_request(&fx, "fast-scope-1");
+    let stdin = prepare_task_bytes(&request);
+    let before = total_plan_revision_count(&fx);
+
+    let missing = fx
+        .run_cli_with_stdin(
+            &prepare_task_args_with_scope(&fx, None, None, None),
+            &stdin,
+            Some(&temp_dir),
+        )
+        .await;
+    assert_eq!(
+        expect_failure(&missing, "prepare-task without fixed scope").code,
+        "invalid_input"
+    );
+
+    let partial = fx
+        .run_cli_with_stdin(
+            &prepare_task_args_with_scope(
+                &fx,
+                Some(fx.binding_id.as_str()),
+                Some(THREAD_UUID),
+                None,
+            ),
+            &stdin,
+            Some(&temp_dir),
+        )
+        .await;
+    assert_eq!(
+        expect_failure(&partial, "prepare-task without --project-root").code,
+        "invalid_input"
+    );
+
+    let wrong_binding = fx
+        .run_cli_with_stdin(
+            &prepare_task_args_with_scope(
+                &fx,
+                Some("bnd_other_chat"),
+                Some(THREAD_UUID),
+                Some(fx.repo.as_path()),
+            ),
+            &stdin,
+            Some(&temp_dir),
+        )
+        .await;
+    assert_eq!(
+        expect_failure(&wrong_binding, "prepare-task with a fixed binding mismatch").code,
+        "binding_mismatch"
+    );
+
+    let wrong_thread = fx
+        .run_cli_with_stdin(
+            &prepare_task_args_with_scope(
+                &fx,
+                Some(fx.binding_id.as_str()),
+                Some(OTHER_THREAD_UUID),
+                Some(fx.repo.as_path()),
+            ),
+            &stdin,
+            Some(&temp_dir),
+        )
+        .await;
+    assert_eq!(
+        expect_failure(&wrong_thread, "prepare-task with a fixed thread mismatch").code,
+        "thread_uuid_mismatch"
+    );
+
+    let other_repo = fx.root.join("prepare-task-other-repo");
+    let _other_commit = init_disposable_repo(&other_repo);
+    let wrong_project_root = fx
+        .run_cli_with_stdin(
+            &prepare_task_args_with_scope(
+                &fx,
+                Some(fx.binding_id.as_str()),
+                Some(THREAD_UUID),
+                Some(other_repo.as_path()),
+            ),
+            &stdin,
+            Some(&temp_dir),
+        )
+        .await;
+    assert_eq!(
+        expect_failure(
+            &wrong_project_root,
+            "prepare-task with a fixed project-root mismatch",
+        )
+        .code,
+        "invalid_repository"
+    );
+
+    let mut changed_repo = request.clone();
+    changed_repo["repository_path"] = serde_json::json!(other_repo);
+    let request_repo_mismatch = fx
+        .run_cli_with_stdin(
+            &prepare_task_args(&fx),
+            &prepare_task_bytes(&changed_repo),
+            Some(&temp_dir),
+        )
+        .await;
+    assert_eq!(
+        expect_failure(
+            &request_repo_mismatch,
+            "prepare-task with a stdin repository_path outside fixed scope",
+        )
+        .code,
+        "invalid_repository"
+    );
+
+    assert_eq!(total_plan_revision_count(&fx), before);
+    assert!(directory_entries(&temp_dir).is_empty());
+    fx.assert_no_approval_artifacts();
+
+    // A stale profile/registry revision must be rejected before the draft is created.
+    let advanced_revision = fx.advance_registry();
+    assert_eq!(advanced_revision, fx.registry_revision + 1);
+    let stale_request = prepare_task_request(&fx, "fast-stale-1");
+    let stale = fx
+        .run_cli_with_stdin(
+            &prepare_task_args(&fx),
+            &prepare_task_bytes(&stale_request),
+            Some(&temp_dir),
+        )
+        .await;
+    assert_eq!(
+        expect_failure(&stale, "prepare-task with a stale registry revision").code,
+        "stale_registry_revision"
+    );
+    assert_eq!(total_plan_revision_count(&fx), before);
+    assert!(directory_entries(&temp_dir).is_empty());
+    fx.assert_no_approval_artifacts();
+
+    fx.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prepare_task_rejects_malformed_requests_and_conflicting_keys_without_side_effects() {
+    let mut fx = ApprovalFixture::start().await;
+    let temp_dir = fx.private_preview_temp_dir();
+    let args = prepare_task_args(&fx);
+    let before = total_plan_revision_count(&fx);
+
+    let valid = prepare_task_request(&fx, "fast-malformed-1");
+    let empty = fx
+        .run_cli_with_stdin(&args, b"", Some(&temp_dir))
+        .await;
+    assert_eq!(
+        expect_failure(&empty, "prepare-task with empty stdin").code,
+        "invalid_input"
+    );
+
+    let malformed_bytes = format!("{{ not valid prepare-task JSON {SECRET_SENTINEL}");
+    let malformed = fx
+        .run_cli_with_stdin(&args, malformed_bytes.as_bytes(), Some(&temp_dir))
+        .await;
+    assert_eq!(
+        expect_failure(&malformed, "prepare-task with malformed stdin").code,
+        "invalid_input"
+    );
+    assert_no_secret_echo(&malformed, "prepare-task with malformed stdin");
+
+    let mut unknown = valid.clone();
+    unknown
+        .as_object_mut()
+        .expect("prepare-task request is an object")
+        .insert("unexpected_field".to_string(), Value::Bool(true));
+    assert_eq!(
+        expect_failure(
+            &fx.run_cli_with_stdin(&args, &prepare_task_bytes(&unknown), Some(&temp_dir))
+                .await,
+            "prepare-task with an unknown top-level field",
+        )
+        .code,
+        "invalid_input"
+    );
+
+    let mut missing_budgets = valid.clone();
+    missing_budgets
+        .as_object_mut()
+        .expect("prepare-task request is an object")
+        .remove("budgets");
+    assert_eq!(
+        expect_failure(
+            &fx.run_cli_with_stdin(
+                &args,
+                &prepare_task_bytes(&missing_budgets),
+                Some(&temp_dir)
+            )
+            .await,
+            "prepare-task without budgets",
+        )
+        .code,
+        "invalid_input"
+    );
+
+    let mut non_coder = valid.clone();
+    non_coder["task"]["role"] = serde_json::json!("reviewer");
+    assert_eq!(
+        expect_failure(
+            &fx.run_cli_with_stdin(&args, &prepare_task_bytes(&non_coder), Some(&temp_dir))
+                .await,
+            "prepare-task with a non-coder task",
+        )
+        .code,
+        "invalid_input"
+    );
+
+    let mut dependent = valid.clone();
+    dependent["task"]["depends_on"] = serde_json::json!(["task-other"]);
+    assert_eq!(
+        expect_failure(
+            &fx.run_cli_with_stdin(&args, &prepare_task_bytes(&dependent), Some(&temp_dir))
+                .await,
+            "prepare-task with a dependent task",
+        )
+        .code,
+        "invalid_input"
+    );
+
+    let mut invalid_base = valid.clone();
+    invalid_base["base_commit"] = serde_json::json!("0".repeat(40));
+    assert_eq!(
+        expect_failure(
+            &fx.run_cli_with_stdin(&args, &prepare_task_bytes(&invalid_base), Some(&temp_dir))
+                .await,
+            "prepare-task with a non-existent base commit",
+        )
+        .code,
+        "invalid_base_commit"
+    );
+
+    let mut invalid_budgets = valid.clone();
+    invalid_budgets["budgets"] = serde_json::json!({"timeout_ms": 0});
+    assert_eq!(
+        expect_failure(
+            &fx.run_cli_with_stdin(
+                &args,
+                &prepare_task_bytes(&invalid_budgets),
+                Some(&temp_dir)
+            )
+            .await,
+            "prepare-task with out-of-bounds budgets",
+        )
+        .code,
+        "validation"
+    );
+
+    let mut oversize = prepare_task_bytes(&valid);
+    oversize.resize(MAX_REQUEST_BYTES + 1, b' ');
+    assert_eq!(
+        expect_failure(
+            &fx.run_cli_with_stdin(&args, &oversize, Some(&temp_dir))
+                .await,
+            "prepare-task with oversize stdin",
+        )
+        .code,
+        "invalid_input"
+    );
+
+    assert_eq!(total_plan_revision_count(&fx), before);
+    assert!(directory_entries(&temp_dir).is_empty());
+    fx.assert_no_approval_artifacts();
+
+    // The first valid invocation creates the original plan.
+    let first: PrivatePreviewReceipt = parse_success(
+        &fx.run_cli_with_stdin(&args, &prepare_task_bytes(&valid), Some(&temp_dir))
+            .await,
+        "first valid prepare-task invocation",
+    );
+    let plan_id = first.preview.request.plan_id.clone();
+    assert_eq!(total_plan_revision_count(&fx), before + 1);
+    assert_eq!(prepare_task_plan_revision_count(&fx, &plan_id), 1);
+    assert_eq!(fx.approval_count(), 0);
+
+    // Reusing the stable key for a different task must fail without creating a second plan.
+    let mut changed_task = valid.clone();
+    changed_task["task"]["id"] = serde_json::json!("task-other");
+    changed_task["task"]["title"] = serde_json::json!("A different fast-path task");
+    let conflict = fx
+        .run_cli_with_stdin(&args, &prepare_task_bytes(&changed_task), Some(&temp_dir))
+        .await;
+    assert_eq!(
+        expect_failure(
+            &conflict,
+            "prepare-task with the same command_key and a different task",
+        )
+        .code,
+        "idempotency_conflict"
+    );
+    assert_eq!(total_plan_revision_count(&fx), before + 1);
+    assert_eq!(prepare_task_plan_revision_count(&fx, &plan_id), 1);
+    assert_eq!(directory_entries(&temp_dir).len(), 1);
+    assert_eq!(fx.approval_count(), 0);
+    fx.assert_no_worker_invocation();
+
+    // Reusing the key with a different summary is also a conflicting original.
+    let mut changed_summary = valid.clone();
+    changed_summary["summary"] = serde_json::json!("A different fast-path plan summary");
+    let summary_conflict = fx
+        .run_cli_with_stdin(&args, &prepare_task_bytes(&changed_summary), Some(&temp_dir))
+        .await;
+    assert_eq!(
+        expect_failure(
+            &summary_conflict,
+            "prepare-task with the same command_key and a different summary",
+        )
+        .code,
+        "idempotency_conflict"
+    );
+    assert_eq!(total_plan_revision_count(&fx), before + 1);
+    assert_eq!(prepare_task_plan_revision_count(&fx, &plan_id), 1);
+    assert_eq!(fx.approval_count(), 0);
+    fx.assert_no_worker_invocation();
+    assert_eq!(fx.head(), fx.base_commit);
+    assert!(fx.worktree_names().is_empty());
+
+    // A superseded original publication must be rejected as stale rather than redone.
+    let superseding_draft = fx
+        .plans
+        .change(
+            1,
+            PlanChange::SaveDraft {
+                plan_id: plan_id.clone(),
+                binding_id: fx.binding_id.clone(),
+                profile_id: PROFILE_ID.to_string(),
+                profile_revision: fx.registry_revision,
+                summary: "Superseding fast-path plan".to_string(),
+                tasks: vec![PlanTask {
+                    id: "task-fast".to_string(),
+                    title: "Superseded fast-path task".to_string(),
+                    instruction: "Implement a superseding fast-path task.".to_string(),
+                    role: WorkflowRole::Coder,
+                    difficulty: Difficulty::Easy,
+                    depends_on: Vec::new(),
+                    allowed_write_paths: vec!["src/lib.rs".to_string()],
+                }],
+            },
+        )
+        .expect("save superseding fast-path draft");
+    fx.plans
+        .change(
+            superseding_draft.revision,
+            PlanChange::Publish {
+                plan_id: plan_id.clone(),
+                revision: superseding_draft.revision,
+            },
+        )
+        .expect("publish superseding fast-path plan");
+    assert_eq!(total_plan_revision_count(&fx), before + 2);
+
+    let stale_plan = fx
+        .run_cli_with_stdin(&args, &prepare_task_bytes(&valid), Some(&temp_dir))
+        .await;
+    assert_eq!(
+        expect_failure(
+            &stale_plan,
+            "prepare-task replay after the original plan was superseded",
+        )
+        .code,
+        "stale_revision"
+    );
+    assert_eq!(total_plan_revision_count(&fx), before + 2);
+    assert_eq!(prepare_task_plan_revision_count(&fx, &plan_id), 2);
+    assert_eq!(directory_entries(&temp_dir).len(), 1);
+    assert_eq!(fx.approval_count(), 0);
     fx.assert_no_worker_invocation();
 
     fx.shutdown().await;
