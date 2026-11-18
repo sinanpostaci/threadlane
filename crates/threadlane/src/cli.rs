@@ -14,6 +14,10 @@ use crate::protocol::ScopedRequest;
 use crate::supervisor::{Supervisor, SupervisorConfig, DEFAULT_TICK_INTERVAL_MS};
 use crate::workers::WorkersConfig;
 
+/// Canonical ordinary Worker quickstart embedded at compile time for offline CLI printing.
+const ORDINARY_WORKER_QUICKSTART_MARKDOWN: &str =
+    include_str!("../../../docs/ORDINARY-WORKER-QUICKSTART.md");
+
 /// Threadlane Milestone 1 local execution supervisor, CLI, and scoped MCP adapter.
 #[derive(Debug, Parser)]
 #[command(
@@ -161,12 +165,22 @@ pub enum Subcommands {
     ClosureTemplate,
 
     /// Print the versioned Threadlane MCP operating guide offline without network or supervisor access.
-    Guide,
+    Guide {
+        /// Print the canonical ordinary Worker quickstart instead of the full operating guide.
+        #[arg(long = "ordinary-worker")]
+        ordinary_worker: bool,
+    },
 }
 
 /// Returns the canonical versioned operating guide Markdown printed by `threadlane guide`.
 pub fn render_operating_guide() -> &'static str {
     OPERATING_GUIDE_MARKDOWN
+}
+
+/// Returns the canonical ordinary Worker quickstart Markdown printed by
+/// `threadlane guide --ordinary-worker`.
+pub fn render_ordinary_worker_quickstart() -> &'static str {
+    ORDINARY_WORKER_QUICKSTART_MARKDOWN
 }
 
 /// Builds a validated [`SupervisorConfig`] from CLI `serve` arguments (without worker profiles).
@@ -345,8 +359,12 @@ pub async fn run_cli(cli: Cli) -> Result<(), Error> {
             println!("{}", render_closure_template_json()?);
             Ok(())
         }
-        Subcommands::Guide => {
-            print!("{}", render_operating_guide());
+        Subcommands::Guide { ordinary_worker } => {
+            if ordinary_worker {
+                print!("{}", render_ordinary_worker_quickstart());
+            } else {
+                print!("{}", render_operating_guide());
+            }
             Ok(())
         }
     }
@@ -451,8 +469,12 @@ mod tests {
     async fn cli_guide_subcommand_parses_without_args_and_executes_offline() {
         let parsed = Cli::try_parse_from(["threadlane", "guide"])
             .expect("`threadlane guide` must parse with no arguments");
-        assert!(matches!(parsed.command, Subcommands::Guide));
-
+        assert!(matches!(
+            parsed.command,
+            Subcommands::Guide {
+                ordinary_worker: false
+            }
+        ));
         assert!(
             Cli::try_parse_from(["threadlane", "guide", "--unexpected"]).is_err(),
             "`threadlane guide` must reject unexpected arguments"
@@ -465,5 +487,62 @@ mod tests {
         run_cli(parsed)
             .await
             .expect("`threadlane guide` must succeed offline without supervisor or state_dir");
+    }
+
+    #[test]
+    fn cli_guide_ordinary_worker_flag_is_opt_in_and_rejects_extra_arguments() {
+        let bare = Cli::try_parse_from(["threadlane", "guide"])
+            .expect("bare `threadlane guide` must parse");
+        assert!(matches!(
+            bare.command,
+            Subcommands::Guide {
+                ordinary_worker: false
+            }
+        ));
+
+        let quickstart = Cli::try_parse_from(["threadlane", "guide", "--ordinary-worker"])
+            .expect("`threadlane guide --ordinary-worker` must parse");
+        assert!(matches!(
+            quickstart.command,
+            Subcommands::Guide {
+                ordinary_worker: true
+            }
+        ));
+
+        assert!(
+            Cli::try_parse_from(["threadlane", "guide", "--ordinary-worker", "--unexpected"])
+                .is_err(),
+            "`threadlane guide --ordinary-worker` must reject additional arguments"
+        );
+        assert!(
+            Cli::try_parse_from(["threadlane", "guide", "--unexpected"]).is_err(),
+            "bare `threadlane guide` must reject unknown arguments"
+        );
+        assert!(
+            Cli::try_parse_from(["threadlane", "guide", "--ordinary-worker=true"]).is_err(),
+            "`--ordinary-worker` must stay a bare opt-in flag"
+        );
+    }
+
+    #[test]
+    fn cli_guide_ordinary_worker_returns_exact_embedded_quickstart_bytes() {
+        const CANONICAL_QUICKSTART: &str =
+            include_str!("../../../docs/ORDINARY-WORKER-QUICKSTART.md");
+
+        let rendered = render_ordinary_worker_quickstart();
+        assert_eq!(rendered.as_bytes(), CANONICAL_QUICKSTART.as_bytes());
+        assert_eq!(rendered, CANONICAL_QUICKSTART);
+        assert_ne!(rendered, render_operating_guide());
+        assert!(rendered.starts_with("# Ordinary Worker quickstart\n"));
+        assert!(rendered.len() <= 4_096);
+    }
+
+    #[tokio::test]
+    async fn cli_guide_ordinary_worker_executes_offline_without_state_dir() {
+        let parsed = Cli::try_parse_from(["threadlane", "guide", "--ordinary-worker"])
+            .expect("`threadlane guide --ordinary-worker` must parse");
+        run_cli(parsed).await.expect(
+            "`threadlane guide --ordinary-worker` must succeed offline without supervisor or state_dir",
+        );
     }
 }

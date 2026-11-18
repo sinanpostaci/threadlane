@@ -48,13 +48,16 @@ quickstart, while the CLI route handles only those covered commands or an
 explicitly selected trusted-local operator workflow. Never bypass real
 connection, binding, readiness, revision, digest, or sandbox refusals.
 
-The minimal ordinary recipe is in `docs/ORDINARY-WORKER-QUICKSTART.md`. Use
-targeted current reads; standalone fixture edits are not product-source edits
-requiring broad Threadlane docs. Read `docs/NATIVE-OPERATOR.md` only for selected
-setup, recovery, or operator workflows not covered there, and
-`docs/PROFILE-FLOW.md` or `docs/MCP-LEGACY-OPERATING-GUIDE.md` only for an
-actually selected legacy role cycle (product-source editing still reads
-`docs/ROADMAP.md` and the current milestone).
+The minimal ordinary recipe is in `docs/ORDINARY-WORKER-QUICKSTART.md`. When a
+dev/runtime package lacks that file, print its exact embedded bytes with the
+verified `cli_package/bin/threadlane guide --ordinary-worker` instead of
+searching another source checkout. Use targeted current reads; standalone
+fixture edits are not product-source edits requiring broad Threadlane docs.
+Read `docs/NATIVE-OPERATOR.md` only for selected setup, recovery, or operator
+workflows not covered there, and `docs/PROFILE-FLOW.md` or
+`docs/MCP-LEGACY-OPERATING-GUIDE.md` only for an actually selected legacy role
+cycle (product-source editing still reads `docs/ROADMAP.md` and the current
+milestone).
 
 ## Selecting a profile
 
@@ -171,6 +174,12 @@ decision or question. NEVER write test or compiler artifacts into the frozen
 delivery worktree, even ignored paths (the diff gate scans ignored files); test
 in a separate exact-byte validation checkout with its own local
 `CARGO_TARGET_DIR` and preserved original tests, inputs, and delivery hashes.
+
+When the human has explicitly assigned a separate primary agent final
+acceptance, after a real ACK at `ready_for_semantic_review` give that named
+primary the original item/execution and evidence, end your turn, and let it run
+the guarded completion; pending external review alone is not `NeedsYou`.
+Routine self-reviewed completion stays unchanged.
 
 Close the callback compactly. Recover the original start mapping first. For pages, check the
 chat's outer/control binding separately from dispatch `session_binding_id`; batch, event, and
