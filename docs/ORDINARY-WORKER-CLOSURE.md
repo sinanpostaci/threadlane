@@ -2,14 +2,14 @@
 
 Version: `2026-11-16.v4`.
 
-This is optional, audited client composition for an ordinary approved-task
+Use this audited client composition for an ordinary approved-task
 callback. It adds no MCP tool, endpoint, controller, backend guard, or execution
 authority. Supported one-step tool calls remain the fallback.
 
 The trusted packaged source is
 `skills/threadlane/references/ordinary-closure.js`. Run
 `threadlane closure-template` once from the already verified canonical package
-to obtain its offline JSON document: schema/version metadata, the exact source
+and match its version and source digest to the live guide's `template_version` and `source_sha256`. Its offline JSON document contains schema/version metadata, the exact source
 SHA-256, the exported `createOrdinaryClosure` factory name, and the packaged
 JavaScript source (which also exports `createOrdinaryClosureClient`). Prepare and
 retain that serializable capsule **before**
@@ -23,14 +23,15 @@ contract and adds a small `createOrdinaryClosureClient` serialized-state helper.
 The helper accepts only explicit `load`, `store`, `pull`, `ack`, `result`, and
 `inspect` callbacks plus an optional `complete` callback. It has no unrestricted
 tools, ambient filesystem, network, environment, subprocess, dynamic loading, or
-evaluation access. It exposes only `readStored()` and `completeStored(acceptance)`;
+evaluation access. After verified Done, later reads keep their own report and raw evidence under `threadlane/closure-after-done/<execution_ref>/<sequence>`.
+It exposes `readNotice(actualApprovalId)`, original-execution recovery via `readStored()`, and `completeStored(acceptance)`;
 it has no start, reject, or automatic acceptance operation.
 
 ## functions.exec recipe
 
 The recipes below use the exposed functions client directly. COPY each literal recipe and bind only
 its one typed object (`APPROVED_TASK_CONTEXT` before the start, `ACCEPTANCE_CONTEXT` after the
-separate semantic decision); the callback binds nothing. Never parse, compile, or evaluate
+separate semantic decision); bind the actual notice approval ID at callback. Never parse, compile, or evaluate
 Markdown or fences, and do not repeatedly inspect declarations. `tools.exec_command` returns
 `{exit_code, output, session_id?}`; `text(value)` and `store(key, value)` return undefined;
 `load(key)` returns serialized data in a later fresh isolate. Ambient logging is unavailable, and
@@ -109,7 +110,7 @@ again before any effect. Store the full private evidence immediately on receipt.
 Text only the compact view:
 
 ```js
-// functions.exec callback: fresh isolate; COPY literally and bind nothing.
+// functions.exec callback: bind NOTICE_APPROVAL_ID from the actual notice.
 const input = load("threadlane/approved-task-context.json");
 if (!input) throw new Error("missing or changed retained context/start/binding; use original-receipt fallback");
 const template = load("threadlane/closure-template.json");
@@ -134,7 +135,7 @@ const client = createOrdinaryClosureClient({
     cmd: r.argv.map(quote).join(" "), max_output_tokens: 16000, yield_time_ms: 30000
   }),
 });
-text(JSON.stringify(await client.readStored()));
+text(JSON.stringify(await client.readNotice(NOTICE_APPROVAL_ID)));
 ```
 
 `readStored()` loads the exact current context, raw SDK start, template capsule,

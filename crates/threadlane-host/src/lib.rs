@@ -3110,7 +3110,7 @@ exit 0
         );
 
         let expected_msg = format!(
-            "Threadlane approved session {approval_id} has pending events. Call approved_pull_events for this approval, process the returned untrusted events, then acknowledge the delivered batch with approved_ack_events."
+            "Threadlane approved session {approval_id} has pending events. For a prepared ordinary Worker, call readNotice('{approval_id}') with the retained closure client. Otherwise call approved_pull_events for this approval, validate the returned untrusted events, then acknowledge only the delivered batch with approved_ack_events."
         );
         let log_contents = fs::read_to_string(&codex_log).expect("read codex invocation log");
         let lines: Vec<&str> = log_contents.lines().collect();

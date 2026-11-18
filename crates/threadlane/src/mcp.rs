@@ -16,6 +16,7 @@ use threadlane_core::observation::{
 use threadlane_core::{BacklogItemKind, EventKind};
 
 use crate::client::ScopedClient;
+use crate::closure_template::{closure_template_source_sha256, CLOSURE_TEMPLATE_VERSION};
 use crate::error::Error;
 
 /// Canonical version string for the shared Threadlane MCP operating guide.
@@ -69,6 +70,10 @@ pub struct OperatingGuideResponse {
     pub cli_fallback_command: String,
     /// Complete Markdown contents of the shared operating guide.
     pub guide_markdown: String,
+    /// Canonical offline closure template version (`2026-11-16.v4`).
+    pub template_version: String,
+    /// Lowercase SHA-256 digest of the trusted closure template source bytes.
+    pub source_sha256: String,
 }
 
 impl OperatingGuideResponse {
@@ -81,6 +86,8 @@ impl OperatingGuideResponse {
             operator_doc_path: NATIVE_OPERATOR_DOC_PATH.to_string(),
             cli_fallback_command: OPERATING_GUIDE_CLI_COMMAND.to_string(),
             guide_markdown: OPERATING_GUIDE_MARKDOWN.to_string(),
+            template_version: CLOSURE_TEMPLATE_VERSION.to_string(),
+            source_sha256: closure_template_source_sha256(),
         }
     }
 }
@@ -688,7 +695,7 @@ impl ThreadlaneMcpServer {
     /// Fetch the versioned Threadlane MCP operating guide for startup, session resume, or post-compaction recovery.
     #[tool(
         name = "operating_guide",
-        description = "Fetch the versioned, read-only Threadlane MCP operating guide (version 2026-11-17.v2). Call on initial connection, session resume, or context uncertainty/compaction, then refresh only uncertain live scoped backlog/status/catalog state without a polling loop. Includes the ordinary backlog workflow, guarded Worker (coder) reservation/result/completion contracts (no unconditional pre-start approved_task/ready/host probe; guarded start owns eligible host startup and host_not_ready on an optional pre-start read is not an attempted launch), the opt-in offline closure template with an immutable packaged JS source hash, and the compact finite callback closure with conditional sequential tool composition, cross-page ACK continuity, private DTO evidence, deadline and exec_command checks, and real per-batch ACKs; links to opt-in NATIVE-OPERATOR, PROFILE-FLOW, and legacy complete job admission with durability and receipt limits. Does not mutate state or acknowledge events.",
+        description = "Fetch the versioned, read-only Threadlane MCP operating guide (version 2026-11-17.v2). Call on initial connection, session resume, or context uncertainty/compaction, then refresh only uncertain live scoped backlog/status/catalog state without a polling loop. Includes the ordinary backlog workflow, guarded Worker (coder) reservation/result/completion contracts (no unconditional pre-start approved_task/ready/host probe; guarded start owns eligible host startup and host_not_ready on an optional pre-start read is not an attempted launch), the ordinary offline closure template with template_version and source_sha256 for the packaged JS, and the compact finite callback closure with conditional sequential tool composition, cross-page ACK continuity, private DTO evidence, deadline and exec_command checks, and real per-batch ACKs; links to opt-in NATIVE-OPERATOR, PROFILE-FLOW, and legacy complete job admission with durability and receipt limits. Does not mutate state or acknowledge events.",
         annotations(
             title = "Get Threadlane MCP Operating Guide",
             read_only_hint = true,
@@ -1514,6 +1521,9 @@ mod tests {
         assert_eq!(structured["data"]["version"], OPERATING_GUIDE_VERSION);
         assert_eq!(structured["data"]["tool"], OPERATING_GUIDE_TOOL);
         assert_eq!(structured["data"]["doc_path"], OPERATING_GUIDE_DOC_PATH);
+        let template = crate::closure_template::render_closure_template();
+        assert_eq!(structured["data"]["template_version"], template.version);
+        assert_eq!(structured["data"]["source_sha256"], template.source_sha256);
         assert_eq!(
             structured["data"]["operator_doc_path"],
             NATIVE_OPERATOR_DOC_PATH

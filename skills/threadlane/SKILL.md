@@ -186,7 +186,7 @@ tools one step at a time with the same checks. Never parallelize dependent mutat
 IDs, replay unknown effects, infer success from prose, or auto-accept semantics. A progress page
 is not liveness. The Coworker still makes its separate semantic decision before guarded
 complete/reject. No fixed wall-clock guarantee follows from client-tagged reasoning or
-physical/MCP time. An opt-in audited helper is packaged as `threadlane closure-template` from the
+physical/MCP time. Use the current guide’s template version and source digest to verify `threadlane closure-template` from the
 trusted offline packaged CLI (not a prerequisite file in `~/.agents`; offline
 JSON with source SHA-256 and a pure JavaScript factory, distinct closure version
 `2026-11-16.v4`); once source and SHA-256 are verified, do not repeat
@@ -194,7 +194,7 @@ declaration, repo, or global-skill searches. Create the storage-only `worker`
 backlog item first with `backlog_create` (creation grants no authority),
 prepare and retain its serializable capsule before `backlog_worker_start`, evaluate only
 that trusted source in a fresh isolate, and use the small `createOrdinaryClosureClient`
-helper around the preserved `read`/`doneView` core. Its `readStored()` revalidates the
+helper around the preserved `read`/`doneView` core. Use `readNotice(NOTICE_APPROVAL_ID)` for a notice and `readStored()` for original no-notice recovery. Each revalidates the
 exact current context, raw start, and prep binding before any effect, keeps full raw
 evidence/report/correlation private, and returns a compact view with current identity,
 technical guard facts, verified event counts/ACK cursor, and the exact physical text.
@@ -203,7 +203,7 @@ checks before one guarded complete, retains completion intent and the exact rece
 reuses only a matching validated retained Done; missing, error, or unknown replies never
 retry or fabricate `Done`. COPY the literal recipes and bind only their one typed object
 (`APPROVED_TASK_CONTEXT` before start, `ACCEPTANCE_CONTEXT` after the separate semantic
-decision); the callback binds nothing. Never parse, compile, or evaluate Markdown or
+decision); bind the actual notice approval ID at callback. Never parse, compile, or evaluate Markdown or
 fences, and do not repeatedly inspect declarations. `exec_command` returns
 `{exit_code, output, session_id?}`; `text`/`store` return undefined; `load` restores
 serialized data in a fresh isolate; ambient logging is absent. Never print the capsule

@@ -48,7 +48,7 @@ a polling loop. The detailed legacy contracts are preserved in
 [`docs/MCP-LEGACY-OPERATING-GUIDE.md`](MCP-LEGACY-OPERATING-GUIDE.md) and are
 opt-in only.
 
-`threadlane closure-template` prints the opt-in ordinary callback helper as
+`threadlane closure-template` prints the ordinary callback helper as
 offline JSON from the trusted offline packaged CLI (not a prerequisite file in
 `~/.agents`; schema/version `2026-11-16.v4`, source SHA-256, and the packaged
 JavaScript factory source). Once source and SHA-256 are verified, do not repeat
@@ -62,12 +62,11 @@ load/store/pull/ACK/result/inspect and optional complete callbacks; never evalua
 event, provider, or filesystem text. The capsule keeps the legacy `read`/`doneView`
 core and adds the small `createOrdinaryClosureClient` helper. COPY the literal
 recipes and bind only their one typed object (`APPROVED_TASK_CONTEXT` before start,
-`ACCEPTANCE_CONTEXT` after the separate semantic decision); the callback recipe binds
-nothing. Never parse, compile, or evaluate Markdown or fences, and do not repeatedly
+`ACCEPTANCE_CONTEXT` after the separate semantic decision); bind the actual notice approval ID at callback. Never parse, compile, or evaluate Markdown or fences, and do not repeatedly
 inspect declarations. The runnable recipe parses the actual `exec_command`
 `{exit_code, output, session_id?}` wrapper; `text`/`store` return undefined, and `load`
 restores serialized data in a fresh isolate. The capsule JavaScript is never printed.
-`readStored()` rejects stale, mixed, or failed-prep state before any effect, retains
+`readNotice(actualApprovalId)` and original no-notice recovery via `readStored()` reject stale, mixed, or failed-prep state before any effect, retains
 every actual returned DTO in private evidence, checks cross-page cursor continuity,
 rejects an inner EventBatch above 49152 UTF-8 bytes or an invalid event `step_seq`
 before ACK, and returns only a compact view with identity, guard facts, verified event

@@ -24,9 +24,8 @@ Version: `2026-11-17.v2`
 
 ## Work ordinary tasks through the backlog
 
-- `backlog_create` stores bounded intent only; `coworker` is conversation work, `worker` is storage-only
-  for the single-task route and grants no authority. `backlog_start`/`backlog_complete` are Coworker attestations;
-  `Doing` is state, not liveness. `NeedsYou` only for an open human decision.
+- `backlog_create` stores intent; `coworker` is conversation, `worker` is storage-only route (no authority).
+  `backlog_start`/`backlog_complete` are Coworker attestations; `Doing` is state. `NeedsYou` for human decision.
 
 ## Approve concrete scope once
 
@@ -80,19 +79,21 @@ match batch/event/ACK bindings, real batch ID, ordered sequences, cross-page con
 Preserve `acceptance_condition_digest`, `delivery_description_digest`, `reservation_revision`, `reserved_at_ms`,
 optional `execution_binding_digest`, and task/subject digests; `item_snapshot.revision` is mutable. See [template](ORDINARY-WORKER-CLOSURE.md).
 
-For opt-in audited closure, create the storage-only `worker` item (`backlog_create`), prepare `threadlane closure-template` once from the trusted
-offline packaged CLI (not a `~/.agents` file; no repeat search once source/hash verified)
-before `backlog_worker_start`, and keep the capsule private. Evaluate only that source; fresh isolates recreate `createOrdinaryClosureClient`.
-`readStored()` validates context, start, capsule, and prep binding before effect, refusing stale/mixed/partial/failed-prep state.
-Its bounded read (8 pages, 16 calls, 60000 ms) rejects inner EventBatch >49152 UTF-8 bytes or invalid `step_seq` before ACK, keeps
-`threadlane/closure-evidence.json`, `threadlane/closure-report.json`, and `threadlane/closure-read-correlation.json` private, and returns a compact view.
-Live `exec_command` session, non-zero exit, conflicting envelope, or truncation fails. Read never completes; success is only `ready_for_semantic_review`.
+For an ordinary Worker, create the storage-only item, then use the prep recipe once before guarded start.
+Use the live guide's `template_version` and `source_sha256` to verify `threadlane closure-template` from the offline packaged CLI.
+Bind `APPROVED_TASK_CONTEXT.expected_source_sha256` to that digest. Keep the verified capsule private.
 
-`completeStored(ACCEPTANCE_CONTEXT)` checks bindings, correlation, revision, ref, and digests before effect, calls `backlog_worker_complete`,
-retains intent/receipt, and formats via `doneView`. Missing/error/unknown replies never retry or fabricate `Done`; matching validated Done formats without a new call.
+At a notice, bind `NOTICE_APPROVAL_ID` from the actual notice and run the callback once. It verifies the original start
+before any effect. Missing notice: use `readStored()` only for the known original execution. Missing or mismatched prep:
+use per-tool recovery for the named approval and its original receipt. Never redispatch.
+Reads are bounded (8 pages, 16 calls, 60000 ms); invalid `step_seq` or a batch over 49152 bytes fails before ACK.
+A live `exec_command` session, nonzero exit, truncation or conflicting envelope fails.
+Keep `threadlane/closure-evidence.json`, `threadlane/closure-report.json` and correlation private.
 
-COPY each literal block and bind only its typed object (`APPROVED_TASK_CONTEXT` for prep, `ACCEPTANCE_CONTEXT` after semantic decision; callback binds nothing).
-Never parse/eval Markdown or fences. `exec_command` yields `{exit_code, output, session_id?}`; `text`/`store` return undefined; `load` restores data across isolates.
+At `ready_for_semantic_review`, check the returned physical contents against the human's acceptance condition.
+Then bind `ACCEPTANCE_CONTEXT` and run the completion recipe. It revalidates correlation, revision, ref and digests.
+After compaction reuse retained verified evidence. An unknown completion requires original-receipt recovery.
+Copy literal recipes; never evaluate Markdown. `load` restores serialized data across isolates.
 
 ```js
 // functions.exec prep: COPY literally; bind the one typed input object.
@@ -142,7 +143,7 @@ text(JSON.stringify({version: template.version, source_sha256: template.source_s
 ```
 
 ```js
-// functions.exec callback: fresh isolate; COPY literally and bind nothing.
+// functions.exec callback: bind NOTICE_APPROVAL_ID from the actual notice.
 const input = load("threadlane/approved-task-context.json");
 if (!input) throw new Error("missing or changed retained context/start/binding; use original-receipt fallback");
 const template = load("threadlane/closure-template.json");
@@ -167,7 +168,7 @@ const client = createOrdinaryClosureClient({
     cmd: r.argv.map(quote).join(" "), max_output_tokens: 16000, yield_time_ms: 30000
   }),
 });
-text(JSON.stringify(await client.readStored()));
+text(JSON.stringify(await client.readNotice(NOTICE_APPROVAL_ID)));
 ```
 
 ```js

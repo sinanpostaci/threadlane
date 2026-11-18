@@ -598,7 +598,7 @@ function createOrdinaryClosureClient(callbacks) {
     return view;
   }
 
-  async function readStored() {
+  async function readRetained(approvalId) {
     var input = await load(ORDINARY_CLOSURE_CLIENT_CONTEXT_KEY);
     var template = await load(ORDINARY_CLOSURE_CLIENT_TEMPLATE_KEY);
     var start = await load(ORDINARY_CLOSURE_CLIENT_START_KEY);
@@ -608,6 +608,15 @@ function createOrdinaryClosureClient(callbacks) {
       throw new Error(
         "missing or changed retained context/start/binding; use original-receipt fallback"
       );
+    }
+    var identity = storedStartIdentity(start);
+    var args = input.start_args;
+    if (!identity || !isPlainObject(args) ||
+        identity.approval_id !== args.approval_id || identity.task_id !== args.task_id ||
+        identity.item_id !== args.item_id || !isPositiveInteger(args.expected_revision) ||
+        identity.reservation_revision !== args.expected_revision + 1 ||
+        (approvalId !== undefined && identity.approval_id !== approvalId)) {
+      throw new Error("notice or retained request identity mismatch; use original-receipt fallback");
     }
     var outcome = await closure.read({
       start: start,
@@ -620,6 +629,29 @@ function createOrdinaryClosureClient(callbacks) {
     });
     var report = outcome.report;
     var evidence = outcome.evidence;
+    if (report.status !== "ready_for_semantic_review") {
+      var receipts = completionState(await load(ORDINARY_CLOSURE_CLIENT_DONE_RECEIPT_KEY));
+      var key = stableStringify(identity);
+      var priorReceipt = completionRecord(receipts, key);
+      if (priorReceipt === undefined) priorReceipt = receipts.legacy;
+      var priorIdentity = storedReceiptIdentity(priorReceipt);
+      if (priorIdentity && stableStringify(priorIdentity) === key) {
+        var priorReport = await load(ORDINARY_CLOSURE_CLIENT_REPORT_KEY);
+        var correlation = await load(ORDINARY_CLOSURE_CLIENT_CORRELATION_KEY);
+        if (isPlainObject(priorReport) && isPlainObject(correlation) &&
+            JSON.stringify(correlation) === JSON.stringify({input: input, start: start, report: priorReport}) &&
+            closure.doneView({receipt: priorReceipt, report: priorReport}).status === "done") {
+          // Keep each subsequent observation without replacing the accepted verification.
+          var prefix = "threadlane/closure-after-done/" + identity.execution_ref;
+          var previous = await load(prefix + "/count");
+          var sequence = previous === undefined ? 1 : previous + 1;
+          if (!isPositiveInteger(sequence)) throw new Error("invalid post-completion evidence index");
+          await store(prefix + "/" + sequence, {identity: identity, report: report, evidence: evidence});
+          await store(prefix + "/count", sequence);
+          return compactReport(report, input);
+        }
+      }
+    }
     await store(ORDINARY_CLOSURE_CLIENT_EVIDENCE_KEY, evidence);
     await store(ORDINARY_CLOSURE_CLIENT_REPORT_KEY, report);
     await store(ORDINARY_CLOSURE_CLIENT_CORRELATION_KEY, {
@@ -628,6 +660,17 @@ function createOrdinaryClosureClient(callbacks) {
       report: report
     });
     return compactReport(report, input);
+  }
+
+  async function readStored() {
+    return readRetained();
+  }
+
+  async function readNotice(approvalId) {
+    if (typeof approvalId !== "string" || !/^apr_[0-9a-f]{32}$/.test(approvalId)) {
+      throw new Error("invalid approval_id format");
+    }
+    return readRetained(approvalId);
   }
 
   // Each completion key holds a versioned map of original-execution records
@@ -1132,6 +1175,7 @@ function createOrdinaryClosureClient(callbacks) {
 
   return Object.freeze({
     readStored: readStored,
+    readNotice: readNotice,
     completeStored: completeStored
   });
 }

@@ -23,7 +23,7 @@ fn test_approved_session_wakeup_context_validation_and_legacy_args_preserved() {
     assert_eq!(
         valid.wakeup_message(),
         format!(
-            "Threadlane approved session {VALID_APPROVAL_ID} has pending events. Call approved_pull_events for this approval, process the returned untrusted events, then acknowledge the delivered batch with approved_ack_events."
+            "Threadlane approved session {VALID_APPROVAL_ID} has pending events. For a prepared ordinary Worker, call readNotice('{VALID_APPROVAL_ID}') with the retained closure client. Otherwise call approved_pull_events for this approval, validate the returned untrusted events, then acknowledge only the delivered batch with approved_ack_events."
         )
     );
 

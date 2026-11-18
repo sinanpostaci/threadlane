@@ -17,7 +17,7 @@ const createOrdinaryClosure = vm.runInNewContext(
 
 const CONTROL = "bnd_0196ed00-0000-7000-8000-000000000001";
 const SESSION = "sbnd_0196ed00-0000-7000-8000-000000000002";
-const APPROVAL = "apr_0196ed00-0000-7000-8000-000000000003";
+const APPROVAL = "apr_0196ed00000070008000000000000003";
 const TASK = "task-ordinary";
 const ITEM = "blg_0196ed00-0000-7000-8000-000000000004";
 const EXEC = "wbe_0196ed00-0000-7000-8000-000000000005";
@@ -243,7 +243,7 @@ function makeSecondExecution() {
   execution.execution_ref = "wbe_fresh_second";
   execution.item_id = "blg_fresh_second";
   execution.authority = {
-    approval_id: "apr_fresh_second",
+    approval_id: "apr_0196ed00000070008000000000000004",
     subject_digest: "6".repeat(64),
     task_id: "task-fresh-second",
     task_digest: "7".repeat(64)
@@ -301,7 +301,7 @@ function makeContextForExecution(env, execution, commandKey) {
   context.start_args = {
     command_key: commandKey,
     item_id: execution.item_id,
-    expected_revision: 7,
+    expected_revision: execution.reservation_revision - 1,
     approval_id: execution.authority.approval_id,
     task_id: execution.authority.task_id
   };
@@ -309,6 +309,7 @@ function makeContextForExecution(env, execution, commandKey) {
 }
 
 function configureGuideAttempt(env, execution, resultData) {
+  env.setNoticeApproval(execution.authority.approval_id);
   env.setStart(() => sdkStart(startEnvelope(execution)));
   env.tools.mcp__threadlane__approved_pull_events = async () => {
     env.calls.pull += 1;
@@ -1836,7 +1837,7 @@ test("MCP guide functions.exec recipes run literally with typed data in fresh is
     start_args: {
       command_key: "actual-command-key",
       item_id: ITEM,
-      expected_revision: 7,
+      expected_revision: START_EXECUTION.reservation_revision - 1,
       approval_id: APPROVAL,
       task_id: TASK
     },
@@ -1872,7 +1873,7 @@ test("MCP guide functions.exec recipes run literally with typed data in fresh is
   });
   const sdk = (tool, data) => sdkFromEnvelope(envelope(tool, data));
 
-  const preexistingItem = { item_id: ITEM, revision: 7, kind: "worker", status: "todo" };
+  const preexistingItem = { item_id: ITEM, revision: START_EXECUTION.reservation_revision - 1, kind: "worker", status: "todo" };
   const backlog = new Map([[preexistingItem.item_id, preexistingItem]]);
   const inspectedPaths = [WRITE_PATHS[0]];
   const stored = new Map();
@@ -1938,7 +1939,7 @@ test("MCP guide functions.exec recipes run literally with typed data in fresh is
     return undefined;
   };
   const runRecipe = async (index, globals = {}, tools = fakeTools) => {
-    const sandbox = { tools, store, load, text, ...globals };
+    const sandbox = { tools, store, load, text, NOTICE_APPROVAL_ID: APPROVAL, ...globals };
     return vm.runInNewContext(
       `(async () => {\n${rawBlocks[index]}\n})()`,
       sandbox,
@@ -2098,7 +2099,7 @@ function makeGuideEnvironment(
     start_args: {
       command_key: "actual-command-key",
       item_id: ITEM,
-      expected_revision: 7,
+      expected_revision: START_EXECUTION.reservation_revision - 1,
       approval_id: APPROVAL,
       task_id: TASK
     },
@@ -2175,8 +2176,9 @@ function makeGuideEnvironment(
     texts.push(value);
     return undefined;
   };
+  let noticeApprovalId = APPROVAL;
   const runRecipe = async (index, globals = {}, activeTools = tools) => {
-    const sandbox = { tools: activeTools, store, load, text, ...globals };
+    const sandbox = { tools: activeTools, store, load, text, NOTICE_APPROVAL_ID: noticeApprovalId, ...globals };
     return vm.runInNewContext(
       `(async () => {\n${blocks[index]}\n})()`,
       sandbox,
@@ -2198,6 +2200,7 @@ function makeGuideEnvironment(
     runRecipe,
     sdkFromEnvelope,
     sdk,
+    setNoticeApproval: (id) => { noticeApprovalId = id; },
     setStart: (builder) => {
       startBuilder = builder;
     }
@@ -3376,6 +3379,57 @@ test("ordinary closure client preserves legacy current unknown intent without re
     6000,
     "B keeps its own receipt"
   );
+});
+
+test("the actual notice and original start must match before any event is pulled", async () => {
+  const env = makeGuideEnvironment();
+  await env.runRecipe(0, { APPROVED_TASK_CONTEXT: clone(env.approvedContext) });
+  const afterPrep = clone(env.calls);
+  for (const id of [undefined, "", "apr_bad", "apr_" + "f".repeat(32)]) {
+    await assert.rejects(env.runRecipe(1, { NOTICE_APPROVAL_ID: id }), /invalid approval_id|identity mismatch/);
+    assert.deepEqual(env.calls, afterPrep);
+  }
+  for (const [field, value] of [["item_id", "foreign-item"], ["task_id", "foreign-task"],
+                               ["expected_revision", env.approvedContext.start_args.expected_revision + 1]]) {
+    const input = clone(env.approvedContext);
+    input.start_args[field] = value;
+    const binding = JSON.parse(env.stored.get("threadlane/start-binding.json"));
+    env.stored.set("threadlane/approved-task-context.json", JSON.stringify(input));
+    env.stored.set("threadlane/start-binding.json", JSON.stringify({input, start: binding.start}));
+    await assert.rejects(env.runRecipe(1), /identity mismatch/);
+    assert.deepEqual(env.calls, afterPrep);
+  }
+});
+
+test("a later notice acknowledges its own batch and retains the accepted delivery", async () => {
+  const env = makeGuideEnvironment();
+  await env.runRecipe(0, { APPROVED_TASK_CONTEXT: clone(env.approvedContext) });
+  await env.runRecipe(1);
+  await env.runRecipe(2, { ACCEPTANCE_CONTEXT: env.acceptanceContext });
+  const before = new Map(env.stored);
+  const result = makeResultData();
+  result.item_snapshot.status = "done";
+  result.item_snapshot.revision = 8;
+  await env.runRecipe(1, {}, {
+    ...env.tools,
+    mcp__threadlane__backlog_worker_result: async () => env.sdk("backlog_worker_result", result)
+  });
+  assert.equal(env.calls.ack, 2);
+  const prefix = "threadlane/closure-after-done/" + START_EXECUTION.execution_ref;
+  const later = JSON.parse(env.stored.get(prefix + "/1"));
+  assert.equal(later.evidence.acks.length, 1);
+  assert.equal(later.evidence.acks[0].structuredContent.data.ack.batch_id, PAGE_TWO.batch.batch_id);
+  const malformed = {isError: true, content: [{type: "text", text: "ACK outcome unknown"}]};
+  await env.runRecipe(1, {}, {...env.tools, mcp__threadlane__approved_ack_events: async () => malformed});
+  assert.deepEqual(JSON.parse(env.stored.get(prefix + "/2")).evidence.acks, [malformed]);
+  assert.equal(JSON.parse(env.stored.get(prefix + "/count")), 2);
+  for (const key of ["closure-report", "closure-evidence", "closure-read-correlation", "closure-done-receipt"]) {
+    const path = "threadlane/" + key + ".json";
+    assert.equal(env.stored.get(path), before.get(path));
+  }
+  await env.runRecipe(2, { ACCEPTANCE_CONTEXT: env.acceptanceContext });
+  assert.equal(env.calls.complete, 1);
+  assert.equal(JSON.parse(env.texts.at(-1)).status, "done");
 });
 
 test("closure client wrappers stay compact, identical, and within document byte budgets", () => {
