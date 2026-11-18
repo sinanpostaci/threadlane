@@ -32,9 +32,8 @@ function minimalAppearanceStorage(theme: 'light' | 'dark'): string {
 }
 
 /**
- * Alpha intentionally has no native sample, job history, or messages so its
- * updatedAtMs is genuinely unavailable. Beta keeps one real idle native sample
- * so the known-age placement is exercised without fabricating waiting state.
+ * Alpha has no content timestamp. Beta has a recorded content timestamp and
+ * an idle native sample. This exercises the age label independently of polling.
  */
 function buildSidebarTitleSnapshot(): WorkspaceSnapshot {
   const base = buildInteractiveWorkspaceSnapshot();
@@ -58,7 +57,8 @@ function buildSidebarTitleSnapshot(): WorkspaceSnapshot {
 
   const idleChat = (
     chat: WorkspaceChatSummary,
-    threadLabel: string
+    threadLabel: string,
+    contentUpdatedAtMs: number | null
   ): WorkspaceChatSummary => ({
     ...chat,
     thread_label: threadLabel,
@@ -66,7 +66,7 @@ function buildSidebarTitleSnapshot(): WorkspaceSnapshot {
     activity: 'idle',
     active_job_count: 0,
     attention_count: 0,
-    updated_at_ms: null,
+    updated_at_ms: contentUpdatedAtMs,
   });
 
   const idleSample = (
@@ -88,8 +88,8 @@ function buildSidebarTitleSnapshot(): WorkspaceSnapshot {
       jobs_has_more: false,
     },
     chats: [
-      idleChat(alphaChat, ALPHA_TITLE),
-      idleChat(betaChat, BETA_TITLE),
+      idleChat(alphaChat, ALPHA_TITLE, null),
+      idleChat(betaChat, BETA_TITLE, betaChat.updated_at_ms),
     ],
     native_samples: [idleSample(betaSample)],
     job_histories: [],
@@ -321,10 +321,8 @@ test.describe('wide sidebar chat titles', () => {
       ALPHA_TITLE,
       BETA_TITLE,
     ]);
-    expect(snapshot.chats.map((chat) => chat.updated_at_ms)).toEqual([
-      null,
-      null,
-    ]);
+    expect(snapshot.chats[0]?.updated_at_ms).toBeNull();
+    expect(snapshot.chats[1]?.updated_at_ms).not.toBeNull();
     expect(snapshot.chats.map((chat) => chat.activity)).toEqual([
       'idle',
       'idle',

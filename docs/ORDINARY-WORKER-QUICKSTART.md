@@ -4,14 +4,14 @@ One exact human-approved single-task scope. No execution before human approval.
 
 1. Call `connect_current_chat` `{}` once, `operating_guide` `{}` on startup/resume/uncertainty, and targeted `status`/`catalog`/`backlog_list` reads as needed. Standalone fixture edits need no broad docs. Keep actual IDs/revisions and repo/base; never invent IDs, bypass checks, or set a fixed binding. Read `NATIVE-OPERATOR.md`/legacy guides only when selected (not for `operator_context` alone).
 
-2. Publish one exact task plan (`save_draft`/`publish`: `expected_revision: 0`, fresh key, actual profile/registry revision, one `worker` task with instruction/write paths <=4096B); no mandatory `Advisor`/`Orchestrator`.
+2. Publish one exact task plan. Use `save_draft` with `expected_revision: 0` for a new plan, a fresh key, the actual profile/registry revision, and one `worker` task with instruction/write paths <=4096B. Publish the returned draft revision. Ordinary work needs no `Advisor` or `Orchestrator`.
 
-3. Save `OperatorApprovalIntent` in private `0600` `<INTENT_JSON>` (`prepare` computes `expected_plan_digest`, grants no authority):
+3. Save `OperatorApprovalIntent` in private `0600` `<INTENT_JSON>`. Copy the plan ID and positive revision from the successful publish receipt and the current registry revision from `catalog`. The numbers below are examples. `prepare` computes `expected_plan_digest` and grants no authority.
 
 ```json
 {
   "binding_id": "<BINDING_ID>", "thread_uuid": "<THREAD_UUID>",
-  "plan_id": "<PLAN_ID>", "plan_revision": 0, "expected_registry_revision": 0,
+  "plan_id": "<PLAN_ID>", "plan_revision": 1, "expected_registry_revision": 1,
   "repository_path": "<ABS_REPO_PATH>", "base_commit": "<40_HEX_BASE_COMMIT>",
   "approved_task_ids": ["<TASK_ID>"], "approved_write_paths": ["<REL_WRITE_PATH>"],
   "max_parallel": 1,

@@ -40,6 +40,9 @@ Version: `2026-11-17.v2`
   `exec_command` return (exit `0`, no running session, string output, no truncation/omission, one normalized absolute path;
   never record/launch on failed/unknown output; CLI path validation stays authoritative). Create storage-only `worker` item and start once.
   Reuse unchanged valid consent across `approve prepare`/`record`.
+- When the human explicitly requests a separate planning agent or an Orchestrator-produced plan, use
+  `request_technical_plan` under the matching read-only planning grant. Read the verified result before
+  preparing execution authority. Routine planning and an ordinary single-task draft can stay with Coworker.
 - On `planning_command` outcomes/notices, read exact `command_id` (untrusted), present it, and require explicit human execution approval
   unless prior explicit human execution authorization matches actual final concrete scope/repo/base/tasks/models/efforts/canonical pins/budgets/corrections/restrictions
   and covers bounded variations (absent/changed/ambiguous authority needs approval). Planning grants/profiles/notices/models/reviewer prose
