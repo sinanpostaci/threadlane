@@ -260,17 +260,18 @@ impl ApprovalFixture {
         ]
     }
 
-    fn record_args(
+    fn record_args_for(
         &self,
-        request: &Path,
+        input_flag: &str,
+        input: &Path,
         confirm_subject: &str,
         confirm_thread: &str,
         operator_approved: bool,
     ) -> Vec<String> {
         let mut args = vec!["record".to_string()];
         args.extend(self.store_args());
-        args.push("--request".to_string());
-        args.push(request.display().to_string());
+        args.push(input_flag.to_string());
+        args.push(input.display().to_string());
         args.push("--confirm-subject".to_string());
         args.push(confirm_subject.to_string());
         args.push("--confirm-thread".to_string());
@@ -279,6 +280,38 @@ impl ApprovalFixture {
             args.push("--operator-approved".to_string());
         }
         args
+    }
+
+    fn record_args(
+        &self,
+        request: &Path,
+        confirm_subject: &str,
+        confirm_thread: &str,
+        operator_approved: bool,
+    ) -> Vec<String> {
+        self.record_args_for(
+            "--request",
+            request,
+            confirm_subject,
+            confirm_thread,
+            operator_approved,
+        )
+    }
+
+    fn record_preview_args(
+        &self,
+        preview: &Path,
+        confirm_subject: &str,
+        confirm_thread: &str,
+        operator_approved: bool,
+    ) -> Vec<String> {
+        self.record_args_for(
+            "--preview",
+            preview,
+            confirm_subject,
+            confirm_thread,
+            operator_approved,
+        )
     }
 
     async fn run_cli(&self, args: &[String]) -> Output {
@@ -311,6 +344,22 @@ impl ApprovalFixture {
     ) -> Output {
         self.run_cli(&self.record_args(request, confirm_subject, confirm_thread, operator_approved))
             .await
+    }
+
+    async fn run_record_preview(
+        &self,
+        preview: &Path,
+        confirm_subject: &str,
+        confirm_thread: &str,
+        operator_approved: bool,
+    ) -> Output {
+        self.run_cli(&self.record_preview_args(
+            preview,
+            confirm_subject,
+            confirm_thread,
+            operator_approved,
+        ))
+        .await
     }
 
     async fn prepare_ok(&self, name: &str) -> OperatorApprovalPreview {
@@ -958,6 +1007,228 @@ async fn record_freezes_exact_tasks_and_exact_retry_is_idempotent() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn record_preview_route_uses_the_same_receipt_and_remains_idempotent() {
+    let mut fx = ApprovalFixture::start().await;
+    let preview = fx.prepare_ok("prepare-preview-route.json").await;
+    let mut preview_bytes =
+        serde_json::to_vec(&preview).expect("serialize actual prepare stdout preview");
+    preview_bytes.push(b'\n');
+    let preview_path = fx.write_request_bytes("record-preview-valid.json", &preview_bytes);
+    let request_path = fx.write_request("record-preview-fallback-request.json", &preview.request);
+    assert_mode(&fx.requests_dir, 0o700, "private preview directory");
+    assert_mode(&preview_path, 0o600, "private preview file");
+
+    let from_preview: ApprovalSummary = parse_success(
+        &fx.run_record_preview(&preview_path, &preview.subject_digest, THREAD_UUID, true)
+            .await,
+        "record unchanged typed preview",
+    );
+    assert_eq!(from_preview.subject_digest, preview.subject_digest);
+    assert_eq!(from_preview.thread_uuid, THREAD_UUID);
+    assert_eq!(fx.approval_count(), 1);
+
+    let from_request: ApprovalSummary = parse_success(
+        &fx.run_record(&request_path, &preview.subject_digest, THREAD_UUID, true)
+            .await,
+        "record the same scope through the fallback request route",
+    );
+    assert_eq!(
+        from_request, from_preview,
+        "the unchanged preview and unchanged normalized request must produce the same receipt"
+    );
+    assert_eq!(fx.approval_count(), 1);
+    assert_eq!(fx.persisted_record().tasks, preview.tasks);
+    fx.assert_no_worker_invocation();
+
+    fx.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn record_preview_rejects_altered_projections_subject_scope_and_insecure_file() {
+    let mut fx = ApprovalFixture::start().await;
+    let preview = fx.prepare_ok("prepare-preview-tampering.json").await;
+
+    let mut altered_tasks = preview.clone();
+    altered_tasks.tasks[0].instruction =
+        "Altered task projection after the operator preview.".to_string();
+    let altered_tasks_path = fx.write_request("preview-altered-tasks.json", &altered_tasks);
+    let altered_tasks_failure = expect_failure(
+        &fx.run_record_preview(
+            &altered_tasks_path,
+            &preview.subject_digest,
+            THREAD_UUID,
+            true,
+        )
+        .await,
+        "record a preview whose frozen task projection changed",
+    );
+    assert_eq!(altered_tasks_failure.code, "validation");
+    fx.assert_no_approval_artifacts();
+
+    let mut altered_subject = preview.clone();
+    altered_subject.subject_digest = different_digest(&preview.subject_digest);
+    let altered_subject_path = fx.write_request("preview-altered-subject.json", &altered_subject);
+    let altered_subject_failure = expect_failure(
+        &fx.run_record_preview(
+            &altered_subject_path,
+            &preview.subject_digest,
+            THREAD_UUID,
+            true,
+        )
+        .await,
+        "record a preview whose subject digest changed",
+    );
+    assert_eq!(altered_subject_failure.code, "validation");
+    fx.assert_no_approval_artifacts();
+
+    let mut altered_scope = preview.clone();
+    altered_scope
+        .request
+        .approved_write_paths
+        .push("src/other.rs".to_string());
+    let altered_scope_path = fx.write_request("preview-altered-scope.json", &altered_scope);
+    let altered_scope_failure = expect_failure(
+        &fx.run_record_preview(
+            &altered_scope_path,
+            &preview.subject_digest,
+            THREAD_UUID,
+            true,
+        )
+        .await,
+        "record a preview whose normalized request scope changed",
+    );
+    assert_eq!(altered_scope_failure.code, "validation");
+    fx.assert_no_approval_artifacts();
+
+    let unchanged_path = fx.write_request("preview-unchanged-subject-check.json", &preview);
+    let wrong_subject_failure = expect_failure(
+        &fx.run_record_preview(
+            &unchanged_path,
+            &different_digest(&preview.subject_digest),
+            THREAD_UUID,
+            true,
+        )
+        .await,
+        "record an unchanged preview with a mismatched confirmation subject",
+    );
+    assert_eq!(wrong_subject_failure.code, "validation");
+    fx.assert_no_approval_artifacts();
+
+    let insecure_path = fx.write_request("preview-insecure.json", &preview);
+    fs::set_permissions(&insecure_path, fs::Permissions::from_mode(0o644))
+        .expect("chmod otherwise-valid preview file 0644");
+    let insecure_failure = expect_failure(
+        &fx.run_record_preview(&insecure_path, &preview.subject_digest, THREAD_UUID, true)
+            .await,
+        "record a group-readable preview file",
+    );
+    assert_eq!(insecure_failure.code, "security_violation");
+    fx.assert_no_approval_artifacts();
+
+    let summary: ApprovalSummary = parse_success(
+        &fx.run_record_preview(&unchanged_path, &preview.subject_digest, THREAD_UUID, true)
+            .await,
+        "record unchanged preview after tampered and insecure previews were rejected",
+    );
+    assert_eq!(summary.subject_digest, preview.subject_digest);
+    assert_eq!(fx.approval_count(), 1);
+    fx.assert_no_worker_invocation();
+
+    fx.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn record_preview_requires_exactly_one_input_and_operator_attestation() {
+    let mut fx = ApprovalFixture::start().await;
+    let preview = fx.prepare_ok("prepare-preview-arguments.json").await;
+    let preview_path = fx.write_request("preview-arguments.json", &preview);
+    let request_path = fx.write_request("preview-arguments-request.json", &preview.request);
+
+    let mut both_inputs = fx.record_args(&request_path, &preview.subject_digest, THREAD_UUID, true);
+    let insert_at = both_inputs
+        .iter()
+        .position(|arg| arg == "--request")
+        .expect("record arguments contain --request");
+    both_inputs.insert(insert_at, preview_path.display().to_string());
+    both_inputs.insert(insert_at, "--preview".to_string());
+    let both_failure = expect_failure(
+        &fx.run_cli(&both_inputs).await,
+        "record with both --request and --preview",
+    );
+    assert_eq!(both_failure.code, "invalid_input");
+    fx.assert_no_approval_artifacts();
+
+    let mut neither_input = vec!["record".to_string()];
+    neither_input.extend(fx.store_args());
+    neither_input.push("--confirm-subject".to_string());
+    neither_input.push(preview.subject_digest.clone());
+    neither_input.push("--confirm-thread".to_string());
+    neither_input.push(THREAD_UUID.to_string());
+    neither_input.push("--operator-approved".to_string());
+    let neither_failure = expect_failure(
+        &fx.run_cli(&neither_input).await,
+        "record without --request or --preview",
+    );
+    assert_eq!(neither_failure.code, "invalid_input");
+    fx.assert_no_approval_artifacts();
+
+    let missing_flag_failure = expect_failure(
+        &fx.run_record_preview(&preview_path, &preview.subject_digest, THREAD_UUID, false)
+            .await,
+        "record a verified preview without --operator-approved",
+    );
+    assert_eq!(missing_flag_failure.code, "invalid_input");
+    fx.assert_no_approval_artifacts();
+
+    let wrong_thread_failure = expect_failure(
+        &fx.run_record_preview(
+            &preview_path,
+            &preview.subject_digest,
+            OTHER_THREAD_UUID,
+            true,
+        )
+        .await,
+        "record a verified preview with a mismatched confirmation thread",
+    );
+    assert_eq!(wrong_thread_failure.code, "thread_uuid_mismatch");
+    fx.assert_no_approval_artifacts();
+
+    let summary: ApprovalSummary = parse_success(
+        &fx.run_record_preview(&preview_path, &preview.subject_digest, THREAD_UUID, true)
+            .await,
+        "record verified preview with exactly one input and explicit attestation",
+    );
+    assert_eq!(summary.subject_digest, preview.subject_digest);
+    assert_eq!(fx.approval_count(), 1);
+    fx.assert_no_worker_invocation();
+
+    fx.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn record_preview_rejects_a_stale_registry_revision_without_approval() {
+    let mut fx = ApprovalFixture::start().await;
+    let preview = fx
+        .prepare_ok("prepare-preview-before-stale-registry.json")
+        .await;
+    let preview_path = fx.write_request("preview-stale-registry.json", &preview);
+
+    let advanced_revision = fx.advance_registry();
+    assert_eq!(advanced_revision, fx.registry_revision + 1);
+
+    let failure = expect_failure(
+        &fx.run_record_preview(&preview_path, &preview.subject_digest, THREAD_UUID, true)
+            .await,
+        "record a verified preview after the pinned registry revision became stale",
+    );
+    assert_eq!(failure.code, "stale_registry_revision");
+    fx.assert_no_approval_artifacts();
+    assert_eq!(fx.plan_status(), PlanStatus::Published);
+
+    fx.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn changed_scope_budget_and_concurrency_require_fresh_confirmation() {
     let mut fx = ApprovalFixture::start().await;
     let preview = fx.prepare_ok("prepare-changed-confirmation.json").await;
@@ -1153,6 +1424,16 @@ async fn superseded_plan_and_replaced_plan_digest_are_rejected_without_new_appro
         .run_record(&record_path, &preview.subject_digest, THREAD_UUID, true)
         .await;
     expect_failure(&record_output, "record of a superseded plan revision");
+    fx.assert_no_approval_artifacts();
+
+    let preview_path = fx.write_request("record-preview-superseded.json", &preview);
+    let preview_output = fx
+        .run_record_preview(&preview_path, &preview.subject_digest, THREAD_UUID, true)
+        .await;
+    expect_failure(
+        &preview_output,
+        "record a verified preview of a superseded plan revision",
+    );
     fx.assert_no_approval_artifacts();
 
     fx.shutdown().await;

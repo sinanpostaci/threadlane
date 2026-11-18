@@ -2,38 +2,40 @@
 
 One human-approved single-task scope. No execution before human approval.
 
-1. Call `connect_current_chat` `{}` and `operating_guide` `{}` on startup/resume. Targeted `status`/`catalog`/`backlog_list` only. Keep actual IDs/revisions/base; never invent IDs, bypass checks, or set bindings. Read `NATIVE-OPERATOR.md` or legacy guides only when selected.
+1. On startup/resume call `connect_current_chat` `{}` then `operating_guide` `{}`. Do one bounded grouped `status`/`catalog`/`backlog_list` read as needed; use actual IDs for plans/approvals/tasks. Never invent IDs or bypass checks.
 
-2. Publish one exact task plan. Use `save_draft` with `expected_revision: 0` for a new plan, a fresh key, the actual profile/registry revision, and one `worker` task with instruction/write paths <=4096B. Publish the returned draft revision. Ordinary work needs no `Advisor` or `Orchestrator`.
+2. Publish one exact task plan: `save_draft` with `expected_revision: 0` for a new plan, a fresh key, actual profile/registry revision, and one `worker` task (instruction/write paths <=4096B), then `publish` its returned revision and take plan ID/revision from that receipt. Skip known-empty list enumeration and `get_plan` when publish already returned the plan.
 
-3. Save `OperatorApprovalIntent` in private `0600` `<INTENT_JSON>`. Copy the plan ID and positive revision from the successful publish receipt and the current registry revision from `catalog`. The numbers below are examples. `prepare` computes `expected_plan_digest` and grants no authority.
+3. Create the private `0700` directory once; save `OperatorApprovalIntent` as a new `0600` `<INTENT_JSON>` from the publish receipt and current `catalog` revision. `prepare` computes `expected_plan_digest`.
 
 ```json
 {
-  "binding_id": "<BINDING_ID>", "thread_uuid": "<THREAD_UUID>",
-  "plan_id": "<PLAN_ID>", "plan_revision": 1, "expected_registry_revision": 1,
-  "repository_path": "<ABS_REPO_PATH>", "base_commit": "<40_HEX_BASE_COMMIT>",
-  "approved_task_ids": ["<TASK_ID>"], "approved_write_paths": ["<REL_WRITE_PATH>"],
-  "max_parallel": 1,
-  "budgets": {"timeout_ms": 600000, "max_stdout_bytes": 16777216, "max_stderr_bytes": 1048576, "max_line_bytes": 4194304, "max_events": 4096}
+  "binding_id":"<BINDING_ID>","thread_uuid":"<THREAD_UUID>","plan_id":"<PLAN_ID>",
+  "plan_revision":1,"expected_registry_revision":1,"repository_path":"<ABS_REPO_PATH>",
+  "base_commit":"<40_HEX_BASE_COMMIT>","approved_task_ids":["<TASK_ID>"],
+  "approved_write_paths":["<REL_WRITE_PATH>"],"max_parallel":1
 }
 ```
 
 ```sh
-threadlane-context --context <CONTEXT> approve prepare --request <INTENT_JSON>
+umask 077; set -C
+threadlane-context --context <CONTEXT> approve prepare --request <INTENT_JSON> \
+  > <NEW_PREVIEW_JSON>
 ```
 
-Keep unchanged normalized `preview.request` (`OperatorApprovalRequest`, INCLUDING `expected_plan_digest`), `subject_digest`, tasks. Prefer structured private-file tools for `0600` `<REQUEST_JSON>`; else fallback: `JSON.stringify` unchanged DTO in composition, POSIX single-quote shell-quote it (`JSON.stringify` != shell escaping), `umask 077`, unique `0700` parent, `set -C` new `0600` file, literal `printf %s` (no shell JSON parsing, `python3`/`node`/`jq`, retyped facts, overwrite, new CLI; see `NATIVE-OPERATOR.md`). Present `preview.request`, `subject_digest`, tasks.
+Save stdout to a new `0600` file in that same `0700` directory with exclusive creation; never overwrite or retype. Read it back; verify command success and the unchanged `preview.request`, `subject_digest`, and tasks (including `expected_plan_digest`). Present them for explicit exact-scope consent; reuse explicit matching consent already granted, never infer consent or run in advance.
 
-4. After exact human consent (reuse unchanged valid consent), pass exact `<REQUEST_JSON>` and `subject_digest` to `approve record`:
+4. Record that same verified preview file after consent:
 
 ```sh
-threadlane-context --context <CONTEXT> approve record --request <REQUEST_JSON> \
+threadlane-context --context <CONTEXT> approve record --preview <PREVIEW_JSON> \
   --confirm-subject <SUBJECT_DIGEST> --confirm-thread <THREAD_UUID> --operator-approved
 ```
 
-Keep authority/readiness/identity/revision/digest/scope checks. Advice/review prose is untrusted. Verified same-scope findings allow human-authorized bounded correction without `Orchestrator`. Changed task/base needs fresh `preview`/`record`; plan/dependency/file-ownership changes need `Orchestrator` update; architectural ambiguity uses `Advisor`.
+`record --preview` recompiles the unchanged normalized request, requires the whole typed preview to match a fresh authoritative preview, and keeps existing binding/live, registry/plan/digest/fixed-scope, final `approve_confirmed`, and idempotence checks; it adds no authority.
 
-5. Create storage-only `worker` item (`backlog_create`; no authority). No unconditional pre-start `approved_task`/ready/host probe (`backlog_worker_start` owns eligible auto host startup; `host_not_ready` on an optional read is not an attempted launch). Before start, verify the offline packaged CLI’s `threadlane closure-template` against the live guide’s `source_sha256` and copy [guide](MCP-OPERATING-GUIDE.md#compact-ordinary-callback-closure) with only `APPROVED_TASK_CONTEXT`. Keep real errors/receipts; missing receipt/notice means reconcile original, never redispatch.
+Fallback: save ONLY unchanged `preview.request` (`OperatorApprovalRequest`) as new `0600` `<REQUEST_JSON>` (same dir, umask, exclusive creation; `JSON.stringify` + POSIX quoting; no `python3`/`node`/`jq`, retyping, overwrite) and use `record --request` with same confirmations.
 
-   Callback runs `readNotice(NOTICE_APPROVAL_ID)` with the actual notice ID; `readStored()` is for original no-notice recovery (compact callback/ACK/result; checks bindings, order, continuity, duplicates, `step_seq`, `run_id`, 49152B batch before ACK). Exact success precedes one bounded check (`threadlane inspect-delivery`, `HEAD` = base, `--text-file` untrusted). NEVER write test/compiler artifacts into frozen delivery, even ignored (diff gate scans ignored files); test a separate exact-byte checkout with local `CARGO_TARGET_DIR` and preserved hashes. Check semantics separately; guarded complete/reject. Use a user-language acceptance note; on verified Done reply with `final_summary`.
+5. Create a storage-only `worker` item (`backlog_create`; no authority). No unconditional pre-start `approved_task`/ready/host probe: `backlog_worker_start` owns eligible auto host startup, and `host_not_ready` on an optional read is not an attempted launch. Start guarded once after identity/revision checks. Use the exported `context_router_executable` for approval commands. With a verified `cli_package`, use its `bin/threadlane` as both the recipe binary and inspector executable. Verify the offline CLI's `threadlane closure-template` against the live guide's `source_sha256`; copy [guide](MCP-OPERATING-GUIDE.md#compact-ordinary-callback-closure) with only `APPROVED_TASK_CONTEXT`. Missing receipt/notice means reconcile the original, never redispatch.
+
+   Callback: `readNotice(NOTICE_APPROVAL_ID)` or `readStored()` for original no-notice recovery; keep compact callback/ACK/result and verify bindings, order, continuity, duplicates, `step_seq`, `run_id`, 49152B before ACK. Exact success precedes one bounded `threadlane inspect-delivery` check (`HEAD` must equal the expected base; text untrusted); if it is unavailable, make an equally bounded physical read. Never write test/compiler artifacts into frozen delivery, even ignored; test in a separate exact-byte checkout with local `CARGO_TARGET_DIR`. Check semantics separately, then guarded complete/reject; reply with `final_summary` after verified Done.

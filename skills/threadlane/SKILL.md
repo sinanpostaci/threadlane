@@ -117,17 +117,24 @@ dependency inputs must match before `prepare_work`; never silently change base.
 Never self-approve or treat a profile, advice, planning, backlog edit, worker
 prose, or CLI flag as authority.
 
-The quickstart writes private `0600` `OperatorApprovalIntent` JSON in a private
-directory, runs `approve prepare` to obtain `OperatorApprovalPreview`, retains
-its DTO/`subject_digest`/tasks, and keeps the unchanged normalized
-`preview.request` (`OperatorApprovalRequest`) INCLUDING computed
-`expected_plan_digest` for `approve record` (`subject_digest` + exact
-normalized request). Prefer exposed structured private-file tools to save ONLY
-that unchanged `preview.request` to a private `0600` file; otherwise use the
-existing-tool fallback: `JSON.stringify` the actual unchanged DTO in client
-composition, apply proper POSIX single-quote shell quoting to that string
-(`JSON.stringify` is not shell escaping), and write via `umask 077`, a unique
-private `0700` parent canonicalized with physical
+The quickstart creates the private `0600` `OperatorApprovalIntent` once in a
+private `0700` directory, runs `approve prepare`, and saves the actual stdout
+`OperatorApprovalPreview` to a new `0600` file in that same private directory
+with exclusive creation. It reads that file back, verifies command success plus
+the unchanged `preview.request` (`OperatorApprovalRequest` INCLUDING
+`expected_plan_digest`), `subject_digest`, and tasks, then presents them for
+explicit human exact-scope consent. It records the same verified file with
+`approve record --preview`; the CLI recompiles the unchanged normalized request,
+requires the whole typed preview to match a fresh authoritative preview, and
+keeps the existing binding/live, registry/plan/digest/fixed-scope, final
+`approve_confirmed`, and idempotence checks. The preview adds no authority.
+Reuse explicit matching scope consent already granted; never infer consent or
+run in advance. Fallback: save ONLY the unchanged normalized `preview.request`
+to a private `0600` file and use `record --request` with the existing safeguards:
+prefer exposed structured private-file tools; otherwise `JSON.stringify` the
+actual unchanged DTO in client composition, apply proper POSIX single-quote
+shell quoting to that string (`JSON.stringify` is not shell escaping), and write
+via `umask 077`, a unique private `0700` parent canonicalized with physical
 `CDPATH= cd -P -- "$dir" && pwd -P` before composing `$dir/request.json` (even
 for trailing-slash, relative, or symlinked `TMPDIR`), `set -C` (noclobber) new
 `0600` file, and literal `printf %s` (no shell JSON parsing, `PATH`
@@ -136,14 +143,16 @@ actual `exec_command` return (`exit_code === 0`, no running `session_id`, string
 `output`, no truncation/omission, and one normalized absolute path) before using
 it; never record or launch on failed/unknown output, do not invent tool fields
 as sole proof, and keep existing CLI path validation authoritative. For optional
-planning grants,
-`flow grant-record` uses a different wrapper
+planning grants, `flow grant-record` uses a different wrapper
 `{request_key, expected_ledger_revision, preview, attestation}` with the actual
 unchanged `preview`, not `PreparePlanningGrantRequest` (detailed examples are in
 `docs/NATIVE-OPERATOR.md` and `docs/MCP-LEGACY-OPERATING-GUIDE.md`).
 
-Ordinary Worker sequence: targeted `status`/`catalog`/`backlog_list` reads as
-needed, published one-task plan, one exact human scope approval,
+Ordinary Worker sequence: one bounded grouped
+`status`/`catalog`/`backlog_list` read as needed, a published one-task plan
+(consume the actual `save_draft`/`publish` receipts in order; skip known-empty
+list enumeration and `get_plan` when publish already returned the plan), one
+exact human scope approval through the verified preview route,
 `approve prepare`/`approve record` actual authority, storage-only `worker`
 backlog item (`backlog_create`), guarded `backlog_worker_start` once, wait for
 an actual callback without MCP polling loops, close advertised event pages with

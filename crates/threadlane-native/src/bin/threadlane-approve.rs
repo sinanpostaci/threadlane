@@ -6,6 +6,13 @@
 //! Prepares a read-only digest-bound [`threadlane_authority::OperatorApprovalPreview`] (`prepare`) and records an
 //! operator-confirmed [`ApprovalSummary`] (`record`) via [`AuthorityStore::approve_confirmed`].
 //!
+//! `record` accepts exactly one private input: the unchanged normalized
+//! [`threadlane_authority::OperatorApprovalRequest`] (`--request`) or the complete typed
+//! [`threadlane_authority::OperatorApprovalPreview`] returned by `prepare` (`--preview`). The preview
+//! route recompiles its unchanged normalized request and requires the fresh authoritative preview
+//! to match the whole typed preview before the same persistence checks run; it grants no new
+//! authority.
+//!
 //! ## Security and Authority Boundaries
 //!
 //! - **Not a transcript listener or classifier**: Never reads conversation turns, never infers
@@ -32,7 +39,7 @@ use threadlane_authority::validation::{
 };
 use threadlane_authority::{
     ApprovalSummary, AuthorityError, AuthorityStore, OperatorApprovalIntent,
-    OperatorApprovalRequest,
+    OperatorApprovalPreview, OperatorApprovalRequest,
 };
 use threadlane_native::fs_safety::{
     ensure_platform_supported, validate_absolute_no_symlink_components,
@@ -88,11 +95,23 @@ enum ApproveCommand {
         #[arg(long = "request", value_name = "ABS_PRIVATE_JSON")]
         request: PathBuf,
     },
-    /// Validate and persist a confirmed `OperatorApprovalRequest` into `approvals.json`.
+    /// Validate and persist a confirmed operator approval into `approvals.json`.
+    ///
+    /// Requires exactly one input: `--request` (unchanged normalized `OperatorApprovalRequest`)
+    /// or `--preview` (the complete typed `OperatorApprovalPreview` returned by `prepare`).
+    #[command(group(
+        clap::ArgGroup::new("record_input")
+            .required(true)
+            .multiple(false)
+            .args(["request", "preview"])
+    ))]
     Record {
         /// Normalized absolute path to the private JSON request file (`OperatorApprovalRequest`).
         #[arg(long = "request", value_name = "ABS_PRIVATE_JSON")]
-        request: PathBuf,
+        request: Option<PathBuf>,
+        /// Normalized absolute path to the private JSON preview file (`OperatorApprovalPreview`).
+        #[arg(long = "preview", value_name = "ABS_PRIVATE_JSON")]
+        preview: Option<PathBuf>,
         /// Explicit 64-character lowercase hex SHA-256 subject digest confirmation.
         #[arg(long = "confirm-subject", value_name = "SHA256")]
         confirm_subject: String,
@@ -397,6 +416,7 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         }
         ApproveCommand::Record {
             request,
+            preview,
             confirm_subject,
             confirm_thread,
             operator_approved,
@@ -423,7 +443,21 @@ async fn run(cli: Cli) -> Result<(), CliError> {
                     ));
                 }
             }
-            let req: OperatorApprovalRequest = load_request_json(&request)?;
+            let (req, supplied_preview): (
+                OperatorApprovalRequest,
+                Option<OperatorApprovalPreview>,
+            ) = match (request, preview) {
+                (Some(request), None) => (load_request_json(&request)?, None),
+                (None, Some(preview)) => {
+                    let supplied: OperatorApprovalPreview = load_request_json(&preview)?;
+                    (supplied.request.clone(), Some(supplied))
+                }
+                _ => {
+                    return Err(CliError::invalid_input(
+                        "record requires exactly one of --request or --preview",
+                    ));
+                }
+            };
 
             let binding_id = validate_identifier("binding_id", &req.binding_id)
                 .map_err(|e| CliError::from_authority(&e))?;
@@ -450,10 +484,16 @@ async fn run(cli: Cli) -> Result<(), CliError> {
             verify_live_binding(&supervisor, &binding_id, &thread_uuid).await?;
 
             let authority = open_validated_authority_store(&dirs)?;
-            let preview = authority
+            let fresh_preview = authority
                 .preview_for_operator(req.clone())
                 .map_err(|e| CliError::from_authority(&e))?;
-            if preview.subject_digest != checked_subject {
+            if supplied_preview.is_some_and(|supplied| supplied != fresh_preview) {
+                return Err(CliError::new(
+                    "validation",
+                    "private approval preview does not match the fresh authoritative preview; re-run prepare",
+                ));
+            }
+            if fresh_preview.subject_digest != checked_subject {
                 return Err(CliError::new(
                     "validation",
                     "confirmed subject digest is invalid or did not match the compiled approval subject",
@@ -462,9 +502,9 @@ async fn run(cli: Cli) -> Result<(), CliError> {
             if let Some(ref fixed) = fixed_scope {
                 enforce_fixed_scope_on_request(
                     fixed,
-                    &preview.request.binding_id,
-                    &preview.request.thread_uuid,
-                    &preview.request.repository_path,
+                    &fresh_preview.request.binding_id,
+                    &fresh_preview.request.thread_uuid,
+                    &fresh_preview.request.repository_path,
                     Some(&checked_confirm_thread),
                 )?;
             }
@@ -1255,6 +1295,64 @@ mod tests {
             Some("550e8400-e29b-41d4-a716-446655440000")
         );
         assert_eq!(routed.project_root.as_deref(), Some(Path::new("/abs/repo")));
+
+        let preview_routed = Cli::try_parse_from([
+            "threadlane-approve",
+            "--state-dir",
+            "/abs/state",
+            "--registry-dir",
+            "/abs/registry",
+            "--plans-dir",
+            "/abs/plans",
+            "--authority-dir",
+            "/abs/authority",
+            "record",
+            "--preview",
+            "/abs/preview.json",
+            "--confirm-subject",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--confirm-thread",
+            "550e8400-e29b-41d4-a716-446655440000",
+            "--operator-approved",
+        ])
+        .expect("parse record with a typed preview input");
+        match preview_routed.command {
+            ApproveCommand::Record {
+                request: None,
+                preview: Some(path),
+                ..
+            } => assert_eq!(path, PathBuf::from("/abs/preview.json")),
+            other => panic!("unexpected record input: {other:?}"),
+        }
+
+        let ambiguous = Cli::try_parse_from([
+            "threadlane-approve",
+            "record",
+            "--request",
+            "/abs/req.json",
+            "--preview",
+            "/abs/preview.json",
+            "--confirm-subject",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--confirm-thread",
+            "550e8400-e29b-41d4-a716-446655440000",
+            "--operator-approved",
+        ]);
+        assert!(ambiguous.is_err(), "both record inputs must be rejected");
+
+        let missing_input = Cli::try_parse_from([
+            "threadlane-approve",
+            "record",
+            "--confirm-subject",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--confirm-thread",
+            "550e8400-e29b-41d4-a716-446655440000",
+            "--operator-approved",
+        ]);
+        assert!(
+            missing_input.is_err(),
+            "record without exactly one private input must be rejected"
+        );
     }
 
     #[test]
