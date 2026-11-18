@@ -13,8 +13,8 @@ use serde::Deserialize;
 use threadlane::SupervisorClient;
 use threadlane_authority::validation::{
     validate_canonical_thread_uuid, validate_executable_worker_instruction, validate_identifier,
-    validate_repository_and_base_commit, validate_revision,
-    validate_write_scope_entry_at_base_commit, validate_worker_task_static,
+    validate_repository_and_base_commit, validate_revision, validate_worker_task_static,
+    validate_write_scope_entry_at_base_commit,
 };
 use threadlane_authority::{resolve_and_validate_worker_executable, OperatorApprovalIntent};
 use threadlane_native::open_workflow_stores;
@@ -28,12 +28,14 @@ use threadlane_workflow::{
 use super::{
     enforce_fixed_scope_on_request, load_stdin_json, prepare_operator_preview, verify_live_binding,
     write_private_preview_file, write_stdout_json, CliError, FixedApprovalScope,
-    PrivatePreviewReceipt, ValidatedStoreDirs,
+    PrivatePreviewReceipt, RecoveryContext, ValidatedStoreDirs,
 };
 
 const SAVE_DRAFT_OUTCOME_UNKNOWN: &str = "workflow draft outcome is uncertain after an I/O, serialization, or response error; reconcile the original plan before retrying";
 const PUBLISH_OUTCOME_UNKNOWN: &str = "workflow publication outcome is uncertain after an I/O, serialization, or response error; reconcile the original plan before retrying";
 const RECEIPT_OUTCOME_UNKNOWN: &str = "the workflow plan or private preview may have been created, but writing the bounded stdout receipt failed";
+const DRAFT_SAVED_PHASE: &str = "draft_saved";
+const PUBLISHED_PHASE: &str = "published";
 
 /// Strict stdin request accepted by the scoped single-task fast path.
 #[derive(Debug, Deserialize)]
@@ -58,10 +60,28 @@ struct PrepareTaskTask {
     id: String,
     title: String,
     instruction: String,
-    role: WorkflowRole,
+    role: PrepareTaskRole,
     difficulty: Difficulty,
     depends_on: Vec<String>,
     allowed_write_paths: Vec<String>,
+}
+
+/// Narrow role input accepted only on the `prepare-task` stdin boundary.
+///
+/// The user-facing `"worker"` spelling and the canonical persisted `"coder"` identifier both
+/// select [`WorkflowRole::Coder`]; every other role fails strict deserialization before mutation.
+#[derive(Debug, Clone, Copy, Deserialize)]
+enum PrepareTaskRole {
+    #[serde(rename = "coder", alias = "worker")]
+    Coder,
+}
+
+impl From<PrepareTaskRole> for WorkflowRole {
+    fn from(role: PrepareTaskRole) -> Self {
+        match role {
+            PrepareTaskRole::Coder => Self::Coder,
+        }
+    }
 }
 
 impl From<PrepareTaskTask> for PlanTask {
@@ -70,11 +90,20 @@ impl From<PrepareTaskTask> for PlanTask {
             id: task.id,
             title: task.title,
             instruction: task.instruction,
-            role: task.role,
+            role: task.role.into(),
             difficulty: task.difficulty,
             depends_on: task.depends_on,
             allowed_write_paths: task.allowed_write_paths,
         }
+    }
+}
+
+/// Builds bounded recovery context from an actual original mutation receipt.
+fn recovery_context(summary: &PlanSummary, phase: &'static str) -> RecoveryContext {
+    RecoveryContext {
+        plan_id: summary.plan_id.clone(),
+        revision: summary.revision,
+        phase,
     }
 }
 
@@ -136,16 +165,47 @@ pub(super) async fn run_prepare_task(
         .save_draft(draft)
         .map_err(|err| workflow_mutation_error(&err, SAVE_DRAFT_OUTCOME_UNKNOWN))?;
 
-    verify_persisted_draft(&workflow, &saved, &request, &task)?;
+    let mut recovery = Some(recovery_context(&saved, DRAFT_SAVED_PHASE));
+    finish_prepare_task(
+        dirs,
+        fixed_scope,
+        &request,
+        &task,
+        &scope,
+        &workflow,
+        &validated_task_paths,
+        &saved,
+        &mut recovery,
+    )
+    .await
+    .map_err(|err| err.with_recovery(recovery))
+}
+
+/// Completes publication, live revalidation, private preview, and the bounded receipt after the
+/// original draft receipt exists, updating the bounded recovery context after each confirmed phase.
+#[allow(clippy::too_many_arguments)]
+async fn finish_prepare_task(
+    dirs: &ValidatedStoreDirs,
+    fixed_scope: &FixedApprovalScope,
+    request: &PrepareTaskRequest,
+    task: &PlanTask,
+    scope: &ValidatedRequestScope,
+    workflow: &ScopedWorkflow,
+    validated_task_paths: &[String],
+    saved: &PlanSummary,
+    recovery: &mut Option<RecoveryContext>,
+) -> Result<(), CliError> {
+    verify_persisted_draft(workflow, saved, request, task)?;
 
     verify_live_binding_at(dirs, &scope.binding_id, &scope.thread_uuid).await?;
-    ensure_current_registry_revision(&workflow, request.profile_revision)?;
+    ensure_current_registry_revision(workflow, request.profile_revision)?;
 
     let published = workflow
         .publish(&saved.plan_id, saved.revision)
         .map_err(|err| workflow_mutation_error(&err, PUBLISH_OUTCOME_UNKNOWN))?;
     let published_header =
-        validate_published_view(&published, &saved, &request, &task, &validated_task_paths)?;
+        validate_published_view(&published, saved, request, task, validated_task_paths)?;
+    *recovery = Some(recovery_context(&published_header, PUBLISHED_PHASE));
 
     verify_live_binding_at(dirs, &scope.binding_id, &scope.thread_uuid).await?;
 
@@ -158,7 +218,7 @@ pub(super) async fn run_prepare_task(
         repository_path: scope.canonical_repo.clone(),
         base_commit: scope.base_commit.clone(),
         approved_task_ids: vec![task.id.clone()],
-        approved_write_paths: validated_task_paths.clone(),
+        approved_write_paths: validated_task_paths.to_vec(),
         max_parallel: 1,
         budgets: request.budgets.clone(),
     };
@@ -166,11 +226,11 @@ pub(super) async fn run_prepare_task(
     let preview = prepare_operator_preview(dirs, Some(fixed_scope), intent).await?;
     validate_preview(
         &preview,
-        &request,
-        &task,
+        request,
+        task,
         &scope.canonical_repo,
         &scope.base_commit,
-        &validated_task_paths,
+        validated_task_paths,
         &published_header,
     )?;
 
@@ -236,9 +296,10 @@ fn prevalidate_request(
             "profile_revision must identify an existing registry revision",
         ));
     }
-    request.budgets.validate().map_err(|_| {
-        CliError::new("validation", "execution budgets failed bounds validation")
-    })?;
+    request
+        .budgets
+        .validate()
+        .map_err(|_| CliError::new("validation", "execution budgets failed bounds validation"))?;
 
     let (canonical_repo, base_commit) =
         validate_repository_and_base_commit(&request.repository_path, &request.base_commit)

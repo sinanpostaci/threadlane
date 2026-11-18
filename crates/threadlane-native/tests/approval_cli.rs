@@ -562,6 +562,15 @@ impl ApprovalFixture {
 struct CliFailure {
     code: String,
     message: String,
+    #[serde(default)]
+    recovery: Option<CliRecoveryContext>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CliRecoveryContext {
+    plan_id: String,
+    revision: u64,
+    phase: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -824,10 +833,7 @@ fn prepare_task_plan_revision_count(fx: &ApprovalFixture, plan_id: &str) -> usiz
 }
 
 fn total_plan_revision_count(fx: &ApprovalFixture) -> usize {
-    fx.plans
-        .snapshot()
-        .expect("read all plan revisions")
-        .len()
+    fx.plans.snapshot().expect("read all plan revisions").len()
 }
 
 fn write_prepare_task_context(fx: &ApprovalFixture, name: &str) -> PathBuf {
@@ -2498,8 +2504,7 @@ async fn prepare_task_context_route_publishes_one_plan_and_preview_and_record_st
     assert_eq!(replay.preview.request.plan_id, plan_id);
     assert_eq!(replay.preview.request.plan_revision, 1);
     assert_eq!(
-        replay.preview.subject_digest,
-        receipt.preview.subject_digest,
+        replay.preview.subject_digest, receipt.preview.subject_digest,
         "an exact replay must reproduce the same frozen subject"
     );
     assert_eq!(prepare_task_plan_revision_count(&fx, &plan_id), 1);
@@ -2537,6 +2542,119 @@ async fn prepare_task_context_route_publishes_one_plan_and_preview_and_record_st
     fx.assert_no_worker_invocation();
     assert_eq!(fx.head(), fx.base_commit);
     assert!(fx.worktree_names().is_empty());
+
+    fx.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prepare_task_context_accepts_user_facing_worker_role_as_canonical_coder() {
+    let mut fx = ApprovalFixture::start().await;
+    let temp_dir = fx.private_preview_temp_dir();
+    let context_path = write_prepare_task_context(&fx, "prepare-task-worker-role-context.json");
+    let mut request = prepare_task_request(&fx, "fast-worker-role-1");
+    request["task"]["role"] = serde_json::json!("worker");
+    let stdin = prepare_task_bytes(&request);
+    let args = vec![
+        "--context".to_string(),
+        context_path.display().to_string(),
+        "approve".to_string(),
+        "prepare-task".to_string(),
+    ];
+
+    let output = run_command_with_stdin(context_command(), &args, &stdin, Some(&temp_dir)).await;
+    let receipt: PrivatePreviewReceipt = parse_success(
+        &output,
+        "context-routed prepare-task with the user-facing worker role",
+    );
+
+    let plan_id = receipt.preview.request.plan_id.clone();
+    assert!(plan_id.starts_with("plan_"));
+    assert_eq!(receipt.preview.request.plan_revision, 1);
+    assert_eq!(receipt.preview.tasks.len(), 1);
+    assert_eq!(receipt.preview.tasks[0].task_id, "task-fast");
+    assert_eq!(receipt.preview.tasks[0].role, WorkflowRole::Coder);
+
+    let revisions = fx
+        .plans
+        .plan_revisions(&plan_id)
+        .expect("read worker-role plan revisions");
+    assert_eq!(revisions.len(), 1);
+    assert_eq!(revisions[0].status, PlanStatus::Published);
+    assert_eq!(revisions[0].revision, 1);
+    assert_eq!(revisions[0].tasks.len(), 1);
+    assert_eq!(revisions[0].tasks[0].id, "task-fast");
+    assert_eq!(revisions[0].tasks[0].role, WorkflowRole::Coder);
+    assert_eq!(prepare_task_plan_revision_count(&fx, &plan_id), 1);
+    assert_eq!(fx.approval_count(), 0);
+    fx.assert_no_approval_artifacts();
+    fx.assert_no_worker_invocation();
+    assert_eq!(fx.head(), fx.base_commit);
+    assert!(fx.worktree_names().is_empty());
+
+    fx.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prepare_task_preserves_published_original_recovery_context_after_preview_tempdir_failure()
+{
+    let mut fx = ApprovalFixture::start().await;
+    let request = prepare_task_request(&fx, "fast-recovery-1");
+    let stdin = prepare_task_bytes(&request);
+
+    let invalid_tmpdir = fx.root.join("invalid-tmpdir-file");
+    fs::write(&invalid_tmpdir, b"not a directory\n").expect("write invalid TMPDIR file");
+    fs::set_permissions(&invalid_tmpdir, fs::Permissions::from_mode(0o600))
+        .expect("chmod invalid TMPDIR file 0600");
+
+    let failed = fx
+        .run_cli_with_stdin(&prepare_task_args(&fx), &stdin, Some(&invalid_tmpdir))
+        .await;
+    let failure = expect_failure(
+        &failed,
+        "prepare-task with an invalid TMPDIR file after publication",
+    );
+    assert_eq!(failure.code, "io");
+    let recovery = failure
+        .recovery
+        .expect("published original recovery context after the private preview failure");
+    assert!(recovery.plan_id.starts_with("plan_"));
+    assert_eq!(recovery.revision, 1);
+    assert_eq!(recovery.phase, "published");
+    assert_eq!(fx.approval_count(), 0);
+    fx.assert_no_approval_artifacts();
+    fx.assert_no_worker_invocation();
+    assert_eq!(fx.head(), fx.base_commit);
+    assert!(fx.worktree_names().is_empty());
+
+    // The safe reference names the actual original published revision and canonical worker role.
+    let revisions = fx
+        .plans
+        .plan_revisions(&recovery.plan_id)
+        .expect("read recovered original plan revisions");
+    assert_eq!(revisions.len(), 1);
+    assert_eq!(revisions[0].revision, recovery.revision);
+    assert_eq!(revisions[0].status, PlanStatus::Published);
+    assert_eq!(revisions[0].tasks.len(), 1);
+    assert_eq!(revisions[0].tasks[0].id, "task-fast");
+    assert_eq!(revisions[0].tasks[0].role, WorkflowRole::Coder);
+
+    // Recovery uses the original command key and revision without creating a new plan or authority.
+    let recovered_temp_dir = fx.private_preview_temp_dir();
+    let recovered = fx
+        .run_cli_with_stdin(&prepare_task_args(&fx), &stdin, Some(&recovered_temp_dir))
+        .await;
+    let recovered_receipt: PrivatePreviewReceipt = parse_success(
+        &recovered,
+        "prepare-task recovery replay through the original revision",
+    );
+    assert_eq!(recovered_receipt.preview.request.plan_id, recovery.plan_id);
+    assert_eq!(
+        recovered_receipt.preview.request.plan_revision,
+        recovery.revision
+    );
+    assert_eq!(prepare_task_plan_revision_count(&fx, &recovery.plan_id), 1);
+    assert_eq!(fx.approval_count(), 0);
+    fx.assert_no_worker_invocation();
 
     fx.shutdown().await;
 }
@@ -2687,9 +2805,7 @@ async fn prepare_task_rejects_malformed_requests_and_conflicting_keys_without_si
     let before = total_plan_revision_count(&fx);
 
     let valid = prepare_task_request(&fx, "fast-malformed-1");
-    let empty = fx
-        .run_cli_with_stdin(&args, b"", Some(&temp_dir))
-        .await;
+    let empty = fx.run_cli_with_stdin(&args, b"", Some(&temp_dir)).await;
     assert_eq!(
         expect_failure(&empty, "prepare-task with empty stdin").code,
         "invalid_input"
@@ -2843,7 +2959,11 @@ async fn prepare_task_rejects_malformed_requests_and_conflicting_keys_without_si
     let mut changed_summary = valid.clone();
     changed_summary["summary"] = serde_json::json!("A different fast-path plan summary");
     let summary_conflict = fx
-        .run_cli_with_stdin(&args, &prepare_task_bytes(&changed_summary), Some(&temp_dir))
+        .run_cli_with_stdin(
+            &args,
+            &prepare_task_bytes(&changed_summary),
+            Some(&temp_dir),
+        )
         .await;
     assert_eq!(
         expect_failure(

@@ -60,6 +60,7 @@ use threadlane_native::fs_safety::{
 use threadlane_native::{open_workflow_stores, NativeError, NativeErrorCode};
 
 /// Scoped single-task fast path implementation.
+#[path = "threadlane-approve/ordinary_task.rs"]
 mod ordinary_task;
 
 /// Maximum byte size (`1 MiB`) permitted for private JSON request files, bounded stdin JSON, and
@@ -155,15 +156,38 @@ enum ApproveCommand {
     },
 }
 
+/// Bounded, non-authoritative context for reconciling the original plan after a later failure.
+///
+/// The presence of this context means the named phase was confirmed by an actual mutation
+/// receipt. It never grants authority, never implies an unconfirmed publication succeeded, and
+/// never authorizes an automatic retry.
+#[derive(Debug, Clone, Serialize)]
+struct RecoveryContext {
+    plan_id: String,
+    revision: u64,
+    phase: &'static str,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct CliError {
     code: &'static str,
     message: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recovery: Option<RecoveryContext>,
 }
 
 impl CliError {
     const fn new(code: &'static str, message: &'static str) -> Self {
-        Self { code, message }
+        Self {
+            code,
+            message,
+            recovery: None,
+        }
+    }
+
+    fn with_recovery(mut self, recovery: Option<RecoveryContext>) -> Self {
+        self.recovery = recovery;
+        self
     }
 
     const fn invalid_input(message: &'static str) -> Self {
@@ -1648,8 +1672,7 @@ mod tests {
             "prepare-task must reject argv request paths"
         );
 
-        let positional_json =
-            Cli::try_parse_from(["threadlane-approve", "prepare-task", "{}"]);
+        let positional_json = Cli::try_parse_from(["threadlane-approve", "prepare-task", "{}"]);
         assert!(
             positional_json.is_err(),
             "prepare-task must reject positional JSON on argv"

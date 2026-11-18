@@ -10,9 +10,18 @@ One human-approved single-task scope. No execution before human approval.
 printf '%s' '<TASK_JSON>' | threadlane-context --context <CONTEXT> approve prepare-task
 ```
 
-3. If the plan was already published by `save_draft` and `publish`, choose `approve prepare-private` on stdin instead. Its `OperatorApprovalIntent` takes the original plan ID/revision, expected registry revision, binding, thread, repository, base commit, approved task IDs/paths, max parallel and budgets. Use the original receipts. For uncertain outcomes reconcile the original command key and plan before another mutation.
+3. If `save_draft` and `publish` already produced a plan, pass its original receipt fields and approved budgets to `approve prepare-private` on stdin. Example `OperatorApprovalIntent`:
 
-Both routes return `{preview_path,preview}`. Use client JSON serialization and a POSIX single-quoted literal for the shell builtin `printf`. Keep JSON off utility argv. The CLI writes the unchanged preview in a canonical 0700 directory as a verified 0600 file. Check the returned task, model/effort, executable, budgets, paths, `preview.request` (including `expected_plan_digest`) and `subject_digest` against the human-approved scope. Keep its exact path for the next step. This creates no execution authority.
+```json
+{
+  "binding_id":"<BINDING_ID>","thread_uuid":"<THREAD_UUID>","plan_id":"<PLAN_ID>",
+  "plan_revision":1,"expected_registry_revision":1,"repository_path":"<ABS_REPO_PATH>",
+  "base_commit":"<40_HEX_BASE_COMMIT>","approved_task_ids":["<TASK_ID>"],
+  "approved_write_paths":["<REL_WRITE_PATH>"],"max_parallel":1
+}
+```
+
+Both routes return `{preview_path,preview}`. Serialize JSON in the client and quote it for shell builtin `printf`. The CLI verifies its 0600 preview in a private 0700 directory. Match task, model/effort, executable, budgets, paths, `expected_plan_digest` and `subject_digest` to the approved scope. Keep the returned path. A command key identifies plan content. Verify the original repo, base and limits separately. After a partial failure inspect the original plan and revision before another mutation.
 
 4. Record the same `preview_path` after consent:
 
