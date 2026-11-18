@@ -2067,6 +2067,7 @@ test("MCP guide functions.exec recipes run literally with typed data in fresh is
   assert.ok(!texts.join("\n").includes(template.javascript));
   assert.ok(!texts.join("\n").includes(RAW_LOG));
   assert.deepEqual(plain(JSON.parse(texts[2])), {
+    final_summary: ACCEPTANCE_CONTEXT.acceptance_note,
     status: "done",
     item_id: ITEM,
     revision: 8,
@@ -2327,6 +2328,7 @@ test("MCP guide completion refuses stale, missing, or changed report correlation
       acceptance_evidence: env.acceptanceContext.acceptance_evidence
     });
     assert.deepEqual(plain(JSON.parse(env.texts[2])), {
+      final_summary: env.acceptanceContext.acceptance_note,
       status: "done",
       item_id: ITEM,
       revision: 8,
@@ -2608,6 +2610,7 @@ test("MCP documents refuse mixed prep input/start bindings before any callback o
       await env.runRecipe(2, { ACCEPTANCE_CONTEXT: clone(env.acceptanceContext) });
       assert.equal(env.calls.complete, 1, `${label}: positive flow completes once`);
       assert.deepEqual(plain(JSON.parse(env.texts[2])), {
+        final_summary: env.acceptanceContext.acceptance_note,
         status: "done",
         item_id: ITEM,
         revision: 8,
@@ -2859,6 +2862,7 @@ test("ordinary closure client requires semantic data and reuses only matching va
   assert.equal(doneView.revision, 8);
   assert.equal(doneView.completed_at_ms, 5000);
   assert.deepEqual(plain(JSON.parse(env.texts[env.texts.length - 1])), {
+    final_summary: env.acceptanceContext.acceptance_note,
     status: "done",
     item_id: ITEM,
     revision: 8,
@@ -2872,6 +2876,7 @@ test("ordinary closure client requires semantic data and reuses only matching va
   assert.deepEqual(plain(env.calls), plain(countsAfterDone), "validated Done makes no later network call");
   assert.equal(env.stored.get("threadlane/closure-done-receipt.json"), receiptAfterDone);
   assert.deepEqual(plain(JSON.parse(env.texts[env.texts.length - 1])), {
+    final_summary: env.acceptanceContext.acceptance_note,
     status: "done",
     item_id: ITEM,
     revision: 8,
@@ -2982,6 +2987,7 @@ test("ordinary closure client never retries missing, error, or unknown completio
       await env.runRecipe(2, { ACCEPTANCE_CONTEXT: clone(env.acceptanceContext) });
       const view = JSON.parse(env.texts[env.texts.length - 1]);
       assert.equal(view.status, "incompatible", "an error reply is never Done");
+      assert.equal(Object.hasOwn(view, "final_summary"), false);
       assert.equal(env.stored.has("threadlane/closure-done-receipt.json"), true);
       assert.equal(env.stored.has("threadlane/closure-done-view.json"), false);
     } else {
@@ -3204,7 +3210,7 @@ test("ordinary closure client isolates completion records by original execution"
           assert.equal(env.stored.get(receipts), legacyReceipt, `${label}/${scenario}: legacy receipt kept`);
           assert.deepEqual(
             plain(JSON.parse(env.texts[env.texts.length - 1])),
-            done(5000),
+            {...done(5000), final_summary: env.acceptanceContext.acceptance_note},
             `${label}/${scenario}: matching legacy current Done is formatted purely`
           );
           assert.equal(env.texts.length, textCount + 1, `${label}/${scenario}: one text`);
@@ -3309,7 +3315,7 @@ test("ordinary closure client isolates completion records by original execution"
       assert.equal(env.stored.get(receipts), receiptAfterB, `${label}/${scenario}: repeated B zero effect`);
       assert.deepEqual(
         plain(JSON.parse(env.texts[env.texts.length - 1])),
-        bDone,
+        {...bDone, final_summary: env.acceptanceContext.acceptance_note},
         `${label}/${scenario}: repeated B formats its own Done`
       );
       assert.equal(env.texts.length, textCountAfterB + 1, `${label}/${scenario}: one extra text`);

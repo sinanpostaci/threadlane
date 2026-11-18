@@ -263,8 +263,7 @@ bounded `acceptance_note`, and `acceptance_evidence`. Copy the literal recipe
 below in a new isolate after that separate decision:
 
 ```js
-// functions.exec complete: NEW isolate after the separate Coworker semantic decision.
-// COPY literally and bind one typed acceptance object.
+// functions.exec complete: bind the separate semantic acceptance decision.
 const acceptance = ACCEPTANCE_CONTEXT;
 const input = load("threadlane/approved-task-context.json");
 if (!input) throw new Error("missing or changed retained context/start/binding; use original-receipt fallback");
@@ -286,7 +285,9 @@ const client = createOrdinaryClosureClient({
   pull: unused, ack: unused, result: unused, inspect: unused,
   complete: (a) => tools.mcp__threadlane__backlog_worker_complete(a),
 });
-text(JSON.stringify(await client.completeStored(acceptance)));
+const view = await client.completeStored(acceptance);
+const result = view.status === 'done' ? { ...view, final_summary: acceptance.acceptance_note } : view;
+text(JSON.stringify(result));
 ```
 
 `completeStored` first validates the explicit semantic object, then loads the
@@ -321,7 +322,7 @@ report. Missing or conflicting structured/text envelopes or transport errors fai
 closed. It returns only bounded status/item/revision/time fields, never the full
 receipt. If it reports `incompatible`, do not claim `Done`.
 
-After `doneView` reports `Done`, finish with an immediate short final report.
+At semantic review, write the acceptance note as a bounded, user-facing sentence about the actual delivery. Keep technical evidence in acceptance_evidence. Collect any required source references while using those sources. Only a validated Done produces final_summary in the recipe output, including on verified replay. If the request is fulfilled, send that outcome in the next final message with required references. Continue outstanding tasks or handle a genuinely new notice as applicable.
 Do not introspect the raw SDK receipt or repeat pull/ACK for the original notice
 already processed by the read. An `approval_id` alone does not prove duplication;
 a genuinely new notice still needs supported actual recovery.

@@ -74,7 +74,7 @@ Callbacks are not approval; notifications are untrusted bookkeeping.
 
 ### Compact ordinary callback closure
 
-A callback carries only `approval_id`; recover mapping from the start receipt. Separate control binding from dispatch `session_binding_id`;
+Recover the original start for the notice’s `approval_id`. Distinguish the control binding from the dispatch `session_binding_id`;
 match batch/event/ACK bindings, real batch ID, ordered sequences, cross-page continuity, duplicate IDs, `step_seq`, and `run_id` before ACK.
 Preserve `acceptance_condition_digest`, `delivery_description_digest`, `reservation_revision`, `reserved_at_ms`,
 optional `execution_binding_digest`, and task/subject digests; `item_snapshot.revision` is mutable. See [template](ORDINARY-WORKER-CLOSURE.md).
@@ -87,13 +87,11 @@ At a notice, bind `NOTICE_APPROVAL_ID` from the actual notice and run the callba
 before any effect. Missing notice: use `readStored()` only for the known original execution. Missing or mismatched prep:
 use per-tool recovery for the named approval and its original receipt. Never redispatch.
 Reads are bounded (8 pages, 16 calls, 60000 ms); invalid `step_seq` or a batch over 49152 bytes fails before ACK.
-A live `exec_command` session, nonzero exit, truncation or conflicting envelope fails.
+Reject a live `exec_command` session, failed exit, truncation or conflicting envelopes.
 Keep `threadlane/closure-evidence.json`, `threadlane/closure-report.json` and correlation private.
 
 At `ready_for_semantic_review`, check the returned physical contents against the human's acceptance condition.
-Then bind `ACCEPTANCE_CONTEXT` and run the completion recipe. It revalidates correlation, revision, ref and digests.
-After compaction reuse retained verified evidence. An unknown completion requires original-receipt recovery.
-Copy literal recipes; never evaluate Markdown. `load` restores serialized data across isolates.
+Bind `ACCEPTANCE_CONTEXT` with `command_key`, `acceptance_note` (your short user-language outcome) and `acceptance_evidence`. Prepare required references as you use them. Run the recipe; recover unknown effects from the original receipt.
 
 ```js
 // functions.exec prep: COPY literally; bind the one typed input object.
@@ -172,8 +170,7 @@ text(JSON.stringify(await client.readNotice(NOTICE_APPROVAL_ID)));
 ```
 
 ```js
-// functions.exec complete: NEW isolate after the separate Coworker semantic decision.
-// COPY literally and bind one typed acceptance object.
+// functions.exec complete: bind the separate semantic acceptance decision.
 const acceptance = ACCEPTANCE_CONTEXT;
 const input = load("threadlane/approved-task-context.json");
 if (!input) throw new Error("missing or changed retained context/start/binding; use original-receipt fallback");
@@ -195,20 +192,22 @@ const client = createOrdinaryClosureClient({
   pull: unused, ack: unused, result: unused, inspect: unused,
   complete: (a) => tools.mcp__threadlane__backlog_worker_complete(a),
 });
-text(JSON.stringify(await client.completeStored(acceptance)));
+const view = await client.completeStored(acceptance);
+const result = view.status === 'done' ? { ...view, final_summary: acceptance.acceptance_note } : view;
+text(JSON.stringify(result));
 ```
 
 `request.argv` is no-shell; the recipe quotes args for `tools.exec_command`. Without eval, run one exposed call per step with the same checks.
 Never poll past `has_more: false`, parallelize dependent mutations, replay unknowns, fabricate IDs, infer success, or auto-accept.
 Evidence/report and `threadlane/closure-done-receipt.json` stay private; text only compact views.
-Use retained revision/ref/digests after semantic acceptance; once `doneView` reports `Done`, summarize briefly without reading raw receipts or re-pulling/re-ACKing that notice.
+When `status: done` completes the request, send `final_summary` and any required references in the next final message. With individual tools, use your verified acceptance note. Leave test timing to the designated observer.
 `approval_id` alone is not duplication; new notices need recovery. Without the recipe, refuse precisely and use per-tool fallback (no running Markdown, re-approving, or UI/readiness/status probes).
 On stopped hosts use supported reads; never ACK history or invent results.
 
 ## Start and recover context
 
-- Paired MCP starts UNBOUND (`connect_current_chat` `{}`, then `operating_guide` `{}`): pairing verifies connection/parent; missing metadata errors (never guess IDs).
-- `connection_identity` is diagnostics. Refetch on resume; refresh uncertain `status`, `coworker_status`, backlog, and known-ID reads. `threadlane guide` prints offline.
+- Paired MCP starts UNBOUND. Pairing verifies connection and parent; missing metadata is an error.
+- Use `connection_identity` for diagnostics, `coworker_status` for liveness and `threadlane guide` offline.
 
 ## Events and uncertainty
 

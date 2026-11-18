@@ -273,8 +273,7 @@ approval/task identity:
   bounded reason while preserving the immutable successful outcome. It creates
   no human question/`NeedsYou` and dispatches nothing. Missing or mismatched
   evidence cannot justify rejection or completion.
-- A successful complete already returns immutable `Done`: finish with a short
-  human-language report; do not reread or manually rewrite the long receipt JSON.
+- At semantic review, make the acceptance note a short user-language result. Keep required references when consulting sources. After a validated `Done` completes the request, send the prepared result in the next final message (`final_summary` in the guide recipe). Keep timing collection with the observer during an instrumented test.
   Backend receipts remain; private artifacts are compact IDs, digests, hashes, and
   verdicts produced once with physical checking. A rejected attempt cannot complete,
   and a result reread preserves the rejection. An exact replay of the original
