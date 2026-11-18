@@ -6,6 +6,13 @@
 //! Prepares a read-only digest-bound [`threadlane_authority::OperatorApprovalPreview`] (`prepare`) and records an
 //! operator-confirmed [`ApprovalSummary`] (`record`) via [`AuthorityStore::approve_confirmed`].
 //!
+//! `prepare-private` is the opt-in stdin route: it accepts one bounded strict
+//! [`threadlane_authority::OperatorApprovalIntent`] JSON document on stdin (never argv), runs the
+//! same authoritative prepare and live/fixed-scope validation as `prepare`, then persists the
+//! unchanged typed preview plus newline as `preview.json` (`0600`) in a new unique private
+//! (`0700`) temp directory and returns a bounded `{preview_path, preview}` receipt. It writes no
+//! approval ledger entry and dispatches no work.
+//!
 //! `record` accepts exactly one private input: the unchanged normalized
 //! [`threadlane_authority::OperatorApprovalRequest`] (`--request`) or the complete typed
 //! [`threadlane_authority::OperatorApprovalPreview`] returned by `prepare` (`--preview`). The preview
@@ -46,8 +53,8 @@ use threadlane_native::fs_safety::{
 };
 use threadlane_native::{open_workflow_stores, NativeError, NativeErrorCode};
 
-/// Maximum byte size (`1 MiB`) permitted for private JSON request files and bounded stdout JSON
-/// responses (including the trailing newline).
+/// Maximum byte size (`1 MiB`) permitted for private JSON request files, bounded stdin JSON, and
+/// bounded stdout JSON responses (including the trailing newline).
 const MAX_IO_BYTES: usize = 1_048_576;
 
 /// Error code emitted when a mutating approval operation completed before its bounded stdout
@@ -95,10 +102,18 @@ enum ApproveCommand {
         #[arg(long = "request", value_name = "ABS_PRIVATE_JSON")]
         request: PathBuf,
     },
+    /// Prepare a validated preview from one bounded strict `OperatorApprovalIntent` JSON document on stdin.
+    ///
+    /// Runs the same authoritative prepare and live/fixed-scope validation as `prepare`, then
+    /// writes the unchanged typed preview plus newline to a new `0600` `preview.json` in a unique
+    /// private `0700` temp directory and returns `{preview_path, preview}`. This route accepts no
+    /// output path argument and writes no authority ledger entry.
+    PreparePrivate,
     /// Validate and persist a confirmed operator approval into `approvals.json`.
     ///
     /// Requires exactly one input: `--request` (unchanged normalized `OperatorApprovalRequest`)
-    /// or `--preview` (the complete typed `OperatorApprovalPreview` returned by `prepare`).
+    /// or `--preview` (the complete typed `OperatorApprovalPreview` returned by `prepare` or
+    /// `prepare-private`).
     #[command(group(
         clap::ArgGroup::new("record_input")
             .required(true)
@@ -327,6 +342,164 @@ impl CliError {
     }
 }
 
+#[derive(Debug, Serialize)]
+struct PrivatePreviewReceipt {
+    preview_path: PathBuf,
+    preview: OperatorApprovalPreview,
+}
+
+/// Reads one bounded strict JSON DTO from stdin without accepting any argv JSON.
+fn load_stdin_json<T: DeserializeOwned>() -> Result<T, CliError> {
+    let mut buf = Vec::new();
+    io::stdin()
+        .lock()
+        .take((MAX_IO_BYTES as u64) + 1)
+        .read_to_end(&mut buf)
+        .map_err(|_| CliError::invalid_input("stdin request could not be read"))?;
+    if buf.len() > MAX_IO_BYTES {
+        return Err(CliError::invalid_input(
+            "stdin request exceeds maximum size of 1 MiB",
+        ));
+    }
+
+    serde_json::from_slice(&buf)
+        .map_err(|_| CliError::invalid_input("stdin request contains invalid JSON"))
+}
+
+/// Runs the single authoritative prepare flow shared by `prepare` and `prepare-private`.
+async fn prepare_operator_preview(
+    dirs: &ValidatedStoreDirs,
+    fixed_scope: Option<&FixedApprovalScope>,
+    intent: OperatorApprovalIntent,
+) -> Result<OperatorApprovalPreview, CliError> {
+    let binding_id = validate_identifier("binding_id", &intent.binding_id)
+        .map_err(|e| CliError::from_authority(&e))?;
+    let thread_uuid = validate_canonical_thread_uuid("thread_uuid", &intent.thread_uuid)
+        .map_err(|e| CliError::from_authority(&e))?;
+    if let Some(fixed) = fixed_scope {
+        enforce_fixed_scope_on_request(
+            fixed,
+            &binding_id,
+            &thread_uuid,
+            &intent.repository_path,
+            None,
+        )?;
+    }
+    validate_repo_non_overlap_with_state_dir(&intent.repository_path, &dirs.state_dir)?;
+
+    let supervisor = SupervisorClient::from_state_dir(&dirs.state_dir)
+        .map_err(|e| CliError::from_supervisor(&e))?;
+    verify_live_binding(&supervisor, &binding_id, &thread_uuid).await?;
+
+    let authority = open_validated_authority_store(dirs)?;
+    let preview = authority
+        .prepare_for_operator(intent)
+        .map_err(|e| CliError::from_authority(&e))?;
+
+    if let Some(fixed) = fixed_scope {
+        enforce_fixed_scope_on_request(
+            fixed,
+            &preview.request.binding_id,
+            &preview.request.thread_uuid,
+            &preview.request.repository_path,
+            None,
+        )?;
+    }
+
+    verify_live_binding(
+        &supervisor,
+        &preview.request.binding_id,
+        &preview.request.thread_uuid,
+    )
+    .await?;
+
+    Ok(preview)
+}
+
+/// Writes the unchanged typed preview plus newline into a new private temp directory.
+///
+/// The returned [`tempfile::TempDir`] stays owned by the caller until the bounded receipt has
+/// been written, so any failure removes the directory and any success keeps it.
+#[cfg(unix)]
+fn write_private_preview_file(
+    preview: &OperatorApprovalPreview,
+) -> Result<(PathBuf, tempfile::TempDir), CliError> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+    let mut bytes = serde_json::to_vec(preview)
+        .map_err(|_| CliError::new("json", "failed to serialize prepared approval preview"))?;
+    bytes.push(b'\n');
+    if bytes.len() > MAX_IO_BYTES {
+        return Err(CliError::invalid_input(
+            "private approval preview exceeds maximum size of 1 MiB",
+        ));
+    }
+
+    let directory = tempfile::Builder::new()
+        .prefix("threadlane-approval-preview-")
+        .permissions(fs::Permissions::from_mode(0o700))
+        .tempdir()
+        .map_err(|_| CliError::new("io", "failed to create private preview directory"))?;
+    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
+        .map_err(|_| CliError::new("io", "failed to secure private preview directory"))?;
+
+    let canonical_dir = fs::canonicalize(directory.path())
+        .map_err(|_| CliError::new("io", "failed to canonicalize private preview directory"))?;
+    let dir_meta = fs::symlink_metadata(&canonical_dir)
+        .map_err(|_| CliError::new("io", "failed to inspect private preview directory"))?;
+    if !canonical_dir.is_absolute()
+        || dir_meta.file_type().is_symlink()
+        || !dir_meta.file_type().is_dir()
+        || (dir_meta.mode() & 0o777) != 0o700
+    {
+        return Err(CliError::security_violation(
+            "private preview directory failed canonical path or 0700 permission checks",
+        ));
+    }
+
+    let preview_path = canonical_dir.join("preview.json");
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&preview_path)
+        .map_err(|_| CliError::new("io", "failed to create private approval preview file"))?;
+    file.set_permissions(fs::Permissions::from_mode(0o600))
+        .map_err(|_| CliError::new("io", "failed to secure private approval preview file"))?;
+    file.write_all(&bytes)
+        .map_err(|_| CliError::new("io", "failed to write private approval preview file"))?;
+    file.sync_all()
+        .map_err(|_| CliError::new("io", "failed to sync private approval preview file"))?;
+    drop(file);
+
+    let readback = fs::read(&preview_path)
+        .map_err(|_| CliError::new("io", "failed to read back private approval preview file"))?;
+    let readback_meta = fs::symlink_metadata(&preview_path)
+        .map_err(|_| CliError::new("io", "failed to inspect private approval preview file"))?;
+    if readback_meta.file_type().is_symlink()
+        || !readback_meta.file_type().is_file()
+        || (readback_meta.mode() & 0o077) != 0
+        || readback != bytes
+    {
+        return Err(CliError::security_violation(
+            "private approval preview file failed regular-file, permission, or readback checks",
+        ));
+    }
+
+    Ok((preview_path, directory))
+}
+
+#[cfg(not(unix))]
+fn write_private_preview_file(
+    _preview: &OperatorApprovalPreview,
+) -> Result<(PathBuf, tempfile::TempDir), CliError> {
+    Err(CliError::new(
+        "unsupported_platform",
+        "threadlane-approve is only supported on Unix platforms",
+    ))
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = match Cli::try_parse() {
@@ -370,49 +543,30 @@ async fn run(cli: Cli) -> Result<(), CliError> {
             let fixed_scope =
                 resolve_fixed_scope(raw_binding, raw_thread, raw_project_root, &dirs)?;
             let intent: OperatorApprovalIntent = load_request_json(&request)?;
-
-            let binding_id = validate_identifier("binding_id", &intent.binding_id)
-                .map_err(|e| CliError::from_authority(&e))?;
-            let thread_uuid = validate_canonical_thread_uuid("thread_uuid", &intent.thread_uuid)
-                .map_err(|e| CliError::from_authority(&e))?;
-            if let Some(ref fixed) = fixed_scope {
-                enforce_fixed_scope_on_request(
-                    fixed,
-                    &binding_id,
-                    &thread_uuid,
-                    &intent.repository_path,
-                    None,
-                )?;
-            }
-            validate_repo_non_overlap_with_state_dir(&intent.repository_path, &dirs.state_dir)?;
-
-            let supervisor = SupervisorClient::from_state_dir(&dirs.state_dir)
-                .map_err(|e| CliError::from_supervisor(&e))?;
-            verify_live_binding(&supervisor, &binding_id, &thread_uuid).await?;
-
-            let authority = open_validated_authority_store(&dirs)?;
-            let preview = authority
-                .prepare_for_operator(intent)
-                .map_err(|e| CliError::from_authority(&e))?;
-
-            if let Some(ref fixed) = fixed_scope {
-                enforce_fixed_scope_on_request(
-                    fixed,
-                    &preview.request.binding_id,
-                    &preview.request.thread_uuid,
-                    &preview.request.repository_path,
-                    None,
-                )?;
-            }
-
-            verify_live_binding(
-                &supervisor,
-                &preview.request.binding_id,
-                &preview.request.thread_uuid,
-            )
-            .await?;
+            let preview = prepare_operator_preview(&dirs, fixed_scope.as_ref(), intent).await?;
 
             write_stdout_json(&preview, false)
+        }
+        ApproveCommand::PreparePrivate => {
+            let dirs =
+                validate_four_store_dirs(&state_dir, &registry_dir, &plans_dir, &authority_dir)?;
+            let fixed_scope =
+                resolve_fixed_scope(raw_binding, raw_thread, raw_project_root, &dirs)?;
+            let intent: OperatorApprovalIntent = load_stdin_json()?;
+            let preview = prepare_operator_preview(&dirs, fixed_scope.as_ref(), intent).await?;
+            let (preview_path, directory) = write_private_preview_file(&preview)?;
+
+            let receipt = PrivatePreviewReceipt {
+                preview_path,
+                preview,
+            };
+
+            // The receipt is serialized before stdout so an oversized or failed response leaves
+            // no private preview directory behind; `keep` commits it only after a successful
+            // bounded write.
+            write_stdout_json(&receipt, false)?;
+            let _kept_path = directory.keep();
+            Ok(())
         }
         ApproveCommand::Record {
             request,
@@ -1352,6 +1506,65 @@ mod tests {
         assert!(
             missing_input.is_err(),
             "record without exactly one private input must be rejected"
+        );
+    }
+
+    #[test]
+    fn prepare_private_parses_without_request_and_rejects_argv_inputs() {
+        let cli = Cli::try_parse_from([
+            "threadlane-approve",
+            "--state-dir",
+            "/abs/state",
+            "--registry-dir",
+            "/abs/registry",
+            "--plans-dir",
+            "/abs/plans",
+            "--authority-dir",
+            "/abs/authority",
+            "prepare-private",
+        ])
+        .expect("parse prepare-private");
+        assert!(matches!(cli.command, ApproveCommand::PreparePrivate));
+        assert!(cli.binding.is_none());
+        assert!(cli.thread.is_none());
+        assert!(cli.project_root.is_none());
+
+        let argv_json = Cli::try_parse_from([
+            "threadlane-approve",
+            "prepare-private",
+            "--request",
+            "/abs/req.json",
+        ]);
+        assert!(
+            argv_json.is_err(),
+            "prepare-private must reject argv JSON paths"
+        );
+
+        let positional_json = Cli::try_parse_from([
+            "threadlane-approve",
+            "prepare-private",
+            "{\"binding_id\":\"bnd_test_1\"}",
+        ]);
+        assert!(
+            positional_json.is_err(),
+            "prepare-private must reject positional JSON on argv"
+        );
+
+        let legacy_without_request = Cli::try_parse_from([
+            "threadlane-approve",
+            "--state-dir",
+            "/abs/state",
+            "--registry-dir",
+            "/abs/registry",
+            "--plans-dir",
+            "/abs/plans",
+            "--authority-dir",
+            "/abs/authority",
+            "prepare",
+        ]);
+        assert!(
+            legacy_without_request.is_err(),
+            "prepare must keep requiring --request"
         );
     }
 

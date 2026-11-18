@@ -32,6 +32,7 @@ use threadlane_workflow::{
     PlanTask, RegistryChange, RoleAssignment, ToolAdapter, ToolDefinition, WorkflowProfile,
     WorkflowRole,
 };
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
 const THREAD_UUID: &str = "550e8400-e29b-41d4-a716-446655440000";
@@ -242,6 +243,39 @@ impl ApprovalFixture {
         args.push("--request".to_string());
         args.push(request.display().to_string());
         args
+    }
+
+    fn prepare_private_args(&self) -> Vec<String> {
+        let mut args = vec!["prepare-private".to_string()];
+        args.extend(self.store_args());
+        args
+    }
+
+    fn private_preview_temp_dir(&self) -> PathBuf {
+        let dir = self.root.join("private-previews");
+        fs::create_dir_all(&dir).expect("create private preview temp dir");
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
+            .expect("chmod private preview temp dir 0700");
+        dir
+    }
+
+    async fn run_cli_with_stdin(
+        &self,
+        args: &[String],
+        stdin: &[u8],
+        temp_dir: Option<&Path>,
+    ) -> Output {
+        run_command_with_stdin(approval_command(), args, stdin, temp_dir).await
+    }
+
+    async fn run_prepare_private(
+        &self,
+        intent: &OperatorApprovalIntent,
+        temp_dir: &Path,
+    ) -> Output {
+        let stdin = serde_json::to_vec(intent).expect("serialize strict intent for stdin");
+        self.run_cli_with_stdin(&self.prepare_private_args(), &stdin, Some(temp_dir))
+            .await
     }
 
     fn prepare_args_with_authority(&self, request: &Path, authority_dir: &Path) -> Vec<String> {
@@ -530,6 +564,12 @@ struct CliFailure {
     message: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct PrivatePreviewReceipt {
+    preview_path: PathBuf,
+    preview: OperatorApprovalPreview,
+}
+
 fn plan_tasks() -> Vec<PlanTask> {
     vec![
         PlanTask {
@@ -651,6 +691,70 @@ fn approval_command() -> Command {
         .env("GIT_CONFIG_SYSTEM", "/dev/null")
         .env("GIT_CONFIG_GLOBAL", "/dev/null");
     command
+}
+
+fn context_command() -> Command {
+    let mut command = Command::new(PathBuf::from(env!("CARGO_BIN_EXE_threadlane-context")));
+    command
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null");
+    command
+}
+
+async fn run_command_with_stdin(
+    mut command: Command,
+    args: &[String],
+    stdin_bytes: &[u8],
+    temp_dir: Option<&Path>,
+) -> Output {
+    command
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(dir) = temp_dir {
+        command.env("TMPDIR", dir);
+    }
+
+    let mut child = command.spawn().expect("spawn stdin command");
+    {
+        let mut pipe = child.stdin.take().expect("child stdin pipe");
+        // A bounded-input rejection can close the child pipe before the writer finishes; the
+        // command's own exit status and stderr are the authoritative result.
+        let _ = pipe.write_all(stdin_bytes).await;
+        let _ = pipe.shutdown().await;
+    }
+    child
+        .wait_with_output()
+        .await
+        .expect("wait for stdin command")
+}
+
+fn directory_entries(dir: &Path) -> Vec<PathBuf> {
+    let mut entries = fs::read_dir(dir)
+        .expect("read directory entries")
+        .map(|entry| entry.expect("read directory entry").path())
+        .collect::<Vec<_>>();
+    entries.sort();
+    entries
+}
+
+fn prepare_private_fixed_args(
+    fx: &ApprovalFixture,
+    binding: &str,
+    thread: &str,
+    project_root: &Path,
+) -> Vec<String> {
+    let mut args = fx.prepare_private_args();
+    args.push("--binding".to_string());
+    args.push(binding.to_string());
+    args.push("--thread".to_string());
+    args.push(thread.to_string());
+    args.push("--project-root".to_string());
+    args.push(project_root.display().to_string());
+    args
 }
 
 fn parse_success<T: DeserializeOwned>(output: &Output, context: &str) -> T {
@@ -938,6 +1042,308 @@ async fn quickstart_example_prepares_exact_intent_without_worker_invocation() {
 
     fx.assert_no_worker_invocation();
     fx.assert_no_approval_artifacts();
+    fx.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prepare_private_stdin_writes_verified_preview_that_record_accepts() {
+    let mut fx = ApprovalFixture::start().await;
+    let temp_dir = fx.private_preview_temp_dir();
+    let intent = fx.intent();
+    let output = fx.run_prepare_private(&intent, &temp_dir).await;
+    let receipt: PrivatePreviewReceipt =
+        parse_success(&output, "prepare-private strict stdin intent");
+
+    let raw: Value = serde_json::from_slice(&output.stdout).expect("receipt is JSON");
+    let object = raw.as_object().expect("receipt is an object");
+    assert_eq!(
+        object.len(),
+        2,
+        "receipt must expose only the canonical path and typed preview"
+    );
+    assert!(object.get("preview_path").is_some());
+    assert!(object.get("preview").is_some());
+
+    assert!(receipt.preview_path.is_absolute());
+    assert_eq!(
+        receipt.preview_path.file_name().and_then(|name| name.to_str()),
+        Some("preview.json")
+    );
+    let preview_dir = receipt
+        .preview_path
+        .parent()
+        .expect("preview path has a parent directory");
+    assert_eq!(
+        fs::canonicalize(preview_dir).expect("canonicalize private preview directory"),
+        preview_dir,
+        "receipt preview_path must be canonical"
+    );
+    assert!(preview_dir.starts_with(&temp_dir));
+    assert_eq!(
+        directory_entries(&temp_dir),
+        vec![preview_dir.to_path_buf()],
+        "a unique private preview directory must be kept"
+    );
+    assert_mode(preview_dir, 0o700, "private preview directory");
+    assert_mode(&receipt.preview_path, 0o600, "private preview file");
+    assert!(
+        fs::symlink_metadata(&receipt.preview_path)
+            .expect("stat private preview file")
+            .file_type()
+            .is_file()
+    );
+
+    let mut expected_bytes =
+        serde_json::to_vec(&receipt.preview).expect("serialize receipt preview");
+    expected_bytes.push(b'\n');
+    assert!(expected_bytes.len() <= MAX_REQUEST_BYTES);
+    assert_eq!(
+        fs::read(&receipt.preview_path).expect("read private preview file"),
+        expected_bytes,
+        "preview file must contain the unchanged full typed preview plus newline"
+    );
+
+    let legacy_path = fx.write_request("prepare-private-equivalence.json", &intent);
+    let legacy_output = fx.run_prepare(&legacy_path).await;
+    let legacy_preview: OperatorApprovalPreview =
+        parse_success(&legacy_output, "legacy prepare for equivalence");
+    assert_eq!(
+        receipt.preview, legacy_preview,
+        "prepare-private must use the same authoritative prepare logic"
+    );
+    assert_eq!(
+        fs::read(&receipt.preview_path).expect("read private preview file"),
+        legacy_output.stdout,
+        "private preview bytes must match the unchanged legacy prepare stdout"
+    );
+
+    fx.assert_no_approval_artifacts();
+
+    let summary: ApprovalSummary = parse_success(
+        &fx.run_record_preview(
+            &receipt.preview_path,
+            &receipt.preview.subject_digest,
+            THREAD_UUID,
+            true,
+        )
+        .await,
+        "record the unchanged private preview returned by prepare-private",
+    );
+    assert_eq!(summary.subject_digest, receipt.preview.subject_digest);
+    assert_eq!(summary.binding_id, fx.binding_id);
+    assert_eq!(
+        summary.approved_task_ids,
+        vec!["task-root".to_string(), "task-child".to_string()]
+    );
+    assert_eq!(fx.approval_count(), 1);
+    fx.assert_no_worker_invocation();
+    assert_eq!(fx.head(), fx.base_commit);
+    assert!(fx.worktree_names().is_empty());
+
+    fx.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prepare_private_rejects_invalid_stdin_and_fixed_scope_before_private_artifacts() {
+    let mut fx = ApprovalFixture::start().await;
+    let temp_dir = fx.private_preview_temp_dir();
+
+    let empty = fx
+        .run_cli_with_stdin(&fx.prepare_private_args(), b"", Some(&temp_dir))
+        .await;
+    assert_eq!(
+        expect_failure(&empty, "prepare-private with empty stdin").code,
+        "invalid_input"
+    );
+    assert!(directory_entries(&temp_dir).is_empty());
+
+    let malformed = format!("{{ not valid intent JSON {SECRET_SENTINEL}");
+    let malformed_output = fx
+        .run_cli_with_stdin(
+            &fx.prepare_private_args(),
+            malformed.as_bytes(),
+            Some(&temp_dir),
+        )
+        .await;
+    assert_eq!(
+        expect_failure(&malformed_output, "prepare-private with malformed stdin").code,
+        "invalid_input"
+    );
+    assert_no_secret_echo(&malformed_output, "prepare-private with malformed stdin");
+    assert!(directory_entries(&temp_dir).is_empty());
+
+    let mut unknown_field = serde_json::to_value(fx.intent()).expect("serialize intent as value");
+    unknown_field
+        .as_object_mut()
+        .expect("intent is an object")
+        .insert("unexpected_field".to_string(), Value::Bool(true));
+    let unknown_bytes = serde_json::to_vec(&unknown_field).expect("serialize invalid intent");
+    let unknown_output = fx
+        .run_cli_with_stdin(
+            &fx.prepare_private_args(),
+            &unknown_bytes,
+            Some(&temp_dir),
+        )
+        .await;
+    assert_eq!(
+        expect_failure(
+            &unknown_output,
+            "prepare-private with an unknown intent field"
+        )
+        .code,
+        "invalid_input"
+    );
+    assert!(directory_entries(&temp_dir).is_empty());
+
+    let mut oversize = serde_json::to_vec(&fx.intent()).expect("serialize oversize stdin intent");
+    oversize.resize(MAX_REQUEST_BYTES + 1, b' ');
+    let oversize_output = fx
+        .run_cli_with_stdin(&fx.prepare_private_args(), &oversize, Some(&temp_dir))
+        .await;
+    assert_eq!(
+        expect_failure(&oversize_output, "prepare-private with oversize stdin").code,
+        "invalid_input"
+    );
+    assert!(directory_entries(&temp_dir).is_empty());
+
+    let intent_bytes = serde_json::to_vec(&fx.intent()).expect("serialize valid stdin intent");
+    let wrong_binding = fx
+        .run_cli_with_stdin(
+            &prepare_private_fixed_args(&fx, "bnd_other_chat", THREAD_UUID, &fx.repo),
+            &intent_bytes,
+            Some(&temp_dir),
+        )
+        .await;
+    assert_eq!(
+        expect_failure(
+            &wrong_binding,
+            "prepare-private with a fixed binding mismatch"
+        )
+        .code,
+        "binding_mismatch"
+    );
+    assert!(directory_entries(&temp_dir).is_empty());
+
+    let wrong_thread = fx
+        .run_cli_with_stdin(
+            &prepare_private_fixed_args(&fx, &fx.binding_id, OTHER_THREAD_UUID, &fx.repo),
+            &intent_bytes,
+            Some(&temp_dir),
+        )
+        .await;
+    assert_eq!(
+        expect_failure(
+            &wrong_thread,
+            "prepare-private with a fixed thread mismatch"
+        )
+        .code,
+        "thread_uuid_mismatch"
+    );
+    assert!(directory_entries(&temp_dir).is_empty());
+
+    let other_repo = fx.root.join("other-prepare-private-repo");
+    let _other_commit = init_disposable_repo(&other_repo);
+    let wrong_repo = fx
+        .run_cli_with_stdin(
+            &prepare_private_fixed_args(&fx, &fx.binding_id, THREAD_UUID, &other_repo),
+            &intent_bytes,
+            Some(&temp_dir),
+        )
+        .await;
+    assert_eq!(
+        expect_failure(
+            &wrong_repo,
+            "prepare-private with a fixed project-root mismatch"
+        )
+        .code,
+        "invalid_repository"
+    );
+    assert!(directory_entries(&temp_dir).is_empty());
+
+    let mut partial_scope = fx.prepare_private_args();
+    partial_scope.push("--binding".to_string());
+    partial_scope.push(fx.binding_id.clone());
+    let partial = fx
+        .run_cli_with_stdin(&partial_scope, &intent_bytes, Some(&temp_dir))
+        .await;
+    assert_eq!(
+        expect_failure(&partial, "prepare-private with partial fixed scope").code,
+        "invalid_input"
+    );
+    assert!(directory_entries(&temp_dir).is_empty());
+
+    let advanced_revision = fx.advance_registry();
+    assert_eq!(advanced_revision, fx.registry_revision + 1);
+    let stale = fx
+        .run_cli_with_stdin(&fx.prepare_private_args(), &intent_bytes, Some(&temp_dir))
+        .await;
+    assert_eq!(
+        expect_failure(&stale, "prepare-private after a stale registry revision").code,
+        "stale_registry_revision"
+    );
+    assert!(directory_entries(&temp_dir).is_empty());
+
+    fx.assert_no_approval_artifacts();
+    fx.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn context_router_forwards_prepare_private_stdin_and_returns_the_receipt() {
+    let mut fx = ApprovalFixture::start().await;
+    let temp_dir = fx.private_preview_temp_dir();
+    let sessions_dir = fx.root.join("sessions");
+    fs::create_dir_all(&sessions_dir).expect("create router sessions directory");
+    fs::set_permissions(&sessions_dir, fs::Permissions::from_mode(0o700))
+        .expect("chmod router sessions directory 0700");
+    fs::create_dir_all(&fx.authority_dir).expect("create router authority directory");
+    fs::set_permissions(&fx.authority_dir, fs::Permissions::from_mode(0o700))
+        .expect("chmod router authority directory 0700");
+
+    let context = serde_json::json!({
+        "schema_version": 1,
+        "project_root": fx.repo.clone(),
+        "binding_id": fx.binding_id.clone(),
+        "thread_uuid": THREAD_UUID,
+        "route": "trusted_local_operator",
+        "native_per_call_identity_verified": false,
+        "stores": {
+            "state_dir": fx.state_dir.clone(),
+            "registry_dir": fx.registry_dir.clone(),
+            "plans_dir": fx.plans_dir.clone(),
+            "authority_dir": fx.authority_dir.clone(),
+            "sessions_dir": sessions_dir,
+        }
+    });
+    let context_path = fx.write_request("prepare-private-context.json", &context);
+
+    let args = vec![
+        "--context".to_string(),
+        context_path.display().to_string(),
+        "approve".to_string(),
+        "prepare-private".to_string(),
+    ];
+    let stdin = serde_json::to_vec(&fx.intent()).expect("serialize router stdin intent");
+    let output = run_command_with_stdin(context_command(), &args, &stdin, Some(&temp_dir)).await;
+    let receipt: PrivatePreviewReceipt = parse_success(&output, "context-routed prepare-private");
+
+    assert_eq!(receipt.preview.request.binding_id, fx.binding_id);
+    assert_eq!(receipt.preview.request.thread_uuid, THREAD_UUID);
+    assert_eq!(receipt.preview.request.plan_id, PLAN_ID);
+    assert_eq!(receipt.preview.request.plan_revision, fx.plan_revision);
+    assert_eq!(receipt.preview.request.repository_path, fx.repo);
+    assert!(receipt.preview_path.starts_with(&temp_dir));
+    assert_mode(
+        receipt
+            .preview_path
+            .parent()
+            .expect("router preview path parent"),
+        0o700,
+        "router private preview directory",
+    );
+    assert_mode(&receipt.preview_path, 0o600, "router private preview file");
+    assert_eq!(directory_entries(&temp_dir).len(), 1);
+    fx.assert_no_approval_artifacts();
+
     fx.shutdown().await;
 }
 

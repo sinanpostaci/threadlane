@@ -10,6 +10,32 @@ Codex host MCP configuration is shared by desktop/CLI/IDE clients; trusted
 project configuration can override it. A project setting does not by itself
 establish which chat made a tool call. See the official [MCP configuration](https://learn.chatgpt.com/docs/extend/mcp).
 
+## Project-scoped Codex MCP registration
+
+`threadlane-codex-setup` can opt into registering the same unbound managed
+`mcp_servers.threadlane` entry in one existing trusted project's
+`.codex/config.toml` with `--project-dir <ABS>`. `--project-dir` and
+`--codex-home` are mutually exclusive; omitting both keeps the user-level
+default. The project must pre-exist as a canonical absolute non-symlink
+directory. The helper does not create the project, change project trust, edit
+user-level configuration, other projects, or the Codex backend.
+
+Set the development `--mcp-executable`, the six private runtime stores, and the
+private setup management directory before `thread/start`: a new thread loads its
+MCP configuration at start, while an already-loaded chat keeps its existing
+connection. `--check` only reports whether the expected managed table is present
+in the selected `config.toml` (failing closed on invalid inputs). It does not
+establish Codex project trust, layer precedence or effective configuration, or
+that a live chat read that table; use Codex's supported trust and
+effective-configuration surfaces for those facts.
+
+After trust and a fresh start, use an ordinary same-chat follow-up without
+per-call configuration overrides. Verify the expected development
+binary/package and project stores plus the original binding, and stop on drift
+rather than rebinding or rewriting configuration. A project configuration can be
+shared by chats in that project and does not establish per-chat identity. See
+[Codex setup](CODEX-SETUP.md) for the exact command and boundaries.
+
 App-server exposes thread-scoped MCP connection lookup and tool calls. The
 reviewed documentation does not establish an authenticated caller chat ID passed
 to an arbitrary third-party stdio MCP server. Absence from these docs is not proof

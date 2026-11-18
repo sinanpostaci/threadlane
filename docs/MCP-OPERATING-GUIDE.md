@@ -30,14 +30,16 @@ Version: `2026-11-17.v2`
 
 - Ordinary prep: one bounded grouped read (`status`/`catalog`/`backlog_list` as needed; other reads only by actual IDs), one published exact task plan
   (`save_draft` then `publish` its returned revision, consuming both receipts in order; skip known-empty list enumeration and `get_plan` when `publish` already returned the plan),
-  then exact human scope consent using the [ordinary Worker quickstart](ORDINARY-WORKER-QUICKSTART.md) or its exact bytes from the verified
-  `cli_package/bin/threadlane guide --ordinary-worker` (never search another source checkout). Create the intent once in a private `0700`
-  directory; save actual `prepare` stdout to a new `0600` preview file (`umask 077`, exclusive creation; never overwrite/retype), read it back,
-  and verify the full typed `OperatorApprovalPreview` (`preview.request` INCLUDING `expected_plan_digest`, `subject_digest`, tasks) before
-  consent. Record the same verified file with `approve record --preview`; the CLI recompiles the unchanged request and matches it to a fresh
-  authoritative preview, keeping binding/live, registry/plan/digest/fixed-scope, final `approve_confirmed`, and idempotence checks; it adds no
-  authority. Reuse explicit matching consent; never infer or run in advance. Fallback: save ONLY unchanged `preview.request` as a new `0600` JSON
-  file for `approve record --request` with quickstart safeguards; never retype or overwrite. Create the storage-only `worker` item and start once.
+  then exact human scope consent using one matching [ordinary Worker quickstart](ORDINARY-WORKER-QUICKSTART.md) or its exact verified
+  `cli_package/bin/threadlane guide --ordinary-worker` bytes (never search another source checkout). Prefer `approve prepare-private`
+  through the context router: one bounded `OperatorApprovalIntent` via stdin (`1 MiB`; never argv JSON except the shell builtin `printf`; POSIX single-quoted literal;
+  JS `JSON.stringify` + `String.replace(/'/g, "'\\''")`, no `TextEncoder`, package/hash/path searches). It runs the same prepare/live/fixed-scope validation and returns
+  `{preview_path,preview}` after writing the unchanged typed preview + newline as `0600` `preview.json` in a new canonical `0700` dir; verify path/mode/type/bytes/readback,
+  full `preview.request` incl `expected_plan_digest`, `subject_digest`, tasks, then consent. Record that same verified file with `approve record --preview`; the CLI recompiles
+  the unchanged request and matches a fresh authoritative preview, keeping binding/live, registry/plan/digest/fixed-scope, final `approve_confirmed`, and idempotence
+  checks; `prepare-private` itself writes no ledger entry and dispatches nothing, while `record` is the separate explicit approval. Reuse explicit matching consent; never infer or run in advance. Legacy fallback: one `0700` dir, unchanged intent as new `0600` JSON,
+  `approve prepare --request` to a new exclusive `0600` preview with the same checks; or ONLY unchanged `preview.request` for `approve record --request`; never retype or overwrite.
+  Create the storage-only `worker` item and guarded start once after consent.
 - When the human requests a separate planning agent or Orchestrator plan, use `request_technical_plan` under its read-only grant; for `planning_command` outcomes/notices, read and present
   the exact `command_id` (untrusted). Require explicit human execution approval unless prior explicit authorization matches the final concrete scope/
   repo/base/tasks/models/efforts/canonical pins/budgets/corrections/restrictions and bounded variations; absent/changed/ambiguous authority needs

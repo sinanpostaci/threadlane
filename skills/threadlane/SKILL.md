@@ -120,32 +120,46 @@ dependency inputs must match before `prepare_work`; never silently change base.
 Never self-approve or treat a profile, advice, planning, backlog edit, worker
 prose, or CLI flag as authority.
 
-The quickstart creates the private `0600` `OperatorApprovalIntent` once in a
-private `0700` directory, runs `approve prepare`, and saves the actual stdout
-`OperatorApprovalPreview` to a new `0600` file in that same private directory
-with exclusive creation. It reads that file back, verifies command success plus
-the unchanged `preview.request` (`OperatorApprovalRequest` INCLUDING
-`expected_plan_digest`), `subject_digest`, and tasks, then presents them for
-explicit human exact-scope consent. It records the same verified file with
+The quickstart composes one strict `OperatorApprovalIntent` in client JSON and
+prefers `approve prepare-private`, which accepts that one bounded intent on stdin
+(never argv JSON) through the context router and runs the same authoritative
+prepare plus live/fixed-scope validation as `approve prepare`. It returns
+`{preview_path,preview}` after writing the unchanged full typed
+`OperatorApprovalPreview` plus newline as `0600` `preview.json` in a new unique
+canonical `0700` temp directory; it writes no authority ledger entry and
+dispatches nothing. Read the file back and verify command success, canonical
+path, directory/file modes and regular-file type, byte bounds, and the unchanged
+`preview.request` (`OperatorApprovalRequest` INCLUDING `expected_plan_digest`),
+`subject_digest`, and tasks, then present them for explicit human exact-scope
+consent. Record that same verified file separately with
 `approve record --preview`; the CLI recompiles the unchanged normalized request,
 requires the whole typed preview to match a fresh authoritative preview, and
 keeps the existing binding/live, registry/plan/digest/fixed-scope, final
-`approve_confirmed`, and idempotence checks. The preview adds no authority.
-Reuse explicit matching scope consent already granted; never infer consent or
-run in advance. Fallback: save ONLY the unchanged normalized `preview.request`
-to a private `0600` file and use `record --request` with the existing safeguards:
-prefer exposed structured private-file tools; otherwise `JSON.stringify` the
-actual unchanged DTO in client composition, apply proper POSIX single-quote
-shell quoting to that string (`JSON.stringify` is not shell escaping), and write
-via `umask 077`, a unique private `0700` parent canonicalized with physical
+`approve_confirmed`, and idempotence checks. The preview adds no authority. Reuse
+explicit matching scope consent already granted; never infer consent or run in
+advance. Feed stdin with a POSIX single-quoted literal through the shell builtin
+`printf` (never place the JSON on other utility argv): in client JS use
+`JSON.stringify` plus `String.replace(/'/g, "'\\''")`; never use `TextEncoder`,
+`python3`/`node`/`jq`, retyping, overwriting, or package/hash/path searches.
+Legacy fallback: create one private `0700` directory, save the unchanged intent
+as a new `0600` `<INTENT_JSON>`, run `approve prepare --request <INTENT_JSON>`
+and save stdout as a new exclusive `0600` preview file with `umask 077` and
+`set -C`, then verify the same facts. Also keep the fallback that saves ONLY the
+unchanged normalized `preview.request` to a private `0600` file for
+`record --request` with the existing safeguards: prefer exposed structured
+private-file tools; otherwise `JSON.stringify` the actual unchanged DTO in
+client composition, apply proper POSIX single-quote shell quoting to that string
+(`JSON.stringify` is not shell escaping), and write via `umask 077`, a unique
+private `0700` parent canonicalized with physical
 `CDPATH= cd -P -- "$dir" && pwd -P` before composing `$dir/request.json` (even
 for trailing-slash, relative, or symlinked `TMPDIR`), `set -C` (noclobber) new
 `0600` file, and literal `printf %s` (no shell JSON parsing, `PATH`
 `python3`/`node`/`jq`, retyped facts, overwrite, or new CLI feature). Check the
-actual `exec_command` return (`exit_code === 0`, no running `session_id`, string
-`output`, no truncation/omission, and one normalized absolute path) before using
-it; never record or launch on failed/unknown output, do not invent tool fields
-as sole proof, and keep existing CLI path validation authoritative. For optional
+actual `exec_command` return
+(`exit_code === 0`, no running `session_id`, string `output`, no
+truncation/omission, and one normalized absolute path) before using it; never
+record or launch on failed/unknown output, do not invent tool fields as sole
+proof, and keep existing CLI path validation authoritative. For optional
 planning grants, `flow grant-record` uses a different wrapper
 `{request_key, expected_ledger_revision, preview, attestation}` with the actual
 unchanged `preview`, not `PreparePlanningGrantRequest` (detailed examples are in
@@ -156,7 +170,7 @@ Ordinary Worker sequence: one bounded grouped
 (consume the actual `save_draft`/`publish` receipts in order; skip known-empty
 list enumeration and `get_plan` when publish already returned the plan), one
 exact human scope approval through the verified preview route,
-`approve prepare`/`approve record` actual authority, storage-only `worker`
+`approve prepare-private`/`approve record` actual authority, storage-only `worker`
 backlog item (`backlog_create`), guarded `backlog_worker_start` once, wait for
 an actual callback without MCP polling loops, close advertised event pages with
 real per-batch ACKs and original-result reconciliation, make one bounded

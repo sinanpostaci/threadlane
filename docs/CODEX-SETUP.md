@@ -1,10 +1,10 @@
 # Codex startup setup
 
-Threadlane provides a focused Rust helper (`threadlane_native::codex_setup`), a standalone CLI (`threadlane-codex-setup`), and a desktop startup integration that register the **unbound paired** `mcp_servers.threadlane` entry in `${CODEX_HOME:-$HOME/.codex}/config.toml`. The desktop also installs or updates its bundled user-level `threadlane` skill independently of MCP registration. The diagnostic `threadlane-skill-setup` CLI performs only skill setup.
+Threadlane provides a focused Rust helper (`threadlane_native::codex_setup`), a standalone CLI (`threadlane-codex-setup`), and a desktop startup integration that register the **unbound paired** `mcp_servers.threadlane` entry in Codex `config.toml`. By default the target is the user-level `${CODEX_HOME:-$HOME/.codex}/config.toml`; the CLI's explicit `--project-dir` opt-in selects only that project's `.codex/config.toml` instead, while Codex project trust remains a separate requirement. The desktop also installs or updates its bundled user-level `threadlane` skill independently of MCP registration. The diagnostic `threadlane-skill-setup` CLI performs only skill setup.
 
 ## Boundary and Safety Invariants
 
-- **Direct surgical TOML edit**: Reads and edits only `mcp_servers.threadlane` in `${CODEX_HOME:-$HOME/.codex}/config.toml` using `toml_edit` (`0.25.17`). All other settings, tables, and comments are preserved. No `codex` subprocess is spawned to register the server, and no raw TOML or secret values are echoed to logs, receipts, or UI surfaces.
+- **Direct surgical TOML edit**: Reads and edits only `mcp_servers.threadlane` in the selected Codex `config.toml` (the user-level home by default, or `<project>/.codex/config.toml` with `--project-dir`) using `toml_edit` (`0.25.17`). All other settings, tables, and comments are preserved. No `codex` subprocess is spawned to register the server, and no raw TOML or secret values are echoed to logs, receipts, or UI surfaces.
 - **Standard owned managed paired server only**: Registers only:
   - `command = "<canonical absolute threadlane-native-mcp path>"`
   - `args = ["--state-dir", "<DIR>", "--pairing-dir", "<DIR>", "--registry-dir", "<DIR>", "--plans-dir", "<DIR>", "--authority-dir", "<DIR>", "--sessions-dir", "<DIR>", "--coworker-native-notices", "--auto-start-approved-hosts"]`
@@ -22,7 +22,7 @@ Threadlane stores a small private (`0600`) ownership receipt at `<management-dir
 4. **Disabled table (`enabled = false`)**: Returns `state: "disabled"` (`registered: false`, `config_modified: false`) and leaves `config.toml` untouched, even if the entry was previously managed by Threadlane.
 5. **Receipt-verified managed upgrade**: If `mcp_servers.threadlane` differs from the current desired binary, store paths or managed flags, Threadlane updates it in place **only** when a valid receipt exists whose `managed_table_sha256` matches the current canonical `command` and `args` in `config.toml`. The recognized historical shapes are the legacy 12-element store-only vector and the 13-element vector ending in `--coworker-native-notices`; the current 14-element vector adds `--auto-start-approved-hosts` after that exact prefix. An optional boolean `enabled = true` and its comments are preserved; it is excluded from the digest so existing ownership receipts remain valid. A missing or mismatched receipt never permits an upgrade.
 6. **Unmanaged or manually edited table**: Any unmanaged entry, edited `command`/`args` that no longer match the receipt digest, non-boolean `enabled`, table with manual/unknown keys (`env`, `cwd`, timeouts, etc.), or unrecognized argument shape (including auto-start without managed notices, reordered flags, values, or extra options) returns `state: "conflict"` (`error_code: "manual_conflict"`) and is never overwritten.
-7. **Lock contention, corrupt, read-only, symlink, or concurrent edits**: Non-blocking lock contention (`error_code: "setup_busy"`), malformed TOML, corrupt receipts, symlinks anywhere along `codex_home`/`config.toml`/store/management paths, read-only files or directories, overlapping store directories, or concurrent external edits return `state: "error"` (`config_modified: false`) with a fixed English message and no forced repair.
+7. **Lock contention, corrupt, read-only, symlink, or concurrent edits**: Non-blocking lock contention (`error_code: "setup_busy"`), malformed TOML, corrupt receipts, symlinks anywhere along the selected project directory/`codex_home`/`config.toml`/store/management paths, read-only files or directories, overlapping store directories, or concurrent external edits return `state: "error"` (`config_modified: false`) with a fixed English message and no forced repair.
 
 ### Managed startup behavior and restart boundary
 
@@ -41,7 +41,7 @@ socket, executable, model, effort or notification overrides.
 
 Upgrading an older owned registration changes `config.toml`, so `restart_required: true` means Codex
 must restart or refresh its MCP connection before the new flags take effect. The maintenance helper
-does not edit configuration outside the selected `CODEX_HOME`, does not enroll a chat, and does not
+does not edit configuration outside the selected Codex home, does not enroll a chat, and does not
 start a host. Fixture coverage does not establish live native-chat delivery;
 installed desktop auto-start, restart recovery, busy-turn delivery and general multi-chat routing
 remain separate acceptance gates.
@@ -51,7 +51,7 @@ remain separate acceptance gates.
 ```bash
 threadlane-codex-setup \
   [--check] \
-  [--codex-home <DIR>] \
+  [--project-dir <ABS> | --codex-home <DIR>] \
   [--mcp-executable <ABS>] \
   --state-dir <DIR> \
   --pairing-dir <DIR> \
@@ -65,7 +65,8 @@ threadlane-codex-setup \
 ### Flags
 
 - `--check`: Inspect in read-only mode (`mode: "check"`). Never creates or modifies directories, lock files, receipts, or `config.toml`.
-- `--codex-home <DIR>`: Optional explicit Codex home directory. When omitted, resolves `CODEX_HOME`, then `$HOME/.codex`.
+- `--project-dir <ABS>`: Explicit opt-in to register only in `<project-dir>/.codex/config.toml`. The project directory must already exist and be supplied as a clean canonical absolute directory with no symlink component. The CLI does not create the project, change project trust, edit user-level configuration, or touch other projects. Apply may create `<project-dir>/.codex` for the registration; `--check` creates nothing. Mutually exclusive with `--codex-home`; `CODEX_HOME` is not consulted when this flag is set.
+- `--codex-home <DIR>`: Optional explicit Codex home directory. When omitted and `--project-dir` is absent, resolves `CODEX_HOME`, then `$HOME/.codex`. Mutually exclusive with `--project-dir`.
 - `--mcp-executable <ABS>` (alias `--mcp-binary <ABS>`): Optional explicit path to `threadlane-native-mcp`. When omitted, resolves `threadlane-native-mcp` from `PATH`, then falls back to the canonical sibling of the running binary.
 - `--state-dir <DIR>`: Threadlane runtime supervisor state directory.
 - `--pairing-dir <DIR>`: Private (`0700`) native MCP pairing directory.
@@ -74,6 +75,51 @@ threadlane-codex-setup \
 - `--authority-dir <DIR>`: Operator approval authority directory (`approvals.json`).
 - `--sessions-dir <DIR>`: Approved host sessions root directory.
 - `--management-dir <DIR>`: Private (`0700`) setup management directory (`codex-setup.lock` and `codex-setup-receipt.json`).
+
+### Project-scoped registration workflow
+
+Use `--project-dir` only for a project the human already trusts. It is an explicit
+per-project opt-in; the default user-level behavior is unchanged. The project
+directory must already exist. Set the development binary and the six private runtime
+stores (create or select them first) before Codex starts the thread, because a new
+thread loads its MCP configuration at `thread/start` and an already-loaded chat keeps
+its existing connection:
+
+```sh
+/absolute/development/target/debug/threadlane-codex-setup \
+  --project-dir /absolute/trusted-project \
+  --mcp-executable /absolute/development/target/debug/threadlane-native-mcp \
+  --state-dir /absolute/trusted-project/.threadlane/runtime \
+  --pairing-dir /absolute/trusted-project/.threadlane/pairing \
+  --registry-dir /absolute/trusted-project/.threadlane/registry \
+  --plans-dir /absolute/trusted-project/.threadlane/plans \
+  --authority-dir /absolute/trusted-project/.threadlane/authority \
+  --sessions-dir /absolute/trusted-project/.threadlane/sessions \
+  --management-dir /absolute/trusted-project/.threadlane/codex-setup
+```
+
+Run the same command with `--check` first, then run it without `--check` to apply.
+The six runtime store paths and the management directory must be distinct canonical
+absolute paths; use private (`0700`) directories appropriate for the project and keep
+runtime stores and setup receipts out of source control. Use a management directory
+dedicated to this selected configuration path because its ownership receipt is bound
+to the exact `config.toml` path. This command registers configuration only. It does
+not trust the project, enroll a chat, create approvals, or start a host.
+
+`--check` is a read-only configuration-presence check: it reports whether the expected
+managed table is present in the selected `config.toml`, and fails closed on invalid
+paths, executables, receipts, or configuration. It does not prove that Codex trusts the
+project, that project and user layers produce the intended effective configuration, or
+that a live chat has read the table. Use Codex's own project trust and
+effective-configuration surfaces to verify those separate facts. A project configuration
+can be shared by all chats in that project.
+
+After the project is trusted and a fresh thread is started, continue with an ordinary
+same-chat follow-up without per-call configuration overrides. Verify that the running
+MCP process uses the expected development binary/package and the intended project
+stores, and that the original binding is unchanged. If any of those differ, stop and
+report the drift; do not rebind, rewrite configuration, edit another chat's metadata,
+or continue with uncertain scope.
 
 ### JSON Output (`CodexSetupReport`)
 
@@ -93,7 +139,14 @@ threadlane-codex-setup \
 
 ## Desktop Startup Integration
 
-- On startup, `threadlane-desktop` spawns a one-time background `apply` task using the active `DesktopControlState` paths (`registry_dir`, `plans_dir`, `authority_dir`, `sessions_dir`), `app_data_dir/pairing`, `app_data_dir/codex-setup`, `CODEX_HOME` (or `$HOME/.codex`), and the runtime `--state-dir` (or original `THREADLANE_CLI_XDG_STATE_HOME` / `XDG_STATE_HOME`, then `$HOME/.local/state/threadlane/runtime`).
+- The desktop startup integration continues to target the user-level Codex home;
+  `--project-dir` is an explicit CLI-only opt-in. On startup, `threadlane-desktop`
+  spawns a one-time background `apply` task using the active `DesktopControlState`
+  paths (`registry_dir`, `plans_dir`, `authority_dir`, `sessions_dir`),
+  `app_data_dir/pairing`, `app_data_dir/codex-setup`, `CODEX_HOME` (or
+  `$HOME/.codex`), and the runtime `--state-dir` (or original
+  `THREADLANE_CLI_XDG_STATE_HOME` / `XDG_STATE_HOME`, then
+  `$HOME/.local/state/threadlane/runtime`).
 - The frontend launches `desktop_codex_setup_status` once independently during startup initialization (without blocking normal state polling and never inside the recurring activity poll) and renders a compact status card in **Settings > Connections** with explicit **Recheck** (`desktop_codex_setup_recheck`) and **Retry setup** (`desktop_codex_setup_apply`) buttons.
 - Browser preview mode (`?preview=1` or non-Tauri browser context) never executes setup and never simulates registration success.
 
