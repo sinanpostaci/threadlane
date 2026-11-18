@@ -1066,7 +1066,10 @@ async fn prepare_private_stdin_writes_verified_preview_that_record_accepts() {
 
     assert!(receipt.preview_path.is_absolute());
     assert_eq!(
-        receipt.preview_path.file_name().and_then(|name| name.to_str()),
+        receipt
+            .preview_path
+            .file_name()
+            .and_then(|name| name.to_str()),
         Some("preview.json")
     );
     let preview_dir = receipt
@@ -1086,12 +1089,10 @@ async fn prepare_private_stdin_writes_verified_preview_that_record_accepts() {
     );
     assert_mode(preview_dir, 0o700, "private preview directory");
     assert_mode(&receipt.preview_path, 0o600, "private preview file");
-    assert!(
-        fs::symlink_metadata(&receipt.preview_path)
-            .expect("stat private preview file")
-            .file_type()
-            .is_file()
-    );
+    assert!(fs::symlink_metadata(&receipt.preview_path)
+        .expect("stat private preview file")
+        .file_type()
+        .is_file());
 
     let mut expected_bytes =
         serde_json::to_vec(&receipt.preview).expect("serialize receipt preview");
@@ -1179,11 +1180,7 @@ async fn prepare_private_rejects_invalid_stdin_and_fixed_scope_before_private_ar
         .insert("unexpected_field".to_string(), Value::Bool(true));
     let unknown_bytes = serde_json::to_vec(&unknown_field).expect("serialize invalid intent");
     let unknown_output = fx
-        .run_cli_with_stdin(
-            &fx.prepare_private_args(),
-            &unknown_bytes,
-            Some(&temp_dir),
-        )
+        .run_cli_with_stdin(&fx.prepare_private_args(), &unknown_bytes, Some(&temp_dir))
         .await;
     assert_eq!(
         expect_failure(
@@ -1298,6 +1295,11 @@ async fn context_router_forwards_prepare_private_stdin_and_returns_the_receipt()
     fs::create_dir_all(&fx.authority_dir).expect("create router authority directory");
     fs::set_permissions(&fx.authority_dir, fs::Permissions::from_mode(0o700))
         .expect("chmod router authority directory 0700");
+    assert_mode(&fx.authority_dir, 0o700, "router authority directory");
+    assert!(
+        directory_entries(&fx.authority_dir).is_empty(),
+        "router authority directory must start empty"
+    );
 
     let context = serde_json::json!({
         "schema_version": 1,

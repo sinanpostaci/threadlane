@@ -41,11 +41,19 @@ pub struct CodexSetupCli {
     /// Optional explicit path to an existing project directory. Selects only
     /// `<project-dir>/.codex/config.toml`; requires a clean canonical absolute non-symlink
     /// directory and is mutually exclusive with `--codex-home`.
-    #[arg(long = "project-dir", value_name = "ABS", conflicts_with = "codex_home")]
+    #[arg(
+        long = "project-dir",
+        value_name = "ABS",
+        conflicts_with = "codex_home"
+    )]
     pub project_dir: Option<PathBuf>,
 
     /// Optional explicit path to the Codex home directory (defaults to `CODEX_HOME`, then `$HOME/.codex`).
-    #[arg(long = "codex-home", value_name = "DIR", conflicts_with = "project_dir")]
+    #[arg(
+        long = "codex-home",
+        value_name = "DIR",
+        conflicts_with = "project_dir"
+    )]
     pub codex_home: Option<PathBuf>,
 
     /// Optional explicit path to the `threadlane-native-mcp` executable (defaults to `PATH` lookup, then canonical sibling of current executable).
@@ -247,12 +255,7 @@ mod tests {
         args
     }
 
-    fn project_args(
-        project: &Path,
-        mcp_exe: &Path,
-        store_root: &Path,
-        check: bool,
-    ) -> Vec<String> {
+    fn project_args(project: &Path, mcp_exe: &Path, store_root: &Path, check: bool) -> Vec<String> {
         let mut args = vec![
             "threadlane-codex-setup".to_string(),
             "--project-dir".to_string(),
@@ -368,7 +371,10 @@ mod tests {
         let expected_config = project.join(".codex").join(CODEX_CONFIG_FILENAME);
         assert_eq!(check_report.mode, CodexSetupMode::Check);
         assert_eq!(check_report.state, CodexSetupState::NotRegistered);
-        assert_eq!(check_report.config_path.as_deref(), expected_config.to_str());
+        assert_eq!(
+            check_report.config_path.as_deref(),
+            expected_config.to_str()
+        );
         assert!(!project.join(".codex").exists());
         assert!(!root.join("management").exists());
 
@@ -377,13 +383,23 @@ mod tests {
         let apply_report = execute_cli(apply_cli);
         assert_eq!(apply_report.mode, CodexSetupMode::Apply);
         assert_eq!(apply_report.state, CodexSetupState::Registered);
-        assert_eq!(apply_report.config_path.as_deref(), expected_config.to_str());
+        assert_eq!(
+            apply_report.config_path.as_deref(),
+            expected_config.to_str()
+        );
         assert!(apply_report.config_modified);
         assert!(expected_config.exists());
 
         let content = fs::read_to_string(&expected_config).unwrap();
         assert!(content.contains(mcp_exe.to_str().unwrap()));
-        for name in ["state", "pairing", "registry", "plans", "authority", "sessions"] {
+        for name in [
+            "state",
+            "pairing",
+            "registry",
+            "plans",
+            "authority",
+            "sessions",
+        ] {
             assert!(content.contains(root.join(name).to_str().unwrap()));
         }
         assert_eq!(fs::read(&global_config).unwrap(), b"# global sentinel\n");
@@ -426,7 +442,11 @@ mod tests {
             let report = execute_cli(cli);
             assert_eq!(report.mode, CodexSetupMode::Apply, "{label}");
             assert_eq!(report.state, CodexSetupState::Error, "{label}");
-            assert_eq!(report.error_code.as_deref(), Some("invalid_project_dir"), "{label}");
+            assert_eq!(
+                report.error_code.as_deref(),
+                Some("invalid_project_dir"),
+                "{label}"
+            );
             assert!(report.config_path.is_none(), "{label}");
             assert!(!report.config_modified, "{label}");
         }

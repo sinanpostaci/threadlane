@@ -49,7 +49,7 @@ use threadlane_authority::{
     OperatorApprovalPreview, OperatorApprovalRequest,
 };
 use threadlane_native::fs_safety::{
-    ensure_platform_supported, validate_absolute_no_symlink_components,
+    ensure_platform_supported, read_private_file_bounded, validate_absolute_no_symlink_components,
 };
 use threadlane_native::{open_workflow_stores, NativeError, NativeErrorCode};
 
@@ -473,17 +473,20 @@ fn write_private_preview_file(
         .map_err(|_| CliError::new("io", "failed to sync private approval preview file"))?;
     drop(file);
 
-    let readback = fs::read(&preview_path)
-        .map_err(|_| CliError::new("io", "failed to read back private approval preview file"))?;
-    let readback_meta = fs::symlink_metadata(&preview_path)
-        .map_err(|_| CliError::new("io", "failed to inspect private approval preview file"))?;
-    if readback_meta.file_type().is_symlink()
-        || !readback_meta.file_type().is_file()
-        || (readback_meta.mode() & 0o077) != 0
-        || readback != bytes
-    {
+    let readback =
+        read_private_file_bounded(&preview_path, MAX_IO_BYTES, "private approval preview file")
+            .map_err(|err| match err.error_code() {
+                NativeErrorCode::SecurityViolation => CliError::security_violation(
+                    "private approval preview file failed path or permission checks",
+                ),
+                _ => CliError::new("io", "failed to read back private approval preview file"),
+            })?
+            .ok_or_else(|| {
+                CliError::new("io", "failed to read back private approval preview file")
+            })?;
+    if readback != bytes {
         return Err(CliError::security_violation(
-            "private approval preview file failed regular-file, permission, or readback checks",
+            "private approval preview file failed readback checks",
         ));
     }
 

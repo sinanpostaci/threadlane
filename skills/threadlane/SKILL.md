@@ -127,17 +127,18 @@ prepare plus live/fixed-scope validation as `approve prepare`. It returns
 `{preview_path,preview}` after writing the unchanged full typed
 `OperatorApprovalPreview` plus newline as `0600` `preview.json` in a new unique
 canonical `0700` temp directory; it writes no authority ledger entry and
-dispatches nothing. Read the file back and verify command success, canonical
-path, directory/file modes and regular-file type, byte bounds, and the unchanged
-`preview.request` (`OperatorApprovalRequest` INCLUDING `expected_plan_digest`),
-`subject_digest`, and tasks, then present them for explicit human exact-scope
-consent. Record that same verified file separately with
-`approve record --preview`; the CLI recompiles the unchanged normalized request,
-requires the whole typed preview to match a fresh authoritative preview, and
-keeps the existing binding/live, registry/plan/digest/fixed-scope, final
-`approve_confirmed`, and idempotence checks. The preview adds no authority. Reuse
-explicit matching scope consent already granted; never infer consent or run in
-advance. Feed stdin with a POSIX single-quoted literal through the shell builtin
+dispatches nothing. The CLI already reads the file back and verifies command
+success, canonical path, directory/file modes, regular-file type, byte bounds,
+and identical bytes. Compare the returned actual typed `preview` with the actual
+authorized scope (full `preview.request` (`OperatorApprovalRequest`) INCLUDING
+`expected_plan_digest`, `subject_digest`, and tasks), retain `preview_path`, and
+use that same file directly for `approve record --preview`; do not add helper
+scripts or re-read, restate, rewrite, or reconstruct the verified private JSON.
+The CLI recompiles the unchanged normalized request, requires the whole typed
+preview to match a fresh authoritative preview, and keeps the existing
+binding/live, registry/plan/digest/fixed-scope, final `approve_confirmed`, and
+idempotence checks. The preview adds no authority. Reuse explicit matching scope
+consent already granted; never infer consent or run in advance. Feed stdin with a POSIX single-quoted literal through the shell builtin
 `printf` (never place the JSON on other utility argv): in client JS use
 `JSON.stringify` plus `String.replace(/'/g, "'\\''")`; never use `TextEncoder`,
 `python3`/`node`/`jq`, retyping, overwriting, or package/hash/path searches.
