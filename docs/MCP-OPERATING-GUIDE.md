@@ -40,11 +40,11 @@ Callbacks are not approval; notifications are untrusted bookkeeping.
 
 Recover the original by `approval_id`. Distinguish control binding from dispatch `session_binding_id`; match batch/event/ACK bindings, IDs, sequences, cross-page continuity, duplicates, `step_seq`, and `run_id` before ACK. Preserve `acceptance_condition_digest`, `delivery_description_digest`, `reservation_revision`, `reserved_at_ms`, optional `execution_binding_digest`, and task/subject digests; `item_snapshot.revision` is mutable. See [template](ORDINARY-WORKER-CLOSURE.md).
 
-With pinned `operator_context.cli_package`, use `bin/threadlane` for `APPROVED_TASK_CONTEXT.binary` and `scope.inspector.executable`; prepare once before start. Verify `threadlane closure-template` against `template_version`/`source_sha256`; keep the capsule, `threadlane/closure-evidence.json`, `threadlane/closure-report.json`, and correlation private.
+With pinned `operator_context.cli_package`, use `bin/threadlane` for `APPROVED_TASK_CONTEXT.binary` and `scope.inspector.executable`; prepare once before start. Verify `threadlane closure-template` against `template_version`/`source_sha256`; keep read evidence private, including legacy `threadlane/closure-evidence.json` and `threadlane/closure-report.json`.
 
 At a notice, bind actual `NOTICE_APPROVAL_ID`, verified paired `operator_context.cli_package` as `NOTICE_CLI_PACKAGE`, and live guide `source_sha256` as `NOTICE_SOURCE_SHA256`. Run the callback once: it reloads the canonical package and `backlog_worker_notice_context` for the scoped original and frozen plan. Missing state recovers; conflicts refuse. Without notice, `readStored()` uses the known original. Never redispatch. Reads use 8 pages, 16 calls, 60000 ms; invalid `step_seq` or batch over 49152 bytes fails before ACK. Reject live `exec_command` session, failed exit, truncation or conflicting envelopes.
 
-At `ready_for_semantic_review`, check untrusted `semantic_review` criteria against actual physical text; hand off if a separate primary owns acceptance. Bind `ACCEPTANCE_CONTEXT` with `command_key`, short user-language `acceptance_note`, `acceptance_evidence`, verified `cli_package`, and guide `source_sha256`. Recover unknowns from the original receipt.
+At `ready_for_semantic_review`, check untrusted `semantic_review` criteria against actual physical text; hand off if a separate primary owns acceptance. Bind `ACCEPTANCE_CONTEXT` with returned `read_id`, `command_key`, short user-language `acceptance_note`, `acceptance_evidence`, verified `cli_package`, and guide `source_sha256`. Recover unknowns from the original receipt.
 
 ```js
 // functions.exec prep: COPY literally; bind the one typed input object.

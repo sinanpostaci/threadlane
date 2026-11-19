@@ -142,9 +142,12 @@ text(JSON.stringify(await client.readNotice(NOTICE_APPROVAL_ID)));
 original execution and frozen plan; existing mismatched values refuse. `readStored()`
 retains its strict legacy behavior and requires its original stored context, SDK
 start, template, and binding. Active reads use fixed finite budgets
-`{max_pages: 8, max_calls: 16, deadline_ms: 60000}`. The legacy composition retains
-the full actual start/page/ACK/result/inspect DTOs in private evidence, while the
-helper stores:
+`{max_pages: 8, max_calls: 16, deadline_ms: 60000}`. With scoped recovery, the
+helper stores each complete `{input, start, report, evidence}` in a separate
+private `threadlane/closure-reads/<read_id>` record. The ID is a content digest,
+not authority. An incomplete result cannot replace a ready report. A verified
+nonterminal result may advance on a later actual notice; an unknown or integrity
+failure requires reconciliation, not a retry. Legacy reads retain:
 
 - `threadlane/closure-evidence.json`: the full raw evidence;
 - `threadlane/closure-report.json`: the full legacy report;
@@ -261,7 +264,9 @@ matches these texts to the original immutable digests; the texts themselves do n
 grant acceptance. Then, and only then, use `completeStored` with one
 real typed semantic `ACCEPTANCE_CONTEXT` carrying the actual fresh `command_key`,
 bounded `acceptance_note`, `acceptance_evidence`, verified `cli_package`, and live
-guide `source_sha256`. The recipe compares the retained source to the canonical
+guide `source_sha256`, plus the returned `read_id`. Each read ID binds a private,
+content-addressed observation to its exact physical report and evidence; parallel
+reads cannot replace one another. The recipe compares the retained source to the canonical
 package before evaluation, restoring a missing capsule without replacing a conflict.
 Copy the literal recipe
 below in a new isolate after that separate decision:
@@ -298,7 +303,8 @@ text(JSON.stringify(result));
 ```
 
 `completeStored` first validates the explicit semantic object, then loads the
-exact current context/template/start/binding/correlation/report. It moves every
+exact current context/template/start/binding and the report/evidence selected by
+`read_id` (or the legacy correlation/report when no ID is provided). It moves every
 current literal check inside the helper before an effect: capsule metadata,
 `{input, start}` binding, `{input, start, report}` correlation, ready status,
 current item/execution identity, positive revision, and result/delivery digest

@@ -3638,11 +3638,18 @@ function makeRecoveredGuide() {
   };
   let override = null;
   let lookups = 0;
+  let selectedReadId;
   const tools = {...env.tools,
     mcp__threadlane__backlog_worker_notice_context: async ({approval_id}) => {
       lookups += 1;
       assert.equal(approval_id, APPROVAL);
       return override || env.sdk("backlog_worker_notice_context", clone(context));
+    },
+    mcp__threadlane__backlog_worker_complete: async (args) => {
+      env.calls.complete += 1;
+      const observation = JSON.parse(env.stored.get(`threadlane/closure-reads/${selectedReadId}`));
+      assert.equal(args.execution_ref, observation.report.mapping.execution_ref);
+      return env.sdkFromEnvelope(makeDoneReceipt(observation.report));
     }
   };
   const run = async (activeTools = tools, vars = {}) => vm.runInNewContext(
@@ -3657,16 +3664,20 @@ function makeRecoveredGuide() {
       ...vars
     }
   );
-  const runComplete = async (activeTools = tools, overrideAcceptance = {}) => vm.runInNewContext(
+  const runComplete = async (activeTools = tools, overrideAcceptance = {}) => {
+    selectedReadId = overrideAcceptance.read_id || JSON.parse(env.texts.at(-1)).read_id;
+    return vm.runInNewContext(
     `(async () => {\n${blocks[2]}\n})()`, {
       tools: activeTools,
       load: (key) => env.stored.has(key) ? JSON.parse(env.stored.get(key)) : undefined,
       store: async (key, value) => { env.stored.set(key, JSON.stringify(value)); },
       text: (value) => env.texts.push(value),
       ACCEPTANCE_CONTEXT: {...env.acceptanceContext, cli_package: "/trusted", source_sha256: SOURCE_SHA256,
+        read_id: selectedReadId,
         ...overrideAcceptance}
     }
-  );
+    );
+  };
   return {env, tools, run, runComplete, setContext: (value) => { context = value; }, getContext: () => clone(context),
     setOverride: (value) => {override = value;}, getLookups: () => lookups};
 }
@@ -3693,7 +3704,7 @@ test("public notice recipe recovers all missing state from the original scoped r
   assert.equal(fixture.env.calls.result, before.result + 1);
   assert.equal(fixture.env.calls.inspect, before.inspect + 1);
   for (const key of TEMPORARY_KEYS) assert.notEqual(JSON.parse(fixture.env.stored.get(key)), null, key);
-  await fixture.env.runRecipe(2, {ACCEPTANCE_CONTEXT: clone(fixture.env.acceptanceContext)});
+  await fixture.runComplete();
   assert.equal(fixture.env.calls.complete, 1, "semantic acceptance remains separate");
   assert.equal(JSON.parse(fixture.env.texts.at(-1)).status, "done");
 });
@@ -3733,8 +3744,9 @@ test("completed notice verifies durable completion and ACKs only real late event
   const fixture = makeRecoveredGuide();
   await fixture.env.runRecipe(0, {APPROVED_TASK_CONTEXT: clone(fixture.env.approvedContext)});
   await fixture.run();
-  await fixture.env.runRecipe(2, {ACCEPTANCE_CONTEXT: clone(fixture.env.acceptanceContext)});
-  const report = JSON.parse(fixture.env.stored.get("threadlane/closure-report.json"));
+  const readId = JSON.parse(fixture.env.texts.at(-1)).read_id;
+  const report = JSON.parse(fixture.env.stored.get(`threadlane/closure-reads/${readId}`)).report;
+  await fixture.runComplete();
   const completion = makeDoneReceipt(report).data.completion;
   const context = fixture.getContext();
   context.execution = clone(completion.execution);
@@ -3904,4 +3916,139 @@ test("scoped criteria are bounded review text, never implicit acceptance", async
     assert.equal(fixture.env.calls.pull, 0);
     assert.equal(fixture.env.calls.complete, 0);
   }
+});
+
+test("immutable observation SHA-256 matches UTF-8 standard vectors", () => {
+  const hash = vm.runInNewContext(`${source}\n;sha256Utf8`, Object.create(null));
+  for (const input of ["", "abc", "a".repeat(1000), "ıstanbul 📍", "\ud800", "\udc00"]) {
+    assert.equal(hash(input), crypto.createHash("sha256").update(input, "utf8").digest("hex"));
+  }
+});
+
+test("interleaved isolated clients keep same-batch ready and incomplete observations independently", async () => {
+  const fixture = makeRecoveredGuide();
+  await fixture.env.runRecipe(0, {APPROVED_TASK_CONTEXT: clone(fixture.env.approvedContext)});
+  const createClient = vm.runInNewContext(`${source}\n;createOrdinaryClosureClient`, Object.create(null));
+  let pulls = 0, ackCount = 0, inspectCount = 0, completionCount = 0, writing = 0, releasePulls, releaseWrites;
+  const pullGate = new Promise((resolve) => {releasePulls = resolve;});
+  const writeGate = new Promise((resolve) => {releaseWrites = resolve;});
+  const readKeys = [];
+  const load = (key) => fixture.env.stored.has(key) ? JSON.parse(fixture.env.stored.get(key)) : undefined;
+  const store = async (key, value) => {
+    if (key.startsWith("threadlane/closure-reads/")) {
+      readKeys.push(key);
+      writing += 1;
+      if (writing === 2) releaseWrites();
+      await writeGate;
+    }
+    fixture.env.stored.set(key, JSON.stringify(value));
+  };
+  const context = fixture.getContext();
+  let readyId;
+  const client = () => createClient({load, store,
+    bootstrap: {binary: "/trusted/bin/threadlane", expected_source_sha256: SOURCE_SHA256, template: fixture.env.template},
+    recover: async () => envelope("backlog_worker_notice_context", clone(context)),
+    pull: async () => { if (++pulls === 2) releasePulls(); await pullGate; return envelope("approved_pull_events", clone(PAGE_TWO)); },
+    ack: async (a) => envelope("approved_ack_events", makeAckData(a.batch_id, 3, ++ackCount === 1)),
+    result: async () => envelope("backlog_worker_result", makeResultData()),
+    inspect: async () => ++inspectCount === 1 ? makeInspection([WRITE_PATHS[0]]) : {exit_code: 1, output: "failed"},
+    complete: async () => {
+      completionCount += 1;
+      const observation = load(`threadlane/closure-reads/${readyId}`);
+      return makeDoneReceipt(observation.report);
+    }
+  });
+  const first = client(), second = client();
+  const [a,b] = await Promise.all([first.readNotice(APPROVAL), second.readNotice(APPROVAL)]);
+  const ready = [a,b].find((v) => v.status === "ready_for_semantic_review");
+  const incomplete = [a,b].find((v) => v.status === "incomplete");
+  assert.ok(ready); assert.ok(incomplete);
+  assert.notEqual(ready.read_id, incomplete.read_id, "different physical observations get different IDs even with same batch ID");
+  assert.equal(readKeys.length, 2); assert.notEqual(readKeys[0], readKeys[1]);
+  assert.equal(load(`threadlane/closure-reads/${ready.read_id}`).report.status, "ready_for_semantic_review");
+  assert.equal(load(`threadlane/closure-reads/${incomplete.read_id}`).report.status, "incomplete");
+  assert.equal(fixture.env.stored.has("threadlane/closure-report.json"), false, "legacy singleton was never clobbered");
+  const acceptance = {command_key: "one-completion", acceptance_note: "checked", acceptance_evidence: "checked evidence"};
+  await assert.rejects(first.completeStored({...acceptance, read_id: incomplete.read_id}), /invalid closure capsule/);
+  readyId = ready.read_id;
+  const done = await first.completeStored({...acceptance, read_id: ready.read_id});
+  assert.equal(done.status, "done"); assert.equal(completionCount, 1);
+});
+
+test("early verified pending notice can advance on the next real notice", async () => {
+  const fixture = makeRecoveredGuide();
+  const pending = makeResultData(); pending.execution.outcome = null;
+  pending.item_snapshot.revision = START_EXECUTION.reservation_revision;
+  await fixture.run({...fixture.tools, mcp__threadlane__backlog_worker_result: async () => fixture.env.sdk("backlog_worker_result", pending)});
+  const early = JSON.parse(fixture.env.texts.at(-1));
+  assert.equal(early.status, "incomplete"); assert.equal(early.reason, "missing_outcome");
+  assert.equal(fixture.env.stored.has(`threadlane/closure-uncertain/${EXEC}`), false);
+  const empty = makePage({pageNumber: 9, events: [], ackedSeq: 3});
+  await fixture.run({...fixture.tools, mcp__threadlane__approved_pull_events: async () => fixture.env.sdk("approved_pull_events", empty)});
+  const ready = JSON.parse(fixture.env.texts.at(-1));
+  assert.equal(ready.status, "ready_for_semantic_review");
+  assert.notEqual(ready.read_id, early.read_id);
+  await fixture.runComplete();
+  assert.equal(JSON.parse(fixture.env.texts.at(-1)).status, "done");
+  assert.equal(fixture.env.calls.complete, 1);
+});
+
+test("unknown ACK and malformed identities require reconciliation before later notices", async () => {
+  for (const mode of ["ack", "identity"]) {
+    const fixture = makeRecoveredGuide();
+    const badPage = clone(PAGE_TWO);
+    if (mode === "identity") badPage.batch.events[0].run_id = "run_foreign";
+    await fixture.run({...fixture.tools,
+      mcp__threadlane__approved_pull_events: async () => fixture.env.sdk("approved_pull_events", badPage),
+      mcp__threadlane__approved_ack_events: async (a) => mode === "ack" ? {isError: true} : fixture.env.sdk("approved_ack_events", makeAckData(a.batch_id, 3, true))
+    });
+    assert.equal(JSON.parse(fixture.env.texts.at(-1)).status, "incomplete");
+    const before = fixture.env.calls.pull;
+    await assert.rejects(fixture.run(), /requires reconciliation; no retry/);
+    assert.equal(fixture.env.calls.pull, before);
+    assert.equal(fixture.env.calls.complete, 0);
+  }
+});
+
+test("a legacy singleton pending observation is verified and preserved when the next notice arrives", async () => {
+  const fixture = makeRecoveredGuide();
+  await fixture.env.runRecipe(0, {APPROVED_TASK_CONTEXT: clone(fixture.env.approvedContext)});
+  const pending = makeResultData(); pending.execution.outcome = null;
+  pending.item_snapshot.revision = START_EXECUTION.reservation_revision;
+  await fixture.env.runRecipe(1, {}, {...fixture.env.tools,
+    mcp__threadlane__backlog_worker_result: async () => fixture.env.sdk("backlog_worker_result", pending)});
+  const oldReport = fixture.env.stored.get("threadlane/closure-report.json");
+  assert.equal(JSON.parse(oldReport).reason, "missing_outcome");
+  const empty = makePage({pageNumber: 10, events: [], ackedSeq: 3});
+  await fixture.run({...fixture.tools, mcp__threadlane__approved_pull_events: async () => fixture.env.sdk("approved_pull_events", empty)});
+  assert.equal(JSON.parse(fixture.env.texts.at(-1)).status, "ready_for_semantic_review");
+  assert.equal(fixture.env.stored.get("threadlane/closure-report.json"), oldReport, "earlier singleton is preserved");
+  await fixture.runComplete();
+  assert.equal(fixture.env.calls.complete, 1);
+});
+
+test("changed immutable observation cannot authorize completion", async () => {
+  const fixture = makeRecoveredGuide();
+  await fixture.run();
+  const id = JSON.parse(fixture.env.texts.at(-1)).read_id;
+  const key = `threadlane/closure-reads/${id}`;
+  const observation = JSON.parse(fixture.env.stored.get(key));
+  observation.report.physical.files[0].text = "changed after review";
+  fixture.env.stored.set(key, JSON.stringify(observation));
+  await assert.rejects(fixture.runComplete(fixture.tools, {read_id: id}), /immutable read observation is missing, stale, or changed/);
+  assert.equal(fixture.env.calls.complete, 0);
+});
+
+test("legacy ready report gains an immutable read ID for the current notice recipe", async () => {
+  const fixture = makeRecoveredGuide();
+  await fixture.env.runRecipe(0, {APPROVED_TASK_CONTEXT: clone(fixture.env.approvedContext)});
+  await fixture.env.runRecipe(1);
+  const ctx = fixture.getContext(); ctx.item_snapshot.revision = 7; fixture.setContext(ctx);
+  const empty = makePage({pageNumber: 11, events: [], ackedSeq: 3});
+  await fixture.run({...fixture.tools, mcp__threadlane__approved_pull_events: async () => fixture.env.sdk("approved_pull_events", empty)});
+  const ready = JSON.parse(fixture.env.texts.at(-1));
+  assert.match(ready.read_id, /^rd_[0-9a-f]{64}$/);
+  assert.equal(ready.status, "ready_for_semantic_review");
+  await fixture.runComplete();
+  assert.equal(fixture.env.calls.complete, 1);
 });

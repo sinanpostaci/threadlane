@@ -260,8 +260,10 @@ callback with the actual ID, verified paired `cli_package`, and live guide sourc
 digest. `readNotice` verifies the packaged source and scoped original execution,
 recovers absent state and refuses conflicting cache. `readStored()` remains available
 for original no-notice recovery. Active reads keep full raw
-evidence/report/correlation private, and returns a compact view with current identity,
-technical guard facts, verified event counts/ACK cursor, and the exact physical text.
+evidence/report/correlation private, and return a compact view with current identity,
+technical guard facts, verified event counts/ACK cursor, untrusted frozen acceptance
+criteria, exact physical text, and immutable `read_id`. Pass that exact `read_id` in
+`ACCEPTANCE_CONTEXT` so completion uses the report that was semantically reviewed.
 Its `completeStored(ACCEPTANCE_CONTEXT)` moves all current correlation/revision/ref/digest
 checks before one guarded complete, retains completion intent and the exact receipt, and
 reuses only a matching validated retained Done; missing, error, or unknown replies never

@@ -35,6 +35,7 @@ var ORDINARY_CLOSURE_CLIENT_INTENT_KEY = "threadlane/closure-completion-intent.j
 var ORDINARY_CLOSURE_CLIENT_DONE_RECEIPT_KEY = "threadlane/closure-done-receipt.json";
 var ORDINARY_CLOSURE_CLIENT_DONE_VIEW_KEY = "threadlane/closure-done-view.json";
 var ORDINARY_CLOSURE_CLIENT_COMPLETION_STATE_TOOL = "threadlane closure-client completion";
+var ORDINARY_CLOSURE_CLIENT_READ_PREFIX = "threadlane/closure-reads/";
 
 function createOrdinaryClosure(callbacks) {
   if (!isPlainObject(callbacks)) {
@@ -608,7 +609,22 @@ function createOrdinaryClosureClient(callbacks) {
     return view;
   }
 
-  async function readRetained(approvalId) {
+  async function retainObservation(input, start, report, evidence) {
+    var observation = {schema_version: 1, input: input, start: start, report: report, evidence: evidence};
+    var readId = "rd_" + sha256Utf8(stableStringify(observation));
+    var observationKey = ORDINARY_CLOSURE_CLIENT_READ_PREFIX + readId;
+    var previous = await load(observationKey);
+    if (previous !== undefined && previous !== null &&
+        stableStringify(previous) !== stableStringify(observation)) {
+      throw new Error("conflicting immutable closure observation");
+    }
+    if (previous === undefined || previous === null) await store(observationKey, observation);
+    var view = compactReport(report, input);
+    view.read_id = readId;
+    return view;
+  }
+
+  async function readRetained(approvalId, isolateObservation) {
     var input = await load(ORDINARY_CLOSURE_CLIENT_CONTEXT_KEY);
     var template = await load(ORDINARY_CLOSURE_CLIENT_TEMPLATE_KEY);
     var start = await load(ORDINARY_CLOSURE_CLIENT_START_KEY);
@@ -639,6 +655,23 @@ function createOrdinaryClosureClient(callbacks) {
     });
     var report = outcome.report;
     var evidence = outcome.evidence;
+    if (isolateObservation) {
+      var isolatedView = await retainObservation(input, start, report, evidence);
+      if (report.status !== "ready_for_semantic_review" &&
+          !isVerifiedPending(report, evidence, identity)) {
+        var uncertainKey = "threadlane/closure-uncertain/" + identity.execution_ref;
+        var marker = {
+          execution_ref: identity.execution_ref, requires_reconciliation: true
+        };
+        var existingMarker = await load(uncertainKey);
+        if (existingMarker !== undefined && existingMarker !== null &&
+            stableStringify(existingMarker) !== stableStringify(marker)) {
+          throw new Error("conflicting reconciliation marker");
+        }
+        if (existingMarker === undefined || existingMarker === null) await store(uncertainKey, marker);
+      }
+      return isolatedView;
+    }
     if (report.status !== "ready_for_semantic_review") {
       var receipts = completionState(await load(ORDINARY_CLOSURE_CLIENT_DONE_RECEIPT_KEY));
       var key = stableStringify(identity);
@@ -803,6 +836,16 @@ function createOrdinaryClosureClient(callbacks) {
         stableStringify(storedStartIdentity(start)) !== stableStringify(identity)) {
       throw new Error("retained start conflicts with original execution");
     }
+    var safePriorPending = false;
+    if (isPlainObject(priorReport) && priorReport.status === "incomplete") {
+      safePriorPending = isPlainObject(priorCorrelation) &&
+        stableStringify(priorCorrelation.input) === stableStringify(input) &&
+        stableStringify(priorCorrelation.start) === stableStringify(start) &&
+        stableStringify(priorCorrelation.report) === stableStringify(priorReport) &&
+        isVerifiedPending(priorReport, priorEvidence, identity);
+      if (!safePriorPending) throw new Error("retained incomplete observation requires reconciliation");
+      priorReport = null;
+    }
     if (priorReport !== undefined && priorReport !== null) {
       var reportIdentity = executionIdentityFromReport(priorReport);
       if (!reportIdentity || stableStringify(reportIdentity) !== stableStringify(identity) ||
@@ -818,9 +861,9 @@ function createOrdinaryClosureClient(callbacks) {
           })) {
         throw new Error("retained report conflicts with original execution");
       }
-    } else if (priorCorrelation !== undefined && priorCorrelation !== null) {
+    } else if (!safePriorPending && priorCorrelation !== undefined && priorCorrelation !== null) {
       throw new Error("retained correlation has no matching report");
-    } else if (priorEvidence !== undefined && priorEvidence !== null) {
+    } else if (!safePriorPending && priorEvidence !== undefined && priorEvidence !== null) {
       throw new Error("retained evidence has no matching report");
     }
     if (snapshot.status === "done") {
@@ -855,14 +898,55 @@ function createOrdinaryClosureClient(callbacks) {
     if (missingStart) await store(ORDINARY_CLOSURE_CLIENT_START_KEY, start);
     if (missingBinding) await store(ORDINARY_CLOSURE_CLIENT_BINDING_KEY, {input: input, start: start});
     if (priorReport) {
-      var retained = compactReport(priorReport, input);
+      var retained = await retainObservation(input, start, priorReport, priorEvidence);
       retained.later_events = await drainDoneEvents(parsed);
       retained.semantic_review = semanticReview;
       return retained;
     }
-    var view = await readRetained(approvalId);
+    var uncertain = await load("threadlane/closure-uncertain/" + identity.execution_ref);
+    if (uncertain !== undefined && uncertain !== null) {
+      throw new Error("original observation requires reconciliation; no retry");
+    }
+    var view = await readRetained(approvalId, true);
     if (view.status === "ready_for_semantic_review") view.semantic_review = semanticReview;
     return view;
+  }
+
+  function isVerifiedPending(report, evidence, identity) {
+    if (report.reason !== "missing_outcome" || report.stage !== "result" ||
+        !isPlainObject(report.last_ack) || report.pending_batch !== null ||
+        !isPlainObject(evidence) || evidence.result === null) return false;
+    try {
+      var start = parseStart(evidence.start, {});
+      if (stableStringify(executionIdentityFromParsed(start)) !== stableStringify(identity) ||
+          !Array.isArray(evidence.pages) || !Array.isArray(evidence.acks) ||
+          evidence.pages.length === 0 || evidence.pages.length > 8 ||
+          evidence.acks.length !== evidence.pages.length) return false;
+      var cursor = null, seen = Object.create(null), lastAck = null;
+      for (var i = 0; i < evidence.pages.length; i += 1) {
+        var page = validatePage(dataOf(unwrapEnvelope(evidence.pages[i], "pending page"),
+          "approved_pull_events", "pull", {}, identity.control_binding_id), start, {}, cursor, seen);
+        if (utf8ByteLength(JSON.stringify(page.batch)) > ORDINARY_CLOSURE_MAX_BATCH_BYTES ||
+            (i + 1 < evidence.pages.length && page.batch.has_more !== true) ||
+            (i + 1 === evidence.pages.length && page.batch.has_more !== false)) return false;
+        lastAck = validateAck(dataOf(unwrapEnvelope(evidence.acks[i], "pending ACK"),
+          "approved_ack_events", "ack", {}, identity.control_binding_id), start, page, {}, true);
+        cursor = lastAck.acked_seq;
+      }
+      if (stableStringify(lastAck) !== stableStringify(report.last_ack)) return false;
+      var env = unwrapEnvelope(evidence.result, "pending result");
+      var data = dataOf(env, "backlog_worker_result", "result", {}, identity.control_binding_id);
+      return isPlainObject(data) && isPlainObject(data.execution) &&
+        stableStringify(storedStartIdentity({execution: data.execution})) === stableStringify(identity) &&
+        (data.execution.outcome === null || data.execution.outcome === undefined) &&
+        isPlainObject(data.item_snapshot) && data.item_snapshot.item_id === identity.item_id &&
+        data.item_snapshot.current_execution_ref === identity.execution_ref &&
+        data.item_snapshot.status === "doing" &&
+        isPositiveInteger(data.item_snapshot.revision) &&
+        data.item_snapshot.revision >= identity.reservation_revision;
+    } catch (_error) {
+      return false;
+    }
   }
 
   function validateDurableDone(data, parsed, identity, priorReport) {
@@ -1238,6 +1322,22 @@ function createOrdinaryClosureClient(callbacks) {
     var binding = await load(ORDINARY_CLOSURE_CLIENT_BINDING_KEY);
     var corr = await load(ORDINARY_CLOSURE_CLIENT_CORRELATION_KEY);
     var report = await load(ORDINARY_CLOSURE_CLIENT_REPORT_KEY);
+    if (acceptance.read_id !== undefined) {
+      if (typeof acceptance.read_id !== "string" || !/^rd_[0-9a-f]{64}$/.test(acceptance.read_id)) {
+        throw new Error("invalid immutable read_id");
+      }
+      var observation = await load(ORDINARY_CLOSURE_CLIENT_READ_PREFIX + acceptance.read_id);
+      if (!isPlainObject(observation) || observation.schema_version !== 1 ||
+          "rd_" + sha256Utf8(stableStringify(observation)) !== acceptance.read_id ||
+          stableStringify(observation.input) !== stableStringify(input) ||
+          stableStringify(observation.start) !== stableStringify(start) ||
+          !isPlainObject(observation.evidence) ||
+          stableStringify(observation.evidence.start) !== stableStringify(start)) {
+        throw new Error("immutable read observation is missing, stale, or changed");
+      }
+      report = observation.report;
+      corr = {input: input, start: start, report: report};
+    }
     var reportIdentity = executionIdentityFromReport(report);
     var startIdentity = storedStartIdentity(start);
     if (!validCapsule(input, template) ||
@@ -1273,6 +1373,7 @@ function createOrdinaryClosureClient(callbacks) {
       acceptance_note: note,
       acceptance_evidence: evidence
     };
+    if (acceptance.read_id !== undefined) acceptanceData.read_id = acceptance.read_id;
     var args = {
       command_key: acceptance.command_key,
       item_id: report.mapping.item_id,
@@ -2526,6 +2627,69 @@ function stableStringify(value) {
     }
   }
   return "{" + fields.join(",") + "}";
+}
+
+// Content-addressed read IDs keep parallel observations independent. This hash
+// is an integrity key, not authentication or execution authority.
+function sha256Utf8(text) {
+  var bytes = [];
+  for (var i = 0; i < text.length; i += 1) {
+    var code = text.charCodeAt(i);
+    if (code >= 0xd800 && code <= 0xdbff && i + 1 < text.length) {
+      var next = text.charCodeAt(i + 1);
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        code = 0x10000 + ((code - 0xd800) << 10) + (next - 0xdc00);
+        i += 1;
+      } else code = 0xfffd;
+    } else if (code >= 0xd800 && code <= 0xdfff) code = 0xfffd;
+    if (code < 0x80) bytes.push(code);
+    else if (code < 0x800) bytes.push(0xc0 | (code >>> 6), 0x80 | (code & 63));
+    else if (code < 0x10000) bytes.push(0xe0 | (code >>> 12), 0x80 | ((code >>> 6) & 63), 0x80 | (code & 63));
+    else bytes.push(0xf0 | (code >>> 18), 0x80 | ((code >>> 12) & 63), 0x80 | ((code >>> 6) & 63), 0x80 | (code & 63));
+  }
+  var length = bytes.length;
+  bytes.push(0x80);
+  while (bytes.length % 64 !== 56) bytes.push(0);
+  var high = Math.floor(length / 0x20000000), low = (length << 3) >>> 0;
+  for (var shift = 24; shift >= 0; shift -= 8) bytes.push((high >>> shift) & 255);
+  for (var shift2 = 24; shift2 >= 0; shift2 -= 8) bytes.push((low >>> shift2) & 255);
+  var k = [
+    0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+    0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+    0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+    0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+    0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+    0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+    0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+    0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2
+  ];
+  var h = [0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19];
+  function rotate(x, n) { return (x >>> n) | (x << (32 - n)); }
+  for (var offset = 0; offset < bytes.length; offset += 64) {
+    var w = [];
+    for (i = 0; i < 16; i += 1) {
+      var p = offset + i * 4;
+      w[i] = ((bytes[p] << 24) | (bytes[p+1] << 16) | (bytes[p+2] << 8) | bytes[p+3]) >>> 0;
+    }
+    for (i = 16; i < 64; i += 1) {
+      var s0 = rotate(w[i-15],7) ^ rotate(w[i-15],18) ^ (w[i-15] >>> 3);
+      var s1 = rotate(w[i-2],17) ^ rotate(w[i-2],19) ^ (w[i-2] >>> 10);
+      w[i] = (w[i-16] + s0 + w[i-7] + s1) >>> 0;
+    }
+    var a=h[0], b=h[1], c=h[2], d=h[3], e=h[4], f=h[5], g=h[6], j=h[7];
+    for (i = 0; i < 64; i += 1) {
+      var big1 = rotate(e,6) ^ rotate(e,11) ^ rotate(e,25);
+      var ch = (e & f) ^ (~e & g);
+      var t1 = (j + big1 + ch + k[i] + w[i]) >>> 0;
+      var big0 = rotate(a,2) ^ rotate(a,13) ^ rotate(a,22);
+      var maj = (a & b) ^ (a & c) ^ (b & c);
+      var t2 = (big0 + maj) >>> 0;
+      j=g; g=f; f=e; e=(d+t1)>>>0; d=c; c=b; b=a; a=(t1+t2)>>>0;
+    }
+    h[0]=(h[0]+a)>>>0; h[1]=(h[1]+b)>>>0; h[2]=(h[2]+c)>>>0; h[3]=(h[3]+d)>>>0;
+    h[4]=(h[4]+e)>>>0; h[5]=(h[5]+f)>>>0; h[6]=(h[6]+g)>>>0; h[7]=(h[7]+j)>>>0;
+  }
+  return h.map(function (v) { return ("00000000" + v.toString(16)).slice(-8); }).join("");
 }
 
 function safeToken(value) {
