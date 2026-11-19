@@ -907,7 +907,7 @@ pub(crate) fn source_baseline_refusal_message(
 ) -> &'static str {
     match (code, clean_at_base) {
         (Some("git_output_limit"), _) => {
-            "Source baseline inspection failed (git_output_limit): the bounded Git file listing exceeded its limit."
+            "Source baseline inspection failed (git_output_limit): Git command output size limit exceeded."
         }
         (Some("file_read_failed"), _) => {
             "Source baseline inspection failed (file_read_failed): a selected reference file could not be read or compared at the base."
@@ -928,7 +928,7 @@ mod tests {
     fn source_baseline_refusal_message_reports_known_codes_and_redacts_unknown_values() {
         let git_limit = source_baseline_refusal_message(Some("git_output_limit"), false);
         assert!(git_limit.contains("git_output_limit"));
-        assert!(git_limit.contains("bounded Git file listing exceeded its limit"));
+        assert!(git_limit.contains("command output size limit exceeded."));
         assert_eq!(
             git_limit,
             source_baseline_refusal_message(Some("git_output_limit"), true)
