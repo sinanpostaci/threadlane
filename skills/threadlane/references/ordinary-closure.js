@@ -1,4 +1,4 @@
-// Threadlane ordinary Worker callback closure template (2026-11-16.v4).
+// Threadlane ordinary Worker callback closure template (2026-11-19.v1).
 //
 // This is trusted packaged source, not event/provider text. It uses standard
 // language builtins only, with no dynamic loading, network, external commands,
@@ -20,7 +20,7 @@
 
 "use strict";
 
-var CREATE_ORDINARY_CLOSURE_VERSION = "2026-11-16.v4";
+var CREATE_ORDINARY_CLOSURE_VERSION = "2026-11-19.v1";
 var ORDINARY_CLOSURE_PAGE_LIMIT = 20;
 var ORDINARY_CLOSURE_MAX_WRITE_PATHS = 128;
 var ORDINARY_CLOSURE_MAX_BATCH_BYTES = 49152;
@@ -45,6 +45,7 @@ function createOrdinaryClosure(callbacks) {
   var result = callbacks.result;
   var inspect = callbacks.inspect;
   var now = callbacks.now;
+  var allowDuplicateAck = callbacks.allow_duplicate_ack === true;
   for (var index = 0; index < 4; index += 1) {
     var named = [
       ["pull", pull],
@@ -223,7 +224,8 @@ function createOrdinaryClosure(callbacks) {
           ),
           start,
           page,
-          state
+          state,
+          allowDuplicateAck
         );
         verifiedCursor = acked.acked_seq;
         state.last_ack = {
@@ -527,6 +529,8 @@ function createOrdinaryClosureClient(callbacks) {
   var result = callbacks.result;
   var inspect = callbacks.inspect;
   var complete = callbacks.complete;
+  var recover = callbacks.recover;
+  var bootstrap = callbacks.bootstrap;
   var required = [
     ["load", load],
     ["store", store],
@@ -543,12 +547,17 @@ function createOrdinaryClosureClient(callbacks) {
   if (complete !== undefined && typeof complete !== "function") {
     throw new TypeError("callback complete must be a function when supplied");
   }
+  if (recover !== undefined && typeof recover !== "function") {
+    throw new TypeError("callback recover must be a function when supplied");
+  }
   var closure = createOrdinaryClosure({
     pull: pull,
     ack: ack,
     result: result,
-    inspect: inspect
+    inspect: inspect,
+    allow_duplicate_ack: recover !== undefined
   });
+  var noticesInFlight = Object.create(null);
 
   function validCapsule(input, template) {
     return isPlainObject(input) &&
@@ -564,7 +573,7 @@ function createOrdinaryClosureClient(callbacks) {
       template.source_sha256 === input.expected_source_sha256 &&
       typeof template.javascript === "string" &&
       template.javascript.indexOf(
-        'var CREATE_ORDINARY_CLOSURE_VERSION = "2026-11-16.v4";'
+        'var CREATE_ORDINARY_CLOSURE_VERSION = "2026-11-19.v1";'
       ) !== -1;
   }
 
@@ -670,7 +679,301 @@ function createOrdinaryClosureClient(callbacks) {
     if (typeof approvalId !== "string" || !/^apr_[0-9a-f]{32}$/.test(approvalId)) {
       throw new Error("invalid approval_id format");
     }
+    if (recover === undefined) return readRetained(approvalId);
+    if (noticesInFlight[approvalId]) return noticesInFlight[approvalId];
+    var pending = readRecovered(approvalId);
+    noticesInFlight[approvalId] = pending;
+    try {
+      return await pending;
+    } finally {
+      delete noticesInFlight[approvalId];
+    }
+  }
+
+  // The caller obtains this capsule from the already verified canonical package
+  // and guide, never from the notification or a Worker. Recovery is read-only.
+  async function readRecovered(approvalId) {
+    if (!isPlainObject(bootstrap) || typeof bootstrap.binary !== "string" ||
+        bootstrap.binary.charAt(0) !== "/" || bootstrap.binary.indexOf("\u0000") !== -1 ||
+        !validCapsule({expected_source_sha256: bootstrap.expected_source_sha256}, bootstrap.template)) {
+      throw new Error("invalid verified package bootstrap");
+    }
+    var raw = await recover({approval_id: approvalId});
+    var env;
+    if (isPlainObject(raw) && (raw.isError === true || raw.is_error === true)) {
+      var errorCopy = {};
+      Object.keys(raw).forEach(function (key) {
+        if (key !== "isError" && key !== "is_error") errorCopy[key] = raw[key];
+      });
+      var failure = unwrapEnvelope(errorCopy, "notice context error");
+      if (isPlainObject(failure) && failure.tool === "backlog_worker_notice_context" &&
+          typeof failure.binding_id === "string" && isPlainObject(failure.error) &&
+          failure.error.code === "no_guarded_execution") {
+        return {status: "legacy_events", approval_id: approvalId};
+      }
+      throw new Error("scoped notice context refused; no legacy fallback");
+    }
+    env = unwrapEnvelope(raw, "notice context");
+    if (!isPlainObject(env) || env.tool !== "backlog_worker_notice_context" ||
+        typeof env.binding_id !== "string") {
+      throw new Error("invalid scoped notice context");
+    }
+    var data = dataOf(env, "backlog_worker_notice_context", "notice context", {});
+    if (!isPlainObject(data) || !isPlainObject(data.execution) ||
+        !isPlainObject(data.scope) || !isPlainObject(data.item_snapshot)) {
+      throw new Error("invalid scoped notice context");
+    }
+    var parsed = parseStart({execution: data.execution}, {}, true);
+    var identity = executionIdentityFromParsed(parsed);
+    var snapshot = data.item_snapshot;
+    if (env.binding_id !== identity.control_binding_id || identity.approval_id !== approvalId ||
+        snapshot.item_id !== identity.item_id || snapshot.current_execution_ref !== identity.execution_ref ||
+        !isPositiveInteger(snapshot.revision) || snapshot.revision < identity.reservation_revision ||
+        (snapshot.status !== "doing" && snapshot.status !== "done" && snapshot.status !== "blocked")) {
+      throw new Error("notice context identity or current revision mismatch");
+    }
+    var scope = parseScope({
+      base_commit: data.scope.base_commit,
+      requested_model: data.scope.requested_model,
+      requested_effort: data.scope.requested_effort,
+      write_paths: data.scope.write_paths,
+      inspector: {executable: bootstrap.binary, argv: ["inspect-delivery"]}
+    }, {});
+    var input = await load(ORDINARY_CLOSURE_CLIENT_CONTEXT_KEY);
+    var template = await load(ORDINARY_CLOSURE_CLIENT_TEMPLATE_KEY);
+    var start = await load(ORDINARY_CLOSURE_CLIENT_START_KEY);
+    var binding = await load(ORDINARY_CLOSURE_CLIENT_BINDING_KEY);
+    var priorReport = await load(ORDINARY_CLOSURE_CLIENT_REPORT_KEY);
+    var priorCorrelation = await load(ORDINARY_CLOSURE_CLIENT_CORRELATION_KEY);
+    var priorEvidence = await load(ORDINARY_CLOSURE_CLIENT_EVIDENCE_KEY);
+    var missingInput = input === undefined || input === null;
+    var missingStart = start === undefined || start === null;
+    var missingBinding = binding === undefined || binding === null;
+    var missingTemplate = template === undefined || template === null;
+    if (!missingTemplate && stableStringify(template) !== stableStringify(bootstrap.template)) {
+      throw new Error("retained template conflicts with verified package");
+    }
+    if (!missingBinding) {
+      if (!isPlainObject(binding) || !isPlainObject(binding.input) || !isPlainObject(binding.start) ||
+          (!missingInput && stableStringify(input) !== stableStringify(binding.input)) ||
+          (!missingStart && stableStringify(start) !== stableStringify(binding.start))) {
+        throw new Error("retained context/start/binding conflict");
+      }
+      if (missingInput) input = binding.input;
+      if (missingStart) start = binding.start;
+    }
+    if (missingBinding && isPlainObject(priorCorrelation)) {
+      if (!isPlainObject(priorCorrelation.input) || !isPlainObject(priorCorrelation.start) ||
+          !isPlainObject(priorCorrelation.report)) {
+        throw new Error("retained correlation is incomplete");
+      }
+      if (missingInput) input = priorCorrelation.input;
+      if (missingStart) start = priorCorrelation.start;
+    }
+    if (input !== undefined && input !== null) {
+      var args = input.start_args;
+      if (!validCapsule(input, bootstrap.template) || input.binary !== bootstrap.binary ||
+          !isPlainObject(args) || args.approval_id !== identity.approval_id ||
+          args.task_id !== identity.task_id || args.item_id !== identity.item_id ||
+          !isPositiveInteger(args.expected_revision) ||
+          args.expected_revision + 1 !== identity.reservation_revision ||
+          stableStringify(parseScope(input.scope, {})) !== stableStringify(scope)) {
+        throw new Error("retained context conflicts with frozen notice scope");
+      }
+    } else {
+      if (identity.reservation_revision <= 1) throw new Error("invalid original reservation revision");
+      input = {
+        binary: bootstrap.binary,
+        expected_source_sha256: bootstrap.expected_source_sha256,
+        start_args: {
+          item_id: identity.item_id, approval_id: identity.approval_id, task_id: identity.task_id,
+          expected_revision: identity.reservation_revision - 1
+        },
+        scope: scope
+      };
+    }
+    if (start !== undefined && start !== null &&
+        stableStringify(storedStartIdentity(start)) !== stableStringify(identity)) {
+      throw new Error("retained start conflicts with original execution");
+    }
+    if (priorReport !== undefined && priorReport !== null) {
+      var reportIdentity = executionIdentityFromReport(priorReport);
+      if (!reportIdentity || stableStringify(reportIdentity) !== stableStringify(identity) ||
+          !isPlainObject(priorCorrelation) ||
+          stableStringify(priorCorrelation.input) !== stableStringify(input) ||
+          stableStringify(priorCorrelation.start) !== stableStringify(start) ||
+          stableStringify(priorCorrelation.report) !== stableStringify(priorReport) ||
+          !isPlainObject(priorEvidence) ||
+          stableStringify(storedStartIdentity(priorEvidence.start)) !== stableStringify(identity) ||
+          stableStringify(priorReport.scope) !== stableStringify({
+            base_commit: scope.base_commit, requested_model: scope.requested_model,
+            requested_effort: scope.requested_effort, write_paths: scope.write_paths
+          })) {
+        throw new Error("retained report conflicts with original execution");
+      }
+    } else if (priorCorrelation !== undefined && priorCorrelation !== null) {
+      throw new Error("retained correlation has no matching report");
+    } else if (priorEvidence !== undefined && priorEvidence !== null) {
+      throw new Error("retained evidence has no matching report");
+    }
+    if (snapshot.status === "done") {
+      var done = validateDurableDone(data, parsed, identity, priorReport);
+      await validateDoneCache(data.completion, identity);
+      done.events = await drainDoneEvents(parsed);
+      return done;
+    }
+    if (snapshot.status === "blocked") {
+      if (data.completion != null || data.execution.completion != null ||
+          !isPlainObject(data.execution.outcome) ||
+          !(data.execution.outcome.outcome === "failure" ||
+            (data.execution.outcome.outcome === "success" && isPlainObject(data.execution.acceptance_rejection)))) {
+        throw new Error("blocked notice lacks an original failure or rejection");
+      }
+      return {status: "blocked", item_id: identity.item_id, revision: snapshot.revision,
+        events: await drainDoneEvents(parsed)};
+    }
+    if (data.completion !== undefined && data.completion !== null ||
+        data.execution.completion !== undefined && data.execution.completion !== null) {
+      throw new Error("doing notice has a completion record");
+    }
+    if (priorReport && (priorReport.status !== "ready_for_semantic_review" ||
+        priorReport.result.current_revision !== snapshot.revision)) {
+      throw new Error("retained result is incomplete or stale; reconcile without retry");
+    }
+    if (start === undefined || start === null) start = {execution: data.execution};
+    // Never replace a present key. A missing binding contains only facts just
+    // checked against the authoritative, binding-scoped original record.
+    if (missingTemplate) await store(ORDINARY_CLOSURE_CLIENT_TEMPLATE_KEY, bootstrap.template);
+    if (missingInput) await store(ORDINARY_CLOSURE_CLIENT_CONTEXT_KEY, input);
+    if (missingStart) await store(ORDINARY_CLOSURE_CLIENT_START_KEY, start);
+    if (missingBinding) await store(ORDINARY_CLOSURE_CLIENT_BINDING_KEY, {input: input, start: start});
+    if (priorReport) {
+      var retained = compactReport(priorReport, input);
+      retained.later_events = await drainDoneEvents(parsed);
+      return retained;
+    }
     return readRetained(approvalId);
+  }
+
+  function validateDurableDone(data, parsed, identity, priorReport) {
+    var receipt = data.completion;
+    var item = receipt && receipt.item;
+    var execution = receipt && receipt.execution;
+    var snapshot = data.item_snapshot;
+    if (!isPlainObject(item) || !isPlainObject(execution) ||
+        stableStringify(execution) !== stableStringify(data.execution) ||
+        item.status !== "done" || item.item_id !== identity.item_id ||
+        item.binding_id !== identity.control_binding_id ||
+        item.current_execution_ref !== identity.execution_ref ||
+        item.revision !== snapshot.revision || !isPositiveInteger(item.revision) ||
+        item.revision <= identity.reservation_revision ||
+        !isPlainObject(execution.outcome) || execution.outcome.outcome !== "success" ||
+        !isPlainObject(execution.completion) ||
+        !/^[0-9a-f]{64}$/.test(execution.outcome.result_digest || "") ||
+        execution.completion.result_digest !== execution.outcome.result_digest ||
+        !/^[0-9a-f]{64}$/.test(execution.completion.delivery_digest || "") ||
+        !isNonNegativeInteger(item.completed_at_ms) ||
+        item.completed_at_ms !== execution.completion.completed_at_ms ||
+        item.completion_note !== execution.completion.acceptance_note ||
+        item.completion_evidence !== execution.completion.acceptance_evidence) {
+      throw new Error("durable completion does not match original execution");
+    }
+    if (priorReport && closure.doneView({receipt: {completion: receipt}, report: priorReport}).status !== "done") {
+      throw new Error("durable completion conflicts with retained report");
+    }
+    return {status: "done", item_id: item.item_id, revision: item.revision,
+      completed_at_ms: item.completed_at_ms};
+  }
+
+  async function validateDoneCache(completion, identity) {
+    var key = stableStringify(identity);
+    var receiptState = completionState(await load(ORDINARY_CLOSURE_CLIENT_DONE_RECEIPT_KEY));
+    var receipt = completionRecord(receiptState, key);
+    if (receipt === undefined && receiptState.legacy !== null &&
+        stableStringify(storedReceiptIdentity(receiptState.legacy)) === key) {
+      receipt = receiptState.legacy;
+    }
+    if (receipt !== undefined) {
+      var envelope = unwrapEnvelope(receipt, "retained done receipt");
+      var body = envelope && envelope.data !== undefined ? envelope.data : envelope;
+      if (!isPlainObject(body) || stableStringify(body.completion) !== stableStringify(completion)) {
+        throw new Error("retained completion conflicts with durable completion");
+      }
+    }
+    var intentState = completionState(await load(ORDINARY_CLOSURE_CLIENT_INTENT_KEY));
+    var intent = completionRecord(intentState, key);
+    if (intent !== undefined && (!isPlainObject(intent) || !isPlainObject(intent.args) ||
+        stableStringify(storedStartIdentity(intent.start)) !== key ||
+        intent.args.execution_ref !== identity.execution_ref ||
+        intent.args.expected_result_digest !== completion.execution.completion.result_digest ||
+        intent.args.expected_delivery_digest !== completion.execution.completion.delivery_digest)) {
+      throw new Error("retained completion intent conflicts with durable completion");
+    }
+    var views = completionState(await load(ORDINARY_CLOSURE_CLIENT_DONE_VIEW_KEY));
+    var view = completionRecord(views, key);
+    if (view !== undefined && (!isPlainObject(view) || view.status !== "done" ||
+        view.item_id !== completion.item.item_id || view.revision !== completion.item.revision ||
+        view.completed_at_ms !== completion.item.completed_at_ms)) {
+      throw new Error("retained Done view conflicts with durable completion");
+    }
+  }
+
+  async function drainDoneEvents(start) {
+    var deadline = Date.now() + 60000;
+    var cursor = null, pages = 0, calls = 0, seen = Object.create(null);
+    var state = {}, batches = [];
+    async function retainOnce(key, value) {
+      var previous = await load(key);
+      if (previous !== undefined && previous !== null) {
+        if (stableStringify(previous) !== stableStringify(value)) {
+          throw new Error("conflicting event evidence");
+        }
+        return;
+      }
+      await store(key, value);
+    }
+    try {
+      for (;;) {
+        if (Date.now() >= deadline || pages >= 8 || calls >= 16) {
+          throw new Error("event drain budget exhausted");
+        }
+        var args = {approval_id: start.approvalId, limit: ORDINARY_CLOSURE_PAGE_LIMIT};
+        if (cursor !== null) args.after_seq = cursor;
+        calls += 1;
+        var raw = await pull(args);
+        if (Date.now() >= deadline) throw new Error("event drain deadline exceeded");
+        var page = validatePage(dataOf(unwrapEnvelope(raw, "pull response"),
+          "approved_pull_events", "pull", state, start.controlBinding), start, state, cursor, seen);
+        if (!/^bat_[a-zA-Z0-9_-]{1,128}$/.test(page.batch.batch_id)) {
+          throw new Error("unsafe event batch identifier");
+        }
+        var evidenceKey = "threadlane/closure-after-done/" + start.executionRef + "/" + page.batch.batch_id;
+        await retainOnce(evidenceKey + "/page", raw);
+        if (utf8ByteLength(JSON.stringify(page.batch)) > ORDINARY_CLOSURE_MAX_BATCH_BYTES) {
+          throw new Error("event batch too large");
+        }
+        pages += 1;
+        if (page.batch.events.length === 0) {
+          return {status: "verified", pages: pages, batches: batches,
+            acked_seq: page.batch.acked_seq};
+        }
+        if (calls >= 16 || Date.now() >= deadline) throw new Error("event drain budget exhausted");
+        calls += 1;
+        var ackRaw = await ack({approval_id: start.approvalId, batch_id: page.batch.batch_id});
+        await retainOnce(evidenceKey + "/ack", ackRaw);
+        if (Date.now() >= deadline) throw new Error("event drain deadline exceeded");
+        var checked = validateAck(dataOf(unwrapEnvelope(ackRaw, "ack response"),
+          "approved_ack_events", "ack", state, start.controlBinding), start, page, state, true);
+        cursor = checked.acked_seq;
+        batches.push({batch_id: checked.batch_id, acked_seq: checked.acked_seq, advanced: checked.advanced});
+        if (!page.batch.has_more) return {status: "verified", pages: pages, batches: batches, acked_seq: cursor};
+      }
+    } catch (error) {
+      // Done is durable even if a stopped host or a bad/unknown ACK prevents
+      // verification of later event delivery. Do not retry or claim an ACK.
+      return {status: "unverified", pages: pages, batches: batches,
+        acked_seq: cursor, reason: error && error.closureIncomplete ? error.reason : "unavailable_or_unknown"};
+    }
   }
 
   // Each completion key holds a versioned map of original-execution records
@@ -1180,7 +1483,7 @@ function createOrdinaryClosureClient(callbacks) {
   });
 }
 
-function parseStart(raw, state) {
+function parseStart(raw, state, allowCompleted) {
   state.stage = "start";
   var envelope = unwrapEnvelope(raw, "start response");
   if (!isPlainObject(envelope)) {
@@ -1235,10 +1538,10 @@ function parseStart(raw, state) {
       dispatch.execution_binding_digest !== null) {
     requireSha256(dispatch.execution_binding_digest, "dispatch execution_binding_digest", state);
   }
-  if (execution.completion !== undefined && execution.completion !== null) {
+  if (!allowCompleted && execution.completion !== undefined && execution.completion !== null) {
     incomplete("already_completed", "start execution already has a completion record", state);
   }
-  if (execution.acceptance_rejection !== undefined &&
+  if (!allowCompleted && execution.acceptance_rejection !== undefined &&
       execution.acceptance_rejection !== null) {
     incomplete("already_rejected", "start execution already has a rejection record", state);
   }
@@ -1461,7 +1764,7 @@ function validatePage(data, start, state, expectedCursor, seenEventIds) {
   return { batch: batch };
 }
 
-function validateAck(data, start, page, state) {
+function validateAck(data, start, page, state, allowDuplicateAck) {
   state.stage = "ack";
   if (!isPlainObject(data)) {
     incomplete("invalid_ack", "ack data is not an object", state);
@@ -1492,7 +1795,7 @@ function validateAck(data, start, page, state) {
   if (typeof ack.advanced !== "boolean") {
     incomplete("invalid_ack", "ack advanced must be boolean", state);
   }
-  if (page.batch.events.length > 0 && ack.advanced !== true) {
+  if (page.batch.events.length > 0 && ack.advanced !== true && !allowDuplicateAck) {
     incomplete("ack_not_advanced", "a non-empty batch acknowledgement did not advance", state);
   }
   return {

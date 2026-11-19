@@ -1,0 +1,26 @@
+// functions.exec callback: bind NOTICE_APPROVAL_ID from the actual notice.
+const input = load("threadlane/approved-task-context.json");
+if (!input) throw new Error("missing or changed retained context/start/binding; use original-receipt fallback");
+const template = load("threadlane/closure-template.json");
+if (!template || template.tool !== "threadlane closure-template" ||
+    template.version !== "2026-11-19.v1" ||
+    template.source_path !== "skills/threadlane/references/ordinary-closure.js" ||
+    template.factory_name !== "createOrdinaryClosure" ||
+    !/^[0-9a-f]{64}$/.test(template.source_sha256) ||
+    template.source_sha256 !== input.expected_source_sha256 ||
+    typeof template.javascript !== "string" ||
+    template.javascript.indexOf('var CREATE_ORDINARY_CLOSURE_VERSION = "2026-11-19.v1";') === -1) {
+  throw new Error("invalid closure capsule");
+}
+const createOrdinaryClosureClient = new Function(template.javascript + "\nreturn createOrdinaryClosureClient;")();
+const quote = (value) => "'" + String(value).replace(/'/g, "'\\''") + "'";
+const client = createOrdinaryClosureClient({
+  load: (key) => load(key), store: (key, value) => store(key, value),
+  pull: (a) => tools.mcp__threadlane__approved_pull_events(a),
+  ack: (a) => tools.mcp__threadlane__approved_ack_events(a),
+  result: (a) => tools.mcp__threadlane__backlog_worker_result(a),
+  inspect: (r) => tools.exec_command({
+    cmd: r.argv.map(quote).join(" "), max_output_tokens: 16000, yield_time_ms: 30000
+  }),
+});
+text(JSON.stringify(await client.readNotice(NOTICE_APPROVAL_ID)));
