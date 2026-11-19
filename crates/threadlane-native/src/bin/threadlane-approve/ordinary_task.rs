@@ -27,7 +27,7 @@ use threadlane_workflow::{
 
 use super::{
     enforce_fixed_scope_on_request, load_stdin_json, prepare_operator_preview, verify_live_binding,
-    write_private_preview_file, write_stdout_json, CliError, FixedApprovalScope,
+    write_private_preview_file, write_stdout_json, CliError, ExplicitBudgets, FixedApprovalScope,
     PrivatePreviewReceipt, RecoveryContext, ValidatedStoreDirs,
 };
 
@@ -40,7 +40,7 @@ const PUBLISHED_PHASE: &str = "published";
 /// Strict stdin request accepted by the scoped single-task fast path.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct PrepareTaskRequest {
+struct PrepareTaskRequest<B = ExecutionBudgets> {
     binding_id: String,
     thread_uuid: String,
     repository_path: PathBuf,
@@ -50,7 +50,24 @@ struct PrepareTaskRequest {
     command_key: String,
     summary: String,
     task: PrepareTaskTask,
-    budgets: ExecutionBudgets,
+    budgets: B,
+}
+
+impl From<PrepareTaskRequest<ExplicitBudgets>> for PrepareTaskRequest {
+    fn from(request: PrepareTaskRequest<ExplicitBudgets>) -> Self {
+        Self {
+            binding_id: request.binding_id,
+            thread_uuid: request.thread_uuid,
+            repository_path: request.repository_path,
+            base_commit: request.base_commit,
+            profile_id: request.profile_id,
+            profile_revision: request.profile_revision,
+            command_key: request.command_key,
+            summary: request.summary,
+            task: request.task,
+            budgets: request.budgets.into(),
+        }
+    }
 }
 
 /// Strict single-task object accepted before conversion to the canonical [`PlanTask`].
@@ -119,8 +136,14 @@ struct ValidatedRequestScope {
 pub(super) async fn run_prepare_task(
     dirs: &ValidatedStoreDirs,
     fixed_scope: &FixedApprovalScope,
+    exact_budgets: bool,
 ) -> Result<(), CliError> {
-    let request: PrepareTaskRequest = load_stdin_json()?;
+    let request: PrepareTaskRequest = if exact_budgets {
+        let explicit: PrepareTaskRequest<ExplicitBudgets> = load_stdin_json()?;
+        explicit.into()
+    } else {
+        load_stdin_json()?
+    };
     let task = PlanTask::from(request.task.clone());
     let scope = prevalidate_request(dirs, fixed_scope, &request, &task)?;
 

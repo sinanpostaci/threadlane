@@ -12,12 +12,14 @@
 //! unchanged typed preview plus newline as `preview.json` (`0600`) in a new unique private
 //! (`0700`) temp directory and returns a bounded `{preview_path, preview}` receipt. It writes no
 //! approval ledger entry and dispatches no work.
+//! `prepare-private-exact` uses the same flow but requires all five budget fields on stdin.
 //!
 //! `prepare-task` is the scoped single-task fast path: it accepts one bounded strict JSON request
 //! on stdin (never argv), creates and publishes exactly one ordinary worker task through
 //! `ScopedWorkflow`, and then runs the same authoritative private preview flow. It creates only
 //! the draft/publication and private preview; it never records authority, reserves execution, or
 //! starts a worker.
+//! `prepare-task-exact` uses the same flow but requires all five budget fields on stdin.
 //!
 //! `record` accepts exactly one private input: the unchanged normalized
 //! [`threadlane_authority::OperatorApprovalRequest`] (`--request`) or the complete typed
@@ -45,7 +47,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use threadlane::{ErrorCode as RuntimeErrorCode, SupervisorClient};
 use threadlane_authority::validation::{
     validate_canonical_thread_uuid, validate_identifier, validate_sha256_hex,
@@ -58,6 +60,7 @@ use threadlane_native::fs_safety::{
     ensure_platform_supported, read_private_file_bounded, validate_absolute_no_symlink_components,
 };
 use threadlane_native::{open_workflow_stores, NativeError, NativeErrorCode};
+use threadlane_workers::{ExecutionBudgets, ProgressWatchdogPolicy};
 
 /// Scoped single-task fast path implementation.
 #[path = "threadlane-approve/ordinary_task.rs"]
@@ -119,6 +122,8 @@ enum ApproveCommand {
     /// private `0700` temp directory and returns `{preview_path, preview}`. This route accepts no
     /// output path argument and writes no authority ledger entry.
     PreparePrivate,
+    /// Prepare a private preview, requiring all five execution budget values on stdin.
+    PreparePrivateExact,
     /// Create and publish one ordinary single-task plan, then write its private operator preview.
     ///
     /// Requires the complete fixed `--binding`, `--thread`, and `--project-root` scope forwarded
@@ -126,6 +131,8 @@ enum ApproveCommand {
     /// and creates only the draft/publication and private preview. It never records approval
     /// authority, reserves execution, or starts a worker.
     PrepareTask,
+    /// Publish one ordinary task and preview it, requiring all five execution budget values.
+    PrepareTaskExact,
     /// Validate and persist a confirmed operator approval into `approvals.json`.
     ///
     /// Requires exactly one input: `--request` (unchanged normalized `OperatorApprovalRequest`)
@@ -388,6 +395,67 @@ struct PrivatePreviewReceipt {
     preview: OperatorApprovalPreview,
 }
 
+/// Explicit stdin budgets. Unlike the persisted type, these five limits cannot default.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExplicitBudgets {
+    timeout_ms: u64,
+    max_line_bytes: usize,
+    max_stdout_bytes: usize,
+    max_stderr_bytes: usize,
+    max_events: usize,
+    #[serde(default)]
+    progress_watchdog: Option<ProgressWatchdogPolicy>,
+}
+
+impl From<ExplicitBudgets> for ExecutionBudgets {
+    fn from(budgets: ExplicitBudgets) -> Self {
+        Self {
+            timeout_ms: budgets.timeout_ms,
+            max_line_bytes: budgets.max_line_bytes,
+            max_stdout_bytes: budgets.max_stdout_bytes,
+            max_stderr_bytes: budgets.max_stderr_bytes,
+            max_events: budgets.max_events,
+            progress_watchdog: budgets.progress_watchdog,
+        }
+    }
+}
+
+/// Stdin intent with explicit budgets, converted to the existing authority input unchanged.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExplicitApprovalIntent {
+    binding_id: String,
+    thread_uuid: String,
+    plan_id: String,
+    plan_revision: u64,
+    expected_registry_revision: u64,
+    repository_path: PathBuf,
+    base_commit: String,
+    approved_task_ids: Vec<String>,
+    approved_write_paths: Vec<String>,
+    max_parallel: usize,
+    budgets: ExplicitBudgets,
+}
+
+impl From<ExplicitApprovalIntent> for OperatorApprovalIntent {
+    fn from(intent: ExplicitApprovalIntent) -> Self {
+        Self {
+            binding_id: intent.binding_id,
+            thread_uuid: intent.thread_uuid,
+            plan_id: intent.plan_id,
+            plan_revision: intent.plan_revision,
+            expected_registry_revision: intent.expected_registry_revision,
+            repository_path: intent.repository_path,
+            base_commit: intent.base_commit,
+            approved_task_ids: intent.approved_task_ids,
+            approved_write_paths: intent.approved_write_paths,
+            max_parallel: intent.max_parallel,
+            budgets: intent.budgets.into(),
+        }
+    }
+}
+
 /// Reads one bounded strict JSON DTO from stdin without accepting any argv JSON.
 fn load_stdin_json<T: DeserializeOwned>() -> Result<T, CliError> {
     let mut buf = Vec::new();
@@ -403,7 +471,7 @@ fn load_stdin_json<T: DeserializeOwned>() -> Result<T, CliError> {
     }
 
     serde_json::from_slice(&buf)
-        .map_err(|_| CliError::invalid_input("stdin request contains invalid JSON"))
+        .map_err(|_| CliError::invalid_input("stdin JSON is malformed or violates the schema"))
 }
 
 /// Runs the single authoritative prepare flow shared by `prepare` and `prepare-private`.
@@ -590,12 +658,17 @@ async fn run(cli: Cli) -> Result<(), CliError> {
 
             write_stdout_json(&preview, false)
         }
-        ApproveCommand::PreparePrivate => {
+        ApproveCommand::PreparePrivate | ApproveCommand::PreparePrivateExact => {
             let dirs =
                 validate_four_store_dirs(&state_dir, &registry_dir, &plans_dir, &authority_dir)?;
             let fixed_scope =
                 resolve_fixed_scope(raw_binding, raw_thread, raw_project_root, &dirs)?;
-            let intent: OperatorApprovalIntent = load_stdin_json()?;
+            let intent = if matches!(cli.command, ApproveCommand::PreparePrivateExact) {
+                let explicit: ExplicitApprovalIntent = load_stdin_json()?;
+                explicit.into()
+            } else {
+                load_stdin_json()?
+            };
             let preview = prepare_operator_preview(&dirs, fixed_scope.as_ref(), intent).await?;
             let (preview_path, directory) = write_private_preview_file(&preview)?;
 
@@ -611,12 +684,17 @@ async fn run(cli: Cli) -> Result<(), CliError> {
             let _kept_path = directory.keep();
             Ok(())
         }
-        ApproveCommand::PrepareTask => {
+        ApproveCommand::PrepareTask | ApproveCommand::PrepareTaskExact => {
             let dirs =
                 validate_four_store_dirs(&state_dir, &registry_dir, &plans_dir, &authority_dir)?;
             let fixed_scope =
                 resolve_complete_fixed_scope(raw_binding, raw_thread, raw_project_root, &dirs)?;
-            ordinary_task::run_prepare_task(&dirs, &fixed_scope).await
+            ordinary_task::run_prepare_task(
+                &dirs,
+                &fixed_scope,
+                matches!(cli.command, ApproveCommand::PrepareTaskExact),
+            )
+            .await
         }
         ApproveCommand::Record {
             request,
@@ -1456,6 +1534,26 @@ fn emit_error(err: &CliError) {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_intent_matches_authority_wire_shape_and_values() {
+        let value = serde_json::json!({
+            "binding_id": "bnd_1", "thread_uuid": "550e8400-e29b-41d4-a716-446655440000",
+            "plan_id": "plan_1", "plan_revision": 2, "expected_registry_revision": 3,
+            "repository_path": "/tmp/repo", "base_commit": "0123456789abcdef0123456789abcdef01234567",
+            "approved_task_ids": ["task-a", "task-b"], "approved_write_paths": ["a", "b"],
+            "max_parallel": 2,
+            "budgets": {"timeout_ms": 90000, "max_line_bytes": 16384,
+                "max_stdout_bytes": 2097152, "max_stderr_bytes": 100000, "max_events": 321,
+                "progress_watchdog": {"soft_timeout_ms": 60000, "extension_ms": 10000,
+                    "recent_advancement_ms": 20000}}
+        });
+        let exact: ExplicitApprovalIntent = serde_json::from_value(value.clone()).unwrap();
+        let original: OperatorApprovalIntent = serde_json::from_value(value.clone()).unwrap();
+        let converted: OperatorApprovalIntent = exact.into();
+        assert_eq!(converted, original);
+        assert_eq!(serde_json::to_value(converted).unwrap(), value);
+    }
 
     #[test]
     fn cli_parses_legacy_subcommand_flags_and_context_routed_global_flags() {

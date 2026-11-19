@@ -1070,80 +1070,104 @@ async fn prepare_freezes_exact_scope_without_approval_execution_or_worktree_side
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn quickstart_example_prepares_exact_intent_without_worker_invocation() {
+async fn quickstart_example_prepares_exact_task_without_worker_invocation() {
     let mut fx = ApprovalFixture::start().await;
 
-    let marker = "```json\n";
+    let marker = "const request = ";
     let start = ORDINARY_WORKER_QUICKSTART
         .find(marker)
         .expect("quickstart strict JSON example")
         + marker.len();
     let rest = &ORDINARY_WORKER_QUICKSTART[start..];
     let end = rest
-        .find("\n```")
+        .find(";\nconst router")
         .expect("quickstart JSON example terminator");
-    let mut intent: OperatorApprovalIntent =
-        serde_json::from_str(&rest[..end]).expect("documented quickstart JSON is a strict intent");
-
-    intent.binding_id = fx.binding_id.clone();
-    intent.thread_uuid = THREAD_UUID.to_string();
-    intent.plan_id = PLAN_ID.to_string();
-    intent.plan_revision = fx.plan_revision;
-    intent.expected_registry_revision = fx.registry_revision;
-    intent.repository_path = fx.repo.clone();
-    intent.base_commit = fx.base_commit.clone();
-    intent.approved_task_ids = vec!["task-root".to_string()];
-    intent.approved_write_paths = vec!["src/lib.rs".to_string()];
-    intent.max_parallel = 1;
-
-    let path = fx.write_request("quickstart-intent.json", &intent);
-    let preview: OperatorApprovalPreview = parse_success(
-        &fx.run_prepare(&path).await,
-        "prepare documented quickstart intent",
+    let mut request: Value =
+        serde_json::from_str(&rest[..end]).expect("documented quickstart JSON");
+    request["binding_id"] = serde_json::json!(fx.binding_id);
+    request["thread_uuid"] = serde_json::json!(THREAD_UUID);
+    request["repository_path"] = serde_json::json!(fx.repo);
+    request["base_commit"] = serde_json::json!(fx.base_commit);
+    request["profile_id"] = serde_json::json!(PROFILE_ID);
+    request["profile_revision"] = serde_json::json!(fx.registry_revision);
+    request["command_key"] = serde_json::json!("quickstart-1");
+    request["summary"] = serde_json::json!("Prepare status text");
+    request["task"]["id"] = serde_json::json!("task-status");
+    request["task"]["title"] = serde_json::json!("Update status");
+    let shell_marker = fx.root.join("unexpected-shell-substitution");
+    let instruction = format!(
+        "Write the user's status $(touch {})",
+        shell_marker.display()
     );
+    request["task"]["instruction"] = serde_json::json!(instruction);
+    let budgets: ExecutionBudgets = serde_json::from_value(request["budgets"].clone()).unwrap();
+
+    let context_path = write_prepare_task_context(&fx, "quickstart's-context.json");
+    let temp_dir = fx.private_preview_temp_dir();
+    let quote = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
+    let command = format!(
+        "printf '%s' {} | {} --context {} approve prepare-task-exact",
+        quote(&serde_json::to_string(&request).unwrap()),
+        quote(env!("CARGO_BIN_EXE_threadlane-context")),
+        quote(context_path.to_str().unwrap()),
+    );
+    let output = Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .env("TMPDIR", &temp_dir)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .output()
+        .await
+        .expect("run documented quoted command");
+    let receipt: PrivatePreviewReceipt = parse_success(
+        &output,
+        "prepare documented quickstart task via context router",
+    );
+    let preview = receipt.preview;
 
     assert_eq!(preview.request.binding_id, fx.binding_id);
     assert_eq!(preview.request.thread_uuid, THREAD_UUID);
-    assert_eq!(preview.request.plan_id, PLAN_ID);
-    assert_eq!(preview.request.plan_revision, fx.plan_revision);
+    assert!(preview.request.plan_id.starts_with("plan_"));
+    assert_eq!(preview.request.plan_revision, 1);
     assert_eq!(
         preview.request.expected_registry_revision,
         fx.registry_revision
     );
-    assert_eq!(preview.request.expected_plan_digest, fx.plan_digest);
+    assert_sha256(
+        &preview.request.expected_plan_digest,
+        "quickstart plan digest",
+    );
     assert_eq!(preview.request.repository_path, fx.repo);
     assert_eq!(preview.request.base_commit, fx.base_commit);
     assert_eq!(
         preview.request.approved_task_ids,
-        vec!["task-root".to_string()]
+        vec!["task-status".to_string()]
     );
     assert_eq!(
         preview.request.approved_write_paths,
-        vec!["src/lib.rs".to_string()]
+        vec!["STATUS.txt".to_string()]
     );
     assert_eq!(preview.request.max_parallel, 1);
-    assert_eq!(
-        preview.request.budgets.timeout_ms,
-        intent.budgets.timeout_ms
-    );
-    assert_eq!(
-        preview.request.budgets.max_stdout_bytes,
-        intent.budgets.max_stdout_bytes
-    );
-    assert_eq!(
-        preview.request.budgets.max_stderr_bytes,
-        intent.budgets.max_stderr_bytes
-    );
-    assert_eq!(
-        preview.request.budgets.max_line_bytes,
-        intent.budgets.max_line_bytes
-    );
-    assert_eq!(
-        preview.request.budgets.max_events,
-        intent.budgets.max_events
-    );
+    assert_eq!(preview.request.budgets, budgets);
     assert_eq!(preview.tasks.len(), 1);
-    assert_eq!(preview.tasks[0].task_id, "task-root");
+    assert_eq!(preview.tasks[0].task_id, "task-status");
+    assert_eq!(preview.tasks[0].instruction, instruction);
+    assert!(
+        !shell_marker.exists(),
+        "request text must never run in the shell"
+    );
+    assert_eq!(
+        preview.tasks[0].canonical_executable.as_deref(),
+        Some(fx.fake_worker.as_path())
+    );
+    assert_eq!(
+        preview.tasks[0].model_arg,
+        "opencode-go/deepseek-v4.1-flash"
+    );
+    assert_eq!(preview.tasks[0].effort.as_deref(), Some("max"));
     assert_sha256(&preview.subject_digest, "quickstart preview subject_digest");
 
     fx.assert_no_worker_invocation();
@@ -1247,6 +1271,256 @@ async fn prepare_private_stdin_writes_verified_preview_that_record_accepts() {
     assert_eq!(fx.head(), fx.base_commit);
     assert!(fx.worktree_names().is_empty());
 
+    fx.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prepare_private_exact_requires_all_budgets_and_preserves_legacy_defaults() {
+    let mut fx = ApprovalFixture::start().await;
+    let temp_dir = fx.private_preview_temp_dir();
+    let mut args = fx.prepare_private_args();
+    args[0] = "prepare-private-exact".to_string();
+    let mut intent = fx.intent();
+    intent.budgets = serde_json::from_value(serde_json::json!({
+        "timeout_ms": 90_000, "max_line_bytes": 16_384,
+        "max_stdout_bytes": 2_097_152, "max_stderr_bytes": 100_000,
+        "max_events": 321,
+        "progress_watchdog": {"soft_timeout_ms": 60_000, "extension_ms": 10_000,
+                              "recent_advancement_ms": 20_000}
+    }))
+    .expect("explicit valid budgets");
+    let valid = serde_json::to_value(&intent).expect("serialize intent");
+
+    for field in [
+        "timeout_ms",
+        "max_line_bytes",
+        "max_stdout_bytes",
+        "max_stderr_bytes",
+        "max_events",
+    ] {
+        let mut missing = valid.clone();
+        missing["budgets"].as_object_mut().unwrap().remove(field);
+        let out = fx
+            .run_cli_with_stdin(
+                &args,
+                &serde_json::to_vec(&missing).unwrap(),
+                Some(&temp_dir),
+            )
+            .await;
+        assert_eq!(
+            expect_failure(&out, "missing explicit private budget").code,
+            "invalid_input",
+            "{field}"
+        );
+    }
+    let mut missing = valid.clone();
+    missing.as_object_mut().unwrap().remove("budgets");
+    let out = fx
+        .run_cli_with_stdin(
+            &args,
+            &serde_json::to_vec(&missing).unwrap(),
+            Some(&temp_dir),
+        )
+        .await;
+    assert_eq!(
+        expect_failure(&out, "missing private budgets").code,
+        "invalid_input"
+    );
+    for field in ["max_attempts", "max_workers"] {
+        for nested in [false, true] {
+            let mut unsupported = valid.clone();
+            let target = if nested {
+                &mut unsupported["budgets"]
+            } else {
+                &mut unsupported
+            };
+            target
+                .as_object_mut()
+                .unwrap()
+                .insert(field.to_string(), Value::from(1));
+            let out = fx
+                .run_cli_with_stdin(
+                    &args,
+                    &serde_json::to_vec(&unsupported).unwrap(),
+                    Some(&temp_dir),
+                )
+                .await;
+            assert_eq!(
+                expect_failure(&out, "unsupported private field").code,
+                "invalid_input",
+                "{field}"
+            );
+        }
+    }
+    assert!(directory_entries(&temp_dir).is_empty());
+    fx.assert_no_approval_artifacts();
+
+    let receipt: PrivatePreviewReceipt = parse_success(
+        &fx.run_cli_with_stdin(&args, &serde_json::to_vec(&valid).unwrap(), Some(&temp_dir))
+            .await,
+        "exact private preview",
+    );
+    assert_eq!(receipt.preview.request.budgets, intent.budgets);
+    assert_eq!(receipt.preview.request.expected_plan_digest, fx.plan_digest);
+    let legacy_path = fx.write_request("exact-equivalent-intent.json", &intent);
+    let equivalent: OperatorApprovalPreview =
+        parse_success(&fx.run_prepare(&legacy_path).await, "legacy equivalent");
+    assert_eq!(receipt.preview, equivalent);
+    assert_eq!(fs::read(&receipt.preview_path).unwrap(), {
+        let mut bytes = serde_json::to_vec(&receipt.preview).unwrap();
+        bytes.push(b'\n');
+        bytes
+    });
+    fx.assert_no_approval_artifacts();
+    let summary: ApprovalSummary = parse_success(
+        &fx.run_record_preview(
+            &receipt.preview_path,
+            &receipt.preview.subject_digest,
+            THREAD_UUID,
+            true,
+        )
+        .await,
+        "record exact private preview separately",
+    );
+    assert_eq!(summary.subject_digest, receipt.preview.subject_digest);
+    let record = fx.persisted_record();
+    assert_eq!(record.budgets, intent.budgets);
+    assert_eq!(
+        serde_json::to_value(&summary).unwrap(),
+        serde_json::to_value(record.to_summary()).unwrap()
+    );
+    fx.assert_no_worker_invocation();
+
+    let mut legacy_default = valid;
+    legacy_default.as_object_mut().unwrap().remove("budgets");
+    let legacy: PrivatePreviewReceipt = parse_success(
+        &fx.run_cli_with_stdin(
+            &fx.prepare_private_args(),
+            &serde_json::to_vec(&legacy_default).unwrap(),
+            Some(&temp_dir),
+        )
+        .await,
+        "legacy private preview retains default budgets",
+    );
+    assert_eq!(legacy.preview.request.budgets, ExecutionBudgets::default());
+    fx.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prepare_task_exact_rejects_omissions_before_publication_and_preserves_values() {
+    let mut fx = ApprovalFixture::start().await;
+    let temp_dir = fx.private_preview_temp_dir();
+    let mut args = prepare_task_args(&fx);
+    args[0] = "prepare-task-exact".to_string();
+    let mut valid = prepare_task_request(&fx, "fast-exact-1");
+    valid["budgets"] = serde_json::json!({
+        "timeout_ms": 90_000, "max_line_bytes": 16_384,
+        "max_stdout_bytes": 2_097_152, "max_stderr_bytes": 100_000, "max_events": 321
+    });
+    let expected: ExecutionBudgets = serde_json::from_value(valid["budgets"].clone()).unwrap();
+    let before = total_plan_revision_count(&fx);
+    for field in [
+        "timeout_ms",
+        "max_line_bytes",
+        "max_stdout_bytes",
+        "max_stderr_bytes",
+        "max_events",
+    ] {
+        let mut missing = valid.clone();
+        missing["budgets"].as_object_mut().unwrap().remove(field);
+        let out = fx
+            .run_cli_with_stdin(&args, &prepare_task_bytes(&missing), Some(&temp_dir))
+            .await;
+        assert_eq!(
+            expect_failure(&out, "missing exact task budget").code,
+            "invalid_input",
+            "{field}"
+        );
+    }
+    for field in ["max_attempts", "max_workers"] {
+        for nested in [false, true] {
+            let mut unsupported = valid.clone();
+            let target = if nested {
+                &mut unsupported["budgets"]
+            } else {
+                &mut unsupported
+            };
+            target
+                .as_object_mut()
+                .unwrap()
+                .insert(field.to_string(), Value::from(1));
+            let out = fx
+                .run_cli_with_stdin(&args, &prepare_task_bytes(&unsupported), Some(&temp_dir))
+                .await;
+            assert_eq!(
+                expect_failure(&out, "unsupported exact task field").code,
+                "invalid_input",
+                "{field}"
+            );
+        }
+    }
+    let mut invalid = valid.clone();
+    invalid["budgets"]["timeout_ms"] = Value::from(0);
+    let out = fx
+        .run_cli_with_stdin(&args, &prepare_task_bytes(&invalid), Some(&temp_dir))
+        .await;
+    assert_eq!(
+        expect_failure(&out, "invalid exact task budget").code,
+        "validation"
+    );
+    assert_eq!(total_plan_revision_count(&fx), before);
+    assert!(directory_entries(&temp_dir).is_empty());
+    fx.assert_no_approval_artifacts();
+
+    let context_path = write_prepare_task_context(&fx, "exact-task-context.json");
+    let context_args = vec![
+        "--context".to_string(),
+        context_path.display().to_string(),
+        "approve".to_string(),
+        "prepare-task-exact".to_string(),
+    ];
+    let receipt: PrivatePreviewReceipt = parse_success(
+        &run_command_with_stdin(
+            context_command(),
+            &context_args,
+            &prepare_task_bytes(&valid),
+            Some(&temp_dir),
+        )
+        .await,
+        "exact task preview through context router",
+    );
+    assert_eq!(receipt.preview.request.budgets, expected);
+    assert_eq!(receipt.preview.request.max_parallel, 1);
+    assert_eq!(
+        receipt.preview.tasks[0].canonical_executable.as_deref(),
+        Some(fx.fake_worker.as_path())
+    );
+    assert_eq!(
+        receipt.preview.tasks[0].model_arg,
+        "opencode-go/deepseek-v4.1-flash"
+    );
+    assert_eq!(receipt.preview.tasks[0].effort.as_deref(), Some("max"));
+    assert_eq!(total_plan_revision_count(&fx), before + 1);
+    fx.assert_no_approval_artifacts();
+    fx.assert_no_worker_invocation();
+
+    let legacy = prepare_task_request(&fx, "fast-legacy-default-1");
+    let legacy_receipt: PrivatePreviewReceipt = parse_success(
+        &fx.run_cli_with_stdin(
+            &prepare_task_args(&fx),
+            &prepare_task_bytes(&legacy),
+            Some(&temp_dir),
+        )
+        .await,
+        "legacy task retains partial default budgets",
+    );
+    assert_eq!(legacy_receipt.preview.request.budgets.timeout_ms, 90_000);
+    assert_eq!(
+        legacy_receipt.preview.request.budgets.max_events,
+        ExecutionBudgets::default().max_events
+    );
+    fx.assert_no_approval_artifacts();
+    fx.assert_no_worker_invocation();
     fx.shutdown().await;
 }
 
