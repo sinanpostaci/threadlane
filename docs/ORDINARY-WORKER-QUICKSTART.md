@@ -6,7 +6,7 @@ No execution before human approval.
 
 2. `prepare-task-exact` saves/publishes one task before preview. For a plan from `save_draft`/`publish`, use `prepare-private-exact` with an `OperatorApprovalIntent`: `binding_id`, `thread_uuid`, `plan_id`, `plan_revision`, `expected_registry_revision`, `repository_path`, `base_commit`, `approved_task_ids`, `approved_write_paths`, `max_parallel` and the same `budgets`.
 
-3. In `functions.exec`, fill this new-task example with the actual connection, authorized task, profile and budgets. Numbers are examples, not authorization. Both commands reject omitted budgets and unknown fields, including `max_attempts`/`max_workers`. `max_parallel` is concurrency; `progress_watchdog` is optional.
+3. In `functions.exec`, use the actual connection, task, profile and authorized budgets. Both commands reject omitted budgets and unknown fields, including `max_attempts`/`max_workers`. `max_parallel` is concurrency; `progress_watchdog` is optional.
 
 ```javascript
 const request = {
@@ -36,4 +36,4 @@ Both return `{preview_path,preview}`; the CLI verifies its `0600` preview in a p
 
 4. After exact human consent, use the same router, quoting and access policy to run `approve record --preview <preview_path> --confirm-subject <subject_digest> --confirm-thread <thread_uuid> --operator-approved`. The CLI recompiles/matches the preview; recording starts no Worker. `record --request` requires unchanged `preview.request` in a private `0600` file.
 
-5. Create a storage-only `worker` item. For exact-file review call `ordinary_review_scope({approval_id,task_id,item_id,source_files})`, then guarded `backlog_worker_start` once; no readiness/host pre-probe. On callback call `ordinary_review_notice({approval_id})` to reconcile, ACK bounded real events and prepare evidence. Decide semantics independently; call `ordinary_review_complete` only on a positive decision. Missing/unsupported scope stops; no automatic fallback. A selected legacy route retains its guide recipe. Never redispatch unknown outcomes. Inspect delivery or use an equally bounded physical read; HEAD must equal the expected base. Test an exact-byte checkout with its own `CARGO_TARGET_DIR`.
+5. Create a storage-only `worker` item. For exact-file review call `ordinary_review_scope({approval_id,task_id,item_id,source_files})`, then guarded `backlog_worker_start` once; no readiness/host pre-probe. List tracked inputs to preserve. For a standalone new file use `source_files: []`. On callback, `ordinary_review_notice({approval_id})` reconciles, ACKs events and prepares evidence. Decide semantics independently; call `ordinary_review_complete` only on a positive decision. Missing/unsupported scope stops; no automatic fallback. For legacy routes use their guide. Never redispatch unknown outcomes. Inspect delivery or use an equally bounded physical read; HEAD must equal the expected base. Test an exact-byte checkout with its own `CARGO_TARGET_DIR`.

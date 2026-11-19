@@ -4219,7 +4219,10 @@ impl PairedMcpServer {
                     {
                         return Err(crate::dispatch_guard::GuardedDispatchError::pre_effect(
                             "source_baseline_unavailable",
-                            "Pre-start source baseline is incomplete or not clean at base.",
+                            crate::ordinary_review::source_baseline_refusal_message(
+                                observed.refusal_code.map(|code| code.as_str()),
+                                observed.clean_at_base,
+                            ),
                         ));
                     }
                     Some(observed)

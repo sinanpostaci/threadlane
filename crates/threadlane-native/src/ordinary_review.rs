@@ -899,9 +899,67 @@ pub(crate) fn done_view(
         "result_digest":completed.result_digest, "delivery_digest":completed.delivery_digest}})
 }
 
+pub(crate) fn source_baseline_refusal_message(
+    code: Option<&str>,
+    clean_at_base: bool,
+) -> &'static str {
+    match (code, clean_at_base) {
+        (Some("git_output_limit"), _) => {
+            "Source baseline inspection failed (git_output_limit): the bounded Git file listing exceeded its limit."
+        }
+        (Some("file_read_failed"), _) => {
+            "Source baseline inspection failed (file_read_failed): a selected reference file could not be read or compared at the base."
+        }
+        (Some(_), _) => "Source baseline inspection failed.",
+        (None, false) => {
+            "Source baseline verification failed: the repository was not clean at the expected base."
+        }
+        (None, true) => "Source baseline verification failed: incomplete evidence.",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_baseline_refusal_message_reports_known_codes_and_redacts_unknown_values() {
+        let git_limit = source_baseline_refusal_message(Some("git_output_limit"), false);
+        assert!(git_limit.contains("git_output_limit"));
+        assert!(git_limit.contains("bounded Git file listing exceeded its limit"));
+        assert_eq!(
+            git_limit,
+            source_baseline_refusal_message(Some("git_output_limit"), true)
+        );
+
+        let read_failed = source_baseline_refusal_message(Some("file_read_failed"), false);
+        assert!(read_failed.contains("file_read_failed"));
+        assert!(read_failed
+            .contains("selected reference file could not be read or compared at the base"));
+        assert_eq!(
+            read_failed,
+            source_baseline_refusal_message(Some("file_read_failed"), true)
+        );
+
+        let sensitive = "sensitive_internal_token";
+        let unknown = source_baseline_refusal_message(Some(sensitive), false);
+        assert!(unknown.contains("inspection failed"));
+        assert!(!unknown.contains(sensitive));
+        assert_eq!(
+            unknown,
+            source_baseline_refusal_message(Some("another_unrecognized_code"), true)
+        );
+    }
+
+    #[test]
+    fn source_baseline_refusal_message_distinguishes_dirty_and_incomplete_baseline() {
+        let dirty = source_baseline_refusal_message(None, false);
+        let incomplete = source_baseline_refusal_message(None, true);
+
+        assert!(dirty.contains("repository was not clean at the expected base"));
+
+        assert!(incomplete.contains("incomplete evidence"));
+    }
 
     fn scope() -> ReviewScope {
         ReviewScope {
