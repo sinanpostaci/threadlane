@@ -517,6 +517,308 @@ async fn ordinary_review_requires_original_ack_and_source_then_recovers_one_done
     host.shutdown().await.expect("stop fixture host");
 }
 
+struct ReviewDecisionFixture {
+    fixture: ApprovedMcpFixture,
+    host: ApprovedHostHandle,
+    mcp: PairedMcpServer,
+    approval_id: String,
+    item_id: String,
+}
+
+async fn review_decision_fixture(write_paths: &[&str]) -> ReviewDecisionFixture {
+    let fixture = setup_approved_mcp_fixture().await;
+    let context = review_test_context(&fixture);
+    let mut tasks = default_plan_tasks("Implement the decision fixture");
+    tasks[0].allowed_write_paths = write_paths.iter().map(|path| (*path).to_string()).collect();
+    let (revision, digest) = create_published_plan(
+        &fixture,
+        "plan-review-decision-fixture",
+        &fixture.binding_a,
+        tasks,
+    );
+    let approval = approve_published_plan(
+        &fixture,
+        "plan-review-decision-fixture",
+        revision,
+        &digest,
+        &fixture.binding_a,
+        THREAD_UUID_A,
+        vec!["task-root-agy".to_string()],
+        1_700_002_901_000,
+    );
+    let host = start_fixture_host(&fixture, &approval.approval_id).await;
+    let mcp = live_mcp(&fixture);
+    enroll_server(&fixture, &mcp, &fixture.binding_a, THREAD_UUID_A).await;
+    mcp.set_review_test_connection(&fixture.binding_a, THREAD_UUID_A, context);
+    let (item_id, revision) =
+        create_worker_item(&mcp, "create-review-decision", "Review decision").await;
+    mcp.invoke_tool_json(
+        "ordinary_review_scope",
+        json!({"approval_id": approval.approval_id, "task_id": "task-root-agy",
+            "item_id": item_id, "source_files": []}),
+        None,
+    )
+    .await
+    .expect("freeze the direct review scope before start");
+    let start = mcp
+        .invoke_tool_json(
+            "backlog_worker_start",
+            json!({"item_id": item_id, "expected_revision": revision,
+                "command_key": "start-review-decision", "approval_id": approval.approval_id,
+                "task_id": "task-root-agy"}),
+            None,
+        )
+        .await
+        .expect("start fake provider for decision fixture");
+    let execution: WorkerBacklogExecution =
+        serde_json::from_value(start.structured_content.unwrap()["data"]["execution"].clone())
+            .expect("decode decision fixture execution");
+    let dispatch = execution.dispatch_receipt.expect("actual dispatch receipt");
+    assert_eq!(
+        wait_for_terminal_task(&mcp, &approval.approval_id, "task-root-agy")
+            .await
+            .status,
+        TaskExecutionStatus::ReadyForReview
+    );
+    let mut terminal_seq = None;
+    for page_number in 0..16 {
+        let pulled = mcp
+            .invoke_tool_json(
+                "approved_pull_events",
+                json!({"approval_id": approval.approval_id}),
+                None,
+            )
+            .await
+            .expect("pull actual decision fixture events");
+        let page: ApprovedEventBatch =
+            serde_json::from_value(pulled.structured_content.unwrap()["data"].clone())
+                .expect("decode fixture event page");
+        assert_eq!(page.session_binding_id, dispatch.session_binding_id);
+        for event in &page.batch.events {
+            if event.kind == EventKind::WorkerCompleted {
+                assert_eq!(event.run_id, dispatch.run_id);
+                assert!(event.important);
+                assert!(terminal_seq.replace(event.seq).is_none());
+            }
+        }
+        let ack = mcp
+            .invoke_tool_json(
+                "approved_ack_events",
+                json!({"approval_id": approval.approval_id, "batch_id": page.batch.batch_id}),
+                None,
+            )
+            .await
+            .expect("acknowledge actual decision fixture batch");
+        let ack: ApprovedEventAck =
+            serde_json::from_value(ack.structured_content.unwrap()["data"].clone())
+                .expect("decode fixture ACK");
+        if !page.batch.has_more {
+            assert!(ack.ack.acked_seq >= terminal_seq.expect("terminal event was acknowledged"));
+            break;
+        }
+        assert!(page_number < 15, "fixture event pages must be bounded");
+    }
+    assert_eq!(read_invocation_count(&fixture.agy_count_file), 1);
+    ReviewDecisionFixture {
+        fixture,
+        host,
+        mcp,
+        approval_id: approval.approval_id,
+        item_id,
+    }
+}
+
+async fn prepare_decision_read(fixture: &ReviewDecisionFixture) -> String {
+    let prepared = fixture
+        .mcp
+        .invoke_tool_json(
+            "ordinary_review_prepare",
+            json!({"approval_id": fixture.approval_id}),
+            None,
+        )
+        .await
+        .expect("prepare direct review from the acknowledged Worker result");
+    let data = prepared.structured_content.unwrap()["data"].clone();
+    assert_eq!(data["status"], "ready_for_semantic_review");
+    assert_eq!(data["source"]["status"], "not_requested");
+    data["read_id"]
+        .as_str()
+        .expect("review read ID")
+        .to_string()
+}
+
+#[tokio::test]
+async fn ordinary_review_pending_intent_without_done_never_reissues_effect() {
+    let f = review_decision_fixture(&["src/lib.rs"]).await;
+    let read_id = prepare_decision_read(&f).await;
+    let store = crate::ordinary_review::ReviewStore::open(&f.fixture.state_dir).unwrap();
+    let read = store.read(&read_id).expect("load exact review read");
+    let reason = "Accept the reviewed decision fixture.";
+    let intent = crate::ordinary_review::DecisionIntent {
+        schema_version: 1,
+        read_id: read_id.clone(),
+        reason: reason.to_string(),
+        acceptance_evidence: crate::ordinary_review::acceptance_evidence(&read_id, &read).unwrap(),
+        refusal: None,
+        completion: None,
+    };
+    // Represent an interruption after persisting the intent and before any guarded effect.
+    store
+        .store_decision(&intent)
+        .expect("persist pending decision intent");
+    let before = get_item(&f.mcp, &f.item_id).await;
+    let history = get_history(&f.mcp, &f.item_id).await;
+    assert_eq!(before.status, BacklogStatus::Doing);
+    assert!(history
+        .entries
+        .iter()
+        .all(|entry| entry.action != BacklogHistoryAction::Completed));
+    let args = json!({"read_id": read_id, "verdict": "accept", "reason": reason});
+    for _ in 0..2 {
+        let error = f
+            .mcp
+            .invoke_tool_json("ordinary_review_complete", args.clone(), None)
+            .await
+            .expect_err("pending intent without a durable Done cannot be retried");
+        assert_eq!(
+            error.structured_content.unwrap()["error"]["code"],
+            "completion_outcome_unknown"
+        );
+        assert_worker_state_unchanged(&f.mcp, &f.item_id, &before, &history).await;
+    }
+    assert_eq!(store.decision(&read_id).unwrap(), Some(intent));
+    assert_eq!(read_invocation_count(&f.fixture.agy_count_file), 1);
+    f.host.shutdown().await.expect("stop fixture host");
+}
+
+#[tokio::test]
+async fn ordinary_review_stale_revision_refusal_is_durable() {
+    let f = review_decision_fixture(&["src/lib.rs"]).await;
+    let read_id = prepare_decision_read(&f).await;
+    let before_edit = get_item(&f.mcp, &f.item_id).await;
+    f.mcp
+        .invoke_tool_json(
+            "backlog_edit",
+            json!({"command_key": "edit-after-review", "item_id": f.item_id,
+            "expected_revision": before_edit.revision, "title": "Edited after the review"}),
+            None,
+        )
+        .await
+        .expect("advance the real Doing item revision after the immutable read");
+    let changed = get_item(&f.mcp, &f.item_id).await;
+    let history = get_history(&f.mcp, &f.item_id).await;
+    assert_eq!(changed.revision, before_edit.revision + 1);
+    assert_eq!(changed.status, BacklogStatus::Doing);
+    let args = json!({"read_id": read_id, "verdict": "accept", "reason": "Accept the reviewed decision fixture."});
+    for _ in 0..2 {
+        let error = f
+            .mcp
+            .invoke_tool_json("ordinary_review_complete", args.clone(), None)
+            .await
+            .expect_err("the stale immutable review cannot complete");
+        assert_eq!(
+            error.structured_content.unwrap()["error"]["code"],
+            "stale_revision"
+        );
+        assert_worker_state_unchanged(&f.mcp, &f.item_id, &changed, &history).await;
+    }
+    let store = crate::ordinary_review::ReviewStore::open(&f.fixture.state_dir).unwrap();
+    let intent = store
+        .decision(&read_id)
+        .unwrap()
+        .expect("persisted stale refusal");
+    assert_eq!(
+        intent.refusal,
+        Some(crate::ordinary_review::DefiniteRefusal::StaleRevision)
+    );
+    assert!(intent.completion.is_none());
+    assert_eq!(read_invocation_count(&f.fixture.agy_count_file), 1);
+    f.host.shutdown().await.expect("stop fixture host");
+}
+
+#[tokio::test]
+async fn ordinary_review_changed_delivery_refusal_is_durable() {
+    let f = review_decision_fixture(&["src/lib.rs"]).await;
+    let read_id = prepare_decision_read(&f).await;
+    let store = crate::ordinary_review::ReviewStore::open(&f.fixture.state_dir).unwrap();
+    let read = store.read(&read_id).expect("load exact review read");
+    let file = Path::new(&read.physical.root).join("src/lib.rs");
+    let original = fs::read(&file).expect("read actual delivered bytes");
+    let mut changed_bytes = original.clone();
+    changed_bytes[0] = if changed_bytes[0] == b'/' { b'#' } else { b'/' };
+    fs::write(&file, &changed_bytes).expect("change delivered bytes after review");
+    let before = get_item(&f.mcp, &f.item_id).await;
+    let history = get_history(&f.mcp, &f.item_id).await;
+    let args = json!({"read_id": read_id, "verdict": "accept", "reason": "Accept the reviewed decision fixture."});
+    let error = f
+        .mcp
+        .invoke_tool_json("ordinary_review_complete", args.clone(), None)
+        .await
+        .expect_err("changed delivery must refuse the first completion");
+    assert_eq!(
+        error.structured_content.unwrap()["error"]["code"],
+        "delivery_digest_mismatch"
+    );
+    assert_worker_state_unchanged(&f.mcp, &f.item_id, &before, &history).await;
+    fs::write(&file, &original).expect("restore exact delivery bytes");
+    let repeated = f
+        .mcp
+        .invoke_tool_json("ordinary_review_complete", args, None)
+        .await
+        .expect_err("the original refusal is retained even after restoring bytes");
+    assert_eq!(
+        repeated.structured_content.unwrap()["error"]["code"],
+        "delivery_digest_mismatch"
+    );
+    assert_worker_state_unchanged(&f.mcp, &f.item_id, &before, &history).await;
+    let intent = store
+        .decision(&read_id)
+        .unwrap()
+        .expect("persisted delivery refusal");
+    assert_eq!(
+        intent.refusal,
+        Some(crate::ordinary_review::DefiniteRefusal::DeliveryDigestMismatch)
+    );
+    assert!(intent.completion.is_none());
+    assert_eq!(read_invocation_count(&f.fixture.agy_count_file), 1);
+    f.host.shutdown().await.expect("stop fixture host");
+}
+
+#[tokio::test]
+async fn ordinary_review_refuses_when_only_a_subset_of_write_paths_changed() {
+    let f = review_decision_fixture(&["src/lib.rs", "src/extra.rs"]).await;
+    let args = json!({"approval_id": f.approval_id});
+    let first = f
+        .mcp
+        .invoke_tool_json("ordinary_review_prepare", args.clone(), None)
+        .await
+        .expect_err("unchanged allowed path must prevent ready review");
+    assert_eq!(
+        first.structured_content.unwrap()["error"]["code"],
+        "review_evidence_incomplete"
+    );
+    let before = get_item(&f.mcp, &f.item_id).await;
+    let history = get_history(&f.mcp, &f.item_id).await;
+    assert_eq!(before.status, BacklogStatus::Doing);
+    let store = crate::ordinary_review::ReviewStore::open(&f.fixture.state_dir).unwrap();
+    assert!(store
+        .indexed_read(&f.fixture.binding_a, &f.approval_id)
+        .unwrap()
+        .is_none());
+    let repeated = f
+        .mcp
+        .invoke_tool_json("ordinary_review_prepare", args, None)
+        .await
+        .expect_err("repeated inspection cannot create Ready for a partial delivery");
+    assert_eq!(
+        repeated.structured_content.unwrap()["error"]["code"],
+        "review_evidence_incomplete"
+    );
+    assert_worker_state_unchanged(&f.mcp, &f.item_id, &before, &history).await;
+    assert_eq!(read_invocation_count(&f.fixture.agy_count_file), 1);
+    f.host.shutdown().await.expect("stop fixture host");
+}
+
 async fn create_worker_item(
     mcp: &PairedMcpServer,
     command_key: &str,
