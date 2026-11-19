@@ -53,10 +53,10 @@ use crate::auto_pair::{
 };
 use crate::backlog_worker::{
     WorkerBacklogCompleteOutcome, WorkerBacklogCompleteParams, WorkerBacklogError,
-    WorkerBacklogRejectOutcome, WorkerBacklogRejectParams, WorkerBacklogResultOutcome,
-    WorkerBacklogResultParams, WorkerBacklogService, WorkerBacklogStartParams,
-    WORKER_BACKLOG_COMPLETE_TOOL, WORKER_BACKLOG_REJECT_TOOL, WORKER_BACKLOG_RESULT_TOOL,
-    WORKER_BACKLOG_START_TOOL,
+    WorkerBacklogNoticeContextParams, WorkerBacklogRejectOutcome, WorkerBacklogRejectParams,
+    WorkerBacklogResultOutcome, WorkerBacklogResultParams, WorkerBacklogService,
+    WorkerBacklogStartParams, WORKER_BACKLOG_COMPLETE_TOOL, WORKER_BACKLOG_NOTICE_CONTEXT_TOOL,
+    WORKER_BACKLOG_REJECT_TOOL, WORKER_BACKLOG_RESULT_TOOL, WORKER_BACKLOG_START_TOOL,
 };
 use crate::error::{NativeError, NativeErrorCode};
 use crate::execution_gateway::{
@@ -1842,6 +1842,7 @@ impl PairedMcpServer {
                 self.prepare_workflow_or_approved_tool_json_future(tool_name, arguments)
             }
             WORKER_BACKLOG_START_TOOL
+            | WORKER_BACKLOG_NOTICE_CONTEXT_TOOL
             | WORKER_BACKLOG_RESULT_TOOL
             | WORKER_BACKLOG_COMPLETE_TOOL
             | WORKER_BACKLOG_REJECT_TOOL => {
@@ -2082,6 +2083,11 @@ impl PairedMcpServer {
                 let params: WorkerBacklogResultParams =
                     Self::parse_tool_params(tool_name, arguments)?;
                 Ok(self.backlog_worker_result_boxed(params))
+            }
+            WORKER_BACKLOG_NOTICE_CONTEXT_TOOL => {
+                let params: WorkerBacklogNoticeContextParams =
+                    Self::parse_tool_params(tool_name, arguments)?;
+                Ok(self.backlog_worker_notice_context_boxed(params))
             }
             WORKER_BACKLOG_COMPLETE_TOOL => {
                 let params: WorkerBacklogCompleteParams =
@@ -3931,6 +3937,58 @@ impl PairedMcpServer {
         })
     }
 
+    fn backlog_worker_notice_context_boxed(
+        &self,
+        params: WorkerBacklogNoticeContextParams,
+    ) -> BoxedTaskLocalFuture<'_, Result<CallToolResult, CallToolResult>> {
+        Box::pin(async move {
+            let enrollment =
+                self.verify_enrolled_binding_for_tool(WORKER_BACKLOG_NOTICE_CONTEXT_TOOL)?;
+            let Some(stores) = self.host_stores.clone() else {
+                return Err(Self::format_scoped_error(
+                    &enrollment.binding_id,
+                    WORKER_BACKLOG_NOTICE_CONTEXT_TOOL,
+                    "host_not_configured",
+                    HOST_NOT_CONFIGURED_MESSAGE,
+                ));
+            };
+            let service = self.backlog_worker_service(&stores).map_err(|error| {
+                Self::format_scoped_error(
+                    &enrollment.binding_id,
+                    WORKER_BACKLOG_NOTICE_CONTEXT_TOOL,
+                    error.code(),
+                    error.message(),
+                )
+            })?;
+            let final_recheck = self.backlog_worker_final_recheck(
+                WORKER_BACKLOG_NOTICE_CONTEXT_TOOL,
+                enrollment.binding_id.clone(),
+                enrollment.thread_id.clone(),
+            );
+            match service
+                .notice_context(
+                    &enrollment.binding_id,
+                    &enrollment.thread_id,
+                    params,
+                    final_recheck,
+                )
+                .await
+            {
+                Ok(outcome) => Self::format_planning_gateway_result(
+                    &enrollment.binding_id,
+                    WORKER_BACKLOG_NOTICE_CONTEXT_TOOL,
+                    outcome,
+                ),
+                Err(error) => Err(Self::format_scoped_error(
+                    &enrollment.binding_id,
+                    WORKER_BACKLOG_NOTICE_CONTEXT_TOOL,
+                    error.code(),
+                    error.message(),
+                )),
+            }
+        })
+    }
+
     fn backlog_worker_result_boxed(
         &self,
         params: WorkerBacklogResultParams,
@@ -5175,6 +5233,25 @@ impl PairedMcpServer {
         Parameters(params): Parameters<WorkerBacklogStartParams>,
     ) -> Result<CallToolResult, CallToolResult> {
         self.backlog_worker_start_boxed(params).await
+    }
+
+    /// Recovers the unique current Worker notice context without changing durable state.
+    #[tool(
+        name = "backlog_worker_notice_context",
+        description = "Resolve one native notice approval_id against the verified paired chat and durable original Worker execution. Returns only a unique current dispatched attempt, frozen inspection scope, current item snapshot, and a canonical already-Done receipt if present. Rejects unknown, foreign, superseded, or ambiguous history. Does not start a host, dispatch, pull or acknowledge events, reconcile outcomes, or grant authority.",
+        annotations(
+            title = "Recover Worker Notice Context",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    pub async fn backlog_worker_notice_context(
+        &self,
+        Parameters(params): Parameters<WorkerBacklogNoticeContextParams>,
+    ) -> Result<CallToolResult, CallToolResult> {
+        self.backlog_worker_notice_context_boxed(params).await
     }
 
     /// Reconciles the exact stored Worker execution against genuine live or stopped host state (requires verified operator enrollment).

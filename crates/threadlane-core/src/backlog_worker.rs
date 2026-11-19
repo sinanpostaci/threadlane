@@ -308,6 +308,15 @@ pub struct WorkerBacklogCompletionReceipt {
     pub execution: WorkerBacklogExecution,
 }
 
+/// Atomic, scoped durable state for recovery of one original Worker notice.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerBacklogNoticeSnapshot {
+    /// Current item read in the same database snapshot as the execution.
+    pub item: BacklogItem,
+    /// The unique execution associated with the approval in this binding.
+    pub execution: WorkerBacklogExecution,
+}
+
 /// Durable rejection receipt returned by the acceptance-rejection commit.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerBacklogAcceptanceRejectionReceipt {
@@ -1290,6 +1299,95 @@ impl Core {
         )?;
         enforce_worker_response_budget(&execution, MAX_COMPACT_RESPONSE_BYTES)?;
         Ok(execution)
+    }
+
+    /// Resolve an approval to one current, previously dispatched Worker execution.
+    ///
+    /// This read neither attaches a receipt nor records an outcome. It refuses multiple
+    /// executions for an approval, superseded attempts and incomplete dispatch records
+    /// rather than choosing a candidate from historical state. The trusted facade must
+    /// reject an `Unknown` outcome before exposing this snapshot for closure.
+    pub fn get_worker_backlog_notice_operator_attested(
+        &self,
+        binding_id: &str,
+        approval_id: &str,
+    ) -> Result<Option<WorkerBacklogNoticeSnapshot>, CoreError> {
+        let clean_binding_id = validate_identifier("binding_id", binding_id)?;
+        let clean_approval_id = validate_identifier("approval_id", approval_id)?;
+        let tx = self.conn.unchecked_transaction()?;
+        Self::ensure_binding_exists_conn(&tx, &clean_binding_id)?;
+        let candidates: Vec<(String, String, String)> = {
+            let mut stmt = tx.prepare(
+                "SELECT binding_id, item_id, execution_ref FROM backlog_worker_executions
+                 WHERE approval_id = ?1 LIMIT 2",
+            )?;
+            let rows = stmt.query_map(params![clean_approval_id], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?;
+            rows.collect::<Result<_, _>>()?
+        };
+        if candidates.is_empty() {
+            tx.commit()?;
+            return Ok(None);
+        }
+        if candidates.len() != 1 || candidates[0].0 != clean_binding_id {
+            return Err(CoreError::Validation {
+                field: "approval_id",
+                reason: "approval must identify exactly one scoped Worker execution".to_string(),
+            });
+        }
+        let (_, item_id, execution_ref) = &candidates[0];
+        let item = load_backlog_item_conn(&tx, &clean_binding_id, item_id)?;
+        let execution = load_worker_execution_conn(&tx, &clean_binding_id, item_id, execution_ref)?;
+        if item.kind != BacklogItemKind::Worker
+            || item.current_execution_ref.as_deref() != Some(execution_ref.as_str())
+            || item.revision < execution.reservation_revision
+            || execution.authority.approval_id != clean_approval_id
+            || execution.dispatch_receipt.is_none()
+        {
+            return Err(CoreError::Validation {
+                field: "approval_id",
+                reason: "Worker execution is not a current, unambiguous dispatched attempt"
+                    .to_string(),
+            });
+        }
+        let (acceptance_digest, delivery_digest) = condition_digests(&item)?;
+        if execution.acceptance_condition_digest != acceptance_digest
+            || execution.delivery_description_digest != delivery_digest
+        {
+            return Err(CoreError::CorruptState(
+                "Worker item conditions no longer match its original reservation".to_string(),
+            ));
+        }
+        match (item.status, execution.completion.as_ref()) {
+            (BacklogStatus::Doing, None)
+                if execution.acceptance_rejection.is_none()
+                    && execution
+                        .outcome
+                        .as_ref()
+                        .is_none_or(|outcome| outcome.outcome == WorkerBacklogOutcome::Success) => {
+            }
+            (BacklogStatus::Blocked, None)
+                if execution.outcome.as_ref().is_some_and(|outcome| {
+                    outcome.outcome != WorkerBacklogOutcome::Success
+                        || execution.acceptance_rejection.is_some()
+                }) => {}
+            (BacklogStatus::Done, Some(completion))
+                if item.completed_at_ms == Some(completion.completed_at_ms)
+                    && item.completion_note.as_deref() == Some(&completion.acceptance_note)
+                    && item.completion_evidence.as_deref()
+                        == Some(&completion.acceptance_evidence) => {}
+            _ => {
+                return Err(CoreError::Validation {
+                    field: "approval_id",
+                    reason: "Worker execution has no recoverable current state".to_string(),
+                });
+            }
+        }
+        let snapshot = WorkerBacklogNoticeSnapshot { item, execution };
+        enforce_worker_response_budget(&snapshot, MAX_COMPACT_RESPONSE_BYTES)?;
+        tx.commit()?;
+        Ok(Some(snapshot))
     }
 
     /// Lists one bounded stable-order page of historical Worker attempt
@@ -2809,6 +2907,205 @@ mod tests {
             CoreError::IdempotencyConflict { .. } => {}
             other => panic!("expected idempotency conflict, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn notice_lookup_is_scoped_read_only_and_returns_the_original_done_receipt() {
+        let (_dir, _db_path, mut core) = open_temp_core();
+        let binding = create_binding(&mut core, THREAD_A, "notice owner");
+        let foreign = create_binding(&mut core, THREAD_B, "other chat");
+        assert!(core
+            .get_worker_backlog_notice_operator_attested(&binding, "apr_missing")
+            .expect("missing lookup")
+            .is_none());
+        let item = core
+            .create_backlog_item(&binding, "notice-item", worker_item("Notice"), 1_000)
+            .expect("create item");
+        let result_digest = "d".repeat(64);
+        let delivery_digest = "e".repeat(64);
+        let execution =
+            reserve_attach_success(&mut core, &binding, &item.item_id, "notice", &result_digest);
+        let before = table_counts(&core);
+        let history = history_entries(&core, &binding, &item.item_id);
+        let snapshot = core
+            .get_worker_backlog_notice_operator_attested(&binding, "apr_notice")
+            .expect("scoped lookup")
+            .expect("execution exists");
+        assert_eq!(snapshot.execution, execution);
+        assert_eq!(snapshot.item.status, BacklogStatus::Doing);
+        assert_validation(
+            core.get_worker_backlog_notice_operator_attested(&foreign, "apr_notice")
+                .expect_err("foreign execution cannot be treated as legacy"),
+            "approval_id",
+        );
+        assert_eq!(table_counts(&core), before);
+        assert_eq!(history_entries(&core, &binding, &item.item_id), history);
+
+        let receipt = core
+            .complete_worker_backlog_item_operator_attested(
+                &binding,
+                "complete-notice",
+                &item.item_id,
+                snapshot.item.revision,
+                completion(&execution.execution_ref, &result_digest, &delivery_digest),
+                1_040,
+            )
+            .expect("complete Worker");
+        let completed_counts = table_counts(&core);
+        let done = core
+            .get_worker_backlog_notice_operator_attested(&binding, "apr_notice")
+            .expect("Done lookup")
+            .expect("Done execution exists");
+        assert_eq!(
+            WorkerBacklogCompletionReceipt {
+                item: done.item,
+                execution: done.execution
+            },
+            receipt
+        );
+        assert_eq!(table_counts(&core), completed_counts);
+
+        let other_item = core
+            .create_backlog_item(&binding, "notice-other", worker_item("Other"), 1_050)
+            .expect("create other item");
+        let mut same_approval = authority("different_task");
+        same_approval.approval_id = "apr_notice".to_string();
+        let other_execution = core
+            .reserve_worker_backlog_execution_operator_attested(
+                &binding,
+                "notice-other-reserve",
+                &other_item.item_id,
+                other_item.revision,
+                same_approval,
+                1_060,
+            )
+            .expect("reserve another task under the approval");
+        core.attach_worker_backlog_dispatch_receipt_operator_attested(
+            &binding,
+            "notice-other-attach",
+            &other_item.item_id,
+            &other_execution.execution_ref,
+            other_execution.reservation_revision,
+            receipt("other"),
+            1_070,
+        )
+        .expect("attach the second eligible dispatch");
+        let ambiguous_counts = table_counts(&core);
+        assert_validation(
+            core.get_worker_backlog_notice_operator_attested(&binding, "apr_notice")
+                .expect_err("multiple executions are ambiguous even when one is Done"),
+            "approval_id",
+        );
+        assert_eq!(table_counts(&core), ambiguous_counts);
+    }
+
+    #[test]
+    fn notice_lookup_rejects_superseded_attempts_and_preserves_unknown_state() {
+        let (_dir, _db_path, mut core) = open_temp_core();
+        let binding = create_binding(&mut core, THREAD_A, "notice recovery");
+        let item = core
+            .create_backlog_item(&binding, "stale-item", worker_item("Stale"), 1_000)
+            .expect("create item");
+        let first = core
+            .reserve_worker_backlog_execution_operator_attested(
+                &binding,
+                "stale-reserve",
+                &item.item_id,
+                item.revision,
+                authority("old"),
+                1_010,
+            )
+            .expect("reserve original");
+        assert_validation(
+            core.get_worker_backlog_notice_operator_attested(&binding, "apr_old")
+                .expect_err("unattached dispatch cannot be recovered"),
+            "approval_id",
+        );
+        core.attach_worker_backlog_dispatch_receipt_operator_attested(
+            &binding,
+            "stale-attach",
+            &item.item_id,
+            &first.execution_ref,
+            2,
+            receipt("old"),
+            1_020,
+        )
+        .expect("attach original");
+        core.record_worker_backlog_outcome_operator_attested(
+            &binding,
+            "stale-failure",
+            &item.item_id,
+            &first.execution_ref,
+            3,
+            WorkerBacklogOutcomeReport {
+                outcome: WorkerBacklogOutcome::Failure,
+                note: "verified failure".to_string(),
+                result_digest: Some("d".repeat(64)),
+            },
+            1_030,
+        )
+        .expect("record failure");
+        let blocked = core
+            .get_worker_backlog_notice_operator_attested(&binding, "apr_old")
+            .expect("blocked lookup")
+            .expect("blocked execution");
+        assert_eq!(blocked.item.status, BacklogStatus::Blocked);
+        let newer = core
+            .reserve_worker_backlog_execution_operator_attested(
+                &binding,
+                "new-reserve",
+                &item.item_id,
+                blocked.item.revision,
+                authority("new"),
+                1_040,
+            )
+            .expect("reserve new authorized attempt");
+        let before = table_counts(&core);
+        assert_validation(
+            core.get_worker_backlog_notice_operator_attested(&binding, "apr_old")
+                .expect_err("old approval is superseded"),
+            "approval_id",
+        );
+        assert_eq!(table_counts(&core), before);
+        let current = core
+            .get_backlog_item(&binding, &item.item_id)
+            .expect("current item");
+        core.attach_worker_backlog_dispatch_receipt_operator_attested(
+            &binding,
+            "new-attach",
+            &item.item_id,
+            &newer.execution_ref,
+            current.revision,
+            receipt("new"),
+            1_050,
+        )
+        .expect("attach newer");
+        let current = core
+            .get_backlog_item(&binding, &item.item_id)
+            .expect("attached item");
+        core.record_worker_backlog_outcome_operator_attested(
+            &binding,
+            "new-unknown",
+            &item.item_id,
+            &newer.execution_ref,
+            current.revision,
+            WorkerBacklogOutcomeReport {
+                outcome: WorkerBacklogOutcome::Unknown,
+                note: "effect unknown".to_string(),
+                result_digest: None,
+            },
+            1_060,
+        )
+        .expect("record unknown");
+        let snapshot = core
+            .get_worker_backlog_notice_operator_attested(&binding, "apr_new")
+            .expect("unknown lookup")
+            .expect("unknown record remains visible to trusted facade");
+        assert_eq!(snapshot.item.status, BacklogStatus::Blocked);
+        assert_eq!(
+            snapshot.execution.outcome.unwrap().outcome,
+            WorkerBacklogOutcome::Unknown
+        );
     }
 
     #[test]

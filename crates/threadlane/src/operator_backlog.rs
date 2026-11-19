@@ -29,8 +29,8 @@ use threadlane_core::{
     estimate_wire_response_bytes, Core, CoreError, WorkerBacklogAcceptanceRejection,
     WorkerBacklogAcceptanceRejectionReceipt, WorkerBacklogAttemptPage, WorkerBacklogAuthority,
     WorkerBacklogCompletion, WorkerBacklogCompletionReceipt, WorkerBacklogDispatchReceipt,
-    WorkerBacklogExecution, WorkerBacklogOutcomeReport, MAX_COMPACT_RESPONSE_BYTES,
-    MAX_PAGE_RESPONSE_BYTES,
+    WorkerBacklogExecution, WorkerBacklogNoticeSnapshot, WorkerBacklogOutcomeReport,
+    MAX_COMPACT_RESPONSE_BYTES, MAX_PAGE_RESPONSE_BYTES,
 };
 
 /// Trusted-local HTTP path for the operator Worker backlog operations.
@@ -133,6 +133,15 @@ pub enum OperatorWorkerBacklogRequest {
         /// Reserved execution reference.
         execution_ref: String,
     },
+    /// Read the unique current dispatched execution for an approval.
+    GetNoticeContext {
+        /// Owning binding identifier.
+        binding_id: String,
+        /// Canonical native thread bound to `binding_id`.
+        thread_uuid: String,
+        /// Frozen approval identifier from the notice.
+        approval_id: String,
+    },
     /// List a bounded page of durable execution attempts for one Worker backlog item.
     ListAttempts {
         /// Owning binding identifier.
@@ -159,6 +168,7 @@ impl OperatorWorkerBacklogRequest {
             | Self::Complete { binding_id, .. }
             | Self::RejectAcceptance { binding_id, .. }
             | Self::GetExecution { binding_id, .. }
+            | Self::GetNoticeContext { binding_id, .. }
             | Self::ListAttempts { binding_id, .. } => binding_id,
         }
     }
@@ -172,6 +182,7 @@ impl OperatorWorkerBacklogRequest {
             | Self::Complete { thread_uuid, .. }
             | Self::RejectAcceptance { thread_uuid, .. }
             | Self::GetExecution { thread_uuid, .. }
+            | Self::GetNoticeContext { thread_uuid, .. }
             | Self::ListAttempts { thread_uuid, .. } => thread_uuid,
         }
     }
@@ -203,6 +214,11 @@ pub enum OperatorWorkerBacklogResponse {
     Execution {
         /// Compact durable execution record.
         execution: WorkerBacklogExecution,
+    },
+    /// Atomic current item and execution snapshot for notice recovery.
+    NoticeContext {
+        /// Unique scoped durable snapshot.
+        snapshot: Option<WorkerBacklogNoticeSnapshot>,
     },
     /// Durable completion receipt returned by complete.
     Completion {
@@ -340,6 +356,12 @@ pub(crate) fn execute_operator_worker_backlog(
                 &execution_ref,
             )?,
         },
+        OperatorWorkerBacklogRequest::GetNoticeContext { approval_id, .. } => {
+            OperatorWorkerBacklogResponse::NoticeContext {
+                snapshot: core
+                    .get_worker_backlog_notice_operator_attested(&binding_id, &approval_id)?,
+            }
+        }
         OperatorWorkerBacklogRequest::ListAttempts {
             item_id,
             cursor,
@@ -371,6 +393,9 @@ pub(crate) fn enforce_operator_worker_backlog_response_budget(
     match response {
         OperatorWorkerBacklogResponse::Execution { execution } => {
             enforce_inner_response_budget(execution, MAX_COMPACT_RESPONSE_BYTES)
+        }
+        OperatorWorkerBacklogResponse::NoticeContext { snapshot } => {
+            enforce_inner_response_budget(snapshot, MAX_COMPACT_RESPONSE_BYTES)
         }
         OperatorWorkerBacklogResponse::Completion { completion } => {
             enforce_inner_response_budget(completion, MAX_COMPACT_RESPONSE_BYTES)

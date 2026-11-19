@@ -494,6 +494,7 @@ async fn guarded_worker_backlog_tools_are_registered_with_strict_bounded_inputs(
     let tools = mcp.list_tools();
 
     for (name, expected, read_only) in [
+        ("backlog_worker_notice_context", &["approval_id"][..], true),
         (
             "backlog_worker_start",
             &[
@@ -593,6 +594,41 @@ async fn guarded_worker_backlog_start_result_complete_duplicate_stopped_and_repl
 
     let (item_id, revision) = create_worker_item(&mcp, "create-happy", "Happy Worker item").await;
 
+    // Only a verified same-chat approval with no guarded history is identified as legacy.
+    let no_guarded = mcp
+        .invoke_tool_json(
+            "backlog_worker_notice_context",
+            json!({"approval_id": approval.approval_id}),
+            None,
+        )
+        .await
+        .expect_err("approval has no guarded execution yet");
+    assert_eq!(
+        no_guarded.structured_content.unwrap()["error"]["code"],
+        "no_guarded_execution"
+    );
+    let foreign_notice = other_mcp
+        .invoke_tool_json(
+            "backlog_worker_notice_context",
+            json!({"approval_id": approval.approval_id}),
+            None,
+        )
+        .await
+        .expect_err("foreign chat cannot discover an approval");
+    assert_eq!(
+        foreign_notice.structured_content.unwrap()["error"]["code"],
+        "scope_mismatch"
+    );
+    let unexpected = mcp
+        .invoke_tool_json(
+            "backlog_worker_notice_context",
+            json!({"approval_id": approval.approval_id, "task_id": "task-root-agy"}),
+            None,
+        )
+        .await
+        .expect_err("notice input only accepts approval_id");
+    assert!(unexpected.is_error.unwrap_or(false));
+
     // Stale caller revision reserves nothing and invokes no provider.
     let stale = mcp
         .invoke_tool_json(
@@ -686,6 +722,18 @@ async fn guarded_worker_backlog_start_result_complete_duplicate_stopped_and_repl
         wrong_thread.structured_content.unwrap()["error"]["code"],
         "scope_mismatch"
     );
+    let wrong_thread_notice = mcp
+        .invoke_tool_json(
+            "backlog_worker_notice_context",
+            json!({"approval_id": alt_thread_approval.approval_id}),
+            None,
+        )
+        .await
+        .expect_err("wrong-thread approval cannot select legacy fallback");
+    assert_eq!(
+        wrong_thread_notice.structured_content.unwrap()["error"]["code"],
+        "scope_mismatch"
+    );
     assert_eq!(read_invocation_count(&fixture.agy_count_file), 0);
     assert_eq!(get_item(&mcp, &item_id).await.status, BacklogStatus::Todo);
 
@@ -705,6 +753,43 @@ async fn guarded_worker_backlog_start_result_complete_duplicate_stopped_and_repl
         serde_json::from_value(start_data["execution"].clone()).expect("decode execution");
     assert!(first_execution.dispatch_receipt.is_some());
     assert_eq!(get_item(&mcp, &item_id).await.status, BacklogStatus::Doing);
+    assert_eq!(read_invocation_count(&fixture.agy_count_file), 1);
+
+    let item_before_notice = get_item(&mcp, &item_id).await;
+    let history_before_notice = get_history(&mcp, &item_id).await;
+    let batches_before_notice = event_batch_row_count(&fixture.state_dir, &fixture.binding_a);
+    let notice = mcp
+        .invoke_tool_json(
+            "backlog_worker_notice_context",
+            json!({"approval_id": approval.approval_id}),
+            None,
+        )
+        .await
+        .expect("recover exact current execution from notice");
+    let notice_data = notice.structured_content.unwrap()["data"].clone();
+    assert_eq!(notice_data["execution"], start_data["execution"]);
+    assert_eq!(notice_data["scope"]["base_commit"], approval.base_commit);
+    assert_eq!(
+        notice_data["scope"]["requested_model"],
+        "gemini-4-argon-high"
+    );
+    assert_eq!(notice_data["scope"]["requested_effort"], "high");
+    assert_eq!(notice_data["scope"]["write_paths"], json!(["src/lib.rs"]));
+    assert_eq!(
+        notice_data["item_snapshot"]["current_execution_ref"],
+        first_execution.execution_ref
+    );
+    assert_eq!(notice_data["item_snapshot"]["status"], "doing");
+    assert!(notice_data.get("completion").is_none());
+    assert!(!notice_data
+        .to_string()
+        .contains("Guarded Worker backlog happy path"));
+    assert_worker_state_unchanged(&mcp, &item_id, &item_before_notice, &history_before_notice)
+        .await;
+    assert_eq!(
+        event_batch_row_count(&fixture.state_dir, &fixture.binding_a),
+        batches_before_notice
+    );
     assert_eq!(read_invocation_count(&fixture.agy_count_file), 1);
 
     // Exact duplicate reuses the same reservation and invocation in-process. This is not a
@@ -935,6 +1020,33 @@ async fn guarded_worker_backlog_start_result_complete_duplicate_stopped_and_repl
 
     // Exact durable replay does not require the old mutable checkout.
     fs::remove_dir_all(&checkout).expect("remove completed task checkout");
+    let before_done_notice = get_item(&mcp, &item_id).await;
+    let done_history = get_history(&mcp, &item_id).await;
+    let host_before_notice = capture_host_history(&fixture, &approval.approval_id);
+    let done_batch_count = event_batch_row_count(&fixture.state_dir, &fixture.binding_a);
+    for _ in 0..2 {
+        let duplicate_notice = mcp
+            .invoke_tool_json(
+                "backlog_worker_notice_context",
+                json!({"approval_id": approval.approval_id}),
+                None,
+            )
+            .await
+            .expect("recover Done without host or checkout");
+        let data = duplicate_notice.structured_content.unwrap()["data"].clone();
+        assert_eq!(data["item_snapshot"]["status"], "done");
+        assert_eq!(data["completion"], completed_data["completion"]);
+    }
+    assert_worker_state_unchanged(&mcp, &item_id, &before_done_notice, &done_history).await;
+    assert_eq!(
+        capture_host_history(&fixture, &approval.approval_id),
+        host_before_notice
+    );
+    assert_eq!(
+        event_batch_row_count(&fixture.state_dir, &fixture.binding_a),
+        done_batch_count
+    );
+    assert_eq!(read_invocation_count(&fixture.agy_count_file), 1);
     let replayed = mcp
         .invoke_tool_json("backlog_worker_complete", complete_params.clone(), None)
         .await
@@ -1076,6 +1188,25 @@ async fn guarded_worker_backlog_failure_is_recorded_and_never_completed() {
     );
     let blocked_item = get_item(&mcp, &item_id).await;
     assert_eq!(blocked_item.status, BacklogStatus::Blocked);
+    let blocked_notice = mcp
+        .invoke_tool_json(
+            "backlog_worker_notice_context",
+            json!({"approval_id": approval.approval_id}),
+            None,
+        )
+        .await
+        .expect("recover failed execution for bounded event handling");
+    let blocked_notice_data = blocked_notice.structured_content.unwrap()["data"].clone();
+    assert_eq!(blocked_notice_data["item_snapshot"]["status"], "blocked");
+    assert_eq!(
+        blocked_notice_data["execution"]["outcome"]["outcome"],
+        "failure"
+    );
+    assert_eq!(
+        blocked_notice_data["execution"]["dispatch_receipt"],
+        json!(execution.dispatch_receipt)
+    );
+    assert!(blocked_notice_data.get("completion").is_none());
     assert!(
         blocked_item
             .blocked_reason
@@ -1332,6 +1463,22 @@ async fn guarded_worker_backlog_rejection_rechecks_delivery_and_replays_durably(
     let rejection: WorkerBacklogAcceptanceRejectionReceipt =
         serde_json::from_value(rejected_data["rejection"].clone())
             .expect("decode rejection receipt");
+    let rejected_notice = mcp
+        .invoke_tool_json(
+            "backlog_worker_notice_context",
+            json!({"approval_id": approval.approval_id}),
+            None,
+        )
+        .await
+        .expect("recover rejected execution for bounded event handling");
+    let rejected_notice_data = rejected_notice.structured_content.unwrap()["data"].clone();
+    assert_eq!(rejected_notice_data["item_snapshot"]["status"], "blocked");
+    assert_eq!(
+        rejected_notice_data["execution"],
+        rejected_data["rejection"]["execution"]
+    );
+    assert!(!rejected_notice_data["execution"]["acceptance_rejection"].is_null());
+    assert!(rejected_notice_data.get("completion").is_none());
     assert_eq!(rejection.item.status, BacklogStatus::Blocked);
     assert_eq!(
         rejection.item.current_execution_ref.as_deref(),
@@ -1653,6 +1800,19 @@ async fn guarded_worker_backlog_rejection_rechecks_delivery_and_replays_durably(
     );
     assert_eq!(read_invocation_count(&fixture.agy_count_file), 2);
 
+    let stale_notice = mcp
+        .invoke_tool_json(
+            "backlog_worker_notice_context",
+            json!({"approval_id": approval.approval_id}),
+            None,
+        )
+        .await
+        .expect_err("superseded notice must not resolve to the old or new attempt");
+    assert_ne!(
+        stale_notice.structured_content.unwrap()["error"]["code"],
+        "no_guarded_execution"
+    );
+
     // The original rejection still replays even though a newer attempt is now current.
     let replay_with_newer_attempt = mcp
         .invoke_tool_json("backlog_worker_reject", reject_params.clone(), None)
@@ -1839,7 +1999,101 @@ async fn guarded_worker_backlog_unresolved_dispatch_intent_is_not_redispatched()
     let reserved = get_item(&mcp, &item_id).await;
     assert_eq!(reserved.status, BacklogStatus::Doing);
     assert!(reserved.current_execution_ref.is_some());
+    let unresolved_notice = mcp
+        .invoke_tool_json(
+            "backlog_worker_notice_context",
+            json!({"approval_id": approval.approval_id}),
+            None,
+        )
+        .await
+        .expect_err("unresolved dispatch cannot select legacy fallback");
+    assert_ne!(
+        unresolved_notice.structured_content.unwrap()["error"]["code"],
+        "no_guarded_execution"
+    );
 
+    host.shutdown().await.expect("stop fixture host");
+}
+
+#[tokio::test]
+async fn worker_notice_refuses_attached_unknown_outcome_without_side_effects() {
+    use threadlane::operator_backlog::OperatorWorkerBacklogRequest;
+    use threadlane_core::WorkerBacklogOutcomeReport;
+
+    let fixture = setup_approved_mcp_fixture().await;
+    let (revision, digest) = create_published_plan(
+        &fixture,
+        "plan-notice-unknown",
+        &fixture.binding_a,
+        default_plan_tasks("Unknown notice fixture"),
+    );
+    let approval = approve_published_plan(
+        &fixture,
+        "plan-notice-unknown",
+        revision,
+        &digest,
+        &fixture.binding_a,
+        THREAD_UUID_A,
+        vec!["task-root-agy".to_string()],
+        1_700_002_151_000,
+    );
+    let host = start_fixture_host(&fixture, &approval.approval_id).await;
+    let mcp = live_mcp(&fixture);
+    enroll_server(&fixture, &mcp, &fixture.binding_a, THREAD_UUID_A).await;
+    let (item_id, item_revision) =
+        create_worker_item(&mcp, "unknown-notice-item", "Unknown notice").await;
+    let started = mcp
+        .invoke_tool_json(
+            "backlog_worker_start",
+            json!({"item_id": item_id, "expected_revision": item_revision,
+            "command_key": "unknown-notice-start", "approval_id": approval.approval_id,
+            "task_id": "task-root-agy"}),
+            None,
+        )
+        .await
+        .expect("start original test Worker");
+    let execution: WorkerBacklogExecution =
+        serde_json::from_value(started.structured_content.unwrap()["data"]["execution"].clone())
+            .expect("decode dispatched test execution");
+    let item = get_item(&mcp, &item_id).await;
+    let supervisor =
+        SupervisorClient::from_state_dir(&fixture.state_dir).expect("fixture supervisor");
+    supervisor
+        .worker_backlog_operator_attested(&OperatorWorkerBacklogRequest::RecordOutcome {
+            binding_id: fixture.binding_a.clone(),
+            thread_uuid: THREAD_UUID_A.to_string(),
+            command_key: "unknown-notice-record".to_string(),
+            item_id: item_id.clone(),
+            execution_ref: execution.execution_ref,
+            expected_revision: item.revision,
+            report: WorkerBacklogOutcomeReport {
+                outcome: WorkerBacklogOutcome::Unknown,
+                note: "controlled unknown fixture".to_string(),
+                result_digest: None,
+            },
+        })
+        .await
+        .expect("record controlled unknown outcome");
+    let blocked = get_item(&mcp, &item_id).await;
+    let history = get_history(&mcp, &item_id).await;
+    let batches = event_batch_row_count(&fixture.state_dir, &fixture.binding_a);
+    let err = mcp
+        .invoke_tool_json(
+            "backlog_worker_notice_context",
+            json!({"approval_id": approval.approval_id}),
+            None,
+        )
+        .await
+        .expect_err("unknown effect must not be recovered as a closure");
+    assert_eq!(
+        err.structured_content.unwrap()["error"]["code"],
+        "worker_effect_unknown"
+    );
+    assert_worker_state_unchanged(&mcp, &item_id, &blocked, &history).await;
+    assert_eq!(
+        event_batch_row_count(&fixture.state_dir, &fixture.binding_a),
+        batches
+    );
     host.shutdown().await.expect("stop fixture host");
 }
 

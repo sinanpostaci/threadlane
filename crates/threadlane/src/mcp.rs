@@ -70,7 +70,7 @@ pub struct OperatingGuideResponse {
     pub cli_fallback_command: String,
     /// Complete Markdown contents of the shared operating guide.
     pub guide_markdown: String,
-    /// Canonical offline closure template version (`2026-11-16.v4`).
+    /// Canonical offline closure template version (`2026-11-19.v1`).
     pub template_version: String,
     /// Lowercase SHA-256 digest of the trusted closure template source bytes.
     pub source_sha256: String,

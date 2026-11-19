@@ -24,8 +24,8 @@ use threadlane_core::{
     BacklogItem, BacklogItemKind, BacklogStatus, WorkerAcceptanceState,
     WorkerBacklogAcceptanceRejection, WorkerBacklogAcceptanceRejectionReceipt,
     WorkerBacklogAuthority, WorkerBacklogCompletion, WorkerBacklogCompletionReceipt,
-    WorkerBacklogDispatchReceipt, WorkerBacklogExecution, WorkerBacklogOutcome,
-    WorkerBacklogOutcomeReport, WorkerStatus,
+    WorkerBacklogDispatchReceipt, WorkerBacklogExecution, WorkerBacklogNoticeSnapshot,
+    WorkerBacklogOutcome, WorkerBacklogOutcomeReport, WorkerStatus,
 };
 use threadlane_host::{
     ApprovedHostClient, DeliveryInspection, HostError, TaskExecutionStatus, TaskStateSnapshot,
@@ -38,6 +38,7 @@ use crate::host_launcher::{
 
 const START_TOOL: &str = "backlog_worker_start";
 const RESULT_TOOL: &str = "backlog_worker_result";
+const NOTICE_CONTEXT_TOOL: &str = "backlog_worker_notice_context";
 const COMPLETE_TOOL: &str = "backlog_worker_complete";
 const REJECT_TOOL: &str = "backlog_worker_reject";
 const FAILURE_RESULT_DIGEST_SCHEMA: &str = "threadlane-worker-backlog-failure-result-v1";
@@ -70,6 +71,14 @@ pub struct WorkerBacklogResultParams {
     pub item_id: String,
     /// Exact stored Worker execution reference.
     pub execution_ref: String,
+}
+
+/// Strict parameters for recovering one original Worker notice context.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerBacklogNoticeContextParams {
+    /// Exact durable approval identifier carried by the native notice.
+    pub approval_id: String,
 }
 
 /// Strict MCP parameters for separate Coworker acceptance completion.
@@ -146,6 +155,33 @@ pub struct WorkerBacklogItemSnapshot {
     pub status: BacklogStatus,
     /// Actual current Worker execution reference, when one holds the item.
     pub current_execution_ref: Option<String>,
+}
+
+/// Frozen approval/task facts needed for independent delivery inspection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerBacklogNoticeScope {
+    /// Approved repository base commit.
+    pub base_commit: String,
+    /// Frozen requested model.
+    pub requested_model: String,
+    /// Frozen requested reasoning effort.
+    pub requested_effort: String,
+    /// Exact approved task write paths.
+    pub write_paths: Vec<String>,
+}
+
+/// Read-only durable recovery context; no field grants new execution authority.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerBacklogNoticeContextOutcome {
+    /// Current durable execution including the original immutable dispatch identity.
+    pub execution: WorkerBacklogExecution,
+    /// Narrow projection of immutable approval scope.
+    pub scope: WorkerBacklogNoticeScope,
+    /// Atomic current item identity, status, and revision.
+    pub item_snapshot: WorkerBacklogItemSnapshot,
+    /// Canonical completion receipt when this same execution is already Done.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completion: Option<WorkerBacklogCompletionReceipt>,
 }
 
 /// Compact Worker evidence derived from the same verified host task snapshot used for
@@ -451,6 +487,130 @@ pub(crate) struct WorkerBacklogService {
 }
 
 impl WorkerBacklogService {
+    /// Resolve a native notice from durable scoped records without consulting or starting a host.
+    pub(crate) async fn notice_context<F>(
+        &self,
+        binding_id: &str,
+        thread_uuid: &str,
+        params: WorkerBacklogNoticeContextParams,
+        final_recheck: F,
+    ) -> Result<WorkerBacklogNoticeContextOutcome, WorkerBacklogError>
+    where
+        F: FnOnce() -> Result<(), WorkerBacklogError> + Send,
+    {
+        // Resolve the approval first so an identifier from another chat cannot be used to
+        // enumerate that chat's execution state.
+        let record = self
+            .load_record_until(binding_id, thread_uuid, &params.approval_id, None)
+            .await?;
+        let maybe_snapshot = self
+            .get_notice_snapshot(binding_id, thread_uuid, &params.approval_id)
+            .await?;
+        let Some(snapshot) = maybe_snapshot else {
+            final_recheck()?;
+            return Err(WorkerBacklogError::new(
+                "no_guarded_execution",
+                "This verified approval has no guarded Worker execution.",
+            ));
+        };
+        let execution = &snapshot.execution;
+        validate_execution_identity(execution, binding_id, &snapshot.item.item_id)?;
+        let task = resolve_approved_task(&record, &execution.authority.task_id)?;
+        let dispatch = execution.dispatch_receipt.as_ref().ok_or_else(|| {
+            WorkerBacklogError::new(
+                "worker_start_unconfirmed",
+                "The original dispatch receipt is unavailable.",
+            )
+        })?;
+        if execution.authority != authority_for_task(&record, task)
+            || task.profile_id.as_deref() != Some(dispatch.profile_id.as_str())
+            || !task.depends_on.is_empty()
+            || task.allowed_write_paths.is_empty()
+        {
+            return Err(WorkerBacklogError::new(
+                "authority_mismatch",
+                "The current execution does not match an unambiguous frozen Worker scope.",
+            ));
+        }
+        let effort = task
+            .effort
+            .as_ref()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                WorkerBacklogError::new(
+                    "authority_mismatch",
+                    "The frozen Worker effort is unavailable.",
+                )
+            })?;
+        // Detect a superseding attempt or a concurrent completion while resolving authority.
+        // The actual result and completion operations independently recheck current state.
+        let verified = self
+            .get_notice_snapshot(binding_id, thread_uuid, &params.approval_id)
+            .await?;
+        if verified.as_ref() != Some(&snapshot) {
+            return Err(WorkerBacklogError::new(
+                "execution_not_current",
+                "The durable Worker state changed during notice recovery.",
+            ));
+        }
+        final_recheck()?;
+        if snapshot.item.status == BacklogStatus::Blocked
+            && execution
+                .outcome
+                .as_ref()
+                .is_some_and(|outcome| outcome.outcome == WorkerBacklogOutcome::Unknown)
+        {
+            return Err(WorkerBacklogError::new(
+                "worker_effect_unknown",
+                "The original Worker effect remains unknown and cannot be recovered as a successful closure.",
+            ));
+        }
+        let completion = if snapshot.item.status == BacklogStatus::Done {
+            Some(WorkerBacklogCompletionReceipt {
+                item: snapshot.item.clone(),
+                execution: snapshot.execution.clone(),
+            })
+        } else {
+            None
+        };
+        Ok(WorkerBacklogNoticeContextOutcome {
+            item_snapshot: WorkerBacklogItemSnapshot {
+                item_id: snapshot.item.item_id,
+                revision: snapshot.item.revision,
+                status: snapshot.item.status,
+                current_execution_ref: snapshot.item.current_execution_ref,
+            },
+            execution: snapshot.execution,
+            scope: WorkerBacklogNoticeScope {
+                base_commit: record.base_commit.clone(),
+                requested_model: task.base_model.clone(),
+                requested_effort: effort.clone(),
+                write_paths: task.allowed_write_paths.clone(),
+            },
+            completion,
+        })
+    }
+
+    async fn get_notice_snapshot(
+        &self,
+        binding_id: &str,
+        thread_uuid: &str,
+        approval_id: &str,
+    ) -> Result<Option<WorkerBacklogNoticeSnapshot>, WorkerBacklogError> {
+        let request = OperatorWorkerBacklogRequest::GetNoticeContext {
+            binding_id: binding_id.to_string(),
+            thread_uuid: thread_uuid.to_string(),
+            approval_id: approval_id.to_string(),
+        };
+        match self.call(request, None).await? {
+            OperatorWorkerBacklogResponse::NoticeContext { snapshot } => Ok(snapshot),
+            _ => Err(WorkerBacklogError::new(
+                "corrupt_worker_state",
+                "The control supervisor returned an unexpected Worker notice snapshot.",
+            )),
+        }
+    }
+
     /// Builds a lazy trusted-local supervisor client around the existing operator stores.
     pub(crate) fn new(
         state_dir: impl AsRef<std::path::Path>,
@@ -2593,6 +2753,8 @@ fn derived_command_key(operation: &str, execution_ref: &str) -> String {
 pub(crate) const WORKER_BACKLOG_START_TOOL: &str = START_TOOL;
 /// Stable result tool name.
 pub(crate) const WORKER_BACKLOG_RESULT_TOOL: &str = RESULT_TOOL;
+/// Stable read-only notice recovery tool name.
+pub(crate) const WORKER_BACKLOG_NOTICE_CONTEXT_TOOL: &str = NOTICE_CONTEXT_TOOL;
 /// Stable completion tool name.
 pub(crate) const WORKER_BACKLOG_COMPLETE_TOOL: &str = COMPLETE_TOOL;
 /// Stable failed-acceptance rejection tool name.
