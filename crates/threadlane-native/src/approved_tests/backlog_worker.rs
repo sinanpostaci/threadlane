@@ -676,9 +676,17 @@ async fn worker_notice_observation_correlates_only_successful_scoped_receipts() 
     );
     mcp.wait_for_observation_journal_idle_for_test().await;
     foreign.wait_for_observation_journal_idle_for_test().await;
+    // `live_mcp` installs host stores, which share the authority's plans store;
+    // paired observations therefore belong in plans_dir, not the runtime state dir.
     let (journal, warnings) =
-        read_journal_records_readonly(&fixture.state_dir).expect("read observation journal");
+        read_journal_records_readonly(&fixture.plans_dir).expect("read plans observation journal");
     assert!(warnings.is_empty());
+    let (runtime_journal, runtime_warnings) = read_journal_records_readonly(&fixture.state_dir)
+        .expect("read runtime observation journal");
+    assert!(runtime_warnings.is_empty());
+    assert!(runtime_journal
+        .iter()
+        .all(|record| { record.operation != "mcp.paired.backlog_worker_notice_context" }));
     let observations: Vec<_> = journal
         .iter()
         .filter(|record| record.operation == "mcp.paired.backlog_worker_notice_context")
