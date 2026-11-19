@@ -3110,7 +3110,7 @@ exit 0
         );
 
         let expected_msg = format!(
-            "Threadlane approved session {approval_id} has pending events. For an ordinary Worker, run the guide notice callback for '{approval_id}' using the verified package and guide pins. Only legacy_events permits approved_pull_events and ACK of the actual validated batch with approved_ack_events; other refusals stop."
+            "Threadlane approved session {approval_id} has pending events. For a pre-registered native review, call ordinary_review_notice({{\"approval_id\":\"{approval_id}\"}}) now. Otherwise use the originally selected guide route. A refusal never authorizes fallback or restart."
         );
         let log_contents = fs::read_to_string(&codex_log).expect("read codex invocation log");
         let lines: Vec<&str> = log_contents.lines().collect();

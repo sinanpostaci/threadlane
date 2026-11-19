@@ -28,7 +28,7 @@ Run `threadlane guide` to print the canonical versioned operating guide
 ([`docs/MCP-OPERATING-GUIDE.md`](MCP-OPERATING-GUIDE.md)) offline without network
 or supervisor access. When connected over MCP (`threadlane mcp` or enrolled
 `threadlane-native-mcp`), call the read-only `operating_guide` (`{}`) tool to
-fetch the same shared guide and version (`2026-11-19.v4`).
+fetch the same shared guide and version (`2026-11-19.v5`).
 
 Compaction detection and memory retention are not automatic. On initial
 connection, session resume, context uncertainty, or before external effects when

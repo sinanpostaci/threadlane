@@ -613,9 +613,28 @@ struct ReviewDecisionFixture {
 }
 
 async fn review_decision_fixture(write_paths: &[&str]) -> ReviewDecisionFixture {
+    review_decision_fixture_inner(write_paths, true).await
+}
+
+async fn review_decision_fixture_inner(
+    write_paths: &[&str],
+    acknowledge: bool,
+) -> ReviewDecisionFixture {
+    review_decision_fixture_config(write_paths, acknowledge, false).await
+}
+
+async fn review_decision_fixture_config(
+    write_paths: &[&str],
+    acknowledge: bool,
+    progress: bool,
+) -> ReviewDecisionFixture {
     let fixture = setup_approved_mcp_fixture().await;
     let context = review_test_context(&fixture);
-    let mut tasks = default_plan_tasks("Implement the decision fixture");
+    let mut tasks = default_plan_tasks(if progress {
+        "NOTICE_PROGRESS_FIXTURE"
+    } else {
+        "Implement the decision fixture"
+    });
     tasks[0].allowed_write_paths = write_paths.iter().map(|path| (*path).to_string()).collect();
     let (revision, digest) = create_published_plan(
         &fixture,
@@ -661,12 +680,25 @@ async fn review_decision_fixture(write_paths: &[&str]) -> ReviewDecisionFixture 
         serde_json::from_value(start.structured_content.unwrap()["data"]["execution"].clone())
             .expect("decode decision fixture execution");
     let dispatch = execution.dispatch_receipt.expect("actual dispatch receipt");
-    assert_eq!(
-        wait_for_terminal_task(&mcp, &approval.approval_id, "task-root-agy")
-            .await
-            .status,
-        TaskExecutionStatus::ReadyForReview
-    );
+    if progress {
+        wait_for_invocation_count(&fixture.agy_count_file, 1).await;
+    } else {
+        assert_eq!(
+            wait_for_terminal_task(&mcp, &approval.approval_id, "task-root-agy")
+                .await
+                .status,
+            TaskExecutionStatus::ReadyForReview
+        );
+    }
+    if !acknowledge {
+        return ReviewDecisionFixture {
+            fixture,
+            host,
+            mcp,
+            approval_id: approval.approval_id,
+            item_id,
+        };
+    }
     let mut terminal_seq = None;
     for page_number in 0..16 {
         let pulled = mcp
@@ -732,6 +764,331 @@ async fn prepare_decision_read(fixture: &ReviewDecisionFixture) -> String {
         .as_str()
         .expect("review read ID")
         .to_string()
+}
+
+#[tokio::test]
+async fn ordinary_notice_real_pages_duplicate_and_done_are_guarded() {
+    let f = review_decision_fixture_inner(&["src/lib.rs"], false).await;
+    let args = json!({"approval_id": f.approval_id});
+    let forged = f
+        .mcp
+        .invoke_tool_json(
+            "ordinary_review_notice",
+            json!({
+        "approval_id":f.approval_id, "batch_id":"forged"}),
+            None,
+        )
+        .await;
+    assert!(forged.is_err(), "caller cannot supply a batch or identity");
+    let foreign = live_mcp(&f.fixture);
+    enroll_server(&f.fixture, &foreign, &f.fixture.binding_b, THREAD_UUID_B).await;
+    foreign.set_review_test_connection(
+        &f.fixture.binding_b,
+        THREAD_UUID_B,
+        review_test_context(&f.fixture),
+    );
+    let denied = foreign
+        .invoke_tool_json("ordinary_review_notice", args.clone(), None)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        denied.structured_content.unwrap()["error"]["code"],
+        "scope_missing"
+    );
+
+    let package_cli = f.fixture.root.join("review-package/bin/threadlane");
+    fs::write(&package_cli, b"changed package").unwrap();
+    let denied = f
+        .mcp
+        .invoke_tool_json("ordinary_review_notice", args.clone(), None)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        denied.structured_content.unwrap()["error"]["code"],
+        "scope_mismatch"
+    );
+    fs::write(&package_cli, b"fixture cli").unwrap();
+
+    let prepared = f
+        .mcp
+        .invoke_tool_json("ordinary_review_notice", args.clone(), None)
+        .await
+        .unwrap();
+    let envelope = prepared.structured_content.unwrap();
+    assert_eq!(envelope["tool"], "ordinary_review_notice");
+    assert_eq!(envelope["data"]["status"], "ready_for_semantic_review");
+    let read_id = envelope["data"]["read_id"].as_str().unwrap().to_string();
+    assert_eq!(
+        get_item(&f.mcp, &f.item_id).await.status,
+        BacklogStatus::Doing
+    );
+    let store = crate::ordinary_review::ReviewStore::open(&f.fixture.state_dir).unwrap();
+    let notice = store
+        .notice(&f.fixture.binding_a, &f.approval_id)
+        .unwrap()
+        .unwrap();
+    assert!(notice.pending.is_none() && notice.terminal.is_some() && notice.cursor > 0);
+    let duplicate = f
+        .mcp
+        .invoke_tool_json("ordinary_review_notice", args.clone(), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        duplicate.structured_content.unwrap()["data"]["read_id"],
+        read_id
+    );
+
+    f.mcp
+        .invoke_tool_json(
+            "ordinary_review_complete",
+            json!({"read_id":read_id,
+        "verdict":"accept", "reason":"The fixture returns 42."}),
+            None,
+        )
+        .await
+        .unwrap();
+    let done = get_item(&f.mcp, &f.item_id).await;
+    let history = get_history(&f.mcp, &f.item_id).await;
+    assert_eq!(done.status, BacklogStatus::Done);
+    let late = f
+        .mcp
+        .invoke_tool_json("ordinary_review_notice", args, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        late.structured_content.unwrap()["data"]["status"],
+        "already_done"
+    );
+    assert_worker_state_unchanged(&f.mcp, &f.item_id, &done, &history).await;
+    assert_eq!(read_invocation_count(&f.fixture.agy_count_file), 1);
+    f.host.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn ordinary_notice_recovery_requires_ack_of_the_exact_original_batch() {
+    for acknowledge_original in [false, true] {
+        let f = review_decision_fixture_inner(&["src/lib.rs"], false).await;
+        let args = json!({"approval_id": f.approval_id});
+        let context = f
+            .mcp
+            .invoke_tool_json("backlog_worker_notice_context", args.clone(), None)
+            .await
+            .unwrap();
+        let context: crate::backlog_worker::WorkerBacklogNoticeContextOutcome =
+            serde_json::from_value(context.structured_content.unwrap()["data"].clone()).unwrap();
+        let store = crate::ordinary_review::ReviewStore::open(&f.fixture.state_dir).unwrap();
+        let scope = store
+            .scope(&f.fixture.binding_a, &f.approval_id)
+            .unwrap()
+            .unwrap();
+        let first = f
+            .mcp
+            .invoke_tool_json(
+                "approved_pull_events",
+                json!({"approval_id":f.approval_id, "after_seq":0}),
+                None,
+            )
+            .await
+            .unwrap();
+        let first: ApprovedEventBatch =
+            serde_json::from_value(first.structured_content.unwrap()["data"].clone()).unwrap();
+        assert!(!first.batch.events.is_empty() && !first.batch.has_more);
+        let mut notice = crate::ordinary_review::NoticeReceipt::new(&scope, &context).unwrap();
+        assert!(crate::ordinary_review::validate_notice_page(&notice, &scope, &first).is_ok());
+        let mut mixed = first.clone();
+        mixed.batch.events[0].run_id = "foreign-run".to_string();
+        notice.pending = Some(mixed);
+        store
+            .store_notice(&f.fixture.binding_a, &f.approval_id, &notice)
+            .unwrap();
+        let bad = f
+            .mcp
+            .invoke_tool_json("ordinary_review_notice", args.clone(), None)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            bad.structured_content.unwrap()["error"]["code"],
+            "event_continuity_mismatch"
+        );
+        assert_eq!(
+            get_item(&f.mcp, &f.item_id).await.status,
+            BacklogStatus::Doing
+        );
+        notice.pending = Some(first.clone());
+        store
+            .store_notice(&f.fixture.binding_a, &f.approval_id, &notice)
+            .unwrap();
+
+        let acknowledged = if acknowledge_original {
+            first.clone()
+        } else {
+            let other = f
+                .mcp
+                .invoke_tool_json(
+                    "approved_pull_events",
+                    json!({"approval_id":f.approval_id, "after_seq":0}),
+                    None,
+                )
+                .await
+                .unwrap();
+            let other: ApprovedEventBatch =
+                serde_json::from_value(other.structured_content.unwrap()["data"].clone()).unwrap();
+            assert_ne!(other.batch.batch_id, first.batch.batch_id);
+            assert_eq!(
+                (other.batch.from_seq, other.batch.to_seq),
+                (first.batch.from_seq, first.batch.to_seq)
+            );
+            other
+        };
+        f.mcp
+            .invoke_tool_json(
+                "approved_ack_events",
+                json!({"approval_id":f.approval_id, "batch_id":acknowledged.batch.batch_id}),
+                None,
+            )
+            .await
+            .unwrap();
+        // The pending page was persisted before ACK. Drop the reply and reconnect a new server epoch.
+        let reopened = reopened_mcp(&f.fixture);
+        enroll_server(&f.fixture, &reopened, &f.fixture.binding_a, THREAD_UUID_A).await;
+        reopened.set_review_test_connection(
+            &f.fixture.binding_a,
+            THREAD_UUID_A,
+            review_test_context(&f.fixture),
+        );
+        let recovered = reopened
+            .invoke_tool_json("ordinary_review_notice", args, None)
+            .await;
+        if acknowledge_original {
+            assert_eq!(
+                recovered.unwrap().structured_content.unwrap()["data"]["status"],
+                "ready_for_semantic_review"
+            );
+            assert!(store
+                .notice(&f.fixture.binding_a, &f.approval_id)
+                .unwrap()
+                .unwrap()
+                .pending
+                .is_none());
+        } else {
+            assert_eq!(
+                recovered.unwrap_err().structured_content.unwrap()["error"]["code"],
+                "ack_outcome_unknown"
+            );
+            assert!(store
+                .notice(&f.fixture.binding_a, &f.approval_id)
+                .unwrap()
+                .unwrap()
+                .pending
+                .is_some());
+        }
+        assert_eq!(
+            get_item(&reopened, &f.item_id).await.status,
+            BacklogStatus::Doing
+        );
+        assert_eq!(read_invocation_count(&f.fixture.agy_count_file), 1);
+        f.host.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn ordinary_notice_concurrent_duplicates_do_not_block_runtime_or_repeat_ack() {
+    let f = review_decision_fixture_inner(&["src/lib.rs"], false).await;
+    let args = json!({"approval_id": f.approval_id});
+    let (one, two) = tokio::time::timeout(Duration::from_secs(15), async {
+        tokio::join!(
+            f.mcp
+                .invoke_tool_json("ordinary_review_notice", args.clone(), None),
+            f.mcp
+                .invoke_tool_json("ordinary_review_notice", args.clone(), None)
+        )
+    })
+    .await
+    .expect("same-scope notices must not block the Tokio worker");
+    assert!(
+        one.is_ok() || two.is_ok(),
+        "one original notice must prepare the review"
+    );
+    for reply in [one, two] {
+        if let Ok(reply) = reply {
+            assert_eq!(
+                reply.structured_content.unwrap()["data"]["status"],
+                "ready_for_semantic_review"
+            );
+        }
+    }
+    let db = f
+        .fixture
+        .sessions_dir
+        .join(&f.approval_id)
+        .join(threadlane_host::RUNTIME_STATE_SUBDIR)
+        .join(DATABASE_FILENAME);
+    let snapshot = threadlane_core::observation::read_core_state_readonly(&db).unwrap();
+    assert_eq!(
+        snapshot
+            .event_batches
+            .iter()
+            .filter(|batch| batch.acked_at_ms.is_some())
+            .count(),
+        1
+    );
+    assert_eq!(
+        get_item(&f.mcp, &f.item_id).await.status,
+        BacklogStatus::Doing
+    );
+    assert_eq!(read_invocation_count(&f.fixture.agy_count_file), 1);
+    f.host.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn ordinary_notice_progress_then_terminal_preserves_continuity() {
+    let f = review_decision_fixture_config(&["src/lib.rs"], false, true).await;
+    let args = json!({"approval_id": f.approval_id});
+    let progress = f
+        .mcp
+        .invoke_tool_json("ordinary_review_notice", args.clone(), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        progress.structured_content.unwrap()["data"]["status"],
+        "awaiting_terminal"
+    );
+    let store = crate::ordinary_review::ReviewStore::open(&f.fixture.state_dir).unwrap();
+    let before = store
+        .notice(&f.fixture.binding_a, &f.approval_id)
+        .unwrap()
+        .unwrap();
+    assert!(before.cursor > 0 && before.terminal.is_none() && before.pending.is_none());
+    assert_eq!(
+        get_item(&f.mcp, &f.item_id).await.status,
+        BacklogStatus::Doing
+    );
+    assert_eq!(
+        wait_for_terminal_task(&f.mcp, &f.approval_id, "task-root-agy")
+            .await
+            .status,
+        TaskExecutionStatus::ReadyForReview
+    );
+    let terminal = f
+        .mcp
+        .invoke_tool_json("ordinary_review_notice", args, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        terminal.structured_content.unwrap()["data"]["status"],
+        "ready_for_semantic_review"
+    );
+    let after = store
+        .notice(&f.fixture.binding_a, &f.approval_id)
+        .unwrap()
+        .unwrap();
+    assert!(after.cursor > before.cursor && after.terminal.is_some() && after.pending.is_none());
+    assert!(before.event_ids.is_subset(&after.event_ids));
+    assert_eq!(
+        get_item(&f.mcp, &f.item_id).await.status,
+        BacklogStatus::Doing
+    );
+    f.host.shutdown().await.unwrap();
 }
 
 #[tokio::test]

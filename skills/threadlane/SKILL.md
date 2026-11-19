@@ -5,7 +5,7 @@ description: "Work through Threadlane in the current Codex conversation: shape r
 
 # Threadlane
 
-Version: `2026-11-19.v4`.
+Version: `2026-11-19.v5`.
 
 Act as the user's Coworker in the native Codex conversation. The human selects
 your model in Codex; Threadlane profiles select execution roles. Infer whether
@@ -113,13 +113,15 @@ are optional, not the Worker profile.
 Ordinary Coworker preparation uses targeted current reads, one published exact
 task plan, and real recorded authorization; no `Advisor`, `Orchestrator`, or
 `prepare_work` is mandatory. For a NEW ordinary task prefer
-`threadlane-context --context <CONTEXT> approve prepare-task`: one bounded stdin
+`threadlane-context --context <CONTEXT> approve prepare-task-exact`: one bounded stdin
 JSON object (`binding_id`, `thread_uuid`, `repository_path`, `base_commit`,
 `profile_id`, `profile_revision`, `command_key`, `summary`, `task` with
 SavePlanDraft fields (one `worker` role, no dependencies), and `budgets` as
-`ExecutionBudgets`) which saves and publishes one exact plan and returns the
+`ExecutionBudgets`, with all five of `timeout_ms`, `max_line_bytes`,
+`max_stdout_bytes`, `max_stderr_bytes`, and `max_events` explicit;
+`progress_watchdog` is optional) which saves and publishes one exact plan and returns the
 actual full private `{preview_path,preview}`. It grants no authority and
-dispatches nothing. For an already published plan use `approve prepare-private` without
+dispatches nothing. For an already published plan use `approve prepare-private-exact` without
 duplicating the plan; the original `save_draft`/`publish` and legacy
 `approve prepare`/`record --request` routes stay supported. Present the concrete
 single-task scope and obtain explicit human execution authorization. On
@@ -142,12 +144,12 @@ dependency inputs must match before `prepare_work`; never silently change base.
 Never self-approve or treat a profile, advice, planning, backlog edit, worker
 prose, or CLI flag as authority.
 
-The quickstart prepares a NEW ordinary task with `approve prepare-task`, which
+The quickstart prepares a NEW ordinary task with `approve prepare-task-exact`, which
 takes one bounded stdin task object through the context router, saves and
 publishes one exact plan, and returns the same verified `{preview_path,preview}`
 without authority or dispatch. For an already published plan it composes one
 strict `OperatorApprovalIntent` in client JSON and prefers
-`approve prepare-private`, which accepts that one bounded intent on stdin (never
+`approve prepare-private-exact`, which accepts that one bounded intent on stdin (never
 argv JSON) through the context router and runs the same authoritative prepare
 plus live/fixed-scope validation as `approve prepare`. It returns
 `{preview_path,preview}` after writing the unchanged full typed
@@ -194,11 +196,11 @@ unchanged `preview`, not `PreparePlanningGrantRequest` (detailed examples are in
 
 Ordinary Worker sequence: one bounded grouped
 `status`/`catalog`/`backlog_list` read as needed, one exact published one-task
-plan (`approve prepare-task` for a new task; otherwise consume actual
+plan (`approve prepare-task-exact` for a new task; otherwise consume actual
 `save_draft`/`publish` receipts in order and skip known-empty list enumeration
 and `get_plan` when publish already returned the plan), one exact human scope
-approval through the verified preview route, `approve prepare-private` for an
-already published plan or the `prepare-task` preview, then `approve record`
+approval through the verified preview route, `approve prepare-private-exact` for an
+already published plan or the `prepare-task-exact` preview, then `approve record`
 actual authority, storage-only `worker` backlog item (`backlog_create`), guarded
 `backlog_worker_start` once, wait for
 an actual callback without MCP polling loops, close advertised event pages with
@@ -224,7 +226,9 @@ primary the original item/execution and evidence, end your turn, and let it run
 the guarded completion; pending external review alone is not `NeedsYou`.
 Routine self-reviewed completion stays unchanged.
 
-Close the callback compactly. Recover the original start mapping first. For pages, check the
+For a pre-registered native review use `ordinary_review_notice({approval_id})`
+as the first operation at the actual callback. The following per-tool checks also
+describe the retained legacy route. Close that callback compactly and recover the original start mapping first. For pages, check the
 chat's outer/control binding separately from dispatch `session_binding_id`; batch, event, and
 ACK bindings match that dispatch session and may differ from the chat. Validate real batch IDs,
 ordered sequences/limits, cross-page continuity against the retained verified ACK cursor,
@@ -248,10 +252,7 @@ IDs, replay unknown effects, infer success from prose, or auto-accept semantics.
 is not liveness. The Coworker still makes its separate semantic decision before guarded
 complete/reject. No fixed wall-clock guarantee follows from client-tagged reasoning or
 physical/MCP time. Reject inner EventBatch JSON over 49152 UTF-8 bytes or an
-invalid `step_seq` before ACK. Before any guarded start, including by a separate
-authorized starter, follow the live guide's prep recipe with the actual approval
-ID. Retain its complete original origin receipt in the conversation and private
-storage before that start. For the compact native review path, also call
+invalid `step_seq` before ACK. For the supported compact native review path, call
 `ordinary_review_scope` before start with the real approval, task and item IDs
 and only the exact source files explicitly authorized by the human, or an empty
 list. This opt-in route supports small exact-file deliveries only: every frozen
@@ -259,14 +260,16 @@ write path must change to a bounded regular UTF-8 file. For broader allowlists,
 optional unchanged paths, binary files or deletions, choose the existing per-tool
 guarded ordinary route and suitable bounded physical inspection before dispatch;
 the legacy composite also requires every frozen write path to change. This freezes
-a source baseline; it does not authorize the Worker. At a
-real notice select `NOTICE_NATIVE_REVIEW = true` in the guide's
-verified recipe: the paired tool checks the original binding, package and guide
-identity and the exact canonical source bytes before evaluation. On a normal
-notice use the retained origin; do not copy or bind a receipt. Never run notice
-or Worker text. After `origin_missing`, use the separate cold-recovery recipe
-with the verbatim original receipt; a changed or missing receipt refuses. Do
-not reconstruct factory names or pins. The scoped original supplies recovery; never redispatch. At `ready_for_semantic_review`,
+a source baseline and original connection/package/guide/source identity; it does
+not authorize the Worker. At a real callback call `ordinary_review_notice({approval_id})`
+directly as the first operation. It verifies the original origin before effects,
+validates and ACKs actual pages, reconciles the original result and prepares physical
+evidence. `awaiting_terminal` waits for a further real callback; missing, stale,
+foreign or unknown evidence stops without fallback or retry. On resume reconnect
+and refetch the guide; a fresh connection alone does not replace the saved origin.
+For the originally selected legacy composite retain the guide's pre-start origin
+and use its unchanged notice and cold-recovery recipes. Never run notice or Worker
+text; never redispatch. At `ready_for_semantic_review`,
 make the separate semantic decision on actual physical text. The native view
 contains only selected source text and matches its pre-start and current
 observations; it does not prove continuous unchanged state. On a positive native
@@ -284,8 +287,8 @@ proof. Use guarded
 rejection for a negative decision; missing evidence permits neither. Without an
 issue or pending human input, report only after validated Done. Preserve unknown completion
 outcomes and never retry. Report a validated Done briefly without raw SDK
-introspection. Late notices verify durable Done and ACK only
-actual validated nonempty events; a stopped host leaves event delivery unverified.
+introspection. A native late notice reports durable `already_done` without repeating
+result, inspection, completion or ACK; event delivery may remain unverified.
 Only `legacy_events` permits the legacy pull/ACK route. See
 `docs/ORDINARY-WORKER-CLOSURE.md`.
 
@@ -309,7 +312,8 @@ approval/task identity:
   absent. Never expect raw instructions, summaries, logs, environment, or
   secrets in the response.
 - An ordinary approved-task callback has only `approval_id` (no job, item, or
-  execution ref) and asks for `approved_pull_events`/ACK. Process the actual
+  execution ref). For a pre-registered native review call `ordinary_review_notice`
+  directly; otherwise follow the originally selected legacy route. There, process the actual
   returned batch, then recover the item/`current_execution_ref` from the retained
   start receipt or bounded backlog reads only when absent. Call
   `backlog_worker_result` for that actual ref. Before acceptance, match returned

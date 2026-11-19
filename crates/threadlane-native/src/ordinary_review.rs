@@ -12,6 +12,7 @@ use threadlane_core::{
     WorkerStatus,
 };
 
+use crate::approved_mcp::{ApprovedEventAck, ApprovedEventBatch};
 use crate::backlog_worker::{WorkerBacklogNoticeContextOutcome, WorkerBacklogResultOutcome};
 use crate::closure_bootstrap::ClosureOrigin;
 use crate::error::{NativeError, NativeErrorCode};
@@ -85,6 +86,184 @@ pub(crate) struct ReviewRead {
     pub terminal_event: Event,
     pub acknowledged_binding: Binding,
     pub physical: DeliveryInspectionReport,
+}
+
+/// Private receipt for the original, explicitly invoked native notice path.
+/// A pending page is retained before attempting its ACK, so an interrupted call
+/// cannot silently skip or fabricate a delivered page.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NoticeReceipt {
+    pub schema_version: u32,
+    pub scope_digest: String,
+    pub execution_ref: String,
+    pub session_binding_id: String,
+    pub run_id: String,
+    pub cursor: u64,
+    pub event_ids: BTreeSet<String>,
+    pub batch_ids: BTreeSet<String>,
+    pub terminal: Option<Event>,
+    pub pending: Option<ApprovedEventBatch>,
+}
+
+impl NoticeReceipt {
+    pub(crate) fn new(
+        scope: &ReviewScope,
+        context: &WorkerBacklogNoticeContextOutcome,
+    ) -> Result<Self, NativeError> {
+        let dispatch = context.execution.dispatch_receipt.as_ref().ok_or_else(|| {
+            error(
+                NativeErrorCode::ValidationFailed,
+                "original dispatch receipt is unavailable",
+            )
+        })?;
+        Ok(Self {
+            schema_version: 1,
+            scope_digest: digest(&encode(scope)?),
+            execution_ref: context.execution.execution_ref.clone(),
+            session_binding_id: dispatch.session_binding_id.clone(),
+            run_id: dispatch.run_id.clone(),
+            cursor: 0,
+            event_ids: BTreeSet::new(),
+            batch_ids: BTreeSet::new(),
+            terminal: None,
+            pending: None,
+        })
+    }
+
+    pub(crate) fn matches(
+        &self,
+        scope: &ReviewScope,
+        context: &WorkerBacklogNoticeContextOutcome,
+    ) -> bool {
+        let Some(dispatch) = context.execution.dispatch_receipt.as_ref() else {
+            return false;
+        };
+        self.schema_version == 1
+            && encode(scope).is_ok_and(|bytes| self.scope_digest == digest(&bytes))
+            && self.execution_ref == context.execution.execution_ref
+            && self.session_binding_id == dispatch.session_binding_id
+            && self.run_id == dispatch.run_id
+            && self.event_ids.len() <= 512
+            && self.batch_ids.len() <= 512
+    }
+}
+
+/// Validate every real event before acknowledging any part of its page.
+pub(crate) fn validate_notice_page(
+    receipt: &NoticeReceipt,
+    scope: &ReviewScope,
+    page: &ApprovedEventBatch,
+) -> Result<(), &'static str> {
+    let batch = &page.batch;
+    if page.approval_id != scope.approval_id
+        || page.control_binding_id != scope.binding_id
+        || page.session_binding_id != receipt.session_binding_id
+        || batch.binding_id != receipt.session_binding_id
+        || batch.batch_id.is_empty()
+        || batch.batch_id.len() > 256
+        || receipt.batch_ids.contains(&batch.batch_id)
+    {
+        return Err("batch_identity_mismatch");
+    }
+    if serde_json::to_vec(batch).map_or(true, |bytes| bytes.len() > 49_152)
+        || batch.events.len() > 20
+        || receipt.event_ids.len().saturating_add(batch.events.len()) > 512
+        || receipt.batch_ids.len() >= 512
+        || batch.acked_seq != receipt.cursor
+        || batch.from_seq > batch.to_seq
+        || batch.to_seq > batch.delivered_seq
+        || batch.acked_seq > batch.delivered_seq
+    {
+        return Err("batch_limits_or_cursor_mismatch");
+    }
+    if batch.events.is_empty() {
+        return if batch.from_seq == receipt.cursor
+            && batch.to_seq == receipt.cursor
+            && !batch.has_more
+        {
+            Ok(())
+        } else {
+            Err("empty_batch_mismatch")
+        };
+    }
+    if receipt.cursor.checked_add(1) != Some(batch.from_seq)
+        || batch.from_seq.checked_add(batch.events.len() as u64 - 1) != Some(batch.to_seq)
+    {
+        return Err("sequence_continuity");
+    }
+    let mut ids = BTreeSet::new();
+    let mut terminal = receipt.terminal.is_some();
+    for (index, event) in batch.events.iter().enumerate() {
+        if event.seq != batch.from_seq + index as u64
+            || event.event_id.is_empty()
+            || event.event_id.len() > 256
+            || !ids.insert(&event.event_id)
+            || receipt.event_ids.contains(&event.event_id)
+            || event.binding_id != receipt.session_binding_id
+            || event.run_id != receipt.run_id
+            || event.created_at_ms < 0
+            || !event.payload.untrusted_data
+            || terminal
+        {
+            return Err("event_continuity_mismatch");
+        }
+        match event.kind {
+            EventKind::WorkerQueued
+            | EventKind::WorkerStarted
+            | EventKind::WorkerProgress
+            | EventKind::WorkerCancelRequested => {}
+            EventKind::WorkerCompleted
+            | EventKind::WorkerFailed
+            | EventKind::WorkerCancelled
+            | EventKind::WorkerTimedOut
+            | EventKind::WorkerUnknown => {
+                if !event.important {
+                    return Err("terminal_event_mismatch");
+                }
+                terminal = true;
+            }
+            _ => return Err("foreign_event_kind"),
+        }
+    }
+    if terminal && batch.has_more {
+        return Err("terminal_not_last");
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_notice_ack(
+    receipt: &NoticeReceipt,
+    scope: &ReviewScope,
+    page: &ApprovedEventBatch,
+    ack: &ApprovedEventAck,
+) -> bool {
+    ack.approval_id == scope.approval_id
+        && ack.control_binding_id == scope.binding_id
+        && ack.session_binding_id == receipt.session_binding_id
+        && ack.ack.binding_id == receipt.session_binding_id
+        && ack.ack.batch_id == page.batch.batch_id
+        && ack.ack.acked_seq == page.batch.to_seq
+        && (page.batch.events.is_empty() || ack.ack.advanced)
+}
+
+pub(crate) fn commit_notice_page(receipt: &mut NoticeReceipt, page: &ApprovedEventBatch) {
+    receipt.cursor = page.batch.to_seq;
+    receipt.batch_ids.insert(page.batch.batch_id.clone());
+    for event in &page.batch.events {
+        receipt.event_ids.insert(event.event_id.clone());
+        if matches!(
+            event.kind,
+            EventKind::WorkerCompleted
+                | EventKind::WorkerFailed
+                | EventKind::WorkerCancelled
+                | EventKind::WorkerTimedOut
+                | EventKind::WorkerUnknown
+        ) {
+            receipt.terminal = Some(event.clone());
+        }
+    }
+    receipt.pending = None;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -302,6 +481,29 @@ impl ReviewStore {
             self.save(&filename, scope)?;
         }
         Ok(format!("ors_{}", digest(&encode(scope)?)))
+    }
+
+    pub(crate) fn notice(
+        &self,
+        binding: &str,
+        approval: &str,
+    ) -> Result<Option<NoticeReceipt>, NativeError> {
+        self.load(&format!(
+            "notice_{}.json",
+            Self::scope_key(binding, approval)
+        ))
+    }
+
+    pub(crate) fn store_notice(
+        &self,
+        binding: &str,
+        approval: &str,
+        receipt: &NoticeReceipt,
+    ) -> Result<(), NativeError> {
+        self.save(
+            &format!("notice_{}.json", Self::scope_key(binding, approval)),
+            receipt,
+        )
     }
 
     pub(crate) fn indexed_read(

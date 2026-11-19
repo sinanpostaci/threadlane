@@ -145,6 +145,9 @@ printf "%s" "$PROMPT" > "$PROMPT_FILE"
 printf '{{"type":"init","session_id":"sess-agy-mcp","model":"%s","effort":"%s"}}\n' "$MODEL" "$EFFORT"
 
 case "$PROMPT" in
+    *NOTICE_PROGRESS_FIXTURE*)
+        sleep 2
+        ;;
     *SLOW_WAIT_FOR_CANCEL*)
         trap 'exit 0' TERM INT
         i=0
@@ -1119,7 +1122,7 @@ async fn approved_mcp_tools_registered_in_router_with_strict_schemas_and_store_c
     // 3. Verify all 8 approved-task tools are registered in the actual `rmcp` tool router with strict schemas.
     let tools = configured_mcp.list_tools();
     // Parent combined router includes ordinary and guarded Worker backlog tools.
-    assert_eq!(tools.len(), 58);
+    assert_eq!(tools.len(), 59);
 
     for (
         tool_name,
@@ -3541,7 +3544,7 @@ async fn codex_first_auto_start_cli_and_policy_prerequisites_and_default_off_inv
     assert_eq!(enabled_server.host_launcher_policy(), Some(&sibling_policy));
     let enabled_tools = enabled_server.list_tools();
     // Parent combined router: base tools + backlog tools + guarded Worker backlog tools.
-    assert_eq!(enabled_tools.len(), 58);
+    assert_eq!(enabled_tools.len(), 59);
     for planning_tool in [
         "prepare_work",
         "consult_advisor",

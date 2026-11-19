@@ -101,7 +101,7 @@ impl ApprovedSessionWakeupContext {
     pub fn wakeup_message(&self) -> String {
         match self.route {
             ApprovedSessionWakeupRoute::Mcp => format!(
-                "Threadlane approved session {} has pending events. For an ordinary Worker, run the guide notice callback for '{}' using the verified package and guide pins. Only legacy_events permits approved_pull_events and ACK of the actual validated batch with approved_ack_events; other refusals stop.",
+                "Threadlane approved session {} has pending events. For a pre-registered native review, call ordinary_review_notice({{\"approval_id\":\"{}\"}}) now. Otherwise use the originally selected guide route. A refusal never authorizes fallback or restart.",
                 self.approval_id, self.approval_id
             ),
             ApprovedSessionWakeupRoute::OperatorCli => format!(
@@ -407,7 +407,7 @@ mod tests {
         assert_eq!(
             mcp_ctx.wakeup_message(),
             format!(
-                "Threadlane approved session {approval_id} has pending events. For an ordinary Worker, run the guide notice callback for '{approval_id}' using the verified package and guide pins. Only legacy_events permits approved_pull_events and ACK of the actual validated batch with approved_ack_events; other refusals stop."
+                "Threadlane approved session {approval_id} has pending events. For a pre-registered native review, call ordinary_review_notice({{\"approval_id\":\"{approval_id}\"}}) now. Otherwise use the originally selected guide route. A refusal never authorizes fallback or restart."
             )
         );
 

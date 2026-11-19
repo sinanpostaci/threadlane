@@ -47,9 +47,9 @@ use crate::approved_mcp::{
     execute_approved_ack_events, execute_approved_activity, execute_approved_pull_events,
     execute_approved_session, execute_approved_task, execute_cancel_approved_task,
     execute_list_approvals, format_approved_scoped_error, open_host_stores_with_known_dirs,
-    ApprovedAckEventsParams, ApprovedActivityParams, ApprovedPullEventsParams,
-    ApprovedSessionParams, ApprovedTaskParams, CancelApprovedTaskParams, ListApprovalsParams,
-    StartApprovedTaskParams, HOST_NOT_CONFIGURED_MESSAGE,
+    ApprovedAckEventsParams, ApprovedActivityParams, ApprovedEventAck, ApprovedEventBatch,
+    ApprovedPullEventsParams, ApprovedSessionParams, ApprovedTaskParams, CancelApprovedTaskParams,
+    ListApprovalsParams, StartApprovedTaskParams, HOST_NOT_CONFIGURED_MESSAGE,
 };
 use crate::auto_pair::{
     parse_thread_hint, AutomaticPairing, AutomaticPairingResult, AutomaticPairingRuntime,
@@ -82,8 +82,8 @@ use crate::native_chat_observation::{
     NativeChatSamplerOwner,
 };
 use crate::ordinary_review::{
-    self, DecisionIntent, ReviewCompleteParams, ReviewPrepareParams, ReviewRead, ReviewScope,
-    ReviewScopeParams, ReviewStore,
+    self, DecisionIntent, NoticeReceipt, ReviewCompleteParams, ReviewPrepareParams, ReviewRead,
+    ReviewScope, ReviewScopeParams, ReviewStore,
 };
 use crate::pairing::{
     ConnectionIdentity, EnrollmentRecord, PairingStore, CONNECTION_IDENTITY_TOOL,
@@ -1887,6 +1887,7 @@ impl PairedMcpServer {
             | WORKER_BACKLOG_COMPLETE_TOOL
             | WORKER_BACKLOG_REJECT_TOOL
             | "ordinary_review_scope"
+            | "ordinary_review_notice"
             | "ordinary_review_prepare"
             | "ordinary_review_complete" => {
                 self.prepare_backlog_worker_tool_json_future(tool_name, arguments)
@@ -2128,6 +2129,10 @@ impl PairedMcpServer {
             "ordinary_review_prepare" => {
                 let params: ReviewPrepareParams = Self::parse_tool_params(tool_name, arguments)?;
                 Ok(self.ordinary_review_prepare_boxed(params))
+            }
+            "ordinary_review_notice" => {
+                let params: ReviewPrepareParams = Self::parse_tool_params(tool_name, arguments)?;
+                Ok(self.ordinary_review_notice_boxed(params))
             }
             "ordinary_review_complete" => {
                 let params: ReviewCompleteParams = Self::parse_tool_params(tool_name, arguments)?;
@@ -4113,8 +4118,9 @@ impl PairedMcpServer {
             &params.task_id,
             None,
             || async {
-                let _lock = store
-                    .scope_lock(binding, &params.approval_id)
+                let _lock = self
+                    .review_scope_lock(binding, &params.approval_id)
+                    .await
                     .map_err(|_| {
                         crate::dispatch_guard::GuardedDispatchError::pre_effect(
                             "review_store_error",
@@ -4278,6 +4284,478 @@ impl PairedMcpServer {
         )
     }
 
+    fn ordinary_review_notice_boxed(
+        &self,
+        params: ReviewPrepareParams,
+    ) -> BoxedTaskLocalFuture<'_, Result<CallToolResult, CallToolResult>> {
+        Box::pin(async move {
+            const TOOL: &str = "ordinary_review_notice";
+            let (binding, thread, stores) = self.verified_host_context(TOOL)?;
+            let observation = self
+                .begin_paired_observation(&binding, &thread, TOOL, Some(&params.approval_id), None)
+                .await;
+            let result = self
+                .handle_review_notice(&binding, &thread, stores, params)
+                .await;
+            self.finish_paired_observation(observation, &result).await;
+            result
+        })
+    }
+
+    async fn review_scope_lock(
+        &self,
+        binding: &str,
+        approval: &str,
+    ) -> Result<crate::fs_safety::CrossProcessLockGuard, NativeError> {
+        let state_dir = self.state_dir.clone();
+        let binding = binding.to_owned();
+        let approval = approval.to_owned();
+        tokio::task::spawn_blocking(move || {
+            ReviewStore::open(&state_dir)?.scope_lock(&binding, &approval)
+        })
+        .await
+        .map_err(|_| NativeError::new(NativeErrorCode::IoError, "Review scope lock failed"))?
+    }
+
+    async fn handle_review_notice(
+        &self,
+        binding: &str,
+        thread: &str,
+        stores: HostStores,
+        params: ReviewPrepareParams,
+    ) -> Result<CallToolResult, CallToolResult> {
+        const TOOL: &str = "ordinary_review_notice";
+        let started = Instant::now();
+        let fail = |code, message| Self::format_scoped_error(binding, TOOL, code, message);
+        let origin = self.review_origin(TOOL, binding, thread)?;
+        let store = ReviewStore::open(&self.state_dir)
+            .map_err(|e| Self::format_planning_gateway_error(binding, TOOL, e))?;
+        let scope_lock = self
+            .review_scope_lock(binding, &params.approval_id)
+            .await
+            .map_err(|e| Self::format_planning_gateway_error(binding, TOOL, e))?;
+        let scope = store.scope(binding, &params.approval_id)
+            .map_err(|e| Self::format_planning_gateway_error(binding, TOOL, e))?
+            .ok_or_else(|| fail("scope_missing", "No original pre-start native review scope exists; use the originally selected route."))?;
+        if scope.schema_version != 1
+            || scope.binding_id != binding
+            || scope.thread_id != thread
+            || scope.approval_id != params.approval_id
+            || scope.origin != origin
+            || scope.repository_path != origin.project_root
+        {
+            return Err(fail(
+                "scope_mismatch",
+                "Original review scope or verified package changed.",
+            ));
+        }
+        let service = self
+            .backlog_worker_service(&stores)
+            .map_err(|e| fail(e.code(), e.message()))?;
+        let get_context = || {
+            service.notice_context(
+                binding,
+                thread,
+                WorkerBacklogNoticeContextParams {
+                    approval_id: params.approval_id.clone(),
+                },
+                self.backlog_worker_final_recheck(TOOL, binding.to_string(), thread.to_string()),
+            )
+        };
+        let context = get_context()
+            .await
+            .map_err(|e| fail(e.code(), e.message()))?;
+        let dispatch = context.execution.dispatch_receipt.as_ref().ok_or_else(|| {
+            fail(
+                "worker_start_unconfirmed",
+                "Original dispatch receipt is unavailable.",
+            )
+        })?;
+        if context.execution.binding_id != binding
+            || context.execution.item_id != scope.item_id
+            || context.execution.authority.approval_id != scope.approval_id
+            || context.execution.authority.task_id != scope.task_id
+            || context.scope.repository_path != scope.repository_path
+            || context.scope.base_commit != scope.base_commit
+            || context.item_snapshot.item_id != scope.item_id
+            || context.item_snapshot.current_execution_ref.as_deref()
+                != Some(context.execution.execution_ref.as_str())
+            || dispatch.session_binding_id.is_empty()
+            || dispatch.session_binding_id == binding
+            || dispatch.run_id.is_empty()
+        {
+            return Err(fail(
+                "execution_not_current",
+                "Original execution does not match the frozen review scope.",
+            ));
+        }
+        if context.item_snapshot.status == threadlane_core::BacklogStatus::Done {
+            // Do not repeat result, inspection, or completion for a late notice.
+            return Self::format_planning_gateway_result(
+                binding,
+                TOOL,
+                json!({"status":"already_done", "item_id":scope.item_id,
+                    "execution_ref":context.execution.execution_ref,
+                    "revision":context.item_snapshot.revision}),
+            );
+        }
+        if context.item_snapshot.status != threadlane_core::BacklogStatus::Doing {
+            return Err(fail(
+                "execution_not_current",
+                "Original item is not awaiting Worker review.",
+            ));
+        }
+        let expected_context = serde_json::to_value(&context)
+            .map_err(|_| fail("protocol_error", "Original execution cannot be checked."))?;
+        let client = threadlane_host::ApprovedHostClient::new(
+            Arc::clone(&stores.authority),
+            &stores.sessions_dir,
+            binding,
+            thread,
+        )
+        .map_err(|_| {
+            fail(
+                "host_unavailable",
+                "Authenticated Worker host is unavailable.",
+            )
+        })?;
+        let live = client
+            .verify_live_ready_binding(&params.approval_id)
+            .await
+            .map_err(|_| {
+                fail(
+                    "ack_unavailable",
+                    "Verified live event cursor is unavailable.",
+                )
+            })?;
+        if live.binding_id != dispatch.session_binding_id || live.acked_seq > live.delivered_seq {
+            return Err(fail(
+                "session_binding_mismatch",
+                "Live event cursor does not match the original dispatch.",
+            ));
+        }
+        let mut receipt = match store
+            .notice(binding, &params.approval_id)
+            .map_err(|e| Self::format_planning_gateway_error(binding, TOOL, e))?
+        {
+            Some(receipt) => receipt,
+            None => {
+                if live.acked_seq != 0 {
+                    return Err(fail(
+                        "cursor_unverified",
+                        "Prior ACKs belong to another path; reconcile that original path.",
+                    ));
+                }
+                NoticeReceipt::new(&scope, &context)
+                    .map_err(|e| Self::format_planning_gateway_error(binding, TOOL, e))?
+            }
+        };
+        if !receipt.matches(&scope, &context)
+            || receipt.terminal.as_ref().is_some_and(|event| {
+                event.seq > receipt.cursor
+                    || event.binding_id != receipt.session_binding_id
+                    || event.run_id != receipt.run_id
+                    || !receipt.event_ids.contains(&event.event_id)
+            })
+        {
+            return Err(fail(
+                "receipt_mismatch",
+                "Retained notice receipt does not match the original execution.",
+            ));
+        }
+        if let Some(pending) = receipt.pending.clone() {
+            ordinary_review::validate_notice_page(&receipt, &scope, &pending).map_err(|code| {
+                fail(
+                    code,
+                    "Retained pending page is invalid; reconcile the original receipt.",
+                )
+            })?;
+            let sessions_dir = stores.sessions_dir.clone();
+            let approval = params.approval_id.clone();
+            let pending_batch = pending.batch.clone();
+            let exact_ack = tokio::task::spawn_blocking(move || {
+                let session =
+                    threadlane_host::verify_existing_session_dir(&sessions_dir, &approval).ok()?;
+                let runtime = threadlane_host::verify_existing_private_dir(
+                    &session.join(threadlane_host::RUNTIME_STATE_SUBDIR),
+                )
+                .ok()?;
+                let snapshot = threadlane_core::observation::read_core_state_readonly(
+                    &runtime.join(threadlane::DATABASE_FILENAME),
+                )
+                .ok()?;
+                let matches: Vec<_> = snapshot
+                    .event_batches
+                    .iter()
+                    .filter(|record| {
+                        record.batch_id == pending_batch.batch_id
+                            && record.binding_id == pending_batch.binding_id
+                            && record.from_seq == pending_batch.from_seq
+                            && record.to_seq == pending_batch.to_seq
+                            && record.event_count == pending_batch.events.len()
+                            && record.acked_at_ms.is_some()
+                    })
+                    .collect();
+                Some(matches.len() == 1)
+            })
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or(false);
+            let rechecked = client
+                .verify_live_ready_binding(&params.approval_id)
+                .await
+                .map_err(|_| {
+                    fail(
+                        "ack_outcome_unknown",
+                        "Live ACK state cannot be reverified.",
+                    )
+                })?;
+            if !pending.batch.events.is_empty()
+                && live.acked_seq == pending.batch.to_seq
+                && rechecked.binding_id == receipt.session_binding_id
+                && rechecked.acked_seq == pending.batch.to_seq
+                && exact_ack
+                && self.review_origin(TOOL, binding, thread)? == origin
+            {
+                // The exact delivered batch has a durable ACK record, independently of
+                // the live cursor. Never resend the original uncertain ACK.
+                ordinary_review::commit_notice_page(&mut receipt, &pending);
+                store
+                    .store_notice(binding, &params.approval_id, &receipt)
+                    .map_err(|e| Self::format_planning_gateway_error(binding, TOOL, e))?;
+            } else {
+                return Err(fail("ack_outcome_unknown", "Pending ACK cannot be reconciled from the live cursor; do not retry it blindly."));
+            }
+        } else if live.acked_seq != receipt.cursor {
+            return Err(fail(
+                "cursor_mismatch",
+                "Live ACK cursor differs from the retained verified receipt.",
+            ));
+        }
+
+        // Each invocation is explicitly caused by a caller; no background ACK occurs.
+        // Eight real pages and a 60-second budget bound a single notice operation.
+        if receipt.terminal.is_none() {
+            for page_number in 0..8 {
+                if started.elapsed() >= Duration::from_secs(60) {
+                    return Err(fail(
+                        "deadline_exceeded",
+                        "Notice budget expired; preserve the original receipt.",
+                    ));
+                }
+                if self.review_origin(TOOL, binding, thread)? != origin
+                    || serde_json::to_value(
+                        get_context()
+                            .await
+                            .map_err(|e| fail(e.code(), e.message()))?,
+                    )
+                    .ok()
+                    .as_ref()
+                        != Some(&expected_context)
+                {
+                    return Err(fail(
+                        "execution_not_current",
+                        "Original execution or origin changed before event delivery.",
+                    ));
+                }
+                let raw = execute_approved_pull_events(
+                    Arc::clone(&stores.authority),
+                    stores.sessions_dir.clone(),
+                    binding.to_string(),
+                    thread.to_string(),
+                    ApprovedPullEventsParams {
+                        approval_id: params.approval_id.clone(),
+                        after_seq: Some(receipt.cursor),
+                        limit: Some(20),
+                    },
+                )
+                .await?;
+                let page: ApprovedEventBatch = raw
+                    .structured_content
+                    .and_then(|value| value.get("data").cloned())
+                    .and_then(|value| serde_json::from_value(value).ok())
+                    .ok_or_else(|| {
+                        fail("invalid_page", "Actual event page could not be verified.")
+                    })?;
+                ordinary_review::validate_notice_page(&receipt, &scope, &page).map_err(|code| {
+                    fail(
+                        code,
+                        "Actual event page failed scope or continuity validation; no ACK issued.",
+                    )
+                })?;
+                if started.elapsed() >= Duration::from_secs(60) {
+                    return Err(fail(
+                        "deadline_exceeded",
+                        "Notice budget expired after delivery; no ACK issued.",
+                    ));
+                }
+                if page.batch.events.is_empty() {
+                    return Self::format_planning_gateway_result(
+                        binding,
+                        TOOL,
+                        json!({"status":"awaiting_terminal", "acked_seq":receipt.cursor}),
+                    );
+                }
+                if self.review_origin(TOOL, binding, thread)? != origin
+                    || serde_json::to_value(
+                        get_context()
+                            .await
+                            .map_err(|e| fail(e.code(), e.message()))?,
+                    )
+                    .ok()
+                    .as_ref()
+                        != Some(&expected_context)
+                {
+                    return Err(fail(
+                        "execution_not_current",
+                        "Original execution or origin changed before ACK.",
+                    ));
+                }
+                if started.elapsed() >= Duration::from_secs(60) {
+                    return Err(fail(
+                        "deadline_exceeded",
+                        "Notice budget expired before ACK; no ACK issued.",
+                    ));
+                }
+                receipt.pending = Some(page.clone());
+                store
+                    .store_notice(binding, &params.approval_id, &receipt)
+                    .map_err(|e| Self::format_planning_gateway_error(binding, TOOL, e))?;
+                if started.elapsed() >= Duration::from_secs(60) {
+                    receipt.pending = None;
+                    store.store_notice(binding, &params.approval_id, &receipt)
+                        .map_err(|_| fail("ack_outcome_unknown", "Pending page state could not be cleared; reconcile the original receipt."))?;
+                    return Err(fail(
+                        "deadline_exceeded",
+                        "Notice budget expired before ACK; no ACK issued.",
+                    ));
+                }
+                let raw = execute_approved_ack_events(
+                    Arc::clone(&stores.authority),
+                    stores.sessions_dir.clone(),
+                    binding.to_string(),
+                    thread.to_string(),
+                    ApprovedAckEventsParams {
+                        approval_id: params.approval_id.clone(),
+                        batch_id: page.batch.batch_id.clone(),
+                    },
+                )
+                .await.map_err(|_| fail("ack_outcome_unknown", "ACK may have taken effect; retain the pending original page and reconcile it."))?;
+                let ack: ApprovedEventAck = raw
+                    .structured_content
+                    .and_then(|value| value.get("data").cloned())
+                    .and_then(|value| serde_json::from_value(value).ok())
+                    .ok_or_else(|| {
+                        fail(
+                            "ack_outcome_unknown",
+                            "ACK response is unavailable; retain the pending original page.",
+                        )
+                    })?;
+                if !ordinary_review::validate_notice_ack(&receipt, &scope, &page, &ack) {
+                    return Err(fail(
+                        "ack_outcome_unknown",
+                        "ACK response did not match the actual page; retain the original receipt.",
+                    ));
+                }
+                ordinary_review::commit_notice_page(&mut receipt, &page);
+                store
+                    .store_notice(binding, &params.approval_id, &receipt)
+                    .map_err(|_| fail("ack_outcome_unknown", "ACK was returned but receipt retention is uncertain; reconcile the original batch."))?;
+                if started.elapsed() >= Duration::from_secs(60) {
+                    return Err(fail(
+                        "deadline_exceeded",
+                        "Notice budget expired after ACK; retain the original receipt.",
+                    ));
+                }
+                if !page.batch.has_more {
+                    break;
+                }
+                if page_number == 7 {
+                    return Err(fail(
+                        "page_budget_exhausted",
+                        "More pages remain; continue only from the retained original receipt.",
+                    ));
+                }
+            }
+        }
+        let Some(terminal) = receipt.terminal.as_ref() else {
+            return Self::format_planning_gateway_result(
+                binding,
+                TOOL,
+                json!({"status":"awaiting_terminal", "acked_seq":receipt.cursor}),
+            );
+        };
+        if self.review_origin(TOOL, binding, thread)? != origin
+            || serde_json::to_value(
+                get_context()
+                    .await
+                    .map_err(|e| fail(e.code(), e.message()))?,
+            )
+            .ok()
+            .as_ref()
+                != Some(&expected_context)
+        {
+            return Err(fail(
+                "execution_not_current",
+                "Original execution or origin changed after ACK.",
+            ));
+        }
+        if started.elapsed() >= Duration::from_secs(60) {
+            return Err(fail(
+                "deadline_exceeded",
+                "Notice budget expired before result reconciliation.",
+            ));
+        }
+        if terminal.kind != threadlane_core::EventKind::WorkerCompleted {
+            let result = service
+                .result(
+                    binding,
+                    thread,
+                    WorkerBacklogResultParams {
+                        item_id: scope.item_id.clone(),
+                        execution_ref: receipt.execution_ref.clone(),
+                    },
+                    self.backlog_worker_final_recheck(
+                        TOOL,
+                        binding.to_string(),
+                        thread.to_string(),
+                    ),
+                )
+                .await
+                .map_err(|e| fail(e.code(), e.message()))?;
+            if started.elapsed() >= Duration::from_secs(60) {
+                return Err(fail(
+                    "deadline_exceeded",
+                    "Result was reconciled after the notice budget; retain the original receipt.",
+                ));
+            }
+            return Self::format_planning_gateway_result(
+                binding,
+                TOOL,
+                json!({"status":"terminal_not_success", "outcome":result.execution.outcome}),
+            );
+        }
+        drop(scope_lock);
+        let prepared = self.prepare_review(binding, thread, stores, params).await?;
+        let view = prepared
+            .structured_content
+            .and_then(|value| value.get("data").cloned())
+            .ok_or_else(|| {
+                fail(
+                    "review_evidence_incomplete",
+                    "Physical review response is unavailable.",
+                )
+            })?;
+        if started.elapsed() >= Duration::from_secs(60) {
+            return Err(fail(
+                "deadline_exceeded",
+                "Notice budget expired during review; retain the original receipt.",
+            ));
+        }
+        Self::format_planning_gateway_result(binding, TOOL, view)
+    }
+
     fn ordinary_review_prepare_boxed(
         &self,
         params: ReviewPrepareParams,
@@ -4305,8 +4783,9 @@ impl PairedMcpServer {
         let origin = self.review_origin(TOOL, binding, thread)?;
         let store = ReviewStore::open(&self.state_dir)
             .map_err(|e| Self::format_planning_gateway_error(binding, TOOL, e))?;
-        let _lock = store
-            .scope_lock(binding, &params.approval_id)
+        let _lock = self
+            .review_scope_lock(binding, &params.approval_id)
+            .await
             .map_err(|e| Self::format_planning_gateway_error(binding, TOOL, e))?;
         let scope = store
             .scope(binding, &params.approval_id)
@@ -5875,7 +6354,7 @@ impl PairedMcpServer {
     /// Delegated `operating_guide` tool (requires verified operator enrollment).
     #[tool(
         name = "operating_guide",
-        description = "Fetch the versioned, read-only Threadlane MCP operating guide (version 2026-11-19.v4) for the enrolled chat binding. Call on initial connection, session resume, or context uncertainty/compaction, then refresh only uncertain live scoped backlog/status/catalog state without a polling loop. Includes the ordinary backlog workflow, guarded Worker (coder) reservation/result/completion contracts (no unconditional pre-start approved_task/ready/host probe; guarded start owns eligible host startup and host_not_ready on an optional pre-start read is not an attempted launch), the ordinary offline closure template with template_version and source_sha256 for the packaged JS, and the compact finite callback closure with conditional sequential tool composition, cross-page ACK continuity, private DTO evidence, deadline and exec_command checks, and real per-batch ACKs; links to opt-in NATIVE-OPERATOR, PROFILE-FLOW, and legacy complete job admission with durability and receipt limits. Does not mutate state or acknowledge events.",
+        description = "Fetch the versioned, read-only Threadlane MCP operating guide (version 2026-11-19.v5) for the enrolled chat binding. Call on initial connection, session resume, or context uncertainty/compaction, then refresh only uncertain live scoped backlog/status/catalog state without a polling loop. Includes the ordinary backlog workflow, guarded Worker (coder) reservation/result/completion contracts (no unconditional pre-start approved_task/ready/host probe; guarded start owns eligible host startup and host_not_ready on an optional pre-start read is not an attempted launch), the ordinary offline closure template with template_version and source_sha256 for the packaged JS, and the compact finite callback closure with conditional sequential tool composition, cross-page ACK continuity, private DTO evidence, deadline and exec_command checks, and real per-batch ACKs; links to opt-in NATIVE-OPERATOR, PROFILE-FLOW, and legacy complete job admission with durability and receipt limits. Does not mutate state or acknowledge events.",
         annotations(
             title = "Get Threadlane MCP Operating Guide",
             read_only_hint = true,
@@ -5927,6 +6406,25 @@ impl PairedMcpServer {
         Parameters(params): Parameters<ReviewScopeParams>,
     ) -> Result<CallToolResult, CallToolResult> {
         self.ordinary_review_scope_boxed(params).await
+    }
+
+    /// Handles an actual callback for an original pre-start native review scope.
+    #[tool(
+        name = "ordinary_review_notice",
+        description = "On an actual callback for a pre-registered native review, recover the original verified scope and dispatch, validate and ACK only real bounded event pages, reconcile the original result, and prepare physical evidence. No semantics are accepted and no Worker is started. A refusal or unknown effect requires reconciliation; do not silently fall back or retry.",
+        annotations(
+            title = "Handle Ordinary Review Notice",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    pub async fn ordinary_review_notice(
+        &self,
+        Parameters(params): Parameters<ReviewPrepareParams>,
+    ) -> Result<CallToolResult, CallToolResult> {
+        self.ordinary_review_notice_boxed(params).await
     }
 
     /// Builds a server-attested immutable review after the real callback ACK.
@@ -7952,7 +8450,7 @@ mod backlog_paired_tests {
         let unbound = PairedMcpServer::new(&state_dir, pairing_store).expect("unbound server");
 
         let tools = unbound.list_tools();
-        assert_eq!(tools.len(), 58, "PairedMcpServer must expose 58 tools");
+        assert_eq!(tools.len(), 59, "PairedMcpServer must expose 59 tools");
 
         let cases: [(&str, bool, &[&str], &[&str]); 8] = [
             (

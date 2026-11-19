@@ -23,7 +23,7 @@ fn test_approved_session_wakeup_context_validation_and_legacy_args_preserved() {
     assert_eq!(
         valid.wakeup_message(),
         format!(
-            "Threadlane approved session {VALID_APPROVAL_ID} has pending events. For an ordinary Worker, run the guide notice callback for '{VALID_APPROVAL_ID}' using the verified package and guide pins. Only legacy_events permits approved_pull_events and ACK of the actual validated batch with approved_ack_events; other refusals stop."
+            "Threadlane approved session {VALID_APPROVAL_ID} has pending events. For a pre-registered native review, call ordinary_review_notice({{\"approval_id\":\"{VALID_APPROVAL_ID}\"}}) now. Otherwise use the originally selected guide route. A refusal never authorizes fallback or restart."
         )
     );
 
