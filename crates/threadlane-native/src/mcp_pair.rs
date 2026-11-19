@@ -9,7 +9,8 @@ use std::time::{Duration, Instant};
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{
-        CallToolResult, Content, Implementation, ProtocolVersion, ServerCapabilities, ServerConfig,
+        CallToolResult, ContentBlock, Implementation, ProtocolVersion, ServerCapabilities,
+        ServerConfig,
     },
     schemars, tool, tool_handler, tool_router, ServerHandler, ServiceExt,
 };
@@ -3719,7 +3720,7 @@ impl PairedMcpServer {
                 ));
             }
             if params.compact {
-                return Ok(CallToolResult::success(vec![Content::text(
+                return Ok(CallToolResult::success(vec![ContentBlock::text(
                     CLOSURE_COMPACT_ATTESTATION,
                 )]));
             }
@@ -6285,6 +6286,11 @@ mod automatic_scope_tests {
             .unwrap();
         assert!(compact.structured_content.is_none());
         assert_ne!(compact.is_error, Some(true));
+        assert_eq!(compact.content.len(), 1);
+        assert_eq!(
+            compact.content[0].as_text().expect("text attestation").text,
+            CLOSURE_COMPACT_ATTESTATION
+        );
         let compact_json = serde_json::to_value(compact).unwrap();
         assert_eq!(
             compact_json["content"],
