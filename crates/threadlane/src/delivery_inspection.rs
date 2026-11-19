@@ -422,7 +422,7 @@ pub struct SourceFileInspection {
     pub base_sha256: String,
     /// Whether the observed bytes match the frozen base.
     pub matches_base: bool,
-    /// Exact size of explicitly requested source text in bytes.
+    /// Exact size of an explicitly requested baseline or source text file in bytes.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub size_bytes: Option<u64>,
     /// Whether explicitly requested source text ends in a final `\n` byte.
@@ -583,6 +583,126 @@ pub fn inspect_delivery_with_source_text_and_limits(
     inspect_delivery_with_source_mode(request, source_root, source_files, limits, true)
 }
 
+/// Observes an explicit source baseline before a task checkout exists, without returning text.
+///
+/// A successful observation is not an approval or a clean-baseline decision. Callers must
+/// require `clean_at_base` and each file's `matches_base` when their policy requires them.
+pub fn inspect_source_baseline(
+    source_root: &Path,
+    expected_base: &str,
+    source_files: &[String],
+) -> SourceInspection {
+    inspect_source_baseline_with_limits(
+        source_root,
+        expected_base,
+        source_files,
+        &DeliveryInspectionLimits::default(),
+    )
+}
+
+/// Observes a source baseline under explicit read, time and output budgets.
+pub fn inspect_source_baseline_with_limits(
+    source_root: &Path,
+    expected_base: &str,
+    source_files: &[String],
+    limits: &DeliveryInspectionLimits,
+) -> SourceInspection {
+    let started = Instant::now();
+    let shape = validate_source_baseline_shape(source_root, expected_base, source_files, limits);
+    let report = match shape {
+        Ok(base) => inspect_source(
+            &SourceInspectionOptions {
+                task_root: None,
+                expected_base: &base,
+                task_bytes: 0,
+                task_text_bytes: 0,
+                include_text: false,
+                include_size: true,
+            },
+            source_root,
+            source_files,
+            limits,
+            started,
+        ),
+        Err(failure) => SourceInspection {
+            ok: false,
+            refusal_code: Some(failure.code),
+            root: truncate_report_field(&source_root.to_string_lossy(), 4096).to_string(),
+            expected_base: truncate_report_field(expected_base, 4096).to_string(),
+            head_commit: None,
+            base_tree: None,
+            changed_paths: Vec::new(),
+            clean_at_base: false,
+            files: Vec::new(),
+        },
+    };
+    enforce_source_output_limit(report, limits.max_output_bytes)
+}
+
+fn validate_source_baseline_shape(
+    root: &Path,
+    expected_base: &str,
+    files: &[String],
+    limits: &DeliveryInspectionLimits,
+) -> Result<String, InspectionFailure> {
+    validate_limits(limits)?;
+    let base = validate_exact_40_hex_sha(expected_base, "expected base")
+        .map_err(|_| InspectionFailure::new(DeliveryInspectionRefusalCode::InvalidExpectedBase))?;
+    if root.as_os_str().is_empty()
+        || root.to_str().is_none()
+        || !root.is_absolute()
+        || root
+            .components()
+            .any(|part| matches!(part, Component::CurDir | Component::ParentDir))
+    {
+        return Err(InspectionFailure::new(
+            DeliveryInspectionRefusalCode::InvalidRoot,
+        ));
+    }
+    if files.len() > limits.max_paths {
+        return Err(InspectionFailure::new(
+            DeliveryInspectionRefusalCode::TooManyPaths,
+        ));
+    }
+    if files.is_empty() {
+        return Err(InspectionFailure::new(
+            DeliveryInspectionRefusalCode::InvalidRequest,
+        ));
+    }
+    let mut seen = BTreeSet::new();
+    for path in files {
+        validate_allowed_path(path)?;
+        if !seen.insert(path) {
+            return Err(InspectionFailure::at(
+                DeliveryInspectionRefusalCode::DuplicatePath,
+                path,
+            ));
+        }
+    }
+    Ok(base)
+}
+
+fn enforce_source_output_limit(report: SourceInspection, max_bytes: usize) -> SourceInspection {
+    if serde_json::to_vec(&report).is_ok_and(|bytes| bytes.len() <= max_bytes) {
+        return report;
+    }
+    SourceInspection {
+        ok: false,
+        refusal_code: Some(
+            report
+                .refusal_code
+                .unwrap_or(DeliveryInspectionRefusalCode::OutputLimit),
+        ),
+        root: String::new(),
+        expected_base: String::new(),
+        head_commit: None,
+        base_tree: None,
+        changed_paths: Vec::new(),
+        clean_at_base: false,
+        files: Vec::new(),
+    }
+}
+
 fn inspect_delivery_with_source_mode(
     request: &DeliveryInspectionRequest,
     source_root: &Path,
@@ -601,14 +721,18 @@ fn inspect_delivery_with_source_mode(
             .map(|text| text.len() as u64)
             .sum();
         report.source = Some(inspect_source(
-            request,
+            &SourceInspectionOptions {
+                task_root: Some(&request.root),
+                expected_base: &request.expected_base,
+                task_bytes,
+                task_text_bytes,
+                include_text: include_source_text,
+                include_size: include_source_text,
+            },
             source_root,
             source_files,
             limits,
             started,
-            task_bytes,
-            task_text_bytes,
-            include_source_text,
         ));
         if report.source.as_ref().is_some_and(|source| !source.ok) {
             report.ok = false;
@@ -632,41 +756,37 @@ fn inspect_delivery_with_source_mode(
     enforce_output_limit(report, limits.max_output_bytes)
 }
 
-#[allow(clippy::too_many_arguments)]
+struct SourceInspectionOptions<'a> {
+    task_root: Option<&'a Path>,
+    expected_base: &'a str,
+    task_bytes: u64,
+    task_text_bytes: u64,
+    include_text: bool,
+    include_size: bool,
+}
+
 fn inspect_source(
-    task: &DeliveryInspectionRequest,
+    options: &SourceInspectionOptions<'_>,
     root: &Path,
     files: &[String],
     limits: &DeliveryInspectionLimits,
     started: Instant,
-    task_bytes: u64,
-    task_text_bytes: u64,
-    include_source_text: bool,
 ) -> SourceInspection {
     let mut report = SourceInspection {
         ok: false,
         refusal_code: None,
         root: truncate_report_field(&root.to_string_lossy(), 4096).to_string(),
-        expected_base: task.expected_base.clone(),
+        expected_base: options.expected_base.to_string(),
         head_commit: None,
         base_tree: None,
         changed_paths: Vec::new(),
         clean_at_base: false,
         files: Vec::new(),
     };
-    let result = inspect_source_inner(
-        task,
-        root,
-        files,
-        limits,
-        started,
-        task_bytes,
-        task_text_bytes,
-        include_source_text,
-    );
+    let result = inspect_source_inner(options, root, files, limits, started);
     match result {
         Ok((head, tree, changes, inspected)) => {
-            report.clean_at_base = head == task.expected_base
+            report.clean_at_base = head == options.expected_base
                 && changes.is_empty()
                 && inspected.iter().all(|file| file.matches_base);
             report.head_commit = Some(head);
@@ -680,16 +800,12 @@ fn inspect_source(
     report
 }
 
-#[allow(clippy::too_many_arguments)]
 fn inspect_source_inner(
-    task: &DeliveryInspectionRequest,
+    options: &SourceInspectionOptions<'_>,
     root: &Path,
     files: &[String],
     limits: &DeliveryInspectionLimits,
     started: Instant,
-    task_bytes: u64,
-    task_text_bytes: u64,
-    include_source_text: bool,
 ) -> Result<
     (
         String,
@@ -699,7 +815,7 @@ fn inspect_source_inner(
     ),
     InspectionFailure,
 > {
-    if root == task.root {
+    if options.task_root.is_some_and(|task_root| root == task_root) {
         return Err(InspectionFailure::new(
             DeliveryInspectionRefusalCode::InvalidRoot,
         ));
@@ -707,9 +823,9 @@ fn inspect_source_inner(
     let source = validate_request(
         &DeliveryInspectionRequest {
             root: root.to_path_buf(),
-            expected_base: task.expected_base.clone(),
+            expected_base: options.expected_base.to_string(),
             allowed_paths: files.to_vec(),
-            text_files: if include_source_text {
+            text_files: if options.include_text {
                 files.to_vec()
             } else {
                 Vec::new()
@@ -743,14 +859,14 @@ fn inspect_source_inner(
     let first = capture_snapshot(&source.root, &source.expected_base, limits, started)?;
     let mut inspected = Vec::new();
     let mut observations = Vec::new();
-    let mut total_read = task_bytes;
-    let mut total_text = task_text_bytes;
+    let mut total_read = options.task_bytes;
+    let mut total_text = options.task_text_bytes;
     for path in &source.allowed_paths {
         let (current, failure) = inspect_file(
             &source.root,
             path,
             first.changes.get(path),
-            include_source_text,
+            options.include_text,
             limits,
             started,
             &mut total_read,
@@ -826,10 +942,10 @@ fn inspect_source_inner(
             matches_base: actual == base,
             sha256: actual,
             base_sha256: base,
-            size_bytes: include_source_text.then_some(current.size_bytes).flatten(),
-            final_lf: include_source_text.then_some(current.final_lf).flatten(),
+            size_bytes: options.include_size.then_some(current.size_bytes).flatten(),
+            final_lf: options.include_text.then_some(current.final_lf).flatten(),
             text: current.text,
-            text_untrusted: include_source_text.then_some(current.text_untrusted),
+            text_untrusted: options.include_text.then_some(current.text_untrusted),
         });
     }
     if capture_snapshot(&source.root, &source.expected_base, limits, started)? != first {

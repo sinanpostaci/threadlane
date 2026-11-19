@@ -10,7 +10,8 @@ use tempfile::TempDir;
 use threadlane::delivery_inspection::{
     inspect_delivery, inspect_delivery_with_limits, inspect_delivery_with_source,
     inspect_delivery_with_source_and_limits, inspect_delivery_with_source_text,
-    inspect_delivery_with_source_text_and_limits, DeliveryChangeKind, DeliveryFileInspection,
+    inspect_delivery_with_source_text_and_limits, inspect_source_baseline,
+    inspect_source_baseline_with_limits, DeliveryChangeKind, DeliveryFileInspection,
     DeliveryFilePhysicalCode, DeliveryInspectionLimits, DeliveryInspectionRefusalCode,
     DeliveryInspectionReport, DeliveryInspectionRequest, DeliveryTextStatus,
 };
@@ -248,6 +249,222 @@ fn source_and_task_share_the_total_read_budget() {
         source.refusal_code,
         Some(DeliveryInspectionRefusalCode::ReadLimit)
     );
+}
+
+#[test]
+fn source_baseline_captures_named_hashes_before_task_checkout_without_text() {
+    let fixture = Fixture::new();
+    let names = vec!["src/lib.rs".to_string(), "src/unchanged.rs".to_string()];
+    let baseline = inspect_source_baseline(&fixture.root, &fixture.base, &names);
+    assert!(baseline.ok && baseline.clean_at_base, "{baseline:?}");
+    assert_eq!(baseline.head_commit.as_deref(), Some(fixture.base.as_str()));
+    assert_eq!(
+        baseline.base_tree.as_deref(),
+        Some(git(&fixture.root, &["rev-parse", "HEAD^{tree}"]).trim())
+    );
+    assert!(baseline.changed_paths.is_empty());
+    assert_eq!(baseline.files.len(), 2);
+    let first = &baseline.files[0];
+    let contents = "pub fn alpha() -> u32 { 1 }\n";
+    assert_eq!(first.path, names[0]);
+    assert_eq!(first.sha256, sha256_hex(contents.as_bytes()));
+    assert_eq!(first.base_sha256, first.sha256);
+    assert!(first.matches_base);
+    assert_eq!(first.size_bytes, Some(contents.len() as u64));
+    assert!(baseline.files.iter().all(|file| {
+        file.text.is_none() && file.text_untrusted.is_none() && file.final_lf.is_none()
+    }));
+    assert!(!serde_json::to_string(&baseline)
+        .unwrap()
+        .contains("pub fn alpha"));
+
+    // A later delivery observation can compare its text and same-read hash to the baseline.
+    let worker_root = fixture.root.parent().unwrap().join("worker");
+    git(
+        &fixture.root,
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "--detach",
+            worker_root.to_str().unwrap(),
+            &fixture.base,
+        ],
+    );
+    fs::write(worker_root.join("src/lib.rs"), "delivery\n").unwrap();
+    let mut request = fixture.request(&["src/lib.rs"], &[]);
+    request.root = worker_root;
+    let later = inspect_delivery_with_source_text(&request, &fixture.root, &names);
+    assert!(later.ok, "{later:?}");
+    let later = later.source.unwrap();
+    assert!(later.clean_at_base);
+    for (before, after) in baseline.files.iter().zip(&later.files) {
+        assert_eq!(before.sha256, after.sha256);
+        assert_eq!(before.base_sha256, after.base_sha256);
+        assert_eq!(before.size_bytes, after.size_bytes);
+        assert!(after.matches_base);
+        assert_eq!(after.text_untrusted, Some(true));
+        assert_eq!(
+            after.sha256,
+            sha256_hex(after.text.as_ref().unwrap().as_bytes())
+        );
+    }
+}
+
+#[test]
+fn source_baseline_reports_changed_and_stale_sources_as_unclean() {
+    let fixture = Fixture::new();
+    let names = vec!["src/lib.rs".to_string()];
+    let before = inspect_source_baseline(&fixture.root, &fixture.base, &names);
+    assert!(before.ok && before.clean_at_base);
+    fixture.write("src/lib.rs", "different source\n");
+    fixture.write("ignored.log", "ignored");
+    let changed = inspect_source_baseline(&fixture.root, &fixture.base, &names);
+    assert!(changed.ok && !changed.clean_at_base, "{changed:?}");
+    assert!(!changed.files[0].matches_base);
+    assert_ne!(changed.files[0].sha256, before.files[0].sha256);
+    assert_eq!(changed.files[0].base_sha256, before.files[0].base_sha256);
+    assert!(changed
+        .changed_paths
+        .iter()
+        .any(|path| path.path == "src/lib.rs"));
+    assert!(changed
+        .changed_paths
+        .iter()
+        .any(|path| path.path == "ignored.log" && path.ignored));
+
+    fixture.commit_all("source head moved");
+    let stale = inspect_source_baseline(&fixture.root, &fixture.base, &names);
+    assert!(stale.ok && !stale.clean_at_base, "{stale:?}");
+    assert_ne!(stale.head_commit.as_deref(), Some(fixture.base.as_str()));
+    assert!(!stale.files[0].matches_base);
+}
+
+#[test]
+fn source_baseline_fails_closed_on_invalid_shape_files_flags_and_limits() {
+    let fixture = Fixture::new();
+    let names = vec!["src/lib.rs".to_string()];
+    let unknown_base = "0".repeat(40);
+    let cases: Vec<(&Path, &str, Vec<String>, DeliveryInspectionRefusalCode)> = vec![
+        (
+            &fixture.root,
+            "invalid",
+            names.clone(),
+            DeliveryInspectionRefusalCode::InvalidExpectedBase,
+        ),
+        (
+            Path::new("relative"),
+            &fixture.base,
+            names.clone(),
+            DeliveryInspectionRefusalCode::InvalidRoot,
+        ),
+        (
+            &fixture.root,
+            &fixture.base,
+            vec![],
+            DeliveryInspectionRefusalCode::InvalidRequest,
+        ),
+        (
+            &fixture.root,
+            &fixture.base,
+            vec!["../outside".into()],
+            DeliveryInspectionRefusalCode::UnsafePath,
+        ),
+        (
+            &fixture.root,
+            &fixture.base,
+            vec![".git/config".into()],
+            DeliveryInspectionRefusalCode::ProtectedPath,
+        ),
+        (
+            &fixture.root,
+            &fixture.base,
+            vec![names[0].clone(), names[0].clone()],
+            DeliveryInspectionRefusalCode::DuplicatePath,
+        ),
+        (
+            &fixture.root,
+            &fixture.base,
+            vec!["src/missing.rs".into()],
+            DeliveryInspectionRefusalCode::FileReadFailed,
+        ),
+        (
+            &fixture.root,
+            &unknown_base,
+            names.clone(),
+            DeliveryInspectionRefusalCode::UnknownBase,
+        ),
+    ];
+    for (root, base, paths, code) in cases {
+        let report = inspect_source_baseline(root, base, &paths);
+        assert!(
+            !report.ok && !report.clean_at_base && report.files.is_empty(),
+            "{report:?}"
+        );
+        assert_eq!(report.refusal_code, Some(code), "{report:?}");
+    }
+
+    let small_file = DeliveryInspectionLimits {
+        max_file_bytes: 1,
+        ..DeliveryInspectionLimits::default()
+    };
+    let report =
+        inspect_source_baseline_with_limits(&fixture.root, &fixture.base, &names, &small_file);
+    assert_eq!(
+        report.refusal_code,
+        Some(DeliveryInspectionRefusalCode::FileSizeLimit)
+    );
+    assert!(!report.ok && report.files.is_empty());
+    let source_size = fs::metadata(fixture.root.join(&names[0])).unwrap().len();
+    let read_limit = DeliveryInspectionLimits {
+        max_total_read_bytes: source_size * 2 - 1,
+        ..DeliveryInspectionLimits::default()
+    };
+    let report =
+        inspect_source_baseline_with_limits(&fixture.root, &fixture.base, &names, &read_limit);
+    assert_eq!(
+        report.refusal_code,
+        Some(DeliveryInspectionRefusalCode::ReadLimit)
+    );
+    assert!(!report.ok && report.files.is_empty());
+    let output_limit = DeliveryInspectionLimits {
+        max_output_bytes: 300,
+        ..DeliveryInspectionLimits::default()
+    };
+    let report =
+        inspect_source_baseline_with_limits(&fixture.root, &fixture.base, &names, &output_limit);
+    assert_eq!(
+        report.refusal_code,
+        Some(DeliveryInspectionRefusalCode::OutputLimit)
+    );
+    assert!(!report.ok && report.files.is_empty());
+    assert!(serde_json::to_vec(&report).unwrap().len() <= output_limit.max_output_bytes);
+
+    git(
+        &fixture.root,
+        &["update-index", "--skip-worktree", &names[0]],
+    );
+    let report = inspect_source_baseline(&fixture.root, &fixture.base, &names);
+    assert_eq!(
+        report.refusal_code,
+        Some(DeliveryInspectionRefusalCode::IndexFlagUnsupported)
+    );
+    assert!(!report.ok && report.files.is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn source_baseline_refuses_symlinks() {
+    use std::os::unix::fs::symlink;
+    let fixture = Fixture::new();
+    fs::remove_file(fixture.root.join("src/lib.rs")).unwrap();
+    symlink("unchanged.rs", fixture.root.join("src/lib.rs")).unwrap();
+    let report = inspect_source_baseline(&fixture.root, &fixture.base, &["src/lib.rs".into()]);
+    assert_eq!(
+        report.refusal_code,
+        Some(DeliveryInspectionRefusalCode::SymlinkEscape)
+    );
+    assert!(!report.ok && report.files.is_empty());
 }
 
 fn source_text_fixture() -> (Fixture, DeliveryInspectionRequest) {
