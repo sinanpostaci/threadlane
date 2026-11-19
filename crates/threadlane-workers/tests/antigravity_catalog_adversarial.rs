@@ -90,8 +90,8 @@ fn assert_effort_missing(evidence: &StreamEvidenceSummary, requested_effort: &st
 fn every_known_catalog_model_verifies_exact_encoded_effort() {
     let cli_version = ANTIGRAVITY_OBSERVED_CLI_VERSION;
     let contract_version = ANTIGRAVITY_CATALOG_CONTRACT_VERSION;
-    assert_eq!(cli_version, "1.5.9");
-    assert_eq!(contract_version, "agy-1.5.9-catalog-v1");
+    assert_eq!(cli_version, "1.5.12");
+    assert_eq!(contract_version, "agy-1.5.12-catalog-v1");
     let expected_catalog: &[(&str, &str)] = &[
         ("gemini-4-argon-low", "low"),
         ("gemini-4-argon-medium", "medium"),
@@ -113,8 +113,12 @@ fn every_known_catalog_model_verifies_exact_encoded_effort() {
         ("gemini-4-hydrogen-medium", "medium"),
         ("gemini-4-hydrogen-high", "high"),
         ("gemini-4-hydrogen-xhigh", "xhigh"),
+        ("gemini-4-neon-low", "low"),
+        ("gemini-4-neon-medium", "medium"),
+        ("gemini-4-neon-high", "high"),
+        ("gemini-4-neon-xhigh", "xhigh"),
     ];
-    assert_eq!(expected_catalog.len(), 20);
+    assert_eq!(expected_catalog.len(), 24);
     assert_eq!(ANTIGRAVITY_KNOWN_CATALOG_MODELS, expected_catalog);
     let mut seen = BTreeSet::new();
 
@@ -128,6 +132,28 @@ fn every_known_catalog_model_verifies_exact_encoded_effort() {
     }
 
     assert_eq!(seen.len(), ANTIGRAVITY_KNOWN_CATALOG_MODELS.len());
+}
+
+#[test]
+fn neon_xhigh_init_confirms_encoded_effort() {
+    let model = "gemini-4-neon-xhigh";
+    let requested = "xhigh";
+    let init = init_line(model);
+    let evidence = parse(model, requested, &[&init, RESULT]);
+    assert_verified_catalog_effort(&evidence, model, requested);
+
+    let conflicting = serde_json::json!({
+        "event": "init",
+        "init": { "model": model, "effort": "high", "session_id": SESSION_ID },
+    })
+    .to_string();
+    let conflict = parse(model, requested, &[&conflicting, RESULT]);
+    assert!(matches!(
+        conflict.effort_evidence,
+        FieldEvidence::Mismatch { .. }
+    ));
+    assert_eq!(conflict.effort_evidence_source, None);
+    assert!(resolve_model_target(WorkerProvider::Antigravity, model, Some("high")).is_err());
 }
 
 #[test]
@@ -154,7 +180,9 @@ fn unregistered_lookalike_ids_never_derive_effort() {
         "gemini-4-carbon-High",        // Carbon case variant
         "GEMINI-4-CARBON-HIGH",        // Carbon folded variant
         "xgemini-4-carbon-medium",     // Carbon prefixed lookalike
-        "gemini-4-boron-high",         // unregistered family
+        "gemini-4-neon-max",
+        "gemini-pro-orchestrator-neon",
+        "gemini-4-boron-high", // unregistered family
     ];
 
     for lookalike in lookalikes {
