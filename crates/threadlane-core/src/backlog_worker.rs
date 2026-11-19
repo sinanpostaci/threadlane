@@ -2941,7 +2941,7 @@ mod tests {
         assert_eq!(table_counts(&core), before);
         assert_eq!(history_entries(&core, &binding, &item.item_id), history);
 
-        let receipt = core
+        let done_receipt = core
             .complete_worker_backlog_item_operator_attested(
                 &binding,
                 "complete-notice",
@@ -2961,7 +2961,7 @@ mod tests {
                 item: done.item,
                 execution: done.execution
             },
-            receipt
+            done_receipt
         );
         assert_eq!(table_counts(&core), completed_counts);
 
