@@ -776,6 +776,14 @@ async fn guarded_worker_backlog_start_result_complete_duplicate_stopped_and_repl
     assert_eq!(notice_data["scope"]["requested_effort"], "high");
     assert_eq!(notice_data["scope"]["write_paths"], json!(["src/lib.rs"]));
     assert_eq!(
+        notice_data["acceptance_condition"],
+        item_before_notice.acceptance_condition
+    );
+    assert_eq!(
+        notice_data["delivery_description"],
+        item_before_notice.delivery_description
+    );
+    assert_eq!(
         notice_data["item_snapshot"]["current_execution_ref"],
         first_execution.execution_ref
     );

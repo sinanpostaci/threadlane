@@ -2941,6 +2941,24 @@ mod tests {
         assert_eq!(table_counts(&core), before);
         assert_eq!(history_entries(&core, &binding, &item.item_id), history);
 
+        // A changed item condition must never be presented as the frozen original scope.
+        core.conn
+            .execute(
+                "UPDATE backlog_items SET acceptance_condition = ?1 WHERE item_id = ?2",
+                params!["altered condition", item.item_id],
+            )
+            .expect("simulate changed condition");
+        assert!(matches!(
+            core.get_worker_backlog_notice_operator_attested(&binding, "apr_notice"),
+            Err(CoreError::CorruptState(_))
+        ));
+        core.conn
+            .execute(
+                "UPDATE backlog_items SET acceptance_condition = ?1 WHERE item_id = ?2",
+                params![item.acceptance_condition, item.item_id],
+            )
+            .expect("restore original fixture condition");
+
         let done_receipt = core
             .complete_worker_backlog_item_operator_attested(
                 &binding,

@@ -177,6 +177,10 @@ pub struct WorkerBacklogNoticeContextOutcome {
     pub execution: WorkerBacklogExecution,
     /// Narrow projection of immutable approval scope.
     pub scope: WorkerBacklogNoticeScope,
+    /// Untrusted item acceptance condition, verified against its reservation digest.
+    pub acceptance_condition: String,
+    /// Untrusted intended delivery description, verified against its reservation digest.
+    pub delivery_description: String,
     /// Atomic current item identity, status, and revision.
     pub item_snapshot: WorkerBacklogItemSnapshot,
     /// Canonical completion receipt when this same execution is already Done.
@@ -577,6 +581,8 @@ impl WorkerBacklogService {
             None
         };
         Ok(WorkerBacklogNoticeContextOutcome {
+            acceptance_condition: snapshot.item.acceptance_condition,
+            delivery_description: snapshot.item.delivery_description,
             item_snapshot: WorkerBacklogItemSnapshot {
                 item_id: snapshot.item.item_id,
                 revision: snapshot.item.revision,
