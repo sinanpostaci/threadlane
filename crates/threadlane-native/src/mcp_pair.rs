@@ -6543,7 +6543,7 @@ mod backlog_paired_tests {
         let unbound = PairedMcpServer::new(&state_dir, pairing_store).expect("unbound server");
 
         let tools = unbound.list_tools();
-        assert_eq!(tools.len(), 53, "PairedMcpServer must expose 53 tools");
+        assert_eq!(tools.len(), 54, "PairedMcpServer must expose 54 tools");
 
         let cases: [(&str, bool, &[&str], &[&str]); 8] = [
             (
