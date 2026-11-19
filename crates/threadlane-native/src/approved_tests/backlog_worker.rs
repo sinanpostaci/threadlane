@@ -660,6 +660,7 @@ async fn ordinary_review_pending_intent_without_done_never_reissues_effect() {
         reason: reason.to_string(),
         acceptance_evidence: crate::ordinary_review::acceptance_evidence(&read_id, &read).unwrap(),
         refusal: None,
+        refusal_message: None,
         completion: None,
     };
     // Represent an interruption after persisting the intent and before any guarded effect.
