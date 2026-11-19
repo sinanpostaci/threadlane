@@ -23,7 +23,7 @@ use crate::error::{NativeError, NativeErrorCode};
 use crate::fs_safety::validate_absolute_no_symlink_components;
 
 /// Bundled Threadlane Codex skill version identifier.
-pub const THREADLANE_SKILL_VERSION: &str = "2026-11-17.v2";
+pub const THREADLANE_SKILL_VERSION: &str = "2026-11-19.v1";
 
 /// Directory and skill name for the bundled Threadlane Codex skill.
 pub const THREADLANE_SKILL_NAME: &str = "threadlane";
@@ -1951,6 +1951,34 @@ mod tests {
         assert_eq!(marker_id_before, marker_id_after);
         assert_eq!(skill_md_id_before, skill_md_id_after);
         assert_eq!(yaml_id_before, yaml_id_after);
+    }
+
+    #[test]
+    fn prior_managed_skill_version_is_detected_as_outdated_then_updated() {
+        let (_tmp, root) = canonical_tempdir();
+        let req = CodexSkillSetupRequest {
+            skills_dir: root.join("skills"),
+        };
+        // Historical fixture: the previous installed version must not be
+        // mistaken for the current notice-recovery bundle.
+        let prior = run_with_bundle(
+            &req,
+            CodexSetupMode::Apply,
+            "2026-11-17.v2",
+            V1_SKILL_MD,
+            V1_OPENAI_YAML,
+        );
+        assert_eq!(prior.state, CodexSkillSetupState::Installed);
+        let check = run_codex_skill_setup(&req, CodexSetupMode::Check);
+        assert_eq!(check.state, CodexSkillSetupState::Outdated);
+        assert_eq!(check.version, "2026-11-19.v1");
+        assert!(!check.files_modified);
+        let update = run_codex_skill_setup(&req, CodexSetupMode::Apply);
+        assert_eq!(update.state, CodexSkillSetupState::Updated);
+        assert_eq!(update.version, THREADLANE_SKILL_VERSION);
+        assert!(update.installed);
+        let current = run_codex_skill_setup(&req, CodexSetupMode::Check);
+        assert_eq!(current.state, CodexSkillSetupState::Unchanged);
     }
 
     #[test]
