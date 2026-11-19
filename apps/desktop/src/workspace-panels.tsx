@@ -101,6 +101,7 @@ import {
   formatCompactUsage,
   formatExecutorRoleLabel,
   formatFeedTimestamp,
+  formatExecutionEffort,
   formatFriendlyModel,
   formatRelativeTime,
   formatRequestedObserved,
@@ -357,7 +358,7 @@ function formatConfiguredSelectionDisplay(
   }
   const friendlyParts = [
     selection.selected_model ? formatFriendlyModel(selection.selected_model) : null,
-    selection.selected_effort ? capitalizeFirst(selection.selected_effort) : null,
+    selection.selected_effort ? formatExecutionEffort(selection.selected_effort) : null,
   ].filter((token): token is string => Boolean(token));
   return {
     friendly: friendlyParts.join(' · '),

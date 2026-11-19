@@ -925,10 +925,23 @@ const DEEPSEEK_FLASH_4_1_MODEL_IDS: ReadonlySet<string> = new Set([
   'deepseek-4.1-flash',
 ]);
 
+export function formatExecutionEffort(value: string, capitalizeOtherEfforts = true): string {
+  if (value.toLowerCase() === 'xhigh') {
+    return 'XHigh';
+  }
+  return capitalizeOtherEfforts ? capitalizeLabel(value) : value;
+}
+
 /** Display names shorten familiar model identifiers; exact receipts stay in detail. */
 export function formatFriendlyModel(value: string): string {
   const model = (value.trim().split('/').at(-1) ?? value.trim()).trim();
   const normalized = model.toLowerCase();
+  if (/^gemini-4-neon-(?:low|medium|high|xhigh)$/.test(model)) {
+    return 'Gemini 4 Neon';
+  }
+  if (normalized === 'gemini-4-neon' || normalized.startsWith('gemini-4-neon-')) {
+    return value.trim();
+  }
   if (DEEPSEEK_FLASH_4_1_MODEL_IDS.has(normalized)) return 'DeepSeek Flash 4.1';
   if (normalized === 'deepseek') return 'DeepSeek';
   if (/^deepseek(?:-|$)/i.test(model)) return `DeepSeek · ${model}`;
@@ -1007,7 +1020,7 @@ export function projectExecutorDisplay(
     role: capitalizeLabel(formatExecutorRoleLabel(executor?.role)),
     model: model === null
       ? 'Model not reported'
-      : [formatFriendlyModel(model), effort ? capitalizeLabel(effort) : null]
+      : [formatFriendlyModel(model), effort ? formatExecutionEffort(effort) : null]
           .filter(Boolean).join(' · '),
     detail,
   };

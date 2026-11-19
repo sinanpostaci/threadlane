@@ -30,6 +30,7 @@ import {
   formatDeliveryStageLabel,
   formatDurationDetail,
   formatDurationSummary,
+  formatExecutionEffort,
   formatExecutorIdentity,
   formatExecutorRoleLabel,
   formatFeedTimestamp,
@@ -1632,6 +1633,34 @@ describe('activity feed request projection', () => {
       '3d ago'
     );
     assert.equal(formatRelativeTime(null, NOW_MS), 'Time not reported');
+  });
+
+  it('formats exact Neon variants and keeps unknown model identities and raw evidence', () => {
+    for (const [input, expected] of [
+      ['gemini-4-neon-low', 'Gemini 4 Neon'],
+      ['gemini-4-neon-medium', 'Gemini 4 Neon'],
+      ['gemini-4-neon-high', 'Gemini 4 Neon'],
+      ['gemini-4-neon-xhigh', 'Gemini 4 Neon'],
+      ['vendor/gemini-4-neon-high', 'Gemini 4 Neon'],
+      ['vendor/gemini-4-neon-preview', 'vendor/gemini-4-neon-preview'],
+      ['vendor/Gemini-4-Neon-XHigh', 'vendor/Gemini-4-Neon-XHigh'],
+      ['gemini-4-neon', 'gemini-4-neon'],
+    ] as const) {
+      assert.equal(formatFriendlyModel(input), expected);
+    }
+    const executor = makeExecutor({
+      requested_model: 'gemini-4-neon-low',
+      requested_effort: 'low',
+      observed_model: 'gemini-4-neon-xhigh',
+      observed_effort: 'xhigh',
+    });
+    const display = projectExecutorDisplay(executor);
+    assert.equal(display.model, 'Gemini 4 Neon · XHigh');
+    assert.match(display.detail, /requested gemini-4-neon-low · observed gemini-4-neon-xhigh/);
+    assert.match(display.detail, /Effort requested low · observed xhigh/);
+    assert.equal(projectExecutorDisplay({ ...executor, observed_effort: null }).model, 'Gemini 4 Neon');
+    assert.equal(formatExecutionEffort('low', false), 'low');
+    assert.equal(formatExecutionEffort('xhigh', false), 'XHigh');
   });
 
   it('recognizes only exact DeepSeek Flash 4.1 IDs and keeps variant identity distinct', () => {

@@ -7,6 +7,7 @@ import type {
 import type { ActivityFeedScope } from './pages/activity-feed-model.ts';
 import {
   formatDurationMs,
+  formatExecutionEffort,
   formatFriendlyModel,
   projectDuration,
 } from './pages/activity-feed-model.ts';
@@ -1136,10 +1137,6 @@ function lowerToken(value: string | null | undefined): string {
   return typeof value === 'string' ? value.trim().toLowerCase() : '';
 }
 
-function capitalizeExecutionEffort(value: string): string {
-  return value.length > 0 ? `${value.charAt(0).toUpperCase()}${value.slice(1)}` : value;
-}
-
 function resolveChatWorkExecutionStatus(
   execution: ChatWorkExecution,
   item: ChatWorkItem | null,
@@ -1414,7 +1411,7 @@ export function buildChatWorkExecutionSummaries(
       provider: execution.provider,
       modelRaw,
       model: modelRaw !== null ? formatFriendlyModel(modelRaw) : null,
-      effort: effortRaw !== null ? capitalizeExecutionEffort(effortRaw) : null,
+      effort: effortRaw !== null ? formatExecutionEffort(effortRaw) : null,
       statusKey,
       statusLabel: presentation.label,
       tone: presentation.tone,

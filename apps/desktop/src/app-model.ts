@@ -18,6 +18,7 @@ import type {
 } from './observation/types.ts';
 import {
   describeDeliveryStage,
+  formatExecutionEffort,
   formatFriendlyModel,
   formatRecordedOperation,
   formatRelativeTime,
@@ -3493,7 +3494,7 @@ function formatExecutorCompactLabel(
   const modelLabel =
     modelToken !== null
       ? effortToken !== null
-        ? `${formatFriendlyModel(modelToken)} · ${effortToken}`
+        ? `${formatFriendlyModel(modelToken)} · ${formatExecutionEffort(effortToken, false)}`
         : formatFriendlyModel(modelToken)
       : null;
   return { label, modelLabel };

@@ -2639,6 +2639,33 @@ test('worker execution footers join exact item/binding attempts and render only 
   assert.equal(views[1]!.outcome, 'success');
 });
 
+test('worker execution summary displays Neon and XHigh while retaining the recorded model ID', () => {
+  const identity = makeIdentity('bnd_alpha_neon', UUID_ALPHA);
+  const execution = makeExecution(identity.binding_id, {
+    provider: 'antigravity',
+    requested_model: 'gemini-4-neon-low',
+    observed_model: 'gemini-4-neon-xhigh',
+    requested_effort: 'low',
+    observed_effort: 'xhigh',
+  });
+  const item = makeBacklogItem({
+    item_id: execution.item_id,
+    binding_id: identity.binding_id,
+    kind: 'worker',
+    status: 'doing',
+    current_execution_ref: execution.execution_ref,
+  });
+  const selection = selectWorkspaceChatWork(
+    [makeChatWork(identity, { items: [item], worker_executions: [execution] })],
+    identity,
+  );
+  const [summary] = buildChatWorkExecutionSummaries(selection);
+  assert.ok(summary);
+  assert.equal(summary.modelRaw, 'gemini-4-neon-xhigh');
+  assert.equal(summary.model, 'Gemini 4 Neon');
+  assert.equal(summary.effort, 'XHigh');
+});
+
 test('worker execution summaries keep the Flash 4.1 label separate from Max and prefer observed identity', () => {
   const identity = makeIdentity('bnd_alpha_execution_model_labels', UUID_ALPHA);
   const requestedItem = makeBacklogItem({
