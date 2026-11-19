@@ -1655,17 +1655,20 @@ mod tests {
         for required_recipe in [
             "functions.exec",
             "tools.exec_command",
-            "tools.mcp__threadlane__approved_pull_events",
-            "tools.mcp__threadlane__approved_ack_events",
-            "tools.mcp__threadlane__backlog_worker_result",
-            "tools.mcp__threadlane__backlog_worker_complete",
-            "store(\"threadlane/closure-template.json\"",
-            "load(\"threadlane/closure-template.json\")",
-            "const input = APPROVED_TASK_CONTEXT;",
-            "const acceptance = ACCEPTANCE_CONTEXT;",
+            "createOrdinaryNativeClient",
+            "readNotice",
+            "NOTICE_APPROVAL_ID",
+            "NOTICE_CLI_PACKAGE",
+            "NOTICE_SOURCE_SHA256",
+            "APPROVED_TASK_CONTEXT",
+            "ACCEPTANCE_CONTEXT",
+            "cli_package",
+            "source_sha256",
+            "read_id",
+            "threadlane/closure-template.json",
             "threadlane/approved-task-context.json",
-            "max_output_tokens: 40000",
-            "JSON.parse(result.output)",
+            "max_output_tokens",
+            "JSON.parse",
             "closure-evidence.json",
             "closure-report.json",
             "closure-done-receipt.json",
@@ -1676,6 +1679,44 @@ mod tests {
                 OPERATING_GUIDE_MARKDOWN.contains(required_recipe),
                 "canonical MCP guide is missing closure recipe fragment `{required_recipe}`"
             );
+        }
+        let template = crate::closure_template::CLOSURE_TEMPLATE_JAVASCRIPT;
+        let delegated_tools = [
+            "backlog_worker_notice_context",
+            "approved_pull_events",
+            "approved_ack_events",
+            "backlog_worker_result",
+            "backlog_worker_complete",
+        ];
+        for capability in delegated_tools.iter().copied().chain([
+            "createOrdinaryNativeClient",
+            "exec_command",
+            "read_id",
+            "source_sha256",
+        ]) {
+            assert!(
+                template.contains(capability),
+                "packaged template is missing capability `{capability}`"
+            );
+        }
+        let adapter_recipes: Vec<_> = OPERATING_GUIDE_MARKDOWN
+            .split("```js")
+            .skip(1)
+            .filter_map(|fragment| fragment.split_once("```").map(|(code, _)| code))
+            .filter(|code| code.contains("createOrdinaryNativeClient"))
+            .collect();
+        assert!(adapter_recipes.len() >= 2, "notice and completion recipes");
+        assert!(adapter_recipes
+            .iter()
+            .any(|code| code.contains("readNotice")));
+        assert!(adapter_recipes.iter().any(|code| code.contains("complete")));
+        for recipe in adapter_recipes {
+            for capability in delegated_tools {
+                assert!(
+                    !recipe.contains(capability),
+                    "guide should delegate `{capability}` to the packaged adapter"
+                );
+            }
         }
         assert!(!OPERATING_GUIDE_MARKDOWN.contains("<ACTUAL_"));
         assert!(!OPERATING_GUIDE_MARKDOWN.contains("Number(\""));
