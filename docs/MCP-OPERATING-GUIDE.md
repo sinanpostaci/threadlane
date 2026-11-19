@@ -1,6 +1,6 @@
 # Threadlane MCP operating guide
 
-Version: `2026-11-19.v3`
+Version: `2026-11-19.v4`
 
 ## Act as the Coworker in the native Codex conversation
 
@@ -44,7 +44,7 @@ Before the guarded start, run the first `functions.exec` recipe with the real `A
 
 At a notice run the retained-origin recipe with actual `NOTICE_APPROVAL_ID`; do not copy or bind `CLOSURE_ORIGIN` in normal use. The name is present only to refuse an explicitly conflicting legacy input. If storage is missing, the recipe returns `origin_missing` without a tool call; use the separate cold recovery below. Reconnect and refetch the guide on resume. The paired verifier checks binding, context, package and guide, then verifies its compiled bootstrap and the exact `threadlane closure-template` source bytes **before evaluation**. No notice or provider text is executed. It prints compact `client_verification`; missing or conflicting identity refuses. Scoped original recovery uses 8 pages, 16 calls and 60000 ms. Invalid `step_seq`, batches over 49152 bytes, a live `exec_command` session, failed exit, truncation or conflicting envelopes refuse. Keep closure-evidence.json and closure-report.json private.
 
-At `ready_for_semantic_review`, separately compare `semantic_review` against actual physical text; hand off if another primary owns acceptance. Only then run the standalone **Guarded Done after semantic review** recipe below once with `ACCEPTANCE_CONTEXT = {read_id, command_key, acceptance_note, acceptance_evidence}`: use the returned read ID, a fresh key, a user-language note, and actual evidence. Its `client.complete` invokes guarded `backlog_worker_complete` with the verified current revision and digests; do not look up or construct that underlying tool schema. The fresh key is 1–128 UTF-8 bytes without control characters or surrounding whitespace; note and evidence are nonblank, at most 2048 UTF-8 bytes each, and contain no NUL. No pins or factory names are reconstructed. Unknown completion needs original-receipt reconciliation, never retry. Lost read storage requires original recovery and renewed semantic review. For an older open task without an origin receipt, reconcile its real original package, approval and start receipt via the supported per-tool pull/ACK, result, physical inspection and guarded decision. Do not guess a new origin or restart; stop if original identity cannot be established.
+At `ready_for_semantic_review`, separately compare `semantic_review` against actual physical text; hand off if another primary owns acceptance. On a positive decision, run **Guarded Done after semantic review** next with `REVIEW_DECISION = {read_id, verdict: "accept", reason}`: the exact returned read ID and your own short, item-specific explanation of what you checked. The reason is nonblank, at most 2048 UTF-8 bytes, and contains no NUL. The package derives the command key and bounded physical/result evidence from that immutable read and invokes guarded `backlog_worker_complete` with the verified current revision and digests; do not look up or construct that underlying tool schema. The retained bootstrap is reverified before evaluation; it is not a decision. On a negative semantic decision use the existing guarded rejection route; missing evidence permits neither decision. If no issue or human input is pending, make the decision call before a progress update and give one concise update after validated Done. Unknown completion needs original-receipt reconciliation, never retry. A read without the new adapter can use the [legacy completion recipe](ORDINARY-WORKER-CLOSURE.md#legacy-completion-for-an-existing-read); lost read storage requires original recovery and renewed semantic review. For an older open task without an origin receipt, reconcile its real original package, approval and start receipt via the supported per-tool pull/ACK, result, physical inspection and guarded decision. Do not guess a new origin or restart; stop if original identity cannot be established.
 
 For source preservation bind `NOTICE_SOURCE_OPTIONS` as `{source_files: [...]}`. The scoped approval supplies the root. Compare HEAD, tree, changed paths and named file/base hashes against the known original; `clean_at_base` requires a known clean start. A file already different from base needs a separately pinned baseline. Missing or mismatched named files refuse. Omit options for no source scan; use the same option on recovery.
 
@@ -116,7 +116,7 @@ if (origin == null) {
   const bootstrap = checked(await tools.mcp__threadlane__ordinary_closure_client({origin})).bootstrap;
   const identity = checked(await tools.mcp__threadlane__ordinary_closure_client({origin, bootstrap}));
   if (identity.bootstrap_verified !== true || !same(identity.origin, origin)) throw new Error("unverified closure bootstrap");
-  const client = new Function(bootstrap)()({tools, load, store, origin, identity});
+  const client = new Function(bootstrap)()({tools, load, store, origin, identity, bootstrap_source: bootstrap});
   text(JSON.stringify(await client.readNotice(id, typeof NOTICE_SOURCE_OPTIONS === "undefined" ? undefined : NOTICE_SOURCE_OPTIONS)));
 }
 ```
@@ -124,35 +124,17 @@ if (origin == null) {
 #### Guarded Done after semantic review
 
 ```js
-const acceptance = ACCEPTANCE_CONTEXT, index = acceptance && await load("threadlane/closure-read-index/" + acceptance.read_id), origin = index && index.origin;
-if (!origin) throw new Error("missing original read; reconcile before completion");
-function same(a, b) {
-  if (a === b) return true;
-  if (!a || !b || typeof a !== "object" || typeof b !== "object" ||
-      Array.isArray(a) !== Array.isArray(b)) return false;
-  const keys = Object.keys(a);
-  return keys.length === Object.keys(b).length &&
-    keys.every((key) => Object.hasOwn(b, key) && same(a[key], b[key]));
-}
-if (typeof CLOSURE_ORIGIN !== "undefined" && !same(origin, CLOSURE_ORIGIN)) throw new Error("closure origin conflicts with original");
-function checked(reply) {
-  const result = reply && reply.structuredContent;
-  if (!result || reply.isError || reply.is_error || result.untrusted_data !== false ||
-      result.tool !== "ordinary_closure_client" || !result.data) {
-    throw new Error("closure refused");
-  }
-  for (const part of reply.content || []) {
-    if (part.type === "text" && !same(JSON.parse(part.text), result)) {
-      throw new Error("conflicting response");
-    }
-  }
-  return result.data;
-}
-const bootstrap = checked(await tools.mcp__threadlane__ordinary_closure_client({origin})).bootstrap;
-const identity = checked(await tools.mcp__threadlane__ordinary_closure_client({origin, bootstrap}));
-if (identity.bootstrap_verified !== true || !same(identity.origin, origin)) throw new Error("unverified closure bootstrap");
-const client = new Function(bootstrap)()({tools, load, store, origin, identity});
-text(JSON.stringify(await client.complete(acceptance)));
+const decision = REVIEW_DECISION;
+const ready = decision && await load("threadlane/closure-ready/" + decision.read_id);
+if (!ready || typeof CLOSURE_ORIGIN !== "undefined") throw new Error("missing or conflicting ready observation");
+const {origin, bootstrap} = ready;
+const proof = await tools.mcp__threadlane__ordinary_closure_client({origin, bootstrap, compact: true});
+if (!proof || proof.isError || proof.is_error || proof.structuredContent != null || proof.structured_content != null ||
+    !Array.isArray(proof.content) || proof.content.length !== 1 || proof.content[0].type !== "text" ||
+    proof.content[0].text !== "threadlane ordinary closure bootstrap verified v1") throw new Error("closure verification refused");
+const client = new Function(bootstrap)()({tools, load, store, origin,
+  identity: {origin, bootstrap_verified: true}, bootstrap_source: bootstrap});
+text(JSON.stringify(await client.accept(decision)));
 ```
 
 #### Cold recovery only after `origin_missing`

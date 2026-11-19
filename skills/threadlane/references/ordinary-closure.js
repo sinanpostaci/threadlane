@@ -609,8 +609,9 @@ function createOrdinaryClosureClient(callbacks) {
     return view;
   }
 
-  async function retainObservation(input, start, report, evidence) {
+  async function retainObservation(input, start, report, evidence, semanticReview) {
     var observation = {schema_version: 1, input: input, start: start, report: report, evidence: evidence};
+    if (semanticReview !== undefined) observation.semantic_review = semanticReview;
     var readId = "rd_" + sha256Utf8(stableStringify(observation));
     var observationKey = ORDINARY_CLOSURE_CLIENT_READ_PREFIX + readId;
     var previous = await load(observationKey);
@@ -624,7 +625,7 @@ function createOrdinaryClosureClient(callbacks) {
     return view;
   }
 
-  async function readRetained(approvalId, isolateObservation, source) {
+  async function readRetained(approvalId, isolateObservation, source, semanticReview) {
     var input = await load(ORDINARY_CLOSURE_CLIENT_CONTEXT_KEY);
     var template = await load(ORDINARY_CLOSURE_CLIENT_TEMPLATE_KEY);
     var start = await load(ORDINARY_CLOSURE_CLIENT_START_KEY);
@@ -657,7 +658,7 @@ function createOrdinaryClosureClient(callbacks) {
     var report = outcome.report;
     var evidence = outcome.evidence;
     if (isolateObservation) {
-      var isolatedView = await retainObservation(input, start, report, evidence);
+      var isolatedView = await retainObservation(input, start, report, evidence, semanticReview);
       if (report.status !== "ready_for_semantic_review" &&
           !isVerifiedPending(report, evidence, identity)) {
         var uncertainKey = "threadlane/closure-uncertain/" + identity.execution_ref;
@@ -930,7 +931,7 @@ function createOrdinaryClosureClient(callbacks) {
     if (missingBinding) await store(ORDINARY_CLOSURE_CLIENT_BINDING_KEY, {input: input, start: start});
     if (priorReport) {
       if (source !== undefined) validateRetainedSource(priorReport, source);
-      var retained = await retainObservation(input, start, priorReport, priorEvidence);
+      var retained = await retainObservation(input, start, priorReport, priorEvidence, semanticReview);
       retained.later_events = await drainDoneEvents(parsed);
       retained.semantic_review = semanticReview;
       return retained;
@@ -939,7 +940,7 @@ function createOrdinaryClosureClient(callbacks) {
     if (uncertain !== undefined && uncertain !== null) {
       throw new Error("original observation requires reconciliation; no retry");
     }
-    var view = await readRetained(approvalId, true, source);
+    var view = await readRetained(approvalId, true, source, semanticReview);
     if (view.status === "ready_for_semantic_review") view.semantic_review = semanticReview;
     return view;
   }
@@ -1037,6 +1038,23 @@ function createOrdinaryClosureClient(callbacks) {
         intent.args.expected_result_digest !== completion.execution.completion.result_digest ||
         intent.args.expected_delivery_digest !== completion.execution.completion.delivery_digest)) {
       throw new Error("retained completion intent conflicts with durable completion");
+    }
+    if (intent !== undefined && intent.decision_kind !== undefined &&
+        intent.decision_kind !== "reviewed_read_v1") {
+      throw new Error("retained completion intent has an unknown decision kind");
+    }
+    if (intent !== undefined && intent.decision_kind === "reviewed_read_v1" &&
+        (!isPlainObject(intent.acceptance) ||
+         !/^rd_[0-9a-f]{64}$/.test(intent.acceptance.read_id || "") ||
+         intent.args.command_key !== "ordinary-done:" + intent.acceptance.read_id ||
+         intent.acceptance.command_key !== intent.args.command_key ||
+         intent.args.item_id !== completion.item.item_id ||
+         intent.args.expected_revision + 1 !== completion.item.revision ||
+         intent.acceptance.acceptance_note !== intent.args.acceptance_note ||
+         intent.acceptance.acceptance_evidence !== intent.args.acceptance_evidence ||
+         intent.args.acceptance_note !== completion.execution.completion.acceptance_note ||
+         intent.args.acceptance_evidence !== completion.execution.completion.acceptance_evidence)) {
+      throw new Error("retained completion intent conflicts with durable semantic decision");
     }
     var views = completionState(await load(ORDINARY_CLOSURE_CLIENT_DONE_VIEW_KEY));
     var view = completionRecord(views, key);
@@ -1336,7 +1354,7 @@ function createOrdinaryClosureClient(callbacks) {
       : "foreign";
   }
 
-  async function completeStored(acceptance) {
+  async function completeStored(acceptance, verifyDecisionReceipt) {
     var note = acceptance && acceptance.acceptance_note;
     var evidence = acceptance && acceptance.acceptance_evidence;
     if (!isPlainObject(acceptance) ||
@@ -1431,6 +1449,7 @@ function createOrdinaryClosureClient(callbacks) {
       args: args,
       start: start
     };
+    if (verifyDecisionReceipt) intent.decision_kind = "reviewed_read_v1";
     var identityKey = stableStringify(reportIdentity);
     var priorIntentState = completionState(
       await load(ORDINARY_CLOSURE_CLIENT_INTENT_KEY)
@@ -1450,6 +1469,8 @@ function createOrdinaryClosureClient(callbacks) {
         priorIntent.schema_version === 1 &&
         priorIntent.template_version === CREATE_ORDINARY_CLOSURE_VERSION &&
         priorIntent.source_sha256 === template.source_sha256 &&
+        (priorIntent.decision_kind === undefined ? null : priorIntent.decision_kind) ===
+          (verifyDecisionReceipt ? "reviewed_read_v1" : null) &&
         stableStringify(priorIntent.acceptance) === stableStringify(acceptanceData) &&
         stableStringify(priorIntent.args) === stableStringify(args) &&
         stableStringify(priorIntent.start) === stableStringify(start);
@@ -1471,6 +1492,9 @@ function createOrdinaryClosureClient(callbacks) {
     }
 
     function retainedDone(receipt, view) {
+      if (verifyDecisionReceipt && !matchesDecisionReceipt(receipt)) {
+        throw new Error("retained completion receipt differs from semantic decision; reconcile; no retry");
+      }
       var retained = closure.doneView({receipt: receipt, report: report});
       if (!isPlainObject(retained) || retained.status !== "done") {
         throw new Error(
@@ -1496,6 +1520,21 @@ function createOrdinaryClosureClient(callbacks) {
         revision: retained.revision,
         completed_at_ms: retained.completed_at_ms
       };
+    }
+
+    function matchesDecisionReceipt(receipt) {
+      try {
+        var envelope = unwrapEnvelope(receipt, "semantic completion receipt");
+        var data = envelope && envelope.data !== undefined ? envelope.data : envelope;
+        var item = data && data.completion && data.completion.item;
+        var execution = data && data.completion && data.completion.execution;
+        var completion = execution && execution.completion;
+        return isPlainObject(item) && isPlainObject(completion) &&
+          item.completion_note === note && item.completion_evidence === evidence &&
+          completion.acceptance_note === note && completion.acceptance_evidence === evidence;
+      } catch (_error) {
+        return false;
+      }
     }
 
     if (recordIntent !== undefined ||
@@ -1616,6 +1655,9 @@ function createOrdinaryClosureClient(callbacks) {
       receipt,
       template
     );
+    if (verifyDecisionReceipt && !matchesDecisionReceipt(receipt)) {
+      throw new Error("completion receipt differs from semantic decision; reconcile; no retry");
+    }
     var view = closure.doneView({receipt: receipt, report: report});
     if (isPlainObject(view) && view.status === "done") {
       await storeCompletionRecord(
@@ -1629,10 +1671,54 @@ function createOrdinaryClosureClient(callbacks) {
     return withVerifiedReadId(view);
   }
 
+  // A positive semantic decision is supplied by the Coworker after seeing the
+  // observation. Mechanical evidence and the key come only from that read.
+  async function acceptReviewed(decision) {
+    if (!isPlainObject(decision) || Object.keys(decision).sort().join(",") !== "read_id,reason,verdict" ||
+        decision.verdict !== "accept" || typeof decision.read_id !== "string" ||
+        !/^rd_[0-9a-f]{64}$/.test(decision.read_id) || typeof decision.reason !== "string" ||
+        decision.reason.replace(/\u0085/g, "").trim().length === 0 || decision.reason.indexOf("\u0000") !== -1 ||
+        utf8ByteLength(decision.reason) > 2048) {
+      throw new Error("explicit positive semantic decision and bounded reason required");
+    }
+    var observation = await load(ORDINARY_CLOSURE_CLIENT_READ_PREFIX + decision.read_id);
+    if (!isPlainObject(observation) || observation.schema_version !== 1 ||
+        "rd_" + sha256Utf8(stableStringify(observation)) !== decision.read_id ||
+        !isPlainObject(observation.report) || observation.report.status !== "ready_for_semantic_review" ||
+        !isPlainObject(observation.report.physical) ||
+        !Array.isArray(observation.report.physical.files) ||
+        !Array.isArray(observation.report.physical.changed_paths) ||
+        !isPlainObject(observation.semantic_review) || observation.semantic_review.untrusted_data !== true ||
+        typeof observation.semantic_review.acceptance_condition !== "string" ||
+        typeof observation.semantic_review.delivery_description !== "string" ||
+        !isPlainObject(observation.report.result)) {
+      throw new Error("immutable ready observation is missing or changed");
+    }
+    var report = observation.report;
+    var evidence = JSON.stringify({
+      read_id: decision.read_id,
+      physical_sha256: sha256Utf8(stableStringify(report.physical)),
+      criteria_sha256: sha256Utf8(stableStringify(observation.semantic_review)),
+      expected_base: report.physical.expected_base,
+      head_commit: report.physical.head_commit,
+      changed_path_count: report.physical.changed_paths.length,
+      file_count: report.physical.files.length,
+      result_digest: report.result.result_digest,
+      delivery_digest: report.result.delivery_digest
+    });
+    return completeStored({
+      read_id: decision.read_id,
+      command_key: "ordinary-done:" + decision.read_id,
+      acceptance_note: decision.reason,
+      acceptance_evidence: evidence
+    }, true);
+  }
+
   return Object.freeze({
     readStored: readStored,
     readNotice: readNotice,
-    completeStored: completeStored
+    completeStored: completeStored,
+    acceptReviewed: acceptReviewed
   });
 }
 
@@ -1667,21 +1753,30 @@ function createOrdinaryNativeClient(environment) {
     inspect: function (r) { return tools.exec_command({cmd: r.argv.map(shellQuote).join(" "), max_output_tokens: 16000, yield_time_ms: 30000}); },
     complete: function (a) { return tools.mcp__threadlane__backlog_worker_complete(a); }
   });
+  async function checkPins(acceptance) {
+    if (!isPlainObject(acceptance) || acceptance.cli_package !== environment.cli_package ||
+        acceptance.source_sha256 !== environment.source_sha256 ||
+        typeof acceptance.read_id !== "string" || !/^rd_[0-9a-f]{64}$/.test(acceptance.read_id)) {
+      throw new Error("invalid semantic acceptance pins");
+    }
+    var input = await environment.load(ORDINARY_CLOSURE_CLIENT_CONTEXT_KEY);
+    var retained = await environment.load(ORDINARY_CLOSURE_CLIENT_TEMPLATE_KEY);
+    if (!isPlainObject(input) || input.binary !== binary || input.expected_source_sha256 !== environment.source_sha256 ||
+        (retained != null && stableStringify(retained) !== stableStringify(template))) {
+      throw new Error("retained source or package conflicts with native pins");
+    }
+    if (retained == null) await environment.store(ORDINARY_CLOSURE_CLIENT_TEMPLATE_KEY, template);
+  }
   return Object.freeze({
     readNotice: function (approvalId, options) { return client.readNotice(approvalId, options); },
+    accept: async function (decision) {
+      await checkPins(decision);
+      var view = await client.acceptReviewed({read_id: decision.read_id, verdict: decision.verdict, reason: decision.reason});
+      if (view.status === "done") view.final_summary = decision.reason;
+      return view;
+    },
     complete: async function (acceptance) {
-      if (!isPlainObject(acceptance) || acceptance.cli_package !== environment.cli_package ||
-          acceptance.source_sha256 !== environment.source_sha256 ||
-          typeof acceptance.read_id !== "string" || !/^rd_[0-9a-f]{64}$/.test(acceptance.read_id)) {
-        throw new Error("invalid semantic acceptance pins");
-      }
-      var input = await environment.load(ORDINARY_CLOSURE_CLIENT_CONTEXT_KEY);
-      var retained = await environment.load(ORDINARY_CLOSURE_CLIENT_TEMPLATE_KEY);
-      if (!isPlainObject(input) || input.binary !== binary || input.expected_source_sha256 !== environment.source_sha256 ||
-          (retained != null && stableStringify(retained) !== stableStringify(template))) {
-        throw new Error("retained source or package conflicts with native pins");
-      }
-      if (retained == null) await environment.store(ORDINARY_CLOSURE_CLIENT_TEMPLATE_KEY, template);
+      await checkPins(acceptance);
       var view = await client.completeStored(acceptance);
       if (view.status === "done") view.final_summary = acceptance.acceptance_note;
       return view;

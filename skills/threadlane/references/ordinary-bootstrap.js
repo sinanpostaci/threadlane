@@ -2,7 +2,7 @@
 // the native MCP server and must be byte-verified before evaluation.
 "use strict";
 return function (environment) {
-  const {tools, load, store, origin, identity} = environment;
+  const {tools, load, store, origin, identity, bootstrap_source} = environment;
   const same = (a, b) => {
     if (a === b) return true;
     if (!a || !b || typeof a !== "object" || typeof b !== "object" || Array.isArray(a) !== Array.isArray(b)) return false;
@@ -12,6 +12,9 @@ return function (environment) {
   if (!origin || !identity || identity.bootstrap_verified !== true ||
       !same(identity.origin, origin)) {
     throw new Error("missing verified closure identity");
+  }
+  if (bootstrap_source !== undefined && typeof bootstrap_source !== "string") {
+    throw new Error("invalid ready bootstrap");
   }
   const checked = (r) => {
     const s = r && r.structuredContent;
@@ -62,6 +65,30 @@ return function (environment) {
       const {client, verification} = await makeClient(prefix);
       const view = await client.readNotice(id, options);
       if (view.read_id) await store("threadlane/closure-read-index/" + view.read_id, {approval_id: id, origin});
+      if (view.status === "ready_for_semantic_review" && bootstrap_source !== undefined) {
+        if (!/^rd_[0-9a-f]{64}$/.test(view.read_id)) {
+          throw new Error("missing verified ready bootstrap");
+        }
+        const key = "threadlane/closure-ready/" + view.read_id;
+        const ready = {read_id: view.read_id, approval_id: id, origin, bootstrap: bootstrap_source};
+        const prior = await load(key);
+        if (prior != null && !same(prior, ready)) throw new Error("conflicting ready observation");
+        if (prior == null) await store(key, ready);
+      }
+      view.client_verification = verification;
+      return view;
+    },
+    accept: async function (decision) {
+      if (!decision || Object.keys(decision).sort().join(",") !== "read_id,reason,verdict" ||
+          decision.verdict !== "accept" || typeof decision.reason !== "string" || !decision.reason.trim() ||
+          typeof decision.read_id !== "string" || !/^rd_[0-9a-f]{64}$/.test(decision.read_id)) {
+        throw new Error("invalid reviewed read");
+      }
+      const ready = await load("threadlane/closure-ready/" + decision.read_id);
+      if (!ready || ready.read_id !== decision.read_id || !same(ready.origin, origin) ||
+          ready.bootstrap !== bootstrap_source) throw new Error("missing or changed ready observation");
+      const {client, verification} = await makeClient(prefixFor(ready.approval_id));
+      const view = await client.accept({...decision, cli_package: origin.cli_package, source_sha256: origin.source_sha256});
       view.client_verification = verification;
       return view;
     },

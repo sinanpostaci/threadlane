@@ -3467,7 +3467,7 @@ test("closure client wrappers stay compact, identical, and within document byte 
   const guideBlocks = readBlocks(guidePath);
   const closureBlocks = readBlocks(closurePath);
   assert.equal(guideBlocks.length, 3);
-  assert.equal(closureBlocks.length, 4);
+  assert.equal(closureBlocks.length, 5);
   assert.equal(guideBlocks[1], closureBlocks[1], "read wrappers are identical");
   assert.equal(guideBlocks[2], closureBlocks[2], "complete wrappers are identical");
   assert.match(guide, /ORDINARY-WORKER-CLOSURE\.md#cold-recovery-only-after-origin_missing/);
@@ -3479,9 +3479,11 @@ test("closure client wrappers stay compact, identical, and within document byte 
   assert.match(guide, /do not look up or construct that underlying tool schema/);
   assert.ok(!guideBlocks[1].includes("APPROVED_TASK_CONTEXT"));
   assert.ok(!guideBlocks[1].includes("ACCEPTANCE_CONTEXT"));
-  assert.equal((guideBlocks[2].match(/ACCEPTANCE_CONTEXT/g) || []).length, 1);
+  assert.equal((guideBlocks[2].match(/REVIEW_DECISION/g) || []).length, 1);
   assert.ok(guideBlocks[1].includes("new Function(bootstrap)"));
   assert.ok(guideBlocks[2].includes("new Function(bootstrap)"));
+  assert.ok(guideBlocks[2].includes("compact: true"));
+  assert.ok(Buffer.byteLength(guideBlocks[2], "utf8") <= 1100, "decision program stays compact");
   assert.ok(bootstrapSource.includes("createOrdinaryNativeClient"));
   assert.ok(bootstrapSource.includes("source_verified"));
   assert.ok(!guideBlocks[1].includes("backlog_worker_complete"));
@@ -4161,7 +4163,7 @@ function makeVerifiedBootstrapGuide() {
   const blocks = [...guide.matchAll(/```js\n([\s\S]*?)```/g)].map((match) => match[1]);
   const contract = fs.readFileSync(path.join(here, "../../../docs/ORDINARY-WORKER-CLOSURE.md"), "utf8");
   const contractBlocks = [...contract.matchAll(/```js\n([\s\S]*?)```/g)].map((match) => match[1]);
-  blocks.push(contractBlocks[3]);
+  blocks.push(contractBlocks[3], contractBlocks[4]);
   const origin = {schema_version: 1, binding_id: CONTROL, thread_id: "thread-original",
     project_root: "/project", cli_package: "/trusted", context_path: "/private/context",
     context_router_executable: "/trusted/bin/threadlane-context", context_sha256: "1".repeat(64),
@@ -4169,6 +4171,8 @@ function makeVerifiedBootstrapGuide() {
     template_version: env.template.version, source_sha256: SOURCE_SHA256,
     bootstrap_sha256: crypto.createHash("sha256").update(bootstrapSource).digest("hex")};
   let activeOrigin = clone(origin), sourceOverride = null, bootstrapOverride = null;
+  let proofOverride = null, completionOverride = null, noticeContextOverride = null;
+  const completedArgs = [];
   const normalized = (v) => Array.isArray(v) ? v.map(normalized) :
     v && typeof v === "object" ? Object.fromEntries(Object.keys(v).sort().map((k) => [k, normalized(v[k])])) : v;
   const order = [];
@@ -4186,29 +4190,44 @@ function makeVerifiedBootstrapGuide() {
       if (args.origin && JSON.stringify(normalized(args.origin)) !== JSON.stringify(normalized(activeOrigin))) throw new Error("origin mismatch");
       if (args.javascript !== undefined && (!args.origin || args.javascript !== source)) throw new Error("source mismatch");
       if (args.bootstrap !== undefined && (!args.origin || args.bootstrap !== bootstrapSource)) throw new Error("bootstrap mismatch");
+      if (args.compact === true) {
+        if (!args.origin || !args.bootstrap || args.javascript !== undefined) throw new Error("invalid compact request");
+        return proofOverride || {content: [{type: "text", text: "threadlane ordinary closure bootstrap verified v1"}]};
+      }
       const data = {origin: clone(activeOrigin), source_verified: args.javascript !== undefined,
         bootstrap_verified: args.bootstrap !== undefined, template: clone(templateMeta)};
       if (args.javascript === undefined && args.bootstrap === undefined) data.bootstrap = bootstrapOverride ?? bootstrapSource;
       return scoped(data);
     },
-    mcp__threadlane__backlog_worker_notice_context: async () => env.sdk("backlog_worker_notice_context", {
+    mcp__threadlane__backlog_worker_notice_context: async () => env.sdk("backlog_worker_notice_context", noticeContextOverride || {
       execution: clone(START_EXECUTION), acceptance_condition: "bounded condition", delivery_description: "bounded delivery",
       scope: {base_commit: BASE, requested_model: MODEL, requested_effort: EFFORT, write_paths: [WRITE_PATHS[0]]},
       item_snapshot: {item_id: ITEM, revision: START_EXECUTION.reservation_revision, status: "doing", current_execution_ref: EXEC}
     }),
-    mcp__threadlane__backlog_worker_complete: async () => {
+    mcp__threadlane__backlog_worker_complete: async (args) => {
       env.calls.complete += 1;
+      completedArgs.push(clone(args));
       const id = JSON.parse(env.texts.at(-1)).read_id;
       const observation = JSON.parse(env.stored.get(`threadlane/closures/${APPROVAL}/threadlane/closure-reads/${id}`));
-      return env.sdkFromEnvelope(makeDoneReceipt(observation.report));
+      const receipt = makeDoneReceipt(observation.report);
+      receipt.data.completion.item.completion_note = args.acceptance_note;
+      receipt.data.completion.item.completion_evidence = args.acceptance_evidence;
+      receipt.data.completion.execution.completion.acceptance_note = args.acceptance_note;
+      receipt.data.completion.execution.completion.acceptance_evidence = args.acceptance_evidence;
+      return env.sdkFromEnvelope(completionOverride ? completionOverride(receipt, args) : receipt);
     }
   };
-  const run = (block, vars = {}) => vm.runInNewContext(`(async () => {\n${blocks[block]}\n})()`, {
+  const runCode = (code, vars = {}) => vm.runInNewContext(`(async () => {\n${code}\n})()`, {
     tools, load: (key) => env.stored.has(key) ? JSON.parse(env.stored.get(key)) : undefined,
     store: async (key, value) => env.stored.set(key, JSON.stringify(value)),
     text: (value) => env.texts.push(value), APPROVAL_ID: APPROVAL, NOTICE_APPROVAL_ID: APPROVAL, ...vars
   });
-  return {env, origin, order, run, setOrigin: (v) => {activeOrigin = v;}, setSource: (v) => {sourceOverride = v;}, setBootstrap: (v) => {bootstrapOverride = v;}};
+  const run = (block, vars = {}) => runCode(blocks[block], vars);
+  const runLegacyNotice = () => runCode(blocks[1].replace(", bootstrap_source: bootstrap", ""));
+  return {env, origin, order, run, runLegacyNotice, completedArgs,
+    setOrigin: (v) => {activeOrigin = v;}, setSource: (v) => {sourceOverride = v;},
+    setBootstrap: (v) => {bootstrapOverride = v;}, setProof: (v) => {proofOverride = v;},
+    setCompletion: (v) => {completionOverride = v;}, setNoticeContext: (v) => {noticeContextOverride = v;}};
 }
 
 test("current bootstrap checks exact bytes before the real ordered read and separate Done", async () => {
@@ -4223,12 +4242,25 @@ test("current bootstrap checks exact bytes before the real ordered read and sepa
   assert.equal(f.env.calls.pull, before.pull + 1); assert.equal(f.env.calls.ack, before.ack + 1);
   assert.equal(f.env.calls.result, before.result + 1); assert.equal(f.env.calls.inspect, before.inspect + 1);
   assert.equal(f.env.calls.complete, 0);
-  await f.run(2, {ACCEPTANCE_CONTEXT: {...f.env.acceptanceContext, read_id: report.read_id}});
+  const decision = {read_id: report.read_id, verdict: "accept", reason: "The physical file meets the condition."};
+  await f.run(2, {REVIEW_DECISION: decision});
   const done = JSON.parse(f.env.texts.at(-1));
   assert.equal(done.status, "done"); assert.equal(done.read_id, report.read_id);
   assert.equal(done.client_verification.source_sha256, SOURCE_SHA256);
   assert.equal(f.env.calls.complete, 1);
-  await f.run(2, {ACCEPTANCE_CONTEXT: {...f.env.acceptanceContext, read_id: report.read_id}});
+  const args = f.completedArgs[0], evidence = JSON.parse(args.acceptance_evidence);
+  const observation = JSON.parse(f.env.stored.get(`threadlane/closures/${APPROVAL}/threadlane/closure-reads/${report.read_id}`));
+  const stable = (v) => JSON.stringify(v, function (_key, value) {
+    return value && typeof value === "object" && !Array.isArray(value)
+      ? Object.fromEntries(Object.keys(value).sort().map((key) => [key, value[key]])) : value;
+  });
+  assert.equal(args.command_key, `ordinary-done:${report.read_id}`);
+  assert.equal(args.acceptance_note, decision.reason);
+  assert.equal(evidence.read_id, report.read_id);
+  assert.equal(evidence.physical_sha256, crypto.createHash("sha256").update(stable(observation.report.physical)).digest("hex"));
+  assert.equal(evidence.criteria_sha256, crypto.createHash("sha256").update(stable(observation.semantic_review)).digest("hex"));
+  assert.deepEqual(observation.semantic_review, report.semantic_review);
+  await f.run(2, {REVIEW_DECISION: decision});
   assert.equal(JSON.parse(f.env.texts.at(-1)).read_id, report.read_id);
   assert.equal(f.env.calls.complete, 1, "validated replay never repeats guarded completion");
 });
@@ -4240,8 +4272,133 @@ test("current bootstrap rejects a changed immutable observation before guarded c
   const observation = JSON.parse(f.env.stored.get(key));
   observation.report.physical.files[0].text = "changed after review";
   f.env.stored.set(key, JSON.stringify(observation));
-  await assert.rejects(f.run(2, {ACCEPTANCE_CONTEXT: {...f.env.acceptanceContext, read_id: readId}}), /immutable read observation is missing, stale, or changed/);
+  await assert.rejects(f.run(2, {REVIEW_DECISION: {read_id: readId, verdict: "accept", reason: "checked"}}), /immutable ready observation is missing or changed/);
   assert.equal(f.env.calls.complete, 0);
+});
+
+test("legacy bootstrap callers ACK successfully and retain their original completion path", async () => {
+  const f = makeVerifiedBootstrapGuide();
+  await f.run(0);
+  await f.runLegacyNotice();
+  const ready = JSON.parse(f.env.texts.at(-1));
+  assert.equal(ready.status, "ready_for_semantic_review");
+  assert.equal(f.env.calls.ack, 1);
+  assert.equal(f.env.stored.has(`threadlane/closure-ready/${ready.read_id}`), false);
+  await f.run(4, {ACCEPTANCE_CONTEXT: {...f.env.acceptanceContext, read_id: ready.read_id}});
+  assert.equal(JSON.parse(f.env.texts.at(-1)).status, "done");
+  assert.equal(f.env.calls.complete, 1);
+});
+
+test("compact decision requires an explicit positive verdict and a bounded nonblank reason", async () => {
+  const f = makeVerifiedBootstrapGuide(); await f.run(0); await f.run(1);
+  const read_id = JSON.parse(f.env.texts.at(-1)).read_id;
+  for (const decision of [
+    {read_id, verdict: "reject", reason: "file differs"},
+    {read_id, reason: "checked"},
+    {read_id, verdict: "accept", reason: " \u0085 "},
+    {read_id, verdict: "accept", reason: "x\u0000y"},
+    {read_id, verdict: "accept", reason: "x".repeat(2049)},
+    {read_id, verdict: "accept", reason: "checked", evidence: "fabricated"}
+  ]) {
+    await assert.rejects(f.run(2, {REVIEW_DECISION: decision}));
+    assert.equal(f.env.calls.complete, 0);
+  }
+});
+
+test("compact entry refuses missing, tampered, foreign or conflicting ready proofs before completion", async () => {
+  for (const mode of ["missing", "read", "origin", "bootstrap", "source", "criteria", "error", "extra", "structured", "structured_snake", "text"]) {
+    const f = makeVerifiedBootstrapGuide(); await f.run(0); await f.run(1);
+    const read_id = JSON.parse(f.env.texts.at(-1)).read_id;
+    const key = `threadlane/closure-ready/${read_id}`;
+    const ready = JSON.parse(f.env.stored.get(key));
+    if (mode === "missing") f.env.stored.delete(key);
+    if (mode === "read") { ready.read_id = "rd_" + "0".repeat(64); f.env.stored.set(key, JSON.stringify(ready)); }
+    if (mode === "origin") { ready.origin.binding_id = "bnd_foreign"; f.env.stored.set(key, JSON.stringify(ready)); }
+    if (mode === "bootstrap") { ready.bootstrap += "\nthrow new Error('untrusted ran')"; f.env.stored.set(key, JSON.stringify(ready)); }
+    if (mode === "source") f.setSource(source + "\nthrow new Error('untrusted ran')");
+    if (mode === "criteria") {
+      const observationKey = `threadlane/closures/${APPROVAL}/threadlane/closure-reads/${read_id}`;
+      const observation = JSON.parse(f.env.stored.get(observationKey));
+      observation.semantic_review.acceptance_condition = "changed after review";
+      f.env.stored.set(observationKey, JSON.stringify(observation));
+    }
+    const text = {type: "text", text: "threadlane ordinary closure bootstrap verified v1"};
+    if (mode === "error") f.setProof({isError: true, content: [text]});
+    if (mode === "extra") f.setProof({content: [text, text]});
+    if (mode === "structured") f.setProof({structuredContent: {unexpected: true}, content: [text]});
+    if (mode === "structured_snake") f.setProof({structured_content: {unexpected: true}, content: [text]});
+    if (mode === "text") f.setProof({content: [{type: "text", text: "incorrect"}]});
+    await assert.rejects(f.run(2, {REVIEW_DECISION: {read_id, verdict: "accept", reason: "checked"}}), mode);
+    assert.equal(f.env.calls.complete, 0, mode);
+  }
+});
+
+test("compact Done checks both durable attestations and never replays an uncertain effect", async () => {
+  for (const field of ["item_note", "item_evidence", "execution_note", "execution_evidence", "unknown"]) {
+    const f = makeVerifiedBootstrapGuide(); await f.run(0); await f.run(1);
+    const read_id = JSON.parse(f.env.texts.at(-1)).read_id;
+    const decision = {read_id, verdict: "accept", reason: "  Checked the actual text.  "};
+    f.setCompletion((receipt) => {
+      if (field === "unknown") throw new Error("lost reply");
+      if (field === "item_note") receipt.data.completion.item.completion_note = "different";
+      if (field === "item_evidence") receipt.data.completion.item.completion_evidence = "different";
+      if (field === "execution_note") receipt.data.completion.execution.completion.acceptance_note = "different";
+      if (field === "execution_evidence") receipt.data.completion.execution.completion.acceptance_evidence = "different";
+      return receipt;
+    });
+    await assert.rejects(f.run(2, {REVIEW_DECISION: decision}), /receipt differs from semantic decision|outcome unknown/);
+    await assert.rejects(f.run(2, {REVIEW_DECISION: decision}), /receipt differs from semantic decision|outcome is unknown/);
+    assert.equal(f.env.calls.complete, 1, field);
+    assert.equal(f.completedArgs[0].acceptance_note, decision.reason, "reason is not normalized");
+  }
+});
+
+test("Done notice reconciles an unknown compact intent only against the same durable decision", async () => {
+  for (const mode of ["matching", "different", "no retained intent"]) {
+    const f = makeVerifiedBootstrapGuide(); await f.run(0); await f.run(1);
+    const read_id = JSON.parse(f.env.texts.at(-1)).read_id;
+    const decision = {read_id, verdict: "accept", reason: "checked the physical file"};
+    f.setCompletion(() => {throw new Error("lost reply");});
+    await assert.rejects(f.run(2, {REVIEW_DECISION: decision}), /outcome unknown/);
+    const observation = JSON.parse(f.env.stored.get(`threadlane/closures/${APPROVAL}/threadlane/closure-reads/${read_id}`));
+    const completion = makeDoneReceipt(observation.report).data.completion;
+    const args = f.completedArgs[0];
+    const note = mode === "matching" ? args.acceptance_note : "another decision";
+    const evidence = mode === "matching" ? args.acceptance_evidence : "another evidence";
+    completion.item.completion_note = note; completion.item.completion_evidence = evidence;
+    completion.execution.completion.acceptance_note = note; completion.execution.completion.acceptance_evidence = evidence;
+    if (mode === "no retained intent") f.env.stored.delete(`threadlane/closures/${APPROVAL}/threadlane/closure-completion-intent.json`);
+    f.setNoticeContext({execution: clone(completion.execution), completion: clone(completion),
+      acceptance_condition: "bounded condition", delivery_description: "bounded delivery",
+      scope: {base_commit: BASE, requested_model: MODEL, requested_effort: EFFORT, write_paths: [WRITE_PATHS[0]]},
+      item_snapshot: {item_id: ITEM, revision: completion.item.revision, status: "done", current_execution_ref: EXEC}});
+    if (mode === "different") {
+      const before = f.env.calls.ack;
+      await assert.rejects(f.run(1), /retained completion intent conflicts with durable semantic decision/);
+      assert.equal(f.env.calls.ack, before);
+    } else {
+      await f.run(1);
+      assert.equal(JSON.parse(f.env.texts.at(-1)).status, "done");
+    }
+    assert.equal(f.env.calls.complete, 1, "reconciliation never repeats the effect");
+  }
+});
+
+test("legacy command keys with the compact prefix keep their original recovery behavior", async () => {
+  const f = makeVerifiedBootstrapGuide(); await f.run(0); await f.runLegacyNotice();
+  const read_id = JSON.parse(f.env.texts.at(-1)).read_id;
+  f.setCompletion(() => {throw new Error("lost reply");});
+  await assert.rejects(f.run(4, {ACCEPTANCE_CONTEXT: {...f.env.acceptanceContext,
+    read_id, command_key: "ordinary-done:my-approval"}}), /outcome unknown/);
+  const observation = JSON.parse(f.env.stored.get(`threadlane/closures/${APPROVAL}/threadlane/closure-reads/${read_id}`));
+  const completion = makeDoneReceipt(observation.report).data.completion;
+  f.setNoticeContext({execution: clone(completion.execution), completion: clone(completion),
+    acceptance_condition: "bounded condition", delivery_description: "bounded delivery",
+    scope: {base_commit: BASE, requested_model: MODEL, requested_effort: EFFORT, write_paths: [WRITE_PATHS[0]]},
+    item_snapshot: {item_id: ITEM, revision: completion.item.revision, status: "done", current_execution_ref: EXEC}});
+  await f.runLegacyNotice();
+  assert.equal(JSON.parse(f.env.texts.at(-1)).status, "done");
+  assert.equal(f.env.calls.complete, 1);
 });
 
 test("current bootstrap refuses changed origin and changed source before any effect", async () => {
@@ -4337,7 +4494,7 @@ test("explicit conflicting origin refuses during preparation and Done", async ()
   const readId = JSON.parse(f.env.texts.at(-1)).read_id;
   const order = [...f.order], before = clone(f.env.calls);
   await assert.rejects(f.run(2, {CLOSURE_ORIGIN: foreign,
-    ACCEPTANCE_CONTEXT: {...f.env.acceptanceContext, read_id: readId}}), /closure origin conflicts/);
+    REVIEW_DECISION: {read_id: readId, verdict: "accept", reason: "checked"}}), /missing or conflicting ready observation/);
   assert.deepEqual(f.order, order);
   assert.deepEqual(f.env.calls, before);
   assert.equal(f.env.calls.complete, 0);

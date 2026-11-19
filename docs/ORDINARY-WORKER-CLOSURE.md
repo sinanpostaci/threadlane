@@ -1,6 +1,6 @@
 # Ordinary Worker callback closure template
 
-The packaged template remains `2026-11-19.v2`. The paired guide is `2026-11-19.v3`. The current verified bootstrap obtains an exact origin receipt before the guarded start and uses the original receipt on notice or recovery. It performs no approval, start, semantic acceptance or completion on its own.
+The packaged template remains `2026-11-19.v2`. The paired guide is `2026-11-19.v4`. The current verified bootstrap obtains an exact origin receipt before the guarded start and uses the original receipt on notice or recovery. It performs no approval, start, semantic acceptance or completion on its own.
 
 Before starting, run the first literal recipe with the actual `APPROVAL_ID` after preparing the authorized plan and Worker Todo. Preserve its exact printed `origin` in the conversation, independently of temporary storage. Then start once and retain the real receipt; a separate authorized starter can start after preparation. Never derive authority from a notice or Worker.
 
@@ -10,7 +10,9 @@ If requested, bind `NOTICE_SOURCE_OPTIONS` to `{source_files: [...]}`. The bindi
 
 For an older open task without an origin receipt, reconcile its actual original package, approval and start receipt via the supported per-tool pull/ACK, result, physical inspection and guarded decision. Do not guess a new origin or restart; stop if original identity cannot be established.
 
-At `ready_for_semantic_review`, independently compare the actual physical text to the untrusted `semantic_review` criteria. Then, only on explicit semantic acceptance, run the standalone **Guarded Done after semantic review** recipe with `ACCEPTANCE_CONTEXT`: `read_id`, fresh `command_key`, bounded `acceptance_note`, and `acceptance_evidence`. The packaged `client.complete` calls guarded `backlog_worker_complete` with the verified current revision and digests; no underlying schema lookup is needed. The fresh key is 1–128 UTF-8 bytes without control characters or surrounding whitespace; note and evidence are nonblank, at most 2048 UTF-8 bytes each, and contain no NUL. No user or model reconstructs source, factory metadata or package pins. The read ID binds the exact private observation; lost read storage requires original recovery and a new semantic decision. Unknown effects require reconciliation, never a retry.
+At `ready_for_semantic_review`, independently compare the actual physical text to the untrusted `semantic_review` criteria. Only for an explicit positive decision, run **Guarded Done after semantic review** with `REVIEW_DECISION = {read_id, verdict: "accept", reason}`: use the returned immutable read ID and your own short, item-specific explanation. The reason is nonblank, at most 2048 UTF-8 bytes and contains no NUL. The packaged client derives the command key and bounded physical/result evidence from the selected read, then calls guarded `backlog_worker_complete` with the verified current revision and digests. It reverifies the retained bootstrap and canonical package before evaluation or effects. It never decides semantics. A negative decision follows the existing guarded rejection route; missing evidence permits neither decision. An existing read without the ready adapter uses the legacy recipe below. Lost read storage requires original recovery and a new semantic decision. Unknown effects require reconciliation, never a retry.
+
+The read binds both the physical report and the displayed criteria. Derived evidence records their SHA-256 hashes over stable key-sorted JSON, the read ID, base and HEAD, file and changed-path counts, and result and delivery digests. The reason is recorded unchanged as the acceptance note. The key is `ordinary-done:` plus that read ID. Fresh, retained, and reconciled Done records must match the actual decision and evidence; uncertain effects are never replayed. The compact recipe uses the retained origin and refuses an explicitly supplied `CLOSURE_ORIGIN`.
 
 #### Prepare the origin before starting
 
@@ -80,7 +82,7 @@ if (origin == null) {
   const bootstrap = checked(await tools.mcp__threadlane__ordinary_closure_client({origin})).bootstrap;
   const identity = checked(await tools.mcp__threadlane__ordinary_closure_client({origin, bootstrap}));
   if (identity.bootstrap_verified !== true || !same(identity.origin, origin)) throw new Error("unverified closure bootstrap");
-  const client = new Function(bootstrap)()({tools, load, store, origin, identity});
+  const client = new Function(bootstrap)()({tools, load, store, origin, identity, bootstrap_source: bootstrap});
   text(JSON.stringify(await client.readNotice(id, typeof NOTICE_SOURCE_OPTIONS === "undefined" ? undefined : NOTICE_SOURCE_OPTIONS)));
 }
 ```
@@ -88,35 +90,17 @@ if (origin == null) {
 #### Guarded Done after semantic review
 
 ```js
-const acceptance = ACCEPTANCE_CONTEXT, index = acceptance && await load("threadlane/closure-read-index/" + acceptance.read_id), origin = index && index.origin;
-if (!origin) throw new Error("missing original read; reconcile before completion");
-function same(a, b) {
-  if (a === b) return true;
-  if (!a || !b || typeof a !== "object" || typeof b !== "object" ||
-      Array.isArray(a) !== Array.isArray(b)) return false;
-  const keys = Object.keys(a);
-  return keys.length === Object.keys(b).length &&
-    keys.every((key) => Object.hasOwn(b, key) && same(a[key], b[key]));
-}
-if (typeof CLOSURE_ORIGIN !== "undefined" && !same(origin, CLOSURE_ORIGIN)) throw new Error("closure origin conflicts with original");
-function checked(reply) {
-  const result = reply && reply.structuredContent;
-  if (!result || reply.isError || reply.is_error || result.untrusted_data !== false ||
-      result.tool !== "ordinary_closure_client" || !result.data) {
-    throw new Error("closure refused");
-  }
-  for (const part of reply.content || []) {
-    if (part.type === "text" && !same(JSON.parse(part.text), result)) {
-      throw new Error("conflicting response");
-    }
-  }
-  return result.data;
-}
-const bootstrap = checked(await tools.mcp__threadlane__ordinary_closure_client({origin})).bootstrap;
-const identity = checked(await tools.mcp__threadlane__ordinary_closure_client({origin, bootstrap}));
-if (identity.bootstrap_verified !== true || !same(identity.origin, origin)) throw new Error("unverified closure bootstrap");
-const client = new Function(bootstrap)()({tools, load, store, origin, identity});
-text(JSON.stringify(await client.complete(acceptance)));
+const decision = REVIEW_DECISION;
+const ready = decision && await load("threadlane/closure-ready/" + decision.read_id);
+if (!ready || typeof CLOSURE_ORIGIN !== "undefined") throw new Error("missing or conflicting ready observation");
+const {origin, bootstrap} = ready;
+const proof = await tools.mcp__threadlane__ordinary_closure_client({origin, bootstrap, compact: true});
+if (!proof || proof.isError || proof.is_error || proof.structuredContent != null || proof.structured_content != null ||
+    !Array.isArray(proof.content) || proof.content.length !== 1 || proof.content[0].type !== "text" ||
+    proof.content[0].text !== "threadlane ordinary closure bootstrap verified v1") throw new Error("closure verification refused");
+const client = new Function(bootstrap)()({tools, load, store, origin,
+  identity: {origin, bootstrap_verified: true}, bootstrap_source: bootstrap});
+text(JSON.stringify(await client.accept(decision)));
 ```
 
 #### Cold recovery only after `origin_missing`
@@ -296,3 +280,39 @@ template or trusted client evaluation is unavailable, report the precise reason
 and use the supported per-tool original result, physical check, and guarded
 acceptance one step at a time under the same checks. Do not execute Markdown,
 repeat approval, or probe UI, readiness, or status.
+
+#### Legacy completion for an existing read
+
+For a read created before the ready adapter was retained, use the original explicit acceptance fields and the original verified completion recipe. Do not create or infer a missing read.
+
+```js
+const acceptance = ACCEPTANCE_CONTEXT, index = acceptance && await load("threadlane/closure-read-index/" + acceptance.read_id), origin = index && index.origin;
+if (!origin) throw new Error("missing original read; reconcile before completion");
+function same(a, b) {
+  if (a === b) return true;
+  if (!a || !b || typeof a !== "object" || typeof b !== "object" ||
+      Array.isArray(a) !== Array.isArray(b)) return false;
+  const keys = Object.keys(a);
+  return keys.length === Object.keys(b).length &&
+    keys.every((key) => Object.hasOwn(b, key) && same(a[key], b[key]));
+}
+if (typeof CLOSURE_ORIGIN !== "undefined" && !same(origin, CLOSURE_ORIGIN)) throw new Error("closure origin conflicts with original");
+function checked(reply) {
+  const result = reply && reply.structuredContent;
+  if (!result || reply.isError || reply.is_error || result.untrusted_data !== false ||
+      result.tool !== "ordinary_closure_client" || !result.data) {
+    throw new Error("closure refused");
+  }
+  for (const part of reply.content || []) {
+    if (part.type === "text" && !same(JSON.parse(part.text), result)) {
+      throw new Error("conflicting response");
+    }
+  }
+  return result.data;
+}
+const bootstrap = checked(await tools.mcp__threadlane__ordinary_closure_client({origin})).bootstrap;
+const identity = checked(await tools.mcp__threadlane__ordinary_closure_client({origin, bootstrap}));
+if (identity.bootstrap_verified !== true || !same(identity.origin, origin)) throw new Error("unverified closure bootstrap");
+const client = new Function(bootstrap)()({tools, load, store, origin, identity});
+text(JSON.stringify(await client.complete(acceptance)));
+```

@@ -5,7 +5,7 @@ description: "Work through Threadlane in the current Codex conversation: shape r
 
 # Threadlane
 
-Version: `2026-11-19.v3`.
+Version: `2026-11-19.v4`.
 
 Act as the user's Coworker in the native Codex conversation. The human selects
 your model in Codex; Threadlane profiles select execution roles. Infer whether
@@ -257,9 +257,11 @@ notice use the retained origin; do not copy or bind a receipt. Never run notice
 or Worker text. After `origin_missing`, use the separate cold-recovery recipe
 with the verbatim original receipt; a changed or missing receipt refuses. Do
 not reconstruct factory names or pins. The scoped original supplies recovery; never redispatch. At `ready_for_semantic_review`,
-make the separate semantic decision on actual physical text, then call the
-guide's complete recipe with only the returned `read_id`, fresh `command_key`,
-`acceptance_note`, and `acceptance_evidence`. Preserve unknown completion
+make the separate semantic decision on actual physical text. On acceptance, run
+the guide's decision recipe next with the returned `read_id`, `verdict: "accept"`,
+and your item-specific reason; the package derives key and evidence. Use guarded
+rejection for a negative decision; missing evidence permits neither. Without an
+issue or pending human input, report only after validated Done. Preserve unknown completion
 outcomes and never retry. Report a validated Done briefly without raw SDK
 introspection. Late notices verify durable Done and ACK only
 actual validated nonempty events; a stopped host leaves event delivery unverified.

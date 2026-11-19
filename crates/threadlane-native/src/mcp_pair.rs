@@ -8,7 +8,9 @@ use std::time::{Duration, Instant};
 
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{CallToolResult, Implementation, ProtocolVersion, ServerCapabilities, ServerConfig},
+    model::{
+        CallToolResult, Content, Implementation, ProtocolVersion, ServerCapabilities, ServerConfig,
+    },
     schemars, tool, tool_handler, tool_router, ServerHandler, ServiceExt,
 };
 use serde::{Deserialize, Serialize};
@@ -93,6 +95,7 @@ const OBSERVATION_JOURNAL_DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_OBSERVATION_JOURNAL_CAPACITY: usize = 256;
 const HOST_NOT_READY_STARTUP_TIMEOUT_MESSAGE: &str =
     "Approved host session is not running or has not reached authenticated ready state.";
+const CLOSURE_COMPACT_ATTESTATION: &str = "threadlane ordinary closure bootstrap verified v1";
 
 /// Parameters for the bootstrap `connection_identity` MCP tool (accepts no arguments).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -112,6 +115,9 @@ pub struct OrdinaryClosureClientParams {
     /// Exact bootstrap returned by this tool, verified before evaluating it.
     #[serde(default)]
     pub bootstrap: Option<String>,
+    /// Return a single bounded text attestation for an original origin and exact bootstrap.
+    #[serde(default)]
+    pub compact: bool,
 }
 
 /// Parameters for the `catalog` MCP tool.
@@ -3567,6 +3573,19 @@ impl PairedMcpServer {
         Box::pin(async move {
             const TOOL: &str = "ordinary_closure_client";
             let enrollment = self.verify_enrolled_binding_for_tool(TOOL)?;
+            if params.compact
+                && (params.origin.is_none()
+                    || params.bootstrap.is_none()
+                    || params.javascript.is_some())
+            {
+                return Err(Self::format_pairing_error(
+                    TOOL,
+                    NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        "compact verification requires only the original origin and bootstrap",
+                    ),
+                ));
+            }
             let connection = self
                 .closure_connection
                 .lock()
@@ -3698,6 +3717,11 @@ impl PairedMcpServer {
                         "closure enrollment changed during verification",
                     ),
                 ));
+            }
+            if params.compact {
+                return Ok(CallToolResult::success(vec![Content::text(
+                    CLOSURE_COMPACT_ATTESTATION,
+                )]));
             }
             let mut data = json!({
                 "origin": actual,
@@ -5005,7 +5029,7 @@ impl PairedMcpServer {
     /// Delegated `operating_guide` tool (requires verified operator enrollment).
     #[tool(
         name = "operating_guide",
-        description = "Fetch the versioned, read-only Threadlane MCP operating guide (version 2026-11-19.v3) for the enrolled chat binding. Call on initial connection, session resume, or context uncertainty/compaction, then refresh only uncertain live scoped backlog/status/catalog state without a polling loop. Includes the ordinary backlog workflow, guarded Worker (coder) reservation/result/completion contracts (no unconditional pre-start approved_task/ready/host probe; guarded start owns eligible host startup and host_not_ready on an optional pre-start read is not an attempted launch), the ordinary offline closure template with template_version and source_sha256 for the packaged JS, and the compact finite callback closure with conditional sequential tool composition, cross-page ACK continuity, private DTO evidence, deadline and exec_command checks, and real per-batch ACKs; links to opt-in NATIVE-OPERATOR, PROFILE-FLOW, and legacy complete job admission with durability and receipt limits. Does not mutate state or acknowledge events.",
+        description = "Fetch the versioned, read-only Threadlane MCP operating guide (version 2026-11-19.v4) for the enrolled chat binding. Call on initial connection, session resume, or context uncertainty/compaction, then refresh only uncertain live scoped backlog/status/catalog state without a polling loop. Includes the ordinary backlog workflow, guarded Worker (coder) reservation/result/completion contracts (no unconditional pre-start approved_task/ready/host probe; guarded start owns eligible host startup and host_not_ready on an optional pre-start read is not an attempted launch), the ordinary offline closure template with template_version and source_sha256 for the packaged JS, and the compact finite callback closure with conditional sequential tool composition, cross-page ACK continuity, private DTO evidence, deadline and exec_command checks, and real per-batch ACKs; links to opt-in NATIVE-OPERATOR, PROFILE-FLOW, and legacy complete job admission with durability and receipt limits. Does not mutate state or acknowledge events.",
         annotations(
             title = "Get Threadlane MCP Operating Guide",
             read_only_hint = true,
@@ -5024,7 +5048,7 @@ impl PairedMcpServer {
     /// Returns the connected package identity or verifies exact closure source without executing it.
     #[tool(
         name = "ordinary_closure_client",
-        description = "Read the verified connected package/guide continuity receipt, or compare a supplied exact canonical closure JavaScript string against compiled trusted bytes. Source verification requires the original receipt and returns only a small proof, never the source. This is read-only and grants no authority or acceptance.",
+        description = "Read the connected package/guide continuity receipt, or compare exact canonical closure bytes against compiled trusted bytes. Verification requires the original receipt. The compact bootstrap attestation requires the exact original receipt and bootstrap; it returns one fixed text receipt only after the same checks. This is read-only and grants no authority or acceptance.",
         annotations(
             title = "Verify Ordinary Closure Client",
             read_only_hint = true,
@@ -6222,7 +6246,7 @@ mod automatic_scope_tests {
             route: "trusted_local_operator".into(),
             native_per_call_identity_verified: false,
             human_approval_verified: false,
-            context_path: Some(context_path),
+            context_path: Some(context_path.clone()),
             context_router_executable: Some(router),
             project_root: Some(project),
             cli_package: Some(package),
@@ -6256,6 +6280,32 @@ mod automatic_scope_tests {
             .unwrap();
         assert_eq!(proof["data"]["bootstrap_verified"], true);
         assert!(proof["data"].get("bootstrap").is_none());
+        let compact = call(json!({"origin": origin, "bootstrap": bootstrap, "compact": true}))
+            .await
+            .unwrap();
+        assert!(compact.structured_content.is_none());
+        assert_ne!(compact.is_error, Some(true));
+        let compact_json = serde_json::to_value(compact).unwrap();
+        assert_eq!(
+            compact_json["content"],
+            json!([{"type": "text", "text": CLOSURE_COMPACT_ATTESTATION}])
+        );
+        for args in [
+            json!({"compact": true}),
+            json!({"origin": origin, "compact": true}),
+            json!({"bootstrap": bootstrap, "compact": true}),
+            json!({"origin": origin, "bootstrap": "changed", "compact": true}),
+            json!({"origin": origin, "bootstrap": bootstrap, "javascript": "x", "compact": true}),
+        ] {
+            assert!(call(args).await.is_err(), "compact proof must fail closed");
+        }
+        let mut compact_foreign = origin.clone();
+        compact_foreign["binding_id"] = json!("bnd_foreign");
+        assert!(
+            call(json!({"origin": compact_foreign, "bootstrap": bootstrap, "compact": true}))
+                .await
+                .is_err()
+        );
         let source = threadlane::CLOSURE_TEMPLATE_JAVASCRIPT;
         let proof = call(json!({"origin": origin, "javascript": source}))
             .await
@@ -6290,6 +6340,23 @@ mod automatic_scope_tests {
         assert!(
             wrong.is_err(),
             "a foreign chat cannot use the current receipt"
+        );
+        let wrong_compact = CALL_THREAD_HINT
+            .scope(
+                Some("0196ed00-0000-7000-8000-00000000000b".into()),
+                server.invoke_tool_json(
+                    "ordinary_closure_client",
+                    json!({"origin": origin, "bootstrap": bootstrap, "compact": true}),
+                    None,
+                ),
+            )
+            .await;
+        assert!(wrong_compact.is_err());
+        std::fs::write(context_path, b"changed private context").unwrap();
+        assert!(
+            call(json!({"origin": origin, "bootstrap": bootstrap, "compact": true}))
+                .await
+                .is_err()
         );
     }
 
