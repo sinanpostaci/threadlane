@@ -1073,7 +1073,8 @@ fi
         let mcp_a = PairedMcpServer::new(&state_dir, pairing_store.clone()).expect("create mcp A");
         let mcp_b = PairedMcpServer::new(&state_dir, pairing_store.clone()).expect("create mcp B");
 
-        // Two connection tools, sixteen runtime tools, eight ordinary backlog tools, five guarded Worker backlog tools, five workflow tools, eight approved-task tools, six Coworker planning tools, and four Coworker execution tools.
+        // The paired router includes connection, runtime, backlog, review, workflow,
+        // approved-task, planning, and execution tools.
         let tools = mcp_a.list_tools();
         assert_eq!(tools.len(), 59, "PairedMcpServer must expose 59 tools");
         let list_activity_tool = tools
