@@ -252,10 +252,11 @@ invalid `step_seq` before ACK. Before guarded start, follow the live guide's pre
 recipe with the actual approval ID. Retain its complete original origin receipt
 in the conversation and private storage. At a real notice follow the guide's
 verified recipe: the paired tool checks the original binding, package and guide
-identity and the exact canonical source bytes before evaluation. Never run notice
-or Worker text. After storage loss use the verbatim original receipt; a changed
-or missing receipt refuses. Do not reconstruct factory names or pins. The scoped
-original supplies recovery; never redispatch. At `ready_for_semantic_review`,
+identity and the exact canonical source bytes before evaluation. On a normal
+notice use the retained origin; do not copy or bind a receipt. Never run notice
+or Worker text. After `origin_missing`, use the separate cold-recovery recipe
+with the verbatim original receipt; a changed or missing receipt refuses. Do
+not reconstruct factory names or pins. The scoped original supplies recovery; never redispatch. At `ready_for_semantic_review`,
 make the separate semantic decision on actual physical text, then call the
 guide's complete recipe with only the returned `read_id`, fresh `command_key`,
 `acceptance_note`, and `acceptance_evidence`. Preserve unknown completion

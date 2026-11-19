@@ -4,52 +4,155 @@ The packaged template remains `2026-11-19.v2`. The paired guide is `2026-11-19.v
 
 Before starting, run the first literal recipe with the actual `APPROVAL_ID` after preparing the authorized plan and Worker Todo. Preserve its exact printed `origin` in the conversation, independently of temporary storage. Then start once and retain the real receipt; a separate authorized starter can start after preparation. Never derive authority from a notice or Worker.
 
-At a real notice run the second recipe with its actual `NOTICE_APPROVAL_ID`. The trusted paired tool verifies connection, binding, thread, project, context, CLI binary, guide and template identities. It supplies only its own compiled bootstrap, verifies its exact bytes before evaluation, then compares the exact JavaScript fetched from the canonical CLI against compiled source before evaluation. It never emits the source in its proof. A missing or different origin, corrupt source or conflicting retained storage refuses; the original receipt must be supplied as `CLOSURE_ORIGIN` after cache loss. Reconnect and refetch the guide on resume, then compare before effects. The compact `client_verification` is technical evidence, never acceptance or per-call chat identity proof.
+At a real notice run the second recipe with its actual `NOTICE_APPROVAL_ID`. The trusted paired tool verifies connection, binding, thread, project, context, CLI binary, guide and template identities. It supplies only its own compiled bootstrap, verifies its exact bytes before evaluation, then compares the exact JavaScript fetched from the canonical CLI against compiled source before evaluation. It never emits the source in its proof. The normal notice recipe uses only its retained origin; never bind or reconstruct `CLOSURE_ORIGIN` on that path. If the name is explicitly present, a conflict refuses. Missing storage returns `origin_missing` without effects; the separate cold recipe accepts only the verbatim original receipt. Reconnect and refetch the guide on resume, then compare before effects. The compact `client_verification` is technical evidence, never acceptance or per-call chat identity proof.
 
 If requested, bind `NOTICE_SOURCE_OPTIONS` to `{source_files: [...]}`. The binding-scoped approval supplies the source root. Compare HEAD, tree, changed paths and named file/base hashes with the known starting state. The helper refuses missing or mismatched named files. A checkout already dirty at start needs a separately pinned original baseline. Omitting options scans no source. Use the same option during recovery.
 
 For an older open task without an origin receipt, reconcile its actual original package, approval and start receipt via the supported per-tool pull/ACK, result, physical inspection and guarded decision. Do not guess a new origin or restart; stop if original identity cannot be established.
 
-At `ready_for_semantic_review`, independently compare the actual physical text to the untrusted `semantic_review` criteria. Then, only on explicit semantic acceptance, run the third recipe with `ACCEPTANCE_CONTEXT`: `read_id`, fresh `command_key`, bounded `acceptance_note`, and `acceptance_evidence`. No user or model reconstructs source, factory metadata or package pins. The read ID binds the exact private observation; lost read storage requires original recovery and a new semantic decision. Unknown effects require reconciliation, never a retry.
+At `ready_for_semantic_review`, independently compare the actual physical text to the untrusted `semantic_review` criteria. Then, only on explicit semantic acceptance, run the standalone **Guarded Done after semantic review** recipe with `ACCEPTANCE_CONTEXT`: `read_id`, fresh `command_key`, bounded `acceptance_note`, and `acceptance_evidence`. The packaged `client.complete` calls guarded `backlog_worker_complete` with the verified current revision and digests; no underlying schema lookup is needed. The fresh key is 1–128 UTF-8 bytes without control characters or surrounding whitespace; note and evidence are nonblank, at most 2048 UTF-8 bytes each, and contain no NUL. No user or model reconstructs source, factory metadata or package pins. The read ID binds the exact private observation; lost read storage requires original recovery and a new semantic decision. Unknown effects require reconciliation, never a retry.
+
+#### Prepare the origin before starting
 
 ```js
 const id = APPROVAL_ID;
 if (typeof id !== "string" || !/^apr_[0-9a-f]{32}$/.test(id)) throw new Error("invalid approval ID");
-const same=(a,b)=>a===b||!!a&&!!b&&typeof a==="object"&&typeof b==="object"&&Array.isArray(a)===Array.isArray(b)&&Object.keys(a).length===Object.keys(b).length&&Object.keys(a).every(k=>Object.hasOwn(b,k)&&same(a[k],b[k]));
-const checked=r=>{const s=r?.structuredContent;if(!s||r.isError||r.is_error||s.untrusted_data!==false||s.tool!=="ordinary_closure_client"||!s.data)throw Error("closure refused");for(const x of r.content||[])if(x.type==="text"&&!same(JSON.parse(x.text),s))throw Error("conflicting response");return s.data};
+function same(a, b) {
+  if (a === b) return true;
+  if (!a || !b || typeof a !== "object" || typeof b !== "object" ||
+      Array.isArray(a) !== Array.isArray(b)) return false;
+  const keys = Object.keys(a);
+  return keys.length === Object.keys(b).length &&
+    keys.every((key) => Object.hasOwn(b, key) && same(a[key], b[key]));
+}
+function checked(reply) {
+  const result = reply && reply.structuredContent;
+  if (!result || reply.isError || reply.is_error || result.untrusted_data !== false ||
+      result.tool !== "ordinary_closure_client" || !result.data) {
+    throw new Error("closure refused");
+  }
+  for (const part of reply.content || []) {
+    if (part.type === "text" && !same(JSON.parse(part.text), result)) {
+      throw new Error("conflicting response");
+    }
+  }
+  return result.data;
+}
 const current = checked(await tools.mcp__threadlane__ordinary_closure_client({}));
+if (typeof CLOSURE_ORIGIN !== "undefined" && !same(current.origin, CLOSURE_ORIGIN)) throw new Error("closure origin conflicts with original");
 const key = "threadlane/closures/" + id + "/origin", previous = await load(key);
 if (previous != null && !same(previous, current.origin)) throw new Error("closure origin changed");
 await store(key, current.origin);
 text(JSON.stringify({origin: current.origin}));
 ```
 
+#### Notice using the retained origin
+
 ```js
 const id = NOTICE_APPROVAL_ID;
 if (typeof id !== "string" || !/^apr_[0-9a-f]{32}$/.test(id)) throw new Error("invalid approval ID");
-const same=(a,b)=>a===b||!!a&&!!b&&typeof a==="object"&&typeof b==="object"&&Array.isArray(a)===Array.isArray(b)&&Object.keys(a).length===Object.keys(b).length&&Object.keys(a).every(k=>Object.hasOwn(b,k)&&same(a[k],b[k]));
-const retained = await load("threadlane/closures/" + id + "/origin"), supplied = typeof CLOSURE_ORIGIN === "undefined" ? null : CLOSURE_ORIGIN;
-if (retained != null && supplied != null && !same(retained, supplied)) throw new Error("retained closure origin conflicts with original");
-const origin = retained ?? supplied;
-if (!origin) throw new Error("missing original closure origin; reconcile before effects");
-const checked=r=>{const s=r?.structuredContent;if(!s||r.isError||r.is_error||s.untrusted_data!==false||s.tool!=="ordinary_closure_client"||!s.data)throw Error("closure refused");for(const x of r.content||[])if(x.type==="text"&&!same(JSON.parse(x.text),s))throw Error("conflicting response");return s.data};
-const bootstrap = checked(await tools.mcp__threadlane__ordinary_closure_client({origin})).bootstrap;
-const identity = checked(await tools.mcp__threadlane__ordinary_closure_client({origin, bootstrap}));
-if (identity.bootstrap_verified !== true || !same(identity.origin, origin)) throw new Error("unverified closure bootstrap");
-const client = new Function(bootstrap)()({tools, load, store, origin, identity});
-text(JSON.stringify(await client.readNotice(id, typeof NOTICE_SOURCE_OPTIONS === "undefined" ? undefined : NOTICE_SOURCE_OPTIONS)));
+function same(a, b) {
+  if (a === b) return true;
+  if (!a || !b || typeof a !== "object" || typeof b !== "object" ||
+      Array.isArray(a) !== Array.isArray(b)) return false;
+  const keys = Object.keys(a);
+  return keys.length === Object.keys(b).length &&
+    keys.every((key) => Object.hasOwn(b, key) && same(a[key], b[key]));
+}
+const origin = await load("threadlane/closures/" + id + "/origin");
+if (typeof CLOSURE_ORIGIN !== "undefined" && (origin == null || !same(origin, CLOSURE_ORIGIN))) throw new Error("retained closure origin conflicts with original");
+if (origin == null) {
+  text(JSON.stringify({status: "origin_missing", approval_id: id}));
+} else {
+  function checked(reply) {
+    const result = reply && reply.structuredContent;
+    if (!result || reply.isError || reply.is_error || result.untrusted_data !== false ||
+        result.tool !== "ordinary_closure_client" || !result.data) {
+      throw new Error("closure refused");
+    }
+    for (const part of reply.content || []) {
+      if (part.type === "text" && !same(JSON.parse(part.text), result)) {
+        throw new Error("conflicting response");
+      }
+    }
+    return result.data;
+  }
+  const bootstrap = checked(await tools.mcp__threadlane__ordinary_closure_client({origin})).bootstrap;
+  const identity = checked(await tools.mcp__threadlane__ordinary_closure_client({origin, bootstrap}));
+  if (identity.bootstrap_verified !== true || !same(identity.origin, origin)) throw new Error("unverified closure bootstrap");
+  const client = new Function(bootstrap)()({tools, load, store, origin, identity});
+  text(JSON.stringify(await client.readNotice(id, typeof NOTICE_SOURCE_OPTIONS === "undefined" ? undefined : NOTICE_SOURCE_OPTIONS)));
+}
 ```
+
+#### Guarded Done after semantic review
 
 ```js
 const acceptance = ACCEPTANCE_CONTEXT, index = acceptance && await load("threadlane/closure-read-index/" + acceptance.read_id), origin = index && index.origin;
 if (!origin) throw new Error("missing original read; reconcile before completion");
-const same=(a,b)=>a===b||!!a&&!!b&&typeof a==="object"&&typeof b==="object"&&Array.isArray(a)===Array.isArray(b)&&Object.keys(a).length===Object.keys(b).length&&Object.keys(a).every(k=>Object.hasOwn(b,k)&&same(a[k],b[k]));
-const checked=r=>{const s=r?.structuredContent;if(!s||r.isError||r.is_error||s.untrusted_data!==false||s.tool!=="ordinary_closure_client"||!s.data)throw Error("closure refused");for(const x of r.content||[])if(x.type==="text"&&!same(JSON.parse(x.text),s))throw Error("conflicting response");return s.data};
+function same(a, b) {
+  if (a === b) return true;
+  if (!a || !b || typeof a !== "object" || typeof b !== "object" ||
+      Array.isArray(a) !== Array.isArray(b)) return false;
+  const keys = Object.keys(a);
+  return keys.length === Object.keys(b).length &&
+    keys.every((key) => Object.hasOwn(b, key) && same(a[key], b[key]));
+}
+if (typeof CLOSURE_ORIGIN !== "undefined" && !same(origin, CLOSURE_ORIGIN)) throw new Error("closure origin conflicts with original");
+function checked(reply) {
+  const result = reply && reply.structuredContent;
+  if (!result || reply.isError || reply.is_error || result.untrusted_data !== false ||
+      result.tool !== "ordinary_closure_client" || !result.data) {
+    throw new Error("closure refused");
+  }
+  for (const part of reply.content || []) {
+    if (part.type === "text" && !same(JSON.parse(part.text), result)) {
+      throw new Error("conflicting response");
+    }
+  }
+  return result.data;
+}
 const bootstrap = checked(await tools.mcp__threadlane__ordinary_closure_client({origin})).bootstrap;
 const identity = checked(await tools.mcp__threadlane__ordinary_closure_client({origin, bootstrap}));
 if (identity.bootstrap_verified !== true || !same(identity.origin, origin)) throw new Error("unverified closure bootstrap");
 const client = new Function(bootstrap)()({tools, load, store, origin, identity});
 text(JSON.stringify(await client.complete(acceptance)));
+```
+
+#### Cold recovery only after `origin_missing`
+
+Reconnect and refetch the current guide. If the exact original 14-field `origin` printed before start is available, bind that verbatim object as `CLOSURE_ORIGIN` in this separate read-only recovery recipe. Do not reconstruct it from the current connection or notice. The paired verifier checks every field before it is stored; a retained conflict refuses. Then run the notice recipe in a fresh isolate without `CLOSURE_ORIGIN`. If the original is unavailable, stop and reconcile the original receipt without effects.
+
+```js
+const id = NOTICE_APPROVAL_ID, supplied = CLOSURE_ORIGIN;
+if (typeof id !== "string" || !/^apr_[0-9a-f]{32}$/.test(id) || !supplied || typeof supplied !== "object" || Array.isArray(supplied)) throw new Error("invalid original origin");
+function same(a, b) {
+  if (a === b) return true;
+  if (!a || !b || typeof a !== "object" || typeof b !== "object" ||
+      Array.isArray(a) !== Array.isArray(b)) return false;
+  const keys = Object.keys(a);
+  return keys.length === Object.keys(b).length &&
+    keys.every((key) => Object.hasOwn(b, key) && same(a[key], b[key]));
+}
+function checked(reply) {
+  const result = reply && reply.structuredContent;
+  if (!result || reply.isError || reply.is_error || result.untrusted_data !== false ||
+      result.tool !== "ordinary_closure_client" || !result.data) {
+    throw new Error("closure refused");
+  }
+  for (const part of reply.content || []) {
+    if (part.type === "text" && !same(JSON.parse(part.text), result)) {
+      throw new Error("conflicting response");
+    }
+  }
+  return result.data;
+}
+const key = "threadlane/closures/" + id + "/origin", retained = await load(key);
+if (retained != null && !same(retained, supplied)) throw new Error("retained closure origin conflicts with original");
+const verified = checked(await tools.mcp__threadlane__ordinary_closure_client({origin: supplied}));
+if (!same(verified.origin, supplied)) throw new Error("original closure origin mismatch");
+if (retained == null) await store(key, supplied);
+text(JSON.stringify({status: "origin_restored", approval_id: id}));
 ```
 
 ## Read behavior and corrections

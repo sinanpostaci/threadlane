@@ -1820,7 +1820,7 @@ test("legacy callback and guide prep/complete work with typed data in fresh isol
   );
   assert.ok(!guide.includes(["text(", "await tools.exec_command"].join("")));
   assert.ok(!guide.includes(["con", "sole", "lo", "g"].join("")));
-  const rawBlocks = [...guide.matchAll(/```js\n([\s\S]*?)```/g)].map((match) => match[1]);
+  const rawBlocks = [...guide.matchAll(/```js\n([\s\S]*?)```/g)].slice(0, 3).map((match) => match[1]);
   assert.equal(rawBlocks.length, 3, "guide must contain prep, callback, and complete recipes");
 
   const prepBlock = legacyPrepBlock;
@@ -2093,7 +2093,7 @@ function documentRecipeBlocks(documentPath) {
   blocks[0] = legacyPrepBlock;
   blocks[1] = legacyReadBlock;
   blocks[2] = legacyCompleteBlock;
-  return blocks;
+  return blocks.slice(0, 3);
 }
 
 function makeGuideEnvironment(
@@ -3467,9 +3467,16 @@ test("closure client wrappers stay compact, identical, and within document byte 
   const guideBlocks = readBlocks(guidePath);
   const closureBlocks = readBlocks(closurePath);
   assert.equal(guideBlocks.length, 3);
-  assert.equal(closureBlocks.length, 3);
+  assert.equal(closureBlocks.length, 4);
   assert.equal(guideBlocks[1], closureBlocks[1], "read wrappers are identical");
   assert.equal(guideBlocks[2], closureBlocks[2], "complete wrappers are identical");
+  assert.match(guide, /ORDINARY-WORKER-CLOSURE\.md#cold-recovery-only-after-origin_missing/);
+  for (const block of [...guideBlocks, closureBlocks[3]]) {
+    assert.ok(!block.includes("const same=(a,b)=>"), "comparisons remain readable");
+    assert.ok(!block.includes("const checked=r=>"), "envelope checks remain readable");
+  }
+  assert.match(guide, /#### Guarded Done after semantic review/);
+  assert.match(guide, /do not look up or construct that underlying tool schema/);
   assert.ok(!guideBlocks[1].includes("APPROVED_TASK_CONTEXT"));
   assert.ok(!guideBlocks[1].includes("ACCEPTANCE_CONTEXT"));
   assert.equal((guideBlocks[2].match(/ACCEPTANCE_CONTEXT/g) || []).length, 1);
@@ -3484,8 +3491,8 @@ test("closure client wrappers stay compact, identical, and within document byte 
     ["complete", guideBlocks[2]]
   ]) {
     assert.ok(
-      Buffer.byteLength(block, "utf8") <= 1700,
-      `${label} program body stays within 1700 UTF-8 bytes, got ${Buffer.byteLength(block, "utf8")}`
+      Buffer.byteLength(block, "utf8") <= 3000,
+      `${label} program body stays within 3000 UTF-8 bytes, got ${Buffer.byteLength(block, "utf8")}`
     );
   }
 });
@@ -4152,6 +4159,9 @@ function makeVerifiedBootstrapGuide() {
   const env = makeGuideEnvironment();
   const guide = fs.readFileSync(path.join(here, "../../../docs/MCP-OPERATING-GUIDE.md"), "utf8");
   const blocks = [...guide.matchAll(/```js\n([\s\S]*?)```/g)].map((match) => match[1]);
+  const contract = fs.readFileSync(path.join(here, "../../../docs/ORDINARY-WORKER-CLOSURE.md"), "utf8");
+  const contractBlocks = [...contract.matchAll(/```js\n([\s\S]*?)```/g)].map((match) => match[1]);
+  blocks.push(contractBlocks[3]);
   const origin = {schema_version: 1, binding_id: CONTROL, thread_id: "thread-original",
     project_root: "/project", cli_package: "/trusted", context_path: "/private/context",
     context_router_executable: "/trusted/bin/threadlane-context", context_sha256: "1".repeat(64),
@@ -4235,14 +4245,13 @@ test("current bootstrap rejects a changed immutable observation before guarded c
 });
 
 test("current bootstrap refuses changed origin and changed source before any effect", async () => {
-  for (const mode of ["origin", "source", "bootstrap", "missing"]) {
+  for (const mode of ["origin", "source", "bootstrap"]) {
     const f = makeVerifiedBootstrapGuide(); await f.run(0);
     if (mode === "origin") f.setOrigin({...f.origin, binding_id: "bnd_foreign"});
     if (mode === "source") f.setSource(source + "\nthrow new Error('untrusted source ran')");
     if (mode === "bootstrap") f.setBootstrap(bootstrapSource + "\nthrow new Error('untrusted bootstrap ran')");
-    if (mode === "missing") f.env.stored.delete(`threadlane/closures/${APPROVAL}/origin`);
     const before = clone(f.env.calls);
-    await assert.rejects(f.run(1), /origin mismatch|source mismatch|bootstrap mismatch|missing original closure origin/);
+    await assert.rejects(f.run(1), /origin mismatch|source mismatch|bootstrap mismatch/);
     assert.equal(f.env.calls.pull, before.pull); assert.equal(f.env.calls.ack, before.ack);
     assert.equal(f.env.calls.result, before.result); assert.equal(f.env.calls.inspect, before.inspect);
     assert.equal(f.env.calls.complete, before.complete);
@@ -4252,7 +4261,9 @@ test("current bootstrap refuses changed origin and changed source before any eff
 test("current bootstrap recovers after storage loss only with its original continuity receipt", async () => {
   const f = makeVerifiedBootstrapGuide(); await f.run(0);
   f.env.stored.clear();
-  await f.run(1, {CLOSURE_ORIGIN: clone(f.origin)});
+  await f.run(3, {CLOSURE_ORIGIN: clone(f.origin)});
+  assert.equal(JSON.parse(f.env.texts.at(-1)).status, "origin_restored");
+  await f.run(1);
   assert.equal(JSON.parse(f.env.texts.at(-1)).status, "ready_for_semantic_review");
   assert.deepEqual(JSON.parse(f.env.stored.get(`threadlane/closures/${APPROVAL}/origin`)), f.origin);
 });
@@ -4261,7 +4272,8 @@ test("current bootstrap accepts the same cold receipt with reordered object keys
   const f = makeVerifiedBootstrapGuide(); await f.run(0);
   f.env.stored.clear();
   const reordered = Object.fromEntries(Object.entries(f.origin).reverse());
-  await f.run(1, {CLOSURE_ORIGIN: reordered});
+  await f.run(3, {CLOSURE_ORIGIN: reordered});
+  await f.run(1);
   assert.equal(JSON.parse(f.env.texts.at(-1)).status, "ready_for_semantic_review");
 });
 
@@ -4274,4 +4286,74 @@ test("supplied original receipt cannot be shadowed by a foreign retained receipt
   await assert.rejects(f.run(1, {CLOSURE_ORIGIN: clone(f.origin)}), /retained closure origin conflicts/);
   assert.equal(f.env.calls.pull, before.pull); assert.equal(f.env.calls.ack, before.ack);
   assert.equal(f.env.calls.result, before.result); assert.equal(f.env.calls.inspect, before.inspect);
+});
+
+test("warm notice uses its retained origin without a copied receipt", async () => {
+  const f = makeVerifiedBootstrapGuide(); await f.run(0);
+  await f.run(1);
+  assert.equal(JSON.parse(f.env.texts.at(-1)).status, "ready_for_semantic_review");
+  assert.equal(f.env.calls.ack, 1);
+});
+
+test("warm notice reports missing origin without contacting any tool", async () => {
+  const f = makeVerifiedBootstrapGuide(); await f.run(0);
+  f.env.stored.delete(`threadlane/closures/${APPROVAL}/origin`);
+  const before = clone(f.env.calls), order = [...f.order];
+  await f.run(1);
+  assert.deepEqual(JSON.parse(f.env.texts.at(-1)), {status: "origin_missing", approval_id: APPROVAL});
+  assert.deepEqual(f.order, order);
+  assert.deepEqual(f.env.calls, before);
+});
+
+test("warm notice never uses an explicitly supplied receipt as a fallback", async () => {
+  const f = makeVerifiedBootstrapGuide(); await f.run(0);
+  const key = `threadlane/closures/${APPROVAL}/origin`;
+  f.env.stored.delete(key);
+  const before = clone(f.env.calls), order = [...f.order];
+  await assert.rejects(f.run(1, {CLOSURE_ORIGIN: clone(f.origin)}), /retained closure origin conflicts/);
+  assert.equal(f.env.stored.has(key), false);
+  assert.deepEqual(f.order, order);
+  assert.deepEqual(f.env.calls, before);
+});
+
+test("a copied warm receipt missing project_root refuses before all effects", async () => {
+  const f = makeVerifiedBootstrapGuide(); await f.run(0);
+  const copied = clone(f.origin); delete copied.project_root;
+  assert.equal(Object.keys(f.origin).length, 14);
+  assert.equal(Object.keys(copied).length, 13);
+  const before = clone(f.env.calls), order = [...f.order];
+  await assert.rejects(f.run(1, {CLOSURE_ORIGIN: copied}), /retained closure origin conflicts/);
+  assert.deepEqual(f.order, order);
+  assert.deepEqual(f.env.calls, before);
+  assert.deepEqual(JSON.parse(f.env.stored.get(`threadlane/closures/${APPROVAL}/origin`)), f.origin);
+});
+
+test("explicit conflicting origin refuses during preparation and Done", async () => {
+  const f = makeVerifiedBootstrapGuide();
+  const foreign = {...f.origin, binding_id: "bnd_foreign"};
+  await assert.rejects(f.run(0, {CLOSURE_ORIGIN: foreign}), /closure origin conflicts/);
+  assert.equal(f.env.stored.has(`threadlane/closures/${APPROVAL}/origin`), false);
+  await f.run(0); await f.run(1);
+  const readId = JSON.parse(f.env.texts.at(-1)).read_id;
+  const order = [...f.order], before = clone(f.env.calls);
+  await assert.rejects(f.run(2, {CLOSURE_ORIGIN: foreign,
+    ACCEPTANCE_CONTEXT: {...f.env.acceptanceContext, read_id: readId}}), /closure origin conflicts/);
+  assert.deepEqual(f.order, order);
+  assert.deepEqual(f.env.calls, before);
+  assert.equal(f.env.calls.complete, 0);
+});
+
+test("cold origin recovery rejects partial, foreign, and conflicting receipts without effects", async () => {
+  for (const mode of ["partial", "foreign", "conflicting retained"]) {
+    const f = makeVerifiedBootstrapGuide(); await f.run(0);
+    const key = `threadlane/closures/${APPROVAL}/origin`, supplied = clone(f.origin);
+    if (mode === "partial") delete supplied.project_root;
+    if (mode === "foreign") supplied.binding_id = "bnd_foreign";
+    if (mode !== "conflicting retained") f.env.stored.delete(key);
+    else f.env.stored.set(key, JSON.stringify({...f.origin, binding_id: "bnd_retained"}));
+    const before = f.env.stored.get(key), counts = clone(f.env.calls);
+    await assert.rejects(f.run(3, {CLOSURE_ORIGIN: supplied}), /origin mismatch|retained closure origin conflicts/);
+    assert.equal(f.env.stored.get(key), before);
+    assert.deepEqual(f.env.calls, counts);
+  }
 });
