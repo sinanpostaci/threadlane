@@ -2098,6 +2098,108 @@ async fn worker_notice_refuses_attached_unknown_outcome_without_side_effects() {
 }
 
 #[tokio::test]
+async fn worker_notice_normalizes_frozen_absent_effort_like_host() {
+    let fixture = setup_approved_mcp_fixture().await;
+    let registry = fixture.registry.snapshot().expect("registry snapshot");
+    let mut model = registry
+        .models
+        .iter()
+        .find(|model| model.id == "model-deepseek")
+        .expect("OpenCode model")
+        .clone();
+    model.allow_no_effort = true;
+    let registry = fixture
+        .registry
+        .apply(registry.revision, RegistryChange::UpsertModel { model })
+        .expect("allow an absent effort");
+    let mut profile = registry
+        .profiles
+        .iter()
+        .find(|profile| profile.id == "profile-main")
+        .expect("profile")
+        .clone();
+    let easy = profile
+        .assignments
+        .iter_mut()
+        .find(|assignment| {
+            assignment.role == WorkflowRole::Coder
+                && assignment.difficulty == Some(Difficulty::Easy)
+        })
+        .expect("OpenCode assignment");
+    easy.choice.effort = None;
+    let registry = fixture
+        .registry
+        .apply(registry.revision, RegistryChange::UpsertProfile { profile })
+        .expect("save no-effort profile");
+    let tasks = default_plan_tasks("unused")
+        .into_iter()
+        .filter(|task| task.id == "task-root-oc")
+        .collect();
+    let draft = fixture
+        .plans
+        .change_at(
+            0,
+            PlanChange::SaveDraft {
+                plan_id: "plan-notice-no-effort".to_string(),
+                binding_id: fixture.binding_a.clone(),
+                profile_id: "profile-main".to_string(),
+                profile_revision: registry.revision,
+                summary: "No-effort Worker notice".to_string(),
+                tasks,
+            },
+            1_700_002_152_000,
+        )
+        .expect("save plan");
+    let published = fixture
+        .plans
+        .change(
+            draft.revision,
+            PlanChange::Publish {
+                plan_id: "plan-notice-no-effort".to_string(),
+                revision: draft.revision,
+            },
+        )
+        .expect("publish plan");
+    let compiled = compile_plan_revision(&published, &registry).expect("compile plan");
+    let approval = approve_published_plan(
+        &fixture,
+        "plan-notice-no-effort",
+        published.revision,
+        &compiled.plan_digest,
+        &fixture.binding_a,
+        THREAD_UUID_A,
+        vec!["task-root-oc".to_string()],
+        1_700_002_152_100,
+    );
+    let host = start_fixture_host(&fixture, &approval.approval_id).await;
+    let mcp = live_mcp(&fixture);
+    enroll_server(&fixture, &mcp, &fixture.binding_a, THREAD_UUID_A).await;
+    let (item_id, item_revision) =
+        create_worker_item(&mcp, "notice-no-effort-item", "No-effort notice").await;
+    mcp.invoke_tool_json("backlog_worker_start", json!({
+        "item_id": item_id, "expected_revision": item_revision, "command_key": "notice-no-effort-start",
+        "approval_id": approval.approval_id, "task_id": "task-root-oc"
+    }), None).await.expect("start no-effort fixture Worker");
+    let notice = mcp
+        .invoke_tool_json(
+            "backlog_worker_notice_context",
+            json!({"approval_id": approval.approval_id}),
+            None,
+        )
+        .await
+        .expect("recover no-effort notice");
+    let data = &notice.structured_content.unwrap()["data"];
+    assert_eq!(
+        data["scope"]["requested_model"],
+        "opencode-go/deepseek-v4.1-flash"
+    );
+    assert_eq!(data["scope"]["requested_effort"], "default");
+    assert_eq!(data["item_snapshot"]["status"], "doing");
+    assert!(data.get("completion").is_none());
+    host.shutdown().await.expect("stop fixture host");
+}
+
+#[tokio::test]
 async fn guarded_worker_backlog_pre_effect_refusal_preserves_exact_reservation() {
     let fixture = setup_approved_mcp_fixture().await;
     let (plan_revision, plan_digest) = create_published_plan(

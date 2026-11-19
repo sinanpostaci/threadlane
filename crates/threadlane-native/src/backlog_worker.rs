@@ -524,6 +524,8 @@ impl WorkerBacklogService {
         })?;
         if execution.authority != authority_for_task(&record, task)
             || task.profile_id.as_deref() != Some(dispatch.profile_id.as_str())
+            // Dependent tasks use a separately sealed execution base; the compact
+            // dispatch receipt stores only its digest, not that base commit.
             || !task.depends_on.is_empty()
             || task.allowed_write_paths.is_empty()
         {
@@ -532,16 +534,17 @@ impl WorkerBacklogService {
                 "The current execution does not match an unambiguous frozen Worker scope.",
             ));
         }
-        let effort = task
-            .effort
-            .as_ref()
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| {
-                WorkerBacklogError::new(
+        // Match the host's runtime normalization of an explicitly absent effort.
+        let effort = match task.effort.as_deref() {
+            Some("") => {
+                return Err(WorkerBacklogError::new(
                     "authority_mismatch",
-                    "The frozen Worker effort is unavailable.",
-                )
-            })?;
+                    "The frozen Worker effort is invalid.",
+                ));
+            }
+            Some(value) => value.to_string(),
+            None => "default".to_string(),
+        };
         // Detect a superseding attempt or a concurrent completion while resolving authority.
         // The actual result and completion operations independently recheck current state.
         let verified = self
@@ -584,7 +587,7 @@ impl WorkerBacklogService {
             scope: WorkerBacklogNoticeScope {
                 base_commit: record.base_commit.clone(),
                 requested_model: task.base_model.clone(),
-                requested_effort: effort.clone(),
+                requested_effort: effort,
                 write_paths: task.allowed_write_paths.clone(),
             },
             completion,

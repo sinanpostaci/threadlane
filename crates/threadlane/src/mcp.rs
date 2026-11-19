@@ -1664,7 +1664,7 @@ mod tests {
             "const input = APPROVED_TASK_CONTEXT;",
             "const acceptance = ACCEPTANCE_CONTEXT;",
             "threadlane/approved-task-context.json",
-            "max_output_tokens: 32000",
+            "max_output_tokens: 40000",
             "JSON.parse(result.output)",
             "closure-evidence.json",
             "closure-report.json",
