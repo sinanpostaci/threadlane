@@ -433,6 +433,132 @@ class DesktopAcceptanceIsolationTests(unittest.TestCase):
                 da.wrap_with_private_dbus(["/nix/store/pw/bin/threadlane-desktop-playwright"])
 
 
+class NixRebuildDriverTests(unittest.TestCase):
+    DRV = "/nix/store/00000000000000000000000000000000-widget.drv"
+    OUT = "/nix/store/00000000000000000000000000000000-widget"
+    COLD_ERR = (
+        f"error: some outputs of '{DRV}' are not valid, so checking is not possible\n"
+        "       Hint: --rebuild and --check error if the derivation was not "
+        "previously built and cannot be substituted."
+    )
+
+    def setUp(self):
+        self.patches = self.enterContext(contextlib.ExitStack())
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.run = self.root / "run"
+        self.layout = da.prepare_child_isolation(self.run)
+        self.patches.enter_context(mock.patch.object(da.sys, "platform", "linux"))
+        self.patches.enter_context(mock.patch.object(da.shutil, "which", return_value="/mock/nix"))
+        self.patches.enter_context(mock.patch.object(da, "wrap_with_private_dbus", side_effect=list))
+        self.runner = self.patches.enter_context(mock.patch.object(da, "run_logged_child"))
+        self.resolve = self.patches.enter_context(mock.patch.object(da, "resolve_vm_store_artifacts_dir"))
+        self.patches.enter_context(mock.patch.object(da, "copy_store_artifacts_privately"))
+        self.validate = self.patches.enter_context(mock.patch.object(da, "verify_vm_acceptance_report"))
+
+    def check_stage(self, responses, expected_checks, failure=None):
+        for dependency in (self.runner, self.resolve, self.validate):
+            dependency.reset_mock()
+        self.runner.side_effect = [subprocess.CompletedProcess([], *response) for response in responses]
+        if failure is not None:
+            with self.assertRaises(da.AcceptanceError) as ctx:
+                da.execute_vm_stage(self.root, self.run, self.layout)
+            self.assertIn(failure, str(ctx.exception))
+            self.resolve.assert_not_called()
+            self.validate.assert_not_called()
+        else:
+            result = da.execute_vm_stage(self.root, self.run, self.layout)
+            self.assertIs(result, self.validate.return_value)
+            self.resolve.assert_called_once_with(Path(self.OUT))
+            self.validate.assert_called_once_with(self.run / "vm" / "vm-acceptance-report.json")
+        calls = [call.args[0] for call in self.runner.call_args_list]
+        self.assertEqual(["--rebuild" in argv for argv in calls], expected_checks)
+        if len(calls) == 2:
+            self.assertEqual([arg for arg in calls[0] if arg != "--rebuild"], calls[1])
+
+    def test_cold_error_then_regular_build_and_validate(self):
+        cases = [
+            ("upstream_with_note", self.COLD_ERR),
+            (
+                "upstream_ansi",
+                "warning: Git tree '/tmp/repo' is dirty\n"
+                f"\x1b[31;1merror:\x1b[0m some outputs of '\x1b[35;1m{self.DRV}\x1b[0m' "
+                "are not valid, so checking is not possible\n",
+            ),
+            (
+                "older_curly_quotes",
+                f"error: some outputs of ‘{self.DRV}’ are not valid, so checking is not possible\n",
+            ),
+            (
+                "singular_output",
+                f"error: output '{self.OUT}' is not valid, so checking is not possible\n",
+            ),
+        ]
+        for name, stderr in cases:
+            with self.subTest(case=name):
+                self.check_stage([(1, "", stderr), (0, self.OUT + "\n", "")], [True, False])
+
+    def test_warm_rebuild_success(self):
+        self.check_stage([(0, self.OUT + "\n", "")], [True])
+
+    def test_unrelated_failure_does_not_retry(self):
+        vm_drv = "/nix/store/00000000000000000000000000000000-vm-test.drv"
+        cases = [
+            (
+                "generic_not_valid",
+                f"error: path '{self.OUT}' is not valid\n",
+                "is not valid",
+            ),
+            (
+                "missing_file",
+                f"error: getting status of '{self.OUT}': No such file or directory\n",
+                "No such file or directory",
+            ),
+            (
+                "note_only",
+                "       note: '--rebuild' and '--check' error if the derivation was not "
+                "previously built and cannot be substituted\n",
+                "'--rebuild' and '--check'",
+            ),
+            (
+                "vm_log_with_nested_cold_line",
+                f"error: builder for '{vm_drv}' failed with exit code 1;\n"
+                "       last 10 log lines:\n"
+                f"       > error: some outputs of '{self.DRV}' are not valid, so checking is not possible\n"
+                "       > machine # AssertionError: service failed\n",
+                "AssertionError: service failed",
+            ),
+            (
+                "prefixed_builder_log",
+                f"widget> error: some outputs of '{self.DRV}' are not valid, so checking is not possible\n"
+                "widget> AssertionError: unit check failed\n",
+                "AssertionError: unit check failed",
+            ),
+        ]
+        for name, stderr, needle in cases:
+            with self.subTest(case=name):
+                self.check_stage([(1, "", stderr)], [True], needle)
+        self.check_stage([(1, self.COLD_ERR, "failed a different VM check")], [True], "different VM check")
+
+    def test_failed_regular_build_propagates_without_third_request(self):
+        second_drv = "/nix/store/11111111111111111111111111111111-second.drv"
+        cases = [
+            (
+                "build_failure",
+                f"error: builder for '{self.DRV}' failed with exit code 1\n"
+                "       > AssertionError: regular build failed\n",
+                "AssertionError: regular build failed",
+            ),
+            (
+                "repeated_cold_error_no_loop",
+                f"error: some outputs of '{second_drv}' are not valid, so checking is not possible\n",
+                second_drv,
+            ),
+        ]
+        for name, second_stderr, needle in cases:
+            with self.subTest(case=name):
+                self.check_stage([(1, "", self.COLD_ERR), (1, "", second_stderr)], [True, False], needle)
+
+
 class DesktopAcceptanceFailClosedVerificationTests(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
