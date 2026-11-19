@@ -28,7 +28,7 @@ Run `threadlane guide` to print the canonical versioned operating guide
 ([`docs/MCP-OPERATING-GUIDE.md`](MCP-OPERATING-GUIDE.md)) offline without network
 or supervisor access. When connected over MCP (`threadlane mcp` or enrolled
 `threadlane-native-mcp`), call the read-only `operating_guide` (`{}`) tool to
-fetch the same shared guide and version (`2026-11-19.v1`).
+fetch the same shared guide and version (`2026-11-19.v2`).
 
 Compaction detection and memory retention are not automatic. On initial
 connection, session resume, context uncertainty, or before external effects when
@@ -50,7 +50,7 @@ opt-in only.
 
 `threadlane closure-template` prints the ordinary callback helper as
 offline JSON from the trusted offline packaged CLI (not a prerequisite file in
-`~/.agents`; schema/version `2026-11-19.v1`, source SHA-256, and the packaged
+`~/.agents`; schema/version `2026-11-19.v2`, source SHA-256, and the packaged
 JavaScript factory source). Once source and SHA-256 are verified, do not repeat
 declaration, repo, or global-skill searches. It needs no state directory,
 supervisor, provider, or network. Create the

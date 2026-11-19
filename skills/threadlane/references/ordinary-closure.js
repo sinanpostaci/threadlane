@@ -1,4 +1,4 @@
-// Threadlane ordinary Worker callback closure template (2026-11-19.v1).
+// Threadlane ordinary Worker callback closure template (2026-11-19.v2).
 //
 // This is trusted packaged source, not event/provider text. It uses standard
 // language builtins only, with no dynamic loading, network, external commands,
@@ -20,7 +20,7 @@
 
 "use strict";
 
-var CREATE_ORDINARY_CLOSURE_VERSION = "2026-11-19.v1";
+var CREATE_ORDINARY_CLOSURE_VERSION = "2026-11-19.v2";
 var ORDINARY_CLOSURE_PAGE_LIMIT = 20;
 var ORDINARY_CLOSURE_MAX_WRITE_PATHS = 128;
 var ORDINARY_CLOSURE_MAX_BATCH_BYTES = 49152;
@@ -284,7 +284,7 @@ function createOrdinaryClosure(callbacks) {
       var checked = validateResult(resultData, start, scope, state);
 
       checkDeadline("inspect");
-      var inspectionRequest = buildInspectionRequest(checked.workerEvidence, scope);
+      var inspectionRequest = buildInspectionRequest(checked.workerEvidence, scope, input.source);
       var inspectRaw = await invoke("inspect", inspect, inspectionRequest);
       var inspection = parseInspection(inspectRaw, state);
       var physical = validateInspection(inspection, inspectionRequest, scope, state);
@@ -575,7 +575,7 @@ function createOrdinaryClosureClient(callbacks) {
       template.source_sha256 === input.expected_source_sha256 &&
       typeof template.javascript === "string" &&
       template.javascript.indexOf(
-        'var CREATE_ORDINARY_CLOSURE_VERSION = "2026-11-19.v1";'
+        'var CREATE_ORDINARY_CLOSURE_VERSION = "2026-11-19.v2";'
       ) !== -1;
   }
 
@@ -624,7 +624,7 @@ function createOrdinaryClosureClient(callbacks) {
     return view;
   }
 
-  async function readRetained(approvalId, isolateObservation) {
+  async function readRetained(approvalId, isolateObservation, source) {
     var input = await load(ORDINARY_CLOSURE_CLIENT_CONTEXT_KEY);
     var template = await load(ORDINARY_CLOSURE_CLIENT_TEMPLATE_KEY);
     var start = await load(ORDINARY_CLOSURE_CLIENT_START_KEY);
@@ -647,6 +647,7 @@ function createOrdinaryClosureClient(callbacks) {
     var outcome = await closure.read({
       start: start,
       scope: input.scope,
+      source: source,
       budgets: {
         max_pages: 8,
         max_calls: 16,
@@ -709,14 +710,36 @@ function createOrdinaryClosureClient(callbacks) {
     return readRetained();
   }
 
-  async function readNotice(approvalId) {
+  async function readNotice(approvalId, options) {
     if (typeof approvalId !== "string" || !/^apr_[0-9a-f]{32}$/.test(approvalId)) {
       throw new Error("invalid approval_id format");
     }
-    if (recover === undefined) return readRetained(approvalId);
-    if (noticesInFlight[approvalId]) return noticesInFlight[approvalId];
-    var pending = readRecovered(approvalId);
-    noticesInFlight[approvalId] = pending;
+    if (options === undefined) options = {};
+    if (!isPlainObject(options) || Object.keys(options).some(function (key) { return key !== "source_files"; })) {
+      throw new Error("invalid notice options");
+    }
+    var sourceFiles = options.source_files === undefined ? null : options.source_files;
+    if (sourceFiles !== null && (!Array.isArray(sourceFiles) || sourceFiles.length > ORDINARY_CLOSURE_MAX_WRITE_PATHS)) {
+      throw new Error("invalid source files");
+    }
+    var seenSourceFiles = Object.create(null);
+    if (sourceFiles !== null) sourceFiles = sourceFiles.map(function (path) {
+      validateRelativePath(path, "source file", {});
+      if (seenSourceFiles[path]) throw new Error("duplicate source file");
+      seenSourceFiles[path] = true;
+      return path;
+    });
+    if (recover === undefined) {
+      if (sourceFiles !== null) throw new Error("source files require scoped notice recovery");
+      return readRetained(approvalId);
+    }
+    var optionsKey = stableStringify(sourceFiles);
+    if (noticesInFlight[approvalId]) {
+      if (noticesInFlight[approvalId].options !== optionsKey) throw new Error("conflicting concurrent source files");
+      return noticesInFlight[approvalId].promise;
+    }
+    var pending = readRecovered(approvalId, sourceFiles);
+    noticesInFlight[approvalId] = {options: optionsKey, promise: pending};
     try {
       return await pending;
     } finally {
@@ -726,7 +749,7 @@ function createOrdinaryClosureClient(callbacks) {
 
   // The caller obtains this capsule from the already verified canonical package
   // and guide, never from the notification or a Worker. Recovery is read-only.
-  async function readRecovered(approvalId) {
+  async function readRecovered(approvalId, sourceFiles) {
     if (!isPlainObject(bootstrap) || typeof bootstrap.binary !== "string" ||
         bootstrap.binary.charAt(0) !== "/" || bootstrap.binary.indexOf("\u0000") !== -1 ||
         !validCapsule({expected_source_sha256: bootstrap.expected_source_sha256}, bootstrap.template)) {
@@ -763,6 +786,14 @@ function createOrdinaryClosureClient(callbacks) {
     }
     var semanticReview = {untrusted_data: true, acceptance_condition: data.acceptance_condition,
       delivery_description: data.delivery_description};
+    var source;
+    if (sourceFiles !== null) {
+      if (typeof data.scope.repository_path !== "string" || data.scope.repository_path.charAt(0) !== "/" ||
+          data.scope.repository_path.indexOf("\u0000") !== -1) {
+        throw new Error("scoped source repository is unavailable");
+      }
+      source = {root: data.scope.repository_path, files: sourceFiles};
+    }
     var parsed = parseStart({execution: data.execution}, {}, true);
     var identity = executionIdentityFromParsed(parsed);
     var snapshot = data.item_snapshot;
@@ -898,6 +929,7 @@ function createOrdinaryClosureClient(callbacks) {
     if (missingStart) await store(ORDINARY_CLOSURE_CLIENT_START_KEY, start);
     if (missingBinding) await store(ORDINARY_CLOSURE_CLIENT_BINDING_KEY, {input: input, start: start});
     if (priorReport) {
+      if (source !== undefined) validateRetainedSource(priorReport, source);
       var retained = await retainObservation(input, start, priorReport, priorEvidence);
       retained.later_events = await drainDoneEvents(parsed);
       retained.semantic_review = semanticReview;
@@ -907,7 +939,7 @@ function createOrdinaryClosureClient(callbacks) {
     if (uncertain !== undefined && uncertain !== null) {
       throw new Error("original observation requires reconciliation; no retry");
     }
-    var view = await readRetained(approvalId, true);
+    var view = await readRetained(approvalId, true, source);
     if (view.status === "ready_for_semantic_review") view.semantic_review = semanticReview;
     return view;
   }
@@ -1597,6 +1629,59 @@ function createOrdinaryClosureClient(callbacks) {
   });
 }
 
+// Native functions.exec adapter. The caller first obtains the canonical template from
+// the paired package and checks its guide pin before evaluating this trusted source.
+function createOrdinaryNativeClient(environment) {
+  if (!isPlainObject(environment) || !isPlainObject(environment.tools) ||
+      typeof environment.load !== "function" || typeof environment.store !== "function" ||
+      typeof environment.cli_package !== "string" || environment.cli_package.charAt(0) !== "/" ||
+      !/^[0-9a-f]{64}$/.test(environment.source_sha256) || !isPlainObject(environment.template)) {
+    throw new Error("invalid native client pins");
+  }
+  var tools = environment.tools;
+  var binary = environment.cli_package + "/bin/threadlane";
+  var template = environment.template;
+  if (template.schema_version !== 1 || template.tool !== "threadlane closure-template" ||
+      template.version !== CREATE_ORDINARY_CLOSURE_VERSION ||
+      template.source_path !== "skills/threadlane/references/ordinary-closure.js" ||
+      template.factory_name !== "createOrdinaryClosure" ||
+      template.source_sha256 !== environment.source_sha256 ||
+      typeof template.javascript !== "string" || sha256Utf8(template.javascript) !== environment.source_sha256) {
+    throw new Error("invalid native template");
+  }
+  var client = createOrdinaryClosureClient({
+    load: environment.load,
+    store: environment.store,
+    bootstrap: {binary: binary, expected_source_sha256: environment.source_sha256, template: template},
+    recover: function (a) { return tools.mcp__threadlane__backlog_worker_notice_context(a); },
+    pull: function (a) { return tools.mcp__threadlane__approved_pull_events(a); },
+    ack: function (a) { return tools.mcp__threadlane__approved_ack_events(a); },
+    result: function (a) { return tools.mcp__threadlane__backlog_worker_result(a); },
+    inspect: function (r) { return tools.exec_command({cmd: r.argv.map(shellQuote).join(" "), max_output_tokens: 16000, yield_time_ms: 30000}); },
+    complete: function (a) { return tools.mcp__threadlane__backlog_worker_complete(a); }
+  });
+  return Object.freeze({
+    readNotice: function (approvalId, options) { return client.readNotice(approvalId, options); },
+    complete: async function (acceptance) {
+      if (!isPlainObject(acceptance) || acceptance.cli_package !== environment.cli_package ||
+          acceptance.source_sha256 !== environment.source_sha256 ||
+          typeof acceptance.read_id !== "string" || !/^rd_[0-9a-f]{64}$/.test(acceptance.read_id)) {
+        throw new Error("invalid semantic acceptance pins");
+      }
+      var input = await environment.load(ORDINARY_CLOSURE_CLIENT_CONTEXT_KEY);
+      var retained = await environment.load(ORDINARY_CLOSURE_CLIENT_TEMPLATE_KEY);
+      if (!isPlainObject(input) || input.binary !== binary || input.expected_source_sha256 !== environment.source_sha256 ||
+          (retained != null && stableStringify(retained) !== stableStringify(template))) {
+        throw new Error("retained source or package conflicts with native pins");
+      }
+      if (retained == null) await environment.store(ORDINARY_CLOSURE_CLIENT_TEMPLATE_KEY, template);
+      var view = await client.completeStored(acceptance);
+      if (view.status === "done") view.final_summary = acceptance.acceptance_note;
+      return view;
+    }
+  });
+}
+
 function parseStart(raw, state, allowCompleted) {
   state.stage = "start";
   var envelope = unwrapEnvelope(raw, "start response");
@@ -2134,7 +2219,7 @@ function validateResult(data, start, scope, state) {
   };
 }
 
-function buildInspectionRequest(workerEvidence, scope) {
+function buildInspectionRequest(workerEvidence, scope, source) {
   var argv = [scope.inspector.executable].concat(scope.inspector.argv);
   argv.push("--root", workerEvidence.task_worktree_path);
   argv.push("--expected-base", scope.base_commit);
@@ -2144,11 +2229,22 @@ function buildInspectionRequest(workerEvidence, scope) {
   for (var textIndex = 0; textIndex < scope.write_paths.length; textIndex += 1) {
     argv.push("--text-file", scope.write_paths[textIndex]);
   }
+  if (source !== undefined) {
+    if (!isPlainObject(source) || typeof source.root !== "string" || source.root.charAt(0) !== "/" ||
+        source.root === workerEvidence.task_worktree_path || !Array.isArray(source.files)) {
+      incomplete("invalid_source", "source must be a separate scoped repository", {});
+    }
+    argv.push("--source-root", source.root);
+    for (var sourceIndex = 0; sourceIndex < source.files.length; sourceIndex += 1) {
+      argv.push("--source-file", source.files[sourceIndex]);
+    }
+  }
   return {
     root: workerEvidence.task_worktree_path,
     expected_base: scope.base_commit,
     allowed_paths: scope.write_paths.slice(),
     text_files: scope.write_paths.slice(),
+    source: source,
     // Execute only `argv` directly. `command` is display-only shell quoting,
     // never a string to pass through a shell.
     argv: argv,
@@ -2347,13 +2443,73 @@ function validateInspection(report, request, scope, state) {
       allowed: true
     });
   }
+  var source = null;
+  if (request.source !== undefined) {
+    source = validateSourceInspection(report.source, request.source, scope.base_commit, state);
+  }
   return {
     root: request.root,
     expected_base: request.expected_base,
     head_commit: report.head_commit,
     changed_paths: changedPaths,
-    files: physicalFiles
+    files: physicalFiles,
+    source: source
   };
+}
+
+function validateSourceInspection(source, request, base, state) {
+  if (!isPlainObject(source) || source.root !== request.root || source.expected_base !== base ||
+      typeof source.ok !== "boolean") {
+    incomplete("source_inspection_invalid", "source inspection identity is missing or mismatched", state);
+  }
+  if (!source.ok) {
+    incomplete("source_inspection_refused", "requested source evidence was unavailable", state);
+  }
+  if (typeof source.head_commit !== "string" || !/^[0-9a-f]{40}$/.test(source.head_commit) ||
+      typeof source.base_tree !== "string" || !/^[0-9a-f]{40}$/.test(source.base_tree) ||
+      !Array.isArray(source.changed_paths) || !Array.isArray(source.files) ||
+      typeof source.clean_at_base !== "boolean" ||
+      source.clean_at_base !== (source.head_commit === base && source.changed_paths.length === 0 &&
+        source.files.every(function (file) { return isPlainObject(file) && file.matches_base === true; })) ||
+      source.files.length !== request.files.length) {
+    incomplete("source_inspection_invalid", "source inspection evidence is incomplete", state);
+  }
+  var seen = Object.create(null);
+  for (var changeIndex = 0; changeIndex < source.changed_paths.length; changeIndex += 1) {
+    var change = source.changed_paths[changeIndex];
+    if (!isPlainObject(change) || typeof change.path !== "string" || !change.path || seen[change.path] ||
+        !Array.isArray(change.change_kinds) || change.change_kinds.length === 0 ||
+        !change.change_kinds.every(function (kind) {
+          return ["added", "modified", "deleted", "type_changed", "untracked", "ignored"].indexOf(kind) !== -1;
+        }) || typeof change.staged !== "boolean" || typeof change.unstaged !== "boolean" ||
+        typeof change.untracked !== "boolean" || typeof change.ignored !== "boolean" || change.allowed !== false) {
+      incomplete("source_inspection_invalid", "source changed-path evidence is malformed", state);
+    }
+    seen[change.path] = true;
+  }
+  for (var index = 0; index < source.files.length; index += 1) {
+    var file = source.files[index];
+    if (!isPlainObject(file) || file.path !== request.files[index] ||
+        typeof file.sha256 !== "string" || !/^[0-9a-f]{64}$/.test(file.sha256) ||
+        typeof file.base_sha256 !== "string" || !/^[0-9a-f]{64}$/.test(file.base_sha256) ||
+        typeof file.matches_base !== "boolean" || file.matches_base !== (file.sha256 === file.base_sha256)) {
+      incomplete("source_inspection_invalid", "source file evidence is inconsistent", state);
+    }
+    if (!file.matches_base) {
+      incomplete("source_file_mismatch", "requested source file differs from the frozen base", state);
+    }
+  }
+  return source;
+}
+
+function validateRetainedSource(report, request) {
+  var state = {};
+  if (!isPlainObject(report.physical)) throw new Error("retained source inspection missing");
+  try {
+    validateSourceInspection(report.physical.source, request, report.scope.base_commit, state);
+  } catch (_error) {
+    throw new Error("retained source evidence conflicts with requested source scope; reconcile without retry");
+  }
 }
 
 function unwrapEnvelope(raw, label) {

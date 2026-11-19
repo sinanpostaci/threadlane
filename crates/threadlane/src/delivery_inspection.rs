@@ -406,6 +406,48 @@ pub struct DeliveryInspectionReport {
     pub untrusted_data: bool,
     /// True when detailed changed/file evidence was omitted to honor the output budget.
     pub output_omitted: bool,
+    /// Optional separately observed source checkout; never an acceptance decision.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<SourceInspection>,
+}
+
+/// Physical comparison of one explicitly requested source file with the frozen Git base.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceFileInspection {
+    /// Exact repository-relative file path.
+    pub path: String,
+    /// SHA-256 of the current regular file's exact bytes.
+    pub sha256: String,
+    /// SHA-256 of the regular file's exact blob bytes at the frozen base.
+    pub base_sha256: String,
+    /// Whether the observed bytes match the frozen base.
+    pub matches_base: bool,
+}
+
+/// Bounded source checkout facts. A failed observation never means the source matched.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceInspection {
+    /// True only when all requested evidence was observed stably.
+    pub ok: bool,
+    /// Fixed refusal code when the source observation could not be completed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refusal_code: Option<DeliveryInspectionRefusalCode>,
+    /// Canonical source root requested by the caller.
+    pub root: String,
+    /// Frozen base used to compare source facts.
+    pub expected_base: String,
+    /// Observed source HEAD.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub head_commit: Option<String>,
+    /// Tree ID of the frozen base.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_tree: Option<String>,
+    /// Complete bounded set of tracked, untracked and ignored changes.
+    pub changed_paths: Vec<DeliveryChangedPath>,
+    /// True only for an observed base HEAD with no changed, untracked or ignored paths.
+    pub clean_at_base: bool,
+    /// Exact byte comparisons for explicitly named regular files.
+    pub files: Vec<SourceFileInspection>,
 }
 
 /// Performs one bounded physical inspection with the default production limits.
@@ -441,6 +483,7 @@ pub fn inspect_delivery_with_limits(
         text_included: false,
         untrusted_data: false,
         output_omitted: false,
+        source: None,
     };
 
     let mut failure = match validate_limits(limits) {
@@ -474,6 +517,243 @@ pub fn inspect_delivery_with_limits(
     }
 
     enforce_output_limit(report, limits.max_output_bytes)
+}
+
+/// Adds a bounded source observation to the same physical inspection invocation.
+/// The source may be dirty; callers decide whether its facts meet their own task.
+pub fn inspect_delivery_with_source(
+    request: &DeliveryInspectionRequest,
+    source_root: &Path,
+    source_files: &[String],
+) -> DeliveryInspectionReport {
+    inspect_delivery_with_source_and_limits(
+        request,
+        source_root,
+        source_files,
+        &DeliveryInspectionLimits::default(),
+    )
+}
+
+/// Inspects the task and source under one shared deadline, byte and output budget.
+pub fn inspect_delivery_with_source_and_limits(
+    request: &DeliveryInspectionRequest,
+    source_root: &Path,
+    source_files: &[String],
+    limits: &DeliveryInspectionLimits,
+) -> DeliveryInspectionReport {
+    let started = Instant::now();
+    let mut report = inspect_delivery_with_limits(request, limits);
+    if report.ok {
+        let task_bytes = report.files.iter().filter_map(|file| file.size_bytes).sum();
+        report.source = Some(inspect_source(
+            request,
+            source_root,
+            source_files,
+            limits,
+            started,
+            task_bytes,
+        ));
+        if report.source.as_ref().is_some_and(|source| !source.ok) {
+            report.ok = false;
+            report.refusal_code = report
+                .source
+                .as_ref()
+                .and_then(|source| source.refusal_code);
+            report.message =
+                "source inspection refused; requested evidence is unavailable".to_string();
+            omit_unstable_text(&mut report.files);
+            report.text_included = false;
+            report.untrusted_data = false;
+        }
+    }
+    enforce_output_limit(report, limits.max_output_bytes)
+}
+
+fn inspect_source(
+    task: &DeliveryInspectionRequest,
+    root: &Path,
+    files: &[String],
+    limits: &DeliveryInspectionLimits,
+    started: Instant,
+    task_bytes: u64,
+) -> SourceInspection {
+    let mut report = SourceInspection {
+        ok: false,
+        refusal_code: None,
+        root: truncate_report_field(&root.to_string_lossy(), 4096).to_string(),
+        expected_base: task.expected_base.clone(),
+        head_commit: None,
+        base_tree: None,
+        changed_paths: Vec::new(),
+        clean_at_base: false,
+        files: Vec::new(),
+    };
+    let result = inspect_source_inner(task, root, files, limits, started, task_bytes);
+    match result {
+        Ok((head, tree, changes, inspected)) => {
+            report.clean_at_base = head == task.expected_base
+                && changes.is_empty()
+                && inspected.iter().all(|file| file.matches_base);
+            report.head_commit = Some(head);
+            report.base_tree = Some(tree);
+            report.changed_paths = changes;
+            report.files = inspected;
+            report.ok = true;
+        }
+        Err(failure) => report.refusal_code = Some(failure.code),
+    }
+    report
+}
+
+fn inspect_source_inner(
+    task: &DeliveryInspectionRequest,
+    root: &Path,
+    files: &[String],
+    limits: &DeliveryInspectionLimits,
+    started: Instant,
+    task_bytes: u64,
+) -> Result<
+    (
+        String,
+        String,
+        Vec<DeliveryChangedPath>,
+        Vec<SourceFileInspection>,
+    ),
+    InspectionFailure,
+> {
+    if root == task.root {
+        return Err(InspectionFailure::new(
+            DeliveryInspectionRefusalCode::InvalidRoot,
+        ));
+    }
+    let source = validate_request(
+        &DeliveryInspectionRequest {
+            root: root.to_path_buf(),
+            expected_base: task.expected_base.clone(),
+            allowed_paths: files.to_vec(),
+            text_files: Vec::new(),
+        },
+        limits,
+    )?;
+    if read_worktree_top_level(&source.root, limits, started)? != source.root {
+        return Err(InspectionFailure::new(
+            DeliveryInspectionRefusalCode::RootNotWorktree,
+        ));
+    }
+    if resolve_git_commit(&source.root, &source.expected_base, limits, started, true)?
+        != source.expected_base
+    {
+        return Err(InspectionFailure::new(
+            DeliveryInspectionRefusalCode::UnknownBase,
+        ));
+    }
+    let tree_spec = format!("{}^{{tree}}", source.expected_base);
+    let tree_bytes = run_git_bytes(
+        &source.root,
+        &["rev-parse", "--verify", &tree_spec],
+        limits,
+        started,
+    )?;
+    let tree_text = std::str::from_utf8(&tree_bytes)
+        .map_err(|_| InspectionFailure::new(DeliveryInspectionRefusalCode::MalformedGitOutput))?;
+    let tree = validate_exact_40_hex_sha(tree_text.trim(), "base tree")
+        .map_err(|_| InspectionFailure::new(DeliveryInspectionRefusalCode::MalformedGitOutput))?;
+    let first = capture_snapshot(&source.root, &source.expected_base, limits, started)?;
+    let mut inspected = Vec::new();
+    let mut observations = Vec::new();
+    let mut total_read = task_bytes;
+    let mut total_text = 0;
+    for path in &source.allowed_paths {
+        let (current, failure) = inspect_file(
+            &source.root,
+            path,
+            first.changes.get(path),
+            false,
+            limits,
+            started,
+            &mut total_read,
+            &mut total_text,
+            &mut observations,
+        );
+        if let Some(failure) = failure {
+            return Err(failure);
+        }
+        let actual = current.sha256.ok_or_else(|| {
+            InspectionFailure::at(DeliveryInspectionRefusalCode::FileReadFailed, path)
+        })?;
+        // `ls-tree` proves the exact base entry is a regular file, not a symlink or tree.
+        let literal = format!(":(literal){path}");
+        let entry = run_git_bytes(
+            &source.root,
+            &["ls-tree", "-z", &source.expected_base, "--", &literal],
+            limits,
+            started,
+        )?;
+        let entry_text = std::str::from_utf8(&entry).map_err(|_| {
+            InspectionFailure::new(DeliveryInspectionRefusalCode::MalformedGitOutput)
+        })?;
+        let (metadata, name) = entry_text
+            .strip_suffix('\0')
+            .and_then(|s| s.split_once('\t'))
+            .ok_or_else(|| {
+                InspectionFailure::at(DeliveryInspectionRefusalCode::FileReadFailed, path)
+            })?;
+        let mut fields = metadata.split(' ');
+        let mode = fields.next();
+        let kind = fields.next();
+        let oid = fields.next();
+        if !matches!(mode, Some("100644" | "100755"))
+            || kind != Some("blob")
+            || fields.next().is_some()
+            || name != path
+        {
+            return Err(InspectionFailure::at(
+                DeliveryInspectionRefusalCode::FileReadFailed,
+                path,
+            ));
+        }
+        let oid =
+            validate_exact_40_hex_sha(oid.unwrap_or_default(), "base blob").map_err(|_| {
+                InspectionFailure::new(DeliveryInspectionRefusalCode::MalformedGitOutput)
+            })?;
+        let size_bytes = run_git_bytes(&source.root, &["cat-file", "-s", &oid], limits, started)?;
+        let size = std::str::from_utf8(&size_bytes)
+            .ok()
+            .and_then(|text| text.trim().parse::<u64>().ok())
+            .ok_or_else(|| {
+                InspectionFailure::new(DeliveryInspectionRefusalCode::MalformedGitOutput)
+            })?;
+        total_read = total_read
+            .checked_add(size)
+            .filter(|size| *size <= limits.max_total_read_bytes)
+            .ok_or_else(|| InspectionFailure::new(DeliveryInspectionRefusalCode::ReadLimit))?;
+        if size > limits.max_git_output_bytes as u64 {
+            return Err(InspectionFailure::new(
+                DeliveryInspectionRefusalCode::GitOutputLimit,
+            ));
+        }
+        let bytes = run_git_bytes(&source.root, &["cat-file", "blob", &oid], limits, started)?;
+        if bytes.len() as u64 != size {
+            return Err(InspectionFailure::new(
+                DeliveryInspectionRefusalCode::ChangingRead,
+            ));
+        }
+        let base = sha256_hex(&bytes);
+        inspected.push(SourceFileInspection {
+            path: path.clone(),
+            matches_base: actual == base,
+            sha256: actual,
+            base_sha256: base,
+        });
+    }
+    if capture_snapshot(&source.root, &source.expected_base, limits, started)? != first {
+        return Err(InspectionFailure::new(
+            DeliveryInspectionRefusalCode::ChangingRead,
+        ));
+    }
+    revalidate_observations(&source.root, &observations, limits, started)?;
+    let changes = changed_paths(&first.changes, &BTreeSet::new());
+    Ok((first.head, tree, changes, inspected))
 }
 
 #[derive(Debug)]
@@ -2048,6 +2328,7 @@ fn enforce_output_limit(
         text_included: false,
         untrusted_data: false,
         output_omitted,
+        source: None,
     };
 
     let bounded = build(

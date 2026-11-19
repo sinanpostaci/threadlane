@@ -8,7 +8,8 @@ use std::time::Duration;
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use threadlane::delivery_inspection::{
-    inspect_delivery, inspect_delivery_with_limits, DeliveryChangeKind, DeliveryFileInspection,
+    inspect_delivery, inspect_delivery_with_limits, inspect_delivery_with_source,
+    inspect_delivery_with_source_and_limits, DeliveryChangeKind, DeliveryFileInspection,
     DeliveryFilePhysicalCode, DeliveryInspectionLimits, DeliveryInspectionRefusalCode,
     DeliveryInspectionReport, DeliveryInspectionRequest, DeliveryTextStatus,
 };
@@ -122,6 +123,130 @@ fn add_executable_bits(path: &Path) {
     let mut permissions = fs::metadata(path).expect("read permissions").permissions();
     permissions.set_mode(permissions.mode() | 0o111);
     fs::set_permissions(path, permissions).expect("set executable bits");
+}
+
+#[test]
+fn source_evidence_compares_named_bytes_and_reports_dirty_and_stale_roots() {
+    let fixture = Fixture::new();
+    let worker_root = fixture._tmp.path().join("worker");
+    let worker_arg = worker_root.to_str().unwrap();
+    git(
+        &fixture.root,
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "--detach",
+            worker_arg,
+            &fixture.base,
+        ],
+    );
+    fs::write(worker_root.join("src/lib.rs"), "worker delivery\n").unwrap();
+    let mut request = fixture.request(&["src/lib.rs"], &["src/lib.rs"]);
+    request.root = worker_root;
+    let source_files = vec!["src/lib.rs".to_string(), "src/unchanged.rs".to_string()];
+
+    let report = inspect_delivery_with_source(&request, &fixture.root, &source_files);
+    assert!(report.ok, "task evidence: {report:?}");
+    let source = report.source.unwrap();
+    assert!(
+        source.ok && source.clean_at_base,
+        "source evidence: {source:?}"
+    );
+    assert_eq!(source.head_commit.as_deref(), Some(fixture.base.as_str()));
+    assert_eq!(
+        source.base_tree.as_deref(),
+        Some(git(&fixture.root, &["rev-parse", "HEAD^{tree}"]).trim())
+    );
+    assert!(source.changed_paths.is_empty());
+    assert_eq!(source.files.len(), 2);
+    assert_eq!(
+        source.files[0].sha256,
+        sha256_hex(b"pub fn alpha() -> u32 { 1 }\n")
+    );
+    assert!(source
+        .files
+        .iter()
+        .all(|file| file.matches_base && file.sha256 == file.base_sha256));
+
+    fixture.write("src/unchanged.rs", b"changed after start\n");
+    fixture.write("ignored.log", b"ignored addition");
+    let changed = inspect_delivery_with_source(&request, &fixture.root, &source_files)
+        .source
+        .unwrap();
+    assert!(changed.ok && !changed.clean_at_base);
+    assert!(!changed.files[1].matches_base);
+    assert_eq!(
+        changed.files[1].sha256,
+        sha256_hex(b"changed after start\n")
+    );
+    assert!(changed
+        .changed_paths
+        .iter()
+        .any(|entry| entry.path == "src/unchanged.rs"));
+    assert!(changed
+        .changed_paths
+        .iter()
+        .any(|entry| entry.path == "ignored.log" && entry.ignored));
+
+    fixture.commit_all("source head moved");
+    let stale = inspect_delivery_with_source(&request, &fixture.root, &source_files)
+        .source
+        .unwrap();
+    assert!(stale.ok && !stale.clean_at_base);
+    assert_ne!(stale.head_commit.as_deref(), Some(fixture.base.as_str()));
+    assert!(!stale.files[1].matches_base);
+
+    let same = inspect_delivery_with_source(&request, &request.root, &source_files);
+    assert!(!same.ok);
+    let same = same.source.unwrap();
+    assert!(!same.ok);
+    assert_eq!(
+        same.refusal_code,
+        Some(DeliveryInspectionRefusalCode::InvalidRoot)
+    );
+    assert!(!same.clean_at_base && same.files.is_empty());
+}
+
+#[test]
+fn source_and_task_share_the_total_read_budget() {
+    let fixture = Fixture::new();
+    let worker_root = fixture._tmp.path().join("worker");
+    git(
+        &fixture.root,
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "--detach",
+            worker_root.to_str().unwrap(),
+            &fixture.base,
+        ],
+    );
+    let task_text = b"delivered\n";
+    fs::write(worker_root.join("src/lib.rs"), task_text).unwrap();
+    let mut request = fixture.request(&["src/lib.rs"], &["src/lib.rs"]);
+    request.root = worker_root;
+    let source_size = fs::metadata(fixture.root.join("src/unchanged.rs"))
+        .unwrap()
+        .len();
+    let limits = DeliveryInspectionLimits {
+        max_total_read_bytes: task_text.len() as u64 + source_size * 2 - 1,
+        ..DeliveryInspectionLimits::default()
+    };
+    let report = inspect_delivery_with_source_and_limits(
+        &request,
+        &fixture.root,
+        &["src/unchanged.rs".to_string()],
+        &limits,
+    );
+    assert!(!report.ok);
+    let source = report.source.unwrap();
+    assert!(!source.ok && !source.clean_at_base && source.files.is_empty());
+    assert_eq!(
+        source.refusal_code,
+        Some(DeliveryInspectionRefusalCode::ReadLimit)
+    );
 }
 
 #[test]

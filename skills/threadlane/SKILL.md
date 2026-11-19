@@ -5,7 +5,7 @@ description: "Work through Threadlane in the current Codex conversation: shape r
 
 # Threadlane
 
-Version: `2026-11-19.v1`.
+Version: `2026-11-19.v2`.
 
 Act as the user's Coworker in the native Codex conversation. The human selects
 your model in Codex; Threadlane profiles select execution roles. Infer whether
@@ -250,12 +250,12 @@ complete/reject. No fixed wall-clock guarantee follows from client-tagged reason
 physical/MCP time. Use the current guide’s template version and source digest to verify `threadlane closure-template` from the
 trusted offline packaged CLI (not a prerequisite file in `~/.agents`; offline
 JSON with source SHA-256 and a pure JavaScript factory, distinct closure version
-`2026-11-19.v1`); once source and SHA-256 are verified, do not repeat
+`2026-11-19.v2`); once source and SHA-256 are verified, do not repeat
 declaration, repo, or global-skill searches. Create the storage-only `worker`
 backlog item first with `backlog_create` (creation grants no authority),
 prepare and retain its serializable capsule before `backlog_worker_start`, evaluate only
-that trusted source in a fresh isolate, and use the small `createOrdinaryClosureClient`
-helper around the preserved `read`/`doneView` core. For a notice, copy the live guide
+that trusted source in a fresh isolate, and use the packaged `createOrdinaryNativeClient`
+adapter around the preserved `read`/`doneView` core. For a notice, copy the live guide
 callback with the actual ID, verified paired `cli_package`, and live guide source
 digest. `readNotice` verifies the packaged source and scoped original execution,
 recovers absent state and refuses conflicting cache. `readStored()` remains available
@@ -264,6 +264,11 @@ evidence/report/correlation private, and return a compact view with current iden
 technical guard facts, verified event counts/ACK cursor, untrusted frozen acceptance
 criteria, exact physical text, and immutable `read_id`. Pass that exact `read_id` in
 `ACCEPTANCE_CONTEXT` so completion uses the report that was semantically reviewed.
+When source preservation is requested, bind `NOTICE_SOURCE_OPTIONS` with the exact
+source files; compare the returned bounded source evidence against the known original
+state before accepting. The scoped approval supplies the source root. Missing or failed
+source evidence is not proof, including on cold recovery. Omit the option for ordinary
+tasks without that requirement; no clean-checkout assumption is imposed on them.
 Its `completeStored(ACCEPTANCE_CONTEXT)` moves all current correlation/revision/ref/digest
 checks before one guarded complete, retains completion intent and the exact receipt, and
 reuses only a matching validated retained Done; missing, error, or unknown replies never

@@ -4,13 +4,13 @@ const input = load("threadlane/approved-task-context.json");
 if (!input) throw new Error("missing or changed retained context/start/binding; use original-receipt fallback");
 const template = load("threadlane/closure-template.json");
 if (!template || template.tool !== "threadlane closure-template" ||
-    template.version !== "2026-11-19.v1" ||
+    template.version !== "2026-11-19.v2" ||
     template.source_path !== "skills/threadlane/references/ordinary-closure.js" ||
     template.factory_name !== "createOrdinaryClosure" ||
     !/^[0-9a-f]{64}$/.test(template.source_sha256) ||
     template.source_sha256 !== input.expected_source_sha256 ||
     typeof template.javascript !== "string" ||
-    template.javascript.indexOf('var CREATE_ORDINARY_CLOSURE_VERSION = "2026-11-19.v1";') === -1) {
+    template.javascript.indexOf('var CREATE_ORDINARY_CLOSURE_VERSION = "2026-11-19.v2";') === -1) {
   throw new Error("invalid closure capsule");
 }
 const createOrdinaryClosureClient = new Function(template.javascript + "\nreturn createOrdinaryClosureClient;")();

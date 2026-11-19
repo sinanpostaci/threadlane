@@ -7,7 +7,9 @@ use clap::{Parser, Subcommand};
 use crate::client::{ScopedClient, SupervisorClient};
 use crate::closure_template::render_closure_template_json;
 use crate::codex::{CodexWakeupConfig, DEFAULT_CODEX_TIMEOUT_MS};
-use crate::delivery_inspection::{inspect_delivery, DeliveryInspectionRequest};
+use crate::delivery_inspection::{
+    inspect_delivery, inspect_delivery_with_source, DeliveryInspectionRequest,
+};
 use crate::error::Error;
 use crate::mcp::{ThreadlaneMcpServer, OPERATING_GUIDE_MARKDOWN};
 use crate::protocol::ScopedRequest;
@@ -156,6 +158,14 @@ pub enum Subcommands {
         /// Exact allowed repository-relative small UTF-8 file whose contents are included (repeatable).
         #[arg(long = "text-file", alias = "text")]
         text_files: Vec<String>,
+
+        /// Frozen approval repository root to observe alongside the task checkout.
+        #[arg(long = "source-root")]
+        source_root: Option<PathBuf>,
+
+        /// Exact source file to compare with its frozen base blob (repeatable).
+        #[arg(long = "source-file", requires = "source_root")]
+        source_files: Vec<String>,
     },
 
     /// Print the opt-in ordinary Worker callback closure template as offline JSON.
@@ -337,6 +347,8 @@ pub async fn run_cli(cli: Cli) -> Result<(), Error> {
             expected_base,
             allowed_paths,
             text_files,
+            source_root,
+            source_files,
         } => {
             let request = DeliveryInspectionRequest {
                 root,
@@ -344,7 +356,10 @@ pub async fn run_cli(cli: Cli) -> Result<(), Error> {
                 allowed_paths,
                 text_files,
             };
-            let report = inspect_delivery(&request);
+            let report = match source_root {
+                Some(root) => inspect_delivery_with_source(&request, &root, &source_files),
+                None => inspect_delivery(&request),
+            };
             println!("{}", serde_json::to_string(&report)?);
             if report.ok {
                 Ok(())
@@ -430,6 +445,7 @@ mod tests {
                 expected_base,
                 allowed_paths,
                 text_files,
+                ..
             } => {
                 assert_eq!(root, std::path::PathBuf::from("/tmp/actual-task-root"));
                 assert_eq!(expected_base, "0123456789abcdef0123456789abcdef01234567");

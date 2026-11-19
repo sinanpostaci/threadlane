@@ -655,13 +655,18 @@ async fn worker_notice_observation_correlates_only_successful_scoped_receipts() 
     let before_history = get_history(&mcp, &item_id).await;
     let before_batches = event_batch_row_count(&fixture.state_dir, &fixture.binding_a);
 
-    mcp.invoke_tool_json(
-        "backlog_worker_notice_context",
-        json!({"approval_id": approval.approval_id}),
-        None,
-    )
-    .await
-    .expect("scoped notice recovery");
+    let notice = mcp
+        .invoke_tool_json(
+            "backlog_worker_notice_context",
+            json!({"approval_id": approval.approval_id}),
+            None,
+        )
+        .await
+        .expect("scoped notice recovery");
+    assert_eq!(
+        notice.structured_content.unwrap()["data"]["scope"]["repository_path"],
+        authority.repository_path.to_string_lossy().as_ref()
+    );
     let denied = foreign
         .invoke_tool_json(
             "backlog_worker_notice_context",

@@ -160,6 +160,8 @@ pub struct WorkerBacklogItemSnapshot {
 /// Frozen approval/task facts needed for independent delivery inspection.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerBacklogNoticeScope {
+    /// Canonical repository path frozen in the scoped approval record.
+    pub repository_path: PathBuf,
     /// Approved repository base commit.
     pub base_commit: String,
     /// Frozen requested model.
@@ -591,6 +593,7 @@ impl WorkerBacklogService {
             },
             execution: snapshot.execution,
             scope: WorkerBacklogNoticeScope {
+                repository_path: record.repository_path.clone(),
                 base_commit: record.base_commit.clone(),
                 requested_model: task.base_model.clone(),
                 requested_effort: effort,

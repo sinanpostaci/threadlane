@@ -1,6 +1,6 @@
 # Ordinary Worker callback closure template
 
-Version: `2026-11-19.v1`.
+Version: `2026-11-19.v2`.
 
 Use this audited client composition for an ordinary approved-task
 callback. The read-only `backlog_worker_notice_context` supplies the original
@@ -28,8 +28,12 @@ verified package bootstrap. It has no unrestricted
 tools, ambient filesystem, network, environment, subprocess, dynamic loading, or
 evaluation access. After verified Done, real late batches and ACKs retain their
 own evidence under `threadlane/closure-after-done/<execution_ref>/<batch_id>/`.
-It exposes `readNotice(actualApprovalId)`, original-execution recovery via `readStored()`, and `completeStored(acceptance)`;
+It exposes `readNotice(actualApprovalId, options)`, original-execution recovery via `readStored()`, and `completeStored(acceptance)`;
 it has no start, reject, or automatic acceptance operation.
+
+The packaged `createOrdinaryNativeClient` supplies the standard functions.exec adapters
+and checks the exact packaged source hash and package pins; it delegates to the same
+guarded client and requires the returned immutable `read_id` for completion.
 
 ## functions.exec recipe
 
@@ -84,7 +88,7 @@ if (result.exit_code !== 0 || result.session_id ||
     typeof result.output !== "string") throw new Error("canonical closure-template failed");
 const template = JSON.parse(result.output);
 if (template.schema_version !== 1 || template.tool !== "threadlane closure-template" ||
-    template.version !== "2026-11-19.v1" ||
+    template.version !== "2026-11-19.v2" ||
     template.source_path !== "skills/threadlane/references/ordinary-closure.js" ||
     template.factory_name !== "createOrdinaryClosure" ||
     template.source_sha256 !== input.expected_source_sha256 ||
@@ -110,32 +114,37 @@ never evaluate event, provider, notification, or other file text. The helper
 matches the scoped original record and every existing retained value before any
 effect. Text only the compact view:
 
+If source preservation was requested, bind `NOTICE_SOURCE_OPTIONS` to an object with
+`source_files` listing the exact source files to compare with the frozen base. An
+explicit empty list requests root/HEAD/tree/changed-path evidence without file reads.
+The source root comes from the binding-scoped approval, not the Worker. The task and
+source use the same bounded inspector invocation. `physical.source` includes `ok`,
+`root`, `expected_base`, `head_commit`, `base_tree`, `changed_paths`, `clean_at_base`,
+and named files with `sha256`, `base_sha256`, and `matches_base`. Unavailable evidence
+or a named mismatch refuses the read. A source that was independently known clean at
+the approved base can be checked using `clean_at_base` and named file matches; otherwise
+compare the returned facts against the actual known starting state. This does not
+require unrelated projects to be clean or establish a missing original baseline. If a
+named preserved file differed from the frozen base at start, use a separate bounded
+before/after check against its pinned original baseline; this helper compares with base
+bytes only. If no
+source inspection is requested, omit the option and `physical.source` is null. Supply
+the same option during recovery; never infer a missing requested check succeeded.
+
 ```js
-// Bind the notice ID and verified package/guide pins.
-if (!/^apr_[0-9a-f]{32}$/.test(NOTICE_APPROVAL_ID) || typeof NOTICE_CLI_PACKAGE !== "string" ||
-    NOTICE_CLI_PACKAGE[0] !== "/" || !/^[0-9a-f]{64}$/.test(NOTICE_SOURCE_SHA256)) throw new Error("invalid notice context");
-const binary = NOTICE_CLI_PACKAGE + "/bin/threadlane";
-const quote = (value) => "'" + String(value).replace(/'/g, "'\\''") + "'";
-const fetched = await tools.exec_command({cmd: quote(binary) + " 'closure-template'", max_output_tokens: 40000, yield_time_ms: 30000});
-if (fetched.exit_code !== 0 || fetched.session_id || fetched.output_truncated === true ||
-    fetched.truncated === true || typeof fetched.output !== "string") throw new Error("canonical closure-template failed");
-const template = JSON.parse(fetched.output);
-if (template.schema_version !== 1 || template.tool !== "threadlane closure-template" || template.version !== "2026-11-19.v1" ||
-    template.source_path !== "skills/threadlane/references/ordinary-closure.js" ||
-    template.factory_name !== "createOrdinaryClosure" ||
-    template.source_sha256 !== NOTICE_SOURCE_SHA256 ||
-    typeof template.javascript !== "string" || !template.javascript.includes('var CREATE_ORDINARY_CLOSURE_VERSION = "2026-11-19.v1";')) throw new Error("invalid closure capsule");
-const createOrdinaryClosureClient = new Function(template.javascript + "\nreturn createOrdinaryClosureClient;")();
-const client = createOrdinaryClosureClient({
-  load: (key) => load(key), store: (key, value) => store(key, value),
-  bootstrap: {binary, expected_source_sha256: NOTICE_SOURCE_SHA256, template},
-  recover: (a) => tools.mcp__threadlane__backlog_worker_notice_context(a),
-  pull: (a) => tools.mcp__threadlane__approved_pull_events(a),
-  ack: (a) => tools.mcp__threadlane__approved_ack_events(a),
-  result: (a) => tools.mcp__threadlane__backlog_worker_result(a),
-  inspect: (r) => tools.exec_command({cmd: r.argv.map(quote).join(" "), max_output_tokens: 16000, yield_time_ms: 30000}),
-});
-text(JSON.stringify(await client.readNotice(NOTICE_APPROVAL_ID)));
+// Bind the actual notice and verified paired package/guide pins. Set NOTICE_SOURCE_OPTIONS
+// only when source preservation is requested, e.g. {source_files: ["SPEC.md", "STATUS.txt"]}.
+const pins = {cli_package: NOTICE_CLI_PACKAGE, source_sha256: NOTICE_SOURCE_SHA256};
+if (typeof pins.cli_package !== "string" || pins.cli_package[0] !== "/" ||
+    !/^[0-9a-f]{64}$/.test(pins.source_sha256)) throw new Error("invalid package pins");
+const quote = (v) => "'" + String(v).replace(/'/g, "'\\''") + "'";
+const result = await tools.exec_command({cmd: quote(pins.cli_package + "/bin/threadlane") + " 'closure-template'", max_output_tokens: 40000, yield_time_ms: 30000});
+if (result.exit_code !== 0 || result.session_id || result.output_truncated || result.truncated || typeof result.output !== "string") throw new Error("canonical closure-template failed");
+const template = JSON.parse(result.output);
+if (template.schema_version !== 1 || template.tool !== "threadlane closure-template" || template.version !== "2026-11-19.v2" || template.source_path !== "skills/threadlane/references/ordinary-closure.js" || template.factory_name !== "createOrdinaryClosure" || template.source_sha256 !== pins.source_sha256 || typeof template.javascript !== "string") throw new Error("invalid canonical capsule");
+const createOrdinaryNativeClient = new Function(template.javascript + "\nreturn createOrdinaryNativeClient;")();
+const client = createOrdinaryNativeClient({tools, load, store, template, ...pins});
+text(JSON.stringify(await client.readNotice(NOTICE_APPROVAL_ID, typeof NOTICE_SOURCE_OPTIONS === "undefined" ? undefined : NOTICE_SOURCE_OPTIONS)));
 ```
 
 `readNotice()` with scoped recovery restores absent temporary values from the
@@ -274,32 +283,15 @@ below in a new isolate after that separate decision:
 ```js
 // functions.exec complete: bind the separate semantic acceptance decision.
 const acceptance = ACCEPTANCE_CONTEXT;
-const input = load("threadlane/approved-task-context.json");
-if (!input || !acceptance || typeof acceptance.cli_package !== "string" ||
-    acceptance.cli_package[0] !== "/" || input.binary !== acceptance.cli_package + "/bin/threadlane" ||
-    acceptance.source_sha256 !== input.expected_source_sha256) throw new Error("invalid acceptance package pins");
-let template = load("threadlane/closure-template.json");
-const quote = (value) => "'" + String(value).replace(/'/g, "'\\''") + "'";
-const fetched = await tools.exec_command({cmd: quote(input.binary) + " 'closure-template'", max_output_tokens: 40000, yield_time_ms: 30000});
-if (fetched.exit_code !== 0 || fetched.session_id || fetched.output_truncated === true ||
-    fetched.truncated === true || typeof fetched.output !== "string") throw new Error("canonical closure-template failed");
-const canonical = JSON.parse(fetched.output);
-if (canonical.schema_version !== 1 || canonical.tool !== "threadlane closure-template" ||
-    canonical.version !== "2026-11-19.v1" || canonical.source_path !== "skills/threadlane/references/ordinary-closure.js" ||
-    canonical.factory_name !== "createOrdinaryClosure" || !/^[0-9a-f]{64}$/.test(acceptance.source_sha256) ||
-    canonical.source_sha256 !== acceptance.source_sha256 || typeof canonical.javascript !== "string") throw new Error("invalid canonical capsule");
-if (template == null) { template = canonical; await store("threadlane/closure-template.json", template); }
-if (canonical.javascript !== template.javascript) throw new Error("retained source conflicts with canonical package");
-const createOrdinaryClosureClient = new Function(template.javascript + "\nreturn createOrdinaryClosureClient;")();
-const unused = () => { throw new Error("callback not used"); };
-const client = createOrdinaryClosureClient({
-  load: (key) => load(key), store: (key, value) => store(key, value),
-  pull: unused, ack: unused, result: unused, inspect: unused,
-  complete: (a) => tools.mcp__threadlane__backlog_worker_complete(a),
-});
-const view = await client.completeStored(acceptance);
-const result = view.status === 'done' ? { ...view, final_summary: acceptance.acceptance_note } : view;
-text(JSON.stringify(result));
+if (!acceptance || typeof acceptance.cli_package !== "string" || acceptance.cli_package[0] !== "/" || !/^[0-9a-f]{64}$/.test(acceptance.source_sha256)) throw new Error("invalid package pins");
+const quote = (v) => "'" + String(v).replace(/'/g, "'\\''") + "'";
+const result = await tools.exec_command({cmd: quote(acceptance.cli_package + "/bin/threadlane") + " 'closure-template'", max_output_tokens: 40000, yield_time_ms: 30000});
+if (result.exit_code !== 0 || result.session_id || result.output_truncated || result.truncated || typeof result.output !== "string") throw new Error("canonical closure-template failed");
+const template = JSON.parse(result.output);
+if (template.schema_version !== 1 || template.tool !== "threadlane closure-template" || template.version !== "2026-11-19.v2" || template.source_path !== "skills/threadlane/references/ordinary-closure.js" || template.factory_name !== "createOrdinaryClosure" || template.source_sha256 !== acceptance.source_sha256 || typeof template.javascript !== "string") throw new Error("invalid canonical capsule");
+const createOrdinaryNativeClient = new Function(template.javascript + "\nreturn createOrdinaryNativeClient;")();
+const client = createOrdinaryNativeClient({tools, load, store, template, cli_package: acceptance.cli_package, source_sha256: acceptance.source_sha256});
+text(JSON.stringify(await client.complete(acceptance)));
 ```
 
 `completeStored` first validates the explicit semantic object, then loads the

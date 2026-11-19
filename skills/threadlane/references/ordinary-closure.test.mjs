@@ -1279,15 +1279,16 @@ test("read exposes no start, acceptance, or completion capability", () => {
   assert.equal(harness.closure.complete, undefined);
   assert.equal(harness.closure.reject, undefined);
   assert.equal(harness.closure.accept, undefined);
-  // `doneView` may name the completion tool to validate a receipt, but the
-  // template must not call any start, completion, or rejection operation.
+  // The core reader and state client cannot directly call completion. The
+  // native adapter alone injects the guarded completion callback separately.
+  const coreSource = source.split("function createOrdinaryNativeClient(")[0];
   for (const forbidden of [
     "backlog_worker_complete(",
     "backlog_worker_reject(",
     "start_approved_task",
     "backlog_worker_start("
   ]) {
-    assert.ok(!source.includes(forbidden), `template must not contain ${forbidden}`);
+    assert.ok(!coreSource.includes(forbidden), `core must not contain ${forbidden}`);
   }
   for (const forbidden of [
     "require(",
@@ -1866,7 +1867,7 @@ test("legacy callback and guide prep/complete work with typed data in fresh isol
   const template = {
     schema_version: 1,
     tool: "threadlane closure-template",
-    version: "2026-11-19.v1",
+    version: "2026-11-19.v2",
     source_path: "skills/threadlane/references/ordinary-closure.js",
     source_sha256: SOURCE_SHA256,
     factory_name: "createOrdinaryClosure",
@@ -2097,7 +2098,7 @@ function makeGuideEnvironment(
   const template = {
     schema_version: 1,
     tool: "threadlane closure-template",
-    version: "2026-11-19.v1",
+    version: "2026-11-19.v2",
     source_path: "skills/threadlane/references/ordinary-closure.js",
     source_sha256: SOURCE_SHA256,
     factory_name: "createOrdinaryClosure",
@@ -3466,8 +3467,8 @@ test("closure client wrappers stay compact, identical, and within document byte 
   assert.ok(!guideBlocks[1].includes("APPROVED_TASK_CONTEXT"));
   assert.ok(!guideBlocks[1].includes("ACCEPTANCE_CONTEXT"));
   assert.equal((guideBlocks[2].match(/ACCEPTANCE_CONTEXT/g) || []).length, 1);
-  assert.ok(guideBlocks[1].includes("createOrdinaryClosureClient"));
-  assert.ok(guideBlocks[2].includes("createOrdinaryClosureClient"));
+  assert.ok(guideBlocks[1].includes("createOrdinaryNativeClient"));
+  assert.ok(guideBlocks[2].includes("createOrdinaryNativeClient"));
   assert.ok(!guideBlocks[1].includes("backlog_worker_complete"));
   assert.ok(!guideBlocks[2].includes("backlog_worker_start"));
   for (const [label, block] of [
@@ -3709,6 +3710,91 @@ test("public notice recipe recovers all missing state from the original scoped r
   assert.equal(JSON.parse(fixture.env.texts.at(-1)).status, "done");
 });
 
+test("opt-in source proof survives cold recovery and remains a separate semantic decision", async () => {
+  const fixture = makeRecoveredGuide();
+  await fixture.env.runRecipe(0, {APPROVED_TASK_CONTEXT: clone(fixture.env.approvedContext)});
+  for (const key of TEMPORARY_KEYS) fixture.env.stored.set(key, "null");
+  const context = fixture.getContext();
+  context.scope.repository_path = "/trusted/original";
+  fixture.setContext(context);
+  const expectedFiles = ["SPEC.md", "STATUS.txt"];
+  const sourceReport = {
+    ok: true, root: "/trusted/original", expected_base: BASE, head_commit: BASE,
+    base_tree: "f".repeat(40), changed_paths: [], clean_at_base: true,
+    files: expectedFiles.map((path, i) => ({path, sha256: String(i + 1).repeat(64),
+      base_sha256: String(i + 1).repeat(64), matches_base: true}))
+  };
+  const originalExec = fixture.tools.exec_command;
+  const tools = {...fixture.tools, exec_command: async (args) => {
+    if (args.cmd.includes("closure-template")) return originalExec(args);
+    assert.ok(args.cmd.includes("'--source-root' '/trusted/original'"));
+    assert.ok(args.cmd.includes("'--source-file' 'SPEC.md'"));
+    assert.ok(args.cmd.includes("'--source-file' 'STATUS.txt'"));
+    return {exit_code: 0, output: JSON.stringify({...makeInspection([WRITE_PATHS[0]]), source: sourceReport})};
+  }};
+  await fixture.run(tools, {NOTICE_SOURCE_OPTIONS: {source_files: expectedFiles}});
+  const view = JSON.parse(fixture.env.texts.at(-1));
+  assert.equal(view.status, "ready_for_semantic_review");
+  assert.deepEqual(view.physical.source, sourceReport);
+  assert.match(view.read_id, /^rd_[0-9a-f]{64}$/);
+  assert.equal(fixture.env.calls.complete, 0, "physical evidence never accepts semantics");
+  await fixture.runComplete(tools, {read_id: view.read_id});
+  assert.equal(JSON.parse(fixture.env.texts.at(-1)).status, "done");
+  assert.equal(fixture.env.calls.complete, 1);
+});
+
+test("requested source failures or mismatches cannot become ready or auto-complete", async () => {
+  for (const mode of ["missing", "foreign root", "unavailable", "file mismatch", "inconsistent file"]) {
+    const fixture = makeRecoveredGuide();
+    await fixture.env.runRecipe(0, {APPROVED_TASK_CONTEXT: clone(fixture.env.approvedContext)});
+    const context = fixture.getContext();
+    context.scope.repository_path = "/trusted/original";
+    fixture.setContext(context);
+    const sha = "1".repeat(64);
+    const sourceReport = {ok: true, root: "/trusted/original", expected_base: BASE, head_commit: BASE,
+      base_tree: "f".repeat(40), changed_paths: [], clean_at_base: true,
+      files: [{path: "SPEC.md", sha256: sha, base_sha256: sha, matches_base: true}]};
+    if (mode === "foreign root") sourceReport.root = "/foreign";
+    if (mode === "unavailable") { sourceReport.ok = false; sourceReport.refusal_code = "file_read_failed"; }
+    if (mode === "file mismatch") { sourceReport.files[0].sha256 = "2".repeat(64); sourceReport.files[0].matches_base = false; sourceReport.clean_at_base = false; }
+    if (mode === "inconsistent file") sourceReport.files[0].sha256 = "2".repeat(64);
+    const originalExec = fixture.tools.exec_command;
+    const tools = {...fixture.tools, exec_command: async (args) => {
+      if (args.cmd.includes("closure-template")) return originalExec(args);
+      const physical = makeInspection([WRITE_PATHS[0]]);
+      if (mode !== "missing") physical.source = sourceReport;
+      return {exit_code: 0, output: JSON.stringify(physical)};
+    }};
+    await fixture.run(tools, {NOTICE_SOURCE_OPTIONS: {source_files: ["SPEC.md"]}});
+    const view = JSON.parse(fixture.env.texts.at(-1));
+    assert.equal(view.status, "incomplete", mode);
+    assert.match(view.reason, /^source_/);
+    assert.equal(fixture.env.calls.complete, 0, mode);
+  }
+});
+
+test("stale source HEAD is returned for semantic rejection, not silently accepted", async () => {
+  const fixture = makeRecoveredGuide();
+  await fixture.env.runRecipe(0, {APPROVED_TASK_CONTEXT: clone(fixture.env.approvedContext)});
+  const context = fixture.getContext();
+  context.scope.repository_path = "/trusted/original";
+  fixture.setContext(context);
+  const originalExec = fixture.tools.exec_command;
+  const tools = {...fixture.tools, exec_command: async (args) => {
+    if (args.cmd.includes("closure-template")) return originalExec(args);
+    return {exit_code: 0, output: JSON.stringify({...makeInspection([WRITE_PATHS[0]]), source: {
+      ok: true, root: "/trusted/original", expected_base: BASE, head_commit: "e".repeat(40),
+      base_tree: "f".repeat(40), changed_paths: [], clean_at_base: false, files: []
+    }})};
+  }};
+  await fixture.run(tools, {NOTICE_SOURCE_OPTIONS: {source_files: []}});
+  const view = JSON.parse(fixture.env.texts.at(-1));
+  assert.equal(view.status, "ready_for_semantic_review");
+  assert.equal(view.physical.source.clean_at_base, false);
+  assert.notEqual(view.physical.source.head_commit, BASE);
+  assert.equal(fixture.env.calls.complete, 0, "semantic reviewer declines stale source");
+});
+
 test("recovered notice rejects conflicting frozen state and never clobbers it", async () => {
   for (const [label, change] of [
     ["foreign approval", (ctx) => {ctx.execution.authority.approval_id = "apr_" + "f".repeat(32);}],
@@ -3822,7 +3908,7 @@ test("blocked original drains validated events without completion", async () => 
 test("live concurrent duplicate notices accept an already-ACKed real batch without a second completion", async () => {
   const createClient = vm.runInNewContext(`${source}\n;createOrdinaryClosureClient`, Object.create(null));
   const memory = new Map();
-  const template = {schema_version: 1, tool: "threadlane closure-template", version: "2026-11-19.v1",
+  const template = {schema_version: 1, tool: "threadlane closure-template", version: "2026-11-19.v2",
     source_path: "skills/threadlane/references/ordinary-closure.js", source_sha256: SOURCE_SHA256,
     factory_name: "createOrdinaryClosure", javascript: source};
   const snapshot = {execution: clone(START_EXECUTION),
@@ -3859,7 +3945,7 @@ test("live concurrent duplicate notices accept an already-ACKed real batch witho
 
 test("duplicate notices on one client share the same in-flight read", async () => {
   const createClient = vm.runInNewContext(`${source}\n;createOrdinaryClosureClient`, Object.create(null));
-  const memory = new Map(); const template = {schema_version: 1, tool: "threadlane closure-template", version: "2026-11-19.v1",
+  const memory = new Map(); const template = {schema_version: 1, tool: "threadlane closure-template", version: "2026-11-19.v2",
     source_path: "skills/threadlane/references/ordinary-closure.js", source_sha256: SOURCE_SHA256,
     factory_name: "createOrdinaryClosure", javascript: source};
   let lookups = 0, pulls = 0;
@@ -3900,7 +3986,7 @@ test("real completion recipe restores a missing canonical capsule and refuses ch
       assert.equal(fixture.env.calls.complete, 1);
       assert.equal(JSON.parse(fixture.env.stored.get(key)).javascript, source);
     } else {
-      await assert.rejects(fixture.runComplete(fixture.tools, altered), /invalid acceptance package pins|retained source conflicts/);
+      await assert.rejects(fixture.runComplete(fixture.tools, altered), /invalid package pins|invalid canonical capsule|retained source or package conflicts/);
       assert.equal(fixture.env.calls.complete, 0);
       assert.equal(fixture.env.stored.get(key), before, "conflicting cache is not overwritten");
     }
