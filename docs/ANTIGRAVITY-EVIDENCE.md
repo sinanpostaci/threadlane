@@ -1,19 +1,10 @@
 # Antigravity model-variant evidence
 
-Canonical AGY 1.5.9 (`agy models`, read without inference on 2026-11-17)
-advertises 20 concrete effort-encoded model variants: the 16 exact identifiers
-previously recorded in AGY 1.5.3 (`agy-1.5.3-catalog-v1`, preserving the 13 AGY
-1.4.12 identifiers such as `gemini-4-argon-high` / `Gemini 4 Argon (High)` plus
-`gemini-4-carbon-low`, `gemini-4-carbon-medium`, and `gemini-4-carbon-high`)
-plus `gemini-4-hydrogen-low` (`Low`), `gemini-4-hydrogen-medium` (`Medium`),
-`gemini-4-hydrogen-high` (`High`), and `gemini-4-hydrogen-xhigh` (`XHigh`). Its
-structured initialization event reports the selected concrete model, but omits a
-separate reasoning effort field. Threadlane recognizes only those 20 exact
-catalog IDs in `workers::antigravity_models` under contract
-`agy-1.5.9-catalog-v1` (observed CLI `1.5.9`). `agy models` also lists
-`gemini-pro-orchestrator` and `gemini-pro-orchestrator-argon` without encoded
-effort labels; Threadlane does not register them in the effort catalog or
-derive effort evidence from them.
+Contract `agy-1.5.12-catalog-v1` retains the 20 variants recorded through AGY 1.5.9. This
+revision maps the four exact AGY 1.5.12 model variants (gemini-4-neon-low,
+gemini-4-neon-medium, gemini-4-neon-high, and gemini-4-neon-xhigh) to low, medium, high, and
+xhigh effort levels, respectively, while excluding unlabeled aliases such as
+gemini-pro-orchestrator-neon.
 
 For the Antigravity adapter, a valid structured `event: init` with a matching
 `init.model` can establish the encoded variant. The sealed report records
