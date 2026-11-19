@@ -564,6 +564,7 @@ function createOrdinaryClosureClient(callbacks) {
       typeof input.expected_source_sha256 === "string" &&
       /^[0-9a-f]{64}$/.test(input.expected_source_sha256) &&
       isPlainObject(template) &&
+      template.schema_version === 1 &&
       template.tool === "threadlane closure-template" &&
       template.version === CREATE_ORDINARY_CLOSURE_VERSION &&
       template.source_path === "skills/threadlane/references/ordinary-closure.js" &&
@@ -720,9 +721,15 @@ function createOrdinaryClosureClient(callbacks) {
     }
     var data = dataOf(env, "backlog_worker_notice_context", "notice context", {});
     if (!isPlainObject(data) || !isPlainObject(data.execution) ||
-        !isPlainObject(data.scope) || !isPlainObject(data.item_snapshot)) {
+        !isPlainObject(data.scope) || !isPlainObject(data.item_snapshot) ||
+        typeof data.acceptance_condition !== "string" || !data.acceptance_condition ||
+        utf8ByteLength(data.acceptance_condition) > 2048 ||
+        typeof data.delivery_description !== "string" || !data.delivery_description ||
+        utf8ByteLength(data.delivery_description) > 2048) {
       throw new Error("invalid scoped notice context");
     }
+    var semanticReview = {untrusted_data: true, acceptance_condition: data.acceptance_condition,
+      delivery_description: data.delivery_description};
     var parsed = parseStart({execution: data.execution}, {}, true);
     var identity = executionIdentityFromParsed(parsed);
     var snapshot = data.item_snapshot;
@@ -850,9 +857,12 @@ function createOrdinaryClosureClient(callbacks) {
     if (priorReport) {
       var retained = compactReport(priorReport, input);
       retained.later_events = await drainDoneEvents(parsed);
+      retained.semantic_review = semanticReview;
       return retained;
     }
-    return readRetained(approvalId);
+    var view = await readRetained(approvalId);
+    if (view.status === "ready_for_semantic_review") view.semantic_review = semanticReview;
+    return view;
   }
 
   function validateDurableDone(data, parsed, identity, priorReport) {
@@ -864,6 +874,8 @@ function createOrdinaryClosureClient(callbacks) {
         stableStringify(execution) !== stableStringify(data.execution) ||
         item.status !== "done" || item.item_id !== identity.item_id ||
         item.binding_id !== identity.control_binding_id ||
+        item.acceptance_condition !== data.acceptance_condition ||
+        item.delivery_description !== data.delivery_description ||
         item.current_execution_ref !== identity.execution_ref ||
         item.revision !== snapshot.revision || !isPositiveInteger(item.revision) ||
         item.revision <= identity.reservation_revision ||
@@ -881,7 +893,8 @@ function createOrdinaryClosureClient(callbacks) {
     if (priorReport && closure.doneView({receipt: {completion: receipt}, report: priorReport}).status !== "done") {
       throw new Error("durable completion conflicts with retained report");
     }
-    return {status: "done", item_id: item.item_id, revision: item.revision,
+    return {status: "done", approval_id: identity.approval_id,
+      execution_ref: identity.execution_ref, item_id: item.item_id, revision: item.revision,
       completed_at_ms: item.completed_at_ms};
   }
 

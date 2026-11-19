@@ -10,6 +10,7 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const source = fs.readFileSync(path.join(here, "ordinary-closure.js"), "utf8");
 const SOURCE_SHA256 = crypto.createHash("sha256").update(source, "utf8").digest("hex");
 const legacyReadBlock = fs.readFileSync(path.join(here, "legacy-read-wrapper.fixture.txt"), "utf8");
+const legacyCompleteBlock = fs.readFileSync(path.join(here, "legacy-complete-wrapper.fixture.txt"), "utf8");
 const createOrdinaryClosure = vm.runInNewContext(
   `${source}\n;createOrdinaryClosure`,
   Object.create(null),
@@ -1817,9 +1818,11 @@ test("legacy callback and guide prep/complete work with typed data in fresh isol
   const rawBlocks = [...guide.matchAll(/```js\n([\s\S]*?)```/g)].map((match) => match[1]);
   assert.equal(rawBlocks.length, 3, "guide must contain prep, callback, and complete recipes");
 
-  const [prepBlock, , completeBlock] = rawBlocks;
+  const [prepBlock] = rawBlocks;
+  const completeBlock = legacyCompleteBlock;
   const readBlock = legacyReadBlock;
   rawBlocks[1] = readBlock;
+  rawBlocks[2] = completeBlock;
   assert.ok(prepBlock.includes("const input = APPROVED_TASK_CONTEXT;"));
   assert.equal((prepBlock.match(/APPROVED_TASK_CONTEXT/g) || []).length, 1);
   assert.ok(completeBlock.includes("const acceptance = ACCEPTANCE_CONTEXT;"));
@@ -2082,6 +2085,7 @@ function documentRecipeBlocks(documentPath) {
   const document = fs.readFileSync(documentPath, "utf8");
   const blocks = [...document.matchAll(/```js\n([\s\S]*?)```/g)].map((match) => match[1]);
   blocks[1] = legacyReadBlock;
+  blocks[2] = legacyCompleteBlock;
   return blocks;
 }
 
@@ -3471,8 +3475,8 @@ test("closure client wrappers stay compact, identical, and within document byte 
     ["complete", guideBlocks[2]]
   ]) {
     assert.ok(
-      Buffer.byteLength(block, "utf8") <= 2200,
-      `${label} program body stays within 2200 UTF-8 bytes, got ${Buffer.byteLength(block, "utf8")}`
+      Buffer.byteLength(block, "utf8") <= 2500,
+      `${label} program body stays within 2500 UTF-8 bytes, got ${Buffer.byteLength(block, "utf8")}`
     );
   }
 });
@@ -3624,9 +3628,11 @@ function makeDoneReceipt(
 function makeRecoveredGuide() {
   const env = makeGuideEnvironment();
   const document = fs.readFileSync(path.join(here, "../../../docs/MCP-OPERATING-GUIDE.md"), "utf8");
-  const block = [...document.matchAll(/```js\n([\s\S]*?)```/g)][1][1];
+  const blocks = [...document.matchAll(/```js\n([\s\S]*?)```/g)].map((match) => match[1]);
+  const block = blocks[1];
   let context = {
     execution: clone(START_EXECUTION),
+    acceptance_condition: "bounded condition", delivery_description: "bounded delivery",
     scope: {base_commit: BASE, requested_model: MODEL, requested_effort: EFFORT, write_paths: [WRITE_PATHS[0]]},
     item_snapshot: {item_id: ITEM, revision: START_EXECUTION.reservation_revision, status: "doing", current_execution_ref: EXEC}
   };
@@ -3651,7 +3657,17 @@ function makeRecoveredGuide() {
       ...vars
     }
   );
-  return {env, tools, run, setContext: (value) => { context = value; }, getContext: () => clone(context),
+  const runComplete = async (activeTools = tools, overrideAcceptance = {}) => vm.runInNewContext(
+    `(async () => {\n${blocks[2]}\n})()`, {
+      tools: activeTools,
+      load: (key) => env.stored.has(key) ? JSON.parse(env.stored.get(key)) : undefined,
+      store: async (key, value) => { env.stored.set(key, JSON.stringify(value)); },
+      text: (value) => env.texts.push(value),
+      ACCEPTANCE_CONTEXT: {...env.acceptanceContext, cli_package: "/trusted", source_sha256: SOURCE_SHA256,
+        ...overrideAcceptance}
+    }
+  );
+  return {env, tools, run, runComplete, setContext: (value) => { context = value; }, getContext: () => clone(context),
     setOverride: (value) => {override = value;}, getLookups: () => lookups};
 }
 
@@ -3668,6 +3684,8 @@ test("public notice recipe recovers all missing state from the original scoped r
   const view = JSON.parse(fixture.env.texts.at(-1));
   assert.equal(view.status, "ready_for_semantic_review");
   assert.equal(view.authority_granted, false);
+  assert.deepEqual(plain(view.semantic_review), {untrusted_data: true,
+    acceptance_condition: "bounded condition", delivery_description: "bounded delivery"});
   assert.equal(fixture.getLookups(), 1);
   assert.equal(fixture.env.calls.start, before.start);
   assert.equal(fixture.env.calls.pull, before.pull + 1);
@@ -3796,6 +3814,7 @@ test("live concurrent duplicate notices accept an already-ACKed real batch witho
     source_path: "skills/threadlane/references/ordinary-closure.js", source_sha256: SOURCE_SHA256,
     factory_name: "createOrdinaryClosure", javascript: source};
   const snapshot = {execution: clone(START_EXECUTION),
+    acceptance_condition: "bounded condition", delivery_description: "bounded delivery",
     scope: {base_commit: BASE, requested_model: MODEL, requested_effort: EFFORT, write_paths: [WRITE_PATHS[0]]},
     item_snapshot: {item_id: ITEM, revision: 5, status: "doing", current_execution_ref: EXEC}};
   let count = 0, release;
@@ -3835,6 +3854,7 @@ test("duplicate notices on one client share the same in-flight read", async () =
   const client = createClient({load: (k) => memory.get(k), store: async (k, v) => memory.set(k, clone(v)),
     bootstrap: {binary: "/trusted/bin/threadlane", expected_source_sha256: SOURCE_SHA256, template},
     recover: async () => {lookups += 1; return envelope("backlog_worker_notice_context", {execution: clone(START_EXECUTION),
+      acceptance_condition: "bounded condition", delivery_description: "bounded delivery",
       scope: {base_commit: BASE, requested_model: MODEL, requested_effort: EFFORT, write_paths: [WRITE_PATHS[0]]},
       item_snapshot: {item_id: ITEM, revision: 5, status: "doing", current_execution_ref: EXEC}});},
     pull: async () => {pulls += 1; return envelope("approved_pull_events", PAGE_TWO);},
@@ -3845,4 +3865,43 @@ test("duplicate notices on one client share the same in-flight read", async () =
   assert.equal(a.status, "ready_for_semantic_review");
   assert.equal(b.status, "ready_for_semantic_review");
   assert.equal(lookups, 1); assert.equal(pulls, 1);
+});
+
+test("real completion recipe restores a missing canonical capsule and refuses changed cached source", async () => {
+  for (const mode of ["missing", "changed", "foreign package", "foreign digest"]) {
+    const fixture = makeRecoveredGuide();
+    await fixture.env.runRecipe(0, {APPROVED_TASK_CONTEXT: clone(fixture.env.approvedContext)});
+    await fixture.run();
+    const key = "threadlane/closure-template.json";
+    const storedTemplate = JSON.parse(fixture.env.stored.get(key));
+    if (mode === "missing") fixture.env.stored.set(key, "null");
+    if (mode === "changed") {
+      storedTemplate.javascript += "\nthrow new Error('must never execute');";
+      fixture.env.stored.set(key, JSON.stringify(storedTemplate));
+    }
+    const before = fixture.env.stored.get(key);
+    const altered = mode === "foreign package" ? {cli_package: "/foreign"} :
+      mode === "foreign digest" ? {source_sha256: "f".repeat(64)} : {};
+    if (mode === "missing") {
+      await fixture.runComplete(fixture.tools, altered);
+      assert.equal(JSON.parse(fixture.env.texts.at(-1)).status, "done");
+      assert.equal(fixture.env.calls.complete, 1);
+      assert.equal(JSON.parse(fixture.env.stored.get(key)).javascript, source);
+    } else {
+      await assert.rejects(fixture.runComplete(fixture.tools, altered), /invalid acceptance package pins|retained source conflicts/);
+      assert.equal(fixture.env.calls.complete, 0);
+      assert.equal(fixture.env.stored.get(key), before, "conflicting cache is not overwritten");
+    }
+  }
+});
+
+test("scoped criteria are bounded review text, never implicit acceptance", async () => {
+  for (const field of ["acceptance_condition", "delivery_description"]) {
+    const fixture = makeRecoveredGuide();
+    const data = fixture.getContext();
+    data[field] = "x".repeat(2049); fixture.setContext(data);
+    await assert.rejects(fixture.run(), /invalid scoped notice context/);
+    assert.equal(fixture.env.calls.pull, 0);
+    assert.equal(fixture.env.calls.complete, 0);
+  }
 });
