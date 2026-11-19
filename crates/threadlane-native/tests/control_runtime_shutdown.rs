@@ -308,6 +308,7 @@ impl FakeOwner {
                 scoped_backlog: true,
                 event_pull_ack: true,
                 guarded_worker_backlog: true,
+                worker_notice_context: true,
                 idle_retire: true,
                 approved_host_control: spec.role == ControlRuntimeRole::ApprovedHost,
             },

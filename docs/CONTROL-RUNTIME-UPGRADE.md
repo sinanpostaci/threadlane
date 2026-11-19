@@ -23,12 +23,21 @@ A live supervisor advertises a bounded authenticated record through
 - the exact `pid`;
 - whether Codex wake-up notifications and worker profiles are configured;
 - operation capabilities for `bindings`, `scoped_backlog`, `event_pull_ack`,
-  `guarded_worker_backlog`, `idle_retire`, and `approved_host_control`.
+  `guarded_worker_backlog`, `worker_notice_context`, `idle_retire`, and
+  `approved_host_control`.
 
 `ensure_control_runtime` reuses a runtime only when the required baseline operation contract is
 present. A package-version difference alone never restarts a healthy compatible runtime, so an
 older package cannot cause restart ping-pong. A newer protocol is never retired by an older
 caller; the caller fails with an actionable incompatible-runtime error instead.
+
+`worker_notice_context` explicitly covers the trusted-local `GetNoticeContext` lookup used by
+ordinary Worker review. It is independent of `guarded_worker_backlog`: earlier supervisors can
+advertise the latter without supporting this lookup. A missing flag defaults to `false`, so the
+new caller upgrades an otherwise eligible idle baseline through the existing atomic retire flow,
+and refuses a busy baseline without interrupting it. The paired `connect_current_chat` flow runs
+this check on both initial and repeated connections before resolving a binding. If it fails on
+an initial connection, that connection remains unbound and cannot create a backlog item.
 
 An older caller that predates this endpoint still performs its original binding readiness check
 and shares the same durable supervisor state. It does not trigger an automatic restart.
@@ -47,6 +56,10 @@ are true:
 - there are zero live worker tasks;
 - there are zero in-flight wake-up notices and zero pending wake-up notices across all bindings;
 - the exact instance/protocol identity still matches the live process.
+
+These counts describe the retiring supervisor's own state and live tasks. Approved hosts use
+separate state; a `Doing` backlog item or an execution in a separate host is not itself counted
+by this supervisor's idle inspection. The retire operation does not signal a separate host.
 
 If activity wins the race, retirement refuses with a bounded busy error (counts included) and no
 side effect. If retirement wins, the mutation latch is set before the `Core` mutex is released;

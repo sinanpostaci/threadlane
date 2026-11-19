@@ -28,8 +28,9 @@ use threadlane::protocol::{
     CONTROL_RUNTIME_PROTOCOL_VERSION,
 };
 use threadlane::{
-    ApiError, ErrorCode as ThreadlaneErrorCode, ScopedClient, Supervisor, SupervisorClient,
-    SupervisorConfig, DEFAULT_CODEX_TIMEOUT_MS, DEFAULT_TICK_INTERVAL_MS,
+    ApiError, ErrorCode as ThreadlaneErrorCode, OperatorWorkerBacklogRequest,
+    OperatorWorkerBacklogResponse, ScopedClient, Supervisor, SupervisorClient, SupervisorConfig,
+    DEFAULT_CODEX_TIMEOUT_MS, DEFAULT_TICK_INTERVAL_MS,
 };
 use threadlane_core::{
     BacklogItemKind, BacklogStatus, Command as CoreCommand, CommandOutput, Core, Run, RunStatus,
@@ -655,6 +656,7 @@ struct FakeInfoSpec {
     workers_configured: bool,
     idle_retire: bool,
     scoped_backlog: bool,
+    worker_notice_context: bool,
     malformed_instance_id: bool,
 }
 
@@ -668,6 +670,7 @@ impl FakeInfoSpec {
             workers_configured: false,
             idle_retire: true,
             scoped_backlog: true,
+            worker_notice_context: true,
             malformed_instance_id: false,
         }
     }
@@ -675,6 +678,14 @@ impl FakeInfoSpec {
     fn incompatible_missing_backlog() -> Self {
         Self {
             scoped_backlog: false,
+            package_version: "0.0.9-old",
+            ..Self::compatible()
+        }
+    }
+
+    fn pre_notice_context() -> Self {
+        Self {
+            worker_notice_context: false,
             package_version: "0.0.9-old",
             ..Self::compatible()
         }
@@ -738,6 +749,7 @@ impl FakeControlRuntime {
                 scoped_backlog: spec.scoped_backlog,
                 event_pull_ack: true,
                 guarded_worker_backlog: true,
+                worker_notice_context: spec.worker_notice_context,
                 idle_retire: spec.idle_retire,
                 approved_host_control: spec.role == ControlRuntimeRole::ApprovedHost,
             },
@@ -924,7 +936,16 @@ async fn handle_fake_control_connection(
             .await;
         }
         ("GET", "/v1/control-runtime/info") if include_info_endpoint => {
-            write_fake_json(socket, "200 OK", info).await;
+            let mut advertised = serde_json::to_value(info).expect("serialize fake info");
+            if !info.capabilities.worker_notice_context {
+                // Model the pre-GetNoticeContext wire advertisement, which omitted the field
+                // while still advertising guarded_worker_backlog as available.
+                advertised["capabilities"]
+                    .as_object_mut()
+                    .expect("capabilities object")
+                    .remove("worker_notice_context");
+            }
+            write_fake_json(socket, "200 OK", &advertised).await;
         }
         ("POST", "/v1/control-runtime/retire") if include_info_endpoint => {
             retire_requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -1041,6 +1062,33 @@ async fn write_fake_json<T: Serialize>(
     let _ = socket.write_all(header.as_bytes()).await;
     let _ = socket.write_all(&body).await;
     let _ = socket.shutdown().await;
+}
+
+#[test]
+fn worker_notice_context_capability_is_additive_and_defaults_to_false() {
+    let old_advertisement = serde_json::json!({
+        "bindings": true,
+        "scoped_backlog": true,
+        "event_pull_ack": true,
+        "guarded_worker_backlog": true,
+        "idle_retire": true,
+        "approved_host_control": false
+    });
+    let missing: ControlRuntimeCapabilities =
+        serde_json::from_value(old_advertisement.clone()).expect("read old capabilities");
+    assert!(missing.guarded_worker_backlog);
+    assert!(!missing.worker_notice_context);
+
+    let mut explicit = old_advertisement;
+    explicit["worker_notice_context"] = serde_json::json!(false);
+    let disabled: ControlRuntimeCapabilities =
+        serde_json::from_value(explicit.clone()).expect("read disabled capability");
+    assert!(!disabled.worker_notice_context);
+    explicit["worker_notice_context"] = serde_json::json!(true);
+    explicit["future_capability"] = serde_json::json!(true);
+    let enabled: ControlRuntimeCapabilities =
+        serde_json::from_value(explicit).expect("ignore unknown future capability");
+    assert!(enabled.worker_notice_context);
 }
 
 /// 1. Existing healthy authenticated supervisor is reused without spawning another process, and
@@ -2110,6 +2158,103 @@ async fn compatible_older_package_runtime_is_reused_by_capability_not_version() 
     assert!(fake.is_serving().await);
 }
 
+#[tokio::test]
+async fn pre_notice_runtime_upgrades_before_first_backlog_item_and_supports_lookup() {
+    let mut fixture = ControlRuntimeTestFixture::new();
+    let count_file = fixture.root.join("notice-upgrade-count.txt");
+    let argv_file = fixture.root.join("notice-upgrade-argv.txt");
+    let spy_exe = fixture.write_real_serve_wrapper("threadlane", &count_file, &argv_file, 0, false);
+    let fake = FakeControlRuntime::start(
+        &fixture.state_dir,
+        FakeInfoSpec::pre_notice_context(),
+        FakeRetireMode::Clean,
+        true,
+    )
+    .await;
+    assert!(fake.info().capabilities.guarded_worker_backlog);
+    assert!(!fake.info().capabilities.worker_notice_context);
+
+    let outcome = ensure_control_runtime(&fixture.state_dir, &spy_exe, Duration::from_secs(8))
+        .await
+        .expect("pre-notice idle baseline must upgrade");
+    fixture.track_pid(outcome.pid);
+    assert_eq!(outcome.status, ControlRuntimeEnsureStatus::Upgraded);
+    assert_eq!(fake.retire_requests(), 1);
+    assert_eq!(read_invocation_count(&count_file), 1);
+
+    let client = SupervisorClient::from_state_dir(&fixture.state_dir).expect("successor client");
+    let info = client.control_runtime_info().await.expect("successor info");
+    assert!(info.capabilities.worker_notice_context);
+    let binding = client
+        .get_or_create_binding(TEST_THREAD_UUID_A, "first item")
+        .await
+        .expect("bind after upgrade");
+    let scoped = ScopedClient::from_state_dir(&fixture.state_dir, &binding.binding.binding_id)
+        .expect("successor scoped client");
+    let page = scoped
+        .list_backlog_items(None, Some(10))
+        .await
+        .expect("read empty backlog after upgrade");
+    assert!(page.items.is_empty());
+
+    let request = OperatorWorkerBacklogRequest::GetNoticeContext {
+        binding_id: binding.binding.binding_id,
+        thread_uuid: TEST_THREAD_UUID_A.to_string(),
+        approval_id: "apr_missing".to_string(),
+    };
+    let result = client
+        .worker_backlog_operator_attested(&request)
+        .await
+        .expect("advertised notice lookup must be understood");
+    assert!(matches!(
+        result,
+        OperatorWorkerBacklogResponse::NoticeContext { snapshot: None }
+    ));
+
+    scoped
+        .create_backlog_item(
+            "first-item-create".to_string(),
+            "First Worker item".to_string(),
+            "Verify the first item remains available".to_string(),
+            "A durable Worker item".to_string(),
+            BacklogItemKind::Worker,
+        )
+        .await
+        .expect("create first item only after upgrade");
+    let result = client
+        .worker_backlog_operator_attested(&request)
+        .await
+        .expect("notice lookup must still work before a Worker is dispatched");
+    assert!(matches!(
+        result,
+        OperatorWorkerBacklogResponse::NoticeContext { snapshot: None }
+    ));
+}
+
+#[tokio::test]
+async fn pre_notice_runtime_without_idle_retire_is_left_untouched() {
+    let fixture = ControlRuntimeTestFixture::new();
+    let count_file = fixture.root.join("notice-refusal-count.txt");
+    let argv_file = fixture.root.join("notice-refusal-argv.txt");
+    let spy_exe = fixture.write_real_serve_wrapper("threadlane", &count_file, &argv_file, 0, false);
+    let mut spec = FakeInfoSpec::pre_notice_context();
+    spec.idle_retire = false;
+    let fake =
+        FakeControlRuntime::start(&fixture.state_dir, spec, FakeRetireMode::Clean, true).await;
+
+    let err = ensure_control_runtime(&fixture.state_dir, &spy_exe, Duration::from_secs(3))
+        .await
+        .expect_err("missing atomic retirement must prevent takeover");
+    assert_eq!(
+        err.error_code(),
+        ControlRuntimeErrorCode::IncompatibleRuntime
+    );
+    assert!(err.message().contains("worker_notice_context"));
+    assert_eq!(fake.retire_requests(), 0);
+    assert_eq!(read_invocation_count(&count_file), 0);
+    assert!(fake.is_serving().await);
+}
+
 /// 10. A legacy authenticated runtime without the control-info/idle-retire handshake fails early
 ///     with precise upgrade guidance, never spawns, and is never signalled or reused.
 #[tokio::test]
@@ -2220,7 +2365,7 @@ async fn inactive_incompatible_baseline_upgrades_preserving_data_without_replay(
     let spy_exe = fixture.write_real_serve_wrapper("threadlane", &count_file, &argv_file, 0, false);
     let fake = FakeControlRuntime::start(
         &fixture.state_dir,
-        FakeInfoSpec::incompatible_missing_backlog(),
+        FakeInfoSpec::pre_notice_context(),
         FakeRetireMode::Clean,
         true,
     )
@@ -2244,6 +2389,7 @@ async fn inactive_incompatible_baseline_upgrades_preserving_data_without_replay(
     assert_eq!(retired.instance_id, fake_instance);
     assert_eq!(retired.package_version, fake_package);
     assert_eq!(read_invocation_count(&count_file), 1);
+    assert_eq!(fake.retire_requests(), 1);
 
     let client = SupervisorClient::from_state_dir(&fixture.state_dir).expect("successor client");
     let bindings = client
@@ -2293,7 +2439,7 @@ async fn incompatible_busy_runtime_refuses_upgrade_without_side_effects() {
     let spy_exe = fixture.write_real_serve_wrapper("threadlane", &count_file, &argv_file, 0, false);
     let fake = FakeControlRuntime::start(
         &fixture.state_dir,
-        FakeInfoSpec::incompatible_missing_backlog(),
+        FakeInfoSpec::pre_notice_context(),
         FakeRetireMode::Busy,
         true,
     )

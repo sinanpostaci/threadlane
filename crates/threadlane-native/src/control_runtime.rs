@@ -42,6 +42,9 @@ pub const CONTROL_RUNTIME_POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// Maximum duration (`500ms`) for a single HTTP readiness probe attempt within the outer deadline.
 const MAX_SINGLE_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
+/// Maximum time to re-read an apparently unlocked live descriptor before failing closed.
+const LOCK_OBSERVATION_RETRY_BUDGET: Duration = Duration::from_millis(60);
+
 /// Explicit statement of how normal `Supervisor` startup handles pre-existing in-flight worker runs.
 pub const CONTROL_RUNTIME_IN_FLIGHT_RECOVERY_POLICY: &str =
     "Normal Supervisor startup marks pre-existing non-terminal worker runs Unknown in state.db and never silently re-dispatches work.";
@@ -1444,7 +1447,8 @@ async fn ensure_control_runtime_locked(
     let (_, initial_exe_identity) =
         validate_executable_with_identity(&policy.threadlane_executable, None)?;
 
-    let initial_state = inspect_runtime_state(state_dir, initial_dir_identity)?;
+    let initial_state =
+        inspect_runtime_state_stable(state_dir, initial_dir_identity, deadline).await?;
 
     match initial_state.descriptor {
         Some(ref snap) if is_process_alive(snap.descriptor.pid) => {
@@ -1542,7 +1546,7 @@ async fn handle_existing_live_descriptor(
         )),
         Ok(RuntimeProbe::Verified(live)) => match evaluate_compatibility(&live.info) {
             RuntimeCompatibility::Compatible => {
-                verify_live_snapshot(state_dir, initial_dir_identity, snap)?;
+                verify_live_snapshot(state_dir, initial_dir_identity, snap, deadline).await?;
                 Ok(ControlRuntimeEnsureOutcome::already_running(
                     state_dir.to_path_buf(),
                     snap.descriptor.pid,
@@ -1564,7 +1568,7 @@ async fn handle_existing_live_descriptor(
                 .await
             }
             RuntimeCompatibility::Upgradeable { .. } => {
-                verify_live_snapshot(state_dir, initial_dir_identity, snap)?;
+                verify_live_snapshot(state_dir, initial_dir_identity, snap, deadline).await?;
                 request_idle_retirement(&snap.descriptor, &live.info, deadline).await?;
                 await_retirement_and_start(
                     policy,
@@ -1672,12 +1676,14 @@ async fn handle_existing_live_descriptor(
     }
 }
 
-fn verify_live_snapshot(
+async fn verify_live_snapshot(
     state_dir: &Path,
     initial_dir_identity: FileIdentity,
     snap: &DescriptorSnapshot,
+    deadline: Instant,
 ) -> Result<(), ControlRuntimeError> {
-    let post_state = inspect_runtime_state(state_dir, initial_dir_identity)?;
+    let post_state =
+        inspect_runtime_state_stable(state_dir, initial_dir_identity, deadline).await?;
     let Some(post_snap) = post_state.descriptor else {
         return Err(ControlRuntimeError::new(
             ControlRuntimeErrorCode::StateChanged,
@@ -1794,7 +1800,8 @@ async fn wait_for_running_winner(
                 match probe_live_runtime(&snap.descriptor, deadline).await {
                     Ok(RuntimeProbe::Verified(live)) => match evaluate_compatibility(&live.info) {
                         RuntimeCompatibility::Compatible => {
-                            verify_live_snapshot(state_dir, initial_dir_identity, snap)?;
+                            verify_live_snapshot(state_dir, initial_dir_identity, snap, deadline)
+                                .await?;
                             return Ok(ControlRuntimeEnsureOutcome::already_running(
                                 state_dir.to_path_buf(),
                                 snap.descriptor.pid,
@@ -2172,6 +2179,23 @@ impl Drop for SpawnedChildGuard {
     }
 }
 
+fn spawn_before_deadline<T>(
+    deadline: Instant,
+    state_dir: &Path,
+    spawn: impl FnOnce() -> Result<T, ControlRuntimeError>,
+) -> Result<T, ControlRuntimeError> {
+    if Instant::now() >= deadline {
+        return Err(ControlRuntimeError::new(
+            ControlRuntimeErrorCode::StartupTimedOut,
+            format!(
+                "control runtime startup deadline expired before spawning `threadlane serve` for `{}`",
+                state_dir.display()
+            ),
+        ));
+    }
+    spawn()
+}
+
 async fn spawn_and_await_control_runtime(
     policy: &ControlRuntimePolicy,
     initial_dir_identity: FileIdentity,
@@ -2199,7 +2223,8 @@ async fn spawn_and_await_control_runtime(
     // Re-check ownership immediately before creating a process. This closes most of the
     // cross-process race where another caller has already acquired the lock or published a
     // different live descriptor since the caller's initial inspection.
-    let pre_spawn_state = inspect_runtime_state(&policy.state_dir, initial_dir_identity)?;
+    let pre_spawn_state =
+        inspect_runtime_state_stable(&policy.state_dir, initial_dir_identity, deadline).await?;
     if pre_spawn_state.lock_holder.is_some() {
         return wait_for_running_winner(
             &policy.state_dir,
@@ -2243,15 +2268,17 @@ async fn spawn_and_await_control_runtime(
         cmd.process_group(0);
     }
 
-    let child = cmd.spawn().map_err(|err| {
-        ControlRuntimeError::new(
-            ControlRuntimeErrorCode::SpawnFailed,
-            format!(
-                "failed to spawn `{}` with `serve --state-dir {}`: {err}",
-                policy.threadlane_executable.display(),
-                policy.state_dir.display()
-            ),
-        )
+    let child = spawn_before_deadline(deadline, &policy.state_dir, || {
+        cmd.spawn().map_err(|err| {
+            ControlRuntimeError::new(
+                ControlRuntimeErrorCode::SpawnFailed,
+                format!(
+                    "failed to spawn `{}` with `serve --state-dir {}`: {err}",
+                    policy.threadlane_executable.display(),
+                    policy.state_dir.display()
+                ),
+            )
+        })
     })?;
 
     let Some(child_pid) = child.id() else {
@@ -2276,13 +2303,16 @@ async fn spawn_and_await_control_runtime(
 
     loop {
         guard.capture_owned_members();
-        let state = match inspect_runtime_state(&policy.state_dir, initial_dir_identity) {
-            Ok(state) => state,
-            Err(err) => {
-                let cleanup = guard.terminate_and_reap().await;
-                return Err(err.with_cleanup_outcome(&cleanup));
-            }
-        };
+        let state =
+            match inspect_runtime_state_stable(&policy.state_dir, initial_dir_identity, deadline)
+                .await
+            {
+                Ok(state) => state,
+                Err(err) => {
+                    let cleanup = guard.terminate_and_reap().await;
+                    return Err(err.with_cleanup_outcome(&cleanup));
+                }
+            };
 
         if let Some(holder) = state.lock_holder {
             if !guard.pid_belongs_to_spawned(holder.pid) {
@@ -2337,10 +2367,13 @@ async fn spawn_and_await_control_runtime(
                         Ok(RuntimeProbe::Verified(live)) => {
                             match evaluate_compatibility(&live.info) {
                                 RuntimeCompatibility::Compatible => {
-                                    let post_state = match inspect_runtime_state(
+                                    let post_state = match inspect_runtime_state_stable(
                                         &policy.state_dir,
                                         initial_dir_identity,
-                                    ) {
+                                        deadline,
+                                    )
+                                    .await
+                                    {
                                         Ok(s) => s,
                                         Err(err) => {
                                             let cleanup = guard.terminate_and_reap().await;
@@ -2674,6 +2707,9 @@ fn missing_required_capabilities(
     }
     if !capabilities.guarded_worker_backlog {
         missing.push("guarded_worker_backlog");
+    }
+    if !capabilities.worker_notice_context {
+        missing.push("worker_notice_context");
     }
     missing
 }
@@ -3017,12 +3053,65 @@ fn inspect_runtime_state(
 ) -> Result<RuntimeStateInspection, ControlRuntimeError> {
     let _ = verify_state_dir_identity(state_dir, Some(expected_dir_identity))?;
     validate_state_dir_contents(state_dir)?;
-    let lock_holder = inspect_supervisor_lock_holder(state_dir)?;
     let descriptor = read_descriptor_snapshot_optional(state_dir, expected_dir_identity)?;
+    let lock_holder = inspect_supervisor_lock_holder(state_dir)?;
     Ok(RuntimeStateInspection {
         lock_holder,
         descriptor,
     })
+}
+
+async fn inspect_runtime_state_stable(
+    state_dir: &Path,
+    expected_dir_identity: FileIdentity,
+    deadline: Instant,
+) -> Result<RuntimeStateInspection, ControlRuntimeError> {
+    let initial = inspect_runtime_state(state_dir, expected_dir_identity)?;
+    retry_unlocked_live_snapshot(initial, deadline, || {
+        inspect_runtime_state(state_dir, expected_dir_identity)
+    })
+    .await
+}
+
+/// A negative `/proc/locks` observation is not enough to accept a live descriptor or infer
+/// ownership release. Re-read briefly, without mutation, and only for the exact same snapshot.
+async fn retry_unlocked_live_snapshot<F>(
+    mut state: RuntimeStateInspection,
+    deadline: Instant,
+    mut inspect: F,
+) -> Result<RuntimeStateInspection, ControlRuntimeError>
+where
+    F: FnMut() -> Result<RuntimeStateInspection, ControlRuntimeError>,
+{
+    let Some(snap) = state.descriptor.as_ref() else {
+        return Ok(state);
+    };
+    if state.lock_holder.is_some() || !is_process_alive(snap.descriptor.pid) {
+        return Ok(state);
+    }
+    let expected = snap.clone();
+    let retry_deadline = deadline.min(Instant::now() + LOCK_OBSERVATION_RETRY_BUDGET);
+    while Instant::now() < retry_deadline {
+        let observed = inspect()?;
+        if !observed
+            .descriptor
+            .as_ref()
+            .is_some_and(|current| current.same_instance(&expected))
+        {
+            // Let the original caller classify a disappearance or replacement: retirement
+            // and concurrent-winner paths have different, deliberately bounded semantics.
+            return Ok(observed);
+        }
+        state = observed;
+        if state.lock_holder.is_some() || !is_process_alive(expected.descriptor.pid) {
+            break;
+        }
+        let remaining = retry_deadline.saturating_duration_since(Instant::now());
+        if !remaining.is_zero() {
+            tokio::time::sleep(CONTROL_RUNTIME_POLL_INTERVAL.min(remaining)).await;
+        }
+    }
+    Ok(state)
 }
 
 fn verify_state_dir_identity(
@@ -3762,5 +3851,126 @@ fn signal_single_pid(pid: u32, signal: libc::c_int) {
             // SAFETY: `kill(pid_i32, signal)` targets a single verified PID owned by `current_euid()`.
             let _ = unsafe { libc::kill(pid_i32, signal) };
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::VecDeque;
+    use threadlane::descriptor::SecretToken;
+
+    fn snapshot(lock_holder: Option<u32>, inode: u64) -> RuntimeStateInspection {
+        RuntimeStateInspection {
+            lock_holder: lock_holder.map(|pid| LockHolderInfo { pid }),
+            descriptor: Some(DescriptorSnapshot {
+                descriptor: RuntimeDescriptor {
+                    version: 1,
+                    host: "127.0.0.1".to_string(),
+                    port: 12345,
+                    pid: std::process::id(),
+                    token: SecretToken::new("a".repeat(64)),
+                },
+                identity: FileIdentity { dev: 1, ino: inode },
+            }),
+        }
+    }
+
+    #[test]
+    fn expired_spawn_deadline_does_not_invoke_spawn() {
+        let invoked = std::cell::Cell::new(false);
+        let result = spawn_before_deadline(Instant::now(), Path::new("/test-state"), || {
+            invoked.set(true);
+            Ok(())
+        });
+        assert_eq!(
+            result
+                .expect_err("expired deadline must refuse spawn")
+                .error_code(),
+            ControlRuntimeErrorCode::StartupTimedOut
+        );
+        assert!(!invoked.get());
+
+        let result = spawn_before_deadline(
+            Instant::now() + Duration::from_secs(1),
+            Path::new("/test-state"),
+            || {
+                invoked.set(true);
+                Ok(())
+            },
+        );
+        assert!(result.is_ok());
+        assert!(invoked.get());
+    }
+
+    #[tokio::test]
+    async fn missing_lock_observation_is_rechecked_for_the_same_live_descriptor() {
+        let pid = std::process::id();
+        let initial = snapshot(None, 1);
+        let mut observations = VecDeque::from([snapshot(Some(pid), 1)]);
+        let verified =
+            retry_unlocked_live_snapshot(initial, Instant::now() + Duration::from_secs(1), || {
+                Ok(observations.pop_front().expect("bounded observations"))
+            })
+            .await
+            .expect("stable recheck");
+        assert_eq!(verified.lock_holder, Some(LockHolderInfo { pid }));
+        assert!(observations.is_empty());
+    }
+
+    #[tokio::test]
+    async fn unlocked_or_changed_descriptor_is_returned_without_fabricating_ownership() {
+        let initial = snapshot(None, 1);
+        let mut attempts = 0;
+        let unlocked = retry_unlocked_live_snapshot(
+            initial.clone(),
+            Instant::now() + Duration::from_secs(1),
+            || {
+                attempts += 1;
+                Ok(initial.clone())
+            },
+        )
+        .await
+        .expect("bounded unlocked observation");
+        assert!(attempts > 0);
+        assert_eq!(unlocked.lock_holder, None);
+
+        let expected = initial.descriptor.clone().expect("initial descriptor");
+        let changed =
+            retry_unlocked_live_snapshot(initial, Instant::now() + Duration::from_secs(1), || {
+                Ok(snapshot(Some(std::process::id()), 2))
+            })
+            .await
+            .expect("replacement remains visible to the caller");
+        assert!(!changed
+            .descriptor
+            .as_ref()
+            .expect("replacement descriptor")
+            .same_instance(&expected));
+
+        let gone = retry_unlocked_live_snapshot(
+            snapshot(None, 1),
+            Instant::now() + Duration::from_secs(1),
+            || {
+                Ok(RuntimeStateInspection {
+                    lock_holder: None,
+                    descriptor: None,
+                })
+            },
+        )
+        .await
+        .expect("descriptor removal remains visible to the caller");
+        assert!(gone.descriptor.is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_open_file_without_a_lock_is_not_lock_ownership() {
+        let dir = tempfile::tempdir().expect("temporary state directory");
+        let _open = File::create(dir.path().join(LOCK_FILENAME)).expect("open without locking");
+        assert_eq!(
+            inspect_supervisor_lock_holder(dir.path()).expect("inspect unlocked file"),
+            None
+        );
     }
 }

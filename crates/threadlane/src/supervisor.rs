@@ -517,6 +517,7 @@ impl SharedState {
                 scoped_backlog: true,
                 event_pull_ack: true,
                 guarded_worker_backlog: true,
+                worker_notice_context: true,
                 idle_retire,
                 approved_host_control: role == ControlRuntimeRole::ApprovedHost,
             },

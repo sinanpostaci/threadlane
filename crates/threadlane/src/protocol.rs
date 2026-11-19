@@ -768,6 +768,9 @@ pub struct ControlRuntimeCapabilities {
     /// Trusted-local guarded Worker backlog reservation and reconciliation are available.
     #[serde(default)]
     pub guarded_worker_backlog: bool,
+    /// Trusted-local Worker notice context lookup by approval is available.
+    #[serde(default)]
+    pub worker_notice_context: bool,
     /// Atomic authenticated idle retirement is available for this exact runtime role.
     #[serde(default)]
     pub idle_retire: bool,

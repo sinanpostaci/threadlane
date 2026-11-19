@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::fs::{self, DirBuilder, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::unix::fs::{symlink, DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -11,7 +11,10 @@ use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
-use threadlane::{NativeReconnectConfig, Supervisor, SupervisorConfig, SupervisorHandle};
+use threadlane::{
+    ControlRuntimeRetireRequest, NativeReconnectConfig, ScopedClient, Supervisor, SupervisorClient,
+    SupervisorConfig, SupervisorHandle,
+};
 use threadlane_core::observation::{
     serialize_workspace_native_sample_sidecar, ObservationProcessInstance, WorkspaceActivityState,
     WorkspaceAvailabilityState, WorkspaceCapabilityState, WorkspaceChatIdentity,
@@ -23,12 +26,13 @@ use threadlane_core::observation::{
     WORKSPACE_SAMPLING_INTERVAL_MS,
 };
 use threadlane_native::{
-    compute_observation_source_id, generate_sample_producer_epoch, native_chat_sample_path,
-    native_chat_samples_dir, prove_native_thread_activity, read_backend_process_instance,
-    read_workspace_native_sample_readonly, read_workspace_native_samples_readonly,
-    write_workspace_native_sample_sidecar, ManagedParentConnectionConfig, NativeErrorCode,
-    NativeThreadStatusDetail, OperatorEnrollRequest, PairedMcpServer, PairingStore,
-    NATIVE_CHAT_SAMPLES_LOCK_FILENAME, NATIVE_CHAT_SAMPLE_ROUTE,
+    compute_observation_source_id, generate_sample_producer_epoch, is_process_alive,
+    native_chat_sample_path, native_chat_samples_dir, prove_native_thread_activity,
+    read_backend_process_instance, read_workspace_native_sample_readonly,
+    read_workspace_native_samples_readonly, write_workspace_native_sample_sidecar,
+    ConnectionEpochState, ManagedParentConnectionConfig, NativeErrorCode, NativeThreadStatusDetail,
+    OperatorEnrollRequest, PairedMcpServer, PairingStore, NATIVE_CHAT_SAMPLES_LOCK_FILENAME,
+    NATIVE_CHAT_SAMPLE_ROUTE,
 };
 use tokio::net::UnixListener;
 use tokio_tungstenite::tungstenite::protocol::Message;
@@ -91,7 +95,7 @@ struct ObservationTestHarness {
     backend_executable: PathBuf,
     application_executable: PathBuf,
     pairing_store: PairingStore,
-    _supervisor: SupervisorHandle,
+    _supervisor: Option<SupervisorHandle>,
     mock_state: Arc<Mutex<MockParentState>>,
     server_task: tokio::task::JoinHandle<()>,
     stop_accepting: Arc<AtomicBool>,
@@ -259,7 +263,7 @@ impl ObservationTestHarness {
             backend_executable,
             application_executable,
             pairing_store,
-            _supervisor: supervisor,
+            _supervisor: Some(supervisor),
             mock_state,
             server_task,
             stop_accepting,
@@ -576,6 +580,335 @@ where
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
+}
+
+/// On panic, retire only a successor executing the ELF copied into this private fixture.
+struct FixtureSuccessorCleanup {
+    state_dir: PathBuf,
+    executable: PathBuf,
+}
+
+impl Drop for FixtureSuccessorCleanup {
+    fn drop(&mut self) {
+        let state_dir = self.state_dir.clone();
+        let executable = self.executable.clone();
+        let _ = std::thread::spawn(move || {
+            let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                return;
+            };
+            runtime.block_on(async {
+                let Ok(client) = SupervisorClient::from_state_dir(&state_dir) else {
+                    return;
+                };
+                let Ok(Ok(info)) =
+                    tokio::time::timeout(Duration::from_secs(1), client.control_runtime_info())
+                        .await
+                else {
+                    return;
+                };
+                if fs::read_link(format!("/proc/{}/exe", info.pid))
+                    .ok()
+                    .as_ref()
+                    != Some(&executable)
+                {
+                    return;
+                }
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(1),
+                    client.retire_idle_control_runtime(&ControlRuntimeRetireRequest {
+                        expected_protocol_version: info.protocol_version,
+                        expected_instance_id: info.instance_id,
+                        expected_pid: info.pid,
+                    }),
+                )
+                .await;
+            });
+        })
+        .join();
+    }
+}
+
+/// Run with THREADLANE_TEST_PRE_NOTICE_BINARY and THREADLANE_TEST_CURRENT_BINARY set to real
+/// `threadlane` executables; the latter must be an ELF copied into this private fixture.
+#[tokio::test]
+#[ignore = "requires real previous-release and candidate binaries"]
+async fn paired_connect_refuses_busy_pre_notice_runtime_before_enrollment_or_backlog() {
+    let previous = fs::canonicalize(
+        std::env::var_os("THREADLANE_TEST_PRE_NOTICE_BINARY")
+            .expect("set THREADLANE_TEST_PRE_NOTICE_BINARY"),
+    )
+    .expect("canonical previous-release binary");
+    assert!(previous.is_file());
+    let candidate = fs::canonicalize(
+        std::env::var_os("THREADLANE_TEST_CURRENT_BINARY")
+            .expect("set THREADLANE_TEST_CURRENT_BINARY"),
+    )
+    .expect("canonical candidate binary");
+    let mut signature = [0; 4];
+    fs::File::open(&candidate)
+        .expect("open candidate binary")
+        .read_exact(&mut signature)
+        .expect("read candidate signature");
+    assert_eq!(&signature, b"\x7fELF", "candidate must be a real ELF");
+    let mut harness = ObservationTestHarness::new().await;
+    let parent = || {
+        ManagedParentConnectionConfig::new(
+            harness.reconnect_config(),
+            harness.backend_pid,
+            &harness.project_root,
+        )
+    };
+    let server_a = harness.build_full_mcp_server(parent());
+    let server_b = harness.build_full_mcp_server(parent());
+    for (thread, server) in [(THREAD_A, &server_a), (THREAD_B, &server_b)] {
+        harness.register_thread(
+            thread,
+            MockThreadState {
+                reported_id: thread.to_string(),
+                project_id: Some("proj_main".to_string()),
+                title: "Upgrade fixture".to_string(),
+                cwd: harness.project_root.to_string_lossy().into_owned(),
+                status_json: json!({"type": "idle"}),
+                model: None,
+                effort: None,
+                artificial_delay: Duration::ZERO,
+                disconnect_immediately: false,
+            },
+            server,
+        );
+    }
+    let first = server_a
+        .invoke_tool_json(
+            "connect_current_chat",
+            json!({}),
+            Some(json!({"threadId": THREAD_A})),
+        )
+        .await
+        .expect("initial connection to current supervisor")
+        .structured_content
+        .expect("structured connection");
+    let binding_a = first["data"]["binding_id"]
+        .as_str()
+        .expect("binding A")
+        .to_string();
+    server_a.stop_native_chat_sampler();
+    harness
+        ._supervisor
+        .take()
+        .expect("supervisor")
+        .shutdown()
+        .await;
+
+    let mut old = tokio::process::Command::new(previous)
+        .env_clear()
+        .arg("serve")
+        .arg("--state-dir")
+        .arg(&harness.state_dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("start owned previous-release supervisor");
+    let old_pid = old.id().expect("old supervisor pid");
+    let (old_client, old_info) = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Ok(client) = SupervisorClient::from_state_dir(&harness.state_dir) {
+                if let Ok(info) = client.control_runtime_info().await {
+                    break (client, info);
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("previous supervisor readiness");
+    assert_eq!(old_info.pid, old_pid);
+    assert!(old_info.capabilities.guarded_worker_backlog);
+    assert!(!old_info.capabilities.worker_notice_context);
+    assert!(old_info.capabilities.idle_retire);
+
+    let scoped_a = ScopedClient::from_state_dir(&harness.state_dir, &binding_a)
+        .expect("old supervisor scoped client");
+    let run = scoped_a
+        .start_demo(
+            "paired-busy-demo".to_string(),
+            "Keep the owned previous supervisor busy".to_string(),
+            Some(5_000),
+        )
+        .await
+        .expect("start owned busy demo");
+    for (thread, server) in [(THREAD_A, &server_a), (THREAD_B, &server_b)] {
+        let failure = server
+            .invoke_tool_json(
+                "connect_current_chat",
+                json!({}),
+                Some(json!({"threadId": thread})),
+            )
+            .await
+            .expect_err("busy old runtime must refuse both connection paths")
+            .structured_content
+            .expect("structured refusal");
+        assert_eq!(failure["error"]["code"], "unsupported_capability");
+        assert!(failure["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("runtime_busy")));
+    }
+    assert_eq!(
+        harness
+            .pairing_store
+            .inspect_epoch(server_a.connection_nonce(), server_a.epoch_id())
+            .expect("existing epoch")
+            .state,
+        ConnectionEpochState::Enrolled
+    );
+    assert_eq!(
+        harness
+            .pairing_store
+            .inspect_epoch(server_b.connection_nonce(), server_b.epoch_id())
+            .expect("new epoch")
+            .state,
+        ConnectionEpochState::Unbound
+    );
+    server_b
+        .invoke_tool_json(
+            "backlog_create",
+            json!({
+                "command_key": "must-not-create",
+                "title": "Blocked first item",
+                "acceptance_condition": "Must remain uncreated",
+                "delivery_description": "No delivery",
+                "kind": "worker"
+            }),
+            Some(json!({"threadId": THREAD_B})),
+        )
+        .await
+        .expect_err("unbound connection cannot create a backlog item");
+    assert_eq!(
+        old_client
+            .list_bindings()
+            .await
+            .expect("old bindings")
+            .len(),
+        1
+    );
+    assert!(scoped_a
+        .list_backlog_items(None, Some(10))
+        .await
+        .expect("old backlog")
+        .items
+        .is_empty());
+    assert!(!scoped_a
+        .get_run(run.run_id.clone())
+        .await
+        .expect("original run survives both refusals")
+        .status
+        .is_terminal());
+    assert_eq!(
+        old_client
+            .control_runtime_info()
+            .await
+            .expect("old info")
+            .pid,
+        old_pid
+    );
+
+    let cancelled = scoped_a
+        .cancel(
+            "paired-demo-cancel".to_string(),
+            run.run_id.clone(),
+            Some("owned test cleanup".to_string()),
+        )
+        .await
+        .expect("cancel owned demo");
+    assert_eq!(cancelled.status, threadlane_core::RunStatus::Cancelled);
+    for round in 0..10 {
+        let batch = scoped_a.pull_events(None, Some(50)).await.expect("events");
+        if batch.events.is_empty() {
+            break;
+        }
+        scoped_a
+            .ack_events(format!("paired-demo-ack-{round}"), batch.batch_id)
+            .await
+            .expect("ack owned test events");
+    }
+    let fixture_executable = harness
+        .anchor_exe
+        .parent()
+        .expect("fixture bin directory")
+        .join("threadlane");
+    fs::copy(&candidate, &fixture_executable).expect("copy candidate into fixture");
+    let _cleanup = FixtureSuccessorCleanup {
+        state_dir: harness.state_dir.clone(),
+        executable: fixture_executable,
+    };
+    let second = server_b
+        .invoke_tool_json(
+            "connect_current_chat",
+            json!({}),
+            Some(json!({"threadId": THREAD_B})),
+        )
+        .await
+        .expect("new connection upgrades the now-idle old supervisor")
+        .structured_content
+        .expect("new connection response");
+    let binding_b = second["data"]["binding_id"]
+        .as_str()
+        .expect("binding B")
+        .to_string();
+    server_b.stop_native_chat_sampler();
+    assert!(tokio::time::timeout(Duration::from_secs(5), old.wait())
+        .await
+        .expect("old supervisor exits")
+        .expect("wait old supervisor")
+        .success());
+    server_a
+        .invoke_tool_json(
+            "connect_current_chat",
+            json!({}),
+            Some(json!({"threadId": THREAD_A})),
+        )
+        .await
+        .expect("existing connection reuses the upgraded supervisor");
+    server_a.stop_native_chat_sampler();
+    let current = SupervisorClient::from_state_dir(&harness.state_dir).expect("current client");
+    let current_info = current.control_runtime_info().await.expect("current info");
+    assert_ne!(current_info.pid, old_pid);
+    assert!(current_info.capabilities.worker_notice_context);
+    assert_eq!(
+        current
+            .list_bindings()
+            .await
+            .expect("current bindings")
+            .len(),
+        2
+    );
+    let scoped_b = ScopedClient::from_state_dir(&harness.state_dir, &binding_b)
+        .expect("new supervisor scoped client");
+    assert!(scoped_b
+        .list_backlog_items(None, Some(10))
+        .await
+        .expect("new backlog remains empty")
+        .items
+        .is_empty());
+    current
+        .retire_idle_control_runtime(&ControlRuntimeRetireRequest {
+            expected_protocol_version: current_info.protocol_version,
+            expected_instance_id: current_info.instance_id,
+            expected_pid: current_info.pid,
+        })
+        .await
+        .expect("retire this fixture's successor");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while is_process_alive(current_info.pid) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("fixture successor exits cleanly");
 }
 
 #[tokio::test]

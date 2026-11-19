@@ -220,6 +220,7 @@ async fn baseline_info_reports_bounded_identity_role_capabilities_and_no_secret(
     assert!(info.capabilities.scoped_backlog);
     assert!(info.capabilities.event_pull_ack);
     assert!(info.capabilities.guarded_worker_backlog);
+    assert!(info.capabilities.worker_notice_context);
     assert!(info.capabilities.idle_retire);
     assert!(!info.capabilities.approved_host_control);
 
