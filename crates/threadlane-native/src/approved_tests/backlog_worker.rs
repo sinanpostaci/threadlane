@@ -568,6 +568,179 @@ async fn guarded_worker_backlog_tools_are_registered_with_strict_bounded_inputs(
 }
 
 #[tokio::test]
+async fn worker_notice_observation_correlates_only_successful_scoped_receipts() {
+    use threadlane::operator_backlog::{
+        OperatorWorkerBacklogRequest, OperatorWorkerBacklogResponse,
+    };
+    use threadlane_core::observation::{
+        read_journal_records_readonly, ObservationCallState, ObservationRecordPhase,
+    };
+    use threadlane_core::WorkerBacklogDispatchReceipt;
+
+    let fixture = setup_approved_mcp_fixture().await;
+    let (plan_revision, plan_digest) = create_published_plan(
+        &fixture,
+        "plan-notice-observation",
+        &fixture.binding_a,
+        default_plan_tasks("private fixture instruction"),
+    );
+    let approval = approve_published_plan(
+        &fixture,
+        "plan-notice-observation",
+        plan_revision,
+        &plan_digest,
+        &fixture.binding_a,
+        THREAD_UUID_A,
+        vec!["task-root-agy".to_string()],
+        1_700_002_002_000,
+    );
+    let authority = fixture
+        .authority
+        .get_for_operator(&approval.approval_id)
+        .expect("fixture approval");
+    let task = authority
+        .tasks
+        .iter()
+        .find(|task| task.task_id == "task-root-agy")
+        .expect("fixture task");
+    let mcp = live_mcp(&fixture);
+    enroll_server(&fixture, &mcp, &fixture.binding_a, THREAD_UUID_A).await;
+    let foreign = live_mcp(&fixture);
+    enroll_server(&fixture, &foreign, &fixture.binding_b, THREAD_UUID_B).await;
+    let (item_id, item_revision) =
+        create_worker_item(&mcp, "observation-item", "Observation fixture").await;
+
+    // Seed a durable dispatch through the fixture's trusted operator transport. No
+    // host, provider, process or actual Worker is started for this observation test.
+    let supervisor =
+        SupervisorClient::from_state_dir(&fixture.state_dir).expect("fixture supervisor");
+    let reserve = supervisor
+        .worker_backlog_operator_attested(&OperatorWorkerBacklogRequest::Reserve {
+            binding_id: fixture.binding_a.clone(),
+            thread_uuid: THREAD_UUID_A.to_string(),
+            command_key: "observation-reserve".to_string(),
+            item_id: item_id.clone(),
+            expected_revision: item_revision,
+            authority: WorkerBacklogAuthority {
+                approval_id: approval.approval_id.clone(),
+                subject_digest: authority.subject_digest.clone(),
+                task_id: task.task_id.clone(),
+                task_digest: task.task_digest.clone(),
+            },
+        })
+        .await
+        .expect("seed reservation");
+    let OperatorWorkerBacklogResponse::Execution { execution } = reserve else {
+        panic!("reservation response must contain execution");
+    };
+    supervisor
+        .worker_backlog_operator_attested(&OperatorWorkerBacklogRequest::AttachDispatchReceipt {
+            binding_id: fixture.binding_a.clone(),
+            thread_uuid: THREAD_UUID_A.to_string(),
+            command_key: "observation-attach".to_string(),
+            item_id: item_id.clone(),
+            execution_ref: execution.execution_ref,
+            expected_revision: execution.reservation_revision,
+            receipt: WorkerBacklogDispatchReceipt {
+                session_binding_id: "bnd_fixture_session".to_string(),
+                run_id: "run_fixture_notice".to_string(),
+                worker_id: "wrk_fixture_notice".to_string(),
+                profile_id: task.profile_id.clone().expect("frozen Worker profile"),
+                execution_binding_digest: None,
+            },
+        })
+        .await
+        .expect("seed attached receipt");
+    let before_item = get_item(&mcp, &item_id).await;
+    let before_history = get_history(&mcp, &item_id).await;
+    let before_batches = event_batch_row_count(&fixture.state_dir, &fixture.binding_a);
+
+    mcp.invoke_tool_json(
+        "backlog_worker_notice_context",
+        json!({"approval_id": approval.approval_id}),
+        None,
+    )
+    .await
+    .expect("scoped notice recovery");
+    let denied = foreign
+        .invoke_tool_json(
+            "backlog_worker_notice_context",
+            json!({"approval_id": approval.approval_id}),
+            None,
+        )
+        .await
+        .expect_err("foreign notice recovery");
+    assert_eq!(
+        denied.structured_content.unwrap()["error"]["code"],
+        "scope_mismatch"
+    );
+    mcp.wait_for_observation_journal_idle_for_test().await;
+    foreign.wait_for_observation_journal_idle_for_test().await;
+    let (journal, warnings) =
+        read_journal_records_readonly(&fixture.state_dir).expect("read observation journal");
+    assert!(warnings.is_empty());
+    let observations: Vec<_> = journal
+        .iter()
+        .filter(|record| record.operation == "mcp.paired.backlog_worker_notice_context")
+        .collect();
+    assert_eq!(observations.len(), 4);
+    let owner_entry = observations
+        .iter()
+        .find(|record| {
+            record.binding_id.as_deref() == Some(fixture.binding_a.as_str())
+                && record.phase == ObservationRecordPhase::Entry
+        })
+        .expect("owner entry");
+    let owner_finish = observations
+        .iter()
+        .find(|record| {
+            record.binding_id.as_deref() == Some(fixture.binding_a.as_str())
+                && record.phase == ObservationRecordPhase::Finish
+        })
+        .expect("owner finish");
+    assert_eq!(owner_entry.request_id, owner_finish.request_id);
+    assert_eq!(owner_entry.thread_uuid.as_deref(), Some(THREAD_UUID_A));
+    assert_eq!(owner_entry.state, ObservationCallState::Running);
+    assert_eq!(owner_entry.approval_id, None);
+    assert_eq!(owner_finish.state, ObservationCallState::Completed);
+    assert_eq!(
+        owner_finish.approval_id.as_deref(),
+        Some(approval.approval_id.as_str())
+    );
+    let foreign_records: Vec<_> = observations
+        .iter()
+        .filter(|record| record.binding_id.as_deref() == Some(fixture.binding_b.as_str()))
+        .collect();
+    assert_eq!(foreign_records.len(), 2);
+    assert!(foreign_records
+        .iter()
+        .all(
+            |record| record.thread_uuid.as_deref() == Some(THREAD_UUID_B)
+                && record.approval_id.is_none()
+                && record.task_id.is_none()
+        ));
+    assert!(foreign_records
+        .iter()
+        .any(|record| record.phase == ObservationRecordPhase::Finish
+            && record.state == ObservationCallState::Failed));
+    let journal_text =
+        serde_json::to_string(&observations).expect("serialize bounded observations");
+    assert!(!journal_text.contains("private fixture instruction"));
+    assert!(!journal_text.contains(&authority.subject_digest));
+    assert!(!journal_text.contains(&task.task_digest));
+    assert!(!serde_json::to_string(&foreign_records)
+        .unwrap()
+        .contains(&approval.approval_id));
+    assert_worker_state_unchanged(&mcp, &item_id, &before_item, &before_history).await;
+    assert_eq!(
+        event_batch_row_count(&fixture.state_dir, &fixture.binding_a),
+        before_batches
+    );
+    assert_eq!(read_invocation_count(&fixture.agy_count_file), 0);
+    assert!(!fixture.sessions_dir.join(&approval.approval_id).exists());
+}
+
+#[tokio::test]
 async fn guarded_worker_backlog_start_result_complete_duplicate_stopped_and_replay() {
     let fixture = setup_approved_mcp_fixture().await;
     let (plan_revision, plan_digest) = create_published_plan(

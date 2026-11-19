@@ -3965,7 +3965,18 @@ impl PairedMcpServer {
                 enrollment.binding_id.clone(),
                 enrollment.thread_id.clone(),
             );
-            match service
+            // The caller's approval hint is not yet scope-verified. Correlate only
+            // a successful, binding-checked response on Finish, never the Entry.
+            let observation = self
+                .begin_paired_observation(
+                    &enrollment.binding_id,
+                    &enrollment.thread_id,
+                    WORKER_BACKLOG_NOTICE_CONTEXT_TOOL,
+                    None,
+                    None,
+                )
+                .await;
+            let res = match service
                 .notice_context(
                     &enrollment.binding_id,
                     &enrollment.thread_id,
@@ -3985,7 +3996,9 @@ impl PairedMcpServer {
                     error.code(),
                     error.message(),
                 )),
-            }
+            };
+            self.finish_paired_observation(observation, &res).await;
+            res
         })
     }
 
@@ -5864,7 +5877,7 @@ fn observation_result_job_id(
     }
 }
 
-/// Reads an approval correlation only from our successful, binding-scoped execution gateway response.
+/// Reads an approval correlation only from a successful, binding-scoped response.
 fn observation_result_approval_id(
     tool_name: &str,
     binding_id: &str,
@@ -5886,6 +5899,17 @@ fn observation_result_approval_id(
             }
             let raw_approval_id = data.get("approval_id").and_then(Value::as_str)?;
             threadlane_core::observation::validate_correlation_id(raw_approval_id)
+        }
+        WORKER_BACKLOG_NOTICE_CONTEXT_TOOL => {
+            if payload.get("tool")?.as_str()? != WORKER_BACKLOG_NOTICE_CONTEXT_TOOL {
+                return None;
+            }
+            let execution = data.get("execution")?;
+            if execution.get("binding_id")?.as_str()? != binding_id {
+                return None;
+            }
+            let approval_id = execution.get("authority")?.get("approval_id")?.as_str()?;
+            threadlane_core::observation::validate_correlation_id(approval_id)
         }
         _ => None,
     }
@@ -6038,6 +6062,45 @@ mod observation_correlation_tests {
             observation_result_plan_id("planning_command", "bnd_a", &pcmd).as_deref(),
             Some("plan_orch_1")
         );
+    }
+
+    #[test]
+    fn notice_approval_correlation_requires_success_and_matching_binding() {
+        let tool = WORKER_BACKLOG_NOTICE_CONTEXT_TOOL;
+        let valid = Ok(ThreadlaneMcpServer::build_structured_tool_result(
+            "bnd_a",
+            tool,
+            json!({"execution": {"binding_id": "bnd_a", "authority": {"approval_id": "apr_original"}}}),
+        ));
+        assert_eq!(
+            observation_result_approval_id(tool, "bnd_a", &valid).as_deref(),
+            Some("apr_original")
+        );
+        assert_eq!(observation_result_approval_id(tool, "bnd_b", &valid), None);
+        let wrong_inner = Ok(ThreadlaneMcpServer::build_structured_tool_result(
+            "bnd_a",
+            tool,
+            json!({"execution": {"binding_id": "bnd_b", "authority": {"approval_id": "apr_foreign"}}}),
+        ));
+        assert_eq!(
+            observation_result_approval_id(tool, "bnd_a", &wrong_inner),
+            None
+        );
+        let wrong_tool = Ok(ThreadlaneMcpServer::build_structured_tool_result(
+            "bnd_a",
+            "other_tool",
+            json!({"execution": {"binding_id": "bnd_a", "authority": {"approval_id": "apr_original"}}}),
+        ));
+        assert_eq!(
+            observation_result_approval_id(tool, "bnd_a", &wrong_tool),
+            None
+        );
+        let failed = Err(CallToolResult::structured_error(
+            json!({"binding_id":"bnd_a", "data": {
+                "execution": {"binding_id": "bnd_a", "authority": {"approval_id": "apr_foreign"}}
+            }}),
+        ));
+        assert_eq!(observation_result_approval_id(tool, "bnd_a", &failed), None);
     }
 
     #[tokio::test]
