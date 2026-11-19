@@ -250,13 +250,16 @@ complete/reject. No fixed wall-clock guarantee follows from client-tagged reason
 physical/MCP time. Use the current guide’s template version and source digest to verify `threadlane closure-template` from the
 trusted offline packaged CLI (not a prerequisite file in `~/.agents`; offline
 JSON with source SHA-256 and a pure JavaScript factory, distinct closure version
-`2026-11-16.v4`); once source and SHA-256 are verified, do not repeat
+`2026-11-19.v1`); once source and SHA-256 are verified, do not repeat
 declaration, repo, or global-skill searches. Create the storage-only `worker`
 backlog item first with `backlog_create` (creation grants no authority),
 prepare and retain its serializable capsule before `backlog_worker_start`, evaluate only
 that trusted source in a fresh isolate, and use the small `createOrdinaryClosureClient`
-helper around the preserved `read`/`doneView` core. Use `readNotice(NOTICE_APPROVAL_ID)` for a notice and `readStored()` for original no-notice recovery. Each revalidates the
-exact current context, raw start, and prep binding before any effect, keeps full raw
+helper around the preserved `read`/`doneView` core. For a notice, copy the live guide
+callback with the actual ID, verified paired `cli_package`, and live guide source
+digest. `readNotice` verifies the packaged source and scoped original execution,
+recovers absent state and refuses conflicting cache. `readStored()` remains available
+for original no-notice recovery. Active reads keep full raw
 evidence/report/correlation private, and returns a compact view with current identity,
 technical guard facts, verified event counts/ACK cursor, and the exact physical text.
 Its `completeStored(ACCEPTANCE_CONTEXT)` moves all current correlation/revision/ref/digest
@@ -264,14 +267,15 @@ checks before one guarded complete, retains completion intent and the exact rece
 reuses only a matching validated retained Done; missing, error, or unknown replies never
 retry or fabricate `Done`. COPY the literal recipes and bind only their one typed object
 (`APPROVED_TASK_CONTEXT` before start, `ACCEPTANCE_CONTEXT` after the separate semantic
-decision); bind the actual notice approval ID at callback. Never parse, compile, or evaluate Markdown or
+decision); bind the actual notice ID and verified package/guide pins at callback. Never parse, compile, or evaluate Markdown or
 fences, and do not repeatedly inspect declarations. `exec_command` returns
 `{exit_code, output, session_id?}`; `text`/`store` return undefined; `load` restores
 serialized data in a fresh isolate; ambient logging is absent. Never print the capsule
 JavaScript, and reject changed immutable execution fields, an inner EventBatch above
 49152 UTF-8 bytes, or an invalid `step_seq` before ACK. After a validated Done, finish
-briefly without raw SDK introspection or repeat pull/ACK of the original notice; a
-genuinely new notice still needs supported actual recovery. See
+briefly without raw SDK introspection. Late notices verify durable Done and ACK only
+actual validated nonempty events; a stopped host leaves event delivery unverified.
+Only `legacy_events` permits the legacy pull/ACK route. See
 `docs/ORDINARY-WORKER-CLOSURE.md`.
 
 Use the guarded paired tools only with real enrollment and the exact frozen

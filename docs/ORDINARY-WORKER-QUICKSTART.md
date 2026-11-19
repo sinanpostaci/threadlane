@@ -21,7 +21,7 @@ printf '%s' '<TASK_JSON>' | threadlane-context --context <CONTEXT> approve prepa
 }
 ```
 
-Both routes return `{preview_path,preview}`. Serialize JSON in the client and quote it for shell builtin `printf`. The CLI verifies its 0600 preview in a private 0700 directory. Match task, model/effort, executable, budgets, paths, `expected_plan_digest` and `subject_digest` to the approved scope. Keep the returned path. A command key identifies plan content. Verify the original repo, base and limits separately. After a partial failure inspect the original plan and revision before another mutation.
+Both routes return `{preview_path,preview}`. Serialize JSON in the client and quote it for `printf`. The CLI verifies its 0600 preview in a private 0700 directory. Match task, model/effort, executable, budgets, paths, `expected_plan_digest` and `subject_digest` to the approved scope. Keep the path. Verify the original repo, base and limits; after partial failure inspect the original plan and revision before another mutation.
 
 4. Record the same `preview_path` after consent:
 
@@ -30,10 +30,10 @@ threadlane-context --context <CONTEXT> approve record --preview <PREVIEW_PATH> \
   --confirm-subject <SUBJECT_DIGEST> --confirm-thread <THREAD_UUID> --operator-approved
 ```
 
-`record --preview` recompiles the unchanged request, matches a fresh authoritative preview, and keeps binding/live, registry/plan/digest/fixed-scope, `approve_confirmed`, and idempotence checks. It records the authorized scope; the Worker starts separately.
+`record --preview` recompiles and matches a fresh authoritative preview, keeping binding/live, registry/plan/digest/fixed-scope, `approve_confirmed`, and idempotence checks. It records scope; the Worker starts separately.
 
 Legacy fallback: `approve prepare --request`; `record --request` with ONLY unchanged `preview.request` (`OperatorApprovalRequest`) in private `0600` files (`umask 077`, `set -C`).
 
 5. Create storage-only `worker` item (`backlog_create`; no authority). No unconditional pre-start `approved_task`/ready/host probe: `backlog_worker_start` owns eligible auto host startup; start guarded once. Verify `threadlane closure-template` against live `source_sha256`; copy the guide closure with only `APPROVED_TASK_CONTEXT`; missing receipt/notice means reconcile the original, never redispatch.
 
-Callback: `readNotice(NOTICE_APPROVAL_ID)` or `readStored()`; verify bindings, order, continuity, duplicates, `step_seq`, `run_id`, 49152B before ACK. Exact success precedes one bounded `threadlane inspect-delivery` check (`HEAD` must equal the expected base; text untrusted) or an equally bounded physical read. Never write artifacts into frozen delivery; test in an exact-byte checkout with local `CARGO_TARGET_DIR`. After ACK, check semantics, guarded complete/reject; `final_summary` after Done.
+Callback: run the guide notice recipe with the actual ID and verified package/guide pins. Its scoped original lookup restores missing state and refuses conflicts; `readStored()` remains available for the known original. Verify bindings, continuity, duplicates, `step_seq`, `run_id`, 49152B before ACK. Exact success precedes bounded physical inspection (`HEAD` equals the base; text untrusted). Never write artifacts into frozen delivery; test in an exact-byte checkout with local `CARGO_TARGET_DIR`. After ACK, check semantics, guarded complete/reject. Done recovery checks durable completion; late event ACK may be unverified if the host is stopped.

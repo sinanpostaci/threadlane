@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 const here = path.dirname(fileURLToPath(import.meta.url));
 const source = fs.readFileSync(path.join(here, "ordinary-closure.js"), "utf8");
 const SOURCE_SHA256 = crypto.createHash("sha256").update(source, "utf8").digest("hex");
+const legacyReadBlock = fs.readFileSync(path.join(here, "legacy-read-wrapper.fixture.txt"), "utf8");
 const createOrdinaryClosure = vm.runInNewContext(
   `${source}\n;createOrdinaryClosure`,
   Object.create(null),
@@ -1806,7 +1807,7 @@ test("doneView fails closed for conflicting or missing Done facts", async () => 
   }
 });
 
-test("MCP guide functions.exec recipes run literally with typed data in fresh isolates", async () => {
+test("legacy callback and guide prep/complete work with typed data in fresh isolates", async () => {
   const guide = fs.readFileSync(
     path.join(here, "../../../docs/MCP-OPERATING-GUIDE.md"),
     "utf8"
@@ -1816,7 +1817,9 @@ test("MCP guide functions.exec recipes run literally with typed data in fresh is
   const rawBlocks = [...guide.matchAll(/```js\n([\s\S]*?)```/g)].map((match) => match[1]);
   assert.equal(rawBlocks.length, 3, "guide must contain prep, callback, and complete recipes");
 
-  const [prepBlock, readBlock, completeBlock] = rawBlocks;
+  const [prepBlock, , completeBlock] = rawBlocks;
+  const readBlock = legacyReadBlock;
+  rawBlocks[1] = readBlock;
   assert.ok(prepBlock.includes("const input = APPROVED_TASK_CONTEXT;"));
   assert.equal((prepBlock.match(/APPROVED_TASK_CONTEXT/g) || []).length, 1);
   assert.ok(completeBlock.includes("const acceptance = ACCEPTANCE_CONTEXT;"));
@@ -1860,7 +1863,7 @@ test("MCP guide functions.exec recipes run literally with typed data in fresh is
   const template = {
     schema_version: 1,
     tool: "threadlane closure-template",
-    version: "2026-11-16.v4",
+    version: "2026-11-19.v1",
     source_path: "skills/threadlane/references/ordinary-closure.js",
     source_sha256: SOURCE_SHA256,
     factory_name: "createOrdinaryClosure",
@@ -2077,7 +2080,9 @@ test("MCP guide functions.exec recipes run literally with typed data in fresh is
 
 function documentRecipeBlocks(documentPath) {
   const document = fs.readFileSync(documentPath, "utf8");
-  return [...document.matchAll(/```js\n([\s\S]*?)```/g)].map((match) => match[1]);
+  const blocks = [...document.matchAll(/```js\n([\s\S]*?)```/g)].map((match) => match[1]);
+  blocks[1] = legacyReadBlock;
+  return blocks;
 }
 
 function makeGuideEnvironment(
@@ -2088,7 +2093,7 @@ function makeGuideEnvironment(
   const template = {
     schema_version: 1,
     tool: "threadlane closure-template",
-    version: "2026-11-16.v4",
+    version: "2026-11-19.v1",
     source_path: "skills/threadlane/references/ordinary-closure.js",
     source_sha256: SOURCE_SHA256,
     factory_name: "createOrdinaryClosure",
@@ -2464,7 +2469,7 @@ test("MCP guide completion refuses stale, missing, or changed report correlation
   }
 });
 
-test("MCP documents refuse mixed prep input/start bindings before any callback or completion effect", async () => {
+test("legacy callback refuses mixed prep input/start bindings before effects", async () => {
   const documents = [
     ["MCP guide", path.join(here, "../../../docs/MCP-OPERATING-GUIDE.md")],
     ["closure doc", path.join(here, "../../../docs/ORDINARY-WORKER-CLOSURE.md")]
@@ -3447,8 +3452,9 @@ test("closure client wrappers stay compact, identical, and within document byte 
   assert.ok(Buffer.byteLength(guide, "utf8") <= 16384, "guide stays within 16384 UTF-8 bytes");
   assert.ok(Buffer.byteLength(quickstart, "utf8") <= 4096, "quickstart stays within 4096 UTF-8 bytes");
 
-  const guideBlocks = documentRecipeBlocks(guidePath);
-  const closureBlocks = documentRecipeBlocks(closurePath);
+  const readBlocks = (p) => [...fs.readFileSync(p, "utf8").matchAll(/```js\n([\s\S]*?)```/g)].map((m) => m[1]);
+  const guideBlocks = readBlocks(guidePath);
+  const closureBlocks = readBlocks(closurePath);
   assert.equal(guideBlocks.length, 3);
   assert.equal(closureBlocks.length, 3);
   assert.equal(guideBlocks[1], closureBlocks[1], "read wrappers are identical");
@@ -3465,8 +3471,8 @@ test("closure client wrappers stay compact, identical, and within document byte 
     ["complete", guideBlocks[2]]
   ]) {
     assert.ok(
-      Buffer.byteLength(block, "utf8") <= 1800,
-      `${label} program body stays within 1800 UTF-8 bytes, got ${Buffer.byteLength(block, "utf8")}`
+      Buffer.byteLength(block, "utf8") <= 2200,
+      `${label} program body stays within 2200 UTF-8 bytes, got ${Buffer.byteLength(block, "utf8")}`
     );
   }
 });
@@ -3613,3 +3619,230 @@ function makeDoneReceipt(
     }
   };
 }
+
+// The public notice recipe is tested independently of the legacy wrapper above.
+function makeRecoveredGuide() {
+  const env = makeGuideEnvironment();
+  const document = fs.readFileSync(path.join(here, "../../../docs/MCP-OPERATING-GUIDE.md"), "utf8");
+  const block = [...document.matchAll(/```js\n([\s\S]*?)```/g)][1][1];
+  let context = {
+    execution: clone(START_EXECUTION),
+    scope: {base_commit: BASE, requested_model: MODEL, requested_effort: EFFORT, write_paths: [WRITE_PATHS[0]]},
+    item_snapshot: {item_id: ITEM, revision: START_EXECUTION.reservation_revision, status: "doing", current_execution_ref: EXEC}
+  };
+  let override = null;
+  let lookups = 0;
+  const tools = {...env.tools,
+    mcp__threadlane__backlog_worker_notice_context: async ({approval_id}) => {
+      lookups += 1;
+      assert.equal(approval_id, APPROVAL);
+      return override || env.sdk("backlog_worker_notice_context", clone(context));
+    }
+  };
+  const run = async (activeTools = tools, vars = {}) => vm.runInNewContext(
+    `(async () => {\n${block}\n})()`, {
+      tools: activeTools,
+      load: (key) => env.stored.has(key) ? JSON.parse(env.stored.get(key)) : undefined,
+      store: async (key, value) => { env.stored.set(key, JSON.stringify(value)); },
+      text: (value) => env.texts.push(value),
+      NOTICE_APPROVAL_ID: APPROVAL,
+      NOTICE_CLI_PACKAGE: "/trusted",
+      NOTICE_SOURCE_SHA256: SOURCE_SHA256,
+      ...vars
+    }
+  );
+  return {env, tools, run, setContext: (value) => { context = value; }, getContext: () => clone(context),
+    setOverride: (value) => {override = value;}, getLookups: () => lookups};
+}
+
+const TEMPORARY_KEYS = ["approved-task-context", "closure-template", "start-receipt", "start-binding"].map(
+  (name) => `threadlane/${name}.json`
+);
+
+test("public notice recipe recovers all missing state from the original scoped record", async () => {
+  const fixture = makeRecoveredGuide();
+  await fixture.env.runRecipe(0, {APPROVED_TASK_CONTEXT: clone(fixture.env.approvedContext)});
+  for (const key of TEMPORARY_KEYS) fixture.env.stored.set(key, "null");
+  const before = clone(fixture.env.calls);
+  await fixture.run();
+  const view = JSON.parse(fixture.env.texts.at(-1));
+  assert.equal(view.status, "ready_for_semantic_review");
+  assert.equal(view.authority_granted, false);
+  assert.equal(fixture.getLookups(), 1);
+  assert.equal(fixture.env.calls.start, before.start);
+  assert.equal(fixture.env.calls.pull, before.pull + 1);
+  assert.equal(fixture.env.calls.ack, before.ack + 1);
+  assert.equal(fixture.env.calls.result, before.result + 1);
+  assert.equal(fixture.env.calls.inspect, before.inspect + 1);
+  for (const key of TEMPORARY_KEYS) assert.notEqual(JSON.parse(fixture.env.stored.get(key)), null, key);
+  await fixture.env.runRecipe(2, {ACCEPTANCE_CONTEXT: clone(fixture.env.acceptanceContext)});
+  assert.equal(fixture.env.calls.complete, 1, "semantic acceptance remains separate");
+  assert.equal(JSON.parse(fixture.env.texts.at(-1)).status, "done");
+});
+
+test("recovered notice rejects conflicting frozen state and never clobbers it", async () => {
+  for (const [label, change] of [
+    ["foreign approval", (ctx) => {ctx.execution.authority.approval_id = "apr_" + "f".repeat(32);}],
+    ["foreign control", (ctx) => {ctx.execution.binding_id = "bnd_foreign";}],
+    ["stale ref", (ctx) => {ctx.item_snapshot.current_execution_ref = "wbe_stale";}],
+    ["model", (ctx) => {ctx.scope.requested_model = "other/model";}],
+    ["base", (ctx) => {ctx.scope.base_commit = "f".repeat(40);}],
+    ["path", (ctx) => {ctx.scope.write_paths = ["foreign.txt"]; }],
+    ["effort", (ctx) => {ctx.scope.requested_effort = "low";}]
+  ]) {
+    const fixture = makeRecoveredGuide();
+    await fixture.env.runRecipe(0, {APPROVED_TASK_CONTEXT: clone(fixture.env.approvedContext)});
+    const context = fixture.getContext(); change(context); fixture.setContext(context);
+    const before = new Map(fixture.env.stored); const calls = clone(fixture.env.calls);
+    await assert.rejects(fixture.run(), /mismatch|conflicts/, label);
+    assert.deepEqual(fixture.env.stored, before, `${label}: nothing overwritten`);
+    assert.equal(fixture.env.calls.pull, calls.pull, `${label}: no pull`);
+    assert.equal(fixture.env.calls.ack, calls.ack, `${label}: no ACK`);
+    assert.equal(fixture.env.calls.result, calls.result, `${label}: no result`);
+  }
+  const fixture = makeRecoveredGuide();
+  await fixture.env.runRecipe(0, {APPROVED_TASK_CONTEXT: clone(fixture.env.approvedContext)});
+  const badTemplate = JSON.parse(fixture.env.stored.get(TEMPORARY_KEYS[1]));
+  badTemplate.javascript += "\n// changed cached source";
+  fixture.env.stored.set(TEMPORARY_KEYS[1], JSON.stringify(badTemplate));
+  const before = new Map(fixture.env.stored);
+  await assert.rejects(fixture.run(), /retained template conflicts/);
+  assert.deepEqual(fixture.env.stored, before);
+  assert.equal(fixture.env.calls.pull, 0);
+});
+
+test("completed notice verifies durable completion and ACKs only real late events", async () => {
+  const fixture = makeRecoveredGuide();
+  await fixture.env.runRecipe(0, {APPROVED_TASK_CONTEXT: clone(fixture.env.approvedContext)});
+  await fixture.run();
+  await fixture.env.runRecipe(2, {ACCEPTANCE_CONTEXT: clone(fixture.env.acceptanceContext)});
+  const report = JSON.parse(fixture.env.stored.get("threadlane/closure-report.json"));
+  const completion = makeDoneReceipt(report).data.completion;
+  const context = fixture.getContext();
+  context.execution = clone(completion.execution);
+  context.item_snapshot = {item_id: ITEM, revision: completion.item.revision, status: "done", current_execution_ref: EXEC};
+  context.completion = clone(completion);
+  fixture.setContext(context);
+  for (const key of TEMPORARY_KEYS) fixture.env.stored.set(key, "null");
+  const counts = clone(fixture.env.calls);
+  const empty = makePage({pageNumber: 5, events: [], ackedSeq: 3});
+  await fixture.run({...fixture.tools, mcp__threadlane__approved_pull_events: async () => fixture.env.sdk("approved_pull_events", empty)});
+  let view = JSON.parse(fixture.env.texts.at(-1));
+  assert.equal(view.status, "done");
+  assert.equal(view.events.status, "verified");
+  assert.equal(view.events.acked_seq, 3);
+  assert.deepEqual(plain(view.events.batches), []);
+  assert.equal(fixture.env.calls.ack, counts.ack, "empty batch is not ACKed");
+  assert.equal(fixture.env.calls.result, counts.result);
+  assert.equal(fixture.env.calls.inspect, counts.inspect);
+  assert.equal(fixture.env.calls.complete, counts.complete);
+  assert.equal(fixture.env.calls.start, counts.start);
+  const late = makePage({pageNumber: 6, events: [makeEvent(4)], ackedSeq: 3});
+  let actualAck;
+  await fixture.run({...fixture.tools,
+    mcp__threadlane__approved_pull_events: async () => fixture.env.sdk("approved_pull_events", late),
+    mcp__threadlane__approved_ack_events: async (args) => {actualAck = args; return fixture.env.sdk("approved_ack_events", makeAckData(args.batch_id, 4, true));}
+  });
+  view = JSON.parse(fixture.env.texts.at(-1));
+  assert.equal(view.status, "done");
+  assert.equal(view.events.acked_seq, 4);
+  assert.equal(actualAck.batch_id, late.batch.batch_id);
+  assert.equal(fixture.env.calls.complete, counts.complete);
+  assert.equal(fixture.env.calls.result, counts.result);
+  assert.ok(fixture.env.stored.has(`threadlane/closure-after-done/${EXEC}/${late.batch.batch_id}/ack`));
+  await fixture.run({...fixture.tools, mcp__threadlane__approved_pull_events: async () => {throw new Error("host stopped");}});
+  view = JSON.parse(fixture.env.texts.at(-1));
+  assert.equal(view.status, "done");
+  assert.equal(view.events.status, "unverified");
+  assert.equal(view.events.acked_seq, null);
+  const tampered = clone(context); tampered.completion.execution.completion.delivery_digest = "f".repeat(64); fixture.setContext(tampered);
+  await assert.rejects(fixture.run(), /durable completion/);
+});
+
+test("only authenticated no_guarded_execution permits legacy handling; unknown refuses", async () => {
+  const fixture = makeRecoveredGuide();
+  const error = (code) => ({isError: true, structuredContent: {tool: "backlog_worker_notice_context", binding_id: CONTROL, error: {code}}});
+  fixture.setOverride(error("no_guarded_execution"));
+  await fixture.run();
+  assert.equal(JSON.parse(fixture.env.texts.at(-1)).status, "legacy_events");
+  for (const code of ["worker_effect_unknown", "foreign_binding", "ambiguous_execution", "stale_execution"]) {
+    fixture.setOverride(error(code));
+    await assert.rejects(fixture.run(), /refused; no legacy fallback/);
+  }
+  assert.equal(fixture.env.calls.pull, 0);
+  assert.equal(fixture.env.calls.complete, 0);
+});
+
+test("blocked original drains validated events without completion", async () => {
+  const fixture = makeRecoveredGuide();
+  const ctx = fixture.getContext();
+  ctx.item_snapshot.status = "blocked";
+  ctx.execution.outcome = {outcome: "failure", result_digest: null};
+  fixture.setContext(ctx);
+  await fixture.run();
+  const view = JSON.parse(fixture.env.texts.at(-1));
+  assert.equal(view.status, "blocked");
+  assert.equal(view.events.status, "verified");
+  assert.equal(fixture.env.calls.ack, 1);
+  assert.equal(fixture.env.calls.result, 0);
+  assert.equal(fixture.env.calls.inspect, 0);
+  assert.equal(fixture.env.calls.complete, 0);
+});
+
+test("live concurrent duplicate notices accept an already-ACKed real batch without a second completion", async () => {
+  const createClient = vm.runInNewContext(`${source}\n;createOrdinaryClosureClient`, Object.create(null));
+  const memory = new Map();
+  const template = {schema_version: 1, tool: "threadlane closure-template", version: "2026-11-19.v1",
+    source_path: "skills/threadlane/references/ordinary-closure.js", source_sha256: SOURCE_SHA256,
+    factory_name: "createOrdinaryClosure", javascript: source};
+  const snapshot = {execution: clone(START_EXECUTION),
+    scope: {base_commit: BASE, requested_model: MODEL, requested_effort: EFFORT, write_paths: [WRITE_PATHS[0]]},
+    item_snapshot: {item_id: ITEM, revision: 5, status: "doing", current_execution_ref: EXEC}};
+  let count = 0, release;
+  const gate = new Promise((resolve) => {release = resolve;});
+  let acks = 0, results = 0, inspections = 0, completions = 0;
+  const client = () => createClient({
+    load: (key) => memory.get(key), store: async (key, value) => memory.set(key, clone(value)),
+    bootstrap: {binary: "/trusted/bin/threadlane", expected_source_sha256: SOURCE_SHA256, template},
+    recover: async () => envelope("backlog_worker_notice_context", clone(snapshot)),
+    pull: async () => {
+      const n = ++count;
+      if (n === 2) release();
+      await gate;
+      return envelope("approved_pull_events", makePage({pageNumber: n, events: [makeEvent(1)], ackedSeq: 0}));
+    },
+    ack: async (args) => envelope("approved_ack_events", makeAckData(args.batch_id, 1, ++acks === 1)),
+    result: async () => {results += 1; return envelope("backlog_worker_result", makeResultData());},
+    inspect: async () => {inspections += 1; return makeInspection([WRITE_PATHS[0]]);},
+    complete: async () => {completions += 1; throw new Error("unexpected");}
+  });
+  const [first, second] = await Promise.all([client().readNotice(APPROVAL), client().readNotice(APPROVAL)]);
+  assert.equal(first.status, "ready_for_semantic_review");
+  assert.equal(second.status, "ready_for_semantic_review");
+  assert.equal(acks, 2);
+  assert.equal(results, 2);
+  assert.equal(inspections, 2);
+  assert.equal(completions, 0, "callbacks do not accept or complete");
+  assert.deepEqual([first.batches[0].advanced, second.batches[0].advanced].sort(), [false, true]);
+});
+
+test("duplicate notices on one client share the same in-flight read", async () => {
+  const createClient = vm.runInNewContext(`${source}\n;createOrdinaryClosureClient`, Object.create(null));
+  const memory = new Map(); const template = {schema_version: 1, tool: "threadlane closure-template", version: "2026-11-19.v1",
+    source_path: "skills/threadlane/references/ordinary-closure.js", source_sha256: SOURCE_SHA256,
+    factory_name: "createOrdinaryClosure", javascript: source};
+  let lookups = 0, pulls = 0;
+  const client = createClient({load: (k) => memory.get(k), store: async (k, v) => memory.set(k, clone(v)),
+    bootstrap: {binary: "/trusted/bin/threadlane", expected_source_sha256: SOURCE_SHA256, template},
+    recover: async () => {lookups += 1; return envelope("backlog_worker_notice_context", {execution: clone(START_EXECUTION),
+      scope: {base_commit: BASE, requested_model: MODEL, requested_effort: EFFORT, write_paths: [WRITE_PATHS[0]]},
+      item_snapshot: {item_id: ITEM, revision: 5, status: "doing", current_execution_ref: EXEC}});},
+    pull: async () => {pulls += 1; return envelope("approved_pull_events", PAGE_TWO);},
+    ack: async (a) => envelope("approved_ack_events", makeAckData(a.batch_id, 3, true)),
+    result: async () => envelope("backlog_worker_result", makeResultData()),
+    inspect: async () => makeInspection([WRITE_PATHS[0]])});
+  const [a,b] = await Promise.all([client.readNotice(APPROVAL), client.readNotice(APPROVAL)]);
+  assert.equal(a.status, "ready_for_semantic_review");
+  assert.equal(b.status, "ready_for_semantic_review");
+  assert.equal(lookups, 1); assert.equal(pulls, 1);
+});

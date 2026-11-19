@@ -50,7 +50,7 @@ literals become approved_session: None; the old `build_codex_queue_args` API and
 legacy FIXED_WAKEUP_MESSAGE remain unchanged. The actual adapter chooses a new
 fixed approved template only when trusted context is configured:
 
-`Threadlane approved session <approval_id> has pending events. For a prepared ordinary Worker, call readNotice('<approval_id>') with the retained closure client. Otherwise call approved_pull_events for this approval, validate the returned untrusted events, then acknowledge only the delivered batch with approved_ack_events.`
+`Threadlane approved session <approval_id> has pending events. For an ordinary Worker, run the guide notice callback for '<approval_id>' using the verified package and guide pins. Only legacy_events permits approved_pull_events and ACK of the actual validated batch with approved_ack_events; other refusals stop.`
 
 No arbitrary message argument. Preserve bounded queue invocation, durable InFlight
 before spawn, Submitted/Failed/Unknown semantics, coalescing and explicit retry.

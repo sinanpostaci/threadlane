@@ -24,7 +24,7 @@ pub const CLOSURE_TEMPLATE_SCHEMA_VERSION: u32 = 1;
 pub const CLOSURE_TEMPLATE_TOOL: &str = "threadlane closure-template";
 
 /// Canonical template version shared with the operating guide and skill metadata.
-pub const CLOSURE_TEMPLATE_VERSION: &str = "2026-11-16.v4";
+pub const CLOSURE_TEMPLATE_VERSION: &str = "2026-11-19.v1";
 
 /// Repository-relative path to the trusted packaged JavaScript template source.
 pub const CLOSURE_TEMPLATE_SOURCE_PATH: &str = "skills/threadlane/references/ordinary-closure.js";
@@ -95,7 +95,7 @@ mod tests {
         let template = render_closure_template();
         assert_eq!(template.schema_version, 1);
         assert_eq!(template.tool, "threadlane closure-template");
-        assert_eq!(template.version, "2026-11-16.v4");
+        assert_eq!(template.version, "2026-11-19.v1");
         assert_eq!(
             template.source_path,
             "skills/threadlane/references/ordinary-closure.js"

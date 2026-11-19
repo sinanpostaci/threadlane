@@ -50,7 +50,7 @@ opt-in only.
 
 `threadlane closure-template` prints the ordinary callback helper as
 offline JSON from the trusted offline packaged CLI (not a prerequisite file in
-`~/.agents`; schema/version `2026-11-16.v4`, source SHA-256, and the packaged
+`~/.agents`; schema/version `2026-11-19.v1`, source SHA-256, and the packaged
 JavaScript factory source). Once source and SHA-256 are verified, do not repeat
 declaration, repo, or global-skill searches. It needs no state directory,
 supervisor, provider, or network. Create the
@@ -58,15 +58,17 @@ storage-only `worker` backlog item first with `backlog_create`; creation grants 
 authority. Prepare and privately retain its serializable capsule before
 `backlog_worker_start` without printing the JavaScript. Evaluate only that immutable
 packaged source in a fresh client JavaScript isolate with injected
-load/store/pull/ACK/result/inspect and optional complete callbacks; never evaluate
+load/store/pull/ACK/result/inspect and optional complete/recover callbacks; never evaluate
 event, provider, or filesystem text. The capsule keeps the legacy `read`/`doneView`
 core and adds the small `createOrdinaryClosureClient` helper. COPY the literal
 recipes and bind only their one typed object (`APPROVED_TASK_CONTEXT` before start,
-`ACCEPTANCE_CONTEXT` after the separate semantic decision); bind the actual notice approval ID at callback. Never parse, compile, or evaluate Markdown or fences, and do not repeatedly
+`ACCEPTANCE_CONTEXT` after the separate semantic decision); bind the actual notice ID and verified package/guide pins at callback. Never parse, compile, or evaluate Markdown or fences, and do not repeatedly
 inspect declarations. The runnable recipe parses the actual `exec_command`
 `{exit_code, output, session_id?}` wrapper; `text`/`store` return undefined, and `load`
 restores serialized data in a fresh isolate. The capsule JavaScript is never printed.
-`readNotice(actualApprovalId)` and original no-notice recovery via `readStored()` reject stale, mixed, or failed-prep state before any effect, retains
+`readNotice(actualApprovalId)` recovers absent temporary state from the scoped original
+execution and frozen scope; conflicting cache refuses. Original no-notice recovery via
+`readStored()` retains its strict legacy checks. Active closure retains
 every actual returned DTO in private evidence, checks cross-page cursor continuity,
 rejects an inner EventBatch above 49152 UTF-8 bytes or an invalid event `step_seq`
 before ACK, and returns only a compact view with identity, guard facts, verified event
@@ -76,8 +78,10 @@ intent and the exact receipt, and reuses only a matching validated retained Done
 It accepts only a clean `exec_command` wrapper (exit `0`, no live session, complete
 output). Its read result is only `ready_for_semantic_review`; inspect the
 item-specific semantics separately, then use the existing guarded complete or reject.
-Its pure `doneView` formats a separately obtained Done receipt. After a validated Done,
-finish briefly without raw SDK introspection or repeat pull/ACK of the original notice;
+Its pure `doneView` formats a separately obtained Done receipt. A later notice verifies
+durable Done and ACKs actual validated nonempty events; a stopped host leaves event
+delivery unverified. Only `legacy_events` permits the legacy event route. After Done,
+finish briefly without raw SDK introspection;
 a genuinely new notice still needs supported actual recovery. The runnable client
 recipe is in the [MCP operating guide](MCP-OPERATING-GUIDE.md) and
 [`docs/ORDINARY-WORKER-CLOSURE.md`](ORDINARY-WORKER-CLOSURE.md). The ordinary
