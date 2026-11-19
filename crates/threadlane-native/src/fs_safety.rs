@@ -447,12 +447,11 @@ impl Drop for CrossProcessLockGuard {
     }
 }
 
-/// Acquires an exclusive cross-process `fs2` lock on `<dir>/<lock_filename>`.
-pub fn acquire_cross_process_lock(
+fn open_cross_process_lock_file(
     dir: &Path,
     lock_filename: &str,
     label: &str,
-) -> Result<CrossProcessLockGuard, NativeError> {
+) -> Result<File, NativeError> {
     ensure_platform_supported()?;
     let lock_path = dir.join(lock_filename);
     validate_private_file_path(&lock_path, label)?;
@@ -517,14 +516,7 @@ pub fn acquire_cross_process_lock(
                     ),
                 )
             })?;
-        file.lock_exclusive().map_err(|err| {
-            NativeError::new(
-                NativeErrorCode::IoError,
-                format!("failed to lock {label}: {}", sanitize_io_error(&err)),
-            )
-        })?;
-
-        Ok(CrossProcessLockGuard { file })
+        Ok(file)
     }
 
     #[cfg(not(unix))]
@@ -532,6 +524,47 @@ pub fn acquire_cross_process_lock(
         let _ = (lock_path, label);
         ensure_platform_supported()?;
         unreachable!()
+    }
+}
+
+fn cross_process_lock_error(label: &str, err: std::io::Error) -> NativeError {
+    NativeError::new(
+        NativeErrorCode::IoError,
+        format!("failed to lock {label}: {}", sanitize_io_error(&err)),
+    )
+}
+
+/// Acquires an exclusive cross-process `fs2` lock on `<dir>/<lock_filename>`.
+pub fn acquire_cross_process_lock(
+    dir: &Path,
+    lock_filename: &str,
+    label: &str,
+) -> Result<CrossProcessLockGuard, NativeError> {
+    let file = open_cross_process_lock_file(dir, lock_filename, label)?;
+    file.lock_exclusive()
+        .map_err(|err| cross_process_lock_error(label, err))?;
+    Ok(CrossProcessLockGuard { file })
+}
+
+/// Waits cooperatively on one validated file description and releases it on cancellation.
+pub(crate) async fn acquire_cross_process_lock_async(
+    dir: &Path,
+    lock_filename: &str,
+    label: &str,
+) -> Result<CrossProcessLockGuard, NativeError> {
+    use std::time::Duration;
+
+    const RETRY_DELAY: Duration = Duration::from_millis(10);
+
+    let file = open_cross_process_lock_file(dir, lock_filename, label)?;
+    loop {
+        match fs2::FileExt::try_lock_exclusive(&file) {
+            Ok(()) => return Ok(CrossProcessLockGuard { file }),
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                tokio::time::sleep(RETRY_DELAY).await;
+            }
+            Err(err) => return Err(cross_process_lock_error(label, err)),
+        }
     }
 }
 
@@ -973,5 +1006,81 @@ mod tests {
             & 0o777;
         assert_eq!(mode, 0o600);
         assert_eq!(count_temp_files(dir.path(), "state.json"), 0);
+    }
+
+    #[tokio::test]
+    async fn async_lock_refuses_insecure_files_and_symlinks() {
+        let dir = create_private_test_dir();
+        let path = dir.path().join("insecure.lock");
+        fs::write(&path, b"existing").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        std::os::unix::fs::symlink(&path, dir.path().join("link.lock")).unwrap();
+
+        for name in ["insecure.lock", "link.lock"] {
+            let error = acquire_cross_process_lock_async(dir.path(), name, "test")
+                .await
+                .unwrap_err();
+            assert_eq!(error.error_code(), NativeErrorCode::SecurityViolation);
+        }
+        assert_eq!(fs::read(&path).unwrap(), b"existing");
+        assert_eq!(
+            fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+    }
+
+    #[test]
+    fn contended_async_lock_yields_scheduler_and_blocking_pool_then_recovers() {
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let dir = create_private_test_dir();
+        let holder = acquire_cross_process_lock(dir.path(), "review.lock", "test").unwrap();
+        let (release, signal) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let signaled = signal.recv_timeout(Duration::from_secs(4)).is_ok();
+            drop(holder);
+            signaled
+        });
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .enable_time()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            {
+                let waiter = acquire_cross_process_lock_async(dir.path(), "review.lock", "test");
+                tokio::pin!(waiter);
+                tokio::select! {
+                    biased;
+                    _ = &mut waiter => panic!("waiter advanced while the lock was held"),
+                    _ = async {
+                        timeout(Duration::from_secs(1), tokio::task::spawn_blocking(|| ()))
+                            .await.expect("blocking pool must remain available").unwrap();
+                    } => {}
+                }
+                assert!(timeout(Duration::from_millis(30), waiter).await.is_err());
+            }
+            release.send(()).unwrap();
+            let guard = timeout(
+                Duration::from_secs(2),
+                acquire_cross_process_lock_async(dir.path(), "review.lock", "test"),
+            )
+            .await
+            .expect("fresh wait must complete after release")
+            .unwrap();
+            let file = File::open(dir.path().join("review.lock")).unwrap();
+            assert_eq!(
+                fs2::FileExt::try_lock_exclusive(&file).unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+            drop(guard);
+            fs2::FileExt::try_lock_exclusive(&file).unwrap();
+        });
+        assert!(
+            holder.join().unwrap(),
+            "holder reached the independent safety timeout"
+        );
     }
 }

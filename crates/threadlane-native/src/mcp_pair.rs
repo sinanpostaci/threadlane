@@ -4118,8 +4118,8 @@ impl PairedMcpServer {
             &params.task_id,
             None,
             || async {
-                let _lock = self
-                    .review_scope_lock(binding, &params.approval_id)
+                let _lock = store
+                    .scope_lock(binding, &params.approval_id)
                     .await
                     .map_err(|_| {
                         crate::dispatch_guard::GuardedDispatchError::pre_effect(
@@ -4305,21 +4305,6 @@ impl PairedMcpServer {
         })
     }
 
-    async fn review_scope_lock(
-        &self,
-        binding: &str,
-        approval: &str,
-    ) -> Result<crate::fs_safety::CrossProcessLockGuard, NativeError> {
-        let state_dir = self.state_dir.clone();
-        let binding = binding.to_owned();
-        let approval = approval.to_owned();
-        tokio::task::spawn_blocking(move || {
-            ReviewStore::open(&state_dir)?.scope_lock(&binding, &approval)
-        })
-        .await
-        .map_err(|_| NativeError::new(NativeErrorCode::IoError, "Review scope lock failed"))?
-    }
-
     async fn handle_review_notice(
         &self,
         binding: &str,
@@ -4333,8 +4318,8 @@ impl PairedMcpServer {
         let origin = self.review_origin(TOOL, binding, thread)?;
         let store = ReviewStore::open(&self.state_dir)
             .map_err(|e| Self::format_planning_gateway_error(binding, TOOL, e))?;
-        let scope_lock = self
-            .review_scope_lock(binding, &params.approval_id)
+        let scope_lock = store
+            .scope_lock(binding, &params.approval_id)
             .await
             .map_err(|e| Self::format_planning_gateway_error(binding, TOOL, e))?;
         let scope = store.scope(binding, &params.approval_id)
@@ -4786,8 +4771,8 @@ impl PairedMcpServer {
         let origin = self.review_origin(TOOL, binding, thread)?;
         let store = ReviewStore::open(&self.state_dir)
             .map_err(|e| Self::format_planning_gateway_error(binding, TOOL, e))?;
-        let _lock = self
-            .review_scope_lock(binding, &params.approval_id)
+        let _lock = store
+            .scope_lock(binding, &params.approval_id)
             .await
             .map_err(|e| Self::format_planning_gateway_error(binding, TOOL, e))?;
         let scope = store
@@ -5094,6 +5079,7 @@ impl PairedMcpServer {
             .map_err(|e| Self::format_planning_gateway_error(binding, TOOL, e))?;
         let _lock = store
             .decision_lock(&params.read_id)
+            .await
             .map_err(|e| Self::format_planning_gateway_error(binding, TOOL, e))?;
         let read = store
             .read(&params.read_id)

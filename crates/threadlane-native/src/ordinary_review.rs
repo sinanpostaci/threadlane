@@ -17,7 +17,7 @@ use crate::backlog_worker::{WorkerBacklogNoticeContextOutcome, WorkerBacklogResu
 use crate::closure_bootstrap::ClosureOrigin;
 use crate::error::{NativeError, NativeErrorCode};
 use crate::fs_safety::{
-    acquire_cross_process_lock, prepare_private_dir, read_private_file_bounded,
+    acquire_cross_process_lock_async, prepare_private_dir, read_private_file_bounded,
     write_private_file_atomic, CrossProcessLockGuard, MAX_PRIVATE_STATE_FILE_BYTES,
 };
 
@@ -418,27 +418,29 @@ impl ReviewStore {
         digest(format!("{binding}\0{approval}").as_bytes())
     }
 
-    pub(crate) fn scope_lock(
+    pub(crate) async fn scope_lock(
         &self,
         binding: &str,
         approval: &str,
     ) -> Result<CrossProcessLockGuard, NativeError> {
-        acquire_cross_process_lock(
+        acquire_cross_process_lock_async(
             &self.dir,
             &format!("scope_{}.lock", Self::scope_key(binding, approval)),
             LABEL,
         )
+        .await
     }
 
-    pub(crate) fn decision_lock(
+    pub(crate) async fn decision_lock(
         &self,
         read_id: &str,
     ) -> Result<CrossProcessLockGuard, NativeError> {
-        acquire_cross_process_lock(
+        acquire_cross_process_lock_async(
             &self.dir,
             &format!("decision_{}.lock", valid_read_id(read_id)?),
             LABEL,
         )
+        .await
     }
 
     fn load<T: for<'de> Deserialize<'de>>(&self, name: &str) -> Result<Option<T>, NativeError> {
