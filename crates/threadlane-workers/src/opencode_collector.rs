@@ -19,8 +19,9 @@
 //! Every metadata command runs without a shell in its own Unix process group (`process_group(0)`),
 //! with `stdin` set to null, `kill_on_drop(true)`, the exact canonical working directory, and the
 //! exact per-child environment overrides used by the model run. On Linux, each metadata command
-//! prepares a dedicated `O_CLOEXEC` `stdout` pipe before spawning the child and sizes/verifies its
-//! kernel pipe capacity via `F_SETPIPE_SZ`/`F_GETPIPE_SZ` to hold at least `max_stdout_bytes`
+//! uses a dedicated `O_CLOEXEC` `stdout` pipe sized and verified before spawning the child; the
+//! session-info and export pipes are reserved before the model process starts. The kernel pipe
+//! capacity, checked via `F_SETPIPE_SZ`/`F_GETPIPE_SZ`, holds at least `max_stdout_bytes`
 //! (`64 KiB` for `session.create`/`session.get` and `1 MiB` for `session export`). Both `stdout`
 //! and `stderr` are drained concurrently under strict byte caps (`64 KiB` for
 //! `session.create`/`session.get`, `1 MiB` for `session export`, and `context.max_stderr_bytes`
@@ -46,8 +47,8 @@ use tokio::time::Instant;
 use crate::fs_safety::ensure_platform_supported;
 use crate::opencode_metadata::{
     validate_opencode_metadata_with_diagnostic, OpenCodeMetadataDiagnostic, OpenCodeMetadataError,
-    OpenCodeMetadataEvidence, OpenCodeMetadataStage, OwnedOpenCodeSession,
-    MAX_OPENCODE_EXPORT_BYTES, MAX_OPENCODE_INFO_BYTES,
+    OpenCodeMetadataEvidence, OpenCodeMetadataStage, OpenCodeSpawnCause, OpenCodeSpawnDiagnostic,
+    OpenCodeSpawnPhase, OwnedOpenCodeSession, MAX_OPENCODE_EXPORT_BYTES, MAX_OPENCODE_INFO_BYTES,
 };
 use crate::spec::{ResolvedModelTarget, MAX_IDENTIFIER_LEN, MAX_STDERR_BYTES};
 use crate::supervisor::{
@@ -64,6 +65,70 @@ pub(crate) const MAX_OPENCODE_CREATE_BYTES: usize = MAX_OPENCODE_INFO_BYTES;
 
 /// Maximum permitted forward clock drift above `started_at_ms` for `session.create` (`5 minutes`).
 pub(crate) const MAX_SESSION_CREATE_FUTURE_DRIFT_MS: u64 = 300_000;
+
+#[cfg(target_os = "linux")]
+struct MetadataStdoutPipe {
+    read: OwnedFd,
+    write: OwnedFd,
+}
+
+#[cfg(not(target_os = "linux"))]
+struct MetadataStdoutPipe;
+
+/// One-use pipes for the original owned run's two later metadata calls.
+pub(crate) struct ReservedMetadataPipes {
+    #[cfg(target_os = "linux")]
+    info: MetadataStdoutPipe,
+    #[cfg(target_os = "linux")]
+    export: MetadataStdoutPipe,
+}
+
+impl ReservedMetadataPipes {
+    fn into_parts(self) -> (Option<MetadataStdoutPipe>, Option<MetadataStdoutPipe>) {
+        #[cfg(target_os = "linux")]
+        {
+            (Some(self.info), Some(self.export))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            (None, None)
+        }
+    }
+}
+
+/// Reserve exact existing Linux capacities before the owned model process starts.
+/// Every unused descriptor closes on error, cancellation, timeout, or drop.
+pub(crate) fn reserve_post_run_pipes(
+    context: &OpenCodeCollectorContext,
+    cancel_rx: &mut watch::Receiver<bool>,
+) -> Result<ReservedMetadataPipes, OpenCodeCollectorDiagnostic> {
+    check_not_cancelled_or_expired(context.overall_deadline, cancel_rx)
+        .map_err(OpenCodeCollectorDiagnostic::from_error)?;
+    #[cfg(target_os = "linux")]
+    {
+        let (read, write, _) = prepare_linux_metadata_stdout_pipe_detailed(MAX_OPENCODE_INFO_BYTES)
+            .map_err(|cause| {
+                OpenCodeCollectorDiagnostic::spawn(OpenCodeSpawnPhase::ReserveSessionGet, cause)
+            })?;
+        let info = MetadataStdoutPipe { read, write };
+        check_not_cancelled_or_expired(context.overall_deadline, cancel_rx)
+            .map_err(OpenCodeCollectorDiagnostic::from_error)?;
+        let (read, write, _) = prepare_linux_metadata_stdout_pipe_detailed(
+            MAX_OPENCODE_EXPORT_BYTES,
+        )
+        .map_err(|cause| {
+            OpenCodeCollectorDiagnostic::spawn(OpenCodeSpawnPhase::ReserveSessionExport, cause)
+        })?;
+        let export = MetadataStdoutPipe { read, write };
+        check_not_cancelled_or_expired(context.overall_deadline, cancel_rx)
+            .map_err(OpenCodeCollectorDiagnostic::from_error)?;
+        Ok(ReservedMetadataPipes { info, export })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Ok(ReservedMetadataPipes {})
+    }
+}
 
 /// Pre-validated execution context shared across OpenCode session allocation and collection.
 #[derive(Clone, PartialEq, Eq)]
@@ -181,12 +246,18 @@ pub(crate) struct OpenCodeCollectorDiagnostic {
     pub(crate) error: OpenCodeCollectorError,
     /// Finite validation stage when available (`None` for transport errors or legacy undifferentiated `invalid_metadata`).
     pub(crate) stage: Option<OpenCodeMetadataStage>,
+    /// Fixed details only when a spawn failure's phase and cause are known.
+    pub(crate) spawn: Option<OpenCodeSpawnDiagnostic>,
 }
 
 impl OpenCodeCollectorDiagnostic {
     /// Creates a collector diagnostic for `error` without a validation stage.
     pub(crate) const fn from_error(error: OpenCodeCollectorError) -> Self {
-        Self { error, stage: None }
+        Self {
+            error,
+            stage: None,
+            spawn: None,
+        }
     }
 
     /// Creates an [`OpenCodeCollectorError::InvalidMetadata`] diagnostic qualified by `stage`.
@@ -194,6 +265,15 @@ impl OpenCodeCollectorDiagnostic {
         Self {
             error: OpenCodeCollectorError::InvalidMetadata,
             stage: Some(stage),
+            spawn: None,
+        }
+    }
+
+    fn spawn(phase: OpenCodeSpawnPhase, cause: OpenCodeSpawnCause) -> Self {
+        Self {
+            error: OpenCodeCollectorError::SpawnFailed,
+            stage: None,
+            spawn: Some(OpenCodeSpawnDiagnostic { phase, cause }),
         }
     }
 
@@ -249,6 +329,7 @@ impl From<OpenCodeMetadataDiagnostic> for OpenCodeCollectorDiagnostic {
         Self {
             error: OpenCodeCollectorError::from(diagnostic.error),
             stage: diagnostic.stage,
+            spawn: None,
         }
     }
 }
@@ -301,9 +382,15 @@ pub(crate) async fn allocate_with_diagnostic(
     let argv = build_session_create_argv(workdir_str, resolved_model)
         .map_err(OpenCodeCollectorDiagnostic::from_error)?;
 
-    let create_stdout = run_metadata_command(context, &argv, MAX_OPENCODE_CREATE_BYTES, cancel_rx)
-        .await
-        .map_err(OpenCodeCollectorDiagnostic::from_error)?;
+    let create_stdout = run_metadata_command_diagnostic(
+        context,
+        &argv,
+        MAX_OPENCODE_CREATE_BYTES,
+        None,
+        OpenCodeSpawnPhase::SessionCreate,
+        cancel_rx,
+    )
+    .await?;
     check_not_cancelled_or_expired(context.overall_deadline, cancel_rx)
         .map_err(OpenCodeCollectorDiagnostic::from_error)?;
 
@@ -332,10 +419,34 @@ pub(crate) async fn collect(
 
 /// Collects and validates authoritative OpenCode v2 session metadata for an [`OwnedOpenCodeSession`],
 /// returning a stage-qualified [`OpenCodeCollectorDiagnostic`] on failure.
+#[cfg(test)]
 pub(crate) async fn collect_with_diagnostic(
     context: &OpenCodeCollectorContext,
     owned: &OwnedOpenCodeSession,
     resolved_model: &ResolvedModelTarget,
+    cancel_rx: &mut watch::Receiver<bool>,
+) -> Result<OpenCodeMetadataEvidence, OpenCodeCollectorDiagnostic> {
+    collect_with_pipe_parts(context, owned, resolved_model, None, None, cancel_rx).await
+}
+
+/// Consume the original pre-reserved pipes for the same owned execution exactly once.
+pub(crate) async fn collect_with_reserved_pipes(
+    context: &OpenCodeCollectorContext,
+    owned: &OwnedOpenCodeSession,
+    resolved_model: &ResolvedModelTarget,
+    reserved: ReservedMetadataPipes,
+    cancel_rx: &mut watch::Receiver<bool>,
+) -> Result<OpenCodeMetadataEvidence, OpenCodeCollectorDiagnostic> {
+    let (info, export) = reserved.into_parts();
+    collect_with_pipe_parts(context, owned, resolved_model, info, export, cancel_rx).await
+}
+
+async fn collect_with_pipe_parts(
+    context: &OpenCodeCollectorContext,
+    owned: &OwnedOpenCodeSession,
+    resolved_model: &ResolvedModelTarget,
+    info_pipe: Option<MetadataStdoutPipe>,
+    export_pipe: Option<MetadataStdoutPipe>,
     cancel_rx: &mut watch::Receiver<bool>,
 ) -> Result<OpenCodeMetadataEvidence, OpenCodeCollectorDiagnostic> {
     let workdir_str = validate_context(context).map_err(OpenCodeCollectorDiagnostic::from_error)?;
@@ -346,17 +457,28 @@ pub(crate) async fn collect_with_diagnostic(
     check_not_cancelled_or_expired(context.overall_deadline, cancel_rx)
         .map_err(OpenCodeCollectorDiagnostic::from_error)?;
     let get_argv = build_session_get_argv(&owned.session_id)?;
-    let info_bytes = run_metadata_command(context, &get_argv, MAX_OPENCODE_INFO_BYTES, cancel_rx)
-        .await
-        .map_err(OpenCodeCollectorDiagnostic::from_error)?;
+    let info_bytes = run_metadata_command_diagnostic(
+        context,
+        &get_argv,
+        MAX_OPENCODE_INFO_BYTES,
+        info_pipe,
+        OpenCodeSpawnPhase::SessionGet,
+        cancel_rx,
+    )
+    .await?;
 
     check_not_cancelled_or_expired(context.overall_deadline, cancel_rx)
         .map_err(OpenCodeCollectorDiagnostic::from_error)?;
     let export_argv = build_session_export_argv(&owned.session_id)?;
-    let export_bytes =
-        run_metadata_command(context, &export_argv, MAX_OPENCODE_EXPORT_BYTES, cancel_rx)
-            .await
-            .map_err(OpenCodeCollectorDiagnostic::from_error)?;
+    let export_bytes = run_metadata_command_diagnostic(
+        context,
+        &export_argv,
+        MAX_OPENCODE_EXPORT_BYTES,
+        export_pipe,
+        OpenCodeSpawnPhase::SessionExport,
+        cancel_rx,
+    )
+    .await?;
 
     check_not_cancelled_or_expired(context.overall_deadline, cancel_rx)
         .map_err(OpenCodeCollectorDiagnostic::from_error)?;
@@ -609,17 +731,21 @@ fn check_not_cancelled_or_expired(
     Ok(overall_deadline.min(max_phase_deadline))
 }
 
+#[cfg(test)]
 async fn run_metadata_command(
     context: &OpenCodeCollectorContext,
     argv: &[String],
     max_stdout_bytes: usize,
     cancel_rx: &mut watch::Receiver<bool>,
 ) -> Result<Vec<u8>, OpenCodeCollectorError> {
+    let mut cause = None;
     run_metadata_command_with_pipe_config(
         context,
         argv,
         max_stdout_bytes,
         max_stdout_bytes,
+        None,
+        &mut cause,
         #[cfg(all(test, target_os = "linux"))]
         None,
         cancel_rx,
@@ -627,20 +753,60 @@ async fn run_metadata_command(
     .await
 }
 
+async fn run_metadata_command_diagnostic(
+    context: &OpenCodeCollectorContext,
+    argv: &[String],
+    max_stdout_bytes: usize,
+    reserved: Option<MetadataStdoutPipe>,
+    phase: OpenCodeSpawnPhase,
+    cancel_rx: &mut watch::Receiver<bool>,
+) -> Result<Vec<u8>, OpenCodeCollectorDiagnostic> {
+    let mut cause = None;
+    run_metadata_command_with_pipe_config(
+        context,
+        argv,
+        max_stdout_bytes,
+        max_stdout_bytes,
+        reserved,
+        &mut cause,
+        #[cfg(all(test, target_os = "linux"))]
+        None,
+        cancel_rx,
+    )
+    .await
+    .map_err(|error| match (error, cause) {
+        (OpenCodeCollectorError::SpawnFailed, Some(cause)) => {
+            OpenCodeCollectorDiagnostic::spawn(phase, cause)
+        }
+        _ => OpenCodeCollectorDiagnostic::from_error(error),
+    })
+}
+
+// The extra test-only argument coordinates a producer before the reader starts.
+#[cfg_attr(all(test, target_os = "linux"), allow(clippy::too_many_arguments))]
 async fn run_metadata_command_with_pipe_config(
     context: &OpenCodeCollectorContext,
     argv: &[String],
     max_stdout_bytes: usize,
     pipe_capacity_bytes: usize,
+    reserved: Option<MetadataStdoutPipe>,
+    spawn_cause: &mut Option<OpenCodeSpawnCause>,
     #[cfg(all(test, target_os = "linux"))] pre_read_sync_socket: Option<&tokio::net::UnixDatagram>,
     cancel_rx: &mut watch::Receiver<bool>,
 ) -> Result<Vec<u8>, OpenCodeCollectorError> {
     let command_deadline = check_not_cancelled_or_expired(context.overall_deadline, cancel_rx)?;
 
-    let (mut child, stdout_pipe) = spawn_isolated_child(context, argv, pipe_capacity_bytes).await?;
+    let (mut child, stdout_pipe) =
+        spawn_isolated_child(context, argv, pipe_capacity_bytes, reserved)
+            .await
+            .map_err(|cause| {
+                *spawn_cause = Some(cause);
+                OpenCodeCollectorError::SpawnFailed
+            })?;
     let child_pid = match child.id() {
         Some(pid) => pid,
         None => {
+            *spawn_cause = Some(OpenCodeSpawnCause::ProcessIdentity);
             drop(stdout_pipe);
             let _ = child.kill().await;
             let _ = child.wait().await;
@@ -650,6 +816,7 @@ async fn run_metadata_command_with_pipe_config(
     let pgid = match i32::try_from(child_pid) {
         Ok(id) => id,
         Err(_) => {
+            *spawn_cause = Some(OpenCodeSpawnCause::ProcessIdentity);
             drop(stdout_pipe);
             let _ = child.kill().await;
             let _ = child.wait().await;
@@ -658,6 +825,7 @@ async fn run_metadata_command_with_pipe_config(
     };
 
     if !is_isolated_process_group(pgid) {
+        *spawn_cause = Some(OpenCodeSpawnCause::ProcessIdentity);
         drop(stdout_pipe);
         let _ = child.kill().await;
         let _ = child.wait().await;
@@ -667,6 +835,7 @@ async fn run_metadata_command_with_pipe_config(
     let mut pgroup_guard = ProcessGroupGuard::new(pgid);
 
     let Some(stderr_pipe) = child.stderr.take() else {
+        *spawn_cause = Some(OpenCodeSpawnCause::StderrSetup);
         drop(stdout_pipe);
         let _ = terminate_and_reap_group(pgid, &mut child).await;
         return Err(OpenCodeCollectorError::SpawnFailed);
@@ -877,11 +1046,14 @@ async fn collect_with_export_transport_test_hook(
     check_not_cancelled_or_expired(context.overall_deadline, cancel_rx)
         .map_err(OpenCodeCollectorDiagnostic::from_error)?;
     let export_argv = build_session_export_argv(&owned.session_id)?;
+    let mut cause = None;
     let export_bytes = run_metadata_command_with_pipe_config(
         context,
         &export_argv,
         MAX_OPENCODE_EXPORT_BYTES,
         export_pipe_capacity_bytes,
+        None,
+        &mut cause,
         export_pre_read_sync_socket,
         cancel_rx,
     )
@@ -911,20 +1083,20 @@ async fn collect_with_export_transport_test_hook(
 #[cfg(target_os = "linux")]
 // Linux pipe sizing has no safe standard-library API; keep the FD FFI exception local.
 #[allow(unsafe_code)]
-fn prepare_linux_metadata_stdout_pipe(
+fn prepare_linux_metadata_stdout_pipe_detailed(
     min_capacity_bytes: usize,
-) -> Result<(OwnedFd, OwnedFd, usize), OpenCodeCollectorError> {
+) -> Result<(OwnedFd, OwnedFd, usize), OpenCodeSpawnCause> {
     if min_capacity_bytes == 0 {
-        return Err(OpenCodeCollectorError::SpawnFailed);
+        return Err(OpenCodeSpawnCause::PipeCapacity);
     }
-    let requested_capacity = libc::c_int::try_from(min_capacity_bytes)
-        .map_err(|_| OpenCodeCollectorError::SpawnFailed)?;
+    let requested_capacity =
+        libc::c_int::try_from(min_capacity_bytes).map_err(|_| OpenCodeSpawnCause::PipeCapacity)?;
 
     let mut fds: [libc::c_int; 2] = [-1, -1];
     // SAFETY: `fds` is a valid 2-element `c_int` buffer; `O_CLOEXEC` atomically marks both ends close-on-exec.
     let pipe_rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
     if pipe_rc != 0 || fds[0] < 0 || fds[1] < 0 {
-        return Err(OpenCodeCollectorError::SpawnFailed);
+        return Err(OpenCodeSpawnCause::PipeCreate);
     }
 
     // SAFETY: `pipe2` succeeded and returned two fresh, valid, unowned file descriptors.
@@ -936,25 +1108,60 @@ fn prepare_linux_metadata_stdout_pipe(
     let set_rc =
         unsafe { libc::fcntl(write_fd.as_raw_fd(), libc::F_SETPIPE_SZ, requested_capacity) };
     if set_rc < 0 {
-        return Err(OpenCodeCollectorError::SpawnFailed);
+        let code = std::io::Error::last_os_error().raw_os_error();
+        return Err(if matches!(code, Some(libc::EPERM | libc::EACCES)) {
+            OpenCodeSpawnCause::PipeCapacityDenied
+        } else {
+            OpenCodeSpawnCause::PipeCapacity
+        });
     }
-    let set_capacity = usize::try_from(set_rc).map_err(|_| OpenCodeCollectorError::SpawnFailed)?;
+    let set_capacity = usize::try_from(set_rc).map_err(|_| OpenCodeSpawnCause::PipeCapacity)?;
     if set_capacity < min_capacity_bytes {
-        return Err(OpenCodeCollectorError::SpawnFailed);
+        return Err(OpenCodeSpawnCause::PipeCapacity);
     }
 
     // SAFETY: `read_fd` is a valid open pipe descriptor owned by `read_fd`.
     let get_rc = unsafe { libc::fcntl(read_fd.as_raw_fd(), libc::F_GETPIPE_SZ) };
     if get_rc < 0 {
-        return Err(OpenCodeCollectorError::SpawnFailed);
+        return Err(OpenCodeSpawnCause::PipeCapacity);
     }
     let verified_capacity =
-        usize::try_from(get_rc).map_err(|_| OpenCodeCollectorError::SpawnFailed)?;
+        usize::try_from(get_rc).map_err(|_| OpenCodeSpawnCause::PipeCapacity)?;
     if verified_capacity < min_capacity_bytes {
-        return Err(OpenCodeCollectorError::SpawnFailed);
+        return Err(OpenCodeSpawnCause::PipeCapacity);
     }
 
     Ok((read_fd, write_fd, verified_capacity))
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn prepare_linux_metadata_stdout_pipe(
+    min_capacity_bytes: usize,
+) -> Result<(OwnedFd, OwnedFd, usize), OpenCodeCollectorError> {
+    prepare_linux_metadata_stdout_pipe_detailed(min_capacity_bytes)
+        .map_err(|_| OpenCodeCollectorError::SpawnFailed)
+}
+
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+fn verify_reserved_metadata_pipe(
+    pipe: &MetadataStdoutPipe,
+    min_capacity: usize,
+) -> Result<(), OpenCodeSpawnCause> {
+    for fd in [pipe.read.as_raw_fd(), pipe.write.as_raw_fd()] {
+        // SAFETY: both descriptors are still owned by `pipe`.
+        let capacity = unsafe { libc::fcntl(fd, libc::F_GETPIPE_SZ) };
+        // SAFETY: both descriptors are still owned by `pipe`.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if capacity < 0
+            || usize::try_from(capacity).map_or(true, |value| value < min_capacity)
+            || flags < 0
+            || flags & libc::FD_CLOEXEC == 0
+        {
+            return Err(OpenCodeSpawnCause::PipeCapacity);
+        }
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -962,9 +1169,23 @@ async fn spawn_isolated_child(
     context: &OpenCodeCollectorContext,
     argv: &[String],
     pipe_capacity_bytes: usize,
-) -> Result<(tokio::process::Child, tokio::process::ChildStdout), OpenCodeCollectorError> {
-    let (stdout_read_fd, stdout_write_fd, _verified_capacity) =
-        prepare_linux_metadata_stdout_pipe(pipe_capacity_bytes)?;
+    reserved: Option<MetadataStdoutPipe>,
+) -> Result<(tokio::process::Child, tokio::process::ChildStdout), OpenCodeSpawnCause> {
+    let pipe = match reserved {
+        Some(pipe) => {
+            verify_reserved_metadata_pipe(&pipe, pipe_capacity_bytes)?;
+            pipe
+        }
+        None => {
+            let (read, write, _) =
+                prepare_linux_metadata_stdout_pipe_detailed(pipe_capacity_bytes)?;
+            MetadataStdoutPipe { read, write }
+        }
+    };
+    let MetadataStdoutPipe {
+        read: stdout_read_fd,
+        write: stdout_write_fd,
+    } = pipe;
 
     let mut cmd = Command::new(&context.executable);
     cmd.args(argv)
@@ -983,7 +1204,7 @@ async fn spawn_isolated_child(
 
     let spawn_res = cmd.spawn();
     drop(cmd);
-    let mut child = spawn_res.map_err(|_| OpenCodeCollectorError::SpawnFailed)?;
+    let mut child = spawn_res.map_err(|_| OpenCodeSpawnCause::ProcessSpawn)?;
 
     let std_stdout = std::process::ChildStdout::from(stdout_read_fd);
     let stdout_pipe = match tokio::process::ChildStdout::from_std(std_stdout) {
@@ -995,7 +1216,7 @@ async fn spawn_isolated_child(
                 let _ = child.kill().await;
                 let _ = child.wait().await;
             }
-            return Err(OpenCodeCollectorError::SpawnFailed);
+            return Err(OpenCodeSpawnCause::StdoutSetup);
         }
     };
 
@@ -1007,9 +1228,13 @@ async fn spawn_isolated_child(
     context: &OpenCodeCollectorContext,
     argv: &[String],
     pipe_capacity_bytes: usize,
-) -> Result<(tokio::process::Child, tokio::process::ChildStdout), OpenCodeCollectorError> {
+    reserved: Option<MetadataStdoutPipe>,
+) -> Result<(tokio::process::Child, tokio::process::ChildStdout), OpenCodeSpawnCause> {
+    if reserved.is_some() {
+        return Err(OpenCodeSpawnCause::PipeCapacity);
+    }
     if pipe_capacity_bytes == 0 {
-        return Err(OpenCodeCollectorError::SpawnFailed);
+        return Err(OpenCodeSpawnCause::PipeCapacity);
     }
 
     let mut cmd = Command::new(&context.executable);
@@ -1031,13 +1256,11 @@ async fn spawn_isolated_child(
         cmd.process_group(0);
     }
 
-    let mut child = cmd
-        .spawn()
-        .map_err(|_| OpenCodeCollectorError::SpawnFailed)?;
+    let mut child = cmd.spawn().map_err(|_| OpenCodeSpawnCause::ProcessSpawn)?;
     let Some(stdout_pipe) = child.stdout.take() else {
         let _ = child.kill().await;
         let _ = child.wait().await;
-        return Err(OpenCodeCollectorError::SpawnFailed);
+        return Err(OpenCodeSpawnCause::StdoutSetup);
     };
 
     Ok((child, stdout_pipe))
@@ -1847,6 +2070,7 @@ exit 99
             Some(OpenCodeCollectorDiagnostic {
                 error: OpenCodeCollectorError::InvalidMetadata,
                 stage: None,
+                spawn: None,
             })
         );
         assert_eq!(
@@ -1854,6 +2078,7 @@ exit 99
             Some(OpenCodeCollectorDiagnostic {
                 error: OpenCodeCollectorError::InvalidMetadata,
                 stage: Some(OpenCodeMetadataStage::ExportJson),
+                spawn: None,
             })
         );
         assert_eq!(
@@ -2130,6 +2355,67 @@ exit 99
     }
 
     #[cfg(target_os = "linux")]
+    #[test]
+    fn reserved_pipe_exec_child_checks_no_inherited_descriptors() {
+        let Ok(targets) = std::env::var("THREADLANE_TEST_RESERVED_PIPE_IDS") else {
+            return;
+        };
+        let targets: Vec<_> = targets.split(',').collect();
+        assert_eq!(targets.len(), 2);
+        let inherited: Vec<_> = fs::read_dir("/proc/self/fd")
+            .expect("inspect child descriptors")
+            .flatten()
+            .filter_map(|entry| fs::read_link(entry.path()).ok())
+            .collect();
+        for target in targets {
+            assert!(
+                !inherited.iter().any(|path| path == Path::new(target)),
+                "reserved pipe leaked across exec"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn reserved_pipes_retain_capacity_and_do_not_cross_exec() {
+        let fixture = TestFixture::new("#!/bin/sh\nexit 0\n");
+        let context = fixture.context(Duration::from_secs(5), 1_000);
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        let pipes = reserve_post_run_pipes(&context, &mut cancel_rx).expect("reserve pipes");
+        verify_reserved_metadata_pipe(&pipes.info, MAX_OPENCODE_INFO_BYTES).expect("info pipe");
+        verify_reserved_metadata_pipe(&pipes.export, MAX_OPENCODE_EXPORT_BYTES)
+            .expect("export pipe");
+        let link = |fd: &OwnedFd| {
+            fs::read_link(format!("/proc/self/fd/{}", fd.as_raw_fd()))
+                .expect("read pipe identity")
+                .to_string_lossy()
+                .into_owned()
+        };
+        let info = link(&pipes.info.read);
+        let export = link(&pipes.export.read);
+        assert_eq!(info, link(&pipes.info.write));
+        assert_eq!(export, link(&pipes.export.write));
+        assert_ne!(info, export);
+
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "opencode_collector::tests::reserved_pipe_exec_child_checks_no_inherited_descriptors",
+                "--nocapture",
+            ])
+            .env("THREADLANE_TEST_RESERVED_PIPE_IDS", format!("{info},{export}"))
+            .output()
+            .expect("spawn descriptor-checking child");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "child failed or did not run: {stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        drop(pipes);
+    }
+
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn pre_read_sync_without_child_signal_is_bounded_and_reaps_child() {
         for child_action in ["exit 97", "exec sleep 60"] {
@@ -2142,6 +2428,7 @@ exit 99
             let context = fixture.context(Duration::from_millis(300), 1_000);
             let (_cancel_tx, mut cancel_rx) = watch::channel(false);
             let started = Instant::now();
+            let mut cause = None;
             let result = tokio::time::timeout(
                 Duration::from_secs(3),
                 run_metadata_command_with_pipe_config(
@@ -2149,6 +2436,8 @@ exit 99
                     &[],
                     MAX_OPENCODE_EXPORT_BYTES,
                     MAX_OPENCODE_EXPORT_BYTES,
+                    None,
+                    &mut cause,
                     Some(&socket),
                     &mut cancel_rx,
                 ),

@@ -199,6 +199,10 @@ pub struct WorkerExecutionReport {
     /// OpenCode v2 session allocation or metadata collection failed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub opencode_metadata_error: Option<String>,
+    /// Fixed phase/cause for a known collector spawn failure; absent in older reports.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opencode_metadata_spawn_diagnostic:
+        Option<crate::opencode_metadata::OpenCodeSpawnDiagnostic>,
     /// Advisory tool-hint supervision, independent of evidence verification and acceptance.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub progress_watchdog: Option<ProgressWatchdogSnapshot>,
@@ -215,6 +219,7 @@ impl WorkerExecutionReport {
         if self.provider != WorkerProvider::OpenCodeV2
             || self.requested_session_id.is_some()
             || self.opencode_metadata_error.is_some()
+            || self.opencode_metadata_spawn_diagnostic.is_some()
             || self.exit_code != Some(0)
             || self.signal.is_some()
             || self.cleanup_incomplete
@@ -367,6 +372,7 @@ impl WorkerExecutionReport {
             && self.allocated_session_id.is_none()
             && self.opencode_metadata.is_none()
             && self.opencode_metadata_error.is_none()
+            && self.opencode_metadata_spawn_diagnostic.is_none()
             && is_pinned_codex_read_only_argv(&self.constructed_argv, &self.requested_model)
     }
 
@@ -388,6 +394,7 @@ impl WorkerExecutionReport {
             && self.allocated_session_id.is_none()
             && self.opencode_metadata.is_none()
             && self.opencode_metadata_error.is_none()
+            && self.opencode_metadata_spawn_diagnostic.is_none()
             && is_pinned_codex_task_files_argv(&self.constructed_argv, &self.requested_model)
     }
 
@@ -550,6 +557,7 @@ impl WorkerExecutionReport {
         self.evidence.saw_result_event
             && self.status != WorkerRunStatus::MissingResultEvidence
             && self.opencode_metadata_error.is_none()
+            && self.opencode_metadata_spawn_diagnostic.is_none()
     }
 
     /// Returns `true` if the worker completed a legacy stream-only run cleanly with verified
@@ -560,6 +568,7 @@ impl WorkerExecutionReport {
             && self.allocated_session_id.is_none()
             && self.opencode_metadata.is_none()
             && self.opencode_metadata_error.is_none()
+            && self.opencode_metadata_spawn_diagnostic.is_none()
             && self.exit_code == Some(0)
             && self.signal.is_none()
             && !self.cleanup_incomplete
@@ -631,6 +640,7 @@ impl WorkerExecutionReport {
             || !self.evidence.provider_errors.is_empty()
             || self.evidence.malformed_lines_count > 0
             || self.opencode_metadata_error.is_some()
+            || self.opencode_metadata_spawn_diagnostic.is_some()
         {
             return false;
         }
@@ -1511,6 +1521,7 @@ fn no_child_launch_report(
         opencode_metadata: None,
         opencode_metadata_error: (provider == WorkerProvider::OpenCodeV2)
             .then(|| status.as_str().to_string()),
+        opencode_metadata_spawn_diagnostic: None,
         provider_health: health_requested.then(|| health.finish(duration_ms, false)),
         progress_watchdog: Some(
             watchdog
@@ -1635,8 +1646,13 @@ where
     let is_new_opencode_run =
         provider == WorkerProvider::OpenCodeV2 && requested_session_id.is_none();
 
-    let mut collector_context: Option<OpenCodeCollectorContext> = None;
-    let mut owned_session: Option<OwnedOpenCodeSession> = None;
+    // Keep ownership and capture resources together: a new owned session must never
+    // silently skip collection because one component was not initialized.
+    let mut opencode_collection: Option<(
+        OpenCodeCollectorContext,
+        OwnedOpenCodeSession,
+        opencode_collector::ReservedMetadataPipes,
+    )> = None;
     let mut allocated_session_id: Option<String> = None;
     let mut effective_session_id = requested_session_id.clone();
     let mut constructed_argv = initial_argv;
@@ -1650,13 +1666,22 @@ where
             started_at_ms,
             max_stderr_bytes: budgets.max_stderr_bytes,
         };
-        match opencode_collector::allocate_with_diagnostic(&ctx, &resolved_model, cancel_rx).await {
-            Ok(owned) => {
+        let allocation =
+            match opencode_collector::allocate_with_diagnostic(&ctx, &resolved_model, cancel_rx)
+                .await
+            {
+                Ok(owned) => match opencode_collector::reserve_post_run_pipes(&ctx, cancel_rx) {
+                    Ok(reserved) => Ok((owned, reserved)),
+                    Err(diagnostic) => Err((diagnostic, Some(owned))),
+                },
+                Err(diagnostic) => Err((diagnostic, None)),
+            };
+        match allocation {
+            Ok((owned, reserved)) => {
                 constructed_argv = rebuild_argv_with_session(&owned.session_id)?;
                 effective_session_id = Some(owned.session_id.clone());
                 allocated_session_id = Some(owned.session_id.clone());
-                owned_session = Some(owned);
-                collector_context = Some(ctx);
+                opencode_collection = Some((ctx, owned, reserved));
 
                 if let Some(abort_status) = launch_abort_status(cancel_rx, overall_deadline) {
                     return Ok((
@@ -1678,7 +1703,7 @@ where
                     ));
                 }
             }
-            Err(alloc_diag) => {
+            Err((alloc_diag, allocated)) => {
                 let alloc_err = alloc_diag.error;
                 let status = map_collector_error_to_run_status(alloc_err);
                 if status == WorkerRunStatus::TimedOut {
@@ -1689,10 +1714,13 @@ where
                 }
                 let cleanup_incomplete =
                     matches!(alloc_err, OpenCodeCollectorError::CleanupIncomplete);
+                let allocated_session_id = allocated.map(|owned| owned.session_id);
                 let empty_parser = NdjsonStreamParser::new_for_provider(
                     provider,
                     resolved_model.clone(),
-                    requested_session_id.clone(),
+                    allocated_session_id
+                        .clone()
+                        .or_else(|| requested_session_id.clone()),
                     budgets.max_events,
                 );
                 let duration_ms =
@@ -1703,7 +1731,7 @@ where
                         executed_executable: Some(canonical_executable.clone()),
                         requested_model: resolved_model,
                         requested_session_id,
-                        allocated_session_id: None,
+                        allocated_session_id,
                         constructed_argv: Vec::new(),
                         working_directory: canonical_workdir,
                         status,
@@ -1721,6 +1749,7 @@ where
                         evidence: empty_parser.finalize(),
                         opencode_metadata: None,
                         opencode_metadata_error: Some(alloc_diag.as_str().to_string()),
+                        opencode_metadata_spawn_diagnostic: alloc_diag.spawn,
                         provider_health: health_requested
                             .then(|| health.finish(duration_ms, false)),
                         progress_watchdog: Some(
@@ -2135,8 +2164,9 @@ where
 
     let mut opencode_metadata: Option<OpenCodeMetadataEvidence> = None;
     let mut opencode_metadata_error: Option<String> = None;
+    let mut opencode_metadata_spawn_diagnostic = None;
 
-    if let (Some(ctx), Some(owned)) = (collector_context.as_ref(), owned_session.as_ref()) {
+    if let Some((ctx, owned, reserved)) = opencode_collection.take() {
         if can_collect_opencode_metadata(
             cancelled,
             timed_out,
@@ -2146,10 +2176,11 @@ where
             signal,
             &evidence,
         ) {
-            match opencode_collector::collect_with_diagnostic(
-                ctx,
-                owned,
+            match opencode_collector::collect_with_reserved_pipes(
+                &ctx,
+                &owned,
                 &resolved_model,
+                reserved,
                 cancel_rx,
             )
             .await
@@ -2165,6 +2196,7 @@ where
                     }
                     status = map_collector_error_to_run_status(collect_err);
                     opencode_metadata_error = Some(collect_diag.as_str().to_string());
+                    opencode_metadata_spawn_diagnostic = collect_diag.spawn;
                 }
             }
         }
@@ -2206,6 +2238,7 @@ where
             evidence,
             opencode_metadata,
             opencode_metadata_error,
+            opencode_metadata_spawn_diagnostic,
             progress_watchdog: Some(final_watchdog),
             provider_health: health_requested
                 .then(|| health.finish(duration_ms, status == WorkerRunStatus::Succeeded)),
@@ -3149,6 +3182,260 @@ mod tests {
     #[cfg(target_os = "linux")]
     static CAPTURE_TEMP_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+    // The irreversible filter is installed only in a separately spawned test process.
+    #[cfg(all(target_os = "linux", target_endian = "little"))]
+    #[allow(unsafe_code)]
+    fn deny_pipe_resize_in_test_process(export_only: bool) {
+        fn ins(code: u32, jt: u8, jf: u8, k: u32) -> libc::sock_filter {
+            libc::sock_filter {
+                code: code as u16,
+                jt,
+                jf,
+                k,
+            }
+        }
+        let load = libc::BPF_LD | libc::BPF_W | libc::BPF_ABS;
+        let equal = libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K;
+        let ret = libc::BPF_RET | libc::BPF_K;
+        let args = std::mem::offset_of!(libc::seccomp_data, args) as u32;
+        let mut filter = vec![
+            ins(
+                load,
+                0,
+                0,
+                std::mem::offset_of!(libc::seccomp_data, nr) as u32,
+            ),
+            ins(
+                equal,
+                0,
+                if export_only { 5 } else { 3 },
+                libc::SYS_fcntl as u32,
+            ),
+            ins(load, 0, 0, args + 8),
+            ins(
+                equal,
+                0,
+                if export_only { 3 } else { 1 },
+                libc::F_SETPIPE_SZ as u32,
+            ),
+        ];
+        if export_only {
+            filter.push(ins(load, 0, 0, args + 16));
+            filter.push(ins(
+                equal,
+                0,
+                1,
+                crate::opencode_metadata::MAX_OPENCODE_EXPORT_BYTES as u32,
+            ));
+        }
+        filter.push(ins(ret, 0, 0, libc::SECCOMP_RET_ERRNO | libc::EPERM as u32));
+        filter.push(ins(ret, 0, 0, libc::SECCOMP_RET_ALLOW));
+        let program = libc::sock_fprog {
+            len: filter.len() as u16,
+            filter: filter.as_mut_ptr(),
+        };
+        // SAFETY: the filter points to a live bounded instruction array and only restricts this
+        // dedicated test process and its descendants; no other process or global policy changes.
+        unsafe {
+            assert_eq!(libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0), 0);
+            assert_eq!(
+                libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, &program),
+                0
+            );
+        }
+    }
+
+    #[cfg(all(target_os = "linux", target_endian = "little"))]
+    #[allow(unsafe_code)]
+    fn assert_pipe_resize_denied_in_test_process(capacity: usize) {
+        let mut fds = [-1; 2];
+        // SAFETY: the local descriptor array is valid; every acquired descriptor is closed.
+        unsafe {
+            assert_eq!(libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC), 0);
+            assert_eq!(
+                libc::fcntl(fds[1], libc::F_SETPIPE_SZ, capacity as libc::c_int),
+                -1
+            );
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::EPERM)
+            );
+            assert_eq!(libc::close(fds[0]), 0);
+            assert_eq!(libc::close(fds[1]), 0);
+        }
+    }
+
+    #[cfg(all(target_os = "linux", target_endian = "little"))]
+    #[test]
+    fn reserved_opencode_pipe_seccomp_child() {
+        use crate::opencode_metadata::{
+            OpenCodeSpawnCause, OpenCodeSpawnDiagnostic, OpenCodeSpawnPhase,
+        };
+
+        let Ok(mode) = std::env::var("THREADLANE_TEST_RESERVATION_MODE") else {
+            return;
+        };
+        assert!(matches!(
+            mode.as_str(),
+            "post_reservation" | "reserve_export_denied"
+        ));
+        let temp = tempfile::tempdir().expect("private test directory");
+        let root = fs::canonicalize(temp.path()).expect("canonical test directory");
+        let executable = root.join("fake-opencode");
+        let log = root.join("calls.txt");
+        let created = current_unix_epoch_ms()
+            .expect("clock")
+            .saturating_add(1_000);
+        let script = r##"#!/bin/sh
+set -eu
+if [ "${1:-}" = "api" ] && [ "${3:-}" = "session.create" ]; then
+  printf 'create\n' >> "$TL_PIPE_TEST_LOG"
+  printf '{"data":{"id":"ses_reserved","location":{"directory":"%s"},"time":{"created":%s}}}\n' "$PWD" "$TL_PIPE_TEST_CREATED"
+  exit 0
+fi
+if [ "${1:-}" = "--standalone" ] && [ "${2:-}" = "run" ]; then
+  printf 'run\n' >> "$TL_PIPE_TEST_LOG"
+  printf '{"type":"step_start","sessionID":"ses_reserved","part":{"type":"step-start"}}\n'
+  exit 0
+fi
+if [ "${1:-}" = "api" ] && [ "${3:-}" = "session.get" ]; then
+  printf 'get\n' >> "$TL_PIPE_TEST_LOG"
+  printf '{"data":{"id":"ses_reserved","outcome":"succeeded","location":{"directory":"%s"},"time":{"created":%s,"idle":%s}}}\n' "$PWD" "$TL_PIPE_TEST_CREATED" "$((TL_PIPE_TEST_CREATED + 30))"
+  exit 0
+fi
+if [ "${1:-}" = "session" ] && [ "${2:-}" = "export" ]; then
+  printf 'export\n' >> "$TL_PIPE_TEST_LOG"
+  printf '{"info":{"id":"ses_reserved","outcome":"succeeded","time":{"created":%s}},"messages":[{"id":"msg_reserved","sessionID":"ses_reserved","type":"assistant","model":{"providerID":"opencode-go","id":"deepseek-v4.1-flash","variant":"max"},"finish":"stop","time":{"created":%s,"completed":%s}}]}\n' "$TL_PIPE_TEST_CREATED" "$((TL_PIPE_TEST_CREATED + 10))" "$((TL_PIPE_TEST_CREATED + 20))"
+  exit 0
+fi
+exit 91
+"##;
+        fs::write(&executable, script).expect("write synthetic CLI");
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).expect("chmod CLI");
+        let inputs = SupervisedLaunchInputs {
+            provider: WorkerProvider::OpenCodeV2,
+            canonical_executable: executable,
+            canonical_workdir: root,
+            resolved_model: ResolvedModelTarget {
+                base_model: "opencode-go/deepseek-v4.1-flash".to_string(),
+                effort: Some("max".to_string()),
+                cli_model_arg: "opencode-go/deepseek-v4.1-flash#max".to_string(),
+            },
+            requested_session_id: None,
+            initial_argv: vec!["--standalone".to_string(), "run".to_string()],
+            child_env: vec![
+                (
+                    "TL_PIPE_TEST_LOG".to_string(),
+                    log.to_string_lossy().to_string(),
+                ),
+                ("TL_PIPE_TEST_CREATED".to_string(), created.to_string()),
+            ],
+            budgets: ExecutionBudgets::default(),
+        };
+        if mode == "reserve_export_denied" {
+            deny_pipe_resize_in_test_process(true);
+            assert_pipe_resize_denied_in_test_process(
+                crate::opencode_metadata::MAX_OPENCODE_EXPORT_BYTES,
+            );
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        let mut on_launch = |_: &[String]| {
+            assert_eq!(
+                mode, "post_reservation",
+                "reservation failure must precede model spawn"
+            );
+            deny_pipe_resize_in_test_process(false);
+            assert_pipe_resize_denied_in_test_process(
+                crate::opencode_metadata::MAX_OPENCODE_INFO_BYTES,
+            );
+            assert_pipe_resize_denied_in_test_process(
+                crate::opencode_metadata::MAX_OPENCODE_EXPORT_BYTES,
+            );
+        };
+        let mut on_spawn_error =
+            |_: u32, _: &std::io::Error| panic!("unexpected model spawn failure");
+        let (report, _) = runtime
+            .block_on(run_supervised_process_group_for_test(
+                inputs,
+                |id| {
+                    Ok(vec![
+                        "--standalone".into(),
+                        "run".into(),
+                        "--session".into(),
+                        id.into(),
+                    ])
+                },
+                None,
+                &mut cancel_rx,
+                None,
+                None,
+                None,
+                Some(&mut on_launch),
+                &mut on_spawn_error,
+            ))
+            .expect("bounded owned run");
+        let calls = fs::read_to_string(log).expect("read invocation names");
+        assert_eq!(report.allocated_session_id.as_deref(), Some("ses_reserved"));
+        if mode == "reserve_export_denied" {
+            assert_eq!(
+                calls, "create\n",
+                "model must not start when reservation fails"
+            );
+            assert_eq!(
+                report.opencode_metadata_error.as_deref(),
+                Some("spawn_failed")
+            );
+            assert_eq!(
+                report.opencode_metadata_spawn_diagnostic,
+                Some(OpenCodeSpawnDiagnostic {
+                    phase: OpenCodeSpawnPhase::ReserveSessionExport,
+                    cause: OpenCodeSpawnCause::PipeCapacityDenied,
+                })
+            );
+            assert!(!report.has_complete_natural_completion_evidence());
+        } else {
+            assert_eq!(calls, "create\nrun\nget\nexport\n");
+            assert_eq!(report.status, WorkerRunStatus::Succeeded);
+            assert_eq!(report.opencode_metadata_error, None);
+            assert_eq!(report.opencode_metadata_spawn_diagnostic, None);
+            let evidence = report
+                .validated_opencode_metadata()
+                .expect("real parsed owned metadata");
+            assert_eq!(evidence.session_id, "ses_reserved");
+            assert_eq!(evidence.observed_model, "opencode-go/deepseek-v4.1-flash");
+            assert_eq!(evidence.observed_effort.as_deref(), Some("max"));
+            assert!(report.has_complete_natural_completion_evidence());
+        }
+    }
+
+    #[cfg(all(target_os = "linux", target_endian = "little"))]
+    #[test]
+    fn reserved_opencode_pipes_survive_denied_future_resizes_and_fail_before_model_when_unavailable(
+    ) {
+        let executable = std::env::current_exe().expect("current test executable");
+        for mode in ["post_reservation", "reserve_export_denied"] {
+            let output = std::process::Command::new(&executable)
+                .args([
+                    "--exact",
+                    "supervisor::tests::reserved_opencode_pipe_seccomp_child",
+                    "--nocapture",
+                ])
+                .env("THREADLANE_TEST_RESERVATION_MODE", mode)
+                .output()
+                .expect("spawn isolated test process");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "{mode} failed or did not run: {stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
     fn sample_report_with_metadata_error(
         opencode_metadata_error: Option<&str>,
     ) -> WorkerExecutionReport {
@@ -3186,6 +3473,7 @@ mod tests {
             evidence: parser.finalize(),
             opencode_metadata: None,
             opencode_metadata_error: opencode_metadata_error.map(str::to_string),
+            opencode_metadata_spawn_diagnostic: None,
             progress_watchdog: None,
             provider_health: None,
         }

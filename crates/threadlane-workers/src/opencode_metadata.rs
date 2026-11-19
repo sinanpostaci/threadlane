@@ -28,6 +28,52 @@ pub const MAX_OPENCODE_EXPORT_BYTES: usize = 1_048_576;
 /// Maximum accepted number of transfer messages, including non-assistant content (`512`).
 pub const MAX_OPENCODE_MESSAGES: usize = 512;
 
+/// Finite operation being prepared when a collector spawn failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OpenCodeSpawnPhase {
+    /// Create the software-owned session.
+    SessionCreate,
+    /// Reserve the future session-info stdout pipe.
+    ReserveSessionGet,
+    /// Reserve the future sanitized-export stdout pipe.
+    ReserveSessionExport,
+    /// Read the software-owned session info.
+    SessionGet,
+    /// Read the software-owned sanitized export.
+    SessionExport,
+}
+
+/// Finite, privacy-safe cause of a collector spawn failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OpenCodeSpawnCause {
+    /// The kernel did not create the stdout pipe.
+    PipeCreate,
+    /// The kernel denied stdout pipe capacity adjustment.
+    PipeCapacityDenied,
+    /// Another error occurred while setting or validating pipe capacity.
+    PipeCapacity,
+    /// The process could not be spawned.
+    ProcessSpawn,
+    /// The process identity or isolated process group was unavailable.
+    ProcessIdentity,
+    /// The stdout reader could not be installed.
+    StdoutSetup,
+    /// The stderr reader could not be installed.
+    StderrSetup,
+}
+
+/// Fixed diagnostic details; no path, stderr, provider data or OS error text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpenCodeSpawnDiagnostic {
+    /// Affected collector phase.
+    pub phase: OpenCodeSpawnPhase,
+    /// Fixed spawn failure category.
+    pub cause: OpenCodeSpawnCause,
+}
+
 /// Trusted ownership data supplied by the caller.
 ///
 /// `canonical_workdir` is already canonical. Validation must not call `Path::canonicalize`; the

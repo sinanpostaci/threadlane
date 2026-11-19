@@ -12,8 +12,8 @@ use tokio::sync::watch;
 
 use threadlane_workers::{
     execute_worker_task, run_worker, run_worker_with_cancel, ExecutionBudgets, FieldEvidence,
-    OpenCodeMetadataEvidence, WorkAcceptanceState, WorkerFilePermissions, WorkerProvider,
-    WorkerRunStatus, WorkerSpec,
+    OpenCodeMetadataEvidence, OpenCodeSpawnCause, OpenCodeSpawnDiagnostic, OpenCodeSpawnPhase,
+    WorkAcceptanceState, WorkerFilePermissions, WorkerProvider, WorkerRunStatus, WorkerSpec,
 };
 
 static SCRIPT_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -229,6 +229,28 @@ exit 2
         !serialized.contains("RAW_EXPORT_SENTINEL"),
         "serialized report must never contain raw export content"
     );
+
+    // An additive diagnostic cannot be removed from the coarse error alone to forge success.
+    let mut tampered = report.clone();
+    tampered.opencode_metadata_spawn_diagnostic = Some(OpenCodeSpawnDiagnostic {
+        phase: OpenCodeSpawnPhase::SessionGet,
+        cause: OpenCodeSpawnCause::PipeCapacityDenied,
+    });
+    assert!(tampered.opencode_metadata_error.is_none());
+    assert!(tampered.validated_opencode_metadata().is_none());
+    assert!(!tampered.has_satisfied_result_evidence());
+    assert!(!tampered.has_complete_natural_completion_evidence());
+    assert!(!tampered.is_completed_pending_effort_evidence());
+    assert_eq!(tampered.effective_observed_model(), None);
+
+    // The historical wire shape omitted the new optional field.
+    let old_shape = serde_json::to_value(&report).expect("serialize old-compatible report");
+    assert!(old_shape
+        .get("opencode_metadata_spawn_diagnostic")
+        .is_none());
+    let restored: threadlane_workers::WorkerExecutionReport =
+        serde_json::from_value(old_shape).expect("read historical report");
+    assert_eq!(restored, report);
 
     assert_eq!(
         read_invocations(&log_path),

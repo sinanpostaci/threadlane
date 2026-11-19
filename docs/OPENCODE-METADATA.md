@@ -101,6 +101,23 @@ overflow, read failure or incomplete descendant cleanup prevents acceptance.
 Metadata and export content stay in memory; only allowlisted evidence or finite
 error codes enter the report.
 
+On Linux, immediately after session creation and before model execution, the
+collector reserves separate close-on-exec stdout pipes for `session.get` and
+sanitized export. Their verified capacities remain at least 64 KiB and 1 MiB,
+respectively, until each is consumed once or closed on an early exit. This holds
+two pipe pairs per active owned run and can cause reservation to fail before the
+model starts if those resources are unavailable. The overall deadline and
+cancellation checks still apply. Other platforms retain their existing transport.
+
+For future spawn failures the existing `opencode_metadata_error` remains
+`spawn_failed`. An optional `opencode_metadata_spawn_diagnostic` gives a fixed
+`phase` (`session_create`, `reserve_session_get`, `reserve_session_export`,
+`session_get`, or `session_export`) and `cause` (`pipe_create`,
+`pipe_capacity_denied`, `pipe_capacity`, `process_spawn`, `process_identity`,
+`stdout_setup`, or `stderr_setup`). It contains no provider data. Old reports
+can lack this field; a diagnostic never authorizes completion and cannot explain
+the cause of an older, undifferentiated failure.
+
 Reports preserve the original NDJSON evidence, including `saw_result_event`.
 Validated per-assistant metadata may supplement missing model, effort or terminal
 completion. Stream mismatches, blocks, errors and malformed output remain

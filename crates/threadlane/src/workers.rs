@@ -2110,6 +2110,7 @@ mod tests {
                 terminal_message_id: "msg_ast_001".to_string(),
             }),
             opencode_metadata_error: None,
+            opencode_metadata_spawn_diagnostic: None,
         };
 
         let diff_gate = DiffGateReport {

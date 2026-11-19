@@ -116,8 +116,9 @@ pub use git::{
 pub use opencode_metadata::{
     validate_opencode_metadata, validate_opencode_metadata_with_diagnostic,
     OpenCodeMetadataDiagnostic, OpenCodeMetadataError, OpenCodeMetadataEvidence,
-    OpenCodeMetadataStage, OwnedOpenCodeSession, MAX_OPENCODE_EXPORT_BYTES,
-    MAX_OPENCODE_INFO_BYTES, MAX_OPENCODE_MESSAGES,
+    OpenCodeMetadataStage, OpenCodeSpawnCause, OpenCodeSpawnDiagnostic, OpenCodeSpawnPhase,
+    OwnedOpenCodeSession, MAX_OPENCODE_EXPORT_BYTES, MAX_OPENCODE_INFO_BYTES,
+    MAX_OPENCODE_MESSAGES,
 };
 pub use owned_process::{
     OwnedProcessObserver, OwnedProcessOrigin, OwnedProcessSnapshot, OwnedProcessState,
