@@ -1005,18 +1005,21 @@ async fn ordinary_notice_concurrent_duplicates_do_not_block_runtime_or_repeat_ac
     })
     .await
     .expect("same-scope notices must not block the Tokio worker");
-    assert!(
-        one.is_ok() || two.is_ok(),
-        "one original notice must prepare the review"
-    );
-    for reply in [one, two] {
-        if let Ok(reply) = reply {
-            assert_eq!(
-                reply.structured_content.unwrap()["data"]["status"],
-                "ready_for_semantic_review"
-            );
-        }
-    }
+    let first = one
+        .expect("first notice must prepare or recover the original review")
+        .structured_content
+        .expect("first notice must return its structured review");
+    let second = two
+        .expect("concurrent duplicate must recover the same review")
+        .structured_content
+        .expect("duplicate notice must return its structured review");
+    assert_eq!(first["data"]["status"], "ready_for_semantic_review");
+    assert_eq!(second["data"]["status"], "ready_for_semantic_review");
+    let read_id = first["data"]["read_id"]
+        .as_str()
+        .expect("first notice must return a review read ID");
+    assert!(read_id.starts_with("rd_"));
+    assert_eq!(second["data"]["read_id"], read_id);
     let db = f
         .fixture
         .sessions_dir
