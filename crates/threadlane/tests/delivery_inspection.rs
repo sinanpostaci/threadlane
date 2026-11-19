@@ -9,7 +9,8 @@ use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use threadlane::delivery_inspection::{
     inspect_delivery, inspect_delivery_with_limits, inspect_delivery_with_source,
-    inspect_delivery_with_source_and_limits, DeliveryChangeKind, DeliveryFileInspection,
+    inspect_delivery_with_source_and_limits, inspect_delivery_with_source_text,
+    inspect_delivery_with_source_text_and_limits, DeliveryChangeKind, DeliveryFileInspection,
     DeliveryFilePhysicalCode, DeliveryInspectionLimits, DeliveryInspectionRefusalCode,
     DeliveryInspectionReport, DeliveryInspectionRequest, DeliveryTextStatus,
 };
@@ -247,6 +248,216 @@ fn source_and_task_share_the_total_read_budget() {
         source.refusal_code,
         Some(DeliveryInspectionRefusalCode::ReadLimit)
     );
+}
+
+fn source_text_fixture() -> (Fixture, DeliveryInspectionRequest) {
+    let fixture = Fixture::new();
+    let worker_root = fixture.root.parent().unwrap().join("worker");
+    git(
+        &fixture.root,
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "--detach",
+            worker_root.to_str().unwrap(),
+            &fixture.base,
+        ],
+    );
+    fs::write(worker_root.join("src/lib.rs"), "ok\n").unwrap();
+    let mut request = fixture.request(&["src/lib.rs"], &["src/lib.rs"]);
+    request.root = worker_root;
+    (fixture, request)
+}
+
+fn assert_source_text_refused(
+    report: &DeliveryInspectionReport,
+    code: DeliveryInspectionRefusalCode,
+) {
+    assert!(!report.ok, "expected source refusal: {report:?}");
+    assert_eq!(report.refusal_code, Some(code), "{report:?}");
+    let source = report.source.as_ref().expect("source refusal evidence");
+    assert!(!source.ok && !source.clean_at_base && source.files.is_empty());
+    assert!(!report.text_included && !report.untrusted_data);
+    assert!(report.files.iter().all(|file| file.text.is_none()));
+}
+
+#[test]
+fn source_text_is_opt_in_exact_and_untrusted_and_old_json_is_unchanged() {
+    let (fixture, mut request) = source_text_fixture();
+    request.text_files.clear();
+    let names = vec!["src/lib.rs".to_string()];
+    let old = inspect_delivery_with_source(&request, &fixture.root, &names);
+    assert!(old.ok && !old.text_included && !old.untrusted_data);
+    let old_json = serde_json::to_value(&old).unwrap();
+    let old_file = &old_json["source"]["files"][0];
+    for field in ["text", "size_bytes", "final_lf", "text_untrusted"] {
+        assert!(
+            old_file.get(field).is_none(),
+            "unexpected old field {field}"
+        );
+    }
+
+    let report = inspect_delivery_with_source_text(&request, &fixture.root, &names);
+    assert!(report.ok && report.text_included && report.untrusted_data);
+    let source = report.source.unwrap();
+    assert!(source.ok && source.clean_at_base);
+    assert_eq!(source.files.len(), 1);
+    let file = &source.files[0];
+    let expected = "pub fn alpha() -> u32 { 1 }\n";
+    assert_eq!(file.text.as_deref(), Some(expected));
+    assert_eq!(file.sha256, sha256_hex(expected.as_bytes()));
+    assert_eq!(file.base_sha256, file.sha256);
+    assert!(file.matches_base);
+    assert_eq!(file.size_bytes, Some(expected.len() as u64));
+    assert_eq!(file.final_lf, Some(true));
+    assert_eq!(file.text_untrusted, Some(true));
+}
+
+#[test]
+fn source_text_preserves_dirty_and_stale_source_facts_and_exact_utf8() {
+    let (fixture, request) = source_text_fixture();
+    let names = vec!["src/lib.rs".to_string()];
+    let contents = "özel içerik without final newline";
+    fixture.write("src/lib.rs", contents);
+    let report = inspect_delivery_with_source_text(&request, &fixture.root, &names);
+    assert!(report.ok, "{report:?}");
+    let source = report.source.unwrap();
+    assert!(!source.clean_at_base && source.head_commit.as_deref() == Some(fixture.base.as_str()));
+    let file = &source.files[0];
+    assert!(!file.matches_base);
+    assert_eq!(file.text.as_deref(), Some(contents));
+    assert_eq!(file.sha256, sha256_hex(contents.as_bytes()));
+    assert_eq!(file.size_bytes, Some(contents.len() as u64));
+    assert_eq!(file.final_lf, Some(false));
+
+    fixture.commit_all("source head moved");
+    let report = inspect_delivery_with_source_text(&request, &fixture.root, &names);
+    assert!(report.ok, "{report:?}");
+    let source = report.source.unwrap();
+    assert!(!source.clean_at_base);
+    assert_ne!(source.head_commit.as_deref(), Some(fixture.base.as_str()));
+    assert!(!source.files[0].matches_base);
+}
+
+#[test]
+fn source_text_refusals_withhold_all_task_and_partial_source_text() {
+    let (fixture, request) = source_text_fixture();
+    let names = vec!["src/unchanged.rs".to_string(), "src/lib.rs".to_string()];
+
+    fixture.write("src/lib.rs", [0xff, 0xfe]);
+    let report = inspect_delivery_with_source_text(&request, &fixture.root, &names);
+    assert_source_text_refused(&report, DeliveryInspectionRefusalCode::TextFileNotUtf8);
+
+    fs::remove_file(fixture.root.join("src/lib.rs")).unwrap();
+    let report = inspect_delivery_with_source_text(&request, &fixture.root, &names);
+    assert_source_text_refused(&report, DeliveryInspectionRefusalCode::TextFileMissing);
+
+    fixture.write("src/lib.rs", "original\n");
+    let duplicate = vec!["src/lib.rs".to_string(), "src/lib.rs".to_string()];
+    let report = inspect_delivery_with_source_text(&request, &fixture.root, &duplicate);
+    assert_source_text_refused(&report, DeliveryInspectionRefusalCode::DuplicatePath);
+    fixture.write("src/new.rs", "not present at the frozen base\n");
+    let untracked = vec!["src/unchanged.rs".to_string(), "src/new.rs".to_string()];
+    let report = inspect_delivery_with_source_text(&request, &fixture.root, &untracked);
+    assert_source_text_refused(&report, DeliveryInspectionRefusalCode::FileReadFailed);
+    let protected = vec![".git/config".to_string()];
+    let report = inspect_delivery_with_source_text(&request, &fixture.root, &protected);
+    assert_source_text_refused(&report, DeliveryInspectionRefusalCode::ProtectedPath);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+        fs::remove_file(fixture.root.join("src/lib.rs")).unwrap();
+        symlink("unchanged.rs", fixture.root.join("src/lib.rs")).unwrap();
+        let report = inspect_delivery_with_source_text(&request, &fixture.root, &names);
+        assert_source_text_refused(&report, DeliveryInspectionRefusalCode::SymlinkEscape);
+    }
+}
+
+#[test]
+fn source_text_enforces_count_and_shares_text_read_and_output_budgets() {
+    let (fixture, request) = source_text_fixture();
+    let names = vec!["src/lib.rs".to_string(), "src/unchanged.rs".to_string()];
+    let count_limits = DeliveryInspectionLimits {
+        max_paths: 1,
+        ..DeliveryInspectionLimits::default()
+    };
+    let report = inspect_delivery_with_source_text_and_limits(
+        &request,
+        &fixture.root,
+        &names,
+        &count_limits,
+    );
+    assert_source_text_refused(&report, DeliveryInspectionRefusalCode::TooManyPaths);
+
+    let file_limits = DeliveryInspectionLimits {
+        max_text_file_bytes: 8,
+        ..DeliveryInspectionLimits::default()
+    };
+    let report = inspect_delivery_with_source_text_and_limits(
+        &request,
+        &fixture.root,
+        &names[..1],
+        &file_limits,
+    );
+    assert_source_text_refused(&report, DeliveryInspectionRefusalCode::TextFileTooLarge);
+
+    let source_size = fs::metadata(fixture.root.join("src/lib.rs")).unwrap().len();
+    let total_limits = DeliveryInspectionLimits {
+        max_total_text_bytes: 3 + source_size - 1,
+        ..DeliveryInspectionLimits::default()
+    };
+    let report = inspect_delivery_with_source_text_and_limits(
+        &request,
+        &fixture.root,
+        &names[..1],
+        &total_limits,
+    );
+    assert_source_text_refused(&report, DeliveryInspectionRefusalCode::TextFileTooLarge);
+
+    let read_limits = DeliveryInspectionLimits {
+        max_total_read_bytes: 3 + source_size * 2 - 1,
+        ..DeliveryInspectionLimits::default()
+    };
+    let report = inspect_delivery_with_source_text_and_limits(
+        &request,
+        &fixture.root,
+        &names[..1],
+        &read_limits,
+    );
+    assert_source_text_refused(&report, DeliveryInspectionRefusalCode::ReadLimit);
+
+    // The task report alone fits, but the source text makes the combined JSON exceed the cap.
+    let mut output_limits = DeliveryInspectionLimits::default();
+    let task_size = serde_json::to_vec(&inspect_delivery(&request))
+        .unwrap()
+        .len();
+    output_limits.max_output_bytes = task_size + 1;
+    let report = inspect_delivery_with_source_text_and_limits(
+        &request,
+        &fixture.root,
+        &names[..1],
+        &output_limits,
+    );
+    assert_eq!(
+        report.refusal_code,
+        Some(DeliveryInspectionRefusalCode::OutputLimit)
+    );
+    assert!(!report.ok && report.output_omitted && report.source.is_none());
+    assert!(!report.text_included && !report.untrusted_data);
+    assert!(report.files.is_empty());
+}
+
+#[test]
+fn source_text_refuses_index_flags_before_exposing_text() {
+    for flag in ["--assume-unchanged", "--skip-worktree"] {
+        let (fixture, request) = source_text_fixture();
+        git(&fixture.root, &["update-index", flag, "src/lib.rs"]);
+        let names = vec!["src/lib.rs".to_string()];
+        let report = inspect_delivery_with_source_text(&request, &fixture.root, &names);
+        assert_source_text_refused(&report, DeliveryInspectionRefusalCode::IndexFlagUnsupported);
+    }
 }
 
 #[test]

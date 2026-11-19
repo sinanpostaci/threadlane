@@ -422,6 +422,18 @@ pub struct SourceFileInspection {
     pub base_sha256: String,
     /// Whether the observed bytes match the frozen base.
     pub matches_base: bool,
+    /// Exact size of explicitly requested source text in bytes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size_bytes: Option<u64>,
+    /// Whether explicitly requested source text ends in a final `\n` byte.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub final_lf: Option<bool>,
+    /// Explicit untrusted source text, included only in the opt-in inspection.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    /// True when source text is included; absent in a non-text source inspection.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text_untrusted: Option<bool>,
 }
 
 /// Bounded source checkout facts. A failed observation never means the source matched.
@@ -541,10 +553,53 @@ pub fn inspect_delivery_with_source_and_limits(
     source_files: &[String],
     limits: &DeliveryInspectionLimits,
 ) -> DeliveryInspectionReport {
+    inspect_delivery_with_source_mode(request, source_root, source_files, limits, false)
+}
+
+/// Inspects explicitly named source files with their bounded, untrusted UTF-8 text.
+///
+/// Text and the current-file SHA-256 come from the same stable read. Source cleanliness,
+/// HEAD and base-byte equality are reported independently and must be checked by the caller.
+pub fn inspect_delivery_with_source_text(
+    request: &DeliveryInspectionRequest,
+    source_root: &Path,
+    source_files: &[String],
+) -> DeliveryInspectionReport {
+    inspect_delivery_with_source_text_and_limits(
+        request,
+        source_root,
+        source_files,
+        &DeliveryInspectionLimits::default(),
+    )
+}
+
+/// Inspects source text under shared task/source deadline, read, text and output budgets.
+pub fn inspect_delivery_with_source_text_and_limits(
+    request: &DeliveryInspectionRequest,
+    source_root: &Path,
+    source_files: &[String],
+    limits: &DeliveryInspectionLimits,
+) -> DeliveryInspectionReport {
+    inspect_delivery_with_source_mode(request, source_root, source_files, limits, true)
+}
+
+fn inspect_delivery_with_source_mode(
+    request: &DeliveryInspectionRequest,
+    source_root: &Path,
+    source_files: &[String],
+    limits: &DeliveryInspectionLimits,
+    include_source_text: bool,
+) -> DeliveryInspectionReport {
     let started = Instant::now();
     let mut report = inspect_delivery_with_limits(request, limits);
     if report.ok {
         let task_bytes = report.files.iter().filter_map(|file| file.size_bytes).sum();
+        let task_text_bytes = report
+            .files
+            .iter()
+            .filter_map(|file| file.text.as_ref())
+            .map(|text| text.len() as u64)
+            .sum();
         report.source = Some(inspect_source(
             request,
             source_root,
@@ -552,6 +607,8 @@ pub fn inspect_delivery_with_source_and_limits(
             limits,
             started,
             task_bytes,
+            task_text_bytes,
+            include_source_text,
         ));
         if report.source.as_ref().is_some_and(|source| !source.ok) {
             report.ok = false;
@@ -564,11 +621,18 @@ pub fn inspect_delivery_with_source_and_limits(
             omit_unstable_text(&mut report.files);
             report.text_included = false;
             report.untrusted_data = false;
+        } else if include_source_text {
+            report.text_included |= report
+                .source
+                .as_ref()
+                .is_some_and(|source| source.files.iter().any(|file| file.text.is_some()));
+            report.untrusted_data = report.text_included;
         }
     }
     enforce_output_limit(report, limits.max_output_bytes)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn inspect_source(
     task: &DeliveryInspectionRequest,
     root: &Path,
@@ -576,6 +640,8 @@ fn inspect_source(
     limits: &DeliveryInspectionLimits,
     started: Instant,
     task_bytes: u64,
+    task_text_bytes: u64,
+    include_source_text: bool,
 ) -> SourceInspection {
     let mut report = SourceInspection {
         ok: false,
@@ -588,7 +654,16 @@ fn inspect_source(
         clean_at_base: false,
         files: Vec::new(),
     };
-    let result = inspect_source_inner(task, root, files, limits, started, task_bytes);
+    let result = inspect_source_inner(
+        task,
+        root,
+        files,
+        limits,
+        started,
+        task_bytes,
+        task_text_bytes,
+        include_source_text,
+    );
     match result {
         Ok((head, tree, changes, inspected)) => {
             report.clean_at_base = head == task.expected_base
@@ -605,6 +680,7 @@ fn inspect_source(
     report
 }
 
+#[allow(clippy::too_many_arguments)]
 fn inspect_source_inner(
     task: &DeliveryInspectionRequest,
     root: &Path,
@@ -612,6 +688,8 @@ fn inspect_source_inner(
     limits: &DeliveryInspectionLimits,
     started: Instant,
     task_bytes: u64,
+    task_text_bytes: u64,
+    include_source_text: bool,
 ) -> Result<
     (
         String,
@@ -631,7 +709,11 @@ fn inspect_source_inner(
             root: root.to_path_buf(),
             expected_base: task.expected_base.clone(),
             allowed_paths: files.to_vec(),
-            text_files: Vec::new(),
+            text_files: if include_source_text {
+                files.to_vec()
+            } else {
+                Vec::new()
+            },
         },
         limits,
     )?;
@@ -662,13 +744,13 @@ fn inspect_source_inner(
     let mut inspected = Vec::new();
     let mut observations = Vec::new();
     let mut total_read = task_bytes;
-    let mut total_text = 0;
+    let mut total_text = task_text_bytes;
     for path in &source.allowed_paths {
         let (current, failure) = inspect_file(
             &source.root,
             path,
             first.changes.get(path),
-            false,
+            include_source_text,
             limits,
             started,
             &mut total_read,
@@ -744,6 +826,10 @@ fn inspect_source_inner(
             matches_base: actual == base,
             sha256: actual,
             base_sha256: base,
+            size_bytes: include_source_text.then_some(current.size_bytes).flatten(),
+            final_lf: include_source_text.then_some(current.final_lf).flatten(),
+            text: current.text,
+            text_untrusted: include_source_text.then_some(current.text_untrusted),
         });
     }
     if capture_snapshot(&source.root, &source.expected_base, limits, started)? != first {
