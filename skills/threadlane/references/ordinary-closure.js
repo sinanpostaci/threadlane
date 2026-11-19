@@ -1354,6 +1354,7 @@ function createOrdinaryClosureClient(callbacks) {
     var binding = await load(ORDINARY_CLOSURE_CLIENT_BINDING_KEY);
     var corr = await load(ORDINARY_CLOSURE_CLIENT_CORRELATION_KEY);
     var report = await load(ORDINARY_CLOSURE_CLIENT_REPORT_KEY);
+    var verifiedReadId = null;
     if (acceptance.read_id !== undefined) {
       if (typeof acceptance.read_id !== "string" || !/^rd_[0-9a-f]{64}$/.test(acceptance.read_id)) {
         throw new Error("invalid immutable read_id");
@@ -1367,6 +1368,7 @@ function createOrdinaryClosureClient(callbacks) {
           stableStringify(observation.evidence.start) !== stableStringify(start)) {
         throw new Error("immutable read observation is missing, stale, or changed");
       }
+      verifiedReadId = "rd_" + sha256Utf8(stableStringify(observation));
       report = observation.report;
       corr = {input: input, start: start, report: report};
     }
@@ -1398,6 +1400,11 @@ function createOrdinaryClosureClient(callbacks) {
         "invalid closure capsule, context, or report; stale or missing " +
         "start/binding/correlation; use original-receipt fallback"
       );
+    }
+
+    function withVerifiedReadId(view) {
+      if (view.status === "done" && verifiedReadId !== null) view.read_id = verifiedReadId;
+      return view;
     }
 
     var acceptanceData = {
@@ -1507,7 +1514,7 @@ function createOrdinaryClosureClient(callbacks) {
             "use original-receipt fallback"
           );
         }
-        return retainedDone(recordReceipt, recordView);
+        return withVerifiedReadId(retainedDone(recordReceipt, recordView));
       }
       if (recordView !== undefined) {
         throw new Error(
@@ -1568,7 +1575,7 @@ function createOrdinaryClosureClient(callbacks) {
           "use original-receipt fallback"
         );
       }
-      return retainedDone(legacyReceipt, legacyView);
+      return withVerifiedReadId(retainedDone(legacyReceipt, legacyView));
     }
     if (legacyView !== null) {
       throw new Error(
@@ -1619,7 +1626,7 @@ function createOrdinaryClosureClient(callbacks) {
         template
       );
     }
-    return view;
+    return withVerifiedReadId(view);
   }
 
   return Object.freeze({

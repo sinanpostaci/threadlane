@@ -23,7 +23,7 @@ use crate::error::{NativeError, NativeErrorCode};
 use crate::fs_safety::validate_absolute_no_symlink_components;
 
 /// Bundled Threadlane Codex skill version identifier.
-pub const THREADLANE_SKILL_VERSION: &str = "2026-11-19.v2";
+pub const THREADLANE_SKILL_VERSION: &str = "2026-11-19.v3";
 
 /// Directory and skill name for the bundled Threadlane Codex skill.
 pub const THREADLANE_SKILL_NAME: &str = "threadlane";
@@ -1971,7 +1971,7 @@ mod tests {
         assert_eq!(prior.state, CodexSkillSetupState::Installed);
         let check = run_codex_skill_setup(&req, CodexSetupMode::Check);
         assert_eq!(check.state, CodexSkillSetupState::Outdated);
-        assert_eq!(check.version, "2026-11-19.v2");
+        assert_eq!(check.version, "2026-11-19.v3");
         assert!(!check.files_modified);
         let update = run_codex_skill_setup(&req, CodexSetupMode::Apply);
         assert_eq!(update.state, CodexSkillSetupState::Updated);

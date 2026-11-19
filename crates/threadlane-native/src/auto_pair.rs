@@ -94,15 +94,34 @@ pub(crate) struct AutomaticPairingRuntime<'a> {
     pub(crate) sampler_owner: &'a NativeChatSamplerOwner,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub(crate) struct AutomaticPairingResult {
     connected: bool,
-    binding_id: String,
-    thread_id: String,
+    pub(crate) binding_id: String,
+    pub(crate) thread_id: String,
     binding_created: bool,
     conversation_role: &'static str,
     native_per_call_identity_verified: bool,
-    operator_context: OperatorContextBootstrap,
+    pub(crate) operator_context: OperatorContextBootstrap,
+}
+
+#[cfg(test)]
+impl AutomaticPairingResult {
+    pub(crate) fn verified_fixture(
+        binding_id: &str,
+        thread_id: &str,
+        operator_context: OperatorContextBootstrap,
+    ) -> Self {
+        Self {
+            connected: true,
+            binding_id: binding_id.to_owned(),
+            thread_id: thread_id.to_owned(),
+            binding_created: false,
+            conversation_role: "coworker",
+            native_per_call_identity_verified: false,
+            operator_context,
+        }
+    }
 }
 
 pub(crate) fn parse_thread_hint(value: Option<&str>) -> Result<String, NativeError> {

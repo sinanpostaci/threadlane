@@ -1,0 +1,44 @@
+// functions.exec prep: COPY literally; bind the one typed input object.
+const input = APPROVED_TASK_CONTEXT;
+const a = input && input.start_args, s = input && input.scope;
+if (!input || typeof input.binary !== "string" || input.binary.charAt(0) !== "/" ||
+    typeof input.expected_source_sha256 !== "string" ||
+    !/^[0-9a-f]{64}$/.test(input.expected_source_sha256) || !a || !s ||
+    typeof s.base_commit !== "string" || !/^[0-9a-f]{40}$/.test(s.base_commit) ||
+    typeof s.requested_model !== "string" || s.requested_model.length === 0 ||
+    typeof s.requested_effort !== "string" || s.requested_effort.length === 0 ||
+    !Array.isArray(s.write_paths) || s.write_paths.length === 0 ||
+    !s.write_paths.every((p) => typeof p === "string" && p.length > 0 &&
+      !p.includes("\u0000") && !p.includes("\\") && p.charAt(0) !== "/" &&
+      p.split("/").every((segment) => segment && segment !== "." && segment !== "..")) ||
+    !s.inspector || typeof s.inspector.executable !== "string" ||
+    s.inspector.executable.charAt(0) !== "/" ||
+    !Array.isArray(s.inspector.argv) || s.inspector.argv.length !== 1 ||
+    s.inspector.argv[0] !== "inspect-delivery" ||
+    !Number.isSafeInteger(a.expected_revision) || a.expected_revision <= 0 ||
+    [a.command_key, a.item_id, a.approval_id, a.task_id]
+      .some((v) => typeof v !== "string" || v.length === 0)) {
+  throw new Error("invalid approved task context");
+}
+await store("threadlane/approved-task-context.json", input);
+const quote = (value) => "'" + String(value).replace(/'/g, "'\\''") + "'";
+const result = await tools.exec_command({
+  cmd: quote(input.binary) + " 'closure-template'",
+  max_output_tokens: 40000, yield_time_ms: 30000,
+});
+if (result.exit_code !== 0 || result.session_id ||
+    result.output_truncated === true || result.truncated === true ||
+    typeof result.output !== "string") throw new Error("canonical closure-template failed");
+const template = JSON.parse(result.output);
+if (template.schema_version !== 1 || template.tool !== "threadlane closure-template" ||
+    template.version !== "2026-11-19.v2" ||
+    template.source_path !== "skills/threadlane/references/ordinary-closure.js" ||
+    template.factory_name !== "createOrdinaryClosure" ||
+    template.source_sha256 !== input.expected_source_sha256 ||
+    typeof template.javascript !== "string") throw new Error("untrusted closure template");
+await store("threadlane/closure-template.json", template);
+const started = await tools.mcp__threadlane__backlog_worker_start(a);
+if (!started || typeof started !== "object") throw new Error("missing guarded start reply; use original-receipt fallback");
+await store("threadlane/start-receipt.json", started);
+await store("threadlane/start-binding.json", {input, start: started});
+text(JSON.stringify({version: template.version, source_sha256: template.source_sha256}));

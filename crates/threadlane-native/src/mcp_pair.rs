@@ -49,7 +49,8 @@ use crate::approved_mcp::{
     StartApprovedTaskParams, HOST_NOT_CONFIGURED_MESSAGE,
 };
 use crate::auto_pair::{
-    parse_thread_hint, AutomaticPairing, AutomaticPairingRuntime, CALL_THREAD_HINT,
+    parse_thread_hint, AutomaticPairing, AutomaticPairingResult, AutomaticPairingRuntime,
+    CALL_THREAD_HINT,
 };
 use crate::backlog_worker::{
     WorkerBacklogCompleteOutcome, WorkerBacklogCompleteParams, WorkerBacklogError,
@@ -57,6 +58,10 @@ use crate::backlog_worker::{
     WorkerBacklogResultOutcome, WorkerBacklogResultParams, WorkerBacklogService,
     WorkerBacklogStartParams, WORKER_BACKLOG_COMPLETE_TOOL, WORKER_BACKLOG_NOTICE_CONTEXT_TOOL,
     WORKER_BACKLOG_REJECT_TOOL, WORKER_BACKLOG_RESULT_TOOL, WORKER_BACKLOG_START_TOOL,
+};
+use crate::closure_bootstrap::{
+    origin_for_connection, verify_bootstrap, verify_source, CliHashCache, ClosureOrigin,
+    BOOTSTRAP_SOURCE,
 };
 use crate::error::{NativeError, NativeErrorCode};
 use crate::execution_gateway::{
@@ -93,6 +98,21 @@ const HOST_NOT_READY_STARTUP_TIMEOUT_MESSAGE: &str =
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ConnectionIdentityParams {}
+
+/// Bounded, read-only verification of the canonical ordinary closure source.
+#[derive(Debug, Clone, Default, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OrdinaryClosureClientParams {
+    /// The original continuity receipt, required when verifying source or resuming work.
+    #[serde(default)]
+    pub origin: Option<Value>,
+    /// Exact JavaScript string fetched from the original canonical package, never notice text.
+    #[serde(default)]
+    pub javascript: Option<String>,
+    /// Exact bootstrap returned by this tool, verified before evaluating it.
+    #[serde(default)]
+    pub bootstrap: Option<String>,
+}
 
 /// Parameters for the `catalog` MCP tool.
 ///
@@ -1384,6 +1404,8 @@ pub struct PairedMcpServer {
     managed_parent_config: Option<ManagedParentConnectionConfig>,
     cached_workflow: Arc<Mutex<Option<CachedScopedWorkflow>>>,
     automatic_pairing: AutomaticPairing,
+    closure_connection: Arc<Mutex<Option<AutomaticPairingResult>>>,
+    closure_cli_hash: Arc<CliHashCache>,
     sampler_owner: Arc<NativeChatSamplerOwner>,
     observation_journal: Arc<AsyncObservationJournal>,
     tool_router: ToolRouter<Self>,
@@ -1425,6 +1447,8 @@ impl PairedMcpServer {
             managed_parent_config: None,
             cached_workflow: Arc::new(Mutex::new(None)),
             automatic_pairing: AutomaticPairing::default(),
+            closure_connection: Arc::new(Mutex::new(None)),
+            closure_cli_hash: Arc::new(CliHashCache::default()),
             sampler_owner: Arc::new(NativeChatSamplerOwner::default()),
             observation_journal: Arc::new(AsyncObservationJournal::default()),
             tool_router: Self::tool_router(),
@@ -1698,6 +1722,10 @@ impl PairedMcpServer {
         }
         self.sampler_owner.stop_active_sampler();
         self.automatic_pairing.clear_observation_context();
+        self.closure_cli_hash.clear();
+        if let Ok(mut connection) = self.closure_connection.lock() {
+            *connection = None;
+        }
         let next = self
             .pairing_store
             .register_restarted_epoch(&self.epoch_id, self.server_pid)?;
@@ -1804,6 +1832,7 @@ impl PairedMcpServer {
             }
             "status"
             | OPERATING_GUIDE_TOOL
+            | "ordinary_closure_client"
             | "get_run"
             | "list_runs"
             | "list_run_revisions"
@@ -1882,6 +1911,10 @@ impl PairedMcpServer {
             OPERATING_GUIDE_TOOL => {
                 let params = self.parse_enrolled_tool_params(tool_name, arguments)?;
                 Ok(self.operating_guide_boxed(params))
+            }
+            "ordinary_closure_client" => {
+                let params = self.parse_enrolled_tool_params(tool_name, arguments)?;
+                Ok(self.ordinary_closure_client_boxed(params))
             }
             "get_run" => {
                 let params = self.parse_enrolled_tool_params(tool_name, arguments)?;
@@ -2278,6 +2311,7 @@ impl PairedMcpServer {
                     *guard = None;
                 }
                 self.automatic_pairing.clear_observation_context();
+                self.closure_cli_hash.clear();
                 return Err(Self::format_pairing_error(tool_name, err));
             }
         };
@@ -2290,6 +2324,7 @@ impl PairedMcpServer {
                 *guard = None;
             }
             self.automatic_pairing.clear_observation_context();
+            self.closure_cli_hash.clear();
             return Err(Self::format_pairing_error(
                 tool_name,
                 NativeError::new(
@@ -2301,7 +2336,10 @@ impl PairedMcpServer {
 
         self.automatic_pairing
             .verify_call(&enrollment.thread_id)
-            .map_err(|err| Self::format_pairing_error(tool_name, err))?;
+            .map_err(|err| {
+                self.closure_cli_hash.clear();
+                Self::format_pairing_error(tool_name, err)
+            })?;
 
         Ok(enrollment)
     }
@@ -2312,7 +2350,10 @@ impl PairedMcpServer {
     ) -> Result<EnrollmentRecord, CallToolResult> {
         self.automatic_pairing
             .verify_call_hint_present_if_required()
-            .map_err(|err| Self::format_pairing_error(tool_name, err))?;
+            .map_err(|err| {
+                self.closure_cli_hash.clear();
+                Self::format_pairing_error(tool_name, err)
+            })?;
         let store_result = self
             .pairing_store
             .verify_enrolled_binding(&self.connection_nonce, &self.epoch_id);
@@ -2326,7 +2367,10 @@ impl PairedMcpServer {
     ) -> Result<EnrollmentRecord, CallToolResult> {
         self.automatic_pairing
             .verify_call_hint_present_if_required()
-            .map_err(|err| Self::format_pairing_error(tool_name, err))?;
+            .map_err(|err| {
+                self.closure_cli_hash.clear();
+                Self::format_pairing_error(tool_name, err)
+            })?;
 
         let wait_budget = match deadline {
             Some(dl) => {
@@ -3429,6 +3473,16 @@ impl PairedMcpServer {
         meta: rmcp::model::RequestMetaObject,
     ) -> BoxedTaskLocalFuture<'_, Result<CallToolResult, CallToolResult>> {
         Box::pin(async move {
+            self.closure_cli_hash.clear();
+            *self.closure_connection.lock().map_err(|_| {
+                Self::format_pairing_error(
+                    "connect_current_chat",
+                    NativeError::new(
+                        NativeErrorCode::SecurityViolation,
+                        "closure connection cache is unavailable",
+                    ),
+                )
+            })? = None;
             let result = async {
                 let hint = parse_thread_hint(meta.get("threadId").and_then(Value::as_str))?;
                 let identity = self
@@ -3464,6 +3518,18 @@ impl PairedMcpServer {
             }
             .await
             .map_err(|error| Self::format_pairing_error("connect_current_chat", error))?;
+            {
+                let mut connection = self.closure_connection.lock().map_err(|_| {
+                    Self::format_pairing_error(
+                        "connect_current_chat",
+                        NativeError::new(
+                            NativeErrorCode::SecurityViolation,
+                            "closure connection cache is unavailable",
+                        ),
+                    )
+                })?;
+                *connection = Some(result.clone());
+            }
             Ok(CallToolResult::structured(
                 json!({"untrusted_data": false, "tool": "connect_current_chat", "data": result}),
             ))
@@ -3491,6 +3557,169 @@ impl PairedMcpServer {
         Box::pin(async move {
             let delegate = self.enrolled_delegate(OPERATING_GUIDE_TOOL).await?;
             delegate.operating_guide(Parameters(params)).await
+        })
+    }
+
+    fn ordinary_closure_client_boxed(
+        &self,
+        params: OrdinaryClosureClientParams,
+    ) -> BoxedTaskLocalFuture<'_, Result<CallToolResult, CallToolResult>> {
+        Box::pin(async move {
+            const TOOL: &str = "ordinary_closure_client";
+            let enrollment = self.verify_enrolled_binding_for_tool(TOOL)?;
+            let connection = self
+                .closure_connection
+                .lock()
+                .map_err(|_| {
+                    Self::format_pairing_error(
+                        TOOL,
+                        NativeError::new(
+                            NativeErrorCode::SecurityViolation,
+                            "closure connection cache is unavailable",
+                        ),
+                    )
+                })?
+                .clone()
+                .ok_or_else(|| {
+                    Self::format_pairing_error(
+                        TOOL,
+                        NativeError::new(
+                            NativeErrorCode::NeedsVerification,
+                            "connect the current chat before using the closure",
+                        ),
+                    )
+                })?;
+            if connection.binding_id != enrollment.binding_id
+                || connection.thread_id != enrollment.thread_id
+            {
+                return Err(Self::format_pairing_error(
+                    TOOL,
+                    NativeError::new(
+                        NativeErrorCode::RebindRejected,
+                        "closure connection does not match the enrolled chat",
+                    ),
+                ));
+            }
+            let binding = enrollment.binding_id.clone();
+            let thread = enrollment.thread_id.clone();
+            let context = connection.operator_context.clone();
+            let cache = self.closure_cli_hash.clone();
+            let actual = tokio::task::spawn_blocking(move || {
+                origin_for_connection(&binding, &thread, &context, &cache)
+            })
+            .await
+            .map_err(|_| {
+                Self::format_pairing_error(
+                    TOOL,
+                    NativeError::new(
+                        NativeErrorCode::IoError,
+                        "closure identity check did not complete",
+                    ),
+                )
+            })?
+            .map_err(|error| Self::format_pairing_error(TOOL, error))?;
+            if let Some(expected) = params.origin {
+                let expected: ClosureOrigin = serde_json::from_value(expected).map_err(|_| {
+                    Self::format_pairing_error(
+                        TOOL,
+                        NativeError::new(
+                            NativeErrorCode::ValidationFailed,
+                            "invalid closure continuity receipt",
+                        ),
+                    )
+                })?;
+                if expected != actual {
+                    return Err(Self::format_pairing_error(
+                        TOOL,
+                        NativeError::new(
+                            NativeErrorCode::RebindRejected,
+                            "closure continuity receipt changed",
+                        ),
+                    ));
+                }
+            } else if params.javascript.is_some() || params.bootstrap.is_some() {
+                return Err(Self::format_pairing_error(
+                    TOOL,
+                    NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        "verification requires the original continuity receipt",
+                    ),
+                ));
+            }
+            if params.javascript.is_some() && params.bootstrap.is_some() {
+                return Err(Self::format_pairing_error(
+                    TOOL,
+                    NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        "verify one closure source at a time",
+                    ),
+                ));
+            }
+            let include_bootstrap = params.javascript.is_none() && params.bootstrap.is_none();
+            let source_verified = if let Some(source) = params.javascript {
+                let digest = verify_source(&source)
+                    .map_err(|error| Self::format_pairing_error(TOOL, error))?;
+                if digest != actual.source_sha256 {
+                    return Err(Self::format_pairing_error(
+                        TOOL,
+                        NativeError::new(
+                            NativeErrorCode::SecurityViolation,
+                            "closure source digest changed",
+                        ),
+                    ));
+                }
+                true
+            } else {
+                false
+            };
+            let bootstrap_verified = if let Some(bootstrap) = params.bootstrap {
+                let digest = verify_bootstrap(&bootstrap)
+                    .map_err(|error| Self::format_pairing_error(TOOL, error))?;
+                if digest != actual.bootstrap_sha256 {
+                    return Err(Self::format_pairing_error(
+                        TOOL,
+                        NativeError::new(
+                            NativeErrorCode::SecurityViolation,
+                            "closure bootstrap digest changed",
+                        ),
+                    ));
+                }
+                true
+            } else {
+                false
+            };
+            let again = self.verify_enrolled_binding_for_tool(TOOL)?;
+            if again.binding_id != enrollment.binding_id || again.thread_id != enrollment.thread_id
+            {
+                return Err(Self::format_pairing_error(
+                    TOOL,
+                    NativeError::new(
+                        NativeErrorCode::RebindRejected,
+                        "closure enrollment changed during verification",
+                    ),
+                ));
+            }
+            let mut data = json!({
+                "origin": actual,
+                "source_verified": source_verified,
+                "bootstrap_verified": bootstrap_verified,
+                "template": {
+                    "schema_version": threadlane::CLOSURE_TEMPLATE_SCHEMA_VERSION,
+                    "tool": threadlane::CLOSURE_TEMPLATE_TOOL,
+                    "version": threadlane::CLOSURE_TEMPLATE_VERSION,
+                    "source_path": threadlane::CLOSURE_TEMPLATE_SOURCE_PATH,
+                    "source_sha256": threadlane::closure_template_source_sha256(),
+                    "factory_name": threadlane::CLOSURE_TEMPLATE_FACTORY_NAME,
+                }
+            });
+            if include_bootstrap {
+                data["bootstrap"] = Value::String(BOOTSTRAP_SOURCE.to_owned());
+            }
+            Ok(CallToolResult::structured(json!({
+                "untrusted_data": false,
+                "tool": TOOL,
+                "data": data
+            })))
         })
     }
 
@@ -4776,7 +5005,7 @@ impl PairedMcpServer {
     /// Delegated `operating_guide` tool (requires verified operator enrollment).
     #[tool(
         name = "operating_guide",
-        description = "Fetch the versioned, read-only Threadlane MCP operating guide (version 2026-11-19.v2) for the enrolled chat binding. Call on initial connection, session resume, or context uncertainty/compaction, then refresh only uncertain live scoped backlog/status/catalog state without a polling loop. Includes the ordinary backlog workflow, guarded Worker (coder) reservation/result/completion contracts (no unconditional pre-start approved_task/ready/host probe; guarded start owns eligible host startup and host_not_ready on an optional pre-start read is not an attempted launch), the ordinary offline closure template with template_version and source_sha256 for the packaged JS, and the compact finite callback closure with conditional sequential tool composition, cross-page ACK continuity, private DTO evidence, deadline and exec_command checks, and real per-batch ACKs; links to opt-in NATIVE-OPERATOR, PROFILE-FLOW, and legacy complete job admission with durability and receipt limits. Does not mutate state or acknowledge events.",
+        description = "Fetch the versioned, read-only Threadlane MCP operating guide (version 2026-11-19.v3) for the enrolled chat binding. Call on initial connection, session resume, or context uncertainty/compaction, then refresh only uncertain live scoped backlog/status/catalog state without a polling loop. Includes the ordinary backlog workflow, guarded Worker (coder) reservation/result/completion contracts (no unconditional pre-start approved_task/ready/host probe; guarded start owns eligible host startup and host_not_ready on an optional pre-start read is not an attempted launch), the ordinary offline closure template with template_version and source_sha256 for the packaged JS, and the compact finite callback closure with conditional sequential tool composition, cross-page ACK continuity, private DTO evidence, deadline and exec_command checks, and real per-batch ACKs; links to opt-in NATIVE-OPERATOR, PROFILE-FLOW, and legacy complete job admission with durability and receipt limits. Does not mutate state or acknowledge events.",
         annotations(
             title = "Get Threadlane MCP Operating Guide",
             read_only_hint = true,
@@ -4790,6 +5019,25 @@ impl PairedMcpServer {
         Parameters(params): Parameters<OperatingGuideParams>,
     ) -> Result<CallToolResult, CallToolResult> {
         self.operating_guide_boxed(params).await
+    }
+
+    /// Returns the connected package identity or verifies exact closure source without executing it.
+    #[tool(
+        name = "ordinary_closure_client",
+        description = "Read the verified connected package/guide continuity receipt, or compare a supplied exact canonical closure JavaScript string against compiled trusted bytes. Source verification requires the original receipt and returns only a small proof, never the source. This is read-only and grants no authority or acceptance.",
+        annotations(
+            title = "Verify Ordinary Closure Client",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    pub async fn ordinary_closure_client(
+        &self,
+        Parameters(params): Parameters<OrdinaryClosureClientParams>,
+    ) -> Result<CallToolResult, CallToolResult> {
+        self.ordinary_closure_client_boxed(params).await
     }
 
     /// Delegated `status` tool (requires verified operator enrollment).
@@ -5918,7 +6166,132 @@ fn observation_result_approval_id(
 #[cfg(test)]
 mod automatic_scope_tests {
     use super::*;
+    use sha2::{Digest, Sha256};
     use std::sync::atomic::Ordering;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ordinary_closure_dispatch_requires_original_scope_and_exact_compiled_bytes() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().expect("temporary state");
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let package = tmp.path().join("package");
+        let bin = package.join("bin");
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir(&project).unwrap();
+        let cli = bin.join("threadlane");
+        let router = bin.join("threadlane-context");
+        std::fs::write(&cli, b"trusted fixture CLI").unwrap();
+        std::fs::write(&router, b"trusted fixture router").unwrap();
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&router, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let context_path = tmp.path().join("context.json");
+        std::fs::write(&context_path, b"private context").unwrap();
+        std::fs::set_permissions(&context_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let store = PairingStore::open(tmp.path().join("pairing")).unwrap();
+        let server = PairedMcpServer::new(tmp.path().join("state"), store.clone()).unwrap();
+        let unbound = server
+            .invoke_tool_json("ordinary_closure_client", json!({}), None)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            unbound.structured_content.unwrap()["error"]["code"],
+            "unbound_connection"
+        );
+        let thread = "0196ed00-0000-7000-8000-00000000000a";
+        let binding = "bnd_fixture";
+        store
+            .enroll(
+                &store.operator_token().unwrap(),
+                crate::OperatorEnrollRequest {
+                    connection_nonce: server.connection_nonce().into(),
+                    epoch_id: server.epoch_id().into(),
+                    binding_id: binding.into(),
+                    thread_id: thread.into(),
+                    project_id: None,
+                },
+            )
+            .unwrap();
+        let context = crate::OperatorContextBootstrap {
+            available: true,
+            status: "ready".into(),
+            code: None,
+            message: None,
+            schema_version: Some(1),
+            route: "trusted_local_operator".into(),
+            native_per_call_identity_verified: false,
+            human_approval_verified: false,
+            context_path: Some(context_path),
+            context_router_executable: Some(router),
+            project_root: Some(project),
+            cli_package: Some(package),
+            content_sha256: Some(format!("{:x}", Sha256::digest(b"private context"))),
+            reused_existing: Some(false),
+        };
+        *server.closure_connection.lock().unwrap() = Some(
+            AutomaticPairingResult::verified_fixture(binding, thread, context),
+        );
+        server
+            .automatic_pairing
+            .require_call_identity
+            .store(true, Ordering::Release);
+        let call = |args| {
+            CALL_THREAD_HINT.scope(
+                Some(thread.to_owned()),
+                server.invoke_tool_json("ordinary_closure_client", args, None),
+            )
+        };
+        let initial = call(json!({})).await.unwrap().structured_content.unwrap();
+        assert_eq!(initial["untrusted_data"], false);
+        assert_eq!(initial["data"]["origin"]["binding_id"], binding);
+        assert_eq!(initial["data"]["origin"]["thread_id"], thread);
+        let origin = initial["data"]["origin"].clone();
+        let bootstrap = initial["data"]["bootstrap"].as_str().unwrap();
+        assert_eq!(bootstrap, BOOTSTRAP_SOURCE);
+        let proof = call(json!({"origin": origin, "bootstrap": bootstrap}))
+            .await
+            .unwrap()
+            .structured_content
+            .unwrap();
+        assert_eq!(proof["data"]["bootstrap_verified"], true);
+        assert!(proof["data"].get("bootstrap").is_none());
+        let source = threadlane::CLOSURE_TEMPLATE_JAVASCRIPT;
+        let proof = call(json!({"origin": origin, "javascript": source}))
+            .await
+            .unwrap()
+            .structured_content
+            .unwrap();
+        assert_eq!(proof["data"]["source_verified"], true);
+        assert!(proof["data"].get("javascript").is_none());
+        let mut foreign = origin.clone();
+        foreign["binding_id"] = json!("bnd_foreign");
+        assert!(call(json!({"origin": foreign})).await.is_err());
+        assert!(
+            call(json!({"origin": origin, "javascript": format!("{source} // changed")}))
+                .await
+                .is_err()
+        );
+        assert!(call(json!({"origin": origin, "bootstrap": "changed"}))
+            .await
+            .is_err());
+        assert!(call(json!({"javascript": source})).await.is_err());
+        assert!(
+            call(json!({"origin": origin, "javascript": "x".repeat(192 * 1024 + 1)}))
+                .await
+                .is_err()
+        );
+        let wrong = CALL_THREAD_HINT
+            .scope(
+                Some("0196ed00-0000-7000-8000-00000000000b".into()),
+                server.invoke_tool_json("ordinary_closure_client", json!({"origin": origin}), None),
+            )
+            .await;
+        assert!(
+            wrong.is_err(),
+            "a foreign chat cannot use the current receipt"
+        );
+    }
 
     #[tokio::test]
     async fn automatic_scope_is_checked_at_delegation_for_each_concurrent_call() {
@@ -6606,7 +6979,7 @@ mod backlog_paired_tests {
         let unbound = PairedMcpServer::new(&state_dir, pairing_store).expect("unbound server");
 
         let tools = unbound.list_tools();
-        assert_eq!(tools.len(), 54, "PairedMcpServer must expose 54 tools");
+        assert_eq!(tools.len(), 55, "PairedMcpServer must expose 55 tools");
 
         let cases: [(&str, bool, &[&str], &[&str]); 8] = [
             (

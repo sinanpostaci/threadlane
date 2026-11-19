@@ -28,7 +28,7 @@ Run `threadlane guide` to print the canonical versioned operating guide
 ([`docs/MCP-OPERATING-GUIDE.md`](MCP-OPERATING-GUIDE.md)) offline without network
 or supervisor access. When connected over MCP (`threadlane mcp` or enrolled
 `threadlane-native-mcp`), call the read-only `operating_guide` (`{}`) tool to
-fetch the same shared guide and version (`2026-11-19.v2`).
+fetch the same shared guide and version (`2026-11-19.v3`).
 
 Compaction detection and memory retention are not automatic. On initial
 connection, session resume, context uncertainty, or before external effects when
@@ -48,46 +48,9 @@ a polling loop. The detailed legacy contracts are preserved in
 [`docs/MCP-LEGACY-OPERATING-GUIDE.md`](MCP-LEGACY-OPERATING-GUIDE.md) and are
 opt-in only.
 
-`threadlane closure-template` prints the ordinary callback helper as
-offline JSON from the trusted offline packaged CLI (not a prerequisite file in
-`~/.agents`; schema/version `2026-11-19.v2`, source SHA-256, and the packaged
-JavaScript factory source). Once source and SHA-256 are verified, do not repeat
-declaration, repo, or global-skill searches. It needs no state directory,
-supervisor, provider, or network. Create the
-storage-only `worker` backlog item first with `backlog_create`; creation grants no
-authority. Prepare and privately retain its serializable capsule before
-`backlog_worker_start` without printing the JavaScript. Evaluate only that immutable
-packaged source in a fresh client JavaScript isolate with injected
-load/store/pull/ACK/result/inspect and optional complete/recover callbacks; never evaluate
-event, provider, or filesystem text. The capsule keeps the legacy `read`/`doneView`
-core and adds the small `createOrdinaryClosureClient` helper. COPY the literal
-recipes and bind only their one typed object (`APPROVED_TASK_CONTEXT` before start,
-`ACCEPTANCE_CONTEXT` after the separate semantic decision); bind the actual notice ID and verified package/guide pins at callback. Never parse, compile, or evaluate Markdown or fences, and do not repeatedly
-inspect declarations. The runnable recipe parses the actual `exec_command`
-`{exit_code, output, session_id?}` wrapper; `text`/`store` return undefined, and `load`
-restores serialized data in a fresh isolate. The capsule JavaScript is never printed.
-`readNotice(actualApprovalId)` recovers absent temporary state from the scoped original
-execution and frozen scope; conflicting cache refuses. Original no-notice recovery via
-`readStored()` retains its strict legacy checks. Active closure retains
-every actual returned DTO in private evidence, checks cross-page cursor continuity,
-rejects an inner EventBatch above 49152 UTF-8 bytes or an invalid event `step_seq`
-before ACK, and returns only a compact view with identity, guard facts, verified event
-counts/ACK cursor, untrusted frozen criteria, exact physical text, and `read_id`.
-Pass the returned `read_id` with semantic acceptance so `completeStored` uses that
-exact private observation. `completeStored` repeats every current
-correlation/revision/ref/digest check before one guarded complete, retains completion
-intent and the exact receipt, and reuses only a matching validated retained Done.
-It accepts only a clean `exec_command` wrapper (exit `0`, no live session, complete
-output). Its read result is only `ready_for_semantic_review`; inspect the
-item-specific semantics separately, then use the existing guarded complete or reject.
-Its pure `doneView` formats a separately obtained Done receipt. A later notice verifies
-durable Done and ACKs actual validated nonempty events; a stopped host leaves event
-delivery unverified. Only `legacy_events` permits the legacy event route. After Done,
-finish briefly without raw SDK introspection;
-a genuinely new notice still needs supported actual recovery. The runnable client
-recipe is in the [MCP operating guide](MCP-OPERATING-GUIDE.md) and
-[`docs/ORDINARY-WORKER-CLOSURE.md`](ORDINARY-WORKER-CLOSURE.md). The ordinary
-supported-tool fallback remains valid.
+For an ordinary Worker, follow the literal recipes in the [MCP operating guide](MCP-OPERATING-GUIDE.md) and [closure contract](ORDINARY-WORKER-CLOSURE.md). Before guarded start, preserve the exact paired origin receipt in the conversation and private storage. The trusted server supplies its small compiled bootstrap, verifies the exact bootstrap bytes before evaluation, and independently verifies the exact canonical packaged closure source before it is evaluated. It never derives code from notices, provider output, or workspace files. The original scoped execution and frozen plan drive recovery; conflicts or missing origin refuse before effects.
+
+For work started under an older guide with no origin receipt, do not mint a new origin or start again. Reconcile its real original package, context and retained start/approval receipt using the original supported per-tool pull/ACK, result, bounded physical inspection and guarded semantic decision. If the old trusted identity or evidence cannot be established, stop and report the missing evidence. Legacy capsule APIs remain available for already verified original contexts. Neither a notice nor an SDK response grants acceptance.
 
 ## Setup and planning
 

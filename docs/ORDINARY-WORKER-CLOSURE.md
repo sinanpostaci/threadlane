@@ -1,182 +1,56 @@
 # Ordinary Worker callback closure template
 
-Version: `2026-11-19.v2`.
+The packaged template remains `2026-11-19.v2`. The paired guide is `2026-11-19.v3`. The current verified bootstrap obtains an exact origin receipt before the guarded start and uses the original receipt on notice or recovery. It performs no approval, start, semantic acceptance or completion on its own.
 
-Use this audited client composition for an ordinary approved-task
-callback. The read-only `backlog_worker_notice_context` supplies the original
-binding-scoped execution, frozen task scope, item snapshot, and durable completion.
-It grants no execution or acceptance authority.
+Before starting, run the first literal recipe with the actual `APPROVAL_ID` after preparing the authorized plan and Worker Todo. Preserve its exact printed `origin` in the conversation, independently of temporary storage. Then start once and retain the real receipt; a separate authorized starter can start after preparation. Never derive authority from a notice or Worker.
 
-The trusted packaged source is
-`skills/threadlane/references/ordinary-closure.js`. Run
-`threadlane closure-template` once from the already verified canonical package
-and match its version and source digest to the live guide's `template_version` and `source_sha256`. Its offline JSON document contains schema/version metadata, the exact source
-SHA-256, the exported `createOrdinaryClosure` factory name, and the packaged
-JavaScript source (which also exports `createOrdinaryClosureClient`). Prepare and
-retain that serializable capsule **before**
-`backlog_worker_start`; do not print the JavaScript. The notice callback reloads
-the same verified canonical package when temporary state is absent. Do not add extra identity,
-UI, or readiness probes. The real client may evaluate only this immutable trusted
-source, never event, provider, notification, or other untrusted files or text.
-Do not fetch, rewrite, or concatenate template source from an event.
+At a real notice run the second recipe with its actual `NOTICE_APPROVAL_ID`. The trusted paired tool verifies connection, binding, thread, project, context, CLI binary, guide and template identities. It supplies only its own compiled bootstrap, verifies its exact bytes before evaluation, then compares the exact JavaScript fetched from the canonical CLI against compiled source before evaluation. It never emits the source in its proof. A missing or different origin, corrupt source or conflicting retained storage refuses; the original receipt must be supplied as `CLOSURE_ORIGIN` after cache loss. Reconnect and refetch the guide on resume, then compare before effects. The compact `client_verification` is technical evidence, never acceptance or per-call chat identity proof.
 
-The capsule preserves the legacy `createOrdinaryClosure` `read`/`doneView`
-contract and adds a small `createOrdinaryClosureClient` serialized-state helper.
-The helper accepts explicit `load`, `store`, `pull`, `ack`, `result`, and
-`inspect` callbacks, optional `complete` and scoped `recover` callbacks, and the
-verified package bootstrap. It has no unrestricted
-tools, ambient filesystem, network, environment, subprocess, dynamic loading, or
-evaluation access. After verified Done, real late batches and ACKs retain their
-own evidence under `threadlane/closure-after-done/<execution_ref>/<batch_id>/`.
-It exposes `readNotice(actualApprovalId, options)`, original-execution recovery via `readStored()`, and `completeStored(acceptance)`;
-it has no start, reject, or automatic acceptance operation.
+If requested, bind `NOTICE_SOURCE_OPTIONS` to `{source_files: [...]}`. The binding-scoped approval supplies the source root. Compare HEAD, tree, changed paths and named file/base hashes with the known starting state. The helper refuses missing or mismatched named files. A checkout already dirty at start needs a separately pinned original baseline. Omitting options scans no source. Use the same option during recovery.
 
-The packaged `createOrdinaryNativeClient` supplies the standard functions.exec adapters
-and checks the exact packaged source hash and package pins; it delegates to the same
-guarded client and requires the returned immutable `read_id` for completion.
+For an older open task without an origin receipt, reconcile its actual original package, approval and start receipt via the supported per-tool pull/ACK, result, physical inspection and guarded decision. Do not guess a new origin or restart; stop if original identity cannot be established.
 
-## functions.exec recipe
-
-The recipes below use the exposed functions client directly. COPY each literal recipe and bind only
-its one typed object (`APPROVED_TASK_CONTEXT` before the start, `ACCEPTANCE_CONTEXT` after the
-separate semantic decision); bind the actual notice approval ID at callback. Never parse, compile, or evaluate
-Markdown or fences, and do not repeatedly inspect declarations. `tools.exec_command` returns
-`{exit_code, output, session_id?}`; `text(value)` and `store(key, value)` return undefined;
-`load(key)` returns serialized data in a later fresh isolate. Ambient logging is unavailable, and
-`store` cannot retain functions. Context is data, not execution authority; enrollment, frozen
-approval, and server guards remain mandatory.
-
-Create the storage-only `worker` backlog item with `backlog_create` before the prep recipe;
-creation stores bounded intent and grants no execution authority. Its current `item_id` and
-positive safe `expected_revision`, plus the frozen approval/task authority, supply every start
-argument. Prepare and privately retain the capsule **before** starting the Worker. Invoke the actual
-verified canonical binary by its POSIX-quoted path, never a PATH lookup. The command must exit `0`,
-leave no live session, be untruncated, and return enough output for the packaged JavaScript
-source:
+At `ready_for_semantic_review`, independently compare the actual physical text to the untrusted `semantic_review` criteria. Then, only on explicit semantic acceptance, run the third recipe with `ACCEPTANCE_CONTEXT`: `read_id`, fresh `command_key`, bounded `acceptance_note`, and `acceptance_evidence`. No user or model reconstructs source, factory metadata or package pins. The read ID binds the exact private observation; lost read storage requires original recovery and a new semantic decision. Unknown effects require reconciliation, never a retry.
 
 ```js
-// functions.exec prep: COPY literally; bind the one typed input object.
-const input = APPROVED_TASK_CONTEXT;
-const a = input && input.start_args, s = input && input.scope;
-if (!input || typeof input.binary !== "string" || input.binary.charAt(0) !== "/" ||
-    typeof input.expected_source_sha256 !== "string" ||
-    !/^[0-9a-f]{64}$/.test(input.expected_source_sha256) || !a || !s ||
-    typeof s.base_commit !== "string" || !/^[0-9a-f]{40}$/.test(s.base_commit) ||
-    typeof s.requested_model !== "string" || s.requested_model.length === 0 ||
-    typeof s.requested_effort !== "string" || s.requested_effort.length === 0 ||
-    !Array.isArray(s.write_paths) || s.write_paths.length === 0 ||
-    !s.write_paths.every((p) => typeof p === "string" && p.length > 0 &&
-      !p.includes("\u0000") && !p.includes("\\") && p.charAt(0) !== "/" &&
-      p.split("/").every((segment) => segment && segment !== "." && segment !== "..")) ||
-    !s.inspector || typeof s.inspector.executable !== "string" ||
-    s.inspector.executable.charAt(0) !== "/" ||
-    !Array.isArray(s.inspector.argv) || s.inspector.argv.length !== 1 ||
-    s.inspector.argv[0] !== "inspect-delivery" ||
-    !Number.isSafeInteger(a.expected_revision) || a.expected_revision <= 0 ||
-    [a.command_key, a.item_id, a.approval_id, a.task_id]
-      .some((v) => typeof v !== "string" || v.length === 0)) {
-  throw new Error("invalid approved task context");
-}
-await store("threadlane/approved-task-context.json", input);
-const quote = (value) => "'" + String(value).replace(/'/g, "'\\''") + "'";
-const result = await tools.exec_command({
-  cmd: quote(input.binary) + " 'closure-template'",
-  max_output_tokens: 40000, yield_time_ms: 30000,
-});
-if (result.exit_code !== 0 || result.session_id ||
-    result.output_truncated === true || result.truncated === true ||
-    typeof result.output !== "string") throw new Error("canonical closure-template failed");
-const template = JSON.parse(result.output);
-if (template.schema_version !== 1 || template.tool !== "threadlane closure-template" ||
-    template.version !== "2026-11-19.v2" ||
-    template.source_path !== "skills/threadlane/references/ordinary-closure.js" ||
-    template.factory_name !== "createOrdinaryClosure" ||
-    template.source_sha256 !== input.expected_source_sha256 ||
-    typeof template.javascript !== "string") throw new Error("untrusted closure template");
-await store("threadlane/closure-template.json", template);
-const started = await tools.mcp__threadlane__backlog_worker_start(a);
-if (!started || typeof started !== "object") throw new Error("missing guarded start reply; use original-receipt fallback");
-await store("threadlane/start-receipt.json", started);
-await store("threadlane/start-binding.json", {input, start: started});
-text(JSON.stringify({version: template.version, source_sha256: template.source_sha256}));
+const id = APPROVAL_ID;
+if (typeof id !== "string" || !/^apr_[0-9a-f]{32}$/.test(id)) throw new Error("invalid approval ID");
+const same=(a,b)=>a===b||!!a&&!!b&&typeof a==="object"&&typeof b==="object"&&Array.isArray(a)===Array.isArray(b)&&Object.keys(a).length===Object.keys(b).length&&Object.keys(a).every(k=>Object.hasOwn(b,k)&&same(a[k],b[k]));
+const checked=r=>{const s=r?.structuredContent;if(!s||r.isError||r.is_error||s.untrusted_data!==false||s.tool!=="ordinary_closure_client"||!s.data)throw Error("closure refused");for(const x of r.content||[])if(x.type==="text"&&!same(JSON.parse(x.text),s))throw Error("conflicting response");return s.data};
+const current = checked(await tools.mcp__threadlane__ordinary_closure_client({}));
+const key = "threadlane/closures/" + id + "/origin", previous = await load(key);
+if (previous != null && !same(previous, current.origin)) throw new Error("closure origin changed");
+await store(key, current.origin);
+text(JSON.stringify({origin: current.origin}));
 ```
-
-Prep stores the exact returned start DTO and its additive binding only after the
-guarded start returns. A failed exec, thrown start, or missing reply leaves prior
-receipts unchanged. Recovery fills absent values only after matching the original
-scoped record; conflicting, partial, foreign or stale values refuse without replacement.
-
-Each callback runs in a fresh V8 isolate. Bind `NOTICE_APPROVAL_ID` from the
-actual notice, `NOTICE_CLI_PACKAGE` from the verified paired operator context,
-and `NOTICE_SOURCE_SHA256` from the live guide. The recipe executes the canonical
-packaged CLI and matches its source digest and metadata before evaluating it;
-never evaluate event, provider, notification, or other file text. The helper
-matches the scoped original record and every existing retained value before any
-effect. Text only the compact view:
-
-If source preservation was requested, bind `NOTICE_SOURCE_OPTIONS` to an object with
-`source_files` listing the exact source files to compare with the frozen base. An
-explicit empty list requests root/HEAD/tree/changed-path evidence without file reads.
-The source root comes from the binding-scoped approval, not the Worker. The task and
-source use the same bounded inspector invocation. `physical.source` includes `ok`,
-`root`, `expected_base`, `head_commit`, `base_tree`, `changed_paths`, `clean_at_base`,
-and named files with `sha256`, `base_sha256`, and `matches_base`. Unavailable evidence
-or a named mismatch refuses the read. A source that was independently known clean at
-the approved base can be checked using `clean_at_base` and named file matches; otherwise
-compare the returned facts against the actual known starting state. This does not
-require unrelated projects to be clean or establish a missing original baseline. If a
-named preserved file differed from the frozen base at start, use a separate bounded
-before/after check against its pinned original baseline; this helper compares with base
-bytes only. If no
-source inspection is requested, omit the option and `physical.source` is null. Supply
-the same option during recovery; never infer a missing requested check succeeded.
 
 ```js
-// Bind the actual notice and verified paired package/guide pins. Set NOTICE_SOURCE_OPTIONS
-// only when source preservation is requested, e.g. {source_files: ["SPEC.md", "STATUS.txt"]}.
-const pins = {cli_package: NOTICE_CLI_PACKAGE, source_sha256: NOTICE_SOURCE_SHA256};
-if (typeof pins.cli_package !== "string" || pins.cli_package[0] !== "/" ||
-    !/^[0-9a-f]{64}$/.test(pins.source_sha256)) throw new Error("invalid package pins");
-const quote = (v) => "'" + String(v).replace(/'/g, "'\\''") + "'";
-const result = await tools.exec_command({cmd: quote(pins.cli_package + "/bin/threadlane") + " 'closure-template'", max_output_tokens: 40000, yield_time_ms: 30000});
-if (result.exit_code !== 0 || result.session_id || result.output_truncated || result.truncated || typeof result.output !== "string") throw new Error("canonical closure-template failed");
-const template = JSON.parse(result.output);
-if (template.schema_version !== 1 || template.tool !== "threadlane closure-template" || template.version !== "2026-11-19.v2" || template.source_path !== "skills/threadlane/references/ordinary-closure.js" || template.factory_name !== "createOrdinaryClosure" || template.source_sha256 !== pins.source_sha256 || typeof template.javascript !== "string") throw new Error("invalid canonical capsule");
-const createOrdinaryNativeClient = new Function(template.javascript + "\nreturn createOrdinaryNativeClient;")();
-const client = createOrdinaryNativeClient({tools, load, store, template, ...pins});
-text(JSON.stringify(await client.readNotice(NOTICE_APPROVAL_ID, typeof NOTICE_SOURCE_OPTIONS === "undefined" ? undefined : NOTICE_SOURCE_OPTIONS)));
+const id = NOTICE_APPROVAL_ID;
+if (typeof id !== "string" || !/^apr_[0-9a-f]{32}$/.test(id)) throw new Error("invalid approval ID");
+const same=(a,b)=>a===b||!!a&&!!b&&typeof a==="object"&&typeof b==="object"&&Array.isArray(a)===Array.isArray(b)&&Object.keys(a).length===Object.keys(b).length&&Object.keys(a).every(k=>Object.hasOwn(b,k)&&same(a[k],b[k]));
+const retained = await load("threadlane/closures/" + id + "/origin"), supplied = typeof CLOSURE_ORIGIN === "undefined" ? null : CLOSURE_ORIGIN;
+if (retained != null && supplied != null && !same(retained, supplied)) throw new Error("retained closure origin conflicts with original");
+const origin = retained ?? supplied;
+if (!origin) throw new Error("missing original closure origin; reconcile before effects");
+const checked=r=>{const s=r?.structuredContent;if(!s||r.isError||r.is_error||s.untrusted_data!==false||s.tool!=="ordinary_closure_client"||!s.data)throw Error("closure refused");for(const x of r.content||[])if(x.type==="text"&&!same(JSON.parse(x.text),s))throw Error("conflicting response");return s.data};
+const bootstrap = checked(await tools.mcp__threadlane__ordinary_closure_client({origin})).bootstrap;
+const identity = checked(await tools.mcp__threadlane__ordinary_closure_client({origin, bootstrap}));
+if (identity.bootstrap_verified !== true || !same(identity.origin, origin)) throw new Error("unverified closure bootstrap");
+const client = new Function(bootstrap)()({tools, load, store, origin, identity});
+text(JSON.stringify(await client.readNotice(id, typeof NOTICE_SOURCE_OPTIONS === "undefined" ? undefined : NOTICE_SOURCE_OPTIONS)));
 ```
 
-`readNotice()` with scoped recovery restores absent temporary values from the
-original execution and frozen plan; existing mismatched values refuse. `readStored()`
-retains its strict legacy behavior and requires its original stored context, SDK
-start, template, and binding. Active reads use fixed finite budgets
-`{max_pages: 8, max_calls: 16, deadline_ms: 60000}`. With scoped recovery, the
-helper stores each complete `{input, start, report, evidence}` in a separate
-private `threadlane/closure-reads/<read_id>` record. The ID is a content digest,
-not authority. An incomplete result cannot replace a ready report. A verified
-nonterminal result may advance on a later actual notice; an unknown or integrity
-failure requires reconciliation, not a retry. Legacy reads retain:
-
-- `threadlane/closure-evidence.json`: the full raw evidence;
-- `threadlane/closure-report.json`: the full legacy report;
-- `threadlane/closure-read-correlation.json`: `{input, start, report}`.
-
-The returned compact view keeps the current mapping, scope, result, batches,
-technical checks, timing, and the exact physical file text required for the
-separate semantic review. It replaces the repeated event array with verified
-event counts, the first/last sequence, important count, and the last verified ACK
-cursor, and adds the actual validated source SHA-256. It never hides required
-physical content and never claims ready when the legacy read reported incomplete,
-refused, oversized, or omitted material.
-
-The factory itself uses only standard language builtins. `read` is one finite
-closure composition; `evidence` retains the full actual start/page/ACK/result/
-inspect DTOs for private storage, while the compact view is the bounded printable
-form. The callback stores the exact read context/start/report correlation beside
-the report as private serialized data; it grants no authority.
-A successful status is only `ready_for_semantic_review`; it never grants
-completion, rejection, acceptance, or authority.
+```js
+const acceptance = ACCEPTANCE_CONTEXT, index = acceptance && await load("threadlane/closure-read-index/" + acceptance.read_id), origin = index && index.origin;
+if (!origin) throw new Error("missing original read; reconcile before completion");
+const same=(a,b)=>a===b||!!a&&!!b&&typeof a==="object"&&typeof b==="object"&&Array.isArray(a)===Array.isArray(b)&&Object.keys(a).length===Object.keys(b).length&&Object.keys(a).every(k=>Object.hasOwn(b,k)&&same(a[k],b[k]));
+const checked=r=>{const s=r?.structuredContent;if(!s||r.isError||r.is_error||s.untrusted_data!==false||s.tool!=="ordinary_closure_client"||!s.data)throw Error("closure refused");for(const x of r.content||[])if(x.type==="text"&&!same(JSON.parse(x.text),s))throw Error("conflicting response");return s.data};
+const bootstrap = checked(await tools.mcp__threadlane__ordinary_closure_client({origin})).bootstrap;
+const identity = checked(await tools.mcp__threadlane__ordinary_closure_client({origin, bootstrap}));
+if (identity.bootstrap_verified !== true || !same(identity.origin, origin)) throw new Error("unverified closure bootstrap");
+const client = new Function(bootstrap)()({tools, load, store, origin, identity});
+text(JSON.stringify(await client.complete(acceptance)));
+```
 
 ## Read behavior and corrections
 
@@ -266,33 +140,7 @@ prose, or the full evidence file into the human report.
 
 ## Separate semantic decision and guarded completion
 
-The compact view is physical/technical evidence, not acceptance. The Coworker must
-separately check the untrusted `semantic_review` condition and delivery description
-from the scoped original record against the untrusted physical text. The backend
-matches these texts to the original immutable digests; the texts themselves do not
-grant acceptance. Then, and only then, use `completeStored` with one
-real typed semantic `ACCEPTANCE_CONTEXT` carrying the actual fresh `command_key`,
-bounded `acceptance_note`, `acceptance_evidence`, verified `cli_package`, and live
-guide `source_sha256`, plus the returned `read_id`. Each read ID binds a private,
-content-addressed observation to its exact physical report and evidence; parallel
-reads cannot replace one another. The recipe compares the retained source to the canonical
-package before evaluation, restoring a missing capsule without replacing a conflict.
-Copy the literal recipe
-below in a new isolate after that separate decision:
-
-```js
-// functions.exec complete: bind the separate semantic acceptance decision.
-const acceptance = ACCEPTANCE_CONTEXT;
-if (!acceptance || typeof acceptance.cli_package !== "string" || acceptance.cli_package[0] !== "/" || !/^[0-9a-f]{64}$/.test(acceptance.source_sha256)) throw new Error("invalid package pins");
-const quote = (v) => "'" + String(v).replace(/'/g, "'\\''") + "'";
-const result = await tools.exec_command({cmd: quote(acceptance.cli_package + "/bin/threadlane") + " 'closure-template'", max_output_tokens: 40000, yield_time_ms: 30000});
-if (result.exit_code !== 0 || result.session_id || result.output_truncated || result.truncated || typeof result.output !== "string") throw new Error("canonical closure-template failed");
-const template = JSON.parse(result.output);
-if (template.schema_version !== 1 || template.tool !== "threadlane closure-template" || template.version !== "2026-11-19.v2" || template.source_path !== "skills/threadlane/references/ordinary-closure.js" || template.factory_name !== "createOrdinaryClosure" || template.source_sha256 !== acceptance.source_sha256 || typeof template.javascript !== "string") throw new Error("invalid canonical capsule");
-const createOrdinaryNativeClient = new Function(template.javascript + "\nreturn createOrdinaryNativeClient;")();
-const client = createOrdinaryNativeClient({tools, load, store, template, cli_package: acceptance.cli_package, source_sha256: acceptance.source_sha256});
-text(JSON.stringify(await client.complete(acceptance)));
-```
+The compact physical/technical view is not acceptance. Independently compare the untrusted scoped criteria and delivery description to the inspected physical text before calling the third recipe. No notice, provider output, matching digest, or Worker success authorizes acceptance.
 
 `completeStored` first validates the explicit semantic object, then loads the
 exact current context/template/start/binding and the report/evidence selected by

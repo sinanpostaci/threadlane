@@ -8,9 +8,13 @@ import { fileURLToPath } from "node:url";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const source = fs.readFileSync(path.join(here, "ordinary-closure.js"), "utf8");
+const bootstrapSource = fs.readFileSync(path.join(here, "ordinary-bootstrap.js"), "utf8");
 const SOURCE_SHA256 = crypto.createHash("sha256").update(source, "utf8").digest("hex");
 const legacyReadBlock = fs.readFileSync(path.join(here, "legacy-read-wrapper.fixture.txt"), "utf8");
 const legacyCompleteBlock = fs.readFileSync(path.join(here, "legacy-complete-wrapper.fixture.txt"), "utf8");
+const legacyPrepBlock = fs.readFileSync(path.join(here, "legacy-prep-wrapper.fixture.txt"), "utf8");
+const legacyPublicNoticeBlock = fs.readFileSync(path.join(here, "legacy-public-notice-wrapper.fixture.txt"), "utf8");
+const legacyPublicCompleteBlock = fs.readFileSync(path.join(here, "legacy-public-complete-wrapper.fixture.txt"), "utf8");
 const createOrdinaryClosure = vm.runInNewContext(
   `${source}\n;createOrdinaryClosure`,
   Object.create(null),
@@ -1819,9 +1823,10 @@ test("legacy callback and guide prep/complete work with typed data in fresh isol
   const rawBlocks = [...guide.matchAll(/```js\n([\s\S]*?)```/g)].map((match) => match[1]);
   assert.equal(rawBlocks.length, 3, "guide must contain prep, callback, and complete recipes");
 
-  const [prepBlock] = rawBlocks;
+  const prepBlock = legacyPrepBlock;
   const completeBlock = legacyCompleteBlock;
   const readBlock = legacyReadBlock;
+  rawBlocks[0] = prepBlock;
   rawBlocks[1] = readBlock;
   rawBlocks[2] = completeBlock;
   assert.ok(prepBlock.includes("const input = APPROVED_TASK_CONTEXT;"));
@@ -2085,6 +2090,7 @@ test("legacy callback and guide prep/complete work with typed data in fresh isol
 function documentRecipeBlocks(documentPath) {
   const document = fs.readFileSync(documentPath, "utf8");
   const blocks = [...document.matchAll(/```js\n([\s\S]*?)```/g)].map((match) => match[1]);
+  blocks[0] = legacyPrepBlock;
   blocks[1] = legacyReadBlock;
   blocks[2] = legacyCompleteBlock;
   return blocks;
@@ -3467,8 +3473,10 @@ test("closure client wrappers stay compact, identical, and within document byte 
   assert.ok(!guideBlocks[1].includes("APPROVED_TASK_CONTEXT"));
   assert.ok(!guideBlocks[1].includes("ACCEPTANCE_CONTEXT"));
   assert.equal((guideBlocks[2].match(/ACCEPTANCE_CONTEXT/g) || []).length, 1);
-  assert.ok(guideBlocks[1].includes("createOrdinaryNativeClient"));
-  assert.ok(guideBlocks[2].includes("createOrdinaryNativeClient"));
+  assert.ok(guideBlocks[1].includes("new Function(bootstrap)"));
+  assert.ok(guideBlocks[2].includes("new Function(bootstrap)"));
+  assert.ok(bootstrapSource.includes("createOrdinaryNativeClient"));
+  assert.ok(bootstrapSource.includes("source_verified"));
   assert.ok(!guideBlocks[1].includes("backlog_worker_complete"));
   assert.ok(!guideBlocks[2].includes("backlog_worker_start"));
   for (const [label, block] of [
@@ -3476,8 +3484,8 @@ test("closure client wrappers stay compact, identical, and within document byte 
     ["complete", guideBlocks[2]]
   ]) {
     assert.ok(
-      Buffer.byteLength(block, "utf8") <= 2500,
-      `${label} program body stays within 2500 UTF-8 bytes, got ${Buffer.byteLength(block, "utf8")}`
+      Buffer.byteLength(block, "utf8") <= 1700,
+      `${label} program body stays within 1700 UTF-8 bytes, got ${Buffer.byteLength(block, "utf8")}`
     );
   }
 });
@@ -3630,7 +3638,8 @@ function makeRecoveredGuide() {
   const env = makeGuideEnvironment();
   const document = fs.readFileSync(path.join(here, "../../../docs/MCP-OPERATING-GUIDE.md"), "utf8");
   const blocks = [...document.matchAll(/```js\n([\s\S]*?)```/g)].map((match) => match[1]);
-  const block = blocks[1];
+  const block = legacyPublicNoticeBlock;
+  blocks[2] = legacyPublicCompleteBlock;
   let context = {
     execution: clone(START_EXECUTION),
     acceptance_condition: "bounded condition", delivery_description: "bounded delivery",
@@ -4137,4 +4146,132 @@ test("legacy ready report gains an immutable read ID for the current notice reci
   assert.equal(ready.status, "ready_for_semantic_review");
   await fixture.runComplete();
   assert.equal(fixture.env.calls.complete, 1);
+});
+
+function makeVerifiedBootstrapGuide() {
+  const env = makeGuideEnvironment();
+  const guide = fs.readFileSync(path.join(here, "../../../docs/MCP-OPERATING-GUIDE.md"), "utf8");
+  const blocks = [...guide.matchAll(/```js\n([\s\S]*?)```/g)].map((match) => match[1]);
+  const origin = {schema_version: 1, binding_id: CONTROL, thread_id: "thread-original",
+    project_root: "/project", cli_package: "/trusted", context_path: "/private/context",
+    context_router_executable: "/trusted/bin/threadlane-context", context_sha256: "1".repeat(64),
+    cli_sha256: "2".repeat(64), guide_version: "guide-version", guide_sha256: "3".repeat(64),
+    template_version: env.template.version, source_sha256: SOURCE_SHA256,
+    bootstrap_sha256: crypto.createHash("sha256").update(bootstrapSource).digest("hex")};
+  let activeOrigin = clone(origin), sourceOverride = null, bootstrapOverride = null;
+  const normalized = (v) => Array.isArray(v) ? v.map(normalized) :
+    v && typeof v === "object" ? Object.fromEntries(Object.keys(v).sort().map((k) => [k, normalized(v[k])])) : v;
+  const order = [];
+  const scoped = (data) => env.sdkFromEnvelope({untrusted_data: false, tool: "ordinary_closure_client", data});
+  const templateMeta = {...env.template}; delete templateMeta.javascript;
+  const tools = {...env.tools,
+    exec_command: async (args) => {
+      if (!args.cmd.includes("closure-template")) return env.tools.exec_command(args);
+      order.push("source");
+      if (sourceOverride !== null) return {exit_code: 0, output: JSON.stringify({...env.template, javascript: sourceOverride})};
+      return env.tools.exec_command(args);
+    },
+    mcp__threadlane__ordinary_closure_client: async (args) => {
+      order.push(args.javascript !== undefined ? "verify" : args.bootstrap !== undefined ? "bootstrap-verify" : "identity");
+      if (args.origin && JSON.stringify(normalized(args.origin)) !== JSON.stringify(normalized(activeOrigin))) throw new Error("origin mismatch");
+      if (args.javascript !== undefined && (!args.origin || args.javascript !== source)) throw new Error("source mismatch");
+      if (args.bootstrap !== undefined && (!args.origin || args.bootstrap !== bootstrapSource)) throw new Error("bootstrap mismatch");
+      const data = {origin: clone(activeOrigin), source_verified: args.javascript !== undefined,
+        bootstrap_verified: args.bootstrap !== undefined, template: clone(templateMeta)};
+      if (args.javascript === undefined && args.bootstrap === undefined) data.bootstrap = bootstrapOverride ?? bootstrapSource;
+      return scoped(data);
+    },
+    mcp__threadlane__backlog_worker_notice_context: async () => env.sdk("backlog_worker_notice_context", {
+      execution: clone(START_EXECUTION), acceptance_condition: "bounded condition", delivery_description: "bounded delivery",
+      scope: {base_commit: BASE, requested_model: MODEL, requested_effort: EFFORT, write_paths: [WRITE_PATHS[0]]},
+      item_snapshot: {item_id: ITEM, revision: START_EXECUTION.reservation_revision, status: "doing", current_execution_ref: EXEC}
+    }),
+    mcp__threadlane__backlog_worker_complete: async () => {
+      env.calls.complete += 1;
+      const id = JSON.parse(env.texts.at(-1)).read_id;
+      const observation = JSON.parse(env.stored.get(`threadlane/closures/${APPROVAL}/threadlane/closure-reads/${id}`));
+      return env.sdkFromEnvelope(makeDoneReceipt(observation.report));
+    }
+  };
+  const run = (block, vars = {}) => vm.runInNewContext(`(async () => {\n${blocks[block]}\n})()`, {
+    tools, load: (key) => env.stored.has(key) ? JSON.parse(env.stored.get(key)) : undefined,
+    store: async (key, value) => env.stored.set(key, JSON.stringify(value)),
+    text: (value) => env.texts.push(value), APPROVAL_ID: APPROVAL, NOTICE_APPROVAL_ID: APPROVAL, ...vars
+  });
+  return {env, origin, order, run, setOrigin: (v) => {activeOrigin = v;}, setSource: (v) => {sourceOverride = v;}, setBootstrap: (v) => {bootstrapOverride = v;}};
+}
+
+test("current bootstrap checks exact bytes before the real ordered read and separate Done", async () => {
+  const f = makeVerifiedBootstrapGuide();
+  await f.run(0);
+  const before = clone(f.env.calls);
+  await f.run(1);
+  const report = JSON.parse(f.env.texts.at(-1));
+  assert.equal(report.status, "ready_for_semantic_review");
+  assert.equal(report.client_verification.verified, true);
+  assert.deepEqual(f.order.slice(-4), ["identity", "bootstrap-verify", "source", "verify"]);
+  assert.equal(f.env.calls.pull, before.pull + 1); assert.equal(f.env.calls.ack, before.ack + 1);
+  assert.equal(f.env.calls.result, before.result + 1); assert.equal(f.env.calls.inspect, before.inspect + 1);
+  assert.equal(f.env.calls.complete, 0);
+  await f.run(2, {ACCEPTANCE_CONTEXT: {...f.env.acceptanceContext, read_id: report.read_id}});
+  const done = JSON.parse(f.env.texts.at(-1));
+  assert.equal(done.status, "done"); assert.equal(done.read_id, report.read_id);
+  assert.equal(done.client_verification.source_sha256, SOURCE_SHA256);
+  assert.equal(f.env.calls.complete, 1);
+  await f.run(2, {ACCEPTANCE_CONTEXT: {...f.env.acceptanceContext, read_id: report.read_id}});
+  assert.equal(JSON.parse(f.env.texts.at(-1)).read_id, report.read_id);
+  assert.equal(f.env.calls.complete, 1, "validated replay never repeats guarded completion");
+});
+
+test("current bootstrap rejects a changed immutable observation before guarded completion", async () => {
+  const f = makeVerifiedBootstrapGuide(); await f.run(0); await f.run(1);
+  const readId = JSON.parse(f.env.texts.at(-1)).read_id;
+  const key = `threadlane/closures/${APPROVAL}/threadlane/closure-reads/${readId}`;
+  const observation = JSON.parse(f.env.stored.get(key));
+  observation.report.physical.files[0].text = "changed after review";
+  f.env.stored.set(key, JSON.stringify(observation));
+  await assert.rejects(f.run(2, {ACCEPTANCE_CONTEXT: {...f.env.acceptanceContext, read_id: readId}}), /immutable read observation is missing, stale, or changed/);
+  assert.equal(f.env.calls.complete, 0);
+});
+
+test("current bootstrap refuses changed origin and changed source before any effect", async () => {
+  for (const mode of ["origin", "source", "bootstrap", "missing"]) {
+    const f = makeVerifiedBootstrapGuide(); await f.run(0);
+    if (mode === "origin") f.setOrigin({...f.origin, binding_id: "bnd_foreign"});
+    if (mode === "source") f.setSource(source + "\nthrow new Error('untrusted source ran')");
+    if (mode === "bootstrap") f.setBootstrap(bootstrapSource + "\nthrow new Error('untrusted bootstrap ran')");
+    if (mode === "missing") f.env.stored.delete(`threadlane/closures/${APPROVAL}/origin`);
+    const before = clone(f.env.calls);
+    await assert.rejects(f.run(1), /origin mismatch|source mismatch|bootstrap mismatch|missing original closure origin/);
+    assert.equal(f.env.calls.pull, before.pull); assert.equal(f.env.calls.ack, before.ack);
+    assert.equal(f.env.calls.result, before.result); assert.equal(f.env.calls.inspect, before.inspect);
+    assert.equal(f.env.calls.complete, before.complete);
+  }
+});
+
+test("current bootstrap recovers after storage loss only with its original continuity receipt", async () => {
+  const f = makeVerifiedBootstrapGuide(); await f.run(0);
+  f.env.stored.clear();
+  await f.run(1, {CLOSURE_ORIGIN: clone(f.origin)});
+  assert.equal(JSON.parse(f.env.texts.at(-1)).status, "ready_for_semantic_review");
+  assert.deepEqual(JSON.parse(f.env.stored.get(`threadlane/closures/${APPROVAL}/origin`)), f.origin);
+});
+
+test("current bootstrap accepts the same cold receipt with reordered object keys", async () => {
+  const f = makeVerifiedBootstrapGuide(); await f.run(0);
+  f.env.stored.clear();
+  const reordered = Object.fromEntries(Object.entries(f.origin).reverse());
+  await f.run(1, {CLOSURE_ORIGIN: reordered});
+  assert.equal(JSON.parse(f.env.texts.at(-1)).status, "ready_for_semantic_review");
+});
+
+test("supplied original receipt cannot be shadowed by a foreign retained receipt", async () => {
+  const f = makeVerifiedBootstrapGuide(); await f.run(0);
+  const foreign = {...f.origin, binding_id: "bnd_foreign"};
+  f.env.stored.set(`threadlane/closures/${APPROVAL}/origin`, JSON.stringify(foreign));
+  f.setOrigin(foreign);
+  const before = clone(f.env.calls);
+  await assert.rejects(f.run(1, {CLOSURE_ORIGIN: clone(f.origin)}), /retained closure origin conflicts/);
+  assert.equal(f.env.calls.pull, before.pull); assert.equal(f.env.calls.ack, before.ack);
+  assert.equal(f.env.calls.result, before.result); assert.equal(f.env.calls.inspect, before.inspect);
 });

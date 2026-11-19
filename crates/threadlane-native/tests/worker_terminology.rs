@@ -274,7 +274,7 @@ async fn mcp_plan_task_params_schema_and_deserializer_normalize_worker_to_canoni
     // 1. Verify the current combined paired MCP tool count and that `save_draft`
     //    schema and `PlanTaskParams` deserializer agree.
     let tools = mcp.list_tools();
-    assert_eq!(tools.len(), 54);
+    assert_eq!(tools.len(), 55);
     let save_draft_tool = tools
         .iter()
         .find(|t| t.name == "save_draft")
@@ -657,8 +657,8 @@ async fn operating_guide_and_startup_instructions_report_current_version_and_wor
 {
     use rmcp::handler::server::wrapper::Parameters;
 
-    assert_eq!(OPERATING_GUIDE_VERSION, "2026-11-19.v2");
-    assert_eq!(THREADLANE_SKILL_VERSION, "2026-11-19.v2");
+    assert_eq!(OPERATING_GUIDE_VERSION, "2026-11-19.v3");
+    assert_eq!(THREADLANE_SKILL_VERSION, "2026-11-19.v3");
     assert!(SCOPED_MCP_STARTUP_INSTRUCTIONS.contains(OPERATING_GUIDE_VERSION));
     assert!(PAIRED_MCP_STARTUP_INSTRUCTIONS.contains(OPERATING_GUIDE_VERSION));
     assert!(OPERATING_GUIDE_MARKDOWN.contains(OPERATING_GUIDE_VERSION));
@@ -667,7 +667,7 @@ async fn operating_guide_and_startup_instructions_report_current_version_and_wor
     assert!(OPERATING_GUIDE_MARKDOWN.contains("role_label"));
 
     let current = OperatingGuideResponse::current();
-    assert_eq!(current.version, "2026-11-19.v2");
+    assert_eq!(current.version, "2026-11-19.v3");
     assert_eq!(current.guide_markdown, OPERATING_GUIDE_MARKDOWN);
 
     let tmp = TempDir::new().expect("tempdir");
@@ -689,7 +689,7 @@ async fn operating_guide_and_startup_instructions_report_current_version_and_wor
         .description
         .as_deref()
         .expect("scoped operating_guide description");
-    assert!(scoped_desc.contains("2026-11-19.v2"));
+    assert!(scoped_desc.contains("2026-11-19.v3"));
     assert!(scoped_desc.contains("Worker (coder)"));
     assert!(scoped_desc.contains("complete job admission"));
 
@@ -698,8 +698,8 @@ async fn operating_guide_and_startup_instructions_report_current_version_and_wor
     let paired_server =
         PairedMcpServer::new(&state_dir, pairing_store.clone()).expect("paired server");
     let paired_tools = paired_server.list_tools();
-    // Current combined paired surface: 54 registered tools.
-    assert_eq!(paired_tools.len(), 54);
+    // Current combined paired surface: 55 registered tools.
+    assert_eq!(paired_tools.len(), 55);
     let paired_guide_tool = paired_tools
         .iter()
         .find(|t| t.name == OPERATING_GUIDE_TOOL)
@@ -708,7 +708,7 @@ async fn operating_guide_and_startup_instructions_report_current_version_and_wor
         .description
         .as_deref()
         .expect("paired operating_guide description");
-    assert!(paired_desc.contains("2026-11-19.v2"));
+    assert!(paired_desc.contains("2026-11-19.v3"));
     assert!(paired_desc.contains("Worker (coder)"));
     assert!(paired_desc.contains("complete job admission"));
 
@@ -740,20 +740,20 @@ async fn operating_guide_and_startup_instructions_report_current_version_and_wor
         .expect("paired operating_guide")
         .structured_content
         .expect("structured guide");
-    assert_eq!(guide_res["data"]["version"], "2026-11-19.v2");
+    assert_eq!(guide_res["data"]["version"], "2026-11-19.v3");
     assert_eq!(
         guide_res["data"]["guide_markdown"],
         OPERATING_GUIDE_MARKDOWN
     );
-    assert!(OPERATING_GUIDE_MARKDOWN.contains("tools.exec_command"));
-    assert!(OPERATING_GUIDE_MARKDOWN.contains("createOrdinaryNativeClient"));
+    assert!(OPERATING_GUIDE_MARKDOWN.contains("ordinary_closure_client"));
+    assert!(OPERATING_GUIDE_MARKDOWN.contains("bootstrap_verified"));
     assert!(threadlane::CLOSURE_TEMPLATE_JAVASCRIPT
         .contains("tools.mcp__threadlane__approved_pull_events"));
     assert!(OPERATING_GUIDE_MARKDOWN.contains("closure-evidence.json"));
     assert!(OPERATING_GUIDE_MARKDOWN.contains("cross-page continuity"));
-    assert!(OPERATING_GUIDE_MARKDOWN.contains("JSON.parse(result.output)"));
-    assert!(OPERATING_GUIDE_MARKDOWN.contains("const input = APPROVED_TASK_CONTEXT;"));
-    assert!(OPERATING_GUIDE_MARKDOWN.contains("const acceptance = ACCEPTANCE_CONTEXT;"));
+    assert!(OPERATING_GUIDE_MARKDOWN.contains("new Function(bootstrap)"));
+    assert!(OPERATING_GUIDE_MARKDOWN.contains("APPROVAL_ID"));
+    assert!(OPERATING_GUIDE_MARKDOWN.contains("const acceptance = ACCEPTANCE_CONTEXT"));
     assert!(!OPERATING_GUIDE_MARKDOWN.contains("<ACTUAL_"));
     let bad_recipe = ["text(", "await tools.exec_command"].concat();
     assert!(!OPERATING_GUIDE_MARKDOWN.contains(bad_recipe.as_str()));

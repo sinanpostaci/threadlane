@@ -5,7 +5,7 @@ description: "Work through Threadlane in the current Codex conversation: shape r
 
 # Threadlane
 
-Version: `2026-11-19.v2`.
+Version: `2026-11-19.v3`.
 
 Act as the user's Coworker in the native Codex conversation. The human selects
 your model in Codex; Threadlane profiles select execution roles. Infer whether
@@ -247,40 +247,20 @@ tools one step at a time with the same checks. Never parallelize dependent mutat
 IDs, replay unknown effects, infer success from prose, or auto-accept semantics. A progress page
 is not liveness. The Coworker still makes its separate semantic decision before guarded
 complete/reject. No fixed wall-clock guarantee follows from client-tagged reasoning or
-physical/MCP time. Use the current guide’s template version and source digest to verify `threadlane closure-template` from the
-trusted offline packaged CLI (not a prerequisite file in `~/.agents`; offline
-JSON with source SHA-256 and a pure JavaScript factory, distinct closure version
-`2026-11-19.v2`); once source and SHA-256 are verified, do not repeat
-declaration, repo, or global-skill searches. Create the storage-only `worker`
-backlog item first with `backlog_create` (creation grants no authority),
-prepare and retain its serializable capsule before `backlog_worker_start`, evaluate only
-that trusted source in a fresh isolate, and use the packaged `createOrdinaryNativeClient`
-adapter around the preserved `read`/`doneView` core. For a notice, copy the live guide
-callback with the actual ID, verified paired `cli_package`, and live guide source
-digest. `readNotice` verifies the packaged source and scoped original execution,
-recovers absent state and refuses conflicting cache. `readStored()` remains available
-for original no-notice recovery. Active reads keep full raw
-evidence/report/correlation private, and return a compact view with current identity,
-technical guard facts, verified event counts/ACK cursor, untrusted frozen acceptance
-criteria, exact physical text, and immutable `read_id`. Pass that exact `read_id` in
-`ACCEPTANCE_CONTEXT` so completion uses the report that was semantically reviewed.
-When source preservation is requested, bind `NOTICE_SOURCE_OPTIONS` with the exact
-source files; compare the returned bounded source evidence against the known original
-state before accepting. The scoped approval supplies the source root. Missing or failed
-source evidence is not proof, including on cold recovery. Omit the option for ordinary
-tasks without that requirement; no clean-checkout assumption is imposed on them.
-Its `completeStored(ACCEPTANCE_CONTEXT)` moves all current correlation/revision/ref/digest
-checks before one guarded complete, retains completion intent and the exact receipt, and
-reuses only a matching validated retained Done; missing, error, or unknown replies never
-retry or fabricate `Done`. COPY the literal recipes and bind only their one typed object
-(`APPROVED_TASK_CONTEXT` before start, `ACCEPTANCE_CONTEXT` after the separate semantic
-decision); bind the actual notice ID and verified package/guide pins at callback. Never parse, compile, or evaluate Markdown or
-fences, and do not repeatedly inspect declarations. `exec_command` returns
-`{exit_code, output, session_id?}`; `text`/`store` return undefined; `load` restores
-serialized data in a fresh isolate; ambient logging is absent. Never print the capsule
-JavaScript, and reject changed immutable execution fields, an inner EventBatch above
-49152 UTF-8 bytes, or an invalid `step_seq` before ACK. After a validated Done, finish
-briefly without raw SDK introspection. Late notices verify durable Done and ACK only
+physical/MCP time. Reject inner EventBatch JSON over 49152 UTF-8 bytes or an
+invalid `step_seq` before ACK. Before guarded start, follow the live guide's prep
+recipe with the actual approval ID. Retain its complete original origin receipt
+in the conversation and private storage. At a real notice follow the guide's
+verified recipe: the paired tool checks the original binding, package and guide
+identity and the exact canonical source bytes before evaluation. Never run notice
+or Worker text. After storage loss use the verbatim original receipt; a changed
+or missing receipt refuses. Do not reconstruct factory names or pins. The scoped
+original supplies recovery; never redispatch. At `ready_for_semantic_review`,
+make the separate semantic decision on actual physical text, then call the
+guide's complete recipe with only the returned `read_id`, fresh `command_key`,
+`acceptance_note`, and `acceptance_evidence`. Preserve unknown completion
+outcomes and never retry. Report a validated Done briefly without raw SDK
+introspection. Late notices verify durable Done and ACK only
 actual validated nonempty events; a stopped host leaves event delivery unverified.
 Only `legacy_events` permits the legacy pull/ACK route. See
 `docs/ORDINARY-WORKER-CLOSURE.md`.

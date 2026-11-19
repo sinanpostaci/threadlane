@@ -30,6 +30,7 @@ mod auto_pair;
 pub mod backlog_worker;
 /// Public `codex app-server proxy` client and native thread metadata types.
 pub mod client;
+mod closure_bootstrap;
 /// Safe startup and CLI registration helper for `mcp_servers.threadlane` in Codex `config.toml`.
 pub mod codex_setup;
 /// Safe startup and CLI installer for the bundled user-level Threadlane Codex skill.
@@ -1072,7 +1073,7 @@ fi
 
         // Two connection tools, sixteen runtime tools, eight ordinary backlog tools, five guarded Worker backlog tools, five workflow tools, eight approved-task tools, six Coworker planning tools, and four Coworker execution tools.
         let tools = mcp_a.list_tools();
-        assert_eq!(tools.len(), 54, "PairedMcpServer must expose 54 tools");
+        assert_eq!(tools.len(), 55, "PairedMcpServer must expose 55 tools");
         let list_activity_tool = tools
             .iter()
             .find(|tool| tool.name == "list_activity")
@@ -1407,7 +1408,7 @@ fi
         let mcp = PairedMcpServer::new(&state_dir, pairing_store).expect("create mcp");
 
         let tools = mcp.list_tools();
-        assert_eq!(tools.len(), 54);
+        assert_eq!(tools.len(), 55);
 
         for (tool_name, expected_read_only, expected_props) in [
             ("catalog", true, &["cursor", "limit"][..]),

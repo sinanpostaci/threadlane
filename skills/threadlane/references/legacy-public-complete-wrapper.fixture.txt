@@ -1,0 +1,11 @@
+// functions.exec complete: bind the separate semantic acceptance decision.
+const acceptance = ACCEPTANCE_CONTEXT;
+if (!acceptance || typeof acceptance.cli_package !== "string" || acceptance.cli_package[0] !== "/" || !/^[0-9a-f]{64}$/.test(acceptance.source_sha256)) throw new Error("invalid package pins");
+const quote = (v) => "'" + String(v).replace(/'/g, "'\\''") + "'";
+const result = await tools.exec_command({cmd: quote(acceptance.cli_package + "/bin/threadlane") + " 'closure-template'", max_output_tokens: 40000, yield_time_ms: 30000});
+if (result.exit_code !== 0 || result.session_id || result.output_truncated || result.truncated || typeof result.output !== "string") throw new Error("canonical closure-template failed");
+const template = JSON.parse(result.output);
+if (template.schema_version !== 1 || template.tool !== "threadlane closure-template" || template.version !== "2026-11-19.v2" || template.source_path !== "skills/threadlane/references/ordinary-closure.js" || template.factory_name !== "createOrdinaryClosure" || template.source_sha256 !== acceptance.source_sha256 || typeof template.javascript !== "string") throw new Error("invalid canonical capsule");
+const createOrdinaryNativeClient = new Function(template.javascript + "\nreturn createOrdinaryNativeClient;")();
+const client = createOrdinaryNativeClient({tools, load, store, template, cli_package: acceptance.cli_package, source_sha256: acceptance.source_sha256});
+text(JSON.stringify(await client.complete(acceptance)));
