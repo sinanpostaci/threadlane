@@ -429,11 +429,13 @@ fn source_text_enforces_count_and_shares_text_read_and_output_budgets() {
     assert_source_text_refused(&report, DeliveryInspectionRefusalCode::ReadLimit);
 
     // The task report alone fits, but the source text makes the combined JSON exceed the cap.
-    let mut output_limits = DeliveryInspectionLimits::default();
     let task_size = serde_json::to_vec(&inspect_delivery(&request))
         .unwrap()
         .len();
-    output_limits.max_output_bytes = task_size + 1;
+    let output_limits = DeliveryInspectionLimits {
+        max_output_bytes: task_size + 1,
+        ..DeliveryInspectionLimits::default()
+    };
     let report = inspect_delivery_with_source_text_and_limits(
         &request,
         &fixture.root,
