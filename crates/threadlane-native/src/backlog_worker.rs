@@ -493,6 +493,38 @@ pub(crate) struct WorkerBacklogService {
 }
 
 impl WorkerBacklogService {
+    /// Validates the frozen approval and an unstarted Worker item while the caller
+    /// holds the same per-binding dispatch guard as guarded Worker start.
+    pub(crate) async fn review_scope_before_start(
+        &self,
+        binding_id: &str,
+        thread_uuid: &str,
+        approval_id: &str,
+        task_id: &str,
+        item_id: &str,
+    ) -> Result<(PathBuf, String), WorkerBacklogError> {
+        let record = self
+            .load_record_until(binding_id, thread_uuid, approval_id, None)
+            .await?;
+        let task = resolve_approved_task(&record, task_id)?;
+        let item = self.load_item(binding_id, item_id).await?;
+        if item.kind != BacklogItemKind::Worker
+            || item.status != BacklogStatus::Todo
+            || item.current_execution_ref.is_some()
+            || task.allowed_write_paths.is_empty()
+            || self
+                .get_notice_snapshot(binding_id, thread_uuid, approval_id)
+                .await?
+                .is_some()
+        {
+            return Err(WorkerBacklogError::new(
+                "invalid_state",
+                "Review source scope requires the original unstarted Worker item and approval.",
+            ));
+        }
+        Ok((record.repository_path, record.base_commit))
+    }
+
     /// Resolve a native notice from durable scoped records without consulting or starting a host.
     pub(crate) async fn notice_context<F>(
         &self,

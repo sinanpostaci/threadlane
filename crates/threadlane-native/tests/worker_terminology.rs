@@ -274,7 +274,7 @@ async fn mcp_plan_task_params_schema_and_deserializer_normalize_worker_to_canoni
     // 1. Verify the current combined paired MCP tool count and that `save_draft`
     //    schema and `PlanTaskParams` deserializer agree.
     let tools = mcp.list_tools();
-    assert_eq!(tools.len(), 55);
+    assert_eq!(tools.len(), 58);
     let save_draft_tool = tools
         .iter()
         .find(|t| t.name == "save_draft")
@@ -698,8 +698,8 @@ async fn operating_guide_and_startup_instructions_report_current_version_and_wor
     let paired_server =
         PairedMcpServer::new(&state_dir, pairing_store.clone()).expect("paired server");
     let paired_tools = paired_server.list_tools();
-    // Current combined paired surface: 55 registered tools.
-    assert_eq!(paired_tools.len(), 55);
+    // Current combined paired surface: 58 registered tools.
+    assert_eq!(paired_tools.len(), 58);
     let paired_guide_tool = paired_tools
         .iter()
         .find(|t| t.name == OPERATING_GUIDE_TOOL)

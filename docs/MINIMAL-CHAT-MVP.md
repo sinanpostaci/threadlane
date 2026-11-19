@@ -127,7 +127,8 @@ The paired, enrolled MCP facade exposes the stable guarded Worker contract:
 - `backlog_worker_complete(command_key, item_id, expected_revision, execution_ref, expected_result_digest, expected_delivery_digest, acceptance_note, acceptance_evidence)`
 - `backlog_worker_reject(command_key, item_id, expected_revision, execution_ref, expected_result_digest, expected_delivery_digest, rejection_reason, rejection_evidence)`
 
-This contract's paired facade totals 52 tools; the scoped surface remains 24.
+The scoped surface remains separate from the additive paired facade; use the
+live tool inventory for its current size.
 
 `backlog_worker_start` requires real enrollment and the exact frozen
 approval/task identity. It records the reservation before any external effect and

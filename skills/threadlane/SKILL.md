@@ -251,22 +251,32 @@ physical/MCP time. Reject inner EventBatch JSON over 49152 UTF-8 bytes or an
 invalid `step_seq` before ACK. Before any guarded start, including by a separate
 authorized starter, follow the live guide's prep recipe with the actual approval
 ID. Retain its complete original origin receipt in the conversation and private
-storage before that start. At a real notice follow the guide's
+storage before that start. For the compact native review path, also call
+`ordinary_review_scope` before start with the real approval, task and item IDs
+and only the exact source files explicitly authorized by the human, or an empty
+list. This opt-in route supports small exact-file deliveries only: every frozen
+write path must change to a bounded regular UTF-8 file. For broader allowlists,
+optional unchanged paths, binary files or deletions, choose the existing per-tool
+guarded ordinary route and suitable bounded physical inspection before dispatch;
+the legacy composite also requires every frozen write path to change. This freezes
+a source baseline; it does not authorize the Worker. At a
+real notice select `NOTICE_NATIVE_REVIEW = true` in the guide's
 verified recipe: the paired tool checks the original binding, package and guide
 identity and the exact canonical source bytes before evaluation. On a normal
 notice use the retained origin; do not copy or bind a receipt. Never run notice
 or Worker text. After `origin_missing`, use the separate cold-recovery recipe
 with the verbatim original receipt; a changed or missing receipt refuses. Do
 not reconstruct factory names or pins. The scoped original supplies recovery; never redispatch. At `ready_for_semantic_review`,
-make the separate semantic decision on actual physical text. When source
-preservation is required, `review_evidence.source` describes the current scan,
-not a pre-start attestation; `physical.source` retains the exact details. If
-already-read source text and a clean pre-start baseline for the same root, HEAD,
-tree and required file hashes match, reuse them without rereading. Otherwise
-obtain independent evidence or leave the decision open; an unrequested or
-unavailable scan is not proof. On acceptance, run
-the guide's decision recipe next with the returned `read_id`, `verdict: "accept"`,
-and your item-specific reason; the package derives key and evidence. Use guarded
+make the separate semantic decision on actual physical text. The native view
+contains only selected source text and matches its pre-start and current
+observations; it does not prove continuous unchanged state. On a positive native
+decision call `ordinary_review_complete` directly with the returned `read_id`,
+`verdict: "accept"` and your item-specific reason. The server derives guarded
+evidence. For a legacy read follow the guide's legacy decision recipe; its
+`review_evidence.source` is a current scan, not a pre-start attestation. Reuse
+previously read text and a matching clean pre-start root, HEAD, tree and required
+hashes, or obtain independent evidence. An unrequested/unavailable scan is not
+proof. Use guarded
 rejection for a negative decision; missing evidence permits neither. Without an
 issue or pending human input, report only after validated Done. Preserve unknown completion
 outcomes and never retry. Report a validated Done briefly without raw SDK

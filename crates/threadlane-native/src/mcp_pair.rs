@@ -81,6 +81,10 @@ use crate::native_chat_observation::{
     resolve_native_sample_store_scope, ManagedParentConnectionConfig, ManagedParentEnvironment,
     NativeChatSamplerOwner,
 };
+use crate::ordinary_review::{
+    self, DecisionIntent, ReviewCompleteParams, ReviewPrepareParams, ReviewRead, ReviewScope,
+    ReviewScopeParams, ReviewStore,
+};
 use crate::pairing::{
     ConnectionIdentity, EnrollmentRecord, PairingStore, CONNECTION_IDENTITY_TOOL,
 };
@@ -1881,7 +1885,10 @@ impl PairedMcpServer {
             | WORKER_BACKLOG_NOTICE_CONTEXT_TOOL
             | WORKER_BACKLOG_RESULT_TOOL
             | WORKER_BACKLOG_COMPLETE_TOOL
-            | WORKER_BACKLOG_REJECT_TOOL => {
+            | WORKER_BACKLOG_REJECT_TOOL
+            | "ordinary_review_scope"
+            | "ordinary_review_prepare"
+            | "ordinary_review_complete" => {
                 self.prepare_backlog_worker_tool_json_future(tool_name, arguments)
             }
             "coworker_status"
@@ -2114,6 +2121,18 @@ impl PairedMcpServer {
     {
         Self::ensure_no_rebind_keys(tool_name, &arguments)?;
         match tool_name {
+            "ordinary_review_scope" => {
+                let params: ReviewScopeParams = Self::parse_tool_params(tool_name, arguments)?;
+                Ok(self.ordinary_review_scope_boxed(params))
+            }
+            "ordinary_review_prepare" => {
+                let params: ReviewPrepareParams = Self::parse_tool_params(tool_name, arguments)?;
+                Ok(self.ordinary_review_prepare_boxed(params))
+            }
+            "ordinary_review_complete" => {
+                let params: ReviewCompleteParams = Self::parse_tool_params(tool_name, arguments)?;
+                Ok(self.ordinary_review_complete_boxed(params))
+            }
             WORKER_BACKLOG_START_TOOL => {
                 let params: WorkerBacklogStartParams =
                     Self::parse_tool_params(tool_name, arguments)?;
@@ -3293,7 +3312,7 @@ impl PairedMcpServer {
         binding_id: &str,
         tool_name: &str,
         code: &'static str,
-        message: &'static str,
+        message: &str,
     ) -> CallToolResult {
         let payload = json!({
             "untrusted_data": true,
@@ -3987,6 +4006,832 @@ impl PairedMcpServer {
             Arc::clone(&stores.authority),
             stores.sessions_dir.clone(),
             self.host_launcher.clone(),
+        )
+    }
+
+    fn review_origin(
+        &self,
+        tool: &'static str,
+        binding: &str,
+        thread: &str,
+    ) -> Result<ClosureOrigin, CallToolResult> {
+        let connection = self
+            .closure_connection
+            .lock()
+            .map_err(|_| {
+                Self::format_scoped_error(
+                    binding,
+                    tool,
+                    "security_violation",
+                    "Review connection is unavailable.",
+                )
+            })?
+            .clone()
+            .ok_or_else(|| {
+                Self::format_scoped_error(
+                    binding,
+                    tool,
+                    "needs_verification",
+                    "Connect the current chat before using review.",
+                )
+            })?;
+        if connection.binding_id != binding || connection.thread_id != thread {
+            return Err(Self::format_scoped_error(
+                binding,
+                tool,
+                "rebind_rejected",
+                "Review connection changed.",
+            ));
+        }
+        origin_for_connection(
+            binding,
+            thread,
+            &connection.operator_context,
+            &self.closure_cli_hash,
+        )
+        .map_err(|e| Self::format_planning_gateway_error(binding, tool, e))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_review_test_connection(
+        &self,
+        binding: &str,
+        thread: &str,
+        context: crate::OperatorContextBootstrap,
+    ) {
+        *self
+            .closure_connection
+            .lock()
+            .expect("review test connection lock") = Some(
+            AutomaticPairingResult::verified_fixture(binding, thread, context),
+        );
+    }
+
+    fn ordinary_review_scope_boxed(
+        &self,
+        params: ReviewScopeParams,
+    ) -> BoxedTaskLocalFuture<'_, Result<CallToolResult, CallToolResult>> {
+        Box::pin(async move {
+            const TOOL: &str = "ordinary_review_scope";
+            let (binding, thread, stores) = self.verified_host_context(TOOL)?;
+            let observation = self
+                .begin_paired_observation(&binding, &thread, TOOL, None, None)
+                .await;
+            let result = self
+                .register_review_scope(&binding, &thread, stores, params)
+                .await;
+            self.finish_paired_observation(observation, &result).await;
+            result
+        })
+    }
+
+    async fn register_review_scope(
+        &self,
+        binding: &str,
+        thread: &str,
+        stores: HostStores,
+        params: ReviewScopeParams,
+    ) -> Result<CallToolResult, CallToolResult> {
+        const TOOL: &str = "ordinary_review_scope";
+        ordinary_review::validate_source_files(&params.source_files)
+            .map_err(|e| Self::format_planning_gateway_error(binding, TOOL, e))?;
+        let origin = self.review_origin(TOOL, binding, thread)?;
+        let store = ReviewStore::open(&self.state_dir)
+            .map_err(|e| Self::format_planning_gateway_error(binding, TOOL, e))?;
+        let service = self
+            .backlog_worker_service(&stores)
+            .map_err(|e| Self::format_scoped_error(binding, TOOL, e.code(), e.message()))?;
+        let final_recheck =
+            self.backlog_worker_final_recheck(TOOL, binding.to_string(), thread.to_string());
+        // The same per-binding advancement lock used by Worker start makes the
+        // Todo check and source-scope registration atomic with guarded dispatch.
+        let guarded = crate::dispatch_guard::with_guarded_native_dispatch(
+            &stores.authority,
+            binding,
+            thread,
+            &params.approval_id,
+            &params.task_id,
+            None,
+            || async {
+                let _lock = store
+                    .scope_lock(binding, &params.approval_id)
+                    .map_err(|_| {
+                        crate::dispatch_guard::GuardedDispatchError::pre_effect(
+                            "review_store_error",
+                            "Review scope storage is unavailable.",
+                        )
+                    })?;
+                if let Some(previous) = store.scope(binding, &params.approval_id).map_err(|_| {
+                    crate::dispatch_guard::GuardedDispatchError::pre_effect(
+                        "review_store_error",
+                        "Review scope storage is invalid.",
+                    )
+                })? {
+                    if previous.binding_id != binding
+                        || previous.thread_id != thread
+                        || previous.origin != origin
+                        || previous.task_id != params.task_id
+                        || previous.item_id != params.item_id
+                        || previous.source_files != params.source_files
+                    {
+                        return Err(crate::dispatch_guard::GuardedDispatchError::pre_effect(
+                            "scope_conflict",
+                            "Review source scope conflicts with the original.",
+                        ));
+                    }
+                    final_recheck().map_err(|e| {
+                        crate::dispatch_guard::GuardedDispatchError::pre_effect(
+                            e.code(),
+                            e.message(),
+                        )
+                    })?;
+                    let scope_id = store.store_scope(&previous).map_err(|_| {
+                        crate::dispatch_guard::GuardedDispatchError::pre_effect(
+                            "review_store_error",
+                            "Review scope cannot be retained.",
+                        )
+                    })?;
+                    return Ok((previous, scope_id));
+                }
+                let (repository_path, base_commit) = service
+                    .review_scope_before_start(
+                        binding,
+                        thread,
+                        &params.approval_id,
+                        &params.task_id,
+                        &params.item_id,
+                    )
+                    .await
+                    .map_err(|e| {
+                        crate::dispatch_guard::GuardedDispatchError::pre_effect(
+                            e.code(),
+                            e.message(),
+                        )
+                    })?;
+                if repository_path != origin.project_root {
+                    return Err(crate::dispatch_guard::GuardedDispatchError::pre_effect(
+                        "scope_mismatch",
+                        "Review project differs from frozen approval.",
+                    ));
+                }
+                let baseline = if params.source_files.is_empty() {
+                    None
+                } else {
+                    let root = repository_path.clone();
+                    let base = base_commit.clone();
+                    let files = params.source_files.clone();
+                    let observed = tokio::task::spawn_blocking(move || {
+                        threadlane::delivery_inspection::inspect_source_baseline(
+                            &root, &base, &files,
+                        )
+                    })
+                    .await
+                    .map_err(|_| {
+                        crate::dispatch_guard::GuardedDispatchError::pre_effect(
+                            "source_baseline_unavailable",
+                            "Pre-start source baseline failed.",
+                        )
+                    })?;
+                    if !observed.ok
+                        || !observed.clean_at_base
+                        || observed.root != repository_path.to_string_lossy()
+                        || observed.expected_base != base_commit
+                        || observed.head_commit.as_deref() != Some(base_commit.as_str())
+                        || observed.base_tree.is_none()
+                        || !observed.changed_paths.is_empty()
+                        || observed.files.len() != params.source_files.len()
+                        || params.source_files.iter().any(|path| {
+                            !observed.files.iter().any(|file| {
+                                file.path == *path
+                                    && file.matches_base
+                                    && file.sha256 == file.base_sha256
+                                    && file.size_bytes.is_some()
+                                    && file.text.is_none()
+                                    && file.text_untrusted.is_none()
+                            })
+                        })
+                    {
+                        return Err(crate::dispatch_guard::GuardedDispatchError::pre_effect(
+                            "source_baseline_unavailable",
+                            "Pre-start source baseline is incomplete or not clean at base.",
+                        ));
+                    }
+                    Some(observed)
+                };
+                final_recheck().map_err(|e| {
+                    crate::dispatch_guard::GuardedDispatchError::pre_effect(e.code(), e.message())
+                })?;
+                let current_origin = self.review_origin(TOOL, binding, thread).map_err(|_| {
+                    crate::dispatch_guard::GuardedDispatchError::pre_effect(
+                        "rebind_rejected",
+                        "Review origin changed.",
+                    )
+                })?;
+                if current_origin != origin {
+                    return Err(crate::dispatch_guard::GuardedDispatchError::pre_effect(
+                        "rebind_rejected",
+                        "Review origin changed.",
+                    ));
+                }
+                let observed_at = current_observation_time_ms();
+                let scope = ReviewScope {
+                    schema_version: 1,
+                    binding_id: binding.to_string(),
+                    thread_id: thread.to_string(),
+                    approval_id: params.approval_id.clone(),
+                    task_id: params.task_id.clone(),
+                    item_id: params.item_id.clone(),
+                    repository_path,
+                    base_commit,
+                    source_files: params.source_files.clone(),
+                    baseline_observed_at_ms: baseline.as_ref().map(|_| observed_at),
+                    created_at_ms: observed_at,
+                    baseline,
+                    origin: origin.clone(),
+                };
+                let scope_id = store.store_scope(&scope).map_err(|_| {
+                    crate::dispatch_guard::GuardedDispatchError::pre_effect(
+                        "review_store_error",
+                        "Review scope cannot be retained.",
+                    )
+                })?;
+                Ok((scope, scope_id))
+            },
+        )
+        .await;
+        let (scope, scope_id) = match guarded {
+            Ok(value) => value,
+            Err(crate::dispatch_guard::GuardedDispatchError::PreEffect { code, message }) => {
+                return Err(Self::format_scoped_error(binding, TOOL, code, message))
+            }
+            Err(crate::dispatch_guard::GuardedDispatchError::Host(error)) => {
+                let (code, message) = crate::approved_mcp::map_host_error_to_mcp(&error);
+                return Err(Self::format_scoped_error(binding, TOOL, code, message));
+            }
+        };
+        Self::format_planning_gateway_result(
+            binding,
+            TOOL,
+            json!({"status":"scope_prepared", "scope_id":scope_id,
+            "approval_id":scope.approval_id, "task_id":scope.task_id, "item_id":scope.item_id,
+            "source_files":scope.source_files}),
+        )
+    }
+
+    fn ordinary_review_prepare_boxed(
+        &self,
+        params: ReviewPrepareParams,
+    ) -> BoxedTaskLocalFuture<'_, Result<CallToolResult, CallToolResult>> {
+        Box::pin(async move {
+            const TOOL: &str = "ordinary_review_prepare";
+            let (binding, thread, stores) = self.verified_host_context(TOOL)?;
+            let observation = self
+                .begin_paired_observation(&binding, &thread, TOOL, None, None)
+                .await;
+            let result = self.prepare_review(&binding, &thread, stores, params).await;
+            self.finish_paired_observation(observation, &result).await;
+            result
+        })
+    }
+
+    async fn prepare_review(
+        &self,
+        binding: &str,
+        thread: &str,
+        stores: HostStores,
+        params: ReviewPrepareParams,
+    ) -> Result<CallToolResult, CallToolResult> {
+        const TOOL: &str = "ordinary_review_prepare";
+        let origin = self.review_origin(TOOL, binding, thread)?;
+        let store = ReviewStore::open(&self.state_dir)
+            .map_err(|e| Self::format_planning_gateway_error(binding, TOOL, e))?;
+        let _lock = store
+            .scope_lock(binding, &params.approval_id)
+            .map_err(|e| Self::format_planning_gateway_error(binding, TOOL, e))?;
+        let scope = store
+            .scope(binding, &params.approval_id)
+            .map_err(|e| Self::format_planning_gateway_error(binding, TOOL, e))?
+            .ok_or_else(|| {
+                Self::format_scoped_error(
+                    binding,
+                    TOOL,
+                    "scope_missing",
+                    "Original pre-start review scope is unavailable.",
+                )
+            })?;
+        if scope.binding_id != binding
+            || scope.thread_id != thread
+            || scope.approval_id != params.approval_id
+            || scope.origin != origin
+        {
+            return Err(Self::format_scoped_error(
+                binding,
+                TOOL,
+                "scope_mismatch",
+                "Original review scope or package changed.",
+            ));
+        }
+        let service = self
+            .backlog_worker_service(&stores)
+            .map_err(|e| Self::format_scoped_error(binding, TOOL, e.code(), e.message()))?;
+        let mut context = service
+            .notice_context(
+                binding,
+                thread,
+                WorkerBacklogNoticeContextParams {
+                    approval_id: params.approval_id.clone(),
+                },
+                self.backlog_worker_final_recheck(TOOL, binding.to_string(), thread.to_string()),
+            )
+            .await
+            .map_err(|e| Self::format_scoped_error(binding, TOOL, e.code(), e.message()))?;
+        if let Some(id) = store
+            .indexed_read(binding, &params.approval_id)
+            .map_err(|e| Self::format_planning_gateway_error(binding, TOOL, e))?
+        {
+            let read = store
+                .read(&id)
+                .map_err(|e| Self::format_planning_gateway_error(binding, TOOL, e))?;
+            if read.scope != scope
+                || context.item_snapshot != read.context.item_snapshot
+                || !ordinary_review::valid_read(&read)
+            {
+                return Err(Self::format_scoped_error(
+                    binding,
+                    TOOL,
+                    "review_stale",
+                    "Original review is stale or conflicts with the current execution.",
+                ));
+            }
+            let view = ordinary_review::view(&id, &read)
+                .map_err(|e| Self::format_planning_gateway_error(binding, TOOL, e))?;
+            return Self::format_planning_gateway_result(binding, TOOL, view);
+        }
+        let dispatch = context.execution.dispatch_receipt.as_ref().ok_or_else(|| {
+            Self::format_scoped_error(
+                binding,
+                TOOL,
+                "worker_start_unconfirmed",
+                "Original dispatch receipt is unavailable.",
+            )
+        })?;
+        let client = threadlane_host::ApprovedHostClient::new(
+            Arc::clone(&stores.authority),
+            &stores.sessions_dir,
+            binding,
+            thread,
+        )
+        .map_err(|_| {
+            Self::format_scoped_error(
+                binding,
+                TOOL,
+                "host_unavailable",
+                "Authenticated Worker host is unavailable.",
+            )
+        })?;
+        let page = client
+            .list_task_activity(
+                &scope.approval_id,
+                &scope.task_id,
+                None,
+                None,
+                Some(2),
+                Some(threadlane_core::EventKind::WorkerCompleted),
+            )
+            .await
+            .map_err(|_| {
+                Self::format_scoped_error(
+                    binding,
+                    TOOL,
+                    "terminal_event_unavailable",
+                    "Original terminal event is unavailable.",
+                )
+            })?;
+        if page.binding_id != dispatch.session_binding_id || page.has_more || page.events.len() != 1
+        {
+            return Err(Self::format_scoped_error(
+                binding,
+                TOOL,
+                "terminal_event_mismatch",
+                "Original terminal event is missing or ambiguous.",
+            ));
+        }
+        let terminal_event = page.events[0].clone();
+        let acknowledged_binding = client
+            .verify_live_ready_binding(&scope.approval_id)
+            .await
+            .map_err(|_| {
+                Self::format_scoped_error(
+                    binding,
+                    TOOL,
+                    "ack_unavailable",
+                    "Verified terminal acknowledgement is unavailable.",
+                )
+            })?;
+        if terminal_event.kind != threadlane_core::EventKind::WorkerCompleted
+            || !terminal_event.important
+            || terminal_event.seq == 0
+            || terminal_event.run_id != dispatch.run_id
+            || terminal_event.binding_id != dispatch.session_binding_id
+            || acknowledged_binding.binding_id != dispatch.session_binding_id
+            || terminal_event.seq > acknowledged_binding.acked_seq
+            || acknowledged_binding.acked_seq > acknowledged_binding.delivered_seq
+        {
+            return Err(Self::format_scoped_error(
+                binding,
+                TOOL,
+                "terminal_ack_missing",
+                "Original terminal event has not been acknowledged.",
+            ));
+        }
+        let execution_ref = context.execution.execution_ref.clone();
+        let result = service
+            .result(
+                binding,
+                thread,
+                WorkerBacklogResultParams {
+                    item_id: scope.item_id.clone(),
+                    execution_ref,
+                },
+                self.backlog_worker_final_recheck(TOOL, binding.to_string(), thread.to_string()),
+            )
+            .await
+            .map_err(|e| Self::format_scoped_error(binding, TOOL, e.code(), e.message()))?;
+        // Result reconciliation can itself record the first terminal outcome and
+        // advance the item revision. Refresh once, then bind only that current
+        // snapshot while refusing any change to the original reservation.
+        let refreshed = service
+            .notice_context(
+                binding,
+                thread,
+                WorkerBacklogNoticeContextParams {
+                    approval_id: params.approval_id.clone(),
+                },
+                self.backlog_worker_final_recheck(TOOL, binding.to_string(), thread.to_string()),
+            )
+            .await
+            .map_err(|e| Self::format_scoped_error(binding, TOOL, e.code(), e.message()))?;
+        if context.execution.execution_ref != refreshed.execution.execution_ref
+            || context.execution.binding_id != refreshed.execution.binding_id
+            || context.execution.item_id != refreshed.execution.item_id
+            || context.execution.authority != refreshed.execution.authority
+            || context.execution.dispatch_receipt != refreshed.execution.dispatch_receipt
+            || context.execution.acceptance_condition_digest
+                != refreshed.execution.acceptance_condition_digest
+            || context.execution.delivery_description_digest
+                != refreshed.execution.delivery_description_digest
+            || context.execution.reservation_revision != refreshed.execution.reservation_revision
+            || context.execution.reserved_at_ms != refreshed.execution.reserved_at_ms
+            || context.acceptance_condition != refreshed.acceptance_condition
+            || context.delivery_description != refreshed.delivery_description
+            || context.scope.repository_path != refreshed.scope.repository_path
+            || context.scope.base_commit != refreshed.scope.base_commit
+            || context.scope.write_paths != refreshed.scope.write_paths
+            || context.scope.requested_model != refreshed.scope.requested_model
+            || context.scope.requested_effort != refreshed.scope.requested_effort
+        {
+            return Err(Self::format_scoped_error(
+                binding,
+                TOOL,
+                "execution_not_current",
+                "Original execution changed during review preparation.",
+            ));
+        }
+        context = refreshed;
+        let worker = result.worker_evidence.as_ref().ok_or_else(|| {
+            Self::format_scoped_error(
+                binding,
+                TOOL,
+                "worker_evidence_missing",
+                "Exact Worker evidence is unavailable.",
+            )
+        })?;
+        let root = worker.task_worktree_path.as_ref().ok_or_else(|| {
+            Self::format_scoped_error(
+                binding,
+                TOOL,
+                "worker_evidence_missing",
+                "Exact task worktree is unavailable.",
+            )
+        })?;
+        let request = threadlane::DeliveryInspectionRequest {
+            root: PathBuf::from(root),
+            expected_base: scope.base_commit.clone(),
+            allowed_paths: context.scope.write_paths.clone(),
+            text_files: context.scope.write_paths.clone(),
+        };
+        let source_files = scope.source_files.clone();
+        let source_root = scope.repository_path.clone();
+        let physical = tokio::task::spawn_blocking(move || {
+            if source_files.is_empty() {
+                threadlane::inspect_delivery(&request)
+            } else {
+                threadlane::inspect_delivery_with_source_text(&request, &source_root, &source_files)
+            }
+        })
+        .await
+        .map_err(|_| {
+            Self::format_scoped_error(
+                binding,
+                TOOL,
+                "inspection_failed",
+                "Physical review inspection failed.",
+            )
+        })?;
+        let read = ReviewRead {
+            schema_version: 1,
+            scope: scope.clone(),
+            context,
+            result,
+            terminal_event,
+            acknowledged_binding,
+            physical,
+        };
+        if !ordinary_review::valid_read(&read) {
+            return Err(Self::format_scoped_error(
+                binding,
+                TOOL,
+                "review_evidence_incomplete",
+                "Original result, acknowledgement, or physical evidence did not verify.",
+            ));
+        }
+        self.backlog_worker_final_recheck(TOOL, binding.to_string(), thread.to_string())()
+            .map_err(|e| Self::format_scoped_error(binding, TOOL, e.code(), e.message()))?;
+        if self.review_origin(TOOL, binding, thread)? != origin {
+            return Err(Self::format_scoped_error(
+                binding,
+                TOOL,
+                "rebind_rejected",
+                "Review package changed during inspection.",
+            ));
+        }
+        // Check the compact response budget before retaining a ready capability.
+        let placeholder = format!("rd_{}", "0".repeat(64));
+        let candidate = ordinary_review::view(&placeholder, &read)
+            .map_err(|e| Self::format_planning_gateway_error(binding, TOOL, e))?;
+        ensure_mcp_response_budget(binding, TOOL, &candidate)
+            .map_err(|e| Self::format_workflow_error(binding, TOOL, e))?;
+        let id = store
+            .store_read(&read)
+            .map_err(|e| Self::format_planning_gateway_error(binding, TOOL, e))?;
+        let view = ordinary_review::view(&id, &read)
+            .map_err(|e| Self::format_planning_gateway_error(binding, TOOL, e))?;
+        Self::format_planning_gateway_result(binding, TOOL, view)
+    }
+
+    fn ordinary_review_complete_boxed(
+        &self,
+        params: ReviewCompleteParams,
+    ) -> BoxedTaskLocalFuture<'_, Result<CallToolResult, CallToolResult>> {
+        Box::pin(async move {
+            const TOOL: &str = "ordinary_review_complete";
+            let (binding, thread, stores) = self.verified_host_context(TOOL)?;
+            let observation = self
+                .begin_paired_observation(&binding, &thread, TOOL, None, None)
+                .await;
+            let result = self
+                .complete_review(&binding, &thread, stores, params)
+                .await;
+            self.finish_paired_observation(observation, &result).await;
+            result
+        })
+    }
+
+    async fn complete_review(
+        &self,
+        binding: &str,
+        thread: &str,
+        stores: HostStores,
+        params: ReviewCompleteParams,
+    ) -> Result<CallToolResult, CallToolResult> {
+        const TOOL: &str = "ordinary_review_complete";
+        ordinary_review::validate_decision(&params)
+            .map_err(|e| Self::format_planning_gateway_error(binding, TOOL, e))?;
+        let origin = self.review_origin(TOOL, binding, thread)?;
+        let store = ReviewStore::open(&self.state_dir)
+            .map_err(|e| Self::format_planning_gateway_error(binding, TOOL, e))?;
+        let _lock = store
+            .decision_lock(&params.read_id)
+            .map_err(|e| Self::format_planning_gateway_error(binding, TOOL, e))?;
+        let read = store
+            .read(&params.read_id)
+            .map_err(|e| Self::format_planning_gateway_error(binding, TOOL, e))?;
+        let scope = store
+            .scope(binding, &read.scope.approval_id)
+            .map_err(|e| Self::format_planning_gateway_error(binding, TOOL, e))?;
+        let index = store
+            .indexed_read(binding, &read.scope.approval_id)
+            .map_err(|e| Self::format_planning_gateway_error(binding, TOOL, e))?;
+        if read.scope.binding_id != binding
+            || read.scope.thread_id != thread
+            || read.scope.origin != origin
+            || scope.as_ref() != Some(&read.scope)
+            || index.as_deref() != Some(params.read_id.as_str())
+            || !ordinary_review::valid_read(&read)
+        {
+            return Err(Self::format_scoped_error(
+                binding,
+                TOOL,
+                "review_mismatch",
+                "Original review scope, package, or evidence changed.",
+            ));
+        }
+        let evidence = ordinary_review::acceptance_evidence(&params.read_id, &read)
+            .map_err(|e| Self::format_planning_gateway_error(binding, TOOL, e))?;
+        let service = self
+            .backlog_worker_service(&stores)
+            .map_err(|e| Self::format_scoped_error(binding, TOOL, e.code(), e.message()))?;
+        let previous = store
+            .decision(&params.read_id)
+            .map_err(|e| Self::format_planning_gateway_error(binding, TOOL, e))?;
+        let mut intent = DecisionIntent {
+            schema_version: 1,
+            read_id: params.read_id.clone(),
+            reason: params.reason.clone(),
+            acceptance_evidence: evidence.clone(),
+            refusal: None,
+            refusal_message: None,
+            completion: None,
+        };
+        if let Some(previous) = previous {
+            if previous.schema_version != 1
+                || previous.read_id != intent.read_id
+                || previous.reason != intent.reason
+                || previous.acceptance_evidence != intent.acceptance_evidence
+            {
+                return Err(Self::format_scoped_error(
+                    binding,
+                    TOOL,
+                    "decision_conflict",
+                    "This review already has a different decision.",
+                ));
+            }
+            if let Some(refusal) = previous.refusal {
+                let Some(message) = previous
+                    .refusal_message
+                    .as_deref()
+                    .filter(|v| !v.is_empty() && v.len() <= 512)
+                else {
+                    return Err(Self::format_scoped_error(
+                        binding,
+                        TOOL,
+                        "completion_conflict",
+                        "Stored refusal state is incomplete.",
+                    ));
+                };
+                if previous.completion.is_some() {
+                    return Err(Self::format_scoped_error(
+                        binding,
+                        TOOL,
+                        "completion_conflict",
+                        "Stored decision state is inconsistent.",
+                    ));
+                }
+                return Err(Self::format_scoped_error(
+                    binding,
+                    TOOL,
+                    refusal.code(),
+                    message,
+                ));
+            }
+            if previous.refusal_message.is_some() {
+                return Err(Self::format_scoped_error(
+                    binding,
+                    TOOL,
+                    "completion_conflict",
+                    "Stored refusal state is inconsistent.",
+                ));
+            }
+            let current = service
+                .notice_context(
+                    binding,
+                    thread,
+                    WorkerBacklogNoticeContextParams {
+                        approval_id: read.scope.approval_id.clone(),
+                    },
+                    self.backlog_worker_final_recheck(
+                        TOOL,
+                        binding.to_string(),
+                        thread.to_string(),
+                    ),
+                )
+                .await
+                .map_err(|e| Self::format_scoped_error(binding, TOOL, e.code(), e.message()))?;
+            let Some(receipt) = current.completion else {
+                return Err(Self::format_scoped_error(
+                    binding,
+                    TOOL,
+                    "completion_outcome_unknown",
+                    "Original completion intent requires reconciliation; no retry was sent.",
+                ));
+            };
+            if !ordinary_review::receipt_matches(&read, &previous, &receipt)
+                || previous
+                    .completion
+                    .as_ref()
+                    .is_some_and(|saved| saved != &receipt)
+            {
+                return Err(Self::format_scoped_error(
+                    binding,
+                    TOOL,
+                    "completion_conflict",
+                    "Durable completion differs from the original decision.",
+                ));
+            }
+            intent.completion = Some(receipt.clone());
+            store
+                .store_decision(&intent)
+                .map_err(|e| Self::format_planning_gateway_error(binding, TOOL, e))?;
+            return Self::format_planning_gateway_result(
+                binding,
+                TOOL,
+                ordinary_review::done_view(&params.read_id, &params.reason, &receipt),
+            );
+        }
+        // Persist the exact semantic intent before the guarded effect. A missing
+        // response is reconciled from the original durable completion, never replayed.
+        store
+            .store_decision(&intent)
+            .map_err(|e| Self::format_planning_gateway_error(binding, TOOL, e))?;
+        let snapshot = read
+            .result
+            .item_snapshot
+            .as_ref()
+            .expect("validated review snapshot");
+        let delivery = read
+            .result
+            .delivery
+            .as_ref()
+            .expect("validated review delivery");
+        let completion_params = WorkerBacklogCompleteParams {
+            item_id: read.scope.item_id.clone(),
+            execution_ref: read.result.execution.execution_ref.clone(),
+            command_key: format!("ordinary-review:{}", params.read_id),
+            expected_revision: snapshot.revision,
+            expected_result_digest: delivery.result_digest.clone(),
+            expected_delivery_digest: delivery.delivery_digest.clone(),
+            acceptance_note: params.reason.clone(),
+            acceptance_evidence: evidence,
+        };
+        let enrollment_recheck =
+            self.backlog_worker_final_recheck(TOOL, binding.to_string(), thread.to_string());
+        let server = self.clone();
+        let expected_origin = origin.clone();
+        let checked_binding = binding.to_string();
+        let checked_thread = thread.to_string();
+        let final_recheck = move || {
+            enrollment_recheck()?;
+            let actual = server
+                .review_origin(TOOL, &checked_binding, &checked_thread)
+                .map_err(|_| {
+                    WorkerBacklogError::new("rebind_rejected", "Review package recheck failed.")
+                })?;
+            if actual != expected_origin {
+                return Err(WorkerBacklogError::new(
+                    "rebind_rejected",
+                    "Review package changed before completion.",
+                ));
+            }
+            Ok(())
+        };
+        let outcome = match service
+            .complete(binding, thread, completion_params, final_recheck)
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                if let Some(refusal) = ordinary_review::DefiniteRefusal::from_code(error.code()) {
+                    intent.refusal = Some(refusal);
+                    intent.refusal_message = Some(error.message().to_string());
+                    store
+                        .store_decision(&intent)
+                        .map_err(|e| Self::format_planning_gateway_error(binding, TOOL, e))?;
+                    return Err(Self::format_scoped_error(
+                        binding,
+                        TOOL,
+                        error.code(),
+                        error.message(),
+                    ));
+                }
+                return Err(Self::format_scoped_error(binding, TOOL, "completion_outcome_unknown", "Guarded completion requires original-receipt reconciliation; no retry was sent."));
+            }
+        };
+        if !ordinary_review::receipt_matches(&read, &intent, &outcome.completion) {
+            return Err(Self::format_scoped_error(
+                binding,
+                TOOL,
+                "completion_conflict",
+                "Guarded receipt differs from the selected review.",
+            ));
+        }
+        intent.completion = Some(outcome.completion.clone());
+        store
+            .store_decision(&intent)
+            .map_err(|e| Self::format_planning_gateway_error(binding, TOOL, e))?;
+        Self::format_planning_gateway_result(
+            binding,
+            TOOL,
+            ordinary_review::done_view(&params.read_id, &params.reason, &outcome.completion),
         )
     }
 
@@ -5063,6 +5908,63 @@ impl PairedMcpServer {
         Parameters(params): Parameters<OrdinaryClosureClientParams>,
     ) -> Result<CallToolResult, CallToolResult> {
         self.ordinary_closure_client_boxed(params).await
+    }
+
+    /// Freezes the explicitly selected source-read scope before guarded Worker start.
+    #[tool(
+        name = "ordinary_review_scope",
+        description = "Before guarded Worker start, freeze the exact human-authorized source files for this original approval, task and unstarted Worker item. Empty source_files requests no source text. This operator selection grants no execution or semantic acceptance authority.",
+        annotations(
+            title = "Prepare Ordinary Review Scope",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    pub async fn ordinary_review_scope(
+        &self,
+        Parameters(params): Parameters<ReviewScopeParams>,
+    ) -> Result<CallToolResult, CallToolResult> {
+        self.ordinary_review_scope_boxed(params).await
+    }
+
+    /// Builds a server-attested immutable review after the real callback ACK.
+    #[tool(
+        name = "ordinary_review_prepare",
+        description = "After the real callback ACK and result, independently verify the original scoped terminal event, acknowledgement and physical delivery. Return a bounded untrusted decision view and immutable read_id, including only preselected source files. It never accepts semantics or completes work.",
+        annotations(
+            title = "Prepare Ordinary Review",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    pub async fn ordinary_review_prepare(
+        &self,
+        Parameters(params): Parameters<ReviewPrepareParams>,
+    ) -> Result<CallToolResult, CallToolResult> {
+        self.ordinary_review_prepare_boxed(params).await
+    }
+
+    /// Records an explicit positive decision for one original immutable review.
+    #[tool(
+        name = "ordinary_review_complete",
+        description = "Complete only after an independent positive semantic decision: provide the returned read_id, verdict accept and a brief item-specific reason. The server derives the original revision, result and delivery digests and rechecks guarded completion. Reconcile an unknown outcome; do not retry it blindly.",
+        annotations(
+            title = "Complete Reviewed Worker",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    pub async fn ordinary_review_complete(
+        &self,
+        Parameters(params): Parameters<ReviewCompleteParams>,
+    ) -> Result<CallToolResult, CallToolResult> {
+        self.ordinary_review_complete_boxed(params).await
     }
 
     /// Delegated `status` tool (requires verified operator enrollment).
@@ -6254,9 +7156,7 @@ mod automatic_scope_tests {
             content_sha256: Some(format!("{:x}", Sha256::digest(b"private context"))),
             reused_existing: Some(false),
         };
-        *server.closure_connection.lock().unwrap() = Some(
-            AutomaticPairingResult::verified_fixture(binding, thread, context),
-        );
+        server.set_review_test_connection(binding, thread, context);
         server
             .automatic_pairing
             .require_call_identity
@@ -7052,7 +7952,7 @@ mod backlog_paired_tests {
         let unbound = PairedMcpServer::new(&state_dir, pairing_store).expect("unbound server");
 
         let tools = unbound.list_tools();
-        assert_eq!(tools.len(), 55, "PairedMcpServer must expose 55 tools");
+        assert_eq!(tools.len(), 58, "PairedMcpServer must expose 58 tools");
 
         let cases: [(&str, bool, &[&str], &[&str]); 8] = [
             (

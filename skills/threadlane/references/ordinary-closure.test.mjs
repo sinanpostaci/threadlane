@@ -4209,7 +4209,7 @@ function makeVerifiedBootstrapGuide() {
     template_version: env.template.version, source_sha256: SOURCE_SHA256,
     bootstrap_sha256: crypto.createHash("sha256").update(bootstrapSource).digest("hex")};
   let activeOrigin = clone(origin), sourceOverride = null, bootstrapOverride = null;
-  let proofOverride = null, completionOverride = null, noticeContextOverride = null;
+  let proofOverride = null, completionOverride = null, noticeContextOverride = null, nativeReviewOverride = null;
   const completedArgs = [];
   const normalized = (v) => Array.isArray(v) ? v.map(normalized) :
     v && typeof v === "object" ? Object.fromEntries(Object.keys(v).sort().map((k) => [k, normalized(v[k])])) : v;
@@ -4242,6 +4242,11 @@ function makeVerifiedBootstrapGuide() {
       scope: {base_commit: BASE, requested_model: MODEL, requested_effort: EFFORT, write_paths: [WRITE_PATHS[0]]},
       item_snapshot: {item_id: ITEM, revision: START_EXECUTION.reservation_revision, status: "doing", current_execution_ref: EXEC}
     }),
+    mcp__threadlane__ordinary_review_prepare: async () => nativeReviewOverride || env.sdk("ordinary_review_prepare", {
+      status: "ready_for_semantic_review", read_id: "rd_" + "d".repeat(64), untrusted_data: true,
+      semantic_review: {acceptance_condition: "bounded condition", delivery_description: "bounded delivery"},
+      delivery: {files: []}, source: {status: "not_requested"}
+    }),
     mcp__threadlane__backlog_worker_complete: async (args) => {
       env.calls.complete += 1;
       completedArgs.push(clone(args));
@@ -4265,7 +4270,8 @@ function makeVerifiedBootstrapGuide() {
   return {env, origin, order, run, runLegacyNotice, completedArgs,
     setOrigin: (v) => {activeOrigin = v;}, setSource: (v) => {sourceOverride = v;},
     setBootstrap: (v) => {bootstrapOverride = v;}, setProof: (v) => {proofOverride = v;},
-    setCompletion: (v) => {completionOverride = v;}, setNoticeContext: (v) => {noticeContextOverride = v;}};
+    setCompletion: (v) => {completionOverride = v;}, setNoticeContext: (v) => {noticeContextOverride = v;},
+    setNativeReview: (v) => {nativeReviewOverride = v;}};
 }
 
 function preservationNoticeContext() {
@@ -4449,6 +4455,47 @@ test("the pre-start recipe retains the original origin before a separate starter
   assert.equal(f.env.calls.ack, 1);
   assert.equal(f.env.calls.complete, 0);
   assert.deepEqual(JSON.parse(f.env.stored.get(`threadlane/closures/${APPROVAL}/origin`)), retained);
+});
+
+test("native review outputs only the paired server's bounded read after the real ACK", async () => {
+  const f = makeVerifiedBootstrapGuide(); await f.run(0);
+  await f.run(1, {NOTICE_NATIVE_REVIEW: true});
+  const ready = JSON.parse(f.env.texts.at(-1));
+  assert.equal(ready.read_id, "rd_" + "d".repeat(64));
+  assert.equal(ready.untrusted_data, true);
+  assert.equal(ready.status, "ready_for_semantic_review");
+  assert.equal(f.env.calls.ack, 1);
+  assert.equal(f.env.calls.complete, 0);
+  assert.equal(f.env.texts.length, 2, "the intermediate legacy Ready is not printed");
+});
+
+test("native review refuses conflicting, foreign, or malformed paired replies without fallback", async () => {
+  for (const mode of ["outer untrusted", "inner untrusted", "binding", "status", "read id", "dual copy", "tool error"]) {
+    const f = makeVerifiedBootstrapGuide(); await f.run(0);
+    const data = {status:"ready_for_semantic_review", read_id:"rd_" + "d".repeat(64), untrusted_data:true};
+    const response = f.env.sdk("ordinary_review_prepare", data);
+    if (mode === "outer untrusted") response.structuredContent.untrusted_data = false;
+    if (mode === "inner untrusted") response.structuredContent.data.untrusted_data = false;
+    if (mode === "binding") response.structuredContent.binding_id = "bnd_foreign";
+    if (mode === "status") response.structuredContent.data.status = "done";
+    if (mode === "read id") response.structuredContent.data.read_id = "rd_bad";
+    if (mode === "tool error") response.isError = true;
+    if (mode !== "dual copy") response.content[0].text = JSON.stringify(response.structuredContent);
+    else response.content[0].text = JSON.stringify({...response.structuredContent, binding_id:"bnd_foreign"});
+    f.setNativeReview(response);
+    await assert.rejects(f.run(1, {NOTICE_NATIVE_REVIEW:true}), /native review refused|conflicting native review/, mode);
+    assert.equal(f.env.calls.ack, 1, mode);
+    assert.equal(f.env.calls.complete, 0, mode);
+    assert.equal(f.env.texts.length, 1, `${mode}: no legacy fallback was printed`);
+  }
+});
+
+test("native review rejects a second source-scope input before pulling events", async () => {
+  const f = makeVerifiedBootstrapGuide(); await f.run(0);
+  await assert.rejects(f.run(1, {NOTICE_NATIVE_REVIEW:true, NOTICE_SOURCE_OPTIONS:{source_files:["foreign.txt"]}}),
+    /native source scope is frozen/);
+  assert.equal(f.env.calls.pull, 0);
+  assert.equal(f.env.calls.ack, 0);
 });
 
 test("current bootstrap rejects a changed immutable observation before guarded completion", async () => {

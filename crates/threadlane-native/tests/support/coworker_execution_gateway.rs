@@ -209,7 +209,7 @@ async fn execution_gateway_mcp_schemas_enrollment_scope_isolation_unapproved_ref
     let mcp_unbound =
         PairedMcpServer::new(&state_dir, pairing_store.clone()).expect("create unbound mcp");
     let tools = mcp_unbound.list_tools();
-    assert_eq!(tools.len(), 55);
+    assert_eq!(tools.len(), 58);
     assert!(
         tools.iter().any(|tool| tool.name == "consult_advisor"),
         "consult_advisor must be advertised on the paired facade"

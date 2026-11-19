@@ -520,7 +520,7 @@ async fn coworker_planning_tools_advertised_routing_guards_and_readonly_status_a
     let mcp_unbound =
         PairedMcpServer::new(&fixture.state_dir, pairing_store.clone()).expect("new unbound mcp");
     let tools = mcp_unbound.list_tools();
-    assert_eq!(tools.len(), 55);
+    assert_eq!(tools.len(), 58);
     for (name, expected_ro) in [
         ("coworker_status", true),
         ("prepare_work", false),

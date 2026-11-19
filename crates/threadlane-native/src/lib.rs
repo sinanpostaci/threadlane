@@ -45,6 +45,8 @@ pub mod conversation_change;
 pub mod coworker_admission;
 /// Independent code controller process lifecycle (`run-owner`, `ensure`, `status`, `reconcile`, `cancel`) and authenticated local RPC.
 pub mod coworker_driver;
+/// Paired ordinary Worker review capabilities and bounded decision inputs.
+pub mod ordinary_review;
 pub use coworker_admission::{
     complete_admission_pins, verify_complete_admission, AdmissionConfirmation,
     AdmissionExecutablePin, AdmissionExecutablePins, AdmissionInspection, AdmissionInspectionState,
@@ -1073,7 +1075,7 @@ fi
 
         // Two connection tools, sixteen runtime tools, eight ordinary backlog tools, five guarded Worker backlog tools, five workflow tools, eight approved-task tools, six Coworker planning tools, and four Coworker execution tools.
         let tools = mcp_a.list_tools();
-        assert_eq!(tools.len(), 55, "PairedMcpServer must expose 55 tools");
+        assert_eq!(tools.len(), 58, "PairedMcpServer must expose 58 tools");
         let list_activity_tool = tools
             .iter()
             .find(|tool| tool.name == "list_activity")
@@ -1408,7 +1410,7 @@ fi
         let mcp = PairedMcpServer::new(&state_dir, pairing_store).expect("create mcp");
 
         let tools = mcp.list_tools();
-        assert_eq!(tools.len(), 55);
+        assert_eq!(tools.len(), 58);
 
         for (tool_name, expected_read_only, expected_props) in [
             ("catalog", true, &["cursor", "limit"][..]),

@@ -64,15 +64,16 @@ pub use coworker_wakeup::{
     COWORKER_JOB_ID_PREFIX, MAX_COWORKER_NOTIFICATION_ID_LEN, MAX_COWORKER_TRANSITION_ID_LEN,
 };
 pub use delivery_inspection::{
-    inspect_delivery, inspect_delivery_with_limits, DeliveryChangeKind, DeliveryChangedPath,
-    DeliveryFileInspection, DeliveryFilePhysicalCode, DeliveryInspectionLimits,
-    DeliveryInspectionRefusalCode, DeliveryInspectionReport, DeliveryInspectionRequest,
-    DeliveryTextStatus, DELIVERY_INSPECTION_GIT_TIMEOUT_MS, DELIVERY_INSPECTION_SCHEMA_VERSION,
-    DELIVERY_INSPECTION_TOOL, MAX_DELIVERY_INSPECTION_CHANGED_PATHS,
-    MAX_DELIVERY_INSPECTION_DURATION, MAX_DELIVERY_INSPECTION_FILE_BYTES,
-    MAX_DELIVERY_INSPECTION_GIT_OUTPUT_BYTES, MAX_DELIVERY_INSPECTION_OUTPUT_BYTES,
-    MAX_DELIVERY_INSPECTION_PATHS, MAX_DELIVERY_INSPECTION_TEXT_FILE_BYTES,
-    MAX_DELIVERY_INSPECTION_TOTAL_READ_BYTES, MAX_DELIVERY_INSPECTION_TOTAL_TEXT_BYTES,
+    inspect_delivery, inspect_delivery_with_limits, inspect_delivery_with_source_text,
+    DeliveryChangeKind, DeliveryChangedPath, DeliveryFileInspection, DeliveryFilePhysicalCode,
+    DeliveryInspectionLimits, DeliveryInspectionRefusalCode, DeliveryInspectionReport,
+    DeliveryInspectionRequest, DeliveryTextStatus, DELIVERY_INSPECTION_GIT_TIMEOUT_MS,
+    DELIVERY_INSPECTION_SCHEMA_VERSION, DELIVERY_INSPECTION_TOOL,
+    MAX_DELIVERY_INSPECTION_CHANGED_PATHS, MAX_DELIVERY_INSPECTION_DURATION,
+    MAX_DELIVERY_INSPECTION_FILE_BYTES, MAX_DELIVERY_INSPECTION_GIT_OUTPUT_BYTES,
+    MAX_DELIVERY_INSPECTION_OUTPUT_BYTES, MAX_DELIVERY_INSPECTION_PATHS,
+    MAX_DELIVERY_INSPECTION_TEXT_FILE_BYTES, MAX_DELIVERY_INSPECTION_TOTAL_READ_BYTES,
+    MAX_DELIVERY_INSPECTION_TOTAL_TEXT_BYTES,
 };
 pub use descriptor::{
     prepare_state_dir, RuntimeDescriptor, SecretToken, StateLock, DATABASE_FILENAME,
