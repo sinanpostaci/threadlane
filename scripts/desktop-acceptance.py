@@ -3134,6 +3134,21 @@ def copy_store_artifacts_privately(src_dir: Path, dest_dir: Path) -> None:
             os.chmod(target, 0o600)
 
 
+def needs_initial_build(stderr: str) -> bool:
+    clean = re.sub(r"\x1b\[[0-9;]*m", "", stderr)
+    if re.search(r"^error:[ \t]+builder for ", clean, re.MULTILINE):
+        return False
+    quoted_path = r"(?:'[^'\s]+'|‘[^’\s]+’)"
+    pattern = (
+        r"^error:[ \t]+(?:"
+        rf"some outputs of {quoted_path} are"
+        rf"|(?:(?:an|the)[ \t]+)?output of {quoted_path} is"
+        rf"|(?:the[ \t]+)?output {quoted_path}(?:[ \t]+of[ \t]+{quoted_path})? is"
+        r") not valid, so checking is not possible\.?[ \t]*\r?$"
+    )
+    return bool(re.search(pattern, clean, re.MULTILINE))
+
+
 def execute_vm_stage(
     repo_root: Path,
     run_dir: Path,
@@ -3167,30 +3182,22 @@ def execute_vm_stage(
         env=child_env,
         log_path=logs_dir / "vm-nixos-acceptance.log",
     )
-    if proc.returncode != 0:
-        first_try_combined = f"{proc.stdout}\n{proc.stderr}".lower()
-        needs_initial_build = (
-            "not built" in first_try_combined
-            or "does not exist" in first_try_combined
-            or "cannot rebuild" in first_try_combined
-            or "is not valid" in first_try_combined
+    if proc.returncode != 0 and needs_initial_build(proc.stderr):
+        wrapped_initial = wrap_with_private_dbus(
+            [
+                str(nix_path),
+                "build",
+                "--no-link",
+                "--print-out-paths",
+                f"{repo_root}#desktop-acceptance-vm",
+            ]
         )
-        if needs_initial_build:
-            wrapped_initial = wrap_with_private_dbus(
-                [
-                    str(nix_path),
-                    "build",
-                    "--no-link",
-                    "--print-out-paths",
-                    f"{repo_root}#desktop-acceptance-vm",
-                ]
-            )
-            proc = run_logged_child(
-                wrapped_initial,
-                cwd=vm_dir,
-                env=child_env,
-                log_path=logs_dir / "vm-nixos-acceptance.log",
-            )
+        proc = run_logged_child(
+            wrapped_initial,
+            cwd=vm_dir,
+            env=child_env,
+            log_path=logs_dir / "vm-nixos-acceptance.log",
+        )
     if proc.returncode != 0:
         detail = redact_sensitive_text(proc.stderr.strip() or proc.stdout.strip())
         raise AcceptanceError(
