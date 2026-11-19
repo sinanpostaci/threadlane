@@ -422,21 +422,19 @@ async fn ordinary_review_requires_original_ack_and_source_then_recovers_one_done
         foreign_complete.structured_content.unwrap()["error"]["code"],
         "review_mismatch"
     );
-    let stale = live_mcp(&fixture);
-    enroll_server(&fixture, &stale, &fixture.binding_a, THREAD_UUID_A).await;
-    stale.set_review_test_connection(&fixture.binding_a, THREAD_UUID_A, context.clone());
-    fixture
-        .pairing_store
-        .expire_epoch(&fixture.operator_token, stale.epoch_id())
-        .expect("expire only the stale fixture enrollment");
-    let stale_complete = stale
+    // A new enrollment supersedes the old connection for the same binding.
+    let active = live_mcp(&fixture);
+    enroll_server(&fixture, &active, &fixture.binding_a, THREAD_UUID_A).await;
+    active.set_review_test_connection(&fixture.binding_a, THREAD_UUID_A, context.clone());
+    let stale_complete = mcp
         .invoke_tool_json("ordinary_review_complete", complete_args.clone(), None)
         .await
-        .expect_err("expired binding must not complete review");
+        .expect_err("superseded binding must not complete review");
     assert_eq!(
         stale_complete.structured_content.unwrap()["error"]["code"],
         "expired_epoch"
     );
+    let mcp = active;
     let before_done = get_item(&mcp, &item_id).await;
     let history_before_done = get_history(&mcp, &item_id).await;
     assert_eq!(before_done.status, BacklogStatus::Doing);
