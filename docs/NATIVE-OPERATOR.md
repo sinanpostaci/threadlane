@@ -72,7 +72,9 @@ execution and frozen scope; conflicting cache refuses. Original no-notice recove
 every actual returned DTO in private evidence, checks cross-page cursor continuity,
 rejects an inner EventBatch above 49152 UTF-8 bytes or an invalid event `step_seq`
 before ACK, and returns only a compact view with identity, guard facts, verified event
-counts/ACK cursor, and exact physical text. `completeStored` repeats every current
+counts/ACK cursor, untrusted frozen criteria, exact physical text, and `read_id`.
+Pass the returned `read_id` with semantic acceptance so `completeStored` uses that
+exact private observation. `completeStored` repeats every current
 correlation/revision/ref/digest check before one guarded complete, retains completion
 intent and the exact receipt, and reuses only a matching validated retained Done.
 It accepts only a clean `exec_command` wrapper (exit `0`, no live session, complete
