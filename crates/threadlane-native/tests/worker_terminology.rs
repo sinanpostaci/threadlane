@@ -753,7 +753,14 @@ async fn operating_guide_and_startup_instructions_report_current_version_and_wor
     assert!(OPERATING_GUIDE_MARKDOWN.contains("cross-page continuity"));
     assert!(OPERATING_GUIDE_MARKDOWN.contains("new Function(bootstrap)"));
     assert!(OPERATING_GUIDE_MARKDOWN.contains("APPROVAL_ID"));
-    assert!(OPERATING_GUIDE_MARKDOWN.contains("const acceptance = ACCEPTANCE_CONTEXT"));
+    assert!(OPERATING_GUIDE_MARKDOWN.contains("const decision = REVIEW_DECISION;"));
+    assert!(OPERATING_GUIDE_MARKDOWN.contains("client.accept(decision)"));
+    assert!(OPERATING_GUIDE_MARKDOWN.contains("verdict: \"accept\""));
+    assert!(OPERATING_GUIDE_MARKDOWN
+        .contains("ORDINARY-WORKER-CLOSURE.md#legacy-completion-for-an-existing-read"));
+    let legacy_closure = include_str!("../../../docs/ORDINARY-WORKER-CLOSURE.md");
+    assert!(legacy_closure.contains("const acceptance = ACCEPTANCE_CONTEXT"));
+    assert!(legacy_closure.contains("client.complete(acceptance)"));
     assert!(!OPERATING_GUIDE_MARKDOWN.contains("<ACTUAL_"));
     let bad_recipe = ["text(", "await tools.exec_command"].concat();
     assert!(!OPERATING_GUIDE_MARKDOWN.contains(bad_recipe.as_str()));

@@ -283,7 +283,7 @@ repeat approval, or probe UI, readiness, or status.
 
 #### Legacy completion for an existing read
 
-For a read created before the ready adapter was retained, use the original explicit acceptance fields and the original verified completion recipe. Do not create or infer a missing read.
+For a read created before the ready adapter was retained, use the original verified completion recipe after independently reviewing its physical evidence. Bind `ACCEPTANCE_CONTEXT = {read_id, command_key, acceptance_note, acceptance_evidence}` to the returned read ID, a fresh key, your user-language note and actual evidence. The fresh key is 1–128 UTF-8 bytes without control characters or surrounding whitespace; note and evidence are nonblank, at most 2048 UTF-8 bytes each, and contain no NUL. Do not create or infer a missing read; reconcile unknown effects without retrying.
 
 ```js
 const acceptance = ACCEPTANCE_CONTEXT, index = acceptance && await load("threadlane/closure-read-index/" + acceptance.read_id), origin = index && index.origin;

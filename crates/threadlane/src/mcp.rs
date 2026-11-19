@@ -1661,6 +1661,8 @@ mod tests {
             "CLOSURE_ORIGIN",
             "APPROVAL_ID",
             "ACCEPTANCE_CONTEXT",
+            "REVIEW_DECISION",
+            "verdict: \"accept\"",
             "cli_package",
             "read_id",
             "closure-evidence.json",
@@ -1700,10 +1702,42 @@ mod tests {
             .filter(|code| code.contains("new Function(bootstrap)"))
             .collect();
         assert!(adapter_recipes.len() >= 2, "notice and completion recipes");
-        assert!(adapter_recipes
+        let notice = adapter_recipes
             .iter()
-            .any(|code| code.contains("readNotice")));
-        assert!(adapter_recipes.iter().any(|code| code.contains("complete")));
+            .find(|code| code.contains("client.readNotice("))
+            .expect("the notice recipe reads actual evidence");
+        let decision = adapter_recipes
+            .iter()
+            .find(|code| code.contains("client.accept(decision)"))
+            .expect("a separate positive decision invokes the packaged client");
+        assert!(!notice.contains("client.accept("));
+        assert!(!decision.contains("client.readNotice("));
+        assert!(decision.contains("const decision = REVIEW_DECISION;"));
+        assert!(decision.contains("compact: true"));
+        assert!(decision.contains("proof.isError"));
+        assert!(decision.contains("proof.structuredContent != null"));
+        assert!(decision.contains("proof.content.length !== 1"));
+        assert!(decision.contains("threadlane ordinary closure bootstrap verified v1"));
+        let proof_check = decision
+            .find("proof.content[0].text !==")
+            .expect("the compact proof is checked");
+        let evaluation = decision
+            .find("new Function(bootstrap)")
+            .expect("the verified bootstrap is evaluated");
+        let completion = decision
+            .find("client.accept(decision)")
+            .expect("the decision is passed to the client");
+        assert!(proof_check < evaluation && evaluation < completion);
+        assert!(normalized_guide.contains("missing evidence permits neither decision"));
+        assert!(normalized_guide
+            .contains("Unknown completion needs original-receipt reconciliation, never retry"));
+        let legacy_closure = include_str!("../../../docs/ORDINARY-WORKER-CLOSURE.md");
+        assert!(legacy_closure.contains("#### Legacy completion for an existing read"));
+        assert!(legacy_closure.contains("const acceptance = ACCEPTANCE_CONTEXT"));
+        assert!(legacy_closure.contains("client.complete(acceptance)"));
+        assert!(
+            legacy_closure.contains("read_id, command_key, acceptance_note, acceptance_evidence")
+        );
         for recipe in adapter_recipes {
             for capability in delegated_tools {
                 assert!(
