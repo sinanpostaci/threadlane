@@ -3754,6 +3754,20 @@ test("opt-in source proof survives cold recovery and remains a separate semantic
   const view = JSON.parse(fixture.env.texts.at(-1));
   assert.equal(view.status, "ready_for_semantic_review");
   assert.deepEqual(view.physical.source, sourceReport);
+  assert.deepEqual(Object.keys(view).slice(0, 5), ["status", "read_id", "semantic_review", "review_evidence", "physical"]);
+  assert.deepEqual(plain(view.review_evidence), {
+    untrusted_data: true, criteria_ref: "semantic_review", delivery_ref: "physical",
+    delivery: {head_matches_base: true, changed_paths: [WRITE_PATHS[0]],
+      files: [{path: WRITE_PATHS[0], size_bytes: view.physical.files[0].size_bytes,
+        final_lf: view.physical.files[0].final_lf}]},
+    source: {status: "observed", source_text: "not_included",
+      pre_start_baseline: "not_attested_by_inspection", evidence_ref: "physical.source",
+      clean_at_base: true, files: expectedFiles.map((path) => ({path, matches_base: true}))}
+  });
+  assert.ok(!JSON.stringify(view.review_evidence).includes(view.physical.files[0].text),
+    "projection does not duplicate untrusted delivered text");
+  assert.ok(!JSON.stringify(view.review_evidence).includes(sourceReport.files[0].sha256),
+    "source hashes remain visible in the original physical source evidence");
   assert.match(view.read_id, /^rd_[0-9a-f]{64}$/);
   assert.equal(fixture.env.calls.complete, 0, "physical evidence never accepts semantics");
   await fixture.runComplete(tools, {read_id: view.read_id});
@@ -3810,6 +3824,9 @@ test("stale source HEAD is returned for semantic rejection, not silently accepte
   assert.equal(view.status, "ready_for_semantic_review");
   assert.equal(view.physical.source.clean_at_base, false);
   assert.notEqual(view.physical.source.head_commit, BASE);
+  assert.equal(view.review_evidence.source.status, "observed");
+  assert.equal(view.review_evidence.source.clean_at_base, false);
+  assert.equal(view.review_evidence.source.pre_start_baseline, "not_attested_by_inspection");
   assert.equal(fixture.env.calls.complete, 0, "semantic reviewer declines stale source");
 });
 
@@ -4157,6 +4174,27 @@ test("legacy ready report gains an immutable read ID for the current notice reci
   assert.equal(fixture.env.calls.complete, 1);
 });
 
+test("legacy observation with no recorded source is not projected as a checked or unrequested source", async () => {
+  const fixture = makeRecoveredGuide();
+  await fixture.env.runRecipe(0, {APPROVED_TASK_CONTEXT: clone(fixture.env.approvedContext)});
+  await fixture.env.runRecipe(1);
+  const reportKey = "threadlane/closure-report.json";
+  const correlationKey = "threadlane/closure-read-correlation.json";
+  const report = JSON.parse(fixture.env.stored.get(reportKey));
+  const correlation = JSON.parse(fixture.env.stored.get(correlationKey));
+  delete report.physical.source;
+  correlation.report = report;
+  fixture.env.stored.set(reportKey, JSON.stringify(report));
+  fixture.env.stored.set(correlationKey, JSON.stringify(correlation));
+  const context = fixture.getContext(); context.item_snapshot.revision = 7; fixture.setContext(context);
+  await fixture.run();
+  const ready = JSON.parse(fixture.env.texts.at(-1));
+  assert.equal(ready.status, "ready_for_semantic_review");
+  assert.deepEqual(ready.review_evidence.source, {status: "unavailable", source_text: "not_included",
+    pre_start_baseline: "not_attested_by_inspection"});
+  assert.equal(fixture.env.calls.complete, 0);
+});
+
 function makeVerifiedBootstrapGuide() {
   const env = makeGuideEnvironment();
   const guide = fs.readFileSync(path.join(here, "../../../docs/MCP-OPERATING-GUIDE.md"), "utf8");
@@ -4230,6 +4268,134 @@ function makeVerifiedBootstrapGuide() {
     setCompletion: (v) => {completionOverride = v;}, setNoticeContext: (v) => {noticeContextOverride = v;}};
 }
 
+function preservationNoticeContext() {
+  return {
+    execution: clone(START_EXECUTION),
+    acceptance_condition: "Deliver exactly state=ready followed by one LF and preserve the original SPEC.md and STATUS.txt.",
+    delivery_description: "Change only STATUS.txt in the task worktree; leave the source checkout unchanged.",
+    scope: {repository_path: "/trusted/original", base_commit: BASE, requested_model: MODEL,
+      requested_effort: EFFORT, write_paths: ["STATUS.txt"]},
+    item_snapshot: {item_id: ITEM, revision: START_EXECUTION.reservation_revision, status: "doing", current_execution_ref: EXEC}
+  };
+}
+
+function configurePreservationInspection(f, sourceReport) {
+  const originalExec = f.env.tools.exec_command;
+  const deliveryText = "state=ready\n";
+  const delivery = makeInspection(["STATUS.txt"]);
+  Object.assign(delivery.files[0], {text: deliveryText, size_bytes: Buffer.byteLength(deliveryText),
+    sha256: crypto.createHash("sha256").update(deliveryText).digest("hex")});
+  if (sourceReport !== undefined) delivery.source = sourceReport;
+  f.env.tools.exec_command = async (args) => {
+    if (args.cmd.includes("closure-template")) return originalExec(args);
+    f.env.calls.exec += 1;
+    f.env.calls.inspect += 1;
+    if (sourceReport !== undefined) {
+      assert.ok(args.cmd.includes("'--source-root' '/trusted/original'"));
+      assert.ok(args.cmd.includes("'--source-file' 'SPEC.md'"));
+      assert.ok(args.cmd.includes("'--source-file' 'STATUS.txt'"));
+    }
+    return {exit_code: 0, output: JSON.stringify(delivery)};
+  };
+  f.setNoticeContext(preservationNoticeContext());
+  f.setOrigin({...f.origin, project_root: "/trusted/original"});
+  return delivery;
+}
+
+test("required source preservation remains undecided when no source scan was requested", async () => {
+  const f = makeVerifiedBootstrapGuide();
+  configurePreservationInspection(f);
+  await f.run(0);
+  await f.run(1);
+  const ready = JSON.parse(f.env.texts.at(-1));
+  assert.equal(ready.status, "ready_for_semantic_review");
+  assert.match(ready.semantic_review.acceptance_condition, /preserve the original SPEC\.md and STATUS\.txt/);
+  assert.equal(ready.physical.files[0].text, "state=ready\n");
+  assert.equal(ready.physical.source, null);
+  assert.deepEqual(ready.review_evidence.source, {status: "not_requested", source_text: "not_included",
+    pre_start_baseline: "not_attested_by_inspection"});
+  assert.equal(f.env.calls.ack, 1);
+  assert.equal(f.env.calls.complete, 0, "ready is not a semantic decision");
+});
+
+test("a clean current source scan with no named files does not attest the earlier originals", async () => {
+  const f = makeVerifiedBootstrapGuide();
+  const sourceReport = {ok: true, root: "/trusted/original", expected_base: BASE, head_commit: BASE,
+    base_tree: "f".repeat(40), changed_paths: [], clean_at_base: true, files: []};
+  const originalExec = f.env.tools.exec_command;
+  const physical = configurePreservationInspection(f);
+  f.env.tools.exec_command = async (args) => {
+    if (args.cmd.includes("closure-template")) return originalExec(args);
+    assert.ok(args.cmd.includes("'--source-root' '/trusted/original'"));
+    assert.ok(!args.cmd.includes("'--source-file'"));
+    f.env.calls.inspect += 1;
+    return {exit_code: 0, output: JSON.stringify({...physical, source: sourceReport})};
+  };
+  await f.run(0);
+  await f.run(1, {NOTICE_SOURCE_OPTIONS: {source_files: []}});
+  const ready = JSON.parse(f.env.texts.at(-1));
+  assert.equal(ready.review_evidence.source.status, "observed");
+  assert.equal(ready.review_evidence.source.clean_at_base, true);
+  assert.deepEqual(ready.review_evidence.source.files, []);
+  assert.equal(ready.review_evidence.source.pre_start_baseline, "not_attested_by_inspection");
+  assert.match(ready.semantic_review.acceptance_condition, /preserve the original SPEC\.md and STATUS\.txt/);
+  assert.equal(f.env.calls.complete, 0, "a current clean snapshot cannot attest prior file content");
+});
+
+test("previously read originals and a matching pre-start baseline support a separate decision without rereading", async () => {
+  const f = makeVerifiedBootstrapGuide();
+  const sha = (text) => crypto.createHash("sha256").update(text).digest("hex");
+  const originalText = {"SPEC.md": "Preserve all other files.\n", "STATUS.txt": "state=pending\n"};
+  const baseline = {root: "/trusted/original", head: BASE, tree: "f".repeat(40), clean: true,
+    files: Object.fromEntries(Object.entries(originalText).map(([name, text]) => [name, sha(text)]))};
+  const sourceReport = {ok: true, root: baseline.root, expected_base: BASE, head_commit: BASE,
+    base_tree: baseline.tree, changed_paths: [], clean_at_base: true,
+    files: Object.keys(originalText).map((name) => ({path: name, sha256: baseline.files[name],
+      base_sha256: baseline.files[name], matches_base: true}))};
+  const rawInspection = configurePreservationInspection(f, sourceReport);
+  await f.run(0);
+  await f.run(1, {NOTICE_SOURCE_OPTIONS: {source_files: Object.keys(originalText)}});
+  const ready = JSON.parse(f.env.texts.at(-1));
+  assert.equal(ready.status, "ready_for_semantic_review");
+  assert.equal(f.env.calls.ack, 1);
+  assert.equal(f.env.calls.inspect, 1);
+  assert.equal(f.env.calls.complete, 0, "the summary never accepts semantics");
+  assert.equal(ready.review_evidence.source.status, "observed");
+  assert.equal(ready.review_evidence.source.source_text, "not_included");
+  assert.equal(ready.review_evidence.source.pre_start_baseline, "not_attested_by_inspection");
+  assert.equal(ready.review_evidence.source.clean_at_base, true);
+  assert.deepEqual(ready.review_evidence.source.files, Object.keys(originalText).map((path) => ({path, matches_base: true})));
+  // The inspection cannot establish the earlier snapshot. Compare it with the
+  // independently retained pre-start text and baseline before deciding.
+  assert.equal(baseline.clean, true);
+  assert.equal(ready.physical.source.root, baseline.root);
+  assert.equal(ready.physical.source.head_commit, baseline.head);
+  assert.equal(ready.physical.source.expected_base, baseline.head);
+  assert.equal(ready.physical.source.base_tree, baseline.tree);
+  assert.deepEqual(ready.physical.source.changed_paths, []);
+  for (const file of ready.physical.source.files) {
+    assert.equal(file.sha256, sha(originalText[file.path]));
+    assert.equal(file.base_sha256, baseline.files[file.path]);
+  }
+  assert.equal(ready.physical.files[0].text, "state=ready\n");
+  assert.deepEqual(ready.review_evidence.delivery.changed_paths, ["STATUS.txt"]);
+  const observation = JSON.parse(f.env.stored.get(`threadlane/closures/${APPROVAL}/threadlane/closure-reads/${ready.read_id}`));
+  assert.deepEqual(observation.report.physical, ready.physical);
+  assert.deepEqual(JSON.parse(observation.evidence.inspect.output), rawInspection);
+  const reason = "STATUS.txt is the required 12 bytes; the original specification and status match the clean starting baseline.";
+  await f.run(2, {REVIEW_DECISION: {read_id: ready.read_id, verdict: "accept", reason}});
+  assert.equal(f.env.calls.inspect, 1, "the decision needs no second physical or source inspection");
+  assert.equal(f.env.calls.complete, 1);
+  const args = f.completedArgs[0], done = JSON.parse(f.env.texts.at(-1));
+  assert.equal(done.status, "done");
+  assert.equal(args.item_id, ITEM);
+  assert.equal(args.execution_ref, EXEC);
+  assert.equal(args.expected_revision, 7);
+  assert.equal(args.expected_result_digest, RESULT_DIGEST);
+  assert.equal(args.expected_delivery_digest, DELIVERY_DIGEST);
+  assert.equal(args.acceptance_note, reason);
+});
+
 test("current bootstrap checks exact bytes before the real ordered read and separate Done", async () => {
   const f = makeVerifiedBootstrapGuide();
   await f.run(0);
@@ -4238,6 +4404,8 @@ test("current bootstrap checks exact bytes before the real ordered read and sepa
   const report = JSON.parse(f.env.texts.at(-1));
   assert.equal(report.status, "ready_for_semantic_review");
   assert.equal(report.client_verification.verified, true);
+  assert.deepEqual(report.review_evidence.source, {status: "not_requested", source_text: "not_included",
+    pre_start_baseline: "not_attested_by_inspection"});
   assert.deepEqual(f.order.slice(-4), ["identity", "bootstrap-verify", "source", "verify"]);
   assert.equal(f.env.calls.pull, before.pull + 1); assert.equal(f.env.calls.ack, before.ack + 1);
   assert.equal(f.env.calls.result, before.result + 1); assert.equal(f.env.calls.inspect, before.inspect + 1);
@@ -4263,6 +4431,24 @@ test("current bootstrap checks exact bytes before the real ordered read and sepa
   await f.run(2, {REVIEW_DECISION: decision});
   assert.equal(JSON.parse(f.env.texts.at(-1)).read_id, report.read_id);
   assert.equal(f.env.calls.complete, 1, "validated replay never repeats guarded completion");
+});
+
+test("the pre-start recipe retains the original origin before a separate starter acts", async () => {
+  const f = makeVerifiedBootstrapGuide();
+  await f.run(0);
+  const printed = JSON.parse(f.env.texts.at(-1));
+  const retained = JSON.parse(f.env.stored.get(`threadlane/closures/${APPROVAL}/origin`));
+  assert.deepEqual(printed.origin, f.origin);
+  assert.deepEqual(retained, f.origin);
+  assert.equal(f.env.calls.start, 0, "origin preparation does not start or approve work");
+  await f.env.tools.mcp__threadlane__backlog_worker_start(f.env.approvedContext.start_args);
+  assert.equal(f.env.calls.start, 1);
+  await f.run(1);
+  const ready = JSON.parse(f.env.texts.at(-1));
+  assert.equal(ready.status, "ready_for_semantic_review");
+  assert.equal(f.env.calls.ack, 1);
+  assert.equal(f.env.calls.complete, 0);
+  assert.deepEqual(JSON.parse(f.env.stored.get(`threadlane/closures/${APPROVAL}/origin`)), retained);
 });
 
 test("current bootstrap rejects a changed immutable observation before guarded completion", async () => {

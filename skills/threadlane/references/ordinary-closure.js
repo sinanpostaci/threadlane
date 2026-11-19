@@ -609,6 +609,57 @@ function createOrdinaryClosureClient(callbacks) {
     return view;
   }
 
+  function reviewEvidence(physical) {
+    var canShowDelivery = isPlainObject(physical) &&
+      typeof physical.head_commit === "string" && /^[0-9a-f]{40}$/.test(physical.head_commit) &&
+      typeof physical.expected_base === "string" && /^[0-9a-f]{40}$/.test(physical.expected_base) &&
+      Array.isArray(physical.changed_paths) && physical.changed_paths.every(function (path) {
+        return isPlainObject(path) && typeof path.path === "string";
+      }) && Array.isArray(physical.files) && physical.files.every(function (file) {
+        return isPlainObject(file) && typeof file.path === "string" &&
+          isNonNegativeInteger(file.size_bytes) && typeof file.final_lf === "boolean";
+      });
+    var observedSource = isPlainObject(physical) && isPlainObject(physical.source) &&
+      typeof physical.source.clean_at_base === "boolean" && Array.isArray(physical.source.files) &&
+      physical.source.files.every(function (file) {
+        return isPlainObject(file) && typeof file.path === "string" && typeof file.matches_base === "boolean";
+      });
+    if (observedSource) {
+      try {
+        validateSourceInspection(physical.source, {root: physical.source.root,
+          files: physical.source.files.map(function (file) { return file.path; })}, physical.expected_base, {});
+      } catch (_error) {
+        observedSource = false;
+      }
+    }
+    var source = {
+      status: observedSource ? "observed" :
+        (isPlainObject(physical) && physical.source === null ? "not_requested" : "unavailable"),
+      source_text: "not_included",
+      pre_start_baseline: "not_attested_by_inspection"
+    };
+    if (observedSource) {
+      source.evidence_ref = "physical.source";
+      source.clean_at_base = physical.source.clean_at_base;
+      source.files = physical.source.files.map(function (file) {
+        return {path: file.path, matches_base: file.matches_base};
+      });
+    }
+    return {
+      untrusted_data: true,
+      criteria_ref: "semantic_review",
+      delivery_ref: "physical",
+      delivery: canShowDelivery ? {
+        head_matches_base: physical.head_commit === physical.expected_base,
+        changed_paths: physical.changed_paths.map(function (path) { return path.path; }),
+        files: physical.files.map(function (file) {
+          return {path: file.path, size_bytes: file.size_bytes, final_lf: file.final_lf};
+        })
+      } : {status: "unavailable"},
+      source: source
+    };
+  }
+
   async function retainObservation(input, start, report, evidence, semanticReview) {
     var observation = {schema_version: 1, input: input, start: start, report: report, evidence: evidence};
     if (semanticReview !== undefined) observation.semantic_review = semanticReview;
@@ -620,8 +671,20 @@ function createOrdinaryClosureClient(callbacks) {
       throw new Error("conflicting immutable closure observation");
     }
     if (previous === undefined || previous === null) await store(observationKey, observation);
-    var view = compactReport(report, input);
-    view.read_id = readId;
+    var compact = compactReport(report, input);
+    var view;
+    if (report.status === "ready_for_semantic_review" && semanticReview !== undefined) {
+      // Put the actual criteria and decision-facing facts first without repeating
+      // file text or replacing the complete existing physical/source fields.
+      view = {status: compact.status, read_id: readId, semantic_review: semanticReview,
+        review_evidence: reviewEvidence(report.physical), physical: compact.physical};
+      Object.keys(compact).forEach(function (key) {
+        if (!Object.prototype.hasOwnProperty.call(view, key)) view[key] = compact[key];
+      });
+    } else {
+      view = compact;
+      view.read_id = readId;
+    }
     return view;
   }
 
