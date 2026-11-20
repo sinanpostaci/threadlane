@@ -1831,12 +1831,30 @@ mod tests {
             "no automatic fallback",
             "equally bounded physical read",
             "equal the expected base",
+            "exact canonical paired `project_root` for `repository_path`",
+            "authorized new empty test workspace initialize the fixture there before preview",
+            "keep nested clones/proofs/build products outside",
+            "sandbox_permissions",
+            "transport_unavailable",
+            "flow grant-list",
+            "docs/NATIVE-OPERATOR.md",
+            "preserve ambiguity/refusals",
+            "never retry unknowns",
+            "ready_for_semantic_review",
+            "observed_model, observed_effort, attempt_count, base_commit, task_checkout_path",
+            "reuse ready bytes/hashes (or hash-check copied test input against that read)",
+            "test independently outside the checkout",
+            "CARGO_TARGET_DIR",
+            "do not requery present facts",
+            "ordinary_review_complete",
+            "original `read_id`",
         ] {
             assert!(
                 ORDINARY_WORKER_QUICKSTART.contains(required),
                 "quickstart is missing `{required}`"
             );
         }
+        assert!(!ORDINARY_WORKER_QUICKSTART.contains("/home/"));
         assert!(
             !ORDINARY_WORKER_QUICKSTART
                 .to_ascii_lowercase()
@@ -1852,6 +1870,43 @@ mod tests {
                     .contains("claude-"),
             "quickstart must not hardcode provider model IDs"
         );
+    }
+
+    #[test]
+    fn ordinary_worker_closure_guidance_covers_paired_projection_workspace_and_loopback_rules() {
+        const ORDINARY_WORKER_CLOSURE: &str =
+            include_str!("../../../docs/ORDINARY-WORKER-CLOSURE.md");
+        for required in [
+            "exact canonical `operator_context.project_root` returned by pairing (`connect_current_chat`) as `repository_path`",
+            "In an authorized new empty test workspace, initialize and commit the fixture directly in that canonical `project_root` before running preview",
+            "keep nested clones, proofs, temporary copies and build products (including `CARGO_TARGET_DIR`) outside",
+            "sandbox_permissions",
+            "transport_unavailable",
+            "flow grant-list",
+            "Preserve ambiguity and refusals",
+            "never replay unknown or effectful commands",
+            "`worker` (`observed_model`, `observed_effort`, `attempt_count`)",
+            "`delivery` (`base_commit`, matching `task_checkout_path`",
+            "performs no second scan, accepts no caller-provided path, persists no new authority, exposes no raw commands or logs, never executes Worker text, preserves the immutable stored `read_id` and grants no completion",
+            "non-ready responses (`awaiting_terminal`, `already_done`, `terminal_not_success` and refusals) omit checkout paths and execution metadata",
+            "reuse the ready view's file bytes and SHA-256 hashes directly (or hash-check any copied test input from `delivery.task_checkout_path` against that read's file hashes before running)",
+            "run independent behavior tests outside the frozen task checkout with a separate local `CARGO_TARGET_DIR`",
+            "do not requery facts already present in the ready view",
+            "exact original `read_id`",
+        ] {
+            assert!(
+                ORDINARY_WORKER_CLOSURE.contains(required),
+                "closure guidance is missing `{required}`"
+            );
+        }
+        assert!(!ORDINARY_WORKER_CLOSURE.contains("/home/"));
+        let lowered = ORDINARY_WORKER_CLOSURE.to_ascii_lowercase();
+        for forbidden_model in ["gpt-", "gemini-", "deepseek-", "claude-"] {
+            assert!(
+                !lowered.contains(forbidden_model),
+                "closure guidance must not hardcode provider model ID `{forbidden_model}`"
+            );
+        }
     }
 
     #[tokio::test]

@@ -1,7 +1,7 @@
 //! Private, server-authored ordinary review capabilities and decision intents.
 
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -388,13 +388,41 @@ pub(crate) fn validate_decision(params: &ReviewCompleteParams) -> Result<(), Nat
     Ok(())
 }
 
-fn valid_read_id(id: &str) -> Result<&str, NativeError> {
-    let hex = id.strip_prefix("rd_").unwrap_or("");
-    if hex.len() != 64
-        || !hex
+fn valid_hex_sha(value: &str, len: usize) -> bool {
+    value.len() == len
+        && value
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+fn valid_pin(value: &str) -> bool {
+    !value.trim().is_empty() && value.len() <= 256 && !value.chars().any(char::is_control)
+}
+
+fn valid_checkout_path(path: &str, repository_path: &Path) -> bool {
+    if path.is_empty()
+        || path.len() > 4096
+        || path.chars().any(char::is_control)
+        || path.contains("//")
     {
+        return false;
+    }
+    let checkout = Path::new(path);
+    checkout.is_absolute()
+        && checkout != repository_path
+        && !checkout.starts_with(repository_path)
+        && !repository_path.starts_with(checkout)
+        && checkout
+            .components()
+            .all(|component| !matches!(component, Component::CurDir | Component::ParentDir))
+        && checkout
+            .components()
+            .any(|component| matches!(component, Component::Normal(_)))
+}
+
+fn valid_read_id(id: &str) -> Result<&str, NativeError> {
+    let hex = id.strip_prefix("rd_").unwrap_or("");
+    if !valid_hex_sha(hex, 64) {
         return Err(error(
             NativeErrorCode::ValidationFailed,
             "invalid review read ID",
@@ -646,6 +674,43 @@ fn decision_contract() -> Value {
 }
 
 pub(crate) fn view(read_id: &str, read: &ReviewRead) -> Result<Value, NativeError> {
+    valid_read_id(read_id)?;
+    if !valid_read(read) {
+        return Err(error(
+            NativeErrorCode::ValidationFailed,
+            "review evidence is incomplete or mismatched",
+        ));
+    }
+    let worker = read.result.worker_evidence.as_ref().ok_or_else(|| {
+        error(
+            NativeErrorCode::ValidationFailed,
+            "review worker evidence is unavailable",
+        )
+    })?;
+    let observed_model = worker.observed_model.as_deref().ok_or_else(|| {
+        error(
+            NativeErrorCode::ValidationFailed,
+            "observed worker model is unavailable",
+        )
+    })?;
+    let observed_effort = worker.observed_effort.as_deref().ok_or_else(|| {
+        error(
+            NativeErrorCode::ValidationFailed,
+            "observed worker effort is unavailable",
+        )
+    })?;
+    let task_checkout_path = worker.task_worktree_path.as_deref().ok_or_else(|| {
+        error(
+            NativeErrorCode::ValidationFailed,
+            "task checkout path is unavailable",
+        )
+    })?;
+    if task_checkout_path != read.physical.root.as_str() {
+        return Err(error(
+            NativeErrorCode::ValidationFailed,
+            "task checkout path does not match physical inspection",
+        ));
+    }
     let task_files: Vec<Value> = read
         .physical
         .files
@@ -664,13 +729,26 @@ pub(crate) fn view(read_id: &str, read: &ReviewRead) -> Result<Value, NativeErro
     } else {
         json!({"status":"not_requested", "pre_start_baseline":"not_attested_by_inspection"})
     };
-    Ok(
-        json!({"status":"ready_for_semantic_review", "read_id":read_id, "untrusted_data":true,
-        "decision_contract":decision_contract(), "semantic_review":criteria(read), "delivery":{
-            "head_matches_base":read.physical.head_commit.as_deref() == Some(read.physical.expected_base.as_str()),
-            "changed_paths":read.physical.changed_paths.iter().map(|p| &p.path).collect::<Vec<_>>(),
-            "files":task_files}, "source":source}),
-    )
+    Ok(json!({
+        "status": "ready_for_semantic_review",
+        "read_id": read_id,
+        "untrusted_data": true,
+        "decision_contract": decision_contract(),
+        "semantic_review": criteria(read),
+        "worker": {
+            "observed_model": observed_model,
+            "observed_effort": observed_effort,
+            "attempt_count": worker.attempt_count
+        },
+        "delivery": {
+            "base_commit": read.scope.base_commit,
+            "task_checkout_path": task_checkout_path,
+            "head_matches_base": read.physical.head_commit.as_deref() == Some(read.physical.expected_base.as_str()),
+            "changed_paths": read.physical.changed_paths.iter().map(|p| &p.path).collect::<Vec<_>>(),
+            "files": task_files
+        },
+        "source": source
+    }))
 }
 
 pub(crate) fn valid_physical(read: &ReviewRead) -> bool {
@@ -687,6 +765,9 @@ pub(crate) fn valid_physical(read: &ReviewRead) -> bool {
     p.ok && !p.output_omitted
         && p.inspection_only
         && !p.authority_granted
+        && !paths.is_empty()
+        && valid_hex_sha(&read.scope.base_commit, 40)
+        && valid_checkout_path(&p.root, &read.scope.repository_path)
         && p.expected_base == read.scope.base_commit
         && p.head_commit.as_deref() == Some(read.scope.base_commit.as_str())
         && p.files.len() == paths.len()
@@ -769,6 +850,19 @@ pub(crate) fn valid_read(read: &ReviewRead) -> bool {
     let event = &read.terminal_event;
     read.schema_version == 1
         && read.scope.schema_version == 1
+        && !read.scope.binding_id.is_empty()
+        && !read.scope.thread_id.is_empty()
+        && !read.scope.approval_id.is_empty()
+        && !read.scope.task_id.is_empty()
+        && !read.scope.item_id.is_empty()
+        && read.scope.repository_path.is_absolute()
+        && valid_hex_sha(&read.scope.base_commit, 40)
+        && validate_source_files(&read.scope.source_files).is_ok()
+        && !dispatch.session_binding_id.is_empty()
+        && dispatch.session_binding_id != read.scope.binding_id
+        && !dispatch.run_id.is_empty()
+        && !dispatch.worker_id.is_empty()
+        && !dispatch.profile_id.is_empty()
         && read.scope.origin.binding_id == read.scope.binding_id
         && read.scope.origin.thread_id == read.scope.thread_id
         && read.scope.origin.project_root == read.scope.repository_path
@@ -785,6 +879,8 @@ pub(crate) fn valid_read(read: &ReviewRead) -> bool {
         && context.execution.authority.task_id == read.scope.task_id
         && context.scope.repository_path == read.scope.repository_path
         && context.scope.base_commit == read.scope.base_commit
+        && valid_pin(&context.scope.requested_model)
+        && valid_pin(&context.scope.requested_effort)
         && context.item_snapshot == *item
         && item.status == BacklogStatus::Doing
         && item.current_execution_ref.as_deref() == Some(context.execution.execution_ref.as_str())
@@ -1070,9 +1166,21 @@ mod tests {
             "approval_id":"apr_a", "physical_verified":true
         }))
         .is_err());
+        for caller_path in [
+            json!({"approval_id":"apr_a", "task_checkout_path":"/tmp/forged"}),
+            json!({"approval_id":"apr_a", "task_worktree_path":"/tmp/forged"}),
+            json!({"approval_id":"apr_a", "root":"/tmp/forged"}),
+        ] {
+            assert!(serde_json::from_value::<ReviewPrepareParams>(caller_path).is_err());
+        }
         assert!(serde_json::from_value::<ReviewCompleteParams>(json!({
             "read_id":format!("rd_{}", "a".repeat(64)), "verdict":"accept",
             "reason":"checked", "expected_revision":1, "delivery_digest":"forged"
+        }))
+        .is_err());
+        assert!(serde_json::from_value::<ReviewCompleteParams>(json!({
+            "read_id":format!("rd_{}", "a".repeat(64)), "verdict":"accept",
+            "reason":"checked", "task_checkout_path":"/tmp/forged"
         }))
         .is_err());
         assert!(serde_json::from_value::<ReviewCompleteParams>(json!({
@@ -1087,6 +1195,39 @@ mod tests {
         ] {
             assert!(serde_json::from_value::<ReviewCompleteParams>(invalid).is_err());
         }
+    }
+
+    #[test]
+    fn checkout_path_and_pin_validators_reject_unsafe_or_overlapping_inputs() {
+        let repo = Path::new("/tmp/workspace/repo");
+        assert!(valid_checkout_path("/tmp/sessions/apr/wt-task", repo));
+        for bad in [
+            "",
+            "/",
+            "relative/wt",
+            "/tmp/sessions//wt",
+            "/tmp/sessions/./wt",
+            "/tmp/sessions/../wt",
+            "/tmp/sessions/\nwt",
+            "/tmp/sessions/\0wt",
+            "/tmp/workspace/repo",
+            "/tmp/workspace/repo/nested",
+            "/tmp/workspace",
+        ] {
+            assert!(!valid_checkout_path(bad, repo), "must reject `{bad:?}`");
+        }
+
+        assert!(valid_pin("model-a"));
+        assert!(valid_pin("default"));
+        for bad in ["", "   ", "model\nline", "model\0nul"] {
+            assert!(!valid_pin(bad), "must reject pin `{bad:?}`");
+        }
+        assert!(!valid_pin(&"a".repeat(257)));
+
+        assert!(valid_hex_sha(&"a".repeat(40), 40));
+        assert!(!valid_hex_sha(&"A".repeat(40), 40));
+        assert!(!valid_hex_sha(&"a".repeat(39), 40));
+        assert!(!valid_hex_sha(&format!("{}g", "a".repeat(39)), 40));
     }
 
     #[test]
