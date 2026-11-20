@@ -1927,6 +1927,7 @@ async fn test_stale_callbacks_crash_recovery_unknown_and_shutdown_drop() {
                 head_commit: Some(repo.base_commit.clone()),
                 dropped_live_events: 0,
                 outcome: WorkerOutcomeSummary {
+                    evidence_failure: None,
                     provider_retry_high_water: None,
                     provider_health: None,
                     exit_code: Some(0),

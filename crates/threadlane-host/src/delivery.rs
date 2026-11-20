@@ -573,8 +573,7 @@ fn verify_delivery_context<'a>(
 
 fn successful_outcome(outcome: &WorkerOutcomeSummary) -> bool {
     outcome.acceptance_state == WorkerAcceptanceState::ReadyForReview
-        && !outcome.missing_model_evidence
-        && !outcome.missing_effort_evidence
+        && !outcome.model_or_effort_rejected()
         && !outcome.provider_error
         && !outcome.incomplete_cleanup
         && !outcome.rejected_by_diff_gate
@@ -1325,6 +1324,7 @@ mod tests {
             },
             progress: WorkerProgressSummary::default(),
             outcome: Some(WorkerOutcomeSummary {
+                evidence_failure: None,
                 provider_retry_high_water: None,
                 provider_health: None,
                 exit_code: Some(0),
@@ -1714,6 +1714,16 @@ mod tests {
                 .as_mut()
                 .expect("outcome")
                 .missing_model_evidence = true;
+        });
+        assert_rejected_with_snapshot(&fixture, |snapshot| {
+            snapshot
+                .worker
+                .as_mut()
+                .expect("worker")
+                .outcome
+                .as_mut()
+                .expect("outcome")
+                .evidence_failure = Some(threadlane_core::WorkerEvidenceFailure::ModelMismatch);
         });
         assert_rejected_with_snapshot(&fixture, |snapshot| {
             snapshot

@@ -28,6 +28,7 @@ fn sample_worktree_update(run_id: &str, worker_id: &str) -> WorkerWorktreeUpdate
 
 fn sample_ready_outcome() -> WorkerOutcomeSummary {
     WorkerOutcomeSummary {
+        evidence_failure: None,
         provider_retry_high_water: None,
         provider_health: None,
         exit_code: Some(0),
@@ -1253,6 +1254,7 @@ fn worker_bounded_progress_cap_secret_redaction_and_wire_budget_enforcement() {
         .collect();
 
     let outcome = WorkerOutcomeSummary {
+        evidence_failure: None,
         provider_retry_high_water: None,
         provider_health: None,
         exit_code: Some(1),

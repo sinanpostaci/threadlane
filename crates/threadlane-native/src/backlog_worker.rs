@@ -25,7 +25,7 @@ use threadlane_core::{
     WorkerBacklogAcceptanceRejection, WorkerBacklogAcceptanceRejectionReceipt,
     WorkerBacklogAuthority, WorkerBacklogCompletion, WorkerBacklogCompletionReceipt,
     WorkerBacklogDispatchReceipt, WorkerBacklogExecution, WorkerBacklogNoticeSnapshot,
-    WorkerBacklogOutcome, WorkerBacklogOutcomeReport, WorkerStatus,
+    WorkerBacklogOutcome, WorkerBacklogOutcomeReport, WorkerEvidenceFailure, WorkerStatus,
 };
 use threadlane_host::{
     ApprovedHostClient, DeliveryInspection, HostError, TaskExecutionStatus, TaskStateSnapshot,
@@ -2365,8 +2365,8 @@ fn worker_evidence_from_snapshot(
         cancelled: outcome.map(|outcome| outcome.cancelled),
         cancel_requested_before_completion: outcome
             .map(|outcome| outcome.cancel_requested_before_completion),
-        missing_model_evidence: outcome.map(|outcome| outcome.missing_model_evidence),
-        missing_effort_evidence: outcome.map(|outcome| outcome.missing_effort_evidence),
+        missing_model_evidence: outcome.map(|outcome| outcome.model_evidence_rejected()),
+        missing_effort_evidence: outcome.map(|outcome| outcome.effort_evidence_rejected()),
         provider_error: outcome.map(|outcome| outcome.provider_error),
         incomplete_cleanup: outcome.map(|outcome| outcome.incomplete_cleanup),
         rejected_by_diff_gate: outcome.map(|outcome| outcome.rejected_by_diff_gate),
@@ -2611,23 +2611,7 @@ fn failure_result_digest(
         head_commit: worker.worktree.head_commit.as_deref(),
         worker_status: worker.status,
         task_status: snapshot.status,
-        outcome: outcome.map(|outcome| FailureOutcomeEncoding {
-            acceptance_state: outcome.acceptance_state,
-            exit_code: outcome.exit_code,
-            signal: outcome.signal,
-            timed_out: outcome.timed_out,
-            cancelled: outcome.cancelled,
-            cancel_requested_before_completion: outcome.cancel_requested_before_completion,
-            missing_model_evidence: outcome.missing_model_evidence,
-            missing_effort_evidence: outcome.missing_effort_evidence,
-            provider_error: outcome.provider_error,
-            incomplete_cleanup: outcome.incomplete_cleanup,
-            rejected_by_diff_gate: outcome.rejected_by_diff_gate,
-            stdout_truncated: outcome.stdout_truncated,
-            stderr_truncated: outcome.stderr_truncated,
-            changed_paths_count: outcome.changed_paths_count,
-            violation_count: outcome.violation_count,
-        }),
+        outcome: outcome.map(FailureOutcomeEncoding::from),
     };
     let bytes = serde_json::to_vec(&encoding).map_err(|_| {
         WorkerBacklogError::new(
@@ -2644,6 +2628,7 @@ fn failure_result_digest(
 /// persisted outcome note or blocked reason.
 #[derive(Clone, Copy, Default)]
 struct FailureNoteEvidence {
+    evidence_failure: Option<WorkerEvidenceFailure>,
     timed_out: bool,
     cancelled: bool,
     rejected_by_diff_gate: bool,
@@ -2671,6 +2656,7 @@ impl FailureNoteEvidence {
         }
         let outcome = worker.outcome.as_ref();
         Ok(Self {
+            evidence_failure: outcome.and_then(|outcome| outcome.evidence_failure),
             timed_out: outcome.is_some_and(|outcome| outcome.timed_out),
             cancelled: outcome.is_some_and(|outcome| outcome.cancelled),
             rejected_by_diff_gate: outcome.is_some_and(|outcome| outcome.rejected_by_diff_gate),
@@ -2702,10 +2688,19 @@ fn failure_note_for(status: TaskExecutionStatus, evidence: FailureNoteEvidence) 
                 "verified worker cancellation"
             } else if evidence.rejected_by_diff_gate {
                 "verified worker diff scope rejection"
+            } else if let Some(reason) = evidence.evidence_failure {
+                match reason {
+                    WorkerEvidenceFailure::MissingModel => "verified worker missing model evidence",
+                    WorkerEvidenceFailure::ModelMismatch => "verified worker model mismatch",
+                    WorkerEvidenceFailure::MissingEffort => {
+                        "verified worker missing effort evidence"
+                    }
+                    WorkerEvidenceFailure::EffortMismatch => "verified worker effort mismatch",
+                }
             } else if evidence.missing_model_evidence {
-                "verified worker missing model evidence"
+                "worker model evidence unverified"
             } else if evidence.missing_effort_evidence {
-                "verified worker missing effort evidence"
+                "worker effort evidence unverified"
             } else if evidence.incomplete_cleanup {
                 "verified worker cleanup incomplete"
             } else if evidence.exit_code.is_some_and(|code| code != 0) {
@@ -2754,6 +2749,8 @@ struct FailureResultEncoding<'a> {
 
 #[derive(Serialize)]
 struct FailureOutcomeEncoding {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    evidence_failure: Option<WorkerEvidenceFailure>,
     acceptance_state: WorkerAcceptanceState,
     exit_code: Option<i32>,
     signal: Option<i32>,
@@ -2769,6 +2766,29 @@ struct FailureOutcomeEncoding {
     stderr_truncated: bool,
     changed_paths_count: u32,
     violation_count: u32,
+}
+
+impl From<&threadlane_core::WorkerOutcomeSummary> for FailureOutcomeEncoding {
+    fn from(outcome: &threadlane_core::WorkerOutcomeSummary) -> Self {
+        Self {
+            evidence_failure: outcome.evidence_failure,
+            acceptance_state: outcome.acceptance_state,
+            exit_code: outcome.exit_code,
+            signal: outcome.signal,
+            timed_out: outcome.timed_out,
+            cancelled: outcome.cancelled,
+            cancel_requested_before_completion: outcome.cancel_requested_before_completion,
+            missing_model_evidence: outcome.missing_model_evidence,
+            missing_effort_evidence: outcome.missing_effort_evidence,
+            provider_error: outcome.provider_error,
+            incomplete_cleanup: outcome.incomplete_cleanup,
+            rejected_by_diff_gate: outcome.rejected_by_diff_gate,
+            stdout_truncated: outcome.stdout_truncated,
+            stderr_truncated: outcome.stderr_truncated,
+            changed_paths_count: outcome.changed_paths_count,
+            violation_count: outcome.violation_count,
+        }
+    }
 }
 
 fn is_missing_host_session(error: &HostError) -> bool {
@@ -2980,24 +3000,159 @@ mod tests {
         assert!(encoded.get("worker_evidence").is_none());
     }
 
+    fn failed_snapshot(
+        verdict: Option<&str>,
+        model_flag: bool,
+        effort_flag: bool,
+    ) -> TaskStateSnapshot {
+        let mut wire = json!({
+            "exit_code": 0, "timed_out": false, "cancelled": false,
+            "cancel_requested_before_completion": false, "provider_error": false,
+            "missing_model_evidence": model_flag, "missing_effort_evidence": effort_flag,
+            "incomplete_cleanup": false, "rejected_by_diff_gate": false,
+            "stdout_truncated": false, "stderr_truncated": false,
+            "acceptance_state": "execution_failed", "changed_paths_count": 0,
+            "changed_paths_preview": [], "violation_count": 0, "violation_summaries": [],
+            "failure_reason": "arbitrary text about a model mismatch"
+        });
+        if let Some(verdict) = verdict {
+            wire["evidence_failure"] = json!(verdict);
+        }
+        let mut snapshot = task_snapshot_with_worker(Some(wire));
+        snapshot.status = TaskExecutionStatus::Failed;
+        let worker = snapshot.worker.as_mut().unwrap();
+        worker.status = threadlane_core::WorkerStatus::Failed;
+        // A conflict may include the requested value; aliases may look different.
+        worker.observed_model = Some("display-alias".into());
+        worker.observed_effort = Some(worker.requested_effort.clone());
+        snapshot
+    }
+
     #[test]
-    fn failure_notes_distinguish_structured_terminal_categories() {
+    fn failure_notes_preserve_exact_verdict_without_guessing_from_identifiers() {
         let cases = [
             (
+                Some("model_mismatch"),
+                true,
+                true,
+                "verified worker model mismatch",
+            ),
+            (
+                Some("effort_mismatch"),
+                false,
+                true,
+                "verified worker effort mismatch",
+            ),
+            (
+                Some("missing_model"),
+                true,
+                false,
+                "verified worker missing model evidence",
+            ),
+            (
+                Some("missing_effort"),
+                false,
+                true,
+                "verified worker missing effort evidence",
+            ),
+            (None, true, false, "worker model evidence unverified"),
+            (None, false, true, "worker effort evidence unverified"),
+            (None, false, false, "verified worker terminal failure"),
+        ];
+        for (verdict, model_flag, effort_flag, expected) in cases {
+            let snapshot = failed_snapshot(verdict, model_flag, effort_flag);
+            assert_eq!(super::failure_outcome_note(&snapshot).unwrap(), expected);
+            let outcome = snapshot.worker.unwrap().outcome.unwrap();
+            let stored = serde_json::to_value(&outcome).unwrap();
+            let encoded =
+                serde_json::to_value(super::FailureOutcomeEncoding::from(&outcome)).unwrap();
+            let expected_field = verdict.map(|value| json!(value));
+            assert_eq!(stored.get("evidence_failure"), expected_field.as_ref());
+            assert_eq!(encoded.get("evidence_failure"), expected_field.as_ref());
+        }
+    }
+
+    #[test]
+    fn legacy_failure_digest_input_preserves_order_and_bytes() {
+        let snapshot = failed_snapshot(None, false, false);
+        let outcome = snapshot.worker.unwrap().outcome.unwrap();
+        let encoded = super::FailureOutcomeEncoding::from(&outcome);
+        // The v1 digest is over ordered JSON bytes, including explicit nulls.
+        assert_eq!(
+            serde_json::to_string(&encoded).unwrap(),
+            concat!(
+                r#"{"acceptance_state":"execution_failed","exit_code":0,"signal":null,"#,
+                r#""timed_out":false,"cancelled":false,"cancel_requested_before_completion":false,"#,
+                r#""missing_model_evidence":false,"missing_effort_evidence":false,"#,
+                r#""provider_error":false,"incomplete_cleanup":false,"rejected_by_diff_gate":false,"#,
+                r#""stdout_truncated":false,"stderr_truncated":false,"changed_paths_count":0,"violation_count":0}"#,
+            )
+        );
+    }
+
+    #[test]
+    fn typed_rejection_blocks_review_with_clear_legacy_flags() {
+        for (verdict, reject_model) in [
+            ("missing_model", true),
+            ("model_mismatch", true),
+            ("missing_effort", false),
+            ("effort_mismatch", false),
+        ] {
+            let mut snapshot = failed_snapshot(Some(verdict), false, false);
+            let completed = snapshot.worker.as_mut().unwrap();
+            completed.status = threadlane_core::WorkerStatus::Completed;
+            completed.outcome.as_mut().unwrap().acceptance_state =
+                threadlane_core::WorkerAcceptanceState::ReadyForReview;
+            assert_eq!(
+                TaskExecutionStatus::from_worker_snapshot(completed),
+                TaskExecutionStatus::Failed
+            );
+            let projected = worker_evidence_from_snapshot(&snapshot).unwrap();
+            assert_eq!(projected.missing_model_evidence, Some(reject_model));
+            assert_eq!(projected.missing_effort_evidence, Some(!reject_model));
+        }
+    }
+
+    #[test]
+    fn failure_notes_distinguish_structured_terminal_categories() {
+        let conflicting_evidence = FailureNoteEvidence {
+            evidence_failure: Some(super::WorkerEvidenceFailure::EffortMismatch),
+            ..FailureNoteEvidence::default()
+        };
+        let cases = [
+            (
+                TaskExecutionStatus::Failed,
+                FailureNoteEvidence {
+                    timed_out: true,
+                    cancelled: true,
+                    ..conflicting_evidence
+                },
+                "verified worker timeout",
+            ),
+            (
+                TaskExecutionStatus::Failed,
+                FailureNoteEvidence {
+                    cancelled: true,
+                    rejected_by_diff_gate: true,
+                    ..conflicting_evidence
+                },
+                "verified worker cancellation",
+            ),
+            (
                 TaskExecutionStatus::TimedOut,
-                FailureNoteEvidence::default(),
+                conflicting_evidence,
                 "verified worker timeout",
             ),
             (
                 TaskExecutionStatus::Cancelled,
-                FailureNoteEvidence::default(),
+                conflicting_evidence,
                 "verified worker cancellation",
             ),
             (
                 TaskExecutionStatus::Failed,
                 FailureNoteEvidence {
                     rejected_by_diff_gate: true,
-                    ..FailureNoteEvidence::default()
+                    ..conflicting_evidence
                 },
                 "verified worker diff scope rejection",
             ),
@@ -3007,7 +3162,7 @@ mod tests {
                     missing_model_evidence: true,
                     ..FailureNoteEvidence::default()
                 },
-                "verified worker missing model evidence",
+                "worker model evidence unverified",
             ),
             (
                 TaskExecutionStatus::Failed,
@@ -3015,7 +3170,7 @@ mod tests {
                     missing_effort_evidence: true,
                     ..FailureNoteEvidence::default()
                 },
-                "verified worker missing effort evidence",
+                "worker effort evidence unverified",
             ),
             (
                 TaskExecutionStatus::Failed,

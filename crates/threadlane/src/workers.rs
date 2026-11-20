@@ -6,10 +6,11 @@ use std::path::{Component, Path, PathBuf};
 use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
 use threadlane_core::{
-    WorkerAcceptanceState, WorkerClaim, WorkerCompletionRecord, WorkerExecutionBinding,
-    WorkerOutcomeSummary, WorkerProgressUpdate, WorkerStatus, WorkerWorktreeUpdate, MAX_ID_LEN,
-    MAX_WORKER_CHANGED_PATHS_PREVIEW, MAX_WORKER_DIGEST_LEN, MAX_WORKER_PATH_BYTES,
-    MAX_WORKER_PROFILE_ID_LEN, MAX_WORKER_SUMMARY_TEXT_BYTES, MAX_WORKER_VIOLATION_SUMMARIES,
+    WorkerAcceptanceState, WorkerClaim, WorkerCompletionRecord, WorkerEvidenceFailure,
+    WorkerExecutionBinding, WorkerOutcomeSummary, WorkerProgressUpdate, WorkerStatus,
+    WorkerWorktreeUpdate, MAX_ID_LEN, MAX_WORKER_CHANGED_PATHS_PREVIEW, MAX_WORKER_DIGEST_LEN,
+    MAX_WORKER_PATH_BYTES, MAX_WORKER_PROFILE_ID_LEN, MAX_WORKER_SUMMARY_TEXT_BYTES,
+    MAX_WORKER_VIOLATION_SUMMARIES,
 };
 use threadlane_workers::git::{
     execute_worker_task_with_process_observer, resolve_allowed_write_scopes_at_base,
@@ -23,10 +24,10 @@ pub use threadlane_workers::{
 };
 use threadlane_workers::{
     sanitize_and_redact, validate_absolute_no_symlink_components, validate_simple_identifier,
-    ExecutionBudgets, NormalizedEventKind, NormalizedWorkerEvent, OutputOverflowKind,
-    OwnedProcessObserver, ResolvedModelTarget, TaskExecutionReport, WorkAcceptanceState,
-    WorkerError, WorkerExecutionReport, WorkerProvider, WorkerRunStatus, WorkerSpec,
-    WorktreeManager,
+    ExecutionBudgets, FieldEvidence, NormalizedEventKind, NormalizedWorkerEvent,
+    OutputOverflowKind, OwnedProcessObserver, ResolvedModelTarget, TaskExecutionReport,
+    WorkAcceptanceState, WorkerError, WorkerExecutionReport, WorkerProvider, WorkerRunStatus,
+    WorkerSpec, WorktreeManager,
 };
 use tokio::sync::{mpsc, watch};
 
@@ -1513,6 +1514,7 @@ pub(crate) fn build_pre_spawn_cancelled_completion(
         head_commit: worktree_update.map(|u| u.base_commit.clone()),
         dropped_live_events: 0,
         outcome: WorkerOutcomeSummary {
+            evidence_failure: None,
             provider_retry_high_water: None,
             provider_health: None,
             exit_code: None,
@@ -1628,6 +1630,20 @@ fn build_completion_from_report(
         .effective_observed_effort()
         .and_then(sanitize_observed_identifier);
 
+    let evidence_failure = match worker_report.status {
+        WorkerRunStatus::MissingModelEvidence => Some(WorkerEvidenceFailure::MissingModel),
+        WorkerRunStatus::ModelMismatch => Some(WorkerEvidenceFailure::ModelMismatch),
+        WorkerRunStatus::MissingEffortEvidence => Some(WorkerEvidenceFailure::MissingEffort),
+        WorkerRunStatus::EffortMismatch => Some(WorkerEvidenceFailure::EffortMismatch),
+        _ => match (
+            &worker_report.evidence.model_evidence,
+            &worker_report.evidence.effort_evidence,
+        ) {
+            (FieldEvidence::Mismatch { .. }, _) => Some(WorkerEvidenceFailure::ModelMismatch),
+            (_, FieldEvidence::Mismatch { .. }) => Some(WorkerEvidenceFailure::EffortMismatch),
+            _ => None,
+        },
+    };
     let missing_model_evidence = !worker_report.has_satisfied_model_evidence()
         || matches!(
             worker_report.status,
@@ -1723,6 +1739,7 @@ fn build_completion_from_report(
         head_commit,
         dropped_live_events,
         outcome: WorkerOutcomeSummary {
+            evidence_failure,
             provider_retry_high_water: provider_health.as_ref().and_then(|_| {
                 worker_report
                     .provider_health
@@ -1774,6 +1791,7 @@ fn build_completion_from_error(
         head_commit: None,
         dropped_live_events: 0,
         outcome: WorkerOutcomeSummary {
+            evidence_failure: None,
             provider_retry_high_water: None,
             provider_health: None,
             exit_code: None,
@@ -2011,8 +2029,8 @@ mod tests {
     use super::*;
     use threadlane_core::{Command, Core};
     use threadlane_workers::{
-        DiffGateReport, FieldEvidence, IsolationLevel, OpenCodeMetadataEvidence,
-        StreamEvidenceSummary, WorktreeKind, WorktreeManifest, MANIFEST_SCHEMA_VERSION,
+        DiffGateReport, IsolationLevel, OpenCodeMetadataEvidence, StreamEvidenceSummary,
+        WorktreeKind, WorktreeManifest, MANIFEST_SCHEMA_VERSION,
     };
 
     fn sample_opencode_task_report(workdir: &Path) -> TaskExecutionReport {
@@ -2209,6 +2227,9 @@ mod tests {
             .expect("record_worker_outcome");
         assert_eq!(snapshot.status, WorkerStatus::Completed);
         let serialized_snapshot = serde_json::to_value(&snapshot).expect("serialize snapshot");
+        assert!(serialized_snapshot["outcome"]
+            .get("evidence_failure")
+            .is_none());
         assert!(
             serialized_snapshot.get("accepted").is_none(),
             "WorkerSnapshot must not fabricate a top-level accepted field"
@@ -2285,6 +2306,10 @@ mod tests {
         let serialized_conflict =
             serde_json::to_value(&conflict_snapshot).expect("serialize conflict snapshot");
         assert!(serialized_conflict.get("accepted").is_none());
+        assert_eq!(
+            serialized_conflict["outcome"]["evidence_failure"],
+            "model_mismatch"
+        );
         assert_eq!(
             conflict_snapshot.outcome.expect("outcome").acceptance_state,
             WorkerAcceptanceState::ExecutionFailed
@@ -2533,6 +2558,9 @@ mod tests {
                 completion.outcome.missing_effort_evidence,
                 expect_missing_effort
             );
+            let encoded =
+                serde_json::to_value(&completion.outcome).expect("encode rejected evidence");
+            assert_eq!(encoded["evidence_failure"], err_code);
             let reason = completion
                 .outcome
                 .failure_reason

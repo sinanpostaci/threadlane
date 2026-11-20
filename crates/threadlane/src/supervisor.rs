@@ -2675,6 +2675,7 @@ mod tests {
                     head_commit: Some("2".repeat(40)),
                     dropped_live_events: 0,
                     outcome: WorkerOutcomeSummary {
+                        evidence_failure: None,
                         provider_retry_high_water: None,
                         provider_health: None,
                         exit_code: Some(0),
@@ -3457,6 +3458,7 @@ mod tests {
                         head_commit: None,
                         dropped_live_events: 0,
                         outcome: WorkerOutcomeSummary {
+                            evidence_failure: None,
                             provider_retry_high_water: None,
                             provider_health: None,
                             exit_code: None,

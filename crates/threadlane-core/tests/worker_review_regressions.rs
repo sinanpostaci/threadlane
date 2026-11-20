@@ -41,6 +41,7 @@ fn terminal_worker_evidence_stays_readable_with_admitted_escaped_instruction_and
         .map(|i| format!("src/{}/{}/file-{i}.rs", "\"".repeat(240), "\"".repeat(240)))
         .collect();
     let outcome = WorkerOutcomeSummary {
+        evidence_failure: None,
         provider_retry_high_water: None,
         provider_health: None,
         exit_code: Some(1),

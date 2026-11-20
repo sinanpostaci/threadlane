@@ -300,8 +300,7 @@ fn project_task_lifecycle_with_mode(
     };
 
     if outcome.acceptance_state != WorkerAcceptanceState::ReadyForReview
-        || outcome.missing_model_evidence
-        || outcome.missing_effort_evidence
+        || outcome.model_or_effort_rejected()
         || outcome.provider_error
         || outcome.incomplete_cleanup
         || outcome.rejected_by_diff_gate

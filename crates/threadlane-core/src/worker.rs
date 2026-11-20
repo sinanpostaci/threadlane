@@ -458,11 +458,28 @@ pub struct WorkerProgressSummary {
     pub watchdog_attention: Option<WorkerProgressWatchdogSnapshot>,
 }
 
+/// Exact model or effort failure classified by the process supervisor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerEvidenceFailure {
+    /// The required model evidence was absent.
+    MissingModel,
+    /// A model observation disagreed with the request or another observation.
+    ModelMismatch,
+    /// The required effort evidence was absent.
+    MissingEffort,
+    /// An effort observation disagreed with the request or another observation.
+    EffortMismatch,
+}
+
 /// Compact, bounded terminal outcome evidence for a worker attempt.
 ///
 /// Contains no raw stdout, raw prompts, argv, or credentials. No `accepted` boolean is ever set.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerOutcomeSummary {
+    /// Exact software-classified failure when available. Legacy flags only indicate a failed check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_failure: Option<WorkerEvidenceFailure>,
     /// Highest retry ordinal reported by unverified diagnostic text, distinct from record count.
     /// Absent means unknown, never zero dispatch attempts or proven healthy transport.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -512,6 +529,31 @@ pub struct WorkerOutcomeSummary {
     pub failure_reason: Option<String>,
     /// Optional identifier of a private finite-size local report artifact stored outside MCP responses.
     pub report_artifact_id: Option<String>,
+}
+
+impl WorkerOutcomeSummary {
+    /// Whether model verification failed according to the legacy flag or exact verdict.
+    pub fn model_evidence_rejected(&self) -> bool {
+        self.missing_model_evidence
+            || matches!(
+                self.evidence_failure,
+                Some(WorkerEvidenceFailure::MissingModel | WorkerEvidenceFailure::ModelMismatch)
+            )
+    }
+
+    /// Whether effort verification failed according to the legacy flag or exact verdict.
+    pub fn effort_evidence_rejected(&self) -> bool {
+        self.missing_effort_evidence
+            || matches!(
+                self.evidence_failure,
+                Some(WorkerEvidenceFailure::MissingEffort | WorkerEvidenceFailure::EffortMismatch)
+            )
+    }
+
+    /// Whether the summary records any rejection of the model or effort evidence.
+    pub fn model_or_effort_rejected(&self) -> bool {
+        self.model_evidence_rejected() || self.effort_evidence_rejected()
+    }
 }
 
 /// Compact durable snapshot of a worker execution record (`start_worker`, `get_worker`, `cancel_worker`).
@@ -1195,6 +1237,7 @@ impl Core {
         }
 
         let outcome = WorkerOutcomeSummary {
+            evidence_failure: None,
             provider_retry_high_water: None,
             provider_health: None,
             exit_code: None,
@@ -1630,8 +1673,7 @@ impl Core {
                     && !outcome.incomplete_cleanup
                     && !outcome.stdout_truncated
                     && !outcome.stderr_truncated
-                    && !outcome.missing_model_evidence
-                    && !outcome.missing_effort_evidence);
+                    && !outcome.model_or_effort_rejected());
             if duration_consistent && recovery_consistent {
                 match merge_provider_health(
                     &mut progress.provider_health,
@@ -1837,6 +1879,7 @@ impl Core {
                 || worker.cancel_requested_at_ms.is_some();
 
             let outcome = WorkerOutcomeSummary {
+                evidence_failure: None,
                 provider_retry_high_water: None,
                 provider_health: None,
                 exit_code: None,
@@ -2189,6 +2232,7 @@ impl Core {
         if worker.status == WorkerStatus::Queued && worker.claim_id.is_none() {
             // Unclaimed queued worker has no external process or worktree: transition directly to Cancelled.
             let outcome = WorkerOutcomeSummary {
+                evidence_failure: None,
                 provider_retry_high_water: None,
                 provider_health: None,
                 exit_code: None,

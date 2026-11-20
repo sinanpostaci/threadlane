@@ -109,15 +109,10 @@ impl TaskSummary {
     /// Constructs a [`TaskSummary`] from a durable [`WorkerSnapshot`], enforcing the invariant
     /// that missing model or effort evidence keeps the status as `failed`.
     pub fn from_worker(worker: &WorkerSnapshot) -> Self {
-        let missing_model = worker
+        let needs_evidence = worker
             .outcome
             .as_ref()
-            .is_some_and(|o| o.missing_model_evidence);
-        let missing_effort = worker
-            .outcome
-            .as_ref()
-            .is_some_and(|o| o.missing_effort_evidence);
-        let needs_evidence = missing_model || missing_effort;
+            .is_some_and(|o| o.model_or_effort_rejected());
 
         let effective_status = if needs_evidence && worker.status == WorkerStatus::Completed {
             WorkerStatus::Failed
@@ -296,11 +291,11 @@ impl RunDetail {
         let missing_model_evidence = worker
             .outcome
             .as_ref()
-            .is_some_and(|o| o.missing_model_evidence);
+            .is_some_and(|o| o.model_evidence_rejected());
         let missing_effort_evidence = worker
             .outcome
             .as_ref()
-            .is_some_and(|o| o.missing_effort_evidence);
+            .is_some_and(|o| o.effort_evidence_rejected());
         let needs_evidence = missing_model_evidence || missing_effort_evidence;
 
         let task = TaskSummary::from_worker(worker);

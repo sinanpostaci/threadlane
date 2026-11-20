@@ -1628,8 +1628,7 @@ fn worker_satisfies_ready_for_review_contract(
     };
 
     if outcome.acceptance_state != WorkerAcceptanceState::ReadyForReview
-        || outcome.missing_model_evidence
-        || outcome.missing_effort_evidence
+        || outcome.model_or_effort_rejected()
         || outcome.provider_error
         || outcome.incomplete_cleanup
         || outcome.rejected_by_diff_gate
@@ -2632,6 +2631,7 @@ mod tests {
                 head_commit: Some("d".repeat(40)),
                 dropped_live_events: 0,
                 outcome: WorkerOutcomeSummary {
+                    evidence_failure: None,
                     provider_retry_high_water: None,
                     provider_health: None,
                     exit_code: Some(0),

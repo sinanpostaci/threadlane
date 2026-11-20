@@ -241,6 +241,7 @@ fn completion(
         head_commit: None,
         dropped_live_events: 97,
         outcome: WorkerOutcomeSummary {
+            evidence_failure: None,
             provider_retry_high_water: snapshot.as_ref().map(|_| 7),
             provider_health: snapshot,
             exit_code: Some(if status == WorkerStatus::Completed {

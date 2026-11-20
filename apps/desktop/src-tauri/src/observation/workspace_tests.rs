@@ -1084,6 +1084,7 @@ mod unix_workspace_tests {
                 head_commit,
                 dropped_live_events: 0,
                 outcome: WorkerOutcomeSummary {
+                    evidence_failure: None,
                     provider_retry_high_water: None,
                     provider_health: None,
                     exit_code,

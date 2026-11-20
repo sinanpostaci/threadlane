@@ -552,6 +552,36 @@ fn idle_wakeup(binding_id: &str, thread_uuid: &str) -> WakeupNotice {
     }
 }
 
+#[test]
+fn typed_rejection_prevents_completed_desktop_status_with_clear_legacy_flags() {
+    use threadlane_core::WorkerEvidenceFailure::*;
+    use threadlane_desktop_bridge::{DemoControls, RunDetail, TaskSummary};
+    for (verdict, reject_model) in [
+        (MissingModel, true),
+        (ModelMismatch, true),
+        (MissingEffort, false),
+        (EffortMismatch, false),
+    ] {
+        let mut worker = sample_worker_snapshot(
+            "binding",
+            "run",
+            WorkerStatus::Completed,
+            WorkerAcceptanceState::ReadyForReview,
+            false,
+            false,
+        );
+        worker.outcome.as_mut().unwrap().evidence_failure = Some(verdict);
+        let summary = TaskSummary::from_worker(&worker);
+        assert!(summary.needs_evidence);
+        assert_eq!(summary.status, "failed");
+        let detail = RunDetail::from_worker(&worker, DemoControls::default());
+        assert_eq!(detail.task, summary);
+        assert_eq!(detail.acceptance_state.as_deref(), Some("execution_failed"));
+        assert_eq!(detail.missing_model_evidence, reject_model);
+        assert_eq!(detail.missing_effort_evidence, !reject_model);
+    }
+}
+
 fn sample_worker_snapshot(
     binding_id: &str,
     run_id: &str,
@@ -610,6 +640,7 @@ fn sample_worker_snapshot(
             last_event_at_ms: Some(1_700_000_000_500),
         },
         outcome: Some(WorkerOutcomeSummary {
+            evidence_failure: None,
             provider_retry_high_water: None,
             provider_health: None,
             exit_code: Some(0),

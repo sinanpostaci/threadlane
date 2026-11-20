@@ -78,6 +78,7 @@ fn sample_worktree_update(run_id: &str, worker_id: &str) -> WorkerWorktreeUpdate
 
 fn sample_ready_outcome() -> WorkerOutcomeSummary {
     WorkerOutcomeSummary {
+        evidence_failure: None,
         provider_retry_high_water: None,
         provider_health: None,
         exit_code: Some(0),

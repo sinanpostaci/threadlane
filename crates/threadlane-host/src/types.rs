@@ -1179,15 +1179,13 @@ impl TaskExecutionStatus {
             WorkerStatus::Running => Self::Running,
             WorkerStatus::CancelRequested => Self::CancelRequested,
             WorkerStatus::Completed => {
-                let acceptance = worker
-                    .outcome
-                    .as_ref()
-                    .map(|o| o.acceptance_state)
-                    .unwrap_or(WorkerAcceptanceState::ReadyForReview);
-                if acceptance == WorkerAcceptanceState::ReadyForReview {
-                    Self::ReadyForReview
-                } else {
+                if worker.outcome.as_ref().is_some_and(|outcome| {
+                    outcome.acceptance_state != WorkerAcceptanceState::ReadyForReview
+                        || outcome.evidence_failure.is_some()
+                }) {
                     Self::Failed
+                } else {
+                    Self::ReadyForReview
                 }
             }
             WorkerStatus::Failed => Self::Failed,

@@ -2582,27 +2582,9 @@ async fn guarded_worker_backlog_failure_is_recorded_and_never_completed() {
     assert_eq!(outcome.outcome, WorkerBacklogOutcome::Failure);
     let digest = outcome.result_digest.clone().expect("failure digest");
     assert_eq!(digest.len(), 64);
-    assert_ne!(
-        outcome.note, "verified terminal worker failure",
-        "failure must carry a concrete software-owned category"
-    );
-    assert!(
-        matches!(
-            outcome.note.as_str(),
-            "verified worker timeout"
-                | "verified worker cancellation"
-                | "verified worker diff scope rejection"
-                | "verified worker missing model evidence"
-                | "verified worker missing effort evidence"
-                | "verified worker cleanup incomplete"
-                | "verified worker nonzero exit"
-                | "verified worker signal termination"
-                | "verified worker provider error"
-                | "verified worker terminal failure"
-        ),
-        "failure note must be a software-owned bounded category: {}",
-        outcome.note
-    );
+    // The fixture exits without emitting any identity evidence. The supervisor classifies
+    // the exit, so the backlog can only report the failed verification for this dimension.
+    assert_eq!(outcome.note, "worker model evidence unverified");
     let blocked_item = get_item(&mcp, &item_id).await;
     assert_eq!(blocked_item.status, BacklogStatus::Blocked);
     let blocked_notice = mcp
