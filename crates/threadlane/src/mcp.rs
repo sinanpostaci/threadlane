@@ -1627,6 +1627,9 @@ mod tests {
             "no exposed/persisted drafts or early accept",
             "only after validated Done send it as next final message without routine lookup/rereads/timing probes",
             "genuine unfinished work or unknown/refused outcomes",
+            "Clickable changed-file links use verified `task_checkout_path` + verified changed relative path",
+            "unchanged source citations may reference verified original base",
+            "omit link if target cannot be established",
         ] {
             assert!(
                 normalized_guide.contains(required_review),

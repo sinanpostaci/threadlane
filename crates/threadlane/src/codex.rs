@@ -101,7 +101,7 @@ impl ApprovedSessionWakeupContext {
     pub fn wakeup_message(&self) -> String {
         match self.route {
             ApprovedSessionWakeupRoute::Mcp => format!(
-                "Threadlane approved session {} has pending events. For a pre-registered native review, call ordinary_review_notice({{\"approval_id\":\"{}\"}}) now. Otherwise use the originally selected guide route. A refusal never authorizes fallback or restart.",
+                "Threadlane approved session {} has pending events. On a resumed or new MCP connection (or uncertain continuity), call connect_current_chat({{}}), refetch operating_guide({{}}), and verify that the original thread, binding, project, and package match before any scoped call; stop if that cannot be verified. On a known continuous connection, take the fast path with no extra probes. Then, for a pre-registered native review, call ordinary_review_notice({{\"approval_id\":\"{}\"}}); otherwise use the originally selected guide route. This notice grants no new authority; a refusal never authorizes fallback or restart.",
                 self.approval_id, self.approval_id
             ),
             ApprovedSessionWakeupRoute::OperatorCli => format!(
@@ -407,7 +407,7 @@ mod tests {
         assert_eq!(
             mcp_ctx.wakeup_message(),
             format!(
-                "Threadlane approved session {approval_id} has pending events. For a pre-registered native review, call ordinary_review_notice({{\"approval_id\":\"{approval_id}\"}}) now. Otherwise use the originally selected guide route. A refusal never authorizes fallback or restart."
+                "Threadlane approved session {approval_id} has pending events. On a resumed or new MCP connection (or uncertain continuity), call connect_current_chat({{}}), refetch operating_guide({{}}), and verify that the original thread, binding, project, and package match before any scoped call; stop if that cannot be verified. On a known continuous connection, take the fast path with no extra probes. Then, for a pre-registered native review, call ordinary_review_notice({{\"approval_id\":\"{approval_id}\"}}); otherwise use the originally selected guide route. This notice grants no new authority; a refusal never authorizes fallback or restart."
             )
         );
 

@@ -50,7 +50,7 @@ literals become approved_session: None; the old `build_codex_queue_args` API and
 legacy FIXED_WAKEUP_MESSAGE remain unchanged. The actual adapter chooses a new
 fixed approved template only when trusted context is configured:
 
-`Threadlane approved session <approval_id> has pending events. For a pre-registered native review, call ordinary_review_notice({"approval_id":"<approval_id>"}) now. Otherwise use the originally selected guide route. A refusal never authorizes fallback or restart.`
+`Threadlane approved session <approval_id> has pending events. On a resumed or new MCP connection (or uncertain continuity), call connect_current_chat({}), refetch operating_guide({}), and verify that the original thread, binding, project, and package match before any scoped call; stop if that cannot be verified. On a known continuous connection, take the fast path with no extra probes. Then, for a pre-registered native review, call ordinary_review_notice({"approval_id":"<approval_id>"}); otherwise use the originally selected guide route. This notice grants no new authority; a refusal never authorizes fallback or restart.`
 
 No arbitrary message argument. Preserve bounded queue invocation, durable InFlight
 before spawn, Submitted/Failed/Unknown semantics, coalescing and explicit retry.

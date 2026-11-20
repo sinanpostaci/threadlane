@@ -23,7 +23,7 @@ fn test_approved_session_wakeup_context_validation_and_legacy_args_preserved() {
     assert_eq!(
         valid.wakeup_message(),
         format!(
-            "Threadlane approved session {VALID_APPROVAL_ID} has pending events. For a pre-registered native review, call ordinary_review_notice({{\"approval_id\":\"{VALID_APPROVAL_ID}\"}}) now. Otherwise use the originally selected guide route. A refusal never authorizes fallback or restart."
+            "Threadlane approved session {VALID_APPROVAL_ID} has pending events. On a resumed or new MCP connection (or uncertain continuity), call connect_current_chat({{}}), refetch operating_guide({{}}), and verify that the original thread, binding, project, and package match before any scoped call; stop if that cannot be verified. On a known continuous connection, take the fast path with no extra probes. Then, for a pre-registered native review, call ordinary_review_notice({{\"approval_id\":\"{VALID_APPROVAL_ID}\"}}); otherwise use the originally selected guide route. This notice grants no new authority; a refusal never authorizes fallback or restart."
         )
     );
 
