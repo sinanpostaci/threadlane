@@ -1607,6 +1607,32 @@ mod tests {
             "canonical MCP guide must stay within 16384 UTF-8 bytes, got {}",
             OPERATING_GUIDE_MARKDOWN.len()
         );
+        let early_guide: String = OPERATING_GUIDE_MARKDOWN.chars().take(1_024).collect();
+        for required_early in [
+            "source citation file/line ranges",
+            "rollout IDs (where required)",
+            "conversation context at first use",
+            "no extra source lookups if a source is not used",
+            "no raw logs or new storage",
+            "no duplicate skill reads",
+        ] {
+            assert!(
+                early_guide.contains(required_early),
+                "early embedded guide is missing `{required_early}`"
+            );
+        }
+        assert!(!OPERATING_GUIDE_MARKDOWN.contains("SKILL.md"));
+        for required_review in [
+            "prepare short final text and required citations before requesting Done",
+            "no exposed/persisted drafts or early accept",
+            "only after validated Done send it as next final message without routine lookup/rereads/timing probes",
+            "genuine unfinished work or unknown/refused outcomes",
+        ] {
+            assert!(
+                normalized_guide.contains(required_review),
+                "canonical MCP guide is missing review guidance `{required_review}`"
+            );
+        }
         assert!(OPERATING_GUIDE_MARKDOWN.contains("optional observation"));
         assert!(normalized_guide.contains("active human conversation"));
         assert!(normalized_guide
