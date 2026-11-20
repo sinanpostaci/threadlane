@@ -1848,12 +1848,19 @@ mod tests {
             "do not requery present facts",
             "ordinary_review_complete",
             "original `read_id`",
+            "only supported small exact-file text deliveries (every approved write path changes)",
+            "before guarded start",
+            "original tracked source files to preserve even for dependent new output",
+            "`[]` only for a standalone new file needing no original source",
+            "Larger/unsupported tasks select their supported route up front",
+            "Native refusal/missing scope stops (no automatic fallback)",
         ] {
             assert!(
                 ORDINARY_WORKER_QUICKSTART.contains(required),
                 "quickstart is missing `{required}`"
             );
         }
+        assert!(!ORDINARY_WORKER_QUICKSTART.contains("(`[]` if new file)"));
         assert!(!ORDINARY_WORKER_QUICKSTART.contains("/home/"));
         assert!(
             !ORDINARY_WORKER_QUICKSTART

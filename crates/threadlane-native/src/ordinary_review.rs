@@ -404,6 +404,7 @@ fn valid_checkout_path(path: &str, repository_path: &Path) -> bool {
         || path.len() > 4096
         || path.chars().any(char::is_control)
         || path.contains("//")
+        || path.split('/').any(|segment| matches!(segment, "." | ".."))
     {
         return false;
     }
@@ -1200,14 +1201,29 @@ mod tests {
     #[test]
     fn checkout_path_and_pin_validators_reject_unsafe_or_overlapping_inputs() {
         let repo = Path::new("/tmp/workspace/repo");
-        assert!(valid_checkout_path("/tmp/sessions/apr/wt-task", repo));
+        for good in [
+            "/tmp/sessions/apr/wt-task",
+            "/tmp/.local/share/dev.threadlane.desktop/sessions/apr/wt-task",
+            "/tmp/sessions/.hidden/wt..task",
+            "/tmp/sessions/wt.",
+            "/tmp/sessions/..wt",
+            "/tmp/sessions/.../wt",
+        ] {
+            assert!(valid_checkout_path(good, repo), "must accept `{good:?}`");
+        }
         for bad in [
             "",
             "/",
             "relative/wt",
             "/tmp/sessions//wt",
             "/tmp/sessions/./wt",
+            "/tmp/sessions/wt/.",
+            "/tmp/sessions/wt/./",
+            "/.",
             "/tmp/sessions/../wt",
+            "/tmp/sessions/wt/..",
+            "/tmp/sessions/wt/../",
+            "/..",
             "/tmp/sessions/\nwt",
             "/tmp/sessions/\0wt",
             "/tmp/workspace/repo",
