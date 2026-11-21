@@ -4100,6 +4100,14 @@ impl PairedMcpServer {
         const TOOL: &str = "ordinary_review_scope";
         ordinary_review::validate_source_files(&params.source_files)
             .map_err(|e| Self::format_planning_gateway_error(binding, TOOL, e))?;
+        if params.source_worktree.is_some() && params.source_files.is_empty() {
+            return Err(Self::format_scoped_error(
+                binding,
+                TOOL,
+                "invalid_source_scope",
+                "A correction worktree requires selected source files.",
+            ));
+        }
         let origin = self.review_origin(TOOL, binding, thread)?;
         let store = ReviewStore::open(&self.state_dir)
             .map_err(|e| Self::format_planning_gateway_error(binding, TOOL, e))?;
@@ -4139,6 +4147,8 @@ impl PairedMcpServer {
                         || previous.task_id != params.task_id
                         || previous.item_id != params.item_id
                         || previous.source_files != params.source_files
+                        || previous.source_worktree.as_deref().map(Path::as_os_str)
+                            != params.source_worktree.as_deref().map(Path::as_os_str)
                     {
                         return Err(crate::dispatch_guard::GuardedDispatchError::pre_effect(
                             "scope_conflict",
@@ -4186,9 +4196,17 @@ impl PairedMcpServer {
                     let root = repository_path.clone();
                     let base = base_commit.clone();
                     let files = params.source_files.clone();
+                    let selected = params.source_worktree.clone();
                     let observed = tokio::task::spawn_blocking(move || {
-                        threadlane::delivery_inspection::inspect_source_baseline(
-                            &root, &base, &files,
+                        ordinary_review::inspect_review_source(
+                            &root,
+                            &base,
+                            selected.as_deref(),
+                            |source| {
+                                threadlane::delivery_inspection::inspect_source_baseline(
+                                    source, &base, &files,
+                                )
+                            },
                         )
                     })
                     .await
@@ -4197,10 +4215,21 @@ impl PairedMcpServer {
                             "source_baseline_unavailable",
                             "Pre-start source baseline failed.",
                         )
+                    })?
+                    .map_err(|message| {
+                        crate::dispatch_guard::GuardedDispatchError::pre_effect(
+                            "source_baseline_unavailable",
+                            message,
+                        )
                     })?;
                     if !observed.ok
                         || !observed.clean_at_base
-                        || observed.root != repository_path.to_string_lossy()
+                        || observed.root
+                            != params
+                                .source_worktree
+                                .as_deref()
+                                .unwrap_or(&repository_path)
+                                .to_string_lossy()
                         || observed.expected_base != base_commit
                         || observed.head_commit.as_deref() != Some(base_commit.as_str())
                         || observed.base_tree.is_none()
@@ -4251,6 +4280,7 @@ impl PairedMcpServer {
                     task_id: params.task_id.clone(),
                     item_id: params.item_id.clone(),
                     repository_path,
+                    source_worktree: params.source_worktree.clone(),
                     base_commit,
                     source_files: params.source_files.clone(),
                     baseline_observed_at_ms: baseline.as_ref().map(|_| observed_at),
@@ -4988,12 +5018,24 @@ impl PairedMcpServer {
             text_files: context.scope.write_paths.clone(),
         };
         let source_files = scope.source_files.clone();
-        let source_root = scope.repository_path.clone();
+        let repository = scope.repository_path.clone();
+        let selected = scope.source_worktree.clone();
         let physical = tokio::task::spawn_blocking(move || {
             if source_files.is_empty() {
-                threadlane::inspect_delivery(&request)
+                Ok(threadlane::inspect_delivery(&request))
             } else {
-                threadlane::inspect_delivery_with_source_text(&request, &source_root, &source_files)
+                ordinary_review::inspect_review_source(
+                    &repository,
+                    &request.expected_base,
+                    selected.as_deref(),
+                    |source| {
+                        threadlane::inspect_delivery_with_source_text(
+                            &request,
+                            source,
+                            &source_files,
+                        )
+                    },
+                )
             }
         })
         .await
@@ -5004,7 +5046,18 @@ impl PairedMcpServer {
                 "inspection_failed",
                 "Physical review inspection failed.",
             )
+        })?
+        .map_err(|message| {
+            Self::format_scoped_error(binding, TOOL, "source_baseline_unavailable", message)
         })?;
+        if physical
+            .source
+            .as_ref()
+            .is_some_and(|source| source.ok && !source.clean_at_base)
+        {
+            return Err(Self::format_scoped_error(binding, TOOL, "review_evidence_incomplete",
+                "The selected source checkout changed after scope registration. Review requires clean source evidence at the approved commit."));
+        }
         let read = ReviewRead {
             schema_version: 1,
             scope: scope.clone(),

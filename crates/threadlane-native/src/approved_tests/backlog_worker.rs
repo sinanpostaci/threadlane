@@ -189,8 +189,42 @@ fn review_test_context(fixture: &ApprovedMcpFixture) -> crate::OperatorContextBo
 
 #[tokio::test]
 async fn ordinary_review_requires_original_ack_and_source_then_recovers_one_done() {
+    qualify_review_source(false).await;
+}
+
+#[tokio::test]
+async fn ordinary_review_uses_pinned_correction_worktree_through_one_done() {
+    qualify_review_source(true).await;
+}
+
+async fn qualify_review_source(correction: bool) {
     let mut fixture = setup_approved_mcp_fixture().await;
     prepare_review_source(&mut fixture);
+    let source_dir = if correction {
+        let path = fixture.root.join("private correction");
+        run_sanitized_git(
+            &fixture.repo_dir,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                path.to_str().unwrap(),
+                &fixture.base_commit,
+            ],
+            DEFAULT_GIT_COMMAND_TIMEOUT_MS,
+        )
+        .unwrap();
+        run_sanitized_git(
+            &fixture.repo_dir,
+            &["switch", "--detach", "HEAD^"],
+            DEFAULT_GIT_COMMAND_TIMEOUT_MS,
+        )
+        .unwrap();
+        assert!(!fixture.repo_dir.join("SPEC.md").exists());
+        path
+    } else {
+        fixture.repo_dir.clone()
+    };
     let context = review_test_context(&fixture);
     let (plan_revision, plan_digest) = create_published_plan(
         &fixture,
@@ -228,13 +262,61 @@ async fn ordinary_review_requires_original_ack_and_source_then_recovers_one_done
     foreign.set_review_test_connection(&fixture.binding_b, THREAD_UUID_B, context.clone());
     let (item_id, revision) =
         create_worker_item(&mcp, "create-direct-review", "Review fixture").await;
-    let scope_args = json!({
+    let mut scope_args = json!({
         "approval_id": approval.approval_id,
         "task_id": "task-root-agy",
         "item_id": item_id,
         "source_files": ["SPEC.md", "STATUS.txt"]
     });
 
+    if correction {
+        let refused = mcp
+            .invoke_tool_json("ordinary_review_scope", scope_args.clone(), None)
+            .await
+            .expect_err("bound source HEAD predates the correction");
+        let body = refused.structured_content.unwrap();
+        assert_eq!(body["error"]["code"], "source_baseline_unavailable");
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("HEAD differs"));
+        assert_eq!(read_invocation_count(&fixture.agy_count_file), 0);
+        let wrong_base = fixture.root.join("wrong-base");
+        run_sanitized_git(
+            &fixture.repo_dir,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                wrong_base.to_str().unwrap(),
+                "HEAD",
+            ],
+            DEFAULT_GIT_COMMAND_TIMEOUT_MS,
+        )
+        .unwrap();
+        let foreign_copy = fixture.root.join("foreign");
+        run_sanitized_git(
+            &fixture.repo_dir,
+            &["clone", "--local", ".", foreign_copy.to_str().unwrap()],
+            DEFAULT_GIT_COMMAND_TIMEOUT_MS,
+        )
+        .unwrap();
+        let alias = fixture.root.join("alias");
+        std::os::unix::fs::symlink(&source_dir, &alias).unwrap();
+        for invalid in [wrong_base, foreign_copy, alias] {
+            let mut invalid_args = scope_args.clone();
+            invalid_args["source_worktree"] = json!(invalid);
+            let refusal = mcp
+                .invoke_tool_json("ordinary_review_scope", invalid_args, None)
+                .await
+                .expect_err("invalid source worktree must refuse before dispatch");
+            assert_eq!(
+                refusal.structured_content.unwrap()["error"]["code"],
+                "source_baseline_unavailable"
+            );
+        }
+        scope_args["source_worktree"] = json!(source_dir);
+    }
     let foreign_scope = foreign
         .invoke_tool_json("ordinary_review_scope", scope_args.clone(), None)
         .await
@@ -268,7 +350,13 @@ async fn ordinary_review_requires_original_ack_and_source_then_recovers_one_done
         .scope(&fixture.binding_a, &approval.approval_id)
         .expect("load original scope")
         .expect("original scope is durable");
+    assert_eq!(scope.repository_path, fixture.repo_dir);
+    assert_eq!(
+        scope.source_worktree.as_ref(),
+        correction.then_some(&source_dir)
+    );
     let baseline = scope.baseline.as_ref().expect("pre-start source baseline");
+    assert_eq!(Path::new(&baseline.root), source_dir);
     assert!(baseline.ok && baseline.clean_at_base);
     assert_eq!(
         baseline.head_commit.as_deref(),
@@ -287,6 +375,22 @@ async fn ordinary_review_requires_original_ack_and_source_then_recovers_one_done
         assert!(file.matches_base);
         assert!(file.text.is_none() && file.text_untrusted.is_none());
     }
+    if correction {
+        let mut changed_root = scope_args.clone();
+        changed_root
+            .as_object_mut()
+            .unwrap()
+            .remove("source_worktree");
+        let refusal = mcp
+            .invoke_tool_json("ordinary_review_scope", changed_root, None)
+            .await
+            .expect_err("replay cannot change the frozen source");
+        assert_eq!(
+            refusal.structured_content.unwrap()["error"]["code"],
+            "scope_conflict"
+        );
+    }
+
     let mut conflicting_scope = scope_args.clone();
     conflicting_scope["source_files"] = json!(["SPEC.md"]);
     let conflict = mcp
@@ -422,11 +526,8 @@ async fn ordinary_review_requires_original_ack_and_source_then_recovers_one_done
     }
     assert!(acked_seq >= terminal_seq);
 
-    fs::write(
-        fixture.repo_dir.join("SPEC.md"),
-        "changed after source scope\n",
-    )
-    .expect("change pre-start source after dispatch");
+    fs::write(source_dir.join("SPEC.md"), "changed after source scope\n")
+        .expect("change pre-start source after dispatch");
     let changed_source = mcp
         .invoke_tool_json(
             "ordinary_review_prepare",
@@ -440,13 +541,17 @@ async fn ordinary_review_requires_original_ack_and_source_then_recovers_one_done
         changed_source_body["error"]["code"],
         "review_evidence_incomplete"
     );
+    assert!(changed_source_body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("source checkout changed"));
     assert_no_ready_metadata_leak(&changed_source_body, None);
     assert_eq!(get_item(&mcp, &item_id).await.status, BacklogStatus::Doing);
     assert!(store
         .indexed_read(&fixture.binding_a, &approval.approval_id)
         .unwrap()
         .is_none());
-    fs::write(fixture.repo_dir.join("SPEC.md"), REVIEW_SPEC).expect("restore original source");
+    fs::write(source_dir.join("SPEC.md"), REVIEW_SPEC).expect("restore original source");
 
     for caller_path in [
         json!({"approval_id": approval.approval_id, "task_checkout_path": fixture.repo_dir}),
@@ -3401,6 +3506,19 @@ async fn guarded_worker_backlog_rejection_rechecks_delivery_and_replays_durably(
         .as_str()
         .expect("worktree identity")
         .to_string();
+    let staged_file = |approval_id: &str, worktree_id: &str| {
+        let area = fixture
+            .sessions_dir
+            .join(approval_id)
+            .join(WORK_AREA_SUBDIR);
+        let manifest = threadlane_workers::load_and_verify_manifest(&area, worktree_id)
+            .expect("verified correction worktree");
+        fs::read_to_string(manifest.checkout_path.join("src/lib.rs"))
+            .expect("delivered Rust source")
+    };
+    assert!(
+        staged_file(&approval.approval_id, &worktree_id).contains("pub fn alpha() -> u32 { 42 }")
+    );
     let item_after_result = get_item(&mcp, &item_id).await;
     assert_eq!(item_after_result.status, BacklogStatus::Doing);
     assert_eq!(read_invocation_count(&fixture.agy_count_file), 1);
@@ -3807,7 +3925,7 @@ async fn guarded_worker_backlog_rejection_rechecks_delivery_and_replays_durably(
         &fixture,
         "plan-worker-backlog-rejection-retry",
         &fixture.binding_a,
-        default_plan_tasks("Fresh authorized retry after rejection"),
+        default_plan_tasks("FIX_REVIEWED_ALPHA: return 43 from alpha as requested in review"),
     );
     let fresh_approval = approve_published_plan(
         &fixture,
@@ -3965,6 +4083,46 @@ async fn guarded_worker_backlog_rejection_rechecks_delivery_and_replays_durably(
     let fresh_terminal =
         wait_for_terminal_task(&mcp, &fresh_approval.approval_id, "task-root-agy").await;
     assert_eq!(fresh_terminal.status, TaskExecutionStatus::ReadyForReview);
+    let result = mcp
+        .invoke_tool_json(
+            "backlog_worker_result",
+            json!({
+                "item_id": item_id, "execution_ref": fresh_execution.execution_ref
+            }),
+            None,
+        )
+        .await
+        .expect("read the corrected result");
+    let data = result.structured_content.expect("result envelope")["data"].clone();
+    let corrected = staged_file(
+        &fresh_approval.approval_id,
+        data["delivery"]["worktree_id"]
+            .as_str()
+            .expect("corrected worktree"),
+    );
+    assert!(corrected.contains("pub fn alpha() -> u32 { 43 }"));
+    let acceptance = json!({
+        "item_id": item_id, "execution_ref": fresh_execution.execution_ref,
+        "command_key": "accept-reviewed-correction", "expected_revision": data["item_snapshot"]["revision"],
+        "expected_result_digest": data["execution"]["outcome"]["result_digest"],
+        "expected_delivery_digest": data["delivery"]["delivery_digest"],
+        "acceptance_note": "The corrected alpha returns 43.",
+        "acceptance_evidence": "Checked src/lib.rs in the verified current task worktree."
+    });
+    mcp.invoke_tool_json("backlog_worker_complete", acceptance.clone(), None)
+        .await
+        .expect("complete the verified correction");
+    let done = get_item(&mcp, &item_id).await;
+    assert_eq!(done.status, BacklogStatus::Done);
+    assert_eq!(
+        done.current_execution_ref,
+        Some(fresh_execution.execution_ref)
+    );
+    mcp.invoke_tool_json("backlog_worker_complete", acceptance, None)
+        .await
+        .expect("replay the same corrected completion");
+    assert_eq!(get_item(&mcp, &item_id).await.revision, done.revision);
+    assert_eq!(read_invocation_count(&fixture.agy_count_file), 2);
     fresh_host
         .shutdown()
         .await

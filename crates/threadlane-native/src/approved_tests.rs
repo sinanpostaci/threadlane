@@ -159,7 +159,11 @@ case "$PROMPT" in
 esac
 
 if [ -d "src" ]; then
-    printf "// updated by fake-agy\npub fn alpha() -> u32 {{ 42 }}\n" > "src/lib.rs"
+    alpha=42
+    case "$PROMPT" in
+        *FIX_REVIEWED_ALPHA*) alpha=43 ;;
+    esac
+    printf "// updated by fake-agy\npub fn alpha() -> u32 {{ %s }}\n" "$alpha" > "src/lib.rs"
 fi
 
 printf '{{"type":"result","subtype":"success","session_id":"sess-agy-mcp","model":"%s","effort":"%s"}}\n' "$MODEL" "$EFFORT"

@@ -21,6 +21,8 @@ use crate::fs_safety::{
     write_private_file_atomic, CrossProcessLockGuard, MAX_PRIVATE_STATE_FILE_BYTES,
 };
 
+mod source_checkout;
+
 const LABEL: &str = "ordinary review state";
 const MAX_SOURCE_FILES: usize = 128;
 
@@ -36,6 +38,8 @@ pub struct ReviewScopeParams {
     pub item_id: String,
     /// Exact source files explicitly selected within the authorized human scope.
     pub source_files: Vec<String>,
+    /// Optional canonical path of a registered detached worktree at the approved correction base.
+    pub source_worktree: Option<PathBuf>,
 }
 
 /// Identifies one originally registered review scope.
@@ -68,6 +72,8 @@ pub(crate) struct ReviewScope {
     pub task_id: String,
     pub item_id: String,
     pub repository_path: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_worktree: Option<PathBuf>,
     pub base_commit: String,
     pub source_files: Vec<String>,
     pub baseline: Option<threadlane::delivery_inspection::SourceInspection>,
@@ -341,6 +347,37 @@ fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, NativeError> {
             "review evidence cannot be serialized",
         )
     })
+}
+
+/// Inspect only after proving where the selected physical source lives. Discard
+/// the observation if its Git registration changes during the read.
+pub(crate) fn inspect_review_source<T>(
+    repository: &Path,
+    base: &str,
+    selected: Option<&Path>,
+    inspect: impl FnOnce(&Path) -> T,
+) -> Result<T, &'static str> {
+    match selected {
+        Some(path) => {
+            source_checkout::verify(repository, base, path)?;
+            let observation = inspect(path);
+            source_checkout::verify(repository, base, path)?;
+            Ok(observation)
+        }
+        None => {
+            let head = threadlane_workers::run_sanitized_git_bytes(
+                repository,
+                &["rev-parse", "--verify", "HEAD"],
+                128,
+                5000,
+            )
+            .map_err(|_| "Could not verify the bound source checkout HEAD.")?;
+            if head.stdout_bytes.strip_suffix(b"\n") != Some(base.as_bytes()) {
+                return Err("Bound source checkout HEAD differs from the approved base. Select the registered detached correction worktree when preparing a new scope.");
+            }
+            Ok(inspect(repository))
+        }
+    }
 }
 
 pub(crate) fn validate_source_files(files: &[String]) -> Result<(), NativeError> {
@@ -792,12 +829,18 @@ pub(crate) fn valid_physical(read: &ReviewRead) -> bool {
             })
         })
         && match (&p.source, read.scope.source_files.is_empty()) {
-            (None, true) => read.scope.baseline.is_none(),
+            (None, true) => read.scope.baseline.is_none() && read.scope.source_worktree.is_none(),
             (Some(s), false) => read.scope.baseline.as_ref().is_some_and(|baseline| {
                 s.ok && baseline.ok
                     && s.clean_at_base
                     && baseline.clean_at_base
-                    && s.root == read.scope.repository_path.to_string_lossy()
+                    && s.root
+                        == read
+                            .scope
+                            .source_worktree
+                            .as_deref()
+                            .unwrap_or(&read.scope.repository_path)
+                            .to_string_lossy()
                     && s.root == baseline.root
                     && s.expected_base == read.scope.base_commit
                     && s.expected_base == baseline.expected_base
@@ -1069,6 +1112,7 @@ mod tests {
             task_id: "task_test".into(),
             item_id: "item_test".into(),
             repository_path: "/repo".into(),
+            source_worktree: None,
             base_commit: "a".repeat(40),
             source_files: vec!["SPEC.md".into()],
             baseline: None,
