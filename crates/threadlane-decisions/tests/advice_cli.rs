@@ -1,16 +1,21 @@
 #![forbid(unsafe_code)]
 
+use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use fs2::FileExt;
+use threadlane_connectors::{ConnectorError, CredentialStore};
 use threadlane_decisions::{
-    AdviceClassifyOutput, AdviceError, AdvicePreviewOutput, AdviceSource,
-    ADVICE_CACHE_SCHEMA_VERSION,
+    classify_advice, list_advice_models, AdviceClassifyOutput, AdviceError, AdvicePreviewOutput,
+    AdviceScope, AdviceSource, DecisionClient, DecisionError, DecisionProvider, DecisionTransport,
+    TransportFuture, TransportMethod, TransportRequest, TransportResponse,
+    ADVICE_CACHE_SCHEMA_VERSION, DEFAULT_CACHE_TTL_SECONDS, JEV_CLASSIFY_URL, OPENAI_CLASSIFY_URL,
 };
 use threadlane_registry::{
     DecisionAdvisor, DecisionAdvisorMode, Difficulty, ModelDefinition, RegistryChange,
@@ -125,6 +130,8 @@ fn cli_help_and_version_run_offline_without_touching_filesystem() {
     assert!(help_out.status.success());
     let help_stdout = String::from_utf8_lossy(&help_out.stdout);
     assert!(help_stdout.contains("threadlane-advice"));
+    assert!(help_stdout.contains("Jev"));
+    assert!(help_stdout.contains("OpenAI Decisions"));
     assert!(help_stdout.contains("--registry-dir"));
     assert!(help_stdout.contains("--cache-dir"));
     assert!(help_stdout.contains("--project-root"));
@@ -857,4 +864,949 @@ fn cli_profile_id_flag_validation_cache_scoping_and_refusals_work_end_to_end() {
     assert_eq!(classify_prof_out.profile_id.as_deref(), Some("profile-jev"));
     assert_eq!(classify_prof_out.source, AdviceSource::Cache);
     assert!(!classify_prof_out.provider_call_performed);
+}
+
+#[derive(Default)]
+struct CliMockVault {
+    secrets: Mutex<HashMap<String, String>>,
+    reads: Mutex<Vec<String>>,
+    fail_reads: Mutex<bool>,
+}
+
+impl CliMockVault {
+    fn with_secrets(pairs: &[(&str, &str)]) -> Arc<Self> {
+        let mut map = HashMap::new();
+        for (tool_id, secret) in pairs {
+            map.insert((*tool_id).to_string(), (*secret).to_string());
+        }
+        Arc::new(Self {
+            secrets: Mutex::new(map),
+            reads: Mutex::new(Vec::new()),
+            fail_reads: Mutex::new(false),
+        })
+    }
+
+    fn failing() -> Arc<Self> {
+        Arc::new(Self {
+            secrets: Mutex::new(HashMap::new()),
+            reads: Mutex::new(Vec::new()),
+            fail_reads: Mutex::new(true),
+        })
+    }
+
+    fn recorded_reads(&self) -> Vec<String> {
+        self.reads.lock().expect("reads lock").clone()
+    }
+}
+
+impl CredentialStore for CliMockVault {
+    fn set(&self, tool_id: &str, secret: &str) -> Result<(), ConnectorError> {
+        self.secrets
+            .lock()
+            .expect("vault lock")
+            .insert(tool_id.to_string(), secret.to_string());
+        Ok(())
+    }
+
+    fn get(&self, tool_id: &str) -> Result<Option<String>, ConnectorError> {
+        self.reads
+            .lock()
+            .expect("reads lock")
+            .push(tool_id.to_string());
+        if *self.fail_reads.lock().expect("fail_reads lock") {
+            return Err(ConnectorError::CredentialStoreUnavailable(
+                "OS credential store is unavailable.",
+            ));
+        }
+        Ok(self
+            .secrets
+            .lock()
+            .expect("vault lock")
+            .get(tool_id)
+            .cloned())
+    }
+
+    fn delete(&self, tool_id: &str) -> Result<(), ConnectorError> {
+        self.secrets.lock().expect("vault lock").remove(tool_id);
+        Ok(())
+    }
+
+    fn status(&self, tool_id: &str) -> Result<String, ConnectorError> {
+        if *self.fail_reads.lock().expect("fail_reads lock") {
+            return Err(ConnectorError::CredentialStoreUnavailable(
+                "OS credential store is unavailable.",
+            ));
+        }
+        let configured = self
+            .secrets
+            .lock()
+            .expect("vault lock")
+            .contains_key(tool_id);
+        Ok(if configured {
+            "configured".to_string()
+        } else {
+            "not_configured".to_string()
+        })
+    }
+}
+
+#[derive(Default)]
+struct CliMockTransport {
+    requests: Mutex<Vec<TransportRequest>>,
+    responses: Mutex<VecDeque<Result<TransportResponse, DecisionError>>>,
+}
+
+impl CliMockTransport {
+    fn with_responses(
+        responses: impl IntoIterator<Item = Result<TransportResponse, DecisionError>>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            requests: Mutex::new(Vec::new()),
+            responses: Mutex::new(responses.into_iter().collect()),
+        })
+    }
+
+    fn recorded_requests(&self) -> Vec<TransportRequest> {
+        self.requests.lock().expect("requests lock").clone()
+    }
+}
+
+impl DecisionTransport for CliMockTransport {
+    fn execute<'a>(&'a self, request: TransportRequest) -> TransportFuture<'a> {
+        Box::pin(async move {
+            self.requests.lock().expect("requests lock").push(request);
+            self.responses
+                .lock()
+                .expect("responses lock")
+                .pop_front()
+                .unwrap_or(Err(DecisionError::TransportFailed))
+        })
+    }
+}
+
+fn seed_multi_provider_registry(fixture: &CliTestFixture) -> u64 {
+    let mut rev = fixture.seed_jev_registry();
+    let store = RegistryStore::open(fixture.registry_dir.clone()).expect("open registry");
+
+    for tool in [
+        ToolDefinition {
+            id: "openai-decisions".to_string(),
+            label: "OpenAI Decisions".to_string(),
+            adapter: ToolAdapter::OpenaiDecisionsApi,
+            executable_path: None,
+            enabled: true,
+        },
+        ToolDefinition {
+            id: "openai-disabled".to_string(),
+            label: "Disabled OpenAI Decisions".to_string(),
+            adapter: ToolAdapter::OpenaiDecisionsApi,
+            executable_path: None,
+            enabled: false,
+        },
+        ToolDefinition {
+            id: "codex-cli".to_string(),
+            label: "Codex CLI".to_string(),
+            adapter: ToolAdapter::CodexCli,
+            executable_path: Some(PathBuf::from("/usr/local/bin/codex")),
+            enabled: true,
+        },
+    ] {
+        let snap = store
+            .apply(rev, RegistryChange::UpsertTool { tool })
+            .expect("upsert tool");
+        rev = snap.revision;
+    }
+
+    let snap = store
+        .apply(
+            rev,
+            RegistryChange::UpsertModels {
+                models: vec![
+                    ModelDefinition {
+                        id: "jev-api:gpt-6-luna".to_string(),
+                        tool_id: "jev-api".to_string(),
+                        label: "mismatched-openai-under-jev".to_string(),
+                        model_arg: "gpt-6-luna".to_string(),
+                        efforts: Vec::new(),
+                        allow_no_effort: true,
+                    },
+                    ModelDefinition {
+                        id: "openai-decisions:gpt-6-luna".to_string(),
+                        tool_id: "openai-decisions".to_string(),
+                        label: "gpt-6-luna".to_string(),
+                        model_arg: "gpt-6-luna".to_string(),
+                        efforts: Vec::new(),
+                        allow_no_effort: true,
+                    },
+                    ModelDefinition {
+                        id: "openai-decisions:gpt-6-luna-2026-10-01".to_string(),
+                        tool_id: "openai-decisions".to_string(),
+                        label: "gpt-6-luna-2026-10-01".to_string(),
+                        model_arg: "gpt-6-luna-2026-10-01".to_string(),
+                        efforts: Vec::new(),
+                        allow_no_effort: true,
+                    },
+                    ModelDefinition {
+                        id: "openai-decisions:gpt-5-nano".to_string(),
+                        tool_id: "openai-decisions".to_string(),
+                        label: "unsupported-openai-model".to_string(),
+                        model_arg: "gpt-5-nano".to_string(),
+                        efforts: Vec::new(),
+                        allow_no_effort: true,
+                    },
+                    ModelDefinition {
+                        id: "openai-decisions:jev-latest".to_string(),
+                        tool_id: "openai-decisions".to_string(),
+                        label: "mismatched-jev-under-openai".to_string(),
+                        model_arg: "jev-latest".to_string(),
+                        efforts: Vec::new(),
+                        allow_no_effort: true,
+                    },
+                    ModelDefinition {
+                        id: "openai-disabled:gpt-6-luna".to_string(),
+                        tool_id: "openai-disabled".to_string(),
+                        label: "gpt-6-luna".to_string(),
+                        model_arg: "gpt-6-luna".to_string(),
+                        efforts: Vec::new(),
+                        allow_no_effort: true,
+                    },
+                    ModelDefinition {
+                        id: "codex-cli:gpt-6-luna".to_string(),
+                        tool_id: "codex-cli".to_string(),
+                        label: "codex-model".to_string(),
+                        model_arg: "gpt-6-luna".to_string(),
+                        efforts: Vec::new(),
+                        allow_no_effort: true,
+                    },
+                ],
+            },
+        )
+        .expect("upsert models");
+    rev = snap.revision;
+
+    for (id, model_id) in [
+        ("profile-jev", "jev-api:jev-latest"),
+        ("profile-openai", "openai-decisions:gpt-6-luna"),
+    ] {
+        let snap = store
+            .apply(
+                rev,
+                RegistryChange::UpsertProfile {
+                    profile: WorkflowProfile {
+                        id: id.to_string(),
+                        name: format!("Profile {id}"),
+                        assignments: Vec::new(),
+                        decision_advisor: Some(DecisionAdvisor {
+                            model_id: model_id.to_string(),
+                            mode: DecisionAdvisorMode::Shadow,
+                        }),
+                    },
+                },
+            )
+            .expect("upsert profile");
+        rev = snap.revision;
+    }
+
+    rev
+}
+
+#[test]
+fn cli_openai_preview_refusals_and_jev_scoped_models_and_profiles_work_offline() {
+    let fixture = CliTestFixture::new("openai-preview-refusals");
+    let reg_rev = seed_multi_provider_registry(&fixture);
+    let context_id = "550e8400-e29b-41d4-a716-446655440010";
+    let raw_summary = "OpenAI Decisions offline preview task summary.";
+
+    let write_req = |name: &str, tool_id: &str, model_id: &str| -> PathBuf {
+        fixture.write_request(
+            name,
+            &format!(
+                r#"{{
+                    "schema_version": 1,
+                    "expected_registry_revision": {reg_rev},
+                    "tool_id": "{tool_id}",
+                    "model_id": "{model_id}",
+                    "task_id": "openai-cli-task-1",
+                    "task_revision": 1,
+                    "task_summary": "{raw_summary}",
+                    "baseline_difficulty": "medium"
+                }}"#
+            ),
+        )
+    };
+
+    let openai_req = write_req(
+        "req-openai.json",
+        "openai-decisions",
+        "openai-decisions:gpt-6-luna",
+    );
+    let openai_pinned_req = write_req(
+        "req-openai-pinned.json",
+        "openai-decisions",
+        "openai-decisions:gpt-6-luna-2026-10-01",
+    );
+    let jev_req = write_req("req-jev.json", "jev-api", "jev-api:jev-latest");
+
+    // 1. OpenAI Decisions `preview` succeeds offline, resolves `"openai"`, omits `profile_id`,
+    //    and does not create `cache_dir`.
+    let preview_cmd = Command::new(advice_bin())
+        .arg("--registry-dir")
+        .arg(&fixture.registry_dir)
+        .arg("--cache-dir")
+        .arg(&fixture.cache_dir)
+        .arg("--project-root")
+        .arg(&fixture.project_root)
+        .arg("--context-id")
+        .arg(context_id)
+        .arg("preview")
+        .arg("--request")
+        .arg(&openai_req)
+        .output()
+        .expect("run openai preview");
+    assert!(
+        preview_cmd.status.success(),
+        "openai preview failed: {}",
+        String::from_utf8_lossy(&preview_cmd.stderr)
+    );
+    assert!(!fixture.cache_dir.exists());
+    let preview_stdout = String::from_utf8_lossy(&preview_cmd.stdout);
+    assert!(!preview_stdout.contains("profile_id"));
+    assert!(preview_stdout.contains(r#""provider": "openai""#));
+    let openai_preview: AdvicePreviewOutput =
+        serde_json::from_slice(&preview_cmd.stdout).expect("parse openai preview");
+    assert!(openai_preview.untrusted_data);
+    assert!(openai_preview.advisory_only);
+    assert_eq!(openai_preview.mode, "shadow");
+    assert_eq!(openai_preview.provider, DecisionProvider::Openai);
+    assert_eq!(openai_preview.tool_id, "openai-decisions");
+    assert_eq!(openai_preview.model_id, "openai-decisions:gpt-6-luna");
+    assert_eq!(openai_preview.requested_model, "gpt-6-luna");
+    assert_eq!(openai_preview.task_summary, raw_summary);
+    assert_eq!(openai_preview.baseline_difficulty, Some(Difficulty::Medium));
+    assert!(!openai_preview.provider_call_performed);
+
+    // 2. Versioned OpenAI model preview and Jev preview on the exact same task/summary
+    //    produce distinct provider-scoped cache keys.
+    let pinned_cmd = Command::new(advice_bin())
+        .arg("--registry-dir")
+        .arg(&fixture.registry_dir)
+        .arg("--cache-dir")
+        .arg(&fixture.cache_dir)
+        .arg("--project-root")
+        .arg(&fixture.project_root)
+        .arg("--context-id")
+        .arg(context_id)
+        .arg("preview")
+        .arg("--request")
+        .arg(&openai_pinned_req)
+        .output()
+        .expect("run pinned openai preview");
+    assert!(pinned_cmd.status.success());
+    let pinned_preview: AdvicePreviewOutput =
+        serde_json::from_slice(&pinned_cmd.stdout).expect("parse pinned openai preview");
+    assert_eq!(pinned_preview.provider, DecisionProvider::Openai);
+    assert_eq!(pinned_preview.requested_model, "gpt-6-luna-2026-10-01");
+    assert_ne!(pinned_preview.cache_key, openai_preview.cache_key);
+
+    let jev_cmd = Command::new(advice_bin())
+        .arg("--registry-dir")
+        .arg(&fixture.registry_dir)
+        .arg("--cache-dir")
+        .arg(&fixture.cache_dir)
+        .arg("--project-root")
+        .arg(&fixture.project_root)
+        .arg("--context-id")
+        .arg(context_id)
+        .arg("preview")
+        .arg("--request")
+        .arg(&jev_req)
+        .output()
+        .expect("run jev preview");
+    assert!(jev_cmd.status.success());
+    let jev_preview: AdvicePreviewOutput =
+        serde_json::from_slice(&jev_cmd.stdout).expect("parse jev preview");
+    assert_eq!(jev_preview.provider, DecisionProvider::Jev);
+    assert_ne!(jev_preview.cache_key, openai_preview.cache_key);
+
+    // 3. Refusals for disabled OpenAI tool, mismatched tool/model pairs, invalid model_arg,
+    //    and non-decision adapters fail closed on both `preview` and `classify` before creating cache_dir.
+    let refusal_cases = [
+        (
+            "disabled-openai",
+            write_req(
+                "req-disabled-openai.json",
+                "openai-disabled",
+                "openai-disabled:gpt-6-luna",
+            ),
+            "tool_disabled",
+        ),
+        (
+            "openai-tool-with-jev-model",
+            write_req(
+                "req-cross-tool-1.json",
+                "openai-decisions",
+                "jev-api:jev-latest",
+            ),
+            "model_not_found",
+        ),
+        (
+            "jev-tool-with-openai-model",
+            write_req(
+                "req-cross-tool-2.json",
+                "jev-api",
+                "openai-decisions:gpt-6-luna",
+            ),
+            "model_not_found",
+        ),
+        (
+            "openai-tool-with-unsupported-model-arg",
+            write_req(
+                "req-unsupported-openai-model.json",
+                "openai-decisions",
+                "openai-decisions:gpt-5-nano",
+            ),
+            "invalid_model",
+        ),
+        (
+            "openai-tool-with-jev-model-arg",
+            write_req(
+                "req-jev-arg-under-openai.json",
+                "openai-decisions",
+                "openai-decisions:jev-latest",
+            ),
+            "invalid_model",
+        ),
+        (
+            "jev-tool-with-openai-model-arg",
+            write_req(
+                "req-openai-arg-under-jev.json",
+                "jev-api",
+                "jev-api:gpt-6-luna",
+            ),
+            "invalid_model",
+        ),
+        (
+            "codex-cli-adapter",
+            write_req("req-codex-cli.json", "codex-cli", "codex-cli:gpt-6-luna"),
+            "unsupported_adapter",
+        ),
+    ];
+
+    for (label, req_path, expected_code) in &refusal_cases {
+        for subcmd in ["preview", "classify"] {
+            let out = Command::new(advice_bin())
+                .arg("--registry-dir")
+                .arg(&fixture.registry_dir)
+                .arg("--cache-dir")
+                .arg(&fixture.cache_dir)
+                .arg("--project-root")
+                .arg(&fixture.project_root)
+                .arg("--context-id")
+                .arg(context_id)
+                .arg(subcmd)
+                .arg("--request")
+                .arg(req_path)
+                .output()
+                .expect("run refusal subprocess");
+            assert!(
+                !out.status.success(),
+                "{subcmd} for {label} unexpectedly succeeded"
+            );
+            let err: AdviceError = serde_json::from_slice(&out.stderr).expect("parse error json");
+            assert_eq!(
+                err.code(),
+                *expected_code,
+                "unexpected error code for {subcmd} {label}: {}",
+                err.message()
+            );
+            assert!(
+                !fixture.cache_dir.exists(),
+                "cache_dir must not be created when {subcmd} fails for {label}"
+            );
+        }
+    }
+
+    // 4. `models` and `--profile-id` stay scoped to Jev (`unsupported_adapter` for OpenAI).
+    let models_openai_cmd = Command::new(advice_bin())
+        .arg("--registry-dir")
+        .arg(&fixture.registry_dir)
+        .arg("--cache-dir")
+        .arg(&fixture.cache_dir)
+        .arg("--project-root")
+        .arg(&fixture.project_root)
+        .arg("--context-id")
+        .arg(context_id)
+        .arg("models")
+        .arg("--tool-id")
+        .arg("openai-decisions")
+        .output()
+        .expect("run models for openai-decisions");
+    assert!(!models_openai_cmd.status.success());
+    let models_err: AdviceError =
+        serde_json::from_slice(&models_openai_cmd.stderr).expect("parse models error");
+    assert_eq!(models_err.code(), "unsupported_adapter");
+    assert!(!fixture.cache_dir.exists());
+
+    for (profile_id, req_path) in [
+        ("profile-openai", &openai_req),
+        ("profile-jev", &openai_req),
+    ] {
+        for subcmd in ["preview", "classify"] {
+            let out = Command::new(advice_bin())
+                .arg("--registry-dir")
+                .arg(&fixture.registry_dir)
+                .arg("--cache-dir")
+                .arg(&fixture.cache_dir)
+                .arg("--project-root")
+                .arg(&fixture.project_root)
+                .arg("--context-id")
+                .arg(context_id)
+                .arg("--profile-id")
+                .arg(profile_id)
+                .arg(subcmd)
+                .arg("--request")
+                .arg(req_path)
+                .output()
+                .expect("run profile-scoped openai refusal");
+            assert!(!out.status.success());
+            let err: AdviceError =
+                serde_json::from_slice(&out.stderr).expect("parse profile refusal error");
+            assert_eq!(err.code(), "unsupported_adapter");
+            assert!(!fixture.cache_dir.exists());
+        }
+    }
+
+    // 5. Busy per-key lock on OpenAI's cache key refuses immediately via subprocess with `cache_busy`.
+    fs::create_dir_all(&fixture.cache_dir).expect("create cache_dir");
+    fs::set_permissions(&fixture.cache_dir, fs::Permissions::from_mode(0o700))
+        .expect("chmod 0700 cache_dir");
+    let lock_path = fixture
+        .cache_dir
+        .join(format!("{}.lock", openai_preview.cache_key));
+    let lock_file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .expect("create openai lock file");
+    fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o600))
+        .expect("chmod 0600 openai lock file");
+    lock_file
+        .try_lock_exclusive()
+        .expect("hold exclusive openai lock");
+
+    let busy_cmd = Command::new(advice_bin())
+        .arg("--registry-dir")
+        .arg(&fixture.registry_dir)
+        .arg("--cache-dir")
+        .arg(&fixture.cache_dir)
+        .arg("--project-root")
+        .arg(&fixture.project_root)
+        .arg("--context-id")
+        .arg(context_id)
+        .arg("classify")
+        .arg("--request")
+        .arg(&openai_req)
+        .output()
+        .expect("run busy openai classify");
+    assert!(!busy_cmd.status.success());
+    let busy_err: AdviceError =
+        serde_json::from_slice(&busy_cmd.stderr).expect("parse busy error json");
+    assert_eq!(busy_err.code(), "cache_busy");
+    lock_file.unlock().expect("unlock openai lock");
+}
+
+#[tokio::test]
+async fn cli_openai_classify_mock_transport_caching_no_second_call_and_cross_provider_isolation() {
+    let fixture = CliTestFixture::new("openai-mock-transport-e2e");
+    let reg_rev = seed_multi_provider_registry(&fixture);
+    let context_id = "550e8400-e29b-41d4-a716-446655440011";
+    let scope = AdviceScope {
+        registry_dir: fixture.registry_dir.clone(),
+        cache_dir: fixture.cache_dir.clone(),
+        project_root: fixture.project_root.clone(),
+        context_id: context_id.to_string(),
+        cache_ttl_seconds: DEFAULT_CACHE_TTL_SECONDS,
+        profile_id: None,
+    };
+
+    let openai_secret = "sk-proj-openai-mock-secret-999";
+    let jev_secret = "ts-jev-mock-secret-888";
+    let raw_summary = "Classify cross-crate lock state transitions without external calls.";
+
+    let write_req = |name: &str, tool_id: &str, model_id: &str, task_id: &str| -> PathBuf {
+        fixture.write_request(
+            name,
+            &format!(
+                r#"{{
+                    "schema_version": 1,
+                    "expected_registry_revision": {reg_rev},
+                    "tool_id": "{tool_id}",
+                    "model_id": "{model_id}",
+                    "task_id": "{task_id}",
+                    "task_revision": 1,
+                    "task_summary": "{raw_summary}",
+                    "baseline_difficulty": "easy"
+                }}"#
+            ),
+        )
+    };
+
+    let openai_req_1 = write_req(
+        "openai-1.json",
+        "openai-decisions",
+        "openai-decisions:gpt-6-luna",
+        "task-shared-1",
+    );
+    let jev_req_1 = write_req(
+        "jev-1.json",
+        "jev-api",
+        "jev-api:jev-latest",
+        "task-shared-1",
+    );
+    let openai_req_2 = write_req(
+        "openai-2.json",
+        "openai-decisions",
+        "openai-decisions:gpt-6-luna",
+        "task-shared-2",
+    );
+    let jev_req_2 = write_req(
+        "jev-2.json",
+        "jev-api",
+        "jev-api:jev-latest",
+        "task-shared-2",
+    );
+    let openai_req_refusal = write_req(
+        "openai-refusal.json",
+        "openai-decisions",
+        "openai-decisions:gpt-6-luna",
+        "task-refusal-3",
+    );
+
+    let openai_only_vault = CliMockVault::with_secrets(&[("openai-decisions", openai_secret)]);
+    let transport = CliMockTransport::with_responses([
+        Ok(TransportResponse {
+            status: 200,
+            body: br#"{
+                "model": "gpt-6-luna-2026-10-01",
+                "answers": [{
+                    "type": "choice",
+                    "name": "difficulty",
+                    "choice": "hard",
+                    "confidence": 0.92,
+                    "probabilities": [
+                        {"value": "hard", "probability": 0.92},
+                        {"value": "medium", "probability": 0.08}
+                    ]
+                }],
+                "usage": {
+                    "input_tokens": 112,
+                    "output_tokens": 0,
+                    "total_tokens": 112
+                }
+            }"#
+            .to_vec(),
+        }),
+        Ok(TransportResponse {
+            status: 429,
+            body: br#"{"error":"rate_limited"}"#.to_vec(),
+        }),
+        Ok(TransportResponse {
+            status: 200,
+            body: br#"{
+                "model": "jev-1.14.0",
+                "answers": {
+                    "difficulty": {
+                        "type": "choice",
+                        "choice": "medium",
+                        "confidence": 0.89,
+                        "probabilities": {
+                            "easy": 0.04,
+                            "medium": 0.89,
+                            "hard": 0.05,
+                            "extreme": 0.02
+                        }
+                    }
+                },
+                "usage": {"input_tokens": 95, "output_tokens": 9}
+            }"#
+            .to_vec(),
+        }),
+        Ok(TransportResponse {
+            status: 200,
+            body: br#"{
+                "model": "gpt-6-luna",
+                "answers": [{
+                    "type": "refusal",
+                    "name": "difficulty"
+                }],
+                "usage": {
+                    "input_tokens": 64,
+                    "output_tokens": 0,
+                    "total_tokens": 64
+                }
+            }"#
+            .to_vec(),
+        }),
+    ]);
+
+    let openai_only_client =
+        DecisionClient::with_transport(openai_only_vault.clone(), transport.clone())
+            .expect("init openai-only client");
+
+    // 1. `list_advice_models` stays scoped to Jev and refuses OpenAI before reading credentials.
+    let models_err = list_advice_models(&scope, "openai-decisions", &openai_only_client)
+        .await
+        .expect_err("models must stay scoped to Jev");
+    assert_eq!(models_err.code(), "unsupported_adapter");
+    assert!(openai_only_vault.recorded_reads().is_empty());
+    assert!(transport.recorded_requests().is_empty());
+
+    // 2. First OpenAI Decisions classify calls mock transport targeting OPENAI_CLASSIFY_URL.
+    let first = classify_advice(
+        &scope,
+        &openai_req_1,
+        false,
+        openai_only_vault.clone(),
+        &openai_only_client,
+    )
+    .await
+    .expect("first openai classify should succeed");
+    assert!(first.untrusted_data);
+    assert!(first.advisory_only);
+    assert_eq!(first.mode, "shadow");
+    assert_eq!(first.source, AdviceSource::Provider);
+    assert!(first.provider_call_performed);
+    assert_eq!(first.tool_id, "openai-decisions");
+    assert_eq!(first.model_id, "openai-decisions:gpt-6-luna");
+    assert_eq!(first.requested_model, "gpt-6-luna");
+    assert_eq!(first.advice.provider, DecisionProvider::Openai);
+    assert_eq!(first.advice.model, "gpt-6-luna-2026-10-01");
+    assert_eq!(first.advice.difficulty, Some(Difficulty::Hard));
+    assert_eq!(first.advice.confidence, Some(0.92));
+    assert!(!first.advice.needs_review);
+    assert_eq!(first.advice.reason_code, "classified");
+    assert_eq!(first.advice.input_tokens, Some(112));
+    assert_eq!(first.advice.output_tokens, Some(0));
+    assert_eq!(first.agrees_with_baseline, Some(false));
+
+    let first_json = serde_json::to_string(&first).expect("serialize first output");
+    assert!(!first_json.contains(raw_summary));
+    assert!(!first_json.contains(openai_secret));
+
+    let recorded = transport.recorded_requests();
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0].provider, DecisionProvider::Openai);
+    assert_eq!(recorded[0].method, TransportMethod::Post);
+    assert_eq!(recorded[0].url, OPENAI_CLASSIFY_URL);
+    assert_eq!(recorded[0].bearer_token, openai_secret);
+    let sent_body: serde_json::Value =
+        serde_json::from_str(recorded[0].json_body.as_deref().expect("openai post body"))
+            .expect("parse sent openai json");
+    assert_eq!(sent_body["model"], "gpt-6-luna");
+    assert_eq!(sent_body["input"], raw_summary);
+    assert_eq!(sent_body["questions"][0]["type"], "choice");
+    assert_eq!(sent_body["questions"][0]["name"], "difficulty");
+
+    let record_path = fixture.cache_dir.join(format!("{}.json", first.cache_key));
+    let persisted_text = fs::read_to_string(&record_path).expect("read openai cache file");
+    assert!(!persisted_text.contains(raw_summary));
+    assert!(!persisted_text.contains(openai_secret));
+    let persisted_val: serde_json::Value =
+        serde_json::from_str(&persisted_text).expect("parse openai cache file");
+    assert_eq!(persisted_val["provider"], "openai");
+
+    // 3. Second call hits cache with ZERO extra provider calls and ZERO vault reads — both via
+    //    `classify_advice` with a failing vault AND via the real `threadlane-advice` CLI subprocess!
+    let failing_vault = CliMockVault::failing();
+    let failing_client =
+        DecisionClient::with_transport(failing_vault.clone(), transport.clone()).expect("client");
+    let cached = classify_advice(
+        &scope,
+        &openai_req_1,
+        false,
+        failing_vault.clone(),
+        &failing_client,
+    )
+    .await
+    .expect("second call must hit cache without vault or network");
+    assert_eq!(cached.source, AdviceSource::Cache);
+    assert!(!cached.provider_call_performed);
+    assert!(cached.cache_age_ms.is_some());
+    assert_eq!(cached.advice, first.advice);
+    assert!(failing_vault.recorded_reads().is_empty());
+    assert_eq!(transport.recorded_requests().len(), 1);
+
+    let cli_hit_cmd = Command::new(advice_bin())
+        .arg("--registry-dir")
+        .arg(&fixture.registry_dir)
+        .arg("--cache-dir")
+        .arg(&fixture.cache_dir)
+        .arg("--project-root")
+        .arg(&fixture.project_root)
+        .arg("--context-id")
+        .arg(context_id)
+        .arg("classify")
+        .arg("--request")
+        .arg(&openai_req_1)
+        .output()
+        .expect("run subprocess openai cache hit");
+    assert!(
+        cli_hit_cmd.status.success(),
+        "subprocess openai cache hit failed: {}",
+        String::from_utf8_lossy(&cli_hit_cmd.stderr)
+    );
+    let cli_hit_stdout = String::from_utf8_lossy(&cli_hit_cmd.stdout);
+    assert!(!cli_hit_stdout.contains(raw_summary));
+    assert!(!cli_hit_stdout.contains(openai_secret));
+    let cli_hit: AdviceClassifyOutput =
+        serde_json::from_slice(&cli_hit_cmd.stdout).expect("parse subprocess classify output");
+    assert_eq!(cli_hit.source, AdviceSource::Cache);
+    assert!(!cli_hit.provider_call_performed);
+    assert_eq!(cli_hit.advice.provider, DecisionProvider::Openai);
+    assert_eq!(cli_hit.advice.difficulty, Some(Difficulty::Hard));
+
+    // 4. Separate credentials and no cross-provider reuse/fallback: Jev request for the exact same
+    //    task must NOT reuse OpenAI's cache entry or OpenAI's credential.
+    let jev_missing_cred = classify_advice(
+        &scope,
+        &jev_req_1,
+        false,
+        openai_only_vault.clone(),
+        &openai_only_client,
+    )
+    .await
+    .expect_err("jev without jev credential must fail closed without reusing openai cache/key");
+    assert_eq!(jev_missing_cred.code(), "not_configured");
+    assert_eq!(transport.recorded_requests().len(), 1);
+
+    // 5. OpenAI rate-limit error makes exactly 1 attempt (no retry), seals `Uncertain`, blocks
+    //    subprocess replay without `--refresh`, and does NOT block Jev for the same task!
+    let rate_err = classify_advice(
+        &scope,
+        &openai_req_2,
+        false,
+        openai_only_vault.clone(),
+        &openai_only_client,
+    )
+    .await
+    .expect_err("429 must fail immediately without retry");
+    assert_eq!(rate_err.code(), "rate_limited");
+    assert_eq!(transport.recorded_requests().len(), 2);
+
+    let cli_uncertain_cmd = Command::new(advice_bin())
+        .arg("--registry-dir")
+        .arg(&fixture.registry_dir)
+        .arg("--cache-dir")
+        .arg(&fixture.cache_dir)
+        .arg("--project-root")
+        .arg(&fixture.project_root)
+        .arg("--context-id")
+        .arg(context_id)
+        .arg("classify")
+        .arg("--request")
+        .arg(&openai_req_2)
+        .output()
+        .expect("run subprocess uncertain refusal");
+    assert!(!cli_uncertain_cmd.status.success());
+    let cli_uncertain_err: AdviceError =
+        serde_json::from_slice(&cli_uncertain_cmd.stderr).expect("parse uncertain err");
+    assert_eq!(
+        cli_uncertain_err.code(),
+        "uncertain_attempt_requires_refresh"
+    );
+
+    let both_vault =
+        CliMockVault::with_secrets(&[("openai-decisions", openai_secret), ("jev-api", jev_secret)]);
+    let both_client =
+        DecisionClient::with_transport(both_vault.clone(), transport.clone()).expect("client");
+
+    let jev_2_out = classify_advice(&scope, &jev_req_2, false, both_vault.clone(), &both_client)
+        .await
+        .expect("jev for same task must not be blocked by openai uncertain state");
+    assert_eq!(jev_2_out.source, AdviceSource::Provider);
+    assert_eq!(jev_2_out.advice.provider, DecisionProvider::Jev);
+    assert_eq!(transport.recorded_requests().len(), 3);
+    assert_eq!(
+        transport.recorded_requests()[2].provider,
+        DecisionProvider::Jev
+    );
+    assert_eq!(transport.recorded_requests()[2].url, JEV_CLASSIFY_URL);
+
+    // 6. OpenAI refusal response is persisted and served offline via both library and CLI subprocess.
+    let refusal = classify_advice(
+        &scope,
+        &openai_req_refusal,
+        false,
+        both_vault.clone(),
+        &both_client,
+    )
+    .await
+    .expect("openai refusal must succeed as advisory output");
+    assert_eq!(refusal.source, AdviceSource::Provider);
+    assert_eq!(refusal.advice.provider, DecisionProvider::Openai);
+    assert_eq!(refusal.advice.difficulty, None);
+    assert_eq!(refusal.advice.confidence, None);
+    assert!(refusal.advice.needs_review);
+    assert_eq!(refusal.advice.reason_code, "refusal");
+    assert_eq!(refusal.agrees_with_baseline, None);
+    assert_eq!(transport.recorded_requests().len(), 4);
+
+    let cli_refusal_hit = Command::new(advice_bin())
+        .arg("--registry-dir")
+        .arg(&fixture.registry_dir)
+        .arg("--cache-dir")
+        .arg(&fixture.cache_dir)
+        .arg("--project-root")
+        .arg(&fixture.project_root)
+        .arg("--context-id")
+        .arg(context_id)
+        .arg("classify")
+        .arg("--request")
+        .arg(&openai_req_refusal)
+        .output()
+        .expect("run subprocess cached refusal");
+    assert!(
+        cli_refusal_hit.status.success(),
+        "subprocess cached refusal failed: {}",
+        String::from_utf8_lossy(&cli_refusal_hit.stderr)
+    );
+    let cli_refusal_out: AdviceClassifyOutput =
+        serde_json::from_slice(&cli_refusal_hit.stdout).expect("parse cached refusal output");
+    assert_eq!(cli_refusal_out.source, AdviceSource::Cache);
+    assert!(!cli_refusal_out.provider_call_performed);
+    assert_eq!(cli_refusal_out.advice.provider, DecisionProvider::Openai);
+    assert_eq!(cli_refusal_out.advice.reason_code, "refusal");
+    assert_eq!(cli_refusal_out.agrees_with_baseline, None);
+
+    // 7. Cross-provider tampering on OpenAI's persisted cache file is refused by subprocess with `corrupt_cache`.
+    let mut tampered = persisted_val;
+    tampered["provider"] = serde_json::Value::String("jev".to_string());
+    fs::write(
+        &record_path,
+        serde_json::to_vec_pretty(&tampered).expect("serialize tampered openai record"),
+    )
+    .expect("write tampered openai record");
+    fs::set_permissions(&record_path, fs::Permissions::from_mode(0o600))
+        .expect("chmod 0600 tampered openai record");
+
+    let cli_tampered_cmd = Command::new(advice_bin())
+        .arg("--registry-dir")
+        .arg(&fixture.registry_dir)
+        .arg("--cache-dir")
+        .arg(&fixture.cache_dir)
+        .arg("--project-root")
+        .arg(&fixture.project_root)
+        .arg("--context-id")
+        .arg(context_id)
+        .arg("classify")
+        .arg("--request")
+        .arg(&openai_req_1)
+        .output()
+        .expect("run subprocess tampered cache refusal");
+    assert!(!cli_tampered_cmd.status.success());
+    let cli_tampered_err: AdviceError =
+        serde_json::from_slice(&cli_tampered_cmd.stderr).expect("parse tampered err");
+    assert_eq!(cli_tampered_err.code(), "corrupt_cache");
 }

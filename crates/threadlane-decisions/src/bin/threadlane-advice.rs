@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-//! `threadlane-advice`: shadow-mode Jev difficulty classification and catalog CLI.
+//! `threadlane-advice`: shadow-mode difficulty classification (Jev and OpenAI Decisions) and Jev catalog CLI.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -18,7 +18,7 @@ use threadlane_decisions::{
 #[command(
     name = "threadlane-advice",
     version,
-    about = "Shadow-mode Jev difficulty advice and catalog CLI for Threadlane",
+    about = "Shadow-mode difficulty advice (Jev and OpenAI Decisions) and Jev catalog CLI for Threadlane",
     disable_help_subcommand = true
 )]
 struct AdviceCli {
@@ -42,7 +42,7 @@ struct AdviceCli {
     #[arg(long = "cache-ttl-seconds", value_name = "SECONDS", global = true)]
     cache_ttl_seconds: Option<u64>,
 
-    /// Optional workflow profile identifier whose configured shadow decision advisor must match the request.
+    /// Optional workflow profile identifier whose configured Jev shadow decision advisor must match the request.
     #[arg(long = "profile-id", value_name = "ID", global = true)]
     profile_id: Option<String>,
 
@@ -52,13 +52,13 @@ struct AdviceCli {
 
 #[derive(Debug, Subcommand)]
 enum AdviceCommand {
-    /// Validate and preview the selected Jev provider/model and task summary offline.
+    /// Validate and preview the selected Jev or OpenAI Decisions provider/model and task summary offline.
     Preview {
         /// Absolute path to the private advice request JSON file.
         #[arg(long = "request", value_name = "ABS")]
         request: PathBuf,
     },
-    /// Execute a single-attempt shadow Jev difficulty classification or return a completed cache hit.
+    /// Execute a single-attempt shadow Jev or OpenAI Decisions difficulty classification or return a completed cache hit.
     Classify {
         /// Absolute path to the private advice request JSON file.
         #[arg(long = "request", value_name = "ABS")]

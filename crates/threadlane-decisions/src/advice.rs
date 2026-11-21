@@ -23,13 +23,13 @@ use threadlane_registry::{
 use crate::client::DecisionClient;
 use crate::error::DecisionError;
 use crate::schema::{
-    is_supported_jev_model, JevCatalogEntry, EASY_DESCRIPTION, EXTREME_DESCRIPTION,
-    HARD_DESCRIPTION, JEV_INSTRUCTIONS, MAX_IDENTIFIER_BYTES, MAX_TASK_SUMMARY_BYTES,
-    MEDIUM_DESCRIPTION, QUESTION_NAME,
+    is_supported_jev_model, is_supported_openai_decision_model, JevCatalogEntry, EASY_DESCRIPTION,
+    EXTREME_DESCRIPTION, HARD_DESCRIPTION, JEV_INSTRUCTIONS, MAX_IDENTIFIER_BYTES,
+    MAX_TASK_SUMMARY_BYTES, MEDIUM_DESCRIPTION, QUESTION_NAME,
 };
 use crate::types::{
-    DecisionAdvice, DecisionProvider, DecisionRequest, MAX_JS_SAFE_INTEGER,
-    MIN_CONFIDENCE_THRESHOLD,
+    DecisionAdvice, DecisionProvider, DecisionRequest, DEFAULT_OPENAI_DECISION_MODEL,
+    MAX_JS_SAFE_INTEGER, MIN_CONFIDENCE_THRESHOLD,
 };
 
 /// Schema version required in private shadow advice request files.
@@ -40,6 +40,13 @@ pub const ADVICE_CACHE_SCHEMA_VERSION: u32 = 1;
 
 /// Version identifier for the Jev shadow difficulty prompt and criteria schema.
 pub const ADVICE_PROMPT_VERSION: &str = "threadlane-jev-shadow-v1";
+
+/// Version identifier for the OpenAI Decisions shadow difficulty prompt and criteria schema.
+const OPENAI_ADVICE_PROMPT_VERSION: &str = "threadlane-openai-shadow-v1";
+
+/// Instructions string used in OpenAI Decisions choice requests (matches `schema::OPENAI_INSTRUCTIONS`).
+const OPENAI_ADVICE_INSTRUCTIONS: &str =
+    "Select implementation difficulty from the supplied evidence.";
 
 /// Shadow execution mode label reported in all advice outputs.
 pub const ADVICE_MODE_SHADOW: &str = "shadow";
@@ -158,14 +165,21 @@ impl AdviceError {
     pub(crate) fn tool_disabled() -> Self {
         Self::new(
             "tool_disabled",
-            "Requested Jev tool is disabled in the registry snapshot.",
+            "Requested decision advisor tool is disabled in the registry snapshot.",
         )
     }
 
     pub(crate) fn unsupported_adapter() -> Self {
         Self::new(
             "unsupported_adapter",
-            "Shadow advice supports enabled jev_api tools only.",
+            "Shadow advice supports enabled jev_api and openai_decisions_api tools only.",
+        )
+    }
+
+    pub(crate) fn unsupported_jev_adapter() -> Self {
+        Self::new(
+            "unsupported_adapter",
+            "This advice operation supports enabled jev_api tools only.",
         )
     }
 
@@ -179,7 +193,7 @@ impl AdviceError {
     pub(crate) fn invalid_model() -> Self {
         Self::new(
             "invalid_model",
-            "Selected registry model does not have a valid Jev model_arg.",
+            "Selected registry model does not have a valid model_arg for the resolved provider.",
         )
     }
 
@@ -288,7 +302,7 @@ pub struct AdviceRequest {
     pub schema_version: u32,
     /// Positive registry revision expected by the caller.
     pub expected_registry_revision: u64,
-    /// Registry tool identifier for an enabled `jev_api` tool.
+    /// Registry tool identifier for an enabled `jev_api` or `openai_decisions_api` tool.
     pub tool_id: String,
     /// Registry model identifier belonging to `tool_id`.
     pub model_id: String,
@@ -325,7 +339,7 @@ impl std::fmt::Debug for AdviceRequest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AdviceSource {
-    /// Newly classified via a single-attempt Jev System One API call.
+    /// Newly classified via a single-attempt decision provider API call.
     Provider,
     /// Served from a validated, non-expired completed cache record without network or vault access.
     Cache,
@@ -357,7 +371,7 @@ pub struct AdvicePreviewOutput {
     pub tool_id: String,
     /// Validated registry model identifier.
     pub model_id: String,
-    /// Resolved decision provider (`"jev"`).
+    /// Resolved decision provider (`"jev"` or `"openai"`).
     pub provider: DecisionProvider,
     /// Exact `model_arg` resolved from the registry snapshot.
     pub requested_model: String,
@@ -488,6 +502,8 @@ struct PersistedCacheRecord {
     registry_revision: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     profile_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    provider: Option<DecisionProvider>,
     tool_id: String,
     model_id: String,
     requested_model: String,
@@ -577,11 +593,11 @@ pub(crate) fn preview_advice_with_options(
     let snapshot =
         read_readonly_registry_snapshot(&validated_scope.registry_dir, options.expected_uid)?;
     let resolved =
-        resolve_jev_tool_and_model(&snapshot, &request, validated_scope.profile_id.as_deref())?;
+        resolve_advice_tool_and_model(&snapshot, &request, validated_scope.profile_id.as_deref())?;
 
     let summary_sha256 = sha256_hex(request.normalized_summary.as_bytes());
-    let prompt_digest = compute_prompt_digest();
-    let cache_key = compute_cache_key(
+    let prompt_digest = compute_prompt_digest_for_provider(resolved.provider);
+    let cache_key = compute_cache_key_for_provider(
         &prompt_digest,
         &validated_scope.project_root_str,
         &validated_scope.context_id,
@@ -589,6 +605,7 @@ pub(crate) fn preview_advice_with_options(
         request.raw.task_revision,
         &summary_sha256,
         request.raw.expected_registry_revision,
+        resolved.provider,
         &resolved.tool_id,
         &resolved.model_id,
         &resolved.requested_model,
@@ -605,7 +622,7 @@ pub(crate) fn preview_advice_with_options(
         profile_id: resolved.profile_id,
         tool_id: resolved.tool_id,
         model_id: resolved.model_id,
-        provider: DecisionProvider::Jev,
+        provider: resolved.provider,
         requested_model: resolved.requested_model,
         task_id: request.raw.task_id,
         task_revision: request.raw.task_revision,
@@ -694,16 +711,16 @@ pub(crate) async fn classify_advice_with_options(
     let request = read_and_validate_request_file(request_path, options.expected_uid)?;
     let initial_snapshot =
         read_readonly_registry_snapshot(&preflight_scope.registry_dir, options.expected_uid)?;
-    let resolved = resolve_jev_tool_and_model(
+    let resolved = resolve_advice_tool_and_model(
         &initial_snapshot,
         &request,
         preflight_scope.profile_id.as_deref(),
     )?;
 
     let summary_sha256 = sha256_hex(request.normalized_summary.as_bytes());
-    let prompt_digest = compute_prompt_digest();
+    let prompt_digest = compute_prompt_digest_for_provider(resolved.provider);
     let project_root_sha256 = sha256_hex(preflight_scope.project_root_str.as_bytes());
-    let cache_key = compute_cache_key(
+    let cache_key = compute_cache_key_for_provider(
         &prompt_digest,
         &preflight_scope.project_root_str,
         &preflight_scope.context_id,
@@ -711,6 +728,7 @@ pub(crate) async fn classify_advice_with_options(
         request.raw.task_revision,
         &summary_sha256,
         request.raw.expected_registry_revision,
+        resolved.provider,
         &resolved.tool_id,
         &resolved.model_id,
         &resolved.requested_model,
@@ -734,6 +752,7 @@ pub(crate) async fn classify_advice_with_options(
         summary_sha256: summary_sha256.clone(),
         registry_revision: request.raw.expected_registry_revision,
         profile_id: resolved.profile_id.clone(),
+        provider: persisted_record_provider(resolved.provider),
         tool_id: resolved.tool_id.clone(),
         model_id: resolved.model_id.clone(),
         requested_model: resolved.requested_model.clone(),
@@ -775,6 +794,7 @@ pub(crate) async fn classify_advice_with_options(
                 &summary_sha256,
                 request.raw.expected_registry_revision,
                 resolved.profile_id.as_deref(),
+                resolved.provider,
                 &resolved.tool_id,
                 &resolved.model_id,
                 &resolved.requested_model,
@@ -803,10 +823,11 @@ pub(crate) async fn classify_advice_with_options(
                     let cache_age_ms = now_ms.saturating_sub(*completed_at_ms);
                     let is_expired = cache_age_ms > ttl_ms;
                     if !is_expired && !refresh {
-                        let agrees_with_baseline = request
-                            .raw
-                            .baseline_difficulty
-                            .map(|baseline| advice.difficulty == Some(baseline));
+                        let agrees_with_baseline =
+                            match (request.raw.baseline_difficulty, advice.difficulty) {
+                                (Some(baseline), Some(classified)) => Some(classified == baseline),
+                                _ => None,
+                            };
                         let elapsed_ms =
                             (started.elapsed().as_millis() as u64).min(MAX_JS_SAFE_INTEGER);
                         let output = AdviceClassifyOutput {
@@ -834,6 +855,7 @@ pub(crate) async fn classify_advice_with_options(
                         let mut obs_tracker = AdviceObservationTracker::new(
                             &validated_scope,
                             &output.task_id,
+                            resolved.provider,
                             &output.tool_id,
                             &output.requested_model,
                             options.now_ms_override,
@@ -906,12 +928,13 @@ pub(crate) async fn classify_advice_with_options(
     }
 
     // 5. Append observation `Entry` immediately before the provider call begins, then execute
-    //    single-attempt Jev classification while holding only `key_lock` (never `.cache.lock`).
+    //    single-attempt provider classification while holding only `key_lock` (never `.cache.lock`).
     //    Any error or cancellation at or after this point may have incurred a paid API call and
     //    must remain `Pending` or `Uncertain` on disk and resolve observation state to `Unknown`.
     let mut obs_tracker = AdviceObservationTracker::new(
         &validated_scope,
         &request.raw.task_id,
+        resolved.provider,
         &resolved.tool_id,
         &resolved.requested_model,
         options.now_ms_override,
@@ -921,7 +944,7 @@ pub(crate) async fn classify_advice_with_options(
     let classify_res = client
         .classify(DecisionRequest {
             tool_id: resolved.tool_id.clone(),
-            provider: DecisionProvider::Jev,
+            provider: resolved.provider,
             model: resolved.requested_model.clone(),
             task_summary: request.normalized_summary.clone(),
         })
@@ -954,17 +977,20 @@ pub(crate) async fn classify_advice_with_options(
         }
     };
 
-    // 6. Recheck registry revision and tool/model resolution after the API call before
-    //    treating advice as current.
+    // 6. Verify provider/model response compatibility and recheck registry revision and
+    //    tool/model resolution after the API call before treating advice as current.
     let post_check = (|| -> Result<(), AdviceError> {
+        validate_persisted_advice(&advice, resolved.provider, &resolved.requested_model)
+            .map_err(|_| AdviceError::from(DecisionError::InvalidResponse))?;
         let post_snapshot =
             read_readonly_registry_snapshot(&validated_scope.registry_dir, options.expected_uid)?;
-        let post_resolved = resolve_jev_tool_and_model(
+        let post_resolved = resolve_advice_tool_and_model(
             &post_snapshot,
             &request,
             validated_scope.profile_id.as_deref(),
         )?;
         if post_resolved.profile_id != resolved.profile_id
+            || post_resolved.provider != resolved.provider
             || post_resolved.tool_id != resolved.tool_id
             || post_resolved.model_id != resolved.model_id
             || post_resolved.requested_model != resolved.requested_model
@@ -1026,10 +1052,10 @@ pub(crate) async fn classify_advice_with_options(
         return Err(pub_err);
     }
 
-    let agrees_with_baseline = request
-        .raw
-        .baseline_difficulty
-        .map(|baseline| advice.difficulty == Some(baseline));
+    let agrees_with_baseline = match (request.raw.baseline_difficulty, advice.difficulty) {
+        (Some(baseline), Some(classified)) => Some(classified == baseline),
+        _ => None,
+    };
     let elapsed_ms = (started.elapsed().as_millis() as u64).min(MAX_JS_SAFE_INTEGER);
 
     let output = AdviceClassifyOutput {
@@ -1066,6 +1092,7 @@ struct AdviceObservationTracker {
     plan_id: Option<String>,
     context_id: String,
     task_id: String,
+    provider: DecisionProvider,
     tool_id: String,
     requested_model: String,
     now_ms_override: Option<u64>,
@@ -1077,6 +1104,7 @@ impl AdviceObservationTracker {
     fn new(
         scope: &ValidatedScope,
         task_id: &str,
+        provider: DecisionProvider,
         tool_id: &str,
         requested_model: &str,
         now_ms_override: Option<u64>,
@@ -1097,6 +1125,7 @@ impl AdviceObservationTracker {
             plan_id: read_env_plan_id(),
             context_id: scope.context_id.clone(),
             task_id: task_id.to_string(),
+            provider,
             tool_id: tool_id.to_string(),
             requested_model: requested_model.to_string(),
             now_ms_override,
@@ -1109,10 +1138,17 @@ impl AdviceObservationTracker {
         ObservationActor::unknown(Some("advice_engine".to_string()))
     }
 
+    fn provider_display_name(&self) -> &'static str {
+        match self.provider {
+            DecisionProvider::Jev => "Jev",
+            DecisionProvider::Openai => "OpenAI Decisions",
+        }
+    }
+
     fn executor(&self, observed_model: Option<String>) -> ObservationExecutor {
         ObservationExecutor {
             tool: Some(self.tool_id.clone()),
-            provider: Some("jev".to_string()),
+            provider: Some(self.provider.as_str().to_string()),
             role: None,
             requested_model: Some(self.requested_model.clone()),
             observed_model,
@@ -1131,7 +1167,8 @@ impl AdviceObservationTracker {
         };
         let at_ms = i64::try_from(started_at_ms).unwrap_or_else(|_| current_observation_time_ms());
         let summary = sanitize_observation_summary(&format!(
-            "Jev classify: requested={}",
+            "{} classify: requested={}",
+            self.provider_display_name(),
             self.requested_model
         ));
         let record = ObservationJournalRecord {
@@ -1202,8 +1239,11 @@ impl AdviceObservationTracker {
             }
         };
         let summary = sanitize_observation_summary(&format!(
-            "Jev classify ({provenance}): requested={}, observed={}, reason={}",
-            output.requested_model, output.advice.model, output.advice.reason_code
+            "{} classify ({provenance}): requested={}, observed={}, reason={}",
+            self.provider_display_name(),
+            output.requested_model,
+            output.advice.model,
+            output.advice.reason_code
         ));
         let record = ObservationJournalRecord {
             record_id: generate_observation_id("obsrec"),
@@ -1249,8 +1289,10 @@ impl AdviceObservationTracker {
             return;
         };
         let at_ms = i64::try_from(failed_at_ms).unwrap_or_else(|_| current_observation_time_ms());
-        let summary =
-            sanitize_observation_summary(&format!("Jev classify outcome unknown ({error_code})"));
+        let summary = sanitize_observation_summary(&format!(
+            "{} classify outcome unknown ({error_code})",
+            self.provider_display_name()
+        ));
         let record = ObservationJournalRecord {
             record_id: generate_observation_id("obsrec"),
             request_id: self.request_id.clone(),
@@ -1480,8 +1522,9 @@ struct ValidatedAdviceRequest {
 }
 
 #[derive(Debug, Clone)]
-struct ResolvedJevTarget {
+struct ResolvedAdviceTarget {
     profile_id: Option<String>,
+    provider: DecisionProvider,
     tool_id: String,
     model_id: String,
     requested_model: String,
@@ -1999,6 +2042,43 @@ fn read_readonly_registry_snapshot(
     })
 }
 
+fn is_supported_model_for_provider(provider: DecisionProvider, model: &str) -> bool {
+    match provider {
+        DecisionProvider::Jev => is_supported_jev_model(model),
+        DecisionProvider::Openai => is_supported_openai_decision_model(model),
+    }
+}
+
+fn is_valid_echoed_model_for_provider(
+    provider: DecisionProvider,
+    requested_model: &str,
+    echoed_model: &str,
+) -> bool {
+    if echoed_model.trim() != echoed_model
+        || !is_supported_model_for_provider(provider, echoed_model)
+    {
+        return false;
+    }
+    match provider {
+        DecisionProvider::Jev => {
+            matches!(requested_model, "jev-latest" | "jev-preview")
+                || echoed_model == requested_model
+        }
+        DecisionProvider::Openai => {
+            echoed_model == requested_model
+                || (requested_model == DEFAULT_OPENAI_DECISION_MODEL
+                    && echoed_model.starts_with("gpt-6-luna-"))
+        }
+    }
+}
+
+fn persisted_record_provider(provider: DecisionProvider) -> Option<DecisionProvider> {
+    match provider {
+        DecisionProvider::Jev => None,
+        DecisionProvider::Openai => Some(DecisionProvider::Openai),
+    }
+}
+
 fn validate_enabled_jev_tool(
     snapshot: &RegistrySnapshot,
     tool_id: &str,
@@ -2010,7 +2090,7 @@ fn validate_enabled_jev_tool(
         .ok_or_else(AdviceError::tool_not_found)?;
 
     if tool.adapter != ToolAdapter::JevApi {
-        return Err(AdviceError::unsupported_adapter());
+        return Err(AdviceError::unsupported_jev_adapter());
     }
 
     if !tool.enabled {
@@ -2020,16 +2100,39 @@ fn validate_enabled_jev_tool(
     Ok(())
 }
 
-fn resolve_jev_tool_and_model(
+fn validate_enabled_decision_tool(
+    snapshot: &RegistrySnapshot,
+    tool_id: &str,
+) -> Result<DecisionProvider, AdviceError> {
+    let tool = snapshot
+        .tools
+        .iter()
+        .find(|candidate| candidate.id == tool_id)
+        .ok_or_else(AdviceError::tool_not_found)?;
+
+    let provider = match tool.adapter {
+        ToolAdapter::JevApi => DecisionProvider::Jev,
+        ToolAdapter::OpenaiDecisionsApi => DecisionProvider::Openai,
+        _ => return Err(AdviceError::unsupported_adapter()),
+    };
+
+    if !tool.enabled {
+        return Err(AdviceError::tool_disabled());
+    }
+
+    Ok(provider)
+}
+
+fn resolve_advice_tool_and_model(
     snapshot: &RegistrySnapshot,
     request: &ValidatedAdviceRequest,
     profile_id: Option<&str>,
-) -> Result<ResolvedJevTarget, AdviceError> {
+) -> Result<ResolvedAdviceTarget, AdviceError> {
     if snapshot.revision != request.raw.expected_registry_revision {
         return Err(AdviceError::stale_registry_revision());
     }
 
-    let resolved_profile_id = if let Some(expected_profile_id) = profile_id {
+    let (resolved_profile_id, provider) = if let Some(expected_profile_id) = profile_id {
         let profile = snapshot
             .profiles
             .iter()
@@ -2060,7 +2163,7 @@ fn resolve_jev_tool_and_model(
             .ok_or_else(AdviceError::tool_not_found)?;
 
         if advisor_tool.adapter != ToolAdapter::JevApi {
-            return Err(AdviceError::unsupported_adapter());
+            return Err(AdviceError::unsupported_jev_adapter());
         }
 
         if !advisor_tool.enabled {
@@ -2078,10 +2181,10 @@ fn resolve_jev_tool_and_model(
             return Err(AdviceError::profile_advisor_mismatch());
         }
 
-        Some(profile.id.clone())
+        (Some(profile.id.clone()), DecisionProvider::Jev)
     } else {
-        validate_enabled_jev_tool(snapshot, &request.raw.tool_id)?;
-        None
+        let provider = validate_enabled_decision_tool(snapshot, &request.raw.tool_id)?;
+        (None, provider)
     };
 
     let model = snapshot
@@ -2093,12 +2196,15 @@ fn resolve_jev_tool_and_model(
         .ok_or_else(AdviceError::model_not_found)?;
 
     let requested_model = model.model_arg.trim();
-    if requested_model != model.model_arg || !is_supported_jev_model(requested_model) {
+    if requested_model != model.model_arg
+        || !is_supported_model_for_provider(provider, requested_model)
+    {
         return Err(AdviceError::invalid_model());
     }
 
-    Ok(ResolvedJevTarget {
+    Ok(ResolvedAdviceTarget {
         profile_id: resolved_profile_id,
+        provider,
         tool_id: request.raw.tool_id.clone(),
         model_id: model.id.clone(),
         requested_model: requested_model.to_string(),
@@ -2122,15 +2228,29 @@ fn hash_len_prefixed(hasher: &mut Sha256, field: &[u8]) {
     hasher.update(field);
 }
 
-fn compute_prompt_digest() -> String {
+fn compute_prompt_digest_for_provider(provider: DecisionProvider) -> String {
     let mut hasher = Sha256::new();
-    hash_len_prefixed(&mut hasher, ADVICE_PROMPT_VERSION.as_bytes());
-    hash_len_prefixed(&mut hasher, QUESTION_NAME.as_bytes());
-    hash_len_prefixed(&mut hasher, JEV_INSTRUCTIONS.as_bytes());
-    hash_len_prefixed(&mut hasher, EASY_DESCRIPTION.as_bytes());
-    hash_len_prefixed(&mut hasher, MEDIUM_DESCRIPTION.as_bytes());
-    hash_len_prefixed(&mut hasher, HARD_DESCRIPTION.as_bytes());
-    hash_len_prefixed(&mut hasher, EXTREME_DESCRIPTION.as_bytes());
+    match provider {
+        DecisionProvider::Jev => {
+            hash_len_prefixed(&mut hasher, ADVICE_PROMPT_VERSION.as_bytes());
+            hash_len_prefixed(&mut hasher, QUESTION_NAME.as_bytes());
+            hash_len_prefixed(&mut hasher, JEV_INSTRUCTIONS.as_bytes());
+            hash_len_prefixed(&mut hasher, EASY_DESCRIPTION.as_bytes());
+            hash_len_prefixed(&mut hasher, MEDIUM_DESCRIPTION.as_bytes());
+            hash_len_prefixed(&mut hasher, HARD_DESCRIPTION.as_bytes());
+            hash_len_prefixed(&mut hasher, EXTREME_DESCRIPTION.as_bytes());
+        }
+        DecisionProvider::Openai => {
+            hash_len_prefixed(&mut hasher, OPENAI_ADVICE_PROMPT_VERSION.as_bytes());
+            hash_len_prefixed(&mut hasher, DecisionProvider::Openai.as_str().as_bytes());
+            hash_len_prefixed(&mut hasher, QUESTION_NAME.as_bytes());
+            hash_len_prefixed(&mut hasher, OPENAI_ADVICE_INSTRUCTIONS.as_bytes());
+            hash_len_prefixed(&mut hasher, EASY_DESCRIPTION.as_bytes());
+            hash_len_prefixed(&mut hasher, MEDIUM_DESCRIPTION.as_bytes());
+            hash_len_prefixed(&mut hasher, HARD_DESCRIPTION.as_bytes());
+            hash_len_prefixed(&mut hasher, EXTREME_DESCRIPTION.as_bytes());
+        }
+    }
     let digest = hasher.finalize();
     let mut out = String::with_capacity(64);
     for byte in digest {
@@ -2140,6 +2260,7 @@ fn compute_prompt_digest() -> String {
     out
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn compute_cache_key(
     prompt_digest: &str,
@@ -2149,6 +2270,37 @@ pub(crate) fn compute_cache_key(
     task_revision: u64,
     summary_sha256: &str,
     registry_revision: u64,
+    tool_id: &str,
+    model_id: &str,
+    requested_model: &str,
+    profile_id: Option<&str>,
+) -> String {
+    compute_cache_key_for_provider(
+        prompt_digest,
+        canonical_project_root,
+        context_id,
+        task_id,
+        task_revision,
+        summary_sha256,
+        registry_revision,
+        DecisionProvider::Jev,
+        tool_id,
+        model_id,
+        requested_model,
+        profile_id,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn compute_cache_key_for_provider(
+    prompt_digest: &str,
+    canonical_project_root: &str,
+    context_id: &str,
+    task_id: &str,
+    task_revision: u64,
+    summary_sha256: &str,
+    registry_revision: u64,
+    provider: DecisionProvider,
     tool_id: &str,
     model_id: &str,
     requested_model: &str,
@@ -2169,6 +2321,10 @@ pub(crate) fn compute_cache_key(
     if let Some(profile_id) = profile_id {
         hash_len_prefixed(&mut hasher, b"profile_id");
         hash_len_prefixed(&mut hasher, profile_id.as_bytes());
+    }
+    if provider != DecisionProvider::Jev {
+        hash_len_prefixed(&mut hasher, b"provider");
+        hash_len_prefixed(&mut hasher, provider.as_str().as_bytes());
     }
     let digest = hasher.finalize();
     let mut out = String::with_capacity(64);
@@ -2706,6 +2862,7 @@ fn read_and_validate_cache_record(
     expected_summary_sha256: &str,
     expected_registry_revision: u64,
     expected_profile_id: Option<&str>,
+    expected_provider: DecisionProvider,
     expected_tool_id: &str,
     expected_model_id: &str,
     expected_requested_model: &str,
@@ -2723,6 +2880,11 @@ fn read_and_validate_cache_record(
     let record: PersistedCacheRecord =
         serde_json::from_slice(&bytes).map_err(|_| AdviceError::corrupt_cache())?;
 
+    let provider_matches = match expected_provider {
+        DecisionProvider::Jev => matches!(record.provider, None | Some(DecisionProvider::Jev)),
+        DecisionProvider::Openai => record.provider == Some(DecisionProvider::Openai),
+    };
+
     if record.schema_version != ADVICE_CACHE_SCHEMA_VERSION
         || record.prompt_digest != expected_prompt_digest
         || record.cache_key != expected_cache_key
@@ -2733,6 +2895,7 @@ fn read_and_validate_cache_record(
         || record.summary_sha256 != expected_summary_sha256
         || record.registry_revision != expected_registry_revision
         || record.profile_id.as_deref() != expected_profile_id
+        || !provider_matches
         || record.tool_id != expected_tool_id
         || record.model_id != expected_model_id
         || record.requested_model != expected_requested_model
@@ -2769,37 +2932,53 @@ fn read_and_validate_cache_record(
             if attempt_id.trim().is_empty() || *completed_at_ms > MAX_JS_SAFE_INTEGER {
                 return Err(AdviceError::corrupt_cache());
             }
-            validate_persisted_advice(advice)?;
+            validate_persisted_advice(advice, expected_provider, expected_requested_model)?;
         }
     }
 
     Ok(record)
 }
 
-fn validate_persisted_advice(advice: &DecisionAdvice) -> Result<(), AdviceError> {
-    if advice.provider != DecisionProvider::Jev {
+fn validate_persisted_advice(
+    advice: &DecisionAdvice,
+    expected_provider: DecisionProvider,
+    expected_requested_model: &str,
+) -> Result<(), AdviceError> {
+    if advice.provider != expected_provider {
         return Err(AdviceError::corrupt_cache());
     }
-    if !is_supported_jev_model(advice.model.trim()) || advice.model.trim() != advice.model {
+    if !is_valid_echoed_model_for_provider(
+        expected_provider,
+        expected_requested_model,
+        &advice.model,
+    ) {
         return Err(AdviceError::corrupt_cache());
     }
-    if advice.difficulty.is_none() {
-        return Err(AdviceError::corrupt_cache());
-    }
-    let Some(confidence) = advice.confidence else {
-        return Err(AdviceError::corrupt_cache());
-    };
-    if !confidence.is_finite() || !(0.0..=1.0).contains(&confidence) {
-        return Err(AdviceError::corrupt_cache());
-    }
-    let expected_needs_review = confidence < MIN_CONFIDENCE_THRESHOLD;
-    let expected_reason_code = if expected_needs_review {
-        "low_confidence"
+    if expected_provider == DecisionProvider::Openai && advice.reason_code == "refusal" {
+        if advice.difficulty.is_some() || advice.confidence.is_some() || !advice.needs_review {
+            return Err(AdviceError::corrupt_cache());
+        }
     } else {
-        "classified"
-    };
-    if advice.needs_review != expected_needs_review || advice.reason_code != expected_reason_code {
-        return Err(AdviceError::corrupt_cache());
+        if advice.difficulty.is_none() {
+            return Err(AdviceError::corrupt_cache());
+        }
+        let Some(confidence) = advice.confidence else {
+            return Err(AdviceError::corrupt_cache());
+        };
+        if !confidence.is_finite() || !(0.0..=1.0).contains(&confidence) {
+            return Err(AdviceError::corrupt_cache());
+        }
+        let expected_needs_review = confidence < MIN_CONFIDENCE_THRESHOLD;
+        let expected_reason_code = if expected_needs_review {
+            "low_confidence"
+        } else {
+            "classified"
+        };
+        if advice.needs_review != expected_needs_review
+            || advice.reason_code != expected_reason_code
+        {
+            return Err(AdviceError::corrupt_cache());
+        }
     }
     if let Some(inp) = advice.input_tokens {
         if inp > MAX_JS_SAFE_INTEGER {
@@ -2973,7 +3152,8 @@ mod tests {
     use threadlane_registry::{ModelDefinition, RegistryChange, ToolDefinition};
 
     use crate::transport::{
-        DecisionTransport, TransportFuture, TransportRequest, TransportResponse,
+        DecisionTransport, TransportFuture, TransportMethod, TransportRequest, TransportResponse,
+        JEV_CLASSIFY_URL, OPENAI_CLASSIFY_URL,
     };
 
     static ADVICE_TEST_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -3106,6 +3286,52 @@ mod tests {
                 .expect("upsert jev model");
             snap.revision
         }
+
+        fn seed_jev_and_openai_registry(&self) -> u64 {
+            let rev = self.seed_jev_registry();
+            let store =
+                RegistryStore::open(self.registry_dir.clone()).expect("open registry store");
+            let s1 = store
+                .apply(
+                    rev,
+                    RegistryChange::UpsertTool {
+                        tool: ToolDefinition {
+                            id: "openai-decisions".to_string(),
+                            label: "OpenAI Decisions API".to_string(),
+                            adapter: ToolAdapter::OpenaiDecisionsApi,
+                            executable_path: None,
+                            enabled: true,
+                        },
+                    },
+                )
+                .expect("upsert openai tool");
+            let s2 = store
+                .apply(
+                    s1.revision,
+                    RegistryChange::UpsertModels {
+                        models: vec![
+                            ModelDefinition {
+                                id: "openai-decisions:gpt-6-luna".to_string(),
+                                tool_id: "openai-decisions".to_string(),
+                                label: "gpt-6-luna".to_string(),
+                                model_arg: "gpt-6-luna".to_string(),
+                                efforts: Vec::new(),
+                                allow_no_effort: true,
+                            },
+                            ModelDefinition {
+                                id: "openai-decisions:gpt-6-luna-2026-10-01".to_string(),
+                                tool_id: "openai-decisions".to_string(),
+                                label: "gpt-6-luna-2026-10-01".to_string(),
+                                model_arg: "gpt-6-luna-2026-10-01".to_string(),
+                                efforts: Vec::new(),
+                                allow_no_effort: true,
+                            },
+                        ],
+                    },
+                )
+                .expect("upsert openai models");
+            s2.revision
+        }
     }
 
     impl Drop for AdviceObsTestWorkspace {
@@ -3117,21 +3343,34 @@ mod tests {
     #[derive(Default)]
     struct MockVault {
         secrets: Mutex<HashMap<String, String>>,
+        reads: Mutex<usize>,
     }
 
     impl MockVault {
         fn with_secret(tool_id: &str, secret: &str) -> Arc<Self> {
+            Self::with_secrets(&[(tool_id, secret)])
+        }
+
+        fn with_secrets(pairs: &[(&str, &str)]) -> Arc<Self> {
             let mut map = HashMap::new();
-            map.insert(tool_id.to_string(), secret.to_string());
+            for (tool_id, secret) in pairs {
+                map.insert((*tool_id).to_string(), (*secret).to_string());
+            }
             Arc::new(Self {
                 secrets: Mutex::new(map),
+                reads: Mutex::new(0),
             })
         }
 
         fn empty() -> Arc<Self> {
             Arc::new(Self {
                 secrets: Mutex::new(HashMap::new()),
+                reads: Mutex::new(0),
             })
+        }
+
+        fn read_count(&self) -> usize {
+            *self.reads.lock().expect("reads lock")
         }
     }
 
@@ -3145,6 +3384,7 @@ mod tests {
         }
 
         fn get(&self, tool_id: &str) -> Result<Option<String>, ConnectorError> {
+            *self.reads.lock().expect("reads lock") += 1;
             Ok(self
                 .secrets
                 .lock()
@@ -3174,6 +3414,7 @@ mod tests {
 
     #[derive(Default)]
     struct MockTransport {
+        requests: Mutex<Vec<TransportRequest>>,
         responses: Mutex<VecDeque<Result<TransportResponse, DecisionError>>>,
         on_execute: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
     }
@@ -3183,6 +3424,7 @@ mod tests {
             responses: impl IntoIterator<Item = Result<TransportResponse, DecisionError>>,
         ) -> Arc<Self> {
             Arc::new(Self {
+                requests: Mutex::new(Vec::new()),
                 responses: Mutex::new(responses.into_iter().collect()),
                 on_execute: Mutex::new(None),
             })
@@ -3191,11 +3433,16 @@ mod tests {
         fn set_on_execute(&self, hook: impl Fn() + Send + Sync + 'static) {
             *self.on_execute.lock().expect("on_execute lock") = Some(Box::new(hook));
         }
+
+        fn recorded_requests(&self) -> Vec<TransportRequest> {
+            self.requests.lock().expect("requests lock").clone()
+        }
     }
 
     impl DecisionTransport for MockTransport {
-        fn execute<'a>(&'a self, _request: TransportRequest) -> TransportFuture<'a> {
+        fn execute<'a>(&'a self, request: TransportRequest) -> TransportFuture<'a> {
             Box::pin(async move {
+                self.requests.lock().expect("requests lock").push(request);
                 if let Some(hook) = self.on_execute.lock().expect("on_execute lock").as_ref() {
                     hook();
                 }
@@ -3784,5 +4031,444 @@ mod tests {
         );
         assert!(recs_3[5].usage.is_none());
         assert!(recs_3[5].delivery.is_empty());
+    }
+
+    fn mock_openai_choice_response(
+        model: &str,
+        choice: &str,
+        confidence: f64,
+        input_tokens: u64,
+        output_tokens: u64,
+    ) -> Result<TransportResponse, DecisionError> {
+        let body = format!(
+            r#"{{
+                "model": "{model}",
+                "answers": [{{
+                    "type": "choice",
+                    "name": "difficulty",
+                    "choice": "{choice}",
+                    "confidence": {confidence},
+                    "probabilities": [
+                        {{"value": "{choice}", "probability": {confidence}}}
+                    ]
+                }}],
+                "usage": {{
+                    "input_tokens": {input_tokens},
+                    "output_tokens": {output_tokens},
+                    "total_tokens": {}
+                }}
+            }}"#,
+            input_tokens + output_tokens
+        );
+        Ok(TransportResponse {
+            status: 200,
+            body: body.into_bytes(),
+        })
+    }
+
+    fn mock_openai_refusal_response(
+        model: &str,
+        input_tokens: u64,
+    ) -> Result<TransportResponse, DecisionError> {
+        let body = format!(
+            r#"{{
+                "model": "{model}",
+                "answers": [{{
+                    "type": "refusal",
+                    "name": "difficulty"
+                }}],
+                "usage": {{
+                    "input_tokens": {input_tokens},
+                    "output_tokens": 0,
+                    "total_tokens": {input_tokens}
+                }}
+            }}"#
+        );
+        Ok(TransportResponse {
+            status: 200,
+            body: body.into_bytes(),
+        })
+    }
+
+    #[tokio::test]
+    async fn openai_observation_journal_records_openai_provider_and_cache_provenance_without_leaking_secrets(
+    ) {
+        let _env_guard = ADVICE_ENV_LOCK.lock().await;
+        let _scoped_env = ScopedEnvVars::set(&[
+            (ENV_OBSERVATION_PARENT_REQUEST_ID, None),
+            (ENV_OBSERVATION_PLAN_ID, None),
+        ]);
+
+        let ws = AdviceObsTestWorkspace::new("openai-obs-journal");
+        let reg_rev = ws.seed_jev_and_openai_registry();
+        let scope = ws.scope("0196ed00-0000-7000-8000-000000000101");
+
+        let secret = "sk-openai-obs-secret-never-log-555";
+        let raw_summary = "Sensitive OpenAI task description that must stay redacted.";
+        let req_path = ws.write_private_file(
+            "openai-req.json",
+            format!(
+                r#"{{
+                    "schema_version": 1,
+                    "expected_registry_revision": {reg_rev},
+                    "tool_id": "openai-decisions",
+                    "model_id": "openai-decisions:gpt-6-luna",
+                    "task_id": "task-openai-obs",
+                    "task_revision": 1,
+                    "task_summary": "{raw_summary}",
+                    "baseline_difficulty": "easy"
+                }}"#
+            )
+            .as_bytes(),
+        );
+
+        let vault = MockVault::with_secret("openai-decisions", secret);
+        let transport = MockTransport::with_responses([mock_openai_choice_response(
+            "gpt-6-luna-2026-10-01",
+            "hard",
+            0.91,
+            115,
+            0,
+        )]);
+        let client =
+            DecisionClient::with_transport(vault.clone(), transport.clone()).expect("client");
+
+        let opts_t0 = AdviceRuntimeOptions {
+            now_ms_override: Some(1_700_000_000_000),
+            ..AdviceRuntimeOptions::default()
+        };
+        let first = classify_advice_with_options(
+            &scope,
+            &req_path,
+            false,
+            vault.clone(),
+            &client,
+            &opts_t0,
+        )
+        .await
+        .expect("openai classify should succeed");
+        assert_eq!(first.source, AdviceSource::Provider);
+        assert_eq!(first.advice.provider, DecisionProvider::Openai);
+        assert_eq!(first.advice.model, "gpt-6-luna-2026-10-01");
+        assert_eq!(first.agrees_with_baseline, Some(false));
+
+        let recorded = transport.recorded_requests();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].provider, DecisionProvider::Openai);
+        assert_eq!(recorded[0].method, TransportMethod::Post);
+        assert_eq!(recorded[0].url, OPENAI_CLASSIFY_URL);
+
+        let reads_after_provider = vault.read_count();
+        let opts_t1 = AdviceRuntimeOptions {
+            now_ms_override: Some(1_700_000_005_000),
+            ..AdviceRuntimeOptions::default()
+        };
+        let second = classify_advice_with_options(
+            &scope,
+            &req_path,
+            false,
+            vault.clone(),
+            &client,
+            &opts_t1,
+        )
+        .await
+        .expect("openai cache hit should succeed");
+        assert_eq!(second.source, AdviceSource::Cache);
+        assert_eq!(second.advice.provider, DecisionProvider::Openai);
+        assert_eq!(vault.read_count(), reads_after_provider);
+        assert_eq!(transport.recorded_requests().len(), 1);
+
+        let raw_journal = fs::read_to_string(ws.plans_dir.join(OBSERVATION_JOURNAL_FILE_NAME))
+            .expect("read raw journal");
+        assert!(!raw_journal.contains(secret));
+        assert!(!raw_journal.contains(raw_summary));
+
+        let (records, warnings) =
+            read_journal_records_readonly(&ws.plans_dir).expect("read journal");
+        assert!(warnings.is_empty());
+        assert_eq!(records.len(), 4);
+        for rec in &records {
+            let exec = rec.executor.as_ref().expect("executor present");
+            assert_eq!(exec.provider.as_deref(), Some("openai"));
+            assert_eq!(exec.tool.as_deref(), Some("openai-decisions"));
+            assert_eq!(exec.requested_model.as_deref(), Some("gpt-6-luna"));
+            assert!(rec
+                .summary
+                .as_deref()
+                .is_some_and(|s| s.starts_with("OpenAI Decisions classify")));
+        }
+        assert_eq!(
+            records[1]
+                .executor
+                .as_ref()
+                .and_then(|e| e.observed_model.as_deref()),
+            Some("gpt-6-luna-2026-10-01")
+        );
+        assert_eq!(
+            records[1].usage.as_ref().map(|u| u.provenance.as_str()),
+            Some("network_response")
+        );
+        assert_eq!(
+            records[3].usage.as_ref().map(|u| u.provenance.as_str()),
+            Some("cache_hit")
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_cache_identities_preserve_legacy_jev_and_isolate_openai_pending_refusal_and_tampering(
+    ) {
+        const GOLDEN_LEGACY_CACHE_KEY: &str =
+            "8c2e1914792f6d6402f008196d29dd7eb07ab314aa6930f7cfbd2edd8ff46614";
+        let fixed_prompt = "1111111111111111111111111111111111111111111111111111111111111111";
+        let fixed_summary = "0000000000000000000000000000000000000000000000000000000000000000";
+
+        let jev_key = compute_cache_key_for_provider(
+            fixed_prompt,
+            "/fixtures/project",
+            "ctx-profile",
+            "task1",
+            1,
+            fixed_summary,
+            17,
+            DecisionProvider::Jev,
+            "jev-api",
+            "jev-api:jev-latest",
+            "jev-latest",
+            None,
+        );
+        assert_eq!(jev_key, GOLDEN_LEGACY_CACHE_KEY);
+
+        let openai_same_inputs_key = compute_cache_key_for_provider(
+            fixed_prompt,
+            "/fixtures/project",
+            "ctx-profile",
+            "task1",
+            1,
+            fixed_summary,
+            17,
+            DecisionProvider::Openai,
+            "jev-api",
+            "jev-api:jev-latest",
+            "jev-latest",
+            None,
+        );
+        assert_ne!(openai_same_inputs_key, GOLDEN_LEGACY_CACHE_KEY);
+        assert_ne!(
+            compute_prompt_digest_for_provider(DecisionProvider::Openai),
+            compute_prompt_digest_for_provider(DecisionProvider::Jev)
+        );
+
+        let ws = AdviceObsTestWorkspace::new("provider-isolation-internal");
+        let reg_rev = ws.seed_jev_and_openai_registry();
+        let scope = ws.scope("0196ed00-0000-7000-8000-000000000102");
+
+        let jev_req = ws.write_private_file(
+            "jev.json",
+            format!(
+                r#"{{
+                    "schema_version": 1,
+                    "expected_registry_revision": {reg_rev},
+                    "tool_id": "jev-api",
+                    "model_id": "jev-api:jev-latest",
+                    "task_id": "shared-task",
+                    "task_revision": 1,
+                    "task_summary": "Shared task summary for cross-provider isolation.",
+                    "baseline_difficulty": "easy"
+                }}"#
+            )
+            .as_bytes(),
+        );
+        let openai_req = ws.write_private_file(
+            "openai.json",
+            format!(
+                r#"{{
+                    "schema_version": 1,
+                    "expected_registry_revision": {reg_rev},
+                    "tool_id": "openai-decisions",
+                    "model_id": "openai-decisions:gpt-6-luna",
+                    "task_id": "shared-task",
+                    "task_revision": 1,
+                    "task_summary": "Shared task summary for cross-provider isolation.",
+                    "baseline_difficulty": "easy"
+                }}"#
+            )
+            .as_bytes(),
+        );
+
+        let jev_preview = preview_advice(&scope, &jev_req).expect("jev preview");
+        let openai_preview = preview_advice(&scope, &openai_req).expect("openai preview");
+        assert_eq!(jev_preview.provider, DecisionProvider::Jev);
+        assert_eq!(openai_preview.provider, DecisionProvider::Openai);
+        assert_ne!(jev_preview.cache_key, openai_preview.cache_key);
+
+        let vault = MockVault::with_secrets(&[
+            ("jev-api", "jev-secret-key"),
+            ("openai-decisions", "openai-secret-key"),
+        ]);
+        let transport = MockTransport::with_responses([
+            mock_jev_response("jev-1.14.0", "easy", 0.94, (0.94, 0.03, 0.02, 0.01), 90, 8),
+            mock_openai_refusal_response("gpt-6-luna", 64),
+        ]);
+        let client =
+            DecisionClient::with_transport(vault.clone(), transport.clone()).expect("client");
+
+        // 1. Seal an abandoned OpenAI Pending record and verify it persists `"provider": "openai"`,
+        //    blocks OpenAI without `--refresh`, and does NOT block Jev for the same task.
+        let abort_opts = AdviceRuntimeOptions {
+            now_ms_override: Some(1_700_000_000_000),
+            abort_after_pending_seal: true,
+            ..AdviceRuntimeOptions::default()
+        };
+        let _ = classify_advice_with_options(
+            &scope,
+            &openai_req,
+            false,
+            vault.clone(),
+            &client,
+            &abort_opts,
+        )
+        .await
+        .expect_err("simulated crash after pending seal");
+
+        let openai_record_path = ws
+            .cache_dir
+            .join(format!("{}.json", openai_preview.cache_key));
+        let openai_pending_val: serde_json::Value = serde_json::from_slice(
+            &fs::read(&openai_record_path).expect("read openai pending record"),
+        )
+        .expect("parse openai pending record");
+        assert_eq!(openai_pending_val["provider"], "openai");
+        assert_eq!(openai_pending_val["state"]["status"], "pending");
+
+        let openai_blocked = classify_advice(&scope, &openai_req, false, vault.clone(), &client)
+            .await
+            .expect_err("openai pending must require --refresh");
+        assert_eq!(openai_blocked.code(), "pending_attempt_requires_refresh");
+        assert!(transport.recorded_requests().is_empty());
+
+        let jev_out = classify_advice_with_options(
+            &scope,
+            &jev_req,
+            false,
+            vault.clone(),
+            &client,
+            &AdviceRuntimeOptions {
+                now_ms_override: Some(1_700_000_001_000),
+                ..AdviceRuntimeOptions::default()
+            },
+        )
+        .await
+        .expect("jev must remain isolated from openai pending record");
+        assert_eq!(jev_out.source, AdviceSource::Provider);
+        assert_eq!(jev_out.advice.provider, DecisionProvider::Jev);
+        assert_eq!(transport.recorded_requests().len(), 1);
+        assert_eq!(transport.recorded_requests()[0].url, JEV_CLASSIFY_URL);
+
+        // Legacy Jev record format omits top-level `"provider"`.
+        let jev_record_path = ws.cache_dir.join(format!("{}.json", jev_preview.cache_key));
+        let jev_record_val: serde_json::Value =
+            serde_json::from_slice(&fs::read(&jev_record_path).expect("read jev completed record"))
+                .expect("parse jev completed record");
+        assert!(jev_record_val.get("provider").is_none());
+
+        // 2. Recover OpenAI with `--refresh` returning an OpenAI refusal; verify `agrees_with_baseline`
+        //    is `None` and the cached refusal validates cleanly on cache hit with zero extra IO.
+        let refusal_out = classify_advice_with_options(
+            &scope,
+            &openai_req,
+            true,
+            vault.clone(),
+            &client,
+            &AdviceRuntimeOptions {
+                now_ms_override: Some(1_700_000_002_000),
+                ..AdviceRuntimeOptions::default()
+            },
+        )
+        .await
+        .expect("openai refusal should succeed as advisory result");
+        assert_eq!(refusal_out.source, AdviceSource::Provider);
+        assert_eq!(refusal_out.advice.provider, DecisionProvider::Openai);
+        assert_eq!(refusal_out.advice.difficulty, None);
+        assert_eq!(refusal_out.advice.confidence, None);
+        assert!(refusal_out.advice.needs_review);
+        assert_eq!(refusal_out.advice.reason_code, "refusal");
+        assert_eq!(refusal_out.agrees_with_baseline, None);
+        assert_eq!(transport.recorded_requests().len(), 2);
+
+        let reads_before_hit = vault.read_count();
+        let refusal_hit = classify_advice_with_options(
+            &scope,
+            &openai_req,
+            false,
+            vault.clone(),
+            &client,
+            &AdviceRuntimeOptions {
+                now_ms_override: Some(1_700_000_003_000),
+                ..AdviceRuntimeOptions::default()
+            },
+        )
+        .await
+        .expect("cached openai refusal must validate and serve offline");
+        assert_eq!(refusal_hit.source, AdviceSource::Cache);
+        assert_eq!(refusal_hit.advice.reason_code, "refusal");
+        assert_eq!(refusal_hit.agrees_with_baseline, None);
+        assert_eq!(vault.read_count(), reads_before_hit);
+        assert_eq!(transport.recorded_requests().len(), 2);
+
+        // 3. Tampering checks: stripping `"provider"` from OpenAI record, adding `"provider": "openai"`
+        //    to Jev record, or injecting a Jev refusal must all fail closed with `corrupt_cache`.
+        let mut openai_stripped: serde_json::Value = serde_json::from_slice(
+            &fs::read(&openai_record_path).expect("read openai refusal record"),
+        )
+        .expect("parse openai refusal record");
+        openai_stripped
+            .as_object_mut()
+            .expect("json object")
+            .remove("provider");
+        fs::write(
+            &openai_record_path,
+            serde_json::to_vec_pretty(&openai_stripped).expect("serialize stripped"),
+        )
+        .expect("write stripped openai record");
+        fs::set_permissions(&openai_record_path, fs::Permissions::from_mode(0o600))
+            .expect("chmod 0600 stripped");
+        let strip_err = classify_advice(&scope, &openai_req, false, vault.clone(), &client)
+            .await
+            .expect_err("openai record missing provider must fail with corrupt_cache");
+        assert_eq!(strip_err.code(), "corrupt_cache");
+
+        let mut jev_wrong_provider = jev_record_val.clone();
+        jev_wrong_provider["provider"] = serde_json::Value::String("openai".to_string());
+        fs::write(
+            &jev_record_path,
+            serde_json::to_vec_pretty(&jev_wrong_provider).expect("serialize jev wrong provider"),
+        )
+        .expect("write jev wrong provider");
+        fs::set_permissions(&jev_record_path, fs::Permissions::from_mode(0o600))
+            .expect("chmod 0600 jev wrong provider");
+        let jev_prov_err = classify_advice(&scope, &jev_req, false, vault.clone(), &client)
+            .await
+            .expect_err("jev record with openai provider must fail with corrupt_cache");
+        assert_eq!(jev_prov_err.code(), "corrupt_cache");
+
+        let mut jev_fake_refusal = jev_record_val;
+        jev_fake_refusal["state"]["advice"]["difficulty"] = serde_json::Value::Null;
+        jev_fake_refusal["state"]["advice"]["confidence"] = serde_json::Value::Null;
+        jev_fake_refusal["state"]["advice"]["needs_review"] = serde_json::Value::Bool(true);
+        jev_fake_refusal["state"]["advice"]["reason_code"] =
+            serde_json::Value::String("refusal".to_string());
+        fs::write(
+            &jev_record_path,
+            serde_json::to_vec_pretty(&jev_fake_refusal).expect("serialize jev refusal"),
+        )
+        .expect("write jev refusal");
+        fs::set_permissions(&jev_record_path, fs::Permissions::from_mode(0o600))
+            .expect("chmod 0600 jev refusal");
+        let jev_refusal_err = classify_advice(&scope, &jev_req, false, vault.clone(), &client)
+            .await
+            .expect_err("jev record with refusal must fail with corrupt_cache");
+        assert_eq!(jev_refusal_err.code(), "corrupt_cache");
+        assert_eq!(vault.read_count(), reads_before_hit);
+        assert_eq!(transport.recorded_requests().len(), 2);
     }
 }

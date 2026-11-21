@@ -1373,15 +1373,15 @@ mod tests {
                 1,
                 RegistryChange::UpsertTool {
                     tool: ToolDefinition {
-                        id: "openai-dec".to_string(),
-                        label: "OpenAI Decisions".to_string(),
-                        adapter: ToolAdapter::OpenaiDecisionsApi,
+                        id: "codex-cli".to_string(),
+                        label: "Codex CLI".to_string(),
+                        adapter: ToolAdapter::CodexCli,
                         executable_path: None,
                         enabled: true,
                     },
                 },
             )
-            .expect("upsert openai tool");
+            .expect("upsert Codex CLI tool");
         store
             .apply(
                 2,
@@ -1402,8 +1402,8 @@ mod tests {
                 RegistryChange::UpsertModels {
                     models: vec![
                         ModelDefinition {
-                            id: "openai-dec:gpt-6-luna".to_string(),
-                            tool_id: "openai-dec".to_string(),
+                            id: "codex-cli:gpt-6-luna".to_string(),
+                            tool_id: "codex-cli".to_string(),
                             label: "gpt-6-luna".to_string(),
                             model_arg: "gpt-6-luna".to_string(),
                             efforts: Vec::new(),
@@ -1458,15 +1458,15 @@ mod tests {
             .expect_err("disabled tool must fail");
         assert_eq!(err.code(), "tool_disabled");
 
-        // 2. OpenAI Decisions tool rejected with unsupported_adapter (shadow advice route is Jev-only)
-        let openai_req = ws.write_private_file(
-            "openai.json",
+        // 2. Codex CLI tool rejected with unsupported_adapter
+        let codex_req = ws.write_private_file(
+            "codex.json",
             format!(
                 r#"{{
                     "schema_version": 1,
                     "expected_registry_revision": {rev},
-                    "tool_id": "openai-dec",
-                    "model_id": "openai-dec:gpt-6-luna",
+                    "tool_id": "codex-cli",
+                    "model_id": "codex-cli:gpt-6-luna",
                     "task_id": "t1",
                     "task_revision": 1,
                     "task_summary": "Summary."
@@ -1474,9 +1474,9 @@ mod tests {
             )
             .as_bytes(),
         );
-        let err = classify_advice(&scope, &openai_req, false, vault.clone(), &client)
+        let err = classify_advice(&scope, &codex_req, false, vault.clone(), &client)
             .await
-            .expect_err("openai adapter must be rejected on jev advice route");
+            .expect_err("CLI adapter must be rejected before credential lookup");
         assert_eq!(err.code(), "unsupported_adapter");
 
         // 3. Model belonging to a different tool rejected with model_not_found
