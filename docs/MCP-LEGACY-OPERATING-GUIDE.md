@@ -34,8 +34,14 @@ erase or silently reinterpret their frozen contracts.
     canonical `advisor` identity into the command, reservation, artifact, and
     observation title (`Advisor consultation`) and requires planning authority
     whose policy explicitly names `advisor`. The retained `consult_architect`
-    entrypoint remains available for existing callers and pre-transition
-    architect-only grants; it keeps the frozen legacy `architect` identity.
+    entrypoint keeps the frozen legacy `architect` identity and is limited to
+    pre-transition `architect` grants (or a target rule explicitly naming
+    `architect` in a valid mixed policy) plus exact immutable replay of an
+    already-persisted confirmed legacy `architect` command with its original
+    scope, grant, job, `request_key`, and payload (with no new provider effect).
+    Under a grant whose policy authorizes only canonical `advisor`, new
+    `consult_architect` requests are refused before creating any command,
+    reservation, artifact, or provider call; use `consult_advisor` instead.
     The field and outcome names are compatibility identifiers; both entrypoints
     produce advisory-only output (`untrusted_data: true`) until explicitly
     accepted into the work brief via `prepare_work`.
@@ -49,7 +55,8 @@ erase or silently reinterpret their frozen contracts.
     `advisor` produces current Advisor round reservations; a pre-transition
     `architect` policy keeps the legacy reservation identity. Explicit `0` keeps
     automatic rounds disabled, and `Coworker` may still call `consult_advisor`
-    (or the retained `consult_architect`) directly before planning. Open
+    (or the retained `consult_architect` under a pre-transition `architect`
+    grant) directly before planning. Open
     technical questions and `proposed_additions` are allowed into technical
     planning, while execution approval remains blocked until open questions and
     unconfirmed proposals are resolved.

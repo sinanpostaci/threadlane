@@ -3877,24 +3877,38 @@ mod tests {
             "tool_disabled"
         );
 
-        // 8. Profile configured with OpenAI Decisions advisor rejected with `unsupported_adapter`
-        //    (both when request matches the OpenAI advisor and when request names a Jev tool).
+        // 8. Profile configured with OpenAI Decisions advisor succeeds in preview when the
+        //    request matches the profile's tool/model without vault, network, or cache work,
+        //    and rejects a mismatched Jev request with `profile_advisor_mismatch`.
         let scope_openai = ws.scope_with_profile("ctx-ref", "profile-openai");
-        for req in [&req_openai, &req_jev_latest] {
-            assert_eq!(
-                preview_advice(&scope_openai, req)
-                    .expect_err("openai advisor preview must fail with unsupported_adapter")
-                    .code(),
-                "unsupported_adapter"
-            );
-            assert_eq!(
-                classify_advice(&scope_openai, req, false, vault.clone(), &client)
-                    .await
-                    .expect_err("openai advisor classify must fail with unsupported_adapter")
-                    .code(),
-                "unsupported_adapter"
-            );
-        }
+        let prev_openai = preview_advice(&scope_openai, &req_openai)
+            .expect("matching openai advisor preview must succeed");
+        assert_eq!(prev_openai.profile_id.as_deref(), Some("profile-openai"));
+        assert_eq!(prev_openai.tool_id, "openai-dec");
+        assert_eq!(prev_openai.model_id, "openai-dec:gpt-6-luna");
+        assert_eq!(prev_openai.provider, DecisionProvider::Openai);
+        assert_eq!(prev_openai.requested_model, "gpt-6-luna");
+        assert!(!prev_openai.provider_call_performed);
+        assert!(!ws.cache_dir.exists(), "preview must not create cache_dir");
+        assert_eq!(
+            preview_advice(&scope_openai, &req_jev_latest)
+                .expect_err("mismatched jev preview against openai profile")
+                .code(),
+            "profile_advisor_mismatch"
+        );
+        assert_eq!(
+            classify_advice(
+                &scope_openai,
+                &req_jev_latest,
+                false,
+                vault.clone(),
+                &client
+            )
+            .await
+            .expect_err("mismatched jev classify against openai profile")
+            .code(),
+            "profile_advisor_mismatch"
+        );
 
         // 9. When `profile_id` is `None`, `default_profile_id` (`profile-jev`) is NOT auto-selected:
         //    requesting `jev-enabled:jev-1.14.0` with `profile_id: None` succeeds in preview with `profile_id: None`.

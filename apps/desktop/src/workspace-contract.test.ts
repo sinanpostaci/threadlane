@@ -3133,3 +3133,438 @@ test('legacy observation upgrade keeps unknown, completed, and failed out of att
     assert.equal(upgraded.job_histories[0]!.historical_failure, null);
   }
 });
+
+test('chat_work worker presence compares identity, epoch, and sequence/time before liveness in either order', () => {
+  const identity = sampleIdentity();
+  const itemId = 'blg_presence_order';
+  const execRef = 'wbe_presence_order_1';
+  const makeDoingItem = (
+    bindingId: string,
+    id: string,
+    executionRef: string,
+  ) => ({
+    item_id: id,
+    binding_id: bindingId,
+    revision: 3,
+    title: 'Execute scoped worker slice',
+    acceptance_condition: 'Live presence reflects newest valid evidence.',
+    delivery_description: 'Deliver verified worker evidence selection.',
+    kind: 'worker' as const,
+    status: 'doing' as const,
+    blocked_reason: null,
+    current_execution_ref: executionRef,
+    completion_note: null,
+    completion_evidence: null,
+    completed_at_ms: null,
+    created_at_ms: 1_700_000_000_100,
+    updated_at_ms: 1_700_000_000_900,
+  });
+  const makePresenceRow = (overrides: Record<string, unknown> = {}) => ({
+    item_id: itemId,
+    execution_ref: execRef,
+    approval_id: 'apr_live_evidence',
+    task_id: 'tsk_live_evidence',
+    run_id: 'run_live_evidence',
+    worker_id: 'wrk_live_evidence',
+    claim_id: 'wcl_live_evidence',
+    host_instance_id: 'hst_live_evidence_1',
+    invocation_id: '0196ed00-0000-7000-8000-000000000601',
+    sequence: 4,
+    availability: 'live',
+    freshness: 'fresh',
+    live: true,
+    sampled_at_ms: 10_000,
+    sample_age_ms: 100,
+    max_sample_age_ms: 5_000,
+    expires_at_ms: 15_000,
+    ...overrides,
+  });
+  const item = makeDoingItem(identity.binding_id, itemId, execRef);
+  const normalizePresence = (rows: Array<Record<string, unknown>>, items = [item]) => {
+    const work = normalizeWorkspaceChatWork({
+      identity,
+      availability: 'available',
+      items,
+      events: [],
+      worker_presence: rows,
+      bounds: { items_omitted: 0, events_omitted: 0, presence_omitted: 0 },
+    });
+    assert.ok(work);
+    return work;
+  };
+
+  const liveSeq4 = makePresenceRow();
+  const nonLiveSeq5 = makePresenceRow({
+    sequence: 5,
+    availability: 'non_live',
+    freshness: 'not_applicable',
+    live: false,
+    sampled_at_ms: 10_200,
+    expires_at_ms: 15_200,
+  });
+  const nonLiveSeq5SameTs = makePresenceRow({
+    sequence: 5,
+    availability: 'non_live',
+    freshness: 'not_applicable',
+    live: false,
+    sampled_at_ms: 10_000,
+    expires_at_ms: 15_000,
+  });
+
+  // 1. Newest explicit non_live (sequence 5) beats still-fresh older live (sequence 4)
+  // in both input orders and even when sampled_at_ms ties within the same epoch.
+  for (const rows of [
+    [liveSeq4, nonLiveSeq5],
+    [nonLiveSeq5, liveSeq4],
+    [liveSeq4, nonLiveSeq5SameTs],
+    [nonLiveSeq5SameTs, liveSeq4],
+  ]) {
+    const work = normalizePresence(rows);
+    assert.equal(work.worker_presence.length, 1);
+    assert.equal(work.worker_presence[0]!.availability, 'non_live');
+    assert.equal(work.worker_presence[0]!.sequence, 5);
+    assert.equal(work.worker_presence[0]!.live, false);
+    assert.equal(work.bounds.presence_omitted, 1);
+  }
+
+  // 2. Inverse ordering: older non_live or unavailable (seq 4) loses to newer live (seq 5).
+  const nonLiveSeq4 = makePresenceRow({
+    sequence: 4,
+    availability: 'non_live',
+    freshness: 'not_applicable',
+    live: false,
+    sampled_at_ms: 10_000,
+  });
+  const unavailableSeq4 = makePresenceRow({
+    sequence: 4,
+    availability: 'unavailable',
+    freshness: 'not_applicable',
+    live: false,
+    sampled_at_ms: 10_000,
+  });
+  const liveSeq5 = makePresenceRow({
+    sequence: 5,
+    availability: 'live',
+    freshness: 'fresh',
+    live: true,
+    sampled_at_ms: 10_200,
+    expires_at_ms: 15_200,
+  });
+  for (const rows of [
+    [nonLiveSeq4, liveSeq5],
+    [liveSeq5, nonLiveSeq4],
+    [unavailableSeq4, liveSeq5],
+    [liveSeq5, unavailableSeq4],
+  ]) {
+    const work = normalizePresence(rows);
+    assert.equal(work.worker_presence.length, 1);
+    assert.equal(work.worker_presence[0]!.availability, 'live');
+    assert.equal(work.worker_presence[0]!.sequence, 5);
+    assert.equal(work.worker_presence[0]!.live, true);
+  }
+
+  // 3. Newer unavailable observation (seq 5) clears older live (seq 4) without asserting live.
+  const unavailableSeq5 = makePresenceRow({
+    sequence: 5,
+    availability: 'unavailable',
+    freshness: 'not_applicable',
+    live: false,
+    sampled_at_ms: 10_200,
+    expires_at_ms: 15_200,
+  });
+  for (const rows of [
+    [liveSeq4, unavailableSeq5],
+    [unavailableSeq5, liveSeq4],
+  ]) {
+    const work = normalizePresence(rows);
+    assert.equal(work.worker_presence.length, 1);
+    assert.equal(work.worker_presence[0]!.availability, 'unavailable');
+    assert.equal(work.worker_presence[0]!.sequence, 5);
+    assert.equal(work.worker_presence[0]!.live, false);
+  }
+
+  // 4. Deterministic exact ordering ties (same epoch, seq 4, sampled_at_ms 10_000).
+  for (const rows of [
+    [liveSeq4, nonLiveSeq4],
+    [nonLiveSeq4, liveSeq4],
+  ]) {
+    const work = normalizePresence(rows);
+    assert.equal(work.worker_presence[0]!.availability, 'non_live');
+    assert.equal(work.worker_presence[0]!.live, false);
+  }
+  const staleTie = makePresenceRow({
+    freshness: 'stale',
+    live: true,
+    sampled_at_ms: 10_000,
+  });
+  for (const rows of [
+    [staleTie, liveSeq4],
+    [liveSeq4, staleTie],
+  ]) {
+    const work = normalizePresence(rows);
+    assert.equal(work.worker_presence[0]!.freshness, 'fresh');
+    assert.equal(work.worker_presence[0]!.live, true);
+  }
+
+  // 5. Restarted epoch with reset sequence=1 uses wall-clock sampled_at_ms across epochs.
+  const restartedStop = makePresenceRow({
+    host_instance_id: 'hst_live_evidence_2',
+    invocation_id: '0196ed00-0000-7000-8000-000000000602',
+    sequence: 1,
+    availability: 'non_live',
+    freshness: 'not_applicable',
+    live: false,
+    sampled_at_ms: 10_300,
+    expires_at_ms: 15_300,
+  });
+  const olderEpochHighSeq = makePresenceRow({
+    invocation_id: '0196ed00-0000-7000-8000-000000000600',
+    sequence: 99,
+    sampled_at_ms: 9_000,
+    expires_at_ms: 14_000,
+  });
+  for (const rows of [
+    [liveSeq4, olderEpochHighSeq, restartedStop],
+    [restartedStop, olderEpochHighSeq, liveSeq4],
+  ]) {
+    const work = normalizePresence(rows);
+    assert.equal(work.worker_presence.length, 1);
+    assert.equal(work.worker_presence[0]!.availability, 'non_live');
+    assert.equal(work.worker_presence[0]!.sequence, 1);
+    assert.equal(work.worker_presence[0]!.host_instance_id, 'hst_live_evidence_2');
+    assert.equal(work.worker_presence[0]!.live, false);
+  }
+
+  const restartedLive = makePresenceRow({
+    host_instance_id: 'hst_live_evidence_2',
+    invocation_id: '0196ed00-0000-7000-8000-000000000602',
+    sequence: 1,
+    availability: 'live',
+    freshness: 'fresh',
+    live: true,
+    sampled_at_ms: 10_400,
+    expires_at_ms: 15_400,
+  });
+  for (const rows of [
+    [nonLiveSeq5, restartedLive],
+    [restartedLive, nonLiveSeq5],
+  ]) {
+    const work = normalizePresence(rows);
+    assert.equal(work.worker_presence.length, 1);
+    assert.equal(work.worker_presence[0]!.live, true);
+    assert.equal(work.worker_presence[0]!.sequence, 1);
+  }
+
+  const untimestampedRestarted = makePresenceRow({
+    ...restartedStop,
+    sampled_at_ms: null,
+    sample_age_ms: null,
+    expires_at_ms: null,
+  });
+  for (const rows of [
+    [liveSeq4, untimestampedRestarted],
+    [untimestampedRestarted, liveSeq4],
+  ]) {
+    const work = normalizePresence(rows);
+    assert.equal(work.worker_presence.length, 1);
+    assert.equal(work.worker_presence[0]!.live, true);
+    assert.equal(work.worker_presence[0]!.sequence, 4);
+  }
+
+  // 6. Separate attempts stay isolated, and malformed rows never clear valid live evidence.
+  const itemB = makeDoingItem(identity.binding_id, 'blg_presence_order_b', 'wbe_presence_order_b');
+  const isolated = normalizePresence(
+    [
+      liveSeq4,
+      makePresenceRow({ ...nonLiveSeq5, run_id: 'run_live_evidence_other' }),
+      makePresenceRow({
+        item_id: itemB.item_id,
+        execution_ref: itemB.current_execution_ref,
+        sequence: 2,
+      }),
+      makePresenceRow({ ...nonLiveSeq5, approval_id: '' }),
+      makePresenceRow({ ...nonLiveSeq5, availability: 'bogus_state' }),
+      makePresenceRow({ ...nonLiveSeq5, freshness: 'bogus_freshness' }),
+      makePresenceRow({ ...nonLiveSeq5, sequence: -1 }),
+      makePresenceRow({ ...nonLiveSeq5, sampled_at_ms: 0 }),
+      makePresenceRow({ ...nonLiveSeq5, max_sample_age_ms: null }),
+      makePresenceRow({ ...nonLiveSeq5, live: 'false' }),
+    ],
+    [item, itemB],
+  );
+  assert.equal(isolated.worker_presence.length, 3);
+  assert.equal(isolated.bounds.presence_omitted, 7);
+  assert.ok(
+    isolated.worker_presence.some(
+      (p) => p.item_id === itemId && p.run_id === 'run_live_evidence' && p.live === true,
+    ),
+  );
+  assert.ok(
+    isolated.worker_presence.some(
+      (p) => p.item_id === itemId && p.run_id === 'run_live_evidence_other' && p.live === false,
+    ),
+  );
+  assert.ok(
+    isolated.worker_presence.some((p) => p.item_id === itemB.item_id && p.live === true),
+  );
+
+  // 7. Shared JSON fixture mirrored 1:1 with `crates/threadlane-core/tests/workspace_observation_contract.rs`.
+  const sharedPresenceFixture = `{
+    "schema_version": 1,
+    "generated_at_ms": 1700000010500,
+    "chat_work": [
+      {
+        "identity": {
+          "source_id": "default",
+          "binding_id": "bnd_chat_alpha",
+          "thread_uuid": "0196ed00-0000-7000-8000-000000000042",
+          "canonical_project_scope": "/home/dev/repos/alpha-app"
+        },
+        "availability": "available",
+        "items": [
+          {
+            "item_id": "blg_shared_stop",
+            "binding_id": "bnd_chat_alpha",
+            "revision": 3,
+            "title": "Shared fixture stop",
+            "acceptance_condition": "Newest explicit non_live wins.",
+            "delivery_description": "Verify Rust/TS presence parity.",
+            "kind": "worker",
+            "status": "doing",
+            "blocked_reason": null,
+            "current_execution_ref": "wbe_shared_stop",
+            "completion_note": null,
+            "completion_evidence": null,
+            "completed_at_ms": null,
+            "created_at_ms": 1700000000100,
+            "updated_at_ms": 1700000000900
+          },
+          {
+            "item_id": "blg_shared_restarted",
+            "binding_id": "bnd_chat_alpha",
+            "revision": 3,
+            "title": "Shared fixture restarted epoch",
+            "acceptance_condition": "Restarted epoch reset sequence wins.",
+            "delivery_description": "Verify epoch reconciliation parity.",
+            "kind": "worker",
+            "status": "doing",
+            "blocked_reason": null,
+            "current_execution_ref": "wbe_shared_restarted",
+            "completion_note": null,
+            "completion_evidence": null,
+            "completed_at_ms": null,
+            "created_at_ms": 1700000000200,
+            "updated_at_ms": 1700000000950
+          }
+        ],
+        "events": [],
+        "worker_presence": [
+          {
+            "item_id": "blg_shared_stop",
+            "execution_ref": "wbe_shared_stop",
+            "approval_id": "apr_shared_1",
+            "task_id": "tsk_shared_1",
+            "run_id": "run_shared_1",
+            "worker_id": "wrk_shared_1",
+            "claim_id": "wcl_shared_1",
+            "host_instance_id": "hst_shared_1",
+            "invocation_id": "0196ed00-0000-7000-8000-000000000701",
+            "sequence": 4,
+            "availability": "live",
+            "freshness": "fresh",
+            "live": true,
+            "sampled_at_ms": 1700000010000,
+            "sample_age_ms": 100,
+            "max_sample_age_ms": 5000,
+            "expires_at_ms": 1700000015000
+          },
+          {
+            "item_id": "blg_shared_restarted",
+            "execution_ref": "wbe_shared_restarted",
+            "approval_id": "apr_shared_2",
+            "task_id": "tsk_shared_2",
+            "run_id": "run_shared_2",
+            "worker_id": "wrk_shared_2",
+            "claim_id": "wcl_shared_2",
+            "host_instance_id": "hst_shared_1",
+            "invocation_id": "0196ed00-0000-7000-8000-000000000702",
+            "sequence": 4,
+            "availability": "non_live",
+            "freshness": "not_applicable",
+            "live": false,
+            "sampled_at_ms": 1700000010000,
+            "sample_age_ms": 100,
+            "max_sample_age_ms": 5000,
+            "expires_at_ms": 1700000015000
+          }
+        ],
+        "bounds": { "items_omitted": 0, "events_omitted": 0, "presence_omitted": 0 }
+      },
+      {
+        "identity": {
+          "source_id": "default",
+          "binding_id": "bnd_chat_alpha",
+          "thread_uuid": "0196ed00-0000-7000-8000-000000000042",
+          "canonical_project_scope": "/home/dev/repos/alpha-app"
+        },
+        "availability": "available",
+        "items": [],
+        "events": [],
+        "worker_presence": [
+          {
+            "item_id": "blg_shared_stop",
+            "execution_ref": "wbe_shared_stop",
+            "approval_id": "apr_shared_1",
+            "task_id": "tsk_shared_1",
+            "run_id": "run_shared_1",
+            "worker_id": "wrk_shared_1",
+            "claim_id": "wcl_shared_1",
+            "host_instance_id": "hst_shared_1",
+            "invocation_id": "0196ed00-0000-7000-8000-000000000701",
+            "sequence": 5,
+            "availability": "non_live",
+            "freshness": "not_applicable",
+            "live": false,
+            "sampled_at_ms": 1700000010200,
+            "sample_age_ms": 50,
+            "max_sample_age_ms": 5000,
+            "expires_at_ms": 1700000015200
+          },
+          {
+            "item_id": "blg_shared_restarted",
+            "execution_ref": "wbe_shared_restarted",
+            "approval_id": "apr_shared_2",
+            "task_id": "tsk_shared_2",
+            "run_id": "run_shared_2",
+            "worker_id": "wrk_shared_2",
+            "claim_id": "wcl_shared_2",
+            "host_instance_id": "hst_shared_2",
+            "invocation_id": "0196ed00-0000-7000-8000-000000000703",
+            "sequence": 1,
+            "availability": "live",
+            "freshness": "fresh",
+            "live": true,
+            "sampled_at_ms": 1700000010300,
+            "sample_age_ms": 50,
+            "max_sample_age_ms": 5000,
+            "expires_at_ms": 1700000015300
+          }
+        ],
+        "bounds": { "items_omitted": 0, "events_omitted": 0, "presence_omitted": 0 }
+      }
+    ]
+  }`;
+
+  const parsedShared = parseWorkspaceSnapshot(sharedPresenceFixture);
+  assert.equal(parsedShared.chat_work.length, 1);
+  const sharedPresence = parsedShared.chat_work[0]!.worker_presence;
+  assert.equal(sharedPresence.length, 2);
+  assert.equal(sharedPresence[0]!.item_id, 'blg_shared_restarted');
+  assert.equal(sharedPresence[0]!.live, true);
+  assert.equal(sharedPresence[0]!.sequence, 1);
+  assert.equal(sharedPresence[1]!.item_id, 'blg_shared_stop');
+  assert.equal(sharedPresence[1]!.live, false);
+  assert.equal(sharedPresence[1]!.availability, 'non_live');
+  assert.equal(sharedPresence[1]!.sequence, 5);
+  assert.equal(parsedShared.chat_work[0]!.bounds.presence_omitted, 2);
+});

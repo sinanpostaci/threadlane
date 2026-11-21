@@ -1259,3 +1259,181 @@ describe('advisor configuration compatibility', () => {
     );
   });
 });
+
+describe('profile decision advisor editor copy and provider selection', () => {
+  function makeDecisionAdvisorSnapshot(
+    profiles: WorkflowProfile[],
+    options: { openAiEnabled?: boolean } = {}
+  ): RegistrySnapshot {
+    const openAiEnabled = options.openAiEnabled ?? true;
+    return {
+      ...createEmptyRegistrySnapshot(),
+      revision: 7,
+      tools: [
+        makeTool(),
+        makeTool({
+          id: 'jev-api',
+          label: 'TypeSafe Jev',
+          adapter: 'jev_api',
+          executable_path: null,
+          enabled: true,
+        }),
+        makeTool({
+          id: 'openai-decisions',
+          label: 'OpenAI Decisions',
+          adapter: 'openai_decisions_api',
+          executable_path: null,
+          enabled: openAiEnabled,
+        }),
+      ],
+      models: [
+        makeModel(),
+        makeModel({
+          id: 'jev-api:jev-latest',
+          tool_id: 'jev-api',
+          label: 'jev-latest',
+          model_arg: 'jev-latest',
+          efforts: [],
+          allow_no_effort: true,
+        }),
+        makeModel({
+          id: 'openai-decisions:gpt-6-luna',
+          tool_id: 'openai-decisions',
+          label: 'gpt-6-luna',
+          model_arg: 'gpt-6-luna',
+          efforts: [],
+          allow_no_effort: true,
+        }),
+      ],
+      profiles,
+      default_profile_id: profiles[0]?.id ?? null,
+    };
+  }
+
+  it('presents Jev and OpenAI Decisions advisors without outdated Jev-only warnings and preserves selections', () => {
+    const profile: WorkflowProfile = {
+      id: 'profile-openai-advisor',
+      name: 'OpenAI Shadow Profile',
+      assignments: makeFiveRoleAssignments(),
+      decision_advisor: {
+        model_id: 'openai-decisions:gpt-6-luna',
+        mode: 'shadow',
+      },
+    };
+    const snapshot = makeDecisionAdvisorSnapshot([profile]);
+    const page = new ProfilesPage(() => {});
+    let root = page.render(snapshot) as unknown as FakeElement;
+
+    assert.equal(root.textContent.includes('Advisor: OpenAI Decisions · gpt-6-luna'), true);
+    assert.equal(root.textContent.includes('Needs attention'), false);
+    assert.equal(root.textContent.includes('future use'), false);
+    assert.equal(root.textContent.includes('executes Jev only'), false);
+    assert.equal(root.textContent.includes('Jev executes today'), false);
+
+    root.querySelector(`[data-focus-key="edit-${profile.id}"]`)?.click();
+    root = page.render(snapshot) as unknown as FakeElement;
+
+    const advisorSection = root.querySelector('[data-advisor-section]');
+    assert.ok(advisorSection, 'expected decision advisor section in profile editor');
+    assert.equal(advisorSection.getAttribute('data-tone'), 'ready');
+    assert.equal(advisorSection.querySelector('[role="alert"]'), null);
+    assert.equal(advisorSection.querySelector('[data-tone="warn"]'), null);
+    assert.equal(
+      advisorSection.textContent.includes(
+        'Suggests task difficulty in shadow mode with Jev or OpenAI Decisions without changing plans or active tasks.'
+      ),
+      true
+    );
+    assert.equal(advisorSection.textContent.includes('future use'), false);
+    assert.equal(advisorSection.textContent.includes('executes Jev only'), false);
+    assert.equal(advisorSection.textContent.includes('Jev executes today'), false);
+
+    const optgroupLabels = advisorSection
+      .querySelectorAll('optgroup')
+      .map((group) => group.getAttribute('label'));
+    assert.deepEqual(optgroupLabels, ['TypeSafe Jev', 'OpenAI Decisions']);
+
+    const advisorSelect = advisorSection.querySelector('[data-advisor-select]');
+    assert.ok(advisorSelect, 'expected decision advisor selector');
+    assert.equal(advisorSelect.value, 'openai-decisions:gpt-6-luna');
+    assert.equal(root.querySelector('[data-focus-key="save-profile"]')?.disabled, false);
+
+    // Switch to Jev and back to OpenAI Decisions without introducing warnings.
+    advisorSelect.value = 'jev-api:jev-latest';
+    advisorSelect.dispatchEvent('change');
+    root = page.render(snapshot) as unknown as FakeElement;
+    assert.equal(root.querySelector('[data-advisor-select]')?.value, 'jev-api:jev-latest');
+    assert.equal(
+      root.querySelector('[data-advisor-section]')?.getAttribute('data-tone'),
+      'ready'
+    );
+
+    const updatedSelect = root.querySelector('[data-advisor-select]');
+    assert.ok(updatedSelect, 'expected advisor selector after switching to Jev');
+    updatedSelect.value = 'openai-decisions:gpt-6-luna';
+    updatedSelect.dispatchEvent('change');
+    root = page.render(snapshot) as unknown as FakeElement;
+
+    const backToOpenAiSection = root.querySelector('[data-advisor-section]');
+    assert.ok(backToOpenAiSection, 'expected advisor section after switching back to OpenAI');
+    assert.equal(backToOpenAiSection.getAttribute('data-tone'), 'ready');
+    assert.equal(backToOpenAiSection.querySelector('[data-tone="warn"]'), null);
+    assert.equal(backToOpenAiSection.querySelector('[role="alert"]'), null);
+    assert.equal(
+      root.querySelector('[data-advisor-select]')?.value,
+      'openai-decisions:gpt-6-luna'
+    );
+
+    // Clearing the advisor sets the draft to off without reintroducing any provider fallback.
+    const clearAdvisor = root.querySelector('[data-focus-key="clear-advisor"]');
+    assert.ok(clearAdvisor, 'expected clear advisor button');
+    clearAdvisor.click();
+    root = page.render(snapshot) as unknown as FakeElement;
+    assert.equal(root.querySelector('[data-advisor-section]')?.getAttribute('data-tone'), 'off');
+    assert.equal(root.querySelector('[data-advisor-select]')?.value, '');
+    assert.equal(root.querySelector('[data-focus-key="clear-advisor"]'), null);
+
+    page.dispose();
+  });
+
+  it('flags a disabled OpenAI Decisions advisor for explicit repair without silently falling back to Jev', () => {
+    const profile: WorkflowProfile = {
+      id: 'profile-disabled-openai-advisor',
+      name: 'Disabled OpenAI Advisor',
+      assignments: makeFiveRoleAssignments(),
+      decision_advisor: {
+        model_id: 'openai-decisions:gpt-6-luna',
+        mode: 'shadow',
+      },
+    };
+    const snapshot = makeDecisionAdvisorSnapshot([profile], { openAiEnabled: false });
+    const summary = summarizeProfile(snapshot, profile);
+    assert.equal(summary.advisor.state, 'invalid');
+    if (summary.advisor.state === 'invalid') {
+      assert.equal(summary.advisor.issue.code, 'disabled_tool');
+    }
+
+    const page = new ProfilesPage(() => {});
+    let root = page.render(snapshot) as unknown as FakeElement;
+    assert.equal(root.textContent.includes('Advisor: Needs repair'), true);
+    assert.equal(root.textContent.includes('Needs attention'), true);
+
+    root.querySelector(`[data-focus-key="edit-${profile.id}"]`)?.click();
+    root = page.render(snapshot) as unknown as FakeElement;
+
+    const advisorSection = root.querySelector('[data-advisor-section]');
+    assert.ok(advisorSection, 'expected advisor section');
+    assert.equal(advisorSection.getAttribute('data-tone'), 'invalid');
+    assert.ok(advisorSection.querySelector('[role="alert"]'), 'expected advisor repair alert');
+    assert.equal(
+      root.querySelector('[data-advisor-select]')?.value,
+      'openai-decisions:gpt-6-luna',
+      'disabled OpenAI advisor must stay selected as unavailable rather than switching to Jev'
+    );
+    assert.equal(root.querySelector('[data-focus-key="save-profile"]')?.disabled, true);
+    assert.equal(advisorSection.textContent.includes('future use'), false);
+    assert.equal(advisorSection.textContent.includes('executes Jev only'), false);
+
+    page.dispose();
+  });
+});

@@ -2018,12 +2018,38 @@ export interface WorkspaceSelectedChatProjection {
   activity: WorkspaceChatActivitySurface;
 }
 
+export type WorkspaceSelectedChatUnavailableReason =
+  | 'source_unavailable'
+  | 'source_omitted'
+  | 'chat_absent';
+
+export interface WorkspaceSelectedChatLabelHint {
+  chatKey: string;
+  threadLabel: string;
+  projectLabel: string;
+}
+
+export interface WorkspaceSelectedChatUnavailableView {
+  chatKey: string;
+  identity: WorkspaceChatIdentity;
+  lifecycle: WorkspaceChatLifecycle;
+  projectKey: string;
+  canonicalProjectScope: string;
+  projectLabel: string;
+  threadLabel: string;
+  reason: WorkspaceSelectedChatUnavailableReason;
+  statusLabel: 'Temporarily unavailable';
+  message: string;
+  sourceUnavailableDetail: string | null;
+}
+
 export interface ProjectWorkspaceSnapshotOptions {
   nowMs?: number;
   lifecycleFilter?: WorkspaceChatLifecycle;
   archivePreferences?: WorkspaceChatArchivePreferenceMap;
   preferenceStorage?: Pick<WorkspaceChatPreferenceStorage, 'getItem'> | null;
   selectedChatKey?: string | null;
+  selectedChatLabelHint?: WorkspaceSelectedChatLabelHint | null;
   selectedTab?: WorkspaceChatSurfaceTab | string | null;
   activityJobId?: string | null;
   loading?: boolean;
@@ -2061,11 +2087,98 @@ export interface WorkspaceProductionProjection {
   statusNotices: string[];
   selectedChatKey: string | null;
   selectedChat: WorkspaceSelectedChatProjection | null;
+  selectedChatUnavailable: WorkspaceSelectedChatUnavailableView | null;
   warnings: string[];
   diagnostics: ProjectDiagnosticRowView[];
 }
 
+const CANONICAL_CHAT_KEY_PREFIX = 'wchat:v1:';
 const WORKSPACE_UTF8_ENCODER = new TextEncoder();
+const WORKSPACE_UTF8_DECODER = new TextDecoder('utf-8', { fatal: true });
+
+/**
+ * Parses and validates a canonical four-part workspace chat key
+ * (`wchat:v1:<len>:<source_id>:<len>:<binding_id>:<len>:<thread_uuid>:<len>:<canonical_project_scope>`).
+ * Non-canonical keys (titles, job IDs, session IDs, malformed UUIDs) return `null`.
+ */
+export function parseWorkspaceChatIdentityKey(
+  rawKey: string | null | undefined,
+): WorkspaceChatIdentity | null {
+  if (typeof rawKey !== 'string') {
+    return null;
+  }
+  const trimmed = rawKey.trim();
+  if (!trimmed.startsWith(CANONICAL_CHAT_KEY_PREFIX)) {
+    return null;
+  }
+
+  const bytes = WORKSPACE_UTF8_ENCODER.encode(trimmed);
+  let offset = CANONICAL_CHAT_KEY_PREFIX.length;
+  const parts: string[] = [];
+
+  for (let idx = 0; idx < 4; idx += 1) {
+    let lengthStr = '';
+    while (offset < bytes.byteLength && bytes[offset] !== 0x3a) {
+      const byte = bytes[offset]!;
+      if (byte < 0x30 || byte > 0x39 || lengthStr.length >= 4) {
+        return null;
+      }
+      lengthStr += String.fromCharCode(byte);
+      offset += 1;
+    }
+    if (
+      lengthStr.length === 0 ||
+      offset >= bytes.byteLength ||
+      bytes[offset] !== 0x3a
+    ) {
+      return null;
+    }
+    offset += 1; // consume ':'
+
+    const fieldByteLen = Number.parseInt(lengthStr, 10);
+    if (
+      !Number.isSafeInteger(fieldByteLen) ||
+      fieldByteLen <= 0 ||
+      offset + fieldByteLen > bytes.byteLength
+    ) {
+      return null;
+    }
+
+    let decodedField: string;
+    try {
+      decodedField = WORKSPACE_UTF8_DECODER.decode(
+        bytes.subarray(offset, offset + fieldByteLen),
+      );
+    } catch {
+      return null;
+    }
+    parts.push(decodedField);
+    offset += fieldByteLen;
+
+    if (idx < 3) {
+      if (offset >= bytes.byteLength || bytes[offset] !== 0x3a) {
+        return null;
+      }
+      offset += 1; // consume separator ':'
+    } else if (offset !== bytes.byteLength) {
+      return null;
+    }
+  }
+
+  try {
+    const validated = validateWorkspaceChatIdentity({
+      source_id: parts[0],
+      binding_id: parts[1],
+      thread_uuid: parts[2],
+      canonical_project_scope: parts[3],
+    });
+    return formatWorkspaceChatIdentityKey(validated) === trimmed
+      ? validated
+      : null;
+  } catch {
+    return null;
+  }
+}
 
 function compareUtf8Lexical(left: string, right: string): number {
   if (left === right) {
@@ -4468,6 +4581,88 @@ function buildSnapshotBoundsNotices(ws: WorkspaceSnapshot): string[] {
   return notices;
 }
 
+function buildSelectedChatUnavailableView(
+  chatKey: string,
+  identity: WorkspaceChatIdentity,
+  lifecycle: WorkspaceChatLifecycle,
+  sourcesById: ReadonlyMap<string, ObservationSource>,
+  unavailableSources: readonly WorkspaceUnavailableSourceView[],
+  labelHint: WorkspaceSelectedChatLabelHint | null | undefined,
+): WorkspaceSelectedChatUnavailableView {
+  const source = sourcesById.get(identity.source_id);
+  const unavailableSource =
+    unavailableSources.find((entry) => entry.sourceId === identity.source_id) ??
+    null;
+
+  let reason: WorkspaceSelectedChatUnavailableReason;
+  let message: string;
+  let sourceUnavailableDetail: string | null = null;
+  if (
+    unavailableSource !== null ||
+    (source !== undefined && source.availability !== 'available')
+  ) {
+    reason = 'source_unavailable';
+    sourceUnavailableDetail = unavailableSource?.rawMessage ?? null;
+    message =
+      'This chat is temporarily unavailable because its observation source is unavailable. It will reappear automatically when observation returns, or you can select another chat.';
+  } else if (source === undefined) {
+    reason = 'source_omitted';
+    message =
+      'This chat is temporarily unavailable because its observation source was omitted from the latest refresh. It will reappear automatically when observation returns, or you can select another chat.';
+  } else {
+    reason = 'chat_absent';
+    message =
+      'This chat is temporarily unavailable in the latest refresh. It will reappear automatically when it returns to observation, or you can select another chat.';
+  }
+
+  const matchedHint =
+    labelHint !== null &&
+    labelHint !== undefined &&
+    labelHint.chatKey === chatKey
+      ? labelHint
+      : null;
+
+  const threadLabel =
+    matchedHint !== null && !isDefaultChatPlaceholderLabel(matchedHint.threadLabel)
+      ? sanitizeWorkspaceLabel(matchedHint.threadLabel, 'Selected chat')
+      : 'Selected chat';
+
+  let rawProjectLabel: string | null = null;
+  if (
+    matchedHint !== null &&
+    !isDefaultProjectPlaceholderLabel(matchedHint.projectLabel)
+  ) {
+    rawProjectLabel = matchedHint.projectLabel;
+  } else if (
+    source !== undefined &&
+    (source.project_path === identity.canonical_project_scope ||
+      source.project_path === null) &&
+    !isDefaultProjectPlaceholderLabel(source.label)
+  ) {
+    rawProjectLabel = source.label;
+  } else {
+    rawProjectLabel = projectScopeBasename(identity.canonical_project_scope);
+  }
+  const projectLabel = sanitizeWorkspaceLabel(rawProjectLabel, 'Project');
+
+  return {
+    chatKey,
+    identity,
+    lifecycle,
+    projectKey: formatWorkspaceProjectGroupKey(
+      identity.source_id,
+      identity.canonical_project_scope,
+    ),
+    canonicalProjectScope: identity.canonical_project_scope,
+    projectLabel,
+    threadLabel,
+    reason,
+    statusLabel: 'Temporarily unavailable',
+    message,
+    sourceUnavailableDetail,
+  };
+}
+
 /**
  * Pure production workspace projection consuming `WorkspaceSnapshot` and shared
  * `workspace-contract.ts` helpers without reimplementing schema, sanitization,
@@ -4538,6 +4733,7 @@ export function projectWorkspaceSnapshot(
         statusNotices: [],
         selectedChatKey: options.selectedChatKey ?? null,
         selectedChat: null,
+        selectedChatUnavailable: null,
         warnings: [],
         diagnostics: [],
       };
@@ -4576,6 +4772,7 @@ export function projectWorkspaceSnapshot(
       statusNotices: [unavailableReason],
       selectedChatKey: options.selectedChatKey ?? null,
       selectedChat: null,
+      selectedChatUnavailable: null,
       warnings: [],
       diagnostics: [],
     };
@@ -5089,6 +5286,13 @@ export function projectWorkspaceSnapshot(
     statusNotices.push(boundNotice);
   }
 
+  const parsedRequestedIdentity = parseWorkspaceChatIdentityKey(
+    options.selectedChatKey,
+  );
+  const canonicalRequestedChatKey = parsedRequestedIdentity
+    ? formatWorkspaceChatIdentityKey(parsedRequestedIdentity)
+    : null;
+
   const totalChatCount = activeChats.length + archivedChats.length;
   const allSourcesUnavailable =
     ws.observation.sources.length > 0 &&
@@ -5100,6 +5304,31 @@ export function projectWorkspaceSnapshot(
       unavailableSources[0]?.statusText ??
       error ??
       'Linked workspace observation sources are currently unavailable.';
+    let unavailableSelection: WorkspaceSelectedChatUnavailableView | null = null;
+    let unavailableSelectedChatKey: string | null = options.selectedChatKey ?? null;
+    if (
+      canonicalRequestedChatKey !== null &&
+      parsedRequestedIdentity !== null
+    ) {
+      const requestedLifecycle = resolveWorkspaceChatLifecycle(
+        archivePreferences,
+        parsedRequestedIdentity,
+      );
+      if (requestedLifecycle === lifecycleFilter) {
+        unavailableSelectedChatKey = canonicalRequestedChatKey;
+        unavailableSelection = buildSelectedChatUnavailableView(
+          canonicalRequestedChatKey,
+          parsedRequestedIdentity,
+          requestedLifecycle,
+          sourcesById,
+          unavailableSources,
+          options.selectedChatLabelHint,
+        );
+        statusNotices.push(unavailableSelection.message);
+      } else {
+        unavailableSelectedChatKey = null;
+      }
+    }
     return {
       status: 'unavailable',
       unavailableReason: primaryReason,
@@ -5129,18 +5358,48 @@ export function projectWorkspaceSnapshot(
       bounds: { ...ws.bounds },
       boundsNotices,
       statusNotices,
-      selectedChatKey: options.selectedChatKey ?? null,
+      selectedChatKey: unavailableSelectedChatKey,
       selectedChat: null,
+      selectedChatUnavailable: unavailableSelection,
       warnings: [...ws.observation.warnings],
       diagnostics,
     };
   }
 
   const visibleChatsFlat = visibleProjects.flatMap((g) => g.chats);
-  const requestedChatKey = options.selectedChatKey ?? null;
   let resolvedChatKey: string | null = null;
-  if (requestedChatKey !== null && sidebarByKey.has(requestedChatKey)) {
-    resolvedChatKey = requestedChatKey;
+  let selectedChatUnavailable: WorkspaceSelectedChatUnavailableView | null = null;
+  if (
+    canonicalRequestedChatKey !== null &&
+    sidebarByKey.has(canonicalRequestedChatKey)
+  ) {
+    resolvedChatKey = canonicalRequestedChatKey;
+  } else if (
+    canonicalRequestedChatKey !== null &&
+    parsedRequestedIdentity !== null
+  ) {
+    const requestedLifecycle = resolveWorkspaceChatLifecycle(
+      archivePreferences,
+      parsedRequestedIdentity,
+    );
+    if (requestedLifecycle === lifecycleFilter) {
+      // Preserve explicit canonical selection when the chat is absent from an
+      // incomplete observation refresh instead of replacing it with another chat.
+      resolvedChatKey = canonicalRequestedChatKey;
+      selectedChatUnavailable = buildSelectedChatUnavailableView(
+        canonicalRequestedChatKey,
+        parsedRequestedIdentity,
+        requestedLifecycle,
+        sourcesById,
+        unavailableSources,
+        options.selectedChatLabelHint,
+      );
+      statusNotices.push(selectedChatUnavailable.message);
+    } else if (visibleChatsFlat.length > 0) {
+      resolvedChatKey = visibleChatsFlat[0]!.chatKey;
+    } else {
+      resolvedChatKey = null;
+    }
   } else if (visibleChatsFlat.length > 0) {
     resolvedChatKey = visibleChatsFlat[0]!.chatKey;
   } else {
@@ -5148,7 +5407,7 @@ export function projectWorkspaceSnapshot(
   }
 
   let selectedChat: WorkspaceSelectedChatProjection | null = null;
-  if (resolvedChatKey !== null) {
+  if (resolvedChatKey !== null && selectedChatUnavailable === null) {
     const selectedSidebar = sidebarByKey.get(resolvedChatKey) ?? null;
     const selectedAcc = accumulators.get(resolvedChatKey) ?? null;
     if (selectedSidebar && selectedAcc) {
@@ -5426,6 +5685,7 @@ export function projectWorkspaceSnapshot(
     statusNotices,
     selectedChatKey: resolvedChatKey,
     selectedChat,
+    selectedChatUnavailable,
     warnings: [...ws.observation.warnings],
     diagnostics,
   };

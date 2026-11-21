@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -22,18 +22,20 @@ use uuid::Uuid;
 use crate::error::AuthorityError;
 use crate::types::{
     ApprovalRecord, ApprovalSummary, ApprovedTaskDispatch, ApprovedTaskRecord, MaterializedPlan,
-    NativeRoute, OperatorApprovalIntent, OperatorApprovalPreview, OperatorApprovalRequest,
-    APPROVALS_FILE_NAME, APPROVALS_LOCK_FILE_NAME, AUTHORITY_POLICY_VERSION,
-    AUTHORITY_SCHEMA_VERSION, MAX_APPROVALS_IN_STORE, MAX_APPROVAL_MAX_PARALLEL,
-    MAX_APPROVED_TASKS, MAX_APPROVED_WRITE_PATHS, MAX_AUTHORITY_STORE_BYTES,
-    MAX_EXECUTABLE_PROFILES_PER_APPROVAL, MIN_APPROVAL_MAX_PARALLEL,
+    NativeRoute, OperatorApprovalIntent, OperatorApprovalIntentV2, OperatorApprovalPreview,
+    OperatorApprovalRequest, OperatorApprovalRequestV2, APPROVALS_FILE_NAME,
+    APPROVALS_LOCK_FILE_NAME, AUTHORITY_POLICY_VERSION, AUTHORITY_SCHEMA_VERSION,
+    MAX_APPROVALS_IN_STORE, MAX_APPROVAL_MAX_PARALLEL, MAX_APPROVED_TASKS,
+    MAX_APPROVED_WRITE_PATHS, MAX_AUTHORITY_STORE_BYTES, MAX_EXECUTABLE_PROFILES_PER_APPROVAL,
+    MIN_APPROVAL_MAX_PARALLEL,
 };
 use crate::validation::{
     compute_authority_core_digest, compute_record_subject_digest, derive_approval_id,
     derive_command_key, derive_profile_id, is_task_scope_contained_in_operator_allowlist,
     resolve_and_validate_worker_executable, sha256_hex, validate_canonical_thread_uuid,
     validate_executable_worker_instruction, validate_identifier,
-    validate_repository_and_base_commit, validate_revision, validate_sha256_hex,
+    validate_repository_and_base_commit, validate_required_changed_paths_at_base_commit,
+    validate_revision, validate_sha256_hex, validate_v2_schema_version,
     validate_work_area_for_materialization, validate_worker_task_static,
     validate_write_scope_entry_at_base_commit, verify_approval_record_integrity,
 };
@@ -203,6 +205,25 @@ impl AuthorityStore {
         &self,
         intent: OperatorApprovalIntent,
     ) -> Result<OperatorApprovalPreview, AuthorityError> {
+        self.prepare_for_operator_internal(intent, &BTreeMap::new())
+    }
+
+    /// Prepares a read-only [`OperatorApprovalPreview`] from a strict v2
+    /// [`OperatorApprovalIntentV2`] carrying optional per-task `required_changed_paths`, without
+    /// persisting an approval record or mutating any store state.
+    pub fn prepare_for_operator_v2(
+        &self,
+        intent_v2: OperatorApprovalIntentV2,
+    ) -> Result<OperatorApprovalPreview, AuthorityError> {
+        validate_v2_schema_version(intent_v2.schema_version)?;
+        self.prepare_for_operator_internal(intent_v2.intent, &intent_v2.task_required_changed_paths)
+    }
+
+    fn prepare_for_operator_internal(
+        &self,
+        intent: OperatorApprovalIntent,
+        task_required_changed_paths: &BTreeMap<String, Vec<String>>,
+    ) -> Result<OperatorApprovalPreview, AuthorityError> {
         let binding_id = validate_identifier("binding_id", &intent.binding_id)?;
         let thread_uuid = validate_canonical_thread_uuid("thread_uuid", &intent.thread_uuid)?;
         let plan_id = validate_identifier("plan_id", &intent.plan_id)?;
@@ -272,7 +293,7 @@ impl AuthorityStore {
             budgets: intent.budgets,
         };
 
-        self.preview_for_operator(request)
+        self.preview_for_operator_internal(request, task_required_changed_paths)
     }
 
     /// Validates an [`OperatorApprovalRequest`] and returns a private [`OperatorApprovalPreview`]
@@ -286,27 +307,31 @@ impl AuthorityStore {
         &self,
         request: OperatorApprovalRequest,
     ) -> Result<OperatorApprovalPreview, AuthorityError> {
-        let record = self.build_validated_approval_record(request, 0)?;
-        let actual_request = OperatorApprovalRequest {
-            binding_id: record.binding_id,
-            thread_uuid: record.thread_uuid,
-            plan_id: record.plan_id,
-            plan_revision: record.plan_revision,
-            expected_registry_revision: record.registry_revision,
-            expected_plan_digest: record.plan_digest,
-            repository_path: record.repository_path,
-            base_commit: record.base_commit,
-            approved_task_ids: record.approved_task_ids,
-            approved_write_paths: record.approved_write_paths,
-            max_parallel: record.max_parallel,
-            budgets: record.budgets,
-        };
+        self.preview_for_operator_internal(request, &BTreeMap::new())
+    }
 
-        Ok(OperatorApprovalPreview {
-            request: actual_request,
-            subject_digest: record.subject_digest,
-            tasks: record.tasks,
-        })
+    /// Validates a strict v2 [`OperatorApprovalRequestV2`] (including per-task
+    /// `required_changed_paths`) and returns a private [`OperatorApprovalPreview`] without writing
+    /// `approvals.json` or starting any worker or host process.
+    pub fn preview_for_operator_v2(
+        &self,
+        request_v2: OperatorApprovalRequestV2,
+    ) -> Result<OperatorApprovalPreview, AuthorityError> {
+        validate_v2_schema_version(request_v2.schema_version)?;
+        self.preview_for_operator_internal(
+            request_v2.request,
+            &request_v2.task_required_changed_paths,
+        )
+    }
+
+    fn preview_for_operator_internal(
+        &self,
+        request: OperatorApprovalRequest,
+        task_required_changed_paths: &BTreeMap<String, Vec<String>>,
+    ) -> Result<OperatorApprovalPreview, AuthorityError> {
+        let record =
+            self.build_validated_approval_record(request, task_required_changed_paths, 0)?;
+        Ok(preview_from_record(&record))
     }
 
     /// Validates and persists an [`OperatorApprovalRequest`] only when the rebuilt candidate's
@@ -325,7 +350,69 @@ impl AuthorityStore {
         let checked_digest =
             validate_sha256_hex("expected_subject_digest", expected_subject_digest)?;
         let now_ms = current_unix_epoch_ms()?;
-        self.approve_at_internal(request, now_ms, Some(&checked_digest))
+        self.approve_at_internal(
+            request,
+            &BTreeMap::new(),
+            now_ms,
+            Some(&checked_digest),
+            None,
+        )
+    }
+
+    /// Validates and persists a strict v2 [`OperatorApprovalRequestV2`] (including per-task
+    /// `required_changed_paths`) only when the rebuilt candidate's `subject_digest` matches
+    /// `expected_subject_digest` under the exclusive authority store lock.
+    pub fn approve_confirmed_v2(
+        &self,
+        request_v2: OperatorApprovalRequestV2,
+        expected_subject_digest: &str,
+    ) -> Result<ApprovalSummary, AuthorityError> {
+        validate_v2_schema_version(request_v2.schema_version)?;
+        let checked_digest =
+            validate_sha256_hex("expected_subject_digest", expected_subject_digest)?;
+        let now_ms = current_unix_epoch_ms()?;
+        self.approve_at_internal(
+            request_v2.request,
+            &request_v2.task_required_changed_paths,
+            now_ms,
+            Some(&checked_digest),
+            None,
+        )
+    }
+
+    /// Reconstructs and verifies an exact normalized [`OperatorApprovalPreview`] (including any
+    /// per-task `required_changed_paths`) and `expected_subject_digest` while holding the
+    /// exclusive authority store lock, persisting the approval only on an exact match.
+    pub fn approve_confirmed_preview(
+        &self,
+        preview: OperatorApprovalPreview,
+        expected_subject_digest: &str,
+    ) -> Result<ApprovalSummary, AuthorityError> {
+        let checked_digest =
+            validate_sha256_hex("expected_subject_digest", expected_subject_digest)?;
+        let now_ms = current_unix_epoch_ms()?;
+        self.approve_confirmed_preview_at(preview, now_ms, &checked_digest)
+    }
+
+    /// Reconstructs and verifies an exact normalized [`OperatorApprovalPreview`] (including any
+    /// per-task `required_changed_paths`) and `expected_subject_digest` under the exclusive
+    /// authority store lock using an explicit `created_at_ms` timestamp.
+    pub fn approve_confirmed_preview_at(
+        &self,
+        preview: OperatorApprovalPreview,
+        created_at_ms: i64,
+        expected_subject_digest: &str,
+    ) -> Result<ApprovalSummary, AuthorityError> {
+        let checked_digest =
+            validate_sha256_hex("expected_subject_digest", expected_subject_digest)?;
+        let task_required_changed_paths = preview.task_required_changed_paths()?;
+        self.approve_at_internal(
+            preview.request.clone(),
+            &task_required_changed_paths,
+            created_at_ms,
+            Some(&checked_digest),
+            Some(&preview),
+        )
     }
 
     /// Validates an operator approval request against the pinned plan revision, global registry,
@@ -360,14 +447,43 @@ impl AuthorityStore {
         request: OperatorApprovalRequest,
         created_at_ms: i64,
     ) -> Result<ApprovalSummary, AuthorityError> {
-        self.approve_at_internal(request, created_at_ms, None)
+        self.approve_at_internal(request, &BTreeMap::new(), created_at_ms, None, None)
+    }
+
+    /// Validates and persists a strict v2 [`OperatorApprovalRequestV2`] (including per-task
+    /// `required_changed_paths`).
+    pub fn approve_v2(
+        &self,
+        request_v2: OperatorApprovalRequestV2,
+    ) -> Result<ApprovalSummary, AuthorityError> {
+        let now_ms = current_unix_epoch_ms()?;
+        self.approve_at_v2(request_v2, now_ms)
+    }
+
+    /// Validates and persists a strict v2 [`OperatorApprovalRequestV2`] using an explicit
+    /// `created_at_ms` timestamp when creating a new record.
+    pub fn approve_at_v2(
+        &self,
+        request_v2: OperatorApprovalRequestV2,
+        created_at_ms: i64,
+    ) -> Result<ApprovalSummary, AuthorityError> {
+        validate_v2_schema_version(request_v2.schema_version)?;
+        self.approve_at_internal(
+            request_v2.request,
+            &request_v2.task_required_changed_paths,
+            created_at_ms,
+            None,
+            None,
+        )
     }
 
     fn approve_at_internal(
         &self,
         request: OperatorApprovalRequest,
+        task_required_changed_paths: &BTreeMap<String, Vec<String>>,
         created_at_ms: i64,
         expected_subject_digest: Option<&str>,
+        expected_preview: Option<&OperatorApprovalPreview>,
     ) -> Result<ApprovalSummary, AuthorityError> {
         let checked_expected_digest = match expected_subject_digest {
             Some(raw) => Some(validate_sha256_hex("expected_subject_digest", raw)?),
@@ -381,7 +497,21 @@ impl AuthorityStore {
         let _file_lock = self.acquire_exclusive_lock()?;
         let mut ledger = self.read_ledger_locked()?;
 
-        let record = self.build_validated_approval_record(request, created_at_ms)?;
+        let record = self.build_validated_approval_record(
+            request,
+            task_required_changed_paths,
+            created_at_ms,
+        )?;
+
+        if let Some(supplied_preview) = expected_preview {
+            let reconstructed_preview = preview_from_record(&record);
+            if &reconstructed_preview != supplied_preview {
+                return Err(AuthorityError::validation(
+                    "preview",
+                    "supplied approval preview does not match the reconstructed authoritative preview",
+                ));
+            }
+        }
 
         if let Some(expected_digest) = checked_expected_digest.as_deref() {
             if record.subject_digest != expected_digest {
@@ -634,6 +764,15 @@ impl AuthorityStore {
                     });
                 }
             }
+            if let Some(ref required_paths) = task.required_changed_paths {
+                validate_required_changed_paths_at_base_commit(
+                    &task.task_id,
+                    required_paths,
+                    &task.allowed_write_paths,
+                    &canonical_repo,
+                    &normalized_base_commit,
+                )?;
+            }
             if task.provider.is_some() {
                 let profile_config = build_approved_worker_profile_config(
                     &record,
@@ -707,6 +846,7 @@ impl AuthorityStore {
     fn build_validated_approval_record(
         &self,
         request: OperatorApprovalRequest,
+        task_required_changed_paths: &BTreeMap<String, Vec<String>>,
         created_at_ms: i64,
     ) -> Result<ApprovalRecord, AuthorityError> {
         let binding_id = validate_identifier("binding_id", &request.binding_id)?;
@@ -755,6 +895,27 @@ impl AuthorityStore {
                 return Err(AuthorityError::validation(
                     "approved_task_ids",
                     format!("duplicate task_id `{task_id}` in approved_task_ids"),
+                ));
+            }
+        }
+
+        if task_required_changed_paths.len() > MAX_APPROVED_TASKS {
+            return Err(AuthorityError::validation(
+                "task_required_changed_paths",
+                format!(
+                    "task_required_changed_paths cannot reference more than {MAX_APPROVED_TASKS} tasks (got {})",
+                    task_required_changed_paths.len()
+                ),
+            ));
+        }
+        for task_id in task_required_changed_paths.keys() {
+            validate_identifier("task_required_changed_paths entry", task_id)?;
+            if !selected_task_set.contains(task_id) {
+                return Err(AuthorityError::validation(
+                    "task_required_changed_paths",
+                    format!(
+                        "task_required_changed_paths references unselected or unknown task `{task_id}`"
+                    ),
                 ));
             }
         }
@@ -965,6 +1126,18 @@ impl AuthorityStore {
                 validated_task_write_paths.push(checked_task_path);
             }
 
+            let validated_required_changed_paths =
+                match task_required_changed_paths.get(&compiled_task.id) {
+                    Some(raw_required) => Some(validate_required_changed_paths_at_base_commit(
+                        &compiled_task.id,
+                        raw_required,
+                        &validated_task_write_paths,
+                        &canonical_repo,
+                        &normalized_base_commit,
+                    )?),
+                    None => None,
+                };
+
             let (
                 provider,
                 canonical_executable,
@@ -1075,6 +1248,7 @@ impl AuthorityStore {
                 file_permissions,
                 depends_on: compiled_task.depends_on.clone(),
                 allowed_write_paths: validated_task_write_paths,
+                required_changed_paths: validated_required_changed_paths,
                 task_digest: compiled_task.task_digest.clone(),
                 profile_id: None,
                 command_key: None,
@@ -1213,6 +1387,28 @@ impl AuthorityStore {
         }
 
         write_result
+    }
+}
+
+/// Projects a validated [`ApprovalRecord`] into its normalized [`OperatorApprovalPreview`].
+fn preview_from_record(record: &ApprovalRecord) -> OperatorApprovalPreview {
+    OperatorApprovalPreview {
+        request: OperatorApprovalRequest {
+            binding_id: record.binding_id.clone(),
+            thread_uuid: record.thread_uuid.clone(),
+            plan_id: record.plan_id.clone(),
+            plan_revision: record.plan_revision,
+            expected_registry_revision: record.registry_revision,
+            expected_plan_digest: record.plan_digest.clone(),
+            repository_path: record.repository_path.clone(),
+            base_commit: record.base_commit.clone(),
+            approved_task_ids: record.approved_task_ids.clone(),
+            approved_write_paths: record.approved_write_paths.clone(),
+            max_parallel: record.max_parallel,
+            budgets: record.budgets.clone(),
+        },
+        subject_digest: record.subject_digest.clone(),
+        tasks: record.tasks.clone(),
     }
 }
 

@@ -770,3 +770,336 @@ async fn operating_guide_and_startup_instructions_report_current_version_and_wor
     let forbidden_log = ["con", "sole"].concat();
     assert!(!OPERATING_GUIDE_MARKDOWN.contains(forbidden_log.as_str()));
 }
+
+fn normalize_whitespace(input: &str) -> String {
+    input.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+#[test]
+fn approval_fallback_docs_and_js_example_align_legacy_and_v2_record_request_contracts() {
+    use threadlane_authority::{
+        ApprovedTaskRecord, OperatorApprovalPreview, OperatorApprovalRequest,
+        AUTHORITY_REQUEST_V2_SCHEMA_VERSION,
+    };
+    use threadlane_workers::{ExecutionBudgets, WorkerFilePermissions, WorkerProvider};
+
+    const NATIVE_OPERATOR_MD: &str = include_str!("../../../docs/NATIVE-OPERATOR.md");
+    const SKILL_MD: &str = include_str!("../../../skills/threadlane/SKILL.md");
+
+    // Preserve guide/skill version pins, byte budgets, and safety hygiene.
+    assert_eq!(OPERATING_GUIDE_VERSION, "2026-11-19.v5");
+    assert_eq!(THREADLANE_SKILL_VERSION, "2026-11-19.v5");
+    assert!(
+        OPERATING_GUIDE_MARKDOWN.len() <= 16_384,
+        "canonical MCP guide must stay within 16384 UTF-8 bytes, got {}",
+        OPERATING_GUIDE_MARKDOWN.len()
+    );
+    assert!(
+        SKILL_MD.len() <= 64 * 1024,
+        "bundled SKILL.md must stay within 65536 UTF-8 bytes, got {}",
+        SKILL_MD.len()
+    );
+    assert!(OPERATING_GUIDE_MARKDOWN.contains(OPERATING_GUIDE_VERSION));
+    assert!(NATIVE_OPERATOR_MD.contains(OPERATING_GUIDE_VERSION));
+    assert!(SKILL_MD.contains(THREADLANE_SKILL_VERSION));
+
+    let normalized_guide = normalize_whitespace(OPERATING_GUIDE_MARKDOWN);
+    let normalized_operator = normalize_whitespace(NATIVE_OPERATOR_MD);
+    let normalized_skill = normalize_whitespace(SKILL_MD);
+
+    // Regression guard: none of the three docs may unconditionally tell fallback users
+    // to serialize `preview.request` regardless of frozen `required_changed_paths`.
+    assert!(!normalized_guide
+        .contains("Legacy `approve prepare --request` records unchanged `preview.request`."));
+    assert!(!normalized_skill.contains("saves ONLY the unchanged normalized `preview.request`"));
+    assert!(!normalized_operator.contains("save ONLY the unchanged `preview.request`"));
+    assert!(!NATIVE_OPERATOR_MD
+        .contains("Example functions.exec fallback for saving unchanged preview.request (0600)"));
+
+    for required in [
+        "Plain legacy shape for `None`; typed v2 `record_request` only for `Some(required_changed_paths)`",
+        "Prefer `approve record --preview` (`None`/`Some`",
+        "Fallback `--request` (`0600`, no overwrite, consent/origin/digest checks): unchanged emitted v2 `record_request` (`Some`) or legacy `preview.request` (`None`)",
+        "fail closed if frozen required paths lack `record_request` (never rebuild, drop data, or authorize a run)",
+    ] {
+        assert!(
+            normalized_guide.contains(required),
+            "MCP operating guide is missing fallback DTO alignment fragment `{required}`"
+        );
+    }
+
+    for required in [
+        "plain legacy output shape for `None`, adding top-level typed v2 `record_request` only when `required_changed_paths` is `Some(R)`",
+        "preferred `approve record --preview` (which works for both legacy `None` and `Some(required_changed_paths)`)",
+        "save ONLY the actual emitted unchanged typed v2 `record_request` (`OperatorApprovalRequestV2`) when any task in `preview.tasks` freezes `required_changed_paths`, or the complete unchanged legacy `preview.request` (`OperatorApprovalRequest`, including `expected_plan_digest`) when all tasks leave `required_changed_paths` unset (`None`, rejecting any unexpected `record_request`)",
+        "Fail closed if a frozen `required_changed_paths` set exists on any task while the actual emitted v2 `record_request` is absent or invalid",
+        "never rebuild it, silently drop `required_changed_paths` or `expected_plan_digest`, or authorize/start a new run",
+    ] {
+        assert!(
+            normalized_skill.contains(required),
+            "bundled SKILL.md is missing fallback DTO alignment fragment `{required}`"
+        );
+    }
+
+    for required in [
+        "preserves the plain legacy `OperatorApprovalPreview` output shape",
+        "emit a top-level typed v2 `record_request` (`OperatorApprovalRequestV2`: `{schema_version: 2, request, task_required_changed_paths}`)",
+        "`record --preview` works for both legacy `None` and `Some(required_changed_paths)`",
+        "When any task in `preview.tasks` freezes `required_changed_paths`, save ONLY the actual emitted top-level typed v2 `record_request`",
+        "Fail closed if a frozen `required_changed_paths` entry exists on any task while the actual emitted v2 `record_request` is absent or malformed",
+        "never rebuild `record_request` manually, never silently drop `required_changed_paths` by falling back to `preview.request`, and never authorize or start a new run",
+        "When all tasks leave `required_changed_paths` unset (`None`, plain legacy output shape), reject any unexpected `record_request` and save ONLY the complete unchanged legacy `preview.request`",
+    ] {
+        assert!(
+            normalized_operator.contains(required),
+            "docs/NATIVE-OPERATOR.md is missing fallback DTO alignment fragment `{required}`"
+        );
+    }
+
+    // Verify the executable functions.exec JS fallback snippet handles both CLI output shapes,
+    // selects emitted v2 `record_request` or legacy `preview.request`, fails closed on missing or
+    // mismatched v2 DTOs, and preserves every 0600/no-overwrite/digest/path safeguard.
+    let js_fallback = NATIVE_OPERATOR_MD
+        .split("```js")
+        .skip(1)
+        .filter_map(|fragment| fragment.split_once("```").map(|(code, _)| code))
+        .find(|code| code.contains("Example functions.exec fallback"))
+        .expect("executable functions.exec fallback JS snippet in docs/NATIVE-OPERATOR.md");
+    for required_js in [
+        "const isPrivateReceipt = Object.hasOwn(prepareOut, \"preview\");",
+        "if (isPrivateReceipt && Object.hasOwn(preview, \"record_request\"))",
+        "Object.hasOwn(task, \"required_changed_paths\")",
+        "if (requiredByTask.size > 0)",
+        "Object.keys(v2).length !== 3 || v2.schema_version !== 2",
+        "v2.request.expected_plan_digest !== preview.request.expected_plan_digest",
+        "v2.task_required_changed_paths",
+        "frozen required_changed_paths require actual emitted v2 record_request",
+        "unexpected record_request on legacy preview without required_changed_paths",
+        "recordDto = v2;",
+        "recordDto = preview.request;",
+        "const rawJson = JSON.stringify(recordDto);",
+        "umask 077; set -C;",
+        "CDPATH= cd -P -- \"$dir\" && pwd -P",
+        "printf '%s'",
+        "shQuote(rawJson)",
+        "!reqPath.endsWith(\"/request.json\")",
+    ] {
+        assert!(
+            js_fallback.contains(required_js),
+            "docs/NATIVE-OPERATOR.md JS fallback snippet is missing `{required_js}`"
+        );
+    }
+    assert!(!js_fallback.contains("JSON.stringify(preview.request)"));
+
+    // Confirm real authority DTO wire shapes match the documented legacy vs v2 contract.
+    assert_eq!(AUTHORITY_REQUEST_V2_SCHEMA_VERSION, 2);
+    let base_request = OperatorApprovalRequest {
+        binding_id: "bnd_0196ed00-0000-7000-8000-000000000704".to_string(),
+        thread_uuid: "0196ed00-0000-7000-8000-000000000704".to_string(),
+        plan_id: "pln_0196ed00-0000-7000-8000-000000000704".to_string(),
+        plan_revision: 1,
+        expected_registry_revision: 1,
+        expected_plan_digest: "a".repeat(64),
+        repository_path: PathBuf::from("/tmp/example-repo"),
+        base_commit: "1".repeat(40),
+        approved_task_ids: vec!["task-1".to_string()],
+        approved_write_paths: vec!["README.md".to_string(), "STATUS.txt".to_string()],
+        max_parallel: 1,
+        budgets: ExecutionBudgets::default(),
+    };
+    let make_task = |required_changed_paths: Option<Vec<String>>| ApprovedTaskRecord {
+        task_id: "task-1".to_string(),
+        title: "Sample task".to_string(),
+        instruction: "Update README.md".to_string(),
+        instruction_digest: "b".repeat(64),
+        role: WorkflowRole::Coder,
+        difficulty: Difficulty::Easy,
+        tool_id: "opencode".to_string(),
+        adapter: ToolAdapter::OpencodeV2,
+        provider: Some(WorkerProvider::OpenCodeV2),
+        canonical_executable: Some(PathBuf::from("/usr/bin/opencode")),
+        model_id: "model-fast".to_string(),
+        model_arg: "provider/model-fast".to_string(),
+        base_model: "provider/model-fast".to_string(),
+        effort: Some("high".to_string()),
+        cli_model_arg: Some("provider/model-fast#high".to_string()),
+        standalone: Some(true),
+        file_permissions: Some(WorkerFilePermissions::TaskFiles),
+        depends_on: vec![],
+        allowed_write_paths: vec!["README.md".to_string(), "STATUS.txt".to_string()],
+        required_changed_paths,
+        task_digest: "c".repeat(64),
+        profile_id: Some("worker-profile-1".to_string()),
+        command_key: Some("cmd-task-1".to_string()),
+    };
+
+    let legacy_preview = OperatorApprovalPreview {
+        request: base_request.clone(),
+        subject_digest: "d".repeat(64),
+        tasks: vec![make_task(None)],
+    };
+    assert!(legacy_preview
+        .task_required_changed_paths()
+        .expect("legacy preview map")
+        .is_empty());
+    let legacy_json = serde_json::to_value(&legacy_preview).expect("serialize legacy preview");
+    let legacy_task_obj = legacy_json["tasks"][0]
+        .as_object()
+        .expect("legacy task object");
+    assert!(!legacy_task_obj.contains_key("required_changed_paths"));
+    assert_eq!(
+        legacy_json["request"]["expected_plan_digest"],
+        "a".repeat(64)
+    );
+
+    let v2_preview = OperatorApprovalPreview {
+        request: base_request,
+        subject_digest: "e".repeat(64),
+        tasks: vec![make_task(Some(vec!["README.md".to_string()]))],
+    };
+    let v2_request = v2_preview
+        .to_request_v2()
+        .expect("derive typed v2 record_request");
+    let v2_json = serde_json::to_value(&v2_request).expect("serialize v2 record_request");
+    let v2_obj = v2_json.as_object().expect("v2 object");
+    assert_eq!(v2_obj.len(), 3);
+    assert_eq!(v2_obj["schema_version"], 2);
+    assert_eq!(v2_obj["request"]["expected_plan_digest"], "a".repeat(64));
+    assert_eq!(
+        v2_obj["task_required_changed_paths"],
+        json!({ "task-1": ["README.md"] })
+    );
+}
+
+#[test]
+fn readonly_role_routing_docs_and_live_mcp_schemas_cover_job_reuse_and_prepare_work() {
+    const NATIVE_OPERATOR_MD: &str = include_str!("../../../docs/NATIVE-OPERATOR.md");
+    const SKILL_MD: &str = include_str!("../../../skills/threadlane/SKILL.md");
+
+    let normalized_guide = normalize_whitespace(OPERATING_GUIDE_MARKDOWN);
+    let normalized_operator = normalize_whitespace(NATIVE_OPERATOR_MD);
+    let normalized_skill = normalize_whitespace(SKILL_MD);
+
+    for required in [
+        "Optional read-only roles (not mandatory; no new job for ordinary work)",
+        "plan/dependency/ownership changes need `Orchestrator`; architectural ambiguity uses `Advisor`",
+        "Reuse a suitable scoped job (`coworker_status`) or call metadata-only `prepare_work` (exact binding/project/base/requirements/profile under live guide; no model calls/grants/auto-approval/dispatch) instead of asking for `job_id`",
+        "pass actual `job_id` + matching live role grant to `request_technical_plan`/`consult_advisor` (legacy `architect`: `consult_architect`)",
+        "Changed authority, missing user-owned requirements, or prior ambiguity stay explicit (no invented IDs/implicit grants)",
+    ] {
+        assert!(
+            normalized_guide.contains(required),
+            "MCP operating guide is missing read-only role routing fragment `{required}`"
+        );
+    }
+
+    for (doc_name, normalized_doc) in [
+        ("docs/NATIVE-OPERATOR.md", &normalized_operator),
+        ("skills/threadlane/SKILL.md", &normalized_skill),
+    ] {
+        for required in [
+            "Read-only `Orchestrator` and `Advisor` stages remain optional (never mandatory, and no new job is required for ordinary single-task Worker work)",
+            "inspect live `coworker_status` first: reuse an existing suitable scoped job whose binding, project, base/tree, requirements, and profile match",
+            "call metadata-only `prepare_work` rather than asking the human for a `job_id`, then pass the actual returned `job_id` together with the matching live role grant (`orchestrator` for `request_technical_plan`; explicit `advisor` for `consult_advisor`, or retained `architect` for pre-transition `consult_architect`) to `request_technical_plan` or `consult_advisor`",
+            "`prepare_work` makes no model calls, creates no grants, grants no execution approval, and dispatches nothing",
+            "missing necessary user-owned requirements, or prior ambiguity remain explicit with the human; never invent a `job_id`, infer implicit grants, auto-dispatch, or auto-approve",
+        ] {
+            assert!(
+                normalized_doc.contains(required),
+                "{doc_name} is missing read-only role routing fragment `{required}`"
+            );
+        }
+    }
+
+    // Verify live paired MCP tool schemas match the documented read-only role routing contract.
+    let tmp = TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("runtime-state");
+    let pairing_dir = tmp.path().join("pairing-state");
+    let pairing_store = PairingStore::open(&pairing_dir).expect("open pairing store");
+    let paired_server =
+        PairedMcpServer::new(&state_dir, pairing_store).expect("create paired server");
+    let paired_tools = paired_server.list_tools();
+
+    let tool_schema = |name: &str| -> Value {
+        let tool = paired_tools
+            .iter()
+            .find(|t| t.name == name)
+            .unwrap_or_else(|| panic!("paired MCP surface must expose `{name}`"));
+        serde_json::to_value(&tool.input_schema).expect("serialize MCP tool input schema")
+    };
+    let required_fields = |schema: &Value| -> Vec<String> {
+        schema
+            .get("required")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
+    let status_schema = tool_schema("coworker_status");
+    assert_eq!(status_schema["additionalProperties"], json!(false));
+    assert!(required_fields(&status_schema).is_empty());
+
+    let prepare_schema = tool_schema("prepare_work");
+    assert_eq!(prepare_schema["additionalProperties"], json!(false));
+    let prepare_required = required_fields(&prepare_schema);
+    for field in [
+        "grant_id",
+        "request_key",
+        "summary",
+        "confirmed_requirements",
+    ] {
+        assert!(
+            prepare_required.iter().any(|item| item == field),
+            "prepare_work schema must require `{field}`"
+        );
+    }
+    let prepare_props = prepare_schema["properties"]
+        .as_object()
+        .expect("prepare_work properties");
+    for server_derived in [
+        "binding_id",
+        "thread_uuid",
+        "job_id",
+        "project_base",
+        "profile_id",
+    ] {
+        assert!(
+            !prepare_props.contains_key(server_derived),
+            "prepare_work must derive `{server_derived}` from live server/grant state, not caller args"
+        );
+    }
+
+    let plan_schema = tool_schema("request_technical_plan");
+    assert_eq!(plan_schema["additionalProperties"], json!(false));
+    let plan_required = required_fields(&plan_schema);
+    for field in ["grant_id", "job_id", "request_key"] {
+        assert!(
+            plan_required.iter().any(|item| item == field),
+            "request_technical_plan schema must require `{field}`"
+        );
+    }
+
+    for advisor_tool in ["consult_advisor", "consult_architect"] {
+        let advisor_schema = tool_schema(advisor_tool);
+        assert_eq!(advisor_schema["additionalProperties"], json!(false));
+        let advisor_required = required_fields(&advisor_schema);
+        for field in [
+            "grant_id",
+            "job_id",
+            "request_key",
+            "question",
+            "dependency_files",
+        ] {
+            assert!(
+                advisor_required.iter().any(|item| item == field),
+                "{advisor_tool} schema must require `{field}`"
+            );
+        }
+    }
+}

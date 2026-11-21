@@ -3295,6 +3295,7 @@ fn coworker_admission_preview_and_record_enforce_worker_instruction_limit_across
                             ),
                             depends_on: ct.depends_on.clone(),
                             allowed_write_paths: ct.allowed_write_paths.clone(),
+                            required_changed_paths: None,
                             task_digest: ct.task_digest.clone(),
                             profile_id: None,
                             command_key: None,

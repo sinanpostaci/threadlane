@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -5,11 +6,17 @@ use threadlane::WorkersConfig;
 use threadlane_registry::{Difficulty, ToolAdapter, WorkflowRole};
 use threadlane_workers::{ExecutionBudgets, WorkerFilePermissions, WorkerProvider};
 
+use crate::error::AuthorityError;
+
 /// Current on-disk schema version for `approvals.json`.
 pub const AUTHORITY_SCHEMA_VERSION: u32 = 1;
 
 /// Current workflow authority policy version included in every approval subject digest.
 pub const AUTHORITY_POLICY_VERSION: u32 = 1;
+
+/// Schema version marker for strict v2 operator approval intents and requests carrying optional
+/// per-task `required_changed_paths`.
+pub const AUTHORITY_REQUEST_V2_SCHEMA_VERSION: u32 = 2;
 
 /// Filename for the persisted authority approval ledger inside the authority directory.
 pub const APPROVALS_FILE_NAME: &str = "approvals.json";
@@ -32,6 +39,9 @@ pub const MAX_EXECUTABLE_PROFILES_PER_APPROVAL: usize = 32;
 
 /// Maximum number of operator-approved write path entries in a single [`OperatorApprovalRequest`].
 pub const MAX_APPROVED_WRITE_PATHS: usize = 64;
+
+/// Maximum number of exact-file `required_changed_paths` entries permitted on a single task.
+pub const MAX_REQUIRED_CHANGED_PATHS: usize = MAX_APPROVED_WRITE_PATHS;
 
 /// Minimum allowed `max_parallel` concurrency limit in an [`OperatorApprovalRequest`].
 pub const MIN_APPROVAL_MAX_PARALLEL: usize = 1;
@@ -110,6 +120,32 @@ pub struct OperatorApprovalRequest {
     pub budgets: ExecutionBudgets,
 }
 
+/// Strict v2 operator approval intent wrapping [`OperatorApprovalIntent`] with optional per-task
+/// exact-file `required_changed_paths`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorApprovalIntentV2 {
+    /// Schema version marker; must equal [`AUTHORITY_REQUEST_V2_SCHEMA_VERSION`] (`2`).
+    pub schema_version: u32,
+    /// Base operator approval intent.
+    pub intent: OperatorApprovalIntent,
+    /// Optional per-task exact-file `required_changed_paths` keyed by selected `task_id`.
+    pub task_required_changed_paths: BTreeMap<String, Vec<String>>,
+}
+
+/// Strict v2 operator approval request wrapping [`OperatorApprovalRequest`] with optional per-task
+/// exact-file `required_changed_paths`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorApprovalRequestV2 {
+    /// Schema version marker; must equal [`AUTHORITY_REQUEST_V2_SCHEMA_VERSION`] (`2`).
+    pub schema_version: u32,
+    /// Base normalized operator approval request.
+    pub request: OperatorApprovalRequest,
+    /// Optional per-task exact-file `required_changed_paths` keyed by selected `task_id`.
+    pub task_required_changed_paths: BTreeMap<String, Vec<String>>,
+}
+
 /// Immutable frozen task snapshot persisted inside an [`ApprovalRecord`].
 ///
 /// Captures a complete copy of the resolved model, effort, canonical CLI executable path (for
@@ -156,6 +192,11 @@ pub struct ApprovedTaskRecord {
     pub depends_on: Vec<String>,
     /// Exact repository-relative write paths permitted for this task.
     pub allowed_write_paths: Vec<String>,
+    /// Optional operator-selected exact repository-relative file paths required to change for
+    /// this task (`None` for legacy or unconstrained approvals). Separate from
+    /// `allowed_write_paths`, which remains the worker's write permission scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required_changed_paths: Option<Vec<String>>,
     /// 64-character lowercase hex SHA-256 digest of the compiled task specification.
     pub task_digest: String,
     /// Deterministic worker profile identifier (`<= 64` chars) for headless worker tasks (`None` for manual native routes).
@@ -286,6 +327,40 @@ pub struct OperatorApprovalPreview {
     pub subject_digest: String,
     /// Frozen copies of the selected tasks in deterministic plan order.
     pub tasks: Vec<ApprovedTaskRecord>,
+}
+
+impl OperatorApprovalPreview {
+    /// Extracts per-task `required_changed_paths` selections present on [`Self::tasks`].
+    ///
+    /// Rejects previews whose [`Self::tasks`] list contains duplicate task identifiers.
+    pub fn task_required_changed_paths(
+        &self,
+    ) -> Result<BTreeMap<String, Vec<String>>, AuthorityError> {
+        let mut seen = BTreeSet::new();
+        let mut map = BTreeMap::new();
+        for task in &self.tasks {
+            if !seen.insert(task.task_id.clone()) {
+                return Err(AuthorityError::validation(
+                    "preview",
+                    format!("duplicate task_id `{}` in approval preview", task.task_id),
+                ));
+            }
+            if let Some(ref required) = task.required_changed_paths {
+                map.insert(task.task_id.clone(), required.clone());
+            }
+        }
+        Ok(map)
+    }
+
+    /// Reconstructs the strict [`OperatorApprovalRequestV2`] corresponding to this preview,
+    /// preserving every task's `required_changed_paths`.
+    pub fn to_request_v2(&self) -> Result<OperatorApprovalRequestV2, AuthorityError> {
+        Ok(OperatorApprovalRequestV2 {
+            schema_version: AUTHORITY_REQUEST_V2_SCHEMA_VERSION,
+            request: self.request.clone(),
+            task_required_changed_paths: self.task_required_changed_paths()?,
+        })
+    }
 }
 
 /// Complete private operator-only approval record persisted in [`crate::AuthorityStore`].

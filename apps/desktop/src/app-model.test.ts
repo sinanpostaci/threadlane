@@ -4639,4 +4639,319 @@ describe('workspace external resolution projection', () => {
     assert.equal(selectedChat.jobSummary.externallyResolvedJobCount, 1);
     assert.equal(selectedChat.jobSummary.partiallyResolvedJobCount, 1);
   });
+
+  it('preserves explicit canonical chat selection during incomplete refreshes, source omissions, scope collisions, and reordering without showing another chat', () => {
+    const idA = makeChatIdentity({
+      source_id: 'src-a',
+      binding_id: 'bnd_alpha',
+      thread_uuid: UUID_CHAT_A,
+      canonical_project_scope: '/work/alpha',
+    });
+    const idB = makeChatIdentity({
+      source_id: 'src-a',
+      binding_id: 'bnd_beta',
+      thread_uuid: UUID_CHAT_B,
+      canonical_project_scope: '/work/alpha',
+    });
+    const idSameThreadDifferentScope = makeChatIdentity({
+      source_id: 'src-a',
+      binding_id: 'bnd_alpha',
+      thread_uuid: UUID_CHAT_A,
+      canonical_project_scope: '/work/alpha-other',
+    });
+    const idDifferentBinding = makeChatIdentity({
+      source_id: 'src-a',
+      binding_id: 'bnd_other_binding',
+      thread_uuid: UUID_CHAT_A,
+      canonical_project_scope: '/work/alpha',
+    });
+    const keyA = formatWorkspaceChatIdentityKey(idA)!;
+    const keyB = formatWorkspaceChatIdentityKey(idB)!;
+
+    const summaryA = {
+      identity: idA,
+      thread_label: 'Chat Alpha',
+      project_label: 'Alpha Repo',
+      availability: 'available' as const,
+      activity: 'idle' as const,
+      configured_selection: createVerifiedConfiguredSelection('gpt-5.4', 'high'),
+      active_job_count: 0,
+      attention_count: 0,
+      updated_at_ms: NOW_MS - 4_000,
+    };
+    const summaryB = {
+      identity: idB,
+      thread_label: 'Chat Beta',
+      project_label: 'Alpha Repo',
+      availability: 'available' as const,
+      activity: 'working' as const,
+      configured_selection: createVerifiedConfiguredSelection('gpt-5.4', 'xhigh'),
+      active_job_count: 1,
+      attention_count: 0,
+      updated_at_ms: NOW_MS - 1_000,
+    };
+
+    const fullSnapshot = makeWorkspaceSnapshotFixture({
+      observation: makeSnapshot({
+        sources: [makeSource({ id: 'src-a', label: 'Alpha Repo', project_path: '/work/alpha' })],
+        jobs: [],
+        requests: [],
+      }),
+      chats: [summaryA, summaryB],
+      native_samples: [
+        makeLiveNativeSample(idA, { activity: 'idle' }),
+        makeLiveNativeSample(idB, { activity: 'working' }),
+      ],
+    });
+
+    // Initial no-selection still auto-selects the first visible chat (B is newer).
+    const initialNoSelection = projectWorkspaceSnapshot(fullSnapshot, {
+      nowMs: NOW_MS,
+    });
+    assert.equal(initialNoSelection.selectedChatKey, keyB);
+    assert.equal(initialNoSelection.selectedChat?.threadLabel, 'Chat Beta');
+    assert.equal(initialNoSelection.selectedChatUnavailable, null);
+
+    // Explicit selection of A while A is present.
+    const selectedA = projectWorkspaceSnapshot(fullSnapshot, {
+      nowMs: NOW_MS,
+      selectedChatKey: keyA,
+    });
+    assert.equal(selectedA.selectedChatKey, keyA);
+    assert.equal(selectedA.selectedChat?.threadLabel, 'Chat Alpha');
+    assert.equal(selectedA.selectedChatUnavailable, null);
+
+    // Incomplete snapshot: A is omitted (bounded refresh), only B is present.
+    const betaOnlySnapshot = makeWorkspaceSnapshotFixture({
+      generated_at_ms: NOW_MS + 1_000,
+      observation: makeSnapshot({
+        generated_at_ms: NOW_MS + 1_000,
+        sources: [makeSource({ id: 'src-a', label: 'Alpha Repo', project_path: '/work/alpha' })],
+        jobs: [],
+        requests: [],
+      }),
+      chats: [{ ...summaryB, updated_at_ms: NOW_MS + 900 }],
+      native_samples: [makeLiveNativeSample(idB, { activity: 'working' })],
+      bounds: {
+        native_samples_omitted: 1,
+        job_histories_omitted: 0,
+        messages_omitted: 0,
+        requests_capped: false,
+        jobs_capped: false,
+      },
+    });
+
+    const absentProj = projectWorkspaceSnapshot(betaOnlySnapshot, {
+      nowMs: NOW_MS + 1_000,
+      selectedChatKey: keyA,
+      selectedChatLabelHint: {
+        chatKey: keyA,
+        threadLabel: 'Chat Alpha',
+        projectLabel: 'Alpha Repo',
+      },
+    });
+    assert.equal(absentProj.status, 'ready');
+    assert.equal(absentProj.selectedChatKey, keyA);
+    assert.equal(absentProj.selectedChat, null);
+    assert.ok(absentProj.selectedChatUnavailable);
+    assert.equal(absentProj.selectedChatUnavailable.chatKey, keyA);
+    assert.deepEqual(absentProj.selectedChatUnavailable.identity, idA);
+    assert.equal(absentProj.selectedChatUnavailable.lifecycle, 'active');
+    assert.equal(absentProj.selectedChatUnavailable.reason, 'chat_absent');
+    assert.equal(absentProj.selectedChatUnavailable.threadLabel, 'Chat Alpha');
+    assert.equal(absentProj.selectedChatUnavailable.projectLabel, 'Alpha Repo');
+    assert.equal(
+      absentProj.selectedChatUnavailable.statusLabel,
+      'Temporarily unavailable',
+    );
+    assert.doesNotMatch(
+      absentProj.selectedChatUnavailable.message,
+      /\b(?:archived?|deleted?|removed?)\b/i,
+    );
+    assert.ok(
+      absentProj.statusNotices.includes(
+        absentProj.selectedChatUnavailable.message,
+      ),
+    );
+
+    // A mismatched label hint for B must never leak B's title onto unavailable A.
+    const mismatchedHintProj = projectWorkspaceSnapshot(betaOnlySnapshot, {
+      nowMs: NOW_MS + 1_000,
+      selectedChatKey: keyA,
+      selectedChatLabelHint: {
+        chatKey: keyB,
+        threadLabel: 'Chat Beta',
+        projectLabel: 'Wrong Project',
+      },
+    });
+    assert.equal(mismatchedHintProj.selectedChat, null);
+    assert.equal(
+      mismatchedHintProj.selectedChatUnavailable?.threadLabel,
+      'Selected chat',
+    );
+    assert.equal(
+      mismatchedHintProj.selectedChatUnavailable?.projectLabel,
+      'Alpha Repo',
+    );
+
+    // Scope/binding collision: a chat sharing thread_uuid with A but differing in
+    // canonical_project_scope or binding_id must never satisfy A.
+    const collisionSnapshot = makeWorkspaceSnapshotFixture({
+      generated_at_ms: NOW_MS + 1_500,
+      observation: makeSnapshot({
+        generated_at_ms: NOW_MS + 1_500,
+        sources: [makeSource({ id: 'src-a', label: 'Alpha Repo', project_path: '/work/alpha' })],
+        jobs: [],
+        requests: [],
+      }),
+      chats: [
+        {
+          ...summaryB,
+          identity: idSameThreadDifferentScope,
+          thread_label: 'Other Scope Twin',
+          project_label: 'Alpha Other',
+        },
+        {
+          ...summaryB,
+          identity: idDifferentBinding,
+          thread_label: 'Other Binding Twin',
+          project_label: 'Alpha Repo',
+        },
+      ],
+    });
+    const collisionProj = projectWorkspaceSnapshot(collisionSnapshot, {
+      nowMs: NOW_MS + 1_500,
+      selectedChatKey: keyA,
+    });
+    assert.equal(collisionProj.selectedChatKey, keyA);
+    assert.equal(collisionProj.selectedChat, null);
+    assert.equal(collisionProj.selectedChatUnavailable?.reason, 'chat_absent');
+
+    // Source omitted: snapshot omits src-a from observation.sources completely.
+    const sourceOmittedSnapshot = makeWorkspaceSnapshotFixture({
+      generated_at_ms: NOW_MS + 2_000,
+      observation: makeSnapshot({
+        generated_at_ms: NOW_MS + 2_000,
+        sources: [],
+        jobs: [],
+        requests: [],
+      }),
+      chats: [],
+      native_samples: [],
+    });
+    const sourceOmittedProj = projectWorkspaceSnapshot(sourceOmittedSnapshot, {
+      nowMs: NOW_MS + 2_000,
+      selectedChatKey: keyA,
+      selectedChatLabelHint: {
+        chatKey: keyA,
+        threadLabel: 'Chat Alpha',
+        projectLabel: 'Alpha Repo',
+      },
+    });
+    assert.equal(sourceOmittedProj.selectedChatKey, keyA);
+    assert.equal(sourceOmittedProj.selectedChat, null);
+    assert.equal(
+      sourceOmittedProj.selectedChatUnavailable?.reason,
+      'source_omitted',
+    );
+    assert.equal(
+      sourceOmittedProj.selectedChatUnavailable?.threadLabel,
+      'Chat Alpha',
+    );
+
+    // Source unavailable (including allSourcesUnavailable path): preserves A cleanly.
+    const allSourcesUnavailableSnapshot = makeWorkspaceSnapshotFixture({
+      generated_at_ms: NOW_MS + 2_500,
+      observation: makeSnapshot({
+        generated_at_ms: NOW_MS + 2_500,
+        sources: [
+          makeSource({
+            id: 'src-a',
+            label: 'Alpha Repo',
+            project_path: '/work/alpha',
+            availability: 'unavailable',
+            message: 'SQLite reader temporarily busy',
+          }),
+        ],
+        jobs: [],
+        requests: [],
+      }),
+      chats: [],
+      native_samples: [],
+    });
+    const sourceUnavailableProj = projectWorkspaceSnapshot(
+      allSourcesUnavailableSnapshot,
+      {
+        nowMs: NOW_MS + 2_500,
+        selectedChatKey: keyA,
+      },
+    );
+    assert.equal(sourceUnavailableProj.status, 'unavailable');
+    assert.equal(sourceUnavailableProj.selectedChatKey, keyA);
+    assert.equal(sourceUnavailableProj.selectedChat, null);
+    assert.equal(
+      sourceUnavailableProj.selectedChatUnavailable?.reason,
+      'source_unavailable',
+    );
+    assert.equal(
+      sourceUnavailableProj.selectedChatUnavailable?.sourceUnavailableDetail,
+      'SQLite reader temporarily busy',
+    );
+
+    // Reordered return: A+B returns with B newer (first in sidebar); A restores automatically.
+    const returnedReorderedSnapshot = makeWorkspaceSnapshotFixture({
+      generated_at_ms: NOW_MS + 3_000,
+      observation: makeSnapshot({
+        generated_at_ms: NOW_MS + 3_000,
+        sources: [makeSource({ id: 'src-a', label: 'Alpha Repo', project_path: '/work/alpha' })],
+        jobs: [],
+        requests: [],
+      }),
+      chats: [
+        { ...summaryB, updated_at_ms: NOW_MS + 2_900 },
+        { ...summaryA, updated_at_ms: NOW_MS - 4_000 },
+      ],
+      native_samples: [
+        makeLiveNativeSample(idB, { activity: 'working' }),
+        makeLiveNativeSample(idA, { activity: 'idle' }),
+      ],
+    });
+    const restoredProj = projectWorkspaceSnapshot(returnedReorderedSnapshot, {
+      nowMs: NOW_MS + 3_000,
+      selectedChatKey: keyA,
+    });
+    assert.equal(restoredProj.visibleProjects[0]?.chats[0]?.chatKey, keyB);
+    assert.equal(restoredProj.selectedChatKey, keyA);
+    assert.equal(restoredProj.selectedChat?.threadLabel, 'Chat Alpha');
+    assert.equal(restoredProj.selectedChatUnavailable, null);
+
+    // Explicit lifecycle separation: if A is archived while viewing Active and A is absent,
+    // Active falls back to B; while viewing Archive, missing archived A stays preserved.
+    const archivedAPrefs = setWorkspaceChatArchivePreference(
+      {},
+      idA,
+      'archived',
+      NOW_MS + 3_100,
+    );
+    const activeAfterArchive = projectWorkspaceSnapshot(betaOnlySnapshot, {
+      nowMs: NOW_MS + 3_100,
+      lifecycleFilter: 'active',
+      archivePreferences: archivedAPrefs,
+      selectedChatKey: keyA,
+    });
+    assert.equal(activeAfterArchive.selectedChatKey, keyB);
+    assert.equal(activeAfterArchive.selectedChat?.threadLabel, 'Chat Beta');
+    assert.equal(activeAfterArchive.selectedChatUnavailable, null);
+
+    const archiveViewMissingA = projectWorkspaceSnapshot(betaOnlySnapshot, {
+      nowMs: NOW_MS + 3_100,
+      lifecycleFilter: 'archived',
+      archivePreferences: archivedAPrefs,
+      selectedChatKey: keyA,
+    });
+    assert.equal(archiveViewMissingA.selectedChatKey, keyA);
+    assert.equal(archiveViewMissingA.selectedChat, null);
+    assert.equal(archiveViewMissingA.selectedChatUnavailable?.lifecycle, 'archived');
+    assert.equal(archiveViewMissingA.selectedChatUnavailable?.reason, 'chat_absent');
+  });
 });

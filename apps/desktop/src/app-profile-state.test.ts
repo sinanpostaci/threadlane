@@ -8,6 +8,7 @@ import {
   beginAsyncOperation,
   beginCloneProfile,
   beginCreateProfile,
+  buildRegistryIndex,
   cancelPendingSwitch,
   clearDraftProfileOverrides,
   clearDraftRoleOverrides,
@@ -31,6 +32,7 @@ import {
   selectProfile,
   selectRoleEffort,
   selectRoleModel,
+  summarizeProfile,
   syncRegistrySnapshot,
   tableFromProfile,
   updateActiveDraft,
@@ -993,6 +995,161 @@ describe('app-profile-state transitions and invariants', () => {
         reloadOp.operationId,
         snapshotRev11Default
       ).accepted,
+      false
+    );
+  });
+
+  it('filters unsupported advisor models from picker while retaining saved invalid selections until repaired or cleared', () => {
+    const savedProfile = makeProfile(
+      'profile-legacy-advisor-model',
+      'Saved Unsupported Advisor',
+      [],
+      'openai-main:gpt-6.2-sol'
+    );
+    const rawSavedBefore = JSON.stringify(savedProfile);
+    const snapshot: RegistrySnapshot = {
+      ...makeSnapshot([savedProfile]),
+      tools: [
+        ...makeTools(),
+        {
+          id: 'openai-main',
+          label: 'OpenAI Decisions API',
+          adapter: 'openai_decisions_api',
+          executable_path: null,
+          enabled: true,
+        },
+        {
+          id: 'openai-disabled',
+          label: 'Disabled OpenAI Decisions API',
+          adapter: 'openai_decisions_api',
+          executable_path: null,
+          enabled: false,
+        },
+      ],
+      models: [
+        ...makeModels(),
+        {
+          id: 'openai-main:gpt-6-luna',
+          tool_id: 'openai-main',
+          label: 'GPT-6 Luna',
+          model_arg: 'gpt-6-luna',
+          efforts: [],
+          allow_no_effort: true,
+        },
+        {
+          id: 'openai-main:gpt-6-luna-2026-10-01',
+          tool_id: 'openai-main',
+          label: 'GPT-6 Luna Dated',
+          model_arg: 'gpt-6-luna-2026-10-01',
+          efforts: [],
+          allow_no_effort: true,
+        },
+        {
+          id: 'openai-main:gpt-6.2-sol',
+          tool_id: 'openai-main',
+          label: 'GPT-6.2 Sol',
+          model_arg: 'gpt-6.2-sol',
+          efforts: [],
+          allow_no_effort: true,
+        },
+        {
+          id: 'jev-main:untrimmed',
+          tool_id: 'jev-main',
+          label: 'Untrimmed Jev',
+          model_arg: ' jev-1.14.0 ',
+          efforts: [],
+          allow_no_effort: true,
+        },
+        {
+          id: 'openai-disabled:gpt-6-luna',
+          tool_id: 'openai-disabled',
+          label: 'Disabled Luna',
+          model_arg: 'gpt-6-luna',
+          efforts: [],
+          allow_no_effort: true,
+        },
+        {
+          id: 'codex-main:gpt-6-luna',
+          tool_id: 'codex-main',
+          label: 'CLI Luna',
+          model_arg: 'gpt-6-luna',
+          efforts: [],
+          allow_no_effort: true,
+        },
+      ],
+    };
+
+    const index = buildRegistryIndex(snapshot);
+    assert.deepEqual(
+      index.advisorChoices.map((choice) => choice.model.id),
+      ['jev-1.14.0', 'openai-main:gpt-6-luna', 'openai-main:gpt-6-luna-2026-10-01']
+    );
+
+    const summary = summarizeProfile(snapshot, savedProfile);
+    assert.equal(summary.advisor.state, 'invalid');
+    if (summary.advisor.state === 'invalid') {
+      assert.equal(summary.advisor.issue.code, 'unsupported_model');
+      assert.equal(summary.advisor.advisor.model_id, 'openai-main:gpt-6.2-sol');
+    }
+
+    const initialState = createProfilesPanelState(snapshot);
+    const initialDraft = getActiveDraft(initialState)!;
+    assert.deepEqual(initialDraft.decisionAdvisor, {
+      model_id: 'openai-main:gpt-6.2-sol',
+      mode: 'shadow',
+    });
+    assert.equal(isDraftDirty(initialDraft), false);
+    assert.equal(JSON.stringify(savedProfile), rawSavedBefore);
+
+    const initialAnalysis = analyzeDraft(snapshot, initialDraft);
+    assert.equal(initialAnalysis.advisor.state, 'invalid');
+    if (initialAnalysis.advisor.state === 'invalid') {
+      assert.equal(initialAnalysis.advisor.issue.code, 'unsupported_model');
+      assert.equal(
+        initialAnalysis.errors.includes(
+          `Decision advisor: ${initialAnalysis.advisor.issue.message}`
+        ),
+        true
+      );
+    }
+
+    // Explicit repair to a supported OpenAI model clears the issue without altering saved data
+    const repairedState = updateActiveDraft(initialState, (draft) => ({
+      ...draft,
+      decisionAdvisor: { model_id: 'openai-main:gpt-6-luna', mode: 'shadow' },
+    }));
+    const repairedDraft = getActiveDraft(repairedState)!;
+    assert.equal(isDraftDirty(repairedDraft), true);
+    const repairedAnalysis = analyzeDraft(snapshot, repairedDraft);
+    assert.equal(repairedAnalysis.advisor.state, 'ready');
+    assert.deepEqual(repairedAnalysis.errors, []);
+    assert.deepEqual(profileFromDraft(repairedDraft).decision_advisor, {
+      model_id: 'openai-main:gpt-6-luna',
+      mode: 'shadow',
+    });
+    assert.equal(JSON.stringify(savedProfile), rawSavedBefore);
+
+    // Discarding the edit restores the unchanged retained invalid selection
+    const discardedState = discardActiveDraft(repairedState);
+    const discardedDraft = getActiveDraft(discardedState)!;
+    assert.equal(isDraftDirty(discardedDraft), false);
+    assert.deepEqual(discardedDraft.decisionAdvisor, {
+      model_id: 'openai-main:gpt-6.2-sol',
+      mode: 'shadow',
+    });
+
+    // Explicit clear switches to off and omits decision_advisor on serialization
+    const clearedState = updateActiveDraft(initialState, (draft) => ({
+      ...draft,
+      decisionAdvisor: null,
+    }));
+    const clearedDraft = getActiveDraft(clearedState)!;
+    assert.equal(isDraftDirty(clearedDraft), true);
+    const clearedAnalysis = analyzeDraft(snapshot, clearedDraft);
+    assert.equal(clearedAnalysis.advisor.state, 'off');
+    assert.deepEqual(clearedAnalysis.errors, []);
+    assert.equal(
+      Object.hasOwn(profileFromDraft(clearedDraft), 'decision_advisor'),
       false
     );
   });

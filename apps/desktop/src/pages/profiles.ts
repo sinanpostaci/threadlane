@@ -706,12 +706,6 @@ function advisorSummaryText(validation: DecisionAdvisorValidation): string {
   return `${validation.tool.label} · ${validation.model.label}`;
 }
 
-function advisorToolNote(tool: ToolDefinition | null): string | null {
-  return tool?.adapter === 'openai_decisions_api'
-    ? 'OpenAI Decisions is configurable for future use; current advice CLI executes Jev only.'
-    : null;
-}
-
 function groupAdvisorChoices(
   choices: readonly DecisionAdvisorChoice[]
 ): Array<{ tool: ToolDefinition; models: ModelDefinition[] }> {
@@ -1485,11 +1479,7 @@ export class ProfilesPage {
 
     let selectedValue = '';
     for (const group of groups) {
-      const groupSuffix =
-        group.tool.adapter === 'openai_decisions_api'
-          ? ' · future; Jev executes today'
-          : '';
-      const optgroup = h('optgroup', { label: `${group.tool.label}${groupSuffix}` });
+      const optgroup = h('optgroup', { label: group.tool.label });
       for (const model of group.models) {
         const modelLabel = model.label || model.id;
         const option = h('option', { value: model.id }, modelLabel);
@@ -1563,10 +1553,6 @@ export class ProfilesPage {
         ]
       : [];
 
-    const openAiNote = advisorToolNote(
-      validation.state === 'off' ? null : validation.tool
-    );
-
     return h(
       'section',
       {
@@ -1588,7 +1574,7 @@ export class ProfilesPage {
       h(
         'p',
         { class: 'aq-profiles-note', id: helpId },
-        'Suggests task difficulty without changing plans or active tasks.'
+        'Suggests task difficulty in shadow mode with Jev or OpenAI Decisions without changing plans or active tasks.'
       ),
       h(
         'div',
@@ -1611,9 +1597,6 @@ export class ProfilesPage {
               ? h('div', { class: 'aq-profiles-advisor-actions' }, ...repairActions)
               : null
           )
-        : null,
-      openAiNote
-        ? h('p', { class: 'aq-profiles-note', 'data-tone': 'warn' }, openAiNote)
         : null,
       choices.length === 0
         ? h(

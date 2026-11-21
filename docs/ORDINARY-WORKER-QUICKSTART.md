@@ -2,35 +2,34 @@
 
 No execution before human approval.
 
-1. Call `connect_current_chat` `{}` then `operating_guide` `{}`; reconnect/refetch on resume. Keep `thread_uuid, binding_id, project_root, cli_package, operator_context.content_sha256`; refresh uncertain state/`catalog`. Use its router/context and exact canonical paired `project_root` for `repository_path`; never guess IDs. In an authorized new empty test workspace initialize the fixture there before preview; keep nested clones/proofs/build products outside.
+1. Call `connect_current_chat` `{}`, `operating_guide` `{}` (refetch on resume); refresh uncertain state/`catalog`. Use exact canonical paired `project_root` for `repository_path`; never guess IDs. In an authorized new empty test workspace initialize the fixture there before preview; keep nested clones/proofs/build products outside.
 
-2. `prepare-task-exact` publishes one task. For `save_draft`/`publish` plans use `prepare-private-exact` (`OperatorApprovalIntent`: `binding_id, thread_uuid, plan_id, plan_revision, expected_registry_revision, repository_path, base_commit, approved_task_ids, approved_write_paths, max_parallel, budgets`).
+2. `prepare-task-exact` publishes one task (opt `task.required_changed_paths`). `save_draft`/`publish` plans use `prepare-private-exact` (`OperatorApprovalIntent` or v2 `{schema_version:2,intent,task_required_changed_paths}`).
 
-3. Use live scope. Both reject omitted budgets and unknown fields (`max_attempts`/`max_workers`). `max_parallel` is concurrency; `progress_watchdog` optional.
+3. Use live scope; both reject omitted budgets and unknown fields (`max_attempts`/`max_workers`).
 
-```javascript
+```js
 const req = {
-  "binding_id":"<BINDING>","thread_uuid":"<THREAD>",
-  "repository_path":"<PROJECT_ROOT>","base_commit":"<40_HEX_BASE>",
-  "profile_id":"<PROFILE>","profile_revision":1,"command_key":"<KEY>",
-  "summary":"<SUM>","task":{"id":"<ID>","title":"<TITLE>",
-    "instruction":"<INSTR>","role":"coder","difficulty":"easy",
-    "depends_on":[],"allowed_write_paths":["STATUS.txt"]},
-  "budgets":{"timeout_ms":90000,"max_line_bytes":16384,"max_stdout_bytes":2097152,
-    "max_stderr_bytes":100000,"max_events":321}
+ "binding_id":"<B>","thread_uuid":"<T>","repository_path":"<ROOT>",
+ "base_commit":"<SHA>","profile_id":"<P>","profile_revision":1,
+ "command_key":"<K>","summary":"<S>","task":{"id":"<ID>","title":"<TI>",
+ "instruction":"<IN>","role":"coder","difficulty":"easy","depends_on":[],
+ "allowed_write_paths":["STATUS.txt"]},"budgets":{"timeout_ms":90000,
+ "max_line_bytes":16384,"max_stdout_bytes":2097152,"max_stderr_bytes":100000,
+ "max_events":321}
 };
 const q = s => "'" + s.replace(/'/g, "'\\''") + "'";
 const cmd = "printf '%s' " + q(JSON.stringify(req)) + " | " + q("<router>") +
-  " --context " + q("<context>") + " approve prepare-task-exact";
+ " --context " + q("<ctx>") + " approve prepare-task-exact";
 const r = await tools.exec_command({cmd, sandbox_permissions:"require_escalated",
-  justification:"Allow supervisor preview?", yield_time_ms:30000});
+ justification:"Allow supervisor preview?", yield_time_ms:30000});
 text(JSON.stringify(r));
 ```
 
-Paths: `operator_context` `context_router_executable`/`context_path`; omit `sandbox_permissions`/`justification` on working loopback. On `transport_unavailable` with ready context, run one read-only `flow grant-list` (`docs/NATIVE-OPERATOR.md`), request executor access (not human approval), retry read-only once; preserve ambiguity/refusals, stop on refusal/denied access, collect `session_id`, never retry unknowns. Max (min 1, line<=stdout): 3600000ms, line/stderr 4194304B, stdout 33554432B, 4096 events.
+Paths: `operator_context` router/context; omit `sandbox_permissions` on working loopback. On `transport_unavailable` (ready context), run `flow grant-list` (`docs/NATIVE-OPERATOR.md`), request executor access (not approval), retry read-only once; preserve ambiguity/refusals, stop on denial, never retry unknowns.
 
-Both return `{preview_path,preview}` (`0600` in `0700`). Match `preview.request` (`OperatorApprovalRequest`), task/model/effort/executable/budgets/paths/digests to scope; keep `preview_path`. Legacy `prepare-task`/`prepare-private`/`prepare --request` stay.
+Returns `{preview_path,preview}` (`0600`/`0700`); adds v2 `record_request` only for `Some(R)` (`None` unchanged). Match `preview.request` (`OperatorApprovalRequest`), task/model/effort/exe/budgets/paths/digests; legacy `prepare-task`/`prepare-private`/`prepare --request` stay.
 
-4. After human consent, run `approve record --preview <path> --confirm-subject <digest> --confirm-thread <uuid> --operator-approved` (same router; starts no Worker). `record --request` needs unchanged `preview.request` in `0600`.
+4. After consent: `approve record --preview <path> --confirm-subject <digest> --confirm-thread <uuid> --operator-approved` (`None`/`Some(R)`; starts no Worker); `record --request` takes `record_request` (`Some(R)`) or `preview.request` (`0600`). Keep matched binaries on one store (`Some(R)` needs v2).
 
-5. Create a storage-only `worker` item. Native review: only supported small exact-file text deliveries (every approved write path changes); before guarded start, `ordinary_review_scope` (correction `source_worktree`: canonical registered detached checkout at approved SHA; `source_files`: original tracked source files to preserve even for dependent new output; `[]` only for a standalone new file needing no original source). Larger/unsupported tasks select their supported route up front (`inspect-delivery` or equally bounded physical read; HEAD must equal the expected base). `backlog_worker_start` once (no readiness/host pre-probe). On callback, `ordinary_review_notice` reconciles/ACKs to `ready_for_semantic_review` (`observed_model, observed_effort, attempt_count, base_commit, task_checkout_path`, `read_id`); reuse ready bytes/hashes (or hash-check copied test input against that read), test independently outside the checkout (own `CARGO_TARGET_DIR`), do not requery present facts. Decide semantics independently; `ordinary_review_complete` (original `read_id`) only on accept. Native refusal/missing scope stops (no automatic fallback); never redispatch unknowns.
+5. Create a storage-only `worker` item. Native review: only supported small exact-file text deliveries (every approved write path changes) or `required_changed_paths` (`R<=D<=A`, no loosening/out-of-scope edits; changed optionals checked as bounded UTF-8); before guarded start, `ordinary_review_scope` (`source_files`: original tracked source files to preserve even for dependent new output; `[]` only for a standalone new file needing no original source). Larger/unsupported tasks select their supported route up front (`inspect-delivery` or equally bounded physical read; HEAD must equal the expected base). `backlog_worker_start` once. On callback, `ordinary_review_notice` -> `ready_for_semantic_review` (`observed_model, observed_effort, attempt_count, base_commit, task_checkout_path`, `read_id`); reuse ready bytes/hashes (or hash-check copied test input against that read), test independently outside the checkout (own `CARGO_TARGET_DIR`), do not requery present facts. Decide semantics independently; `ordinary_review_complete` (original `read_id`) only on accept. Link the verified task files after guarded Done. Applying the delivery to a named repository needs separate human authorization. Native refusal/missing scope stops (no automatic fallback); never redispatch unknowns.

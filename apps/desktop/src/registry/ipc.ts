@@ -3,7 +3,6 @@ import { hasTauriRuntime, isDevPreviewFixtureMode } from '../ipc.ts';
 import {
   decisionAdvisorFromProfile,
   profileWithDecisionAdvisor,
-  validateDecisionAdvisor,
 } from './profile-advisor.ts';
 export { hasTauriRuntime, isDevPreviewFixtureMode };
 import {
@@ -192,20 +191,56 @@ function validateDecisionAdvisorReference(
   if (!advisor) {
     return null;
   }
-  const validation = validateDecisionAdvisor({ tools, models }, advisor);
-  if (validation.state === 'invalid') {
+
+  // Mirror the native Rust registry storage contract (`threadlane-registry`):
+  // enforce shadow shape, existing model, enabled known decision API tool, and
+  // `allow_no_effort`, while allowing stored/legacy provider `model_arg` values
+  // whose runtime capability is rejected by `validateDecisionAdvisor`.
+  const model =
+    models.find((candidate) => candidate.id === advisor.model_id) ??
+    models.find((candidate) => candidate.id.trim() === advisor.model_id) ??
+    null;
+  if (!model) {
     throw new AppIpcError(
-      validation.issue.code,
-      `Profile "${profileName}" decision advisor is invalid: ${validation.issue.message}`
+      'missing_model',
+      `Profile "${profileName}" decision advisor is invalid: Advisor model "${advisor.model_id}" is not in the registry.`
     );
   }
-  if (validation.state !== 'ready') {
+
+  const modelLabel = model.label || model.id;
+  const tool =
+    tools.find((candidate) => candidate.id === model.tool_id) ??
+    tools.find((candidate) => candidate.id.trim() === model.tool_id) ??
+    null;
+  if (!tool) {
     throw new AppIpcError(
-      'invalid_advisor',
-      `Profile "${profileName}" decision advisor is invalid.`
+      'missing_tool',
+      `Profile "${profileName}" decision advisor is invalid: Advisor model "${modelLabel}" refers to missing tool "${model.tool_id}".`
     );
   }
-  return { ...validation.advisor };
+
+  if (!tool.enabled) {
+    throw new AppIpcError(
+      'disabled_tool',
+      `Profile "${profileName}" decision advisor is invalid: Advisor model "${modelLabel}" belongs to disabled tool "${tool.label}".`
+    );
+  }
+
+  if (!isApiToolAdapter(tool.adapter)) {
+    throw new AppIpcError(
+      'wrong_adapter',
+      `Profile "${profileName}" decision advisor is invalid: Model "${modelLabel}" belongs to "${tool.label}", which is not a Jev or OpenAI decisions API.`
+    );
+  }
+
+  if (!model.allow_no_effort) {
+    throw new AppIpcError(
+      'effort_required',
+      `Profile "${profileName}" decision advisor is invalid: Advisor model "${modelLabel}" requires an effort, but decision advisors have no effort setting.`
+    );
+  }
+
+  return { ...advisor };
 }
 
 function assertDecisionAdvisorReferences(

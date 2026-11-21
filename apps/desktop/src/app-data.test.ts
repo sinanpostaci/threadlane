@@ -1200,10 +1200,30 @@ describe('app-data DesktopAppCoordinator', () => {
     // Healthy source src-a still counts its 1 live working coworker.
     assert.equal(partialProj.totalWorkingCoworkerCount, 1);
 
-    // When src-b chats drop completely on the next refresh, selection falls back cleanly to healthy src-a.
+    // When src-b chats drop completely on the next refresh, explicit selection stays on keySrcB
+    // as temporarily unavailable instead of silently switching to healthy src-a.
     dropSrcBChats = true;
     await coordinator.refreshWorkspace({ mode: 'refresh' });
+    assert.equal(coordinator.getState().selectedChatKey, keySrcB);
+    const missingSrcBProj = coordinator.projectWorkspace(NOW_MS + 2_000);
+    assert.equal(missingSrcBProj.selectedChatKey, keySrcB);
+    assert.equal(missingSrcBProj.selectedChat, null);
+    assert.equal(
+      missingSrcBProj.selectedChatUnavailable?.reason,
+      'source_unavailable',
+    );
+    assert.equal(
+      missingSrcBProj.selectedChatUnavailable?.threadLabel,
+      'Beta Cached Chat',
+    );
+
+    // Manual selection of healthy src-a still switches immediately.
+    coordinator.selectChat(keyA);
     assert.equal(coordinator.getState().selectedChatKey, keyA);
+    assert.equal(
+      coordinator.projectWorkspace(NOW_MS + 2_000).selectedChat?.threadLabel,
+      'Alpha Chat',
+    );
 
     // Legacy scoped merge helpers remain intact for non-production callers.
     const mergedReqs = mergeScopedObservationRequests(
@@ -1717,6 +1737,861 @@ describe('app-data DesktopAppCoordinator', () => {
       5,
     );
     assert.equal(versionCalls, 2);
+    coordinator.dispose();
+  });
+
+  it('preserves explicit chat selection across incomplete refreshes, omitted sources, and reordering, then restores automatically until another chat is manually selected', async () => {
+    const keyA = formatWorkspaceChatIdentityKey(IDENTITY_A)!;
+    const keyB = formatWorkspaceChatIdentityKey(IDENTITY_B)!;
+    const keySrcB = formatWorkspaceChatIdentityKey(IDENTITY_SRC_B)!;
+    const { raw, storage } = createMemoryStorage();
+    const openCodexTargets: CodexChatTarget[] = [];
+    const emptyMessages: WorkspaceSnapshot['messages'] = {
+      availability: 'available',
+      items: [],
+      max_items: MAX_WORKSPACE_MESSAGES_WINDOW,
+      omitted_count: 0,
+      has_more: false,
+      truncated: false,
+      requires_transcript: false,
+      allows_synthetic_user_messages: false,
+    };
+
+    let snapshotToServe: WorkspaceSnapshot = makeWorkspaceSnapshot({
+      generated_at_ms: NOW_MS + 1_000,
+      observation: makeLegacyObservationSnapshot({
+        generated_at_ms: NOW_MS + 1_000,
+        sources: [makeSource({ id: 'src-a', label: 'Alpha Project', project_path: '/work/alpha' })],
+        jobs: [],
+        requests: [],
+      }),
+      chats: [
+        makeChatSummary(IDENTITY_A, {
+          thread_label: 'Chat A',
+          project_label: 'Alpha Project',
+          updated_at_ms: NOW_MS - 2_000,
+        }),
+        makeChatSummary(IDENTITY_B, {
+          thread_label: 'Chat B',
+          project_label: 'Alpha Project',
+          updated_at_ms: NOW_MS - 1_000,
+        }),
+      ],
+      native_samples: [
+        makeNativeSample(IDENTITY_A, { activity: 'idle', sequence: 1 }),
+        makeNativeSample(IDENTITY_B, { activity: 'working', sequence: 1 }),
+      ],
+      job_histories: [],
+      messages: emptyMessages,
+    });
+
+    let currentNowMs = NOW_MS + 1_000;
+    const coordinator = new DesktopAppCoordinator(
+      {
+        fetchWorkspaceSnapshot: async () => snapshotToServe,
+        openCodexChat: async (target) => {
+          openCodexTargets.push(target);
+        },
+        preferenceStorage: storage,
+        now: () => currentNowMs,
+      },
+    );
+
+    // 1. Initial no-selection auto-selects first visible chat (Chat B is newer).
+    await coordinator.refreshWorkspace({ mode: 'replace' });
+    assert.equal(coordinator.getState().selectedChatKey, keyB);
+    assert.equal(coordinator.projectWorkspace().selectedChat?.threadLabel, 'Chat B');
+
+    // 2. User explicitly selects Chat A.
+    coordinator.selectChat(keyA);
+    assert.equal(coordinator.getState().selectedChatKey, keyA);
+    assert.equal(coordinator.projectWorkspace().selectedChat?.threadLabel, 'Chat A');
+
+    // 3. Successful incomplete snapshot returns only Chat B (bounded omission, Chat B newer).
+    currentNowMs = NOW_MS + 2_000;
+    snapshotToServe = makeWorkspaceSnapshot({
+      generated_at_ms: currentNowMs,
+      observation: makeLegacyObservationSnapshot({
+        generated_at_ms: currentNowMs,
+        sources: [makeSource({ id: 'src-a', label: 'Alpha Project', project_path: '/work/alpha' })],
+        jobs: [],
+        requests: [],
+      }),
+      chats: [
+        makeChatSummary(IDENTITY_B, {
+          thread_label: 'Chat B',
+          project_label: 'Alpha Project',
+          updated_at_ms: currentNowMs - 100,
+        }),
+      ],
+      native_samples: [
+        makeNativeSample(IDENTITY_B, {
+          activity: 'working',
+          sequence: 2,
+          observed_at_ms: currentNowMs - 100,
+          last_success_at_ms: currentNowMs - 100,
+        }),
+      ],
+      job_histories: [],
+      messages: emptyMessages,
+      bounds: {
+        native_samples_omitted: 1,
+        job_histories_omitted: 0,
+        messages_omitted: 0,
+        requests_capped: false,
+        jobs_capped: false,
+      },
+    });
+    await coordinator.refreshWorkspace({ mode: 'refresh' });
+
+    assert.equal(coordinator.getState().selectedChatKey, keyA);
+    const unavailableProj = coordinator.projectWorkspace();
+    assert.equal(unavailableProj.selectedChatKey, keyA);
+    assert.equal(unavailableProj.selectedChat, null);
+    assert.equal(unavailableProj.selectedChatUnavailable?.reason, 'chat_absent');
+    assert.equal(unavailableProj.selectedChatUnavailable?.threadLabel, 'Chat A');
+    assert.equal(
+      unavailableProj.selectedChatUnavailable?.projectLabel,
+      'Alpha Project',
+    );
+    assert.equal(
+      unavailableProj.selectedChatUnavailable?.statusLabel,
+      'Temporarily unavailable',
+    );
+    assert.doesNotMatch(
+      unavailableProj.selectedChatUnavailable?.message ?? '',
+      /\b(?:archived?|deleted?|removed?)\b/i,
+    );
+    // Absence of evidence must never write archive preferences.
+    assert.deepEqual(coordinator.getState().archivePreferences, {});
+    assert.equal(raw.get(WORKSPACE_CHAT_ARCHIVE_STORAGE_KEY), undefined);
+    // Opening Codex for the temporarily unavailable selected chat must be refused.
+    assert.equal(
+      await coordinator.openCodexChat({
+        source_id: IDENTITY_A.source_id,
+        thread_uuid: IDENTITY_A.thread_uuid,
+        job_id: null,
+      }),
+      false,
+    );
+    assert.equal(openCodexTargets.length, 0);
+    assert.match(
+      coordinator.getState().codexOpenError ?? '',
+      /temporarily unavailable/i,
+    );
+    coordinator.clearCodexOpenError();
+
+    // 4. Snapshot omits src-a from observation.sources entirely (only src-b present).
+    currentNowMs = NOW_MS + 3_000;
+    snapshotToServe = makeWorkspaceSnapshot({
+      generated_at_ms: currentNowMs,
+      observation: makeLegacyObservationSnapshot({
+        generated_at_ms: currentNowMs,
+        sources: [
+          makeSource({
+            id: 'src-b',
+            label: 'Beta Service',
+            project_path: '/work/beta:service',
+          }),
+        ],
+        jobs: [],
+        requests: [],
+      }),
+      chats: [
+        makeChatSummary(IDENTITY_SRC_B, {
+          thread_label: 'Src B Chat',
+          project_label: 'Beta Service',
+          updated_at_ms: currentNowMs - 100,
+        }),
+      ],
+      native_samples: [makeNativeSample(IDENTITY_SRC_B)],
+      job_histories: [],
+      messages: emptyMessages,
+    });
+    await coordinator.refreshWorkspace({ mode: 'refresh' });
+
+    assert.equal(coordinator.getState().selectedChatKey, keyA);
+    const omittedSourceProj = coordinator.projectWorkspace();
+    assert.equal(omittedSourceProj.selectedChat, null);
+    assert.equal(
+      omittedSourceProj.selectedChatUnavailable?.reason,
+      'source_omitted',
+    );
+    assert.equal(omittedSourceProj.selectedChatUnavailable?.threadLabel, 'Chat A');
+    assert.equal(
+      await coordinator.openCodexChat({
+        source_id: IDENTITY_A.source_id,
+        thread_uuid: IDENTITY_A.thread_uuid,
+        job_id: null,
+      }),
+      false,
+    );
+    assert.equal(openCodexTargets.length, 0);
+    coordinator.clearCodexOpenError();
+
+    // 5. Snapshot restores A+B reordered (B is newer and ordered first) -> A restores automatically.
+    currentNowMs = NOW_MS + 4_000;
+    snapshotToServe = makeWorkspaceSnapshot({
+      generated_at_ms: currentNowMs,
+      observation: makeLegacyObservationSnapshot({
+        generated_at_ms: currentNowMs,
+        sources: [makeSource({ id: 'src-a', label: 'Alpha Project', project_path: '/work/alpha' })],
+        jobs: [],
+        requests: [],
+      }),
+      chats: [
+        makeChatSummary(IDENTITY_B, {
+          thread_label: 'Chat B',
+          project_label: 'Alpha Project',
+          updated_at_ms: currentNowMs - 50,
+        }),
+        makeChatSummary(IDENTITY_A, {
+          thread_label: 'Chat A',
+          project_label: 'Alpha Project',
+          updated_at_ms: NOW_MS - 2_000,
+        }),
+      ],
+      native_samples: [
+        makeNativeSample(IDENTITY_B, { sequence: 3 }),
+        makeNativeSample(IDENTITY_A, { sequence: 2 }),
+      ],
+      job_histories: [],
+      messages: emptyMessages,
+    });
+    await coordinator.refreshWorkspace({ mode: 'refresh' });
+
+    assert.equal(coordinator.getState().selectedChatKey, keyA);
+    const restoredProj = coordinator.projectWorkspace();
+    assert.equal(restoredProj.visibleProjects[0]?.chats[0]?.chatKey, keyB);
+    assert.equal(restoredProj.selectedChat?.threadLabel, 'Chat A');
+    assert.equal(restoredProj.selectedChatUnavailable, null);
+    assert.equal(
+      await coordinator.openCodexChat({
+        source_id: IDENTITY_A.source_id,
+        thread_uuid: IDENTITY_A.thread_uuid,
+        job_id: null,
+      }),
+      true,
+    );
+    assert.equal(openCodexTargets.length, 1);
+
+    // 6. A disappears again, user manually selects B, then A+B returns -> stays on B.
+    currentNowMs = NOW_MS + 5_000;
+    snapshotToServe = makeWorkspaceSnapshot({
+      generated_at_ms: currentNowMs,
+      observation: makeLegacyObservationSnapshot({
+        generated_at_ms: currentNowMs,
+        sources: [makeSource({ id: 'src-a', label: 'Alpha Project', project_path: '/work/alpha' })],
+        jobs: [],
+        requests: [],
+      }),
+      chats: [
+        makeChatSummary(IDENTITY_B, {
+          thread_label: 'Chat B',
+          project_label: 'Alpha Project',
+          updated_at_ms: currentNowMs - 50,
+        }),
+      ],
+      native_samples: [makeNativeSample(IDENTITY_B, { sequence: 4 })],
+      job_histories: [],
+      messages: emptyMessages,
+    });
+    await coordinator.refreshWorkspace({ mode: 'refresh' });
+    assert.equal(coordinator.getState().selectedChatKey, keyA);
+
+    coordinator.selectChat(keyB);
+    assert.equal(coordinator.getState().selectedChatKey, keyB);
+    assert.equal(coordinator.projectWorkspace().selectedChat?.threadLabel, 'Chat B');
+
+    currentNowMs = NOW_MS + 6_000;
+    snapshotToServe = makeWorkspaceSnapshot({
+      generated_at_ms: currentNowMs,
+      observation: makeLegacyObservationSnapshot({
+        generated_at_ms: currentNowMs,
+        sources: [makeSource({ id: 'src-a', label: 'Alpha Project', project_path: '/work/alpha' })],
+        jobs: [],
+        requests: [],
+      }),
+      chats: [
+        makeChatSummary(IDENTITY_A, {
+          thread_label: 'Chat A',
+          project_label: 'Alpha Project',
+          updated_at_ms: currentNowMs - 50,
+        }),
+        makeChatSummary(IDENTITY_B, {
+          thread_label: 'Chat B',
+          project_label: 'Alpha Project',
+          updated_at_ms: NOW_MS - 2_000,
+        }),
+      ],
+      native_samples: [
+        makeNativeSample(IDENTITY_A, { sequence: 3 }),
+        makeNativeSample(IDENTITY_B, { sequence: 5 }),
+      ],
+      job_histories: [],
+      messages: emptyMessages,
+    });
+    await coordinator.refreshWorkspace({ mode: 'refresh' });
+    assert.equal(coordinator.getState().selectedChatKey, keyB);
+    assert.equal(coordinator.projectWorkspace().selectedChat?.threadLabel, 'Chat B');
+
+    // 7. Explicit archive/restore, lifecycle change, and scope change still work.
+    assert.equal(coordinator.setChatArchived(IDENTITY_B, true), true);
+    assert.equal(coordinator.getState().selectedChatKey, keyA);
+    coordinator.setWorkspaceLifecycle('archived');
+    assert.equal(coordinator.getState().selectedChatKey, keyB);
+    assert.equal(coordinator.setChatArchived(IDENTITY_B, false), true);
+    assert.equal(coordinator.getState().selectedChatKey, null);
+    coordinator.setWorkspaceLifecycle('active');
+    assert.equal(coordinator.getState().selectedChatKey, keyA);
+
+    currentNowMs = NOW_MS + 7_000;
+    snapshotToServe = makeWorkspaceSnapshot({
+      generated_at_ms: currentNowMs,
+      observation: makeLegacyObservationSnapshot({
+        generated_at_ms: currentNowMs,
+        sources: [
+          makeSource({
+            id: 'src-b',
+            label: 'Beta Service',
+            project_path: '/work/beta:service',
+          }),
+        ],
+        jobs: [],
+        requests: [],
+      }),
+      chats: [
+        makeChatSummary(IDENTITY_SRC_B, {
+          thread_label: 'Src B Chat',
+          project_label: 'Beta Service',
+        }),
+      ],
+      native_samples: [makeNativeSample(IDENTITY_SRC_B)],
+      job_histories: [],
+      messages: emptyMessages,
+    });
+    coordinator.setObservationScope({ source_id: 'src-b', job_id: 'job-b1' });
+    assert.equal(coordinator.getState().selectedChatKey, null);
+    await flushMicrotasks();
+    assert.equal(coordinator.getState().selectedChatKey, keySrcB);
+
+    coordinator.dispose();
+  });
+
+  it('preserves explicit chat selection across same-scope replace reads with unchanged source_id/job_id until another chat is manually selected or archived', async () => {
+    const keyA = formatWorkspaceChatIdentityKey(IDENTITY_A)!;
+    const keyB = formatWorkspaceChatIdentityKey(IDENTITY_B)!;
+    const { raw, storage } = createMemoryStorage();
+    const requestsReceived: ObservationSnapshotRequest[] = [];
+    const openCodexTargets: CodexChatTarget[] = [];
+    const emptyMessages: WorkspaceSnapshot['messages'] = {
+      availability: 'available',
+      items: [],
+      max_items: MAX_WORKSPACE_MESSAGES_WINDOW,
+      omitted_count: 0,
+      has_more: false,
+      truncated: false,
+      requires_transcript: false,
+      allows_synthetic_user_messages: false,
+    };
+
+    const makeScopedSnapshot = (
+      generatedAtMs: number,
+      chats: WorkspaceChatSummary[],
+      nativeSamples: WorkspaceNativeSample[],
+    ): WorkspaceSnapshot =>
+      makeWorkspaceSnapshot({
+        generated_at_ms: generatedAtMs,
+        observation: makeLegacyObservationSnapshot({
+          generated_at_ms: generatedAtMs,
+          sources: [
+            makeSource({
+              id: 'src-a',
+              label: 'Alpha Project',
+              project_path: '/work/alpha',
+            }),
+          ],
+          jobs: [],
+          requests: [],
+        }),
+        chats,
+        native_samples: nativeSamples,
+        job_histories: [],
+        messages: emptyMessages,
+      });
+
+    let currentNowMs = NOW_MS + 1_000;
+    let snapshotToServe = makeScopedSnapshot(
+      currentNowMs,
+      [
+        makeChatSummary(IDENTITY_A, {
+          thread_label: 'Chat A',
+          project_label: 'Alpha Project',
+          updated_at_ms: NOW_MS - 2_000,
+        }),
+        makeChatSummary(IDENTITY_B, {
+          thread_label: 'Chat B',
+          project_label: 'Alpha Project',
+          updated_at_ms: NOW_MS - 1_000,
+        }),
+      ],
+      [
+        makeNativeSample(IDENTITY_A, { activity: 'idle', sequence: 1 }),
+        makeNativeSample(IDENTITY_B, { activity: 'working', sequence: 1 }),
+      ],
+    );
+
+    const coordinator = new DesktopAppCoordinator({
+      fetchWorkspaceSnapshot: async (req) => {
+        requestsReceived.push(req ?? {});
+        return snapshotToServe;
+      },
+      openCodexChat: async (target) => {
+        openCodexTargets.push(target);
+      },
+      preferenceStorage: storage,
+      now: () => currentNowMs,
+    });
+
+    // 1. Enter scoped filter { source_id: 'src-a', job_id: 'job-1' } with two observed chats A+B.
+    // Default navigation auto-selects the first visible chat (Chat B is newer).
+    coordinator.setObservationScope({ source_id: 'src-a', job_id: 'job-1' });
+    await flushMicrotasks();
+    assert.equal(requestsReceived.length, 1);
+    assert.deepEqual(requestsReceived[0], {
+      source_id: 'src-a',
+      job_id: 'job-1',
+      cursor: null,
+      limit: DEFAULT_OBSERVATION_REQUEST_PAGE_LIMIT,
+    });
+    assert.equal(coordinator.getState().selectedChatKey, keyB);
+    assert.equal(
+      coordinator.projectWorkspace().selectedChat?.threadLabel,
+      'Chat B',
+    );
+
+    // 2. User explicitly selects Chat A.
+    coordinator.selectChat(keyA);
+    assert.equal(coordinator.getState().selectedChatKey, keyA);
+    assert.equal(
+      coordinator.projectWorkspace().selectedChat?.threadLabel,
+      'Chat A',
+    );
+
+    // Re-applying the exact same scope filter is a no-op and does not reset snapshot or selection.
+    coordinator.setObservationScope({ source_id: 'src-a', job_id: 'job-1' });
+    assert.equal(requestsReceived.length, 1);
+    assert.equal(coordinator.getState().selectedChatKey, keyA);
+
+    // 3. Same-scope refreshWorkspace({ mode: 'replace' }) returns only Chat B (Chat A absent).
+    // Must stay on Chat A (temporarily unavailable) instead of jumping to Chat B.
+    currentNowMs = NOW_MS + 2_000;
+    snapshotToServe = makeScopedSnapshot(
+      currentNowMs,
+      [
+        makeChatSummary(IDENTITY_B, {
+          thread_label: 'Chat B',
+          project_label: 'Alpha Project',
+          updated_at_ms: currentNowMs - 100,
+        }),
+      ],
+      [
+        makeNativeSample(IDENTITY_B, {
+          activity: 'working',
+          sequence: 2,
+          observed_at_ms: currentNowMs - 100,
+          last_success_at_ms: currentNowMs - 100,
+        }),
+      ],
+    );
+    await coordinator.refreshWorkspace({ mode: 'replace' });
+
+    assert.equal(requestsReceived.length, 2);
+    assert.equal(requestsReceived[1]?.source_id, 'src-a');
+    assert.equal(requestsReceived[1]?.job_id, 'job-1');
+    assert.equal(coordinator.getState().selectedChatKey, keyA);
+    const unavailableProj = coordinator.projectWorkspace();
+    assert.equal(unavailableProj.selectedChatKey, keyA);
+    assert.equal(unavailableProj.selectedChat, null);
+    assert.equal(unavailableProj.selectedChatUnavailable?.reason, 'chat_absent');
+    assert.equal(unavailableProj.selectedChatUnavailable?.threadLabel, 'Chat A');
+    assert.equal(
+      unavailableProj.selectedChatUnavailable?.projectLabel,
+      'Alpha Project',
+    );
+    assert.deepEqual(coordinator.getState().archivePreferences, {});
+    assert.equal(raw.get(WORKSPACE_CHAT_ARCHIVE_STORAGE_KEY), undefined);
+    assert.equal(
+      await coordinator.openCodexChat({
+        source_id: IDENTITY_A.source_id,
+        thread_uuid: IDENTITY_A.thread_uuid,
+        job_id: null,
+      }),
+      false,
+    );
+    assert.equal(openCodexTargets.length, 0);
+    coordinator.clearCodexOpenError();
+
+    // 4. Same-scope refreshWorkspace({ mode: 'replace' }) restores A+B (B still newer and ordered first).
+    // Selection remains Chat A (A -> A unavailable -> A, never A -> B -> B).
+    currentNowMs = NOW_MS + 3_000;
+    snapshotToServe = makeScopedSnapshot(
+      currentNowMs,
+      [
+        makeChatSummary(IDENTITY_B, {
+          thread_label: 'Chat B',
+          project_label: 'Alpha Project',
+          updated_at_ms: currentNowMs - 50,
+        }),
+        makeChatSummary(IDENTITY_A, {
+          thread_label: 'Chat A',
+          project_label: 'Alpha Project',
+          updated_at_ms: NOW_MS - 2_000,
+        }),
+      ],
+      [
+        makeNativeSample(IDENTITY_B, { sequence: 3 }),
+        makeNativeSample(IDENTITY_A, { sequence: 2 }),
+      ],
+    );
+    await coordinator.refreshWorkspace({ mode: 'replace' });
+
+    assert.equal(coordinator.getState().selectedChatKey, keyA);
+    const restoredProj = coordinator.projectWorkspace();
+    assert.equal(restoredProj.visibleProjects[0]?.chats[0]?.chatKey, keyB);
+    assert.equal(restoredProj.selectedChat?.threadLabel, 'Chat A');
+    assert.equal(restoredProj.selectedChatUnavailable, null);
+    assert.equal(
+      await coordinator.openCodexChat({
+        source_id: IDENTITY_A.source_id,
+        thread_uuid: IDENTITY_A.thread_uuid,
+        job_id: null,
+      }),
+      true,
+    );
+    assert.equal(openCodexTargets.length, 1);
+
+    // 5. Explicit selection after absence still switches to Chat B and holds across A+B replace.
+    currentNowMs = NOW_MS + 4_000;
+    snapshotToServe = makeScopedSnapshot(
+      currentNowMs,
+      [
+        makeChatSummary(IDENTITY_B, {
+          thread_label: 'Chat B',
+          project_label: 'Alpha Project',
+          updated_at_ms: currentNowMs - 50,
+        }),
+      ],
+      [makeNativeSample(IDENTITY_B, { sequence: 4 })],
+    );
+    await coordinator.refreshWorkspace({ mode: 'replace' });
+    assert.equal(coordinator.getState().selectedChatKey, keyA);
+
+    coordinator.selectChat(keyB);
+    assert.equal(coordinator.getState().selectedChatKey, keyB);
+    assert.equal(
+      coordinator.projectWorkspace().selectedChat?.threadLabel,
+      'Chat B',
+    );
+
+    currentNowMs = NOW_MS + 5_000;
+    snapshotToServe = makeScopedSnapshot(
+      currentNowMs,
+      [
+        makeChatSummary(IDENTITY_A, {
+          thread_label: 'Chat A',
+          project_label: 'Alpha Project',
+          updated_at_ms: currentNowMs - 50,
+        }),
+        makeChatSummary(IDENTITY_B, {
+          thread_label: 'Chat B',
+          project_label: 'Alpha Project',
+          updated_at_ms: NOW_MS - 2_000,
+        }),
+      ],
+      [
+        makeNativeSample(IDENTITY_A, { sequence: 3 }),
+        makeNativeSample(IDENTITY_B, { sequence: 5 }),
+      ],
+    );
+    await coordinator.refreshWorkspace({ mode: 'replace' });
+    assert.equal(coordinator.getState().selectedChatKey, keyB);
+    assert.equal(
+      coordinator.projectWorkspace().selectedChat?.threadLabel,
+      'Chat B',
+    );
+
+    // 6. Archive and restore still update selection within the active scope.
+    assert.equal(coordinator.setChatArchived(IDENTITY_B, true), true);
+    assert.equal(coordinator.getState().selectedChatKey, keyA);
+    coordinator.setWorkspaceLifecycle('archived');
+    assert.equal(coordinator.getState().selectedChatKey, keyB);
+    assert.equal(coordinator.setChatArchived(IDENTITY_B, false), true);
+    assert.equal(coordinator.getState().selectedChatKey, null);
+    coordinator.setWorkspaceLifecycle('active');
+    assert.equal(coordinator.getState().selectedChatKey, keyA);
+
+    coordinator.dispose();
+  });
+
+  it('resets absent selection on explicit setObservationScope navigation across job_id, failed/empty first reads, and source_id changes', async () => {
+    const keyA = formatWorkspaceChatIdentityKey(IDENTITY_A)!;
+    const keyB = formatWorkspaceChatIdentityKey(IDENTITY_B)!;
+    const keySrcB = formatWorkspaceChatIdentityKey(IDENTITY_SRC_B)!;
+    const requestsReceived: ObservationSnapshotRequest[] = [];
+    const emptyMessages: WorkspaceSnapshot['messages'] = {
+      availability: 'available',
+      items: [],
+      max_items: MAX_WORKSPACE_MESSAGES_WINDOW,
+      omitted_count: 0,
+      has_more: false,
+      truncated: false,
+      requires_transcript: false,
+      allows_synthetic_user_messages: false,
+    };
+
+    const makeScopedSnapshot = (
+      generatedAtMs: number,
+      sources: ObservationSource[],
+      chats: WorkspaceChatSummary[],
+      nativeSamples: WorkspaceNativeSample[],
+    ): WorkspaceSnapshot =>
+      makeWorkspaceSnapshot({
+        generated_at_ms: generatedAtMs,
+        observation: makeLegacyObservationSnapshot({
+          generated_at_ms: generatedAtMs,
+          sources,
+          jobs: [],
+          requests: [],
+        }),
+        chats,
+        native_samples: nativeSamples,
+        job_histories: [],
+        messages: emptyMessages,
+      });
+
+    const sourceA = makeSource({
+      id: 'src-a',
+      label: 'Alpha Project',
+      project_path: '/work/alpha',
+    });
+    const sourceB = makeSource({
+      id: 'src-b',
+      label: 'Beta Service',
+      project_path: '/work/beta:service',
+    });
+
+    let currentNowMs = NOW_MS + 1_000;
+    let shouldFail = false;
+    let snapshotToServe = makeScopedSnapshot(
+      currentNowMs,
+      [sourceA],
+      [
+        makeChatSummary(IDENTITY_A, {
+          thread_label: 'Chat A',
+          project_label: 'Alpha Project',
+          updated_at_ms: NOW_MS - 2_000,
+        }),
+        makeChatSummary(IDENTITY_B, {
+          thread_label: 'Chat B',
+          project_label: 'Alpha Project',
+          updated_at_ms: NOW_MS - 1_000,
+        }),
+      ],
+      [
+        makeNativeSample(IDENTITY_A, { sequence: 1 }),
+        makeNativeSample(IDENTITY_B, { sequence: 1 }),
+      ],
+    );
+
+    const coordinator = new DesktopAppCoordinator({
+      fetchWorkspaceSnapshot: async (req) => {
+        requestsReceived.push(req ?? {});
+        if (shouldFail) {
+          throw new Error('Scoped snapshot unavailable');
+        }
+        return snapshotToServe;
+      },
+      now: () => currentNowMs,
+    });
+
+    // 1. Load initial filter { source_id: 'src-a', job_id: 'job-1' } with A+B and select A.
+    coordinator.setObservationScope({ source_id: 'src-a', job_id: 'job-1' });
+    await flushMicrotasks();
+    coordinator.selectChat(keyA);
+    assert.equal(coordinator.getState().selectedChatKey, keyA);
+
+    // 2. Explicit job_id filter change within the SAME source_id -> snapshot only has Chat B.
+    // Must switch selection from Chat A to Chat B rather than keeping stale Chat A.
+    currentNowMs = NOW_MS + 2_000;
+    snapshotToServe = makeScopedSnapshot(
+      currentNowMs,
+      [sourceA],
+      [
+        makeChatSummary(IDENTITY_B, {
+          thread_label: 'Chat B',
+          project_label: 'Alpha Project',
+          updated_at_ms: currentNowMs - 100,
+        }),
+      ],
+      [makeNativeSample(IDENTITY_B, { sequence: 2 })],
+    );
+    coordinator.setObservationScope({ source_id: 'src-a', job_id: 'job-2' });
+    assert.equal(coordinator.getState().workspaceSnapshot, null);
+    assert.equal(coordinator.getState().selectedChatKey, keyA);
+    await flushMicrotasks();
+
+    assert.equal(requestsReceived.at(-1)?.source_id, 'src-a');
+    assert.equal(requestsReceived.at(-1)?.job_id, 'job-2');
+    assert.equal(coordinator.getState().selectedChatKey, keyB);
+    assert.equal(
+      coordinator.projectWorkspace().selectedChat?.threadLabel,
+      'Chat B',
+    );
+    assert.equal(coordinator.projectWorkspace().selectedChatUnavailable, null);
+
+    // 3. Explicit job_id filter change whose initial read fails, then succeeds on retry with only Chat A.
+    // Because no snapshot committed for job-3 yet, retry must still switch from Chat B to Chat A.
+    currentNowMs = NOW_MS + 3_000;
+    shouldFail = true;
+    coordinator.setObservationScope({ source_id: 'src-a', job_id: 'job-3' });
+    await flushMicrotasks();
+    assert.equal(coordinator.getState().workspaceSnapshot, null);
+    assert.equal(
+      coordinator.getState().observationError,
+      'Scoped snapshot unavailable',
+    );
+    assert.equal(coordinator.getState().selectedChatKey, keyB);
+
+    shouldFail = false;
+    currentNowMs = NOW_MS + 4_000;
+    snapshotToServe = makeScopedSnapshot(
+      currentNowMs,
+      [sourceA],
+      [
+        makeChatSummary(IDENTITY_A, {
+          thread_label: 'Chat A',
+          project_label: 'Alpha Project',
+          updated_at_ms: currentNowMs - 100,
+        }),
+      ],
+      [makeNativeSample(IDENTITY_A, { sequence: 2 })],
+    );
+    await coordinator.refreshWorkspace({ mode: 'refresh' });
+    assert.equal(coordinator.getState().observationError, null);
+    assert.equal(coordinator.getState().selectedChatKey, keyA);
+    assert.equal(
+      coordinator.projectWorkspace().selectedChat?.threadLabel,
+      'Chat A',
+    );
+
+    // 4. Explicit job_id filter change whose first snapshot is empty, then populates with Chat B.
+    // Empty first snapshot clears carried-over Chat A so Chat B auto-selects when it arrives.
+    currentNowMs = NOW_MS + 5_000;
+    snapshotToServe = makeScopedSnapshot(currentNowMs, [sourceA], [], []);
+    coordinator.setObservationScope({ source_id: 'src-a', job_id: 'job-4' });
+    await flushMicrotasks();
+    assert.equal(coordinator.getState().selectedChatKey, null);
+    assert.equal(coordinator.projectWorkspace().selectedChatUnavailable, null);
+
+    currentNowMs = NOW_MS + 6_000;
+    snapshotToServe = makeScopedSnapshot(
+      currentNowMs,
+      [sourceA],
+      [
+        makeChatSummary(IDENTITY_B, {
+          thread_label: 'Chat B',
+          project_label: 'Alpha Project',
+          updated_at_ms: currentNowMs - 100,
+        }),
+      ],
+      [makeNativeSample(IDENTITY_B, { sequence: 3 })],
+    );
+    await coordinator.refreshWorkspace({ mode: 'refresh' });
+    assert.equal(coordinator.getState().selectedChatKey, keyB);
+    assert.equal(
+      coordinator.projectWorkspace().selectedChat?.threadLabel,
+      'Chat B',
+    );
+
+    // 5. Explicit filter change to a different source_id clears selection synchronously and selects src-b chat.
+    currentNowMs = NOW_MS + 7_000;
+    snapshotToServe = makeScopedSnapshot(
+      currentNowMs,
+      [sourceB],
+      [
+        makeChatSummary(IDENTITY_SRC_B, {
+          thread_label: 'Beta Chat',
+          project_label: 'Beta Service',
+          updated_at_ms: currentNowMs - 100,
+        }),
+      ],
+      [makeNativeSample(IDENTITY_SRC_B, { sequence: 1 })],
+    );
+    coordinator.setObservationScope({ source_id: 'src-b', job_id: 'job-b1' });
+    assert.equal(coordinator.getState().selectedChatKey, null);
+    await flushMicrotasks();
+    assert.equal(coordinator.getState().selectedChatKey, keySrcB);
+    assert.equal(
+      coordinator.projectWorkspace().selectedChat?.threadLabel,
+      'Beta Chat',
+    );
+
+    // 6. Explicit filter reset to null keeps current selection and preserves it on subsequent replace absence.
+    currentNowMs = NOW_MS + 8_000;
+    snapshotToServe = makeScopedSnapshot(
+      currentNowMs,
+      [sourceA, sourceB],
+      [
+        makeChatSummary(IDENTITY_A, {
+          thread_label: 'Chat A',
+          project_label: 'Alpha Project',
+          updated_at_ms: currentNowMs - 50,
+        }),
+        makeChatSummary(IDENTITY_SRC_B, {
+          thread_label: 'Beta Chat',
+          project_label: 'Beta Service',
+          updated_at_ms: NOW_MS - 2_000,
+        }),
+      ],
+      [
+        makeNativeSample(IDENTITY_A, { sequence: 3 }),
+        makeNativeSample(IDENTITY_SRC_B, { sequence: 2 }),
+      ],
+    );
+    coordinator.setObservationScope(null);
+    assert.equal(coordinator.getState().selectedChatKey, keySrcB);
+    await flushMicrotasks();
+    assert.equal(coordinator.getState().selectedChatKey, keySrcB);
+    assert.equal(
+      coordinator.projectWorkspace().selectedChat?.threadLabel,
+      'Beta Chat',
+    );
+
+    currentNowMs = NOW_MS + 9_000;
+    snapshotToServe = makeScopedSnapshot(
+      currentNowMs,
+      [sourceA, sourceB],
+      [
+        makeChatSummary(IDENTITY_A, {
+          thread_label: 'Chat A',
+          project_label: 'Alpha Project',
+          updated_at_ms: currentNowMs - 50,
+        }),
+      ],
+      [makeNativeSample(IDENTITY_A, { sequence: 4 })],
+    );
+    await coordinator.refreshWorkspace({ mode: 'replace' });
+    assert.equal(coordinator.getState().selectedChatKey, keySrcB);
+    assert.equal(
+      coordinator.projectWorkspace().selectedChatUnavailable?.reason,
+      'chat_absent',
+    );
+    assert.equal(
+      coordinator.projectWorkspace().selectedChatUnavailable?.threadLabel,
+      'Beta Chat',
+    );
+
     coordinator.dispose();
   });
 });

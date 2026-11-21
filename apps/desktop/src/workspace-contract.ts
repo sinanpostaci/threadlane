@@ -2698,18 +2698,50 @@ function parseBacklogOutcome(raw: unknown): WorkspaceBacklogOutcome | null {
 
 function parseBacklogPresenceAvailability(
   raw: unknown,
-): WorkspaceBacklogPresenceAvailability {
+): WorkspaceBacklogPresenceAvailability | null {
   return typeof raw === 'string' &&
     (WORKSPACE_BACKLOG_PRESENCE_AVAILABILITIES as readonly string[]).includes(raw)
     ? (raw as WorkspaceBacklogPresenceAvailability)
-    : 'unavailable';
+    : null;
 }
 
-function parseBacklogPresenceFreshness(raw: unknown): WorkspaceBacklogPresenceFreshness {
+function parseBacklogPresenceFreshness(
+  raw: unknown,
+): WorkspaceBacklogPresenceFreshness | null {
   return typeof raw === 'string' &&
     (WORKSPACE_BACKLOG_PRESENCE_FRESHNESSES as readonly string[]).includes(raw)
     ? (raw as WorkspaceBacklogPresenceFreshness)
-    : 'not_applicable';
+    : null;
+}
+
+function cleanStrictOptionalNonNegativeInt(raw: unknown): number | null | undefined {
+  if (raw === null || raw === undefined) {
+    return null;
+  }
+  if (typeof raw !== 'number' || !Number.isSafeInteger(raw) || raw < 0) {
+    return undefined;
+  }
+  return raw;
+}
+
+function cleanStrictOptionalPositiveInt(raw: unknown): number | null | undefined {
+  if (raw === null || raw === undefined) {
+    return null;
+  }
+  if (typeof raw !== 'number' || !Number.isSafeInteger(raw) || raw <= 0) {
+    return undefined;
+  }
+  return raw;
+}
+
+function cleanStrictPresenceMaxSampleAgeMs(raw: unknown): number | undefined {
+  if (raw === undefined) {
+    return MAX_WORKSPACE_BACKLOG_PRESENCE_SAMPLE_AGE_MS;
+  }
+  if (typeof raw !== 'number' || !Number.isSafeInteger(raw) || raw < 0) {
+    return undefined;
+  }
+  return raw;
 }
 
 function cleanBacklogToken(raw: unknown, maxBytes: number): string | null {
@@ -2901,15 +2933,15 @@ function normalizeBacklogPresence(raw: unknown): WorkspaceBacklogWorkerPresence 
   const claimId = cleanOptionalBacklogToken(raw.claim_id, MAX_WORKSPACE_LABEL_BYTES);
   const hostInstanceId = cleanOptionalBacklogToken(raw.host_instance_id, MAX_WORKSPACE_LABEL_BYTES);
   const invocationId = cleanOptionalBacklogToken(raw.invocation_id, MAX_WORKSPACE_LABEL_BYTES);
-  const sequence = cleanNonNegativeIntOrNull(raw.sequence);
+  const sequence = cleanStrictOptionalNonNegativeInt(raw.sequence);
   const availability = parseBacklogPresenceAvailability(raw.availability);
   const freshness = parseBacklogPresenceFreshness(raw.freshness);
-  const sampledAtMs = cleanPositiveIntOrNull(raw.sampled_at_ms);
-  const sampleAgeMs = cleanNonNegativeIntOrNull(raw.sample_age_ms);
-  const maxSampleAgeMs =
-    cleanNonNegativeIntOrNull(raw.max_sample_age_ms) ??
-    MAX_WORKSPACE_BACKLOG_PRESENCE_SAMPLE_AGE_MS;
-  const expiresAtMs = cleanPositiveIntOrNull(raw.expires_at_ms);
+  const sampledAtMs = cleanStrictOptionalPositiveInt(raw.sampled_at_ms);
+  const sampleAgeMs = cleanStrictOptionalNonNegativeInt(raw.sample_age_ms);
+  const maxSampleAgeMs = cleanStrictPresenceMaxSampleAgeMs(raw.max_sample_age_ms);
+  const expiresAtMs = cleanStrictOptionalPositiveInt(raw.expires_at_ms);
+  const rawLive =
+    raw.live === undefined ? false : typeof raw.live === 'boolean' ? raw.live : undefined;
   if (
     itemId === null ||
     executionRef === null ||
@@ -2919,7 +2951,15 @@ function normalizeBacklogPresence(raw: unknown): WorkspaceBacklogWorkerPresence 
     workerId === null ||
     claimId === undefined ||
     hostInstanceId === undefined ||
-    invocationId === undefined
+    invocationId === undefined ||
+    sequence === undefined ||
+    availability === null ||
+    freshness === null ||
+    sampledAtMs === undefined ||
+    sampleAgeMs === undefined ||
+    maxSampleAgeMs === undefined ||
+    expiresAtMs === undefined ||
+    rawLive === undefined
   ) {
     return null;
   }
@@ -2936,8 +2976,7 @@ function normalizeBacklogPresence(raw: unknown): WorkspaceBacklogWorkerPresence 
     sequence,
     availability,
     freshness,
-    live:
-      raw.live === true && availability === 'live' && freshness === 'fresh',
+    live: rawLive && availability === 'live' && freshness === 'fresh',
     sampled_at_ms: sampledAtMs,
     sample_age_ms: sampleAgeMs,
     max_sample_age_ms: maxSampleAgeMs,
@@ -3335,7 +3374,7 @@ function normalizeWorkspaceChatWorkEntry(raw: unknown): WorkspaceChatWork | null
   }
 
   let presenceOmitted = 0;
-  const presenceByKey = new Map<string, WorkspaceBacklogWorkerPresence>();
+  const presenceGroups = new Map<string, WorkspaceBacklogWorkerPresence[]>();
   if (Array.isArray(raw.worker_presence)) {
     for (const entry of raw.worker_presence) {
       const presence = normalizeBacklogPresence(entry);
@@ -3350,19 +3389,24 @@ function normalizeWorkspaceChatWorkEntry(raw: unknown): WorkspaceChatWork | null
         presenceOmitted += 1;
         continue;
       }
-      const key = `${presence.item_id}\u0000${presence.execution_ref}`;
-      const existing = presenceByKey.get(key);
-      if (existing === undefined || compareBacklogPresence(presence, existing) < 0) {
-        if (existing !== undefined) {
-          presenceOmitted += 1;
-        }
-        presenceByKey.set(key, presence);
+      const key = backlogPresenceAttemptKey(presence);
+      const group = presenceGroups.get(key);
+      if (group === undefined) {
+        presenceGroups.set(key, [presence]);
       } else {
-        presenceOmitted += 1;
+        group.push(presence);
       }
     }
   }
-  let workerPresence = Array.from(presenceByKey.values()).sort(compareBacklogPresence);
+  let workerPresence: WorkspaceBacklogWorkerPresence[] = [];
+  for (const group of presenceGroups.values()) {
+    const reconciled = reconcileBacklogPresenceAttempt(group);
+    if (reconciled !== null) {
+      workerPresence.push(reconciled.winner);
+      presenceOmitted += reconciled.omitted;
+    }
+  }
+  workerPresence.sort(compareBacklogPresence);
   if (workerPresence.length > MAX_WORKSPACE_CHAT_WORK_PRESENCE_PER_CHAT) {
     const overflow = workerPresence.length - MAX_WORKSPACE_CHAT_WORK_PRESENCE_PER_CHAT;
     workerPresence = workerPresence.slice(0, MAX_WORKSPACE_CHAT_WORK_PRESENCE_PER_CHAT);
@@ -3392,26 +3436,216 @@ function normalizeWorkspaceChatWorkEntry(raw: unknown): WorkspaceChatWork | null
   };
 }
 
+function backlogPresenceAttemptKey(presence: WorkspaceBacklogWorkerPresence): string {
+  return [
+    presence.item_id,
+    presence.execution_ref,
+    presence.approval_id,
+    presence.task_id,
+    presence.run_id,
+    presence.worker_id,
+  ].join('\u0000');
+}
+
+function backlogPresenceEpochKey(
+  presence: WorkspaceBacklogWorkerPresence,
+  invocationId: string,
+): string {
+  return [
+    presence.host_instance_id === null ? '0:' : `1:${presence.host_instance_id}`,
+    `1:${invocationId}`,
+    presence.claim_id === null ? '0:' : `1:${presence.claim_id}`,
+  ].join('\u0000');
+}
+
+function backlogPresenceStateRank(presence: WorkspaceBacklogWorkerPresence): number {
+  if (presence.availability === 'non_live') {
+    return 3;
+  }
+  if (
+    presence.live === true &&
+    presence.availability === 'live' &&
+    presence.freshness === 'fresh'
+  ) {
+    return 2;
+  }
+  if (presence.availability === 'unavailable' && presence.freshness !== 'stale') {
+    return 1;
+  }
+  return 0;
+}
+
+function backlogPresenceAvailabilityRank(
+  availability: WorkspaceBacklogPresenceAvailability,
+): number {
+  if (availability === 'non_live') {
+    return 2;
+  }
+  if (availability === 'live') {
+    return 1;
+  }
+  return 0;
+}
+
+function backlogPresenceFreshnessRank(
+  freshness: WorkspaceBacklogPresenceFreshness,
+): number {
+  if (freshness === 'fresh') {
+    return 2;
+  }
+  if (freshness === 'not_applicable') {
+    return 1;
+  }
+  return 0;
+}
+
+function compareOptionalNumberDesc(left: number | null, right: number | null): number {
+  if (left !== null && right !== null) {
+    return left === right ? 0 : left > right ? -1 : 1;
+  }
+  if (left !== null) {
+    return -1;
+  }
+  if (right !== null) {
+    return 1;
+  }
+  return 0;
+}
+
+function compareOptionalNumberAsc(left: number | null, right: number | null): number {
+  if (left !== null && right !== null) {
+    return left === right ? 0 : left < right ? -1 : 1;
+  }
+  if (left !== null) {
+    return -1;
+  }
+  if (right !== null) {
+    return 1;
+  }
+  return 0;
+}
+
+function compareOptionalStringsUtf8SomeFirst(
+  left: string | null,
+  right: string | null,
+): number {
+  if (left !== null && right !== null) {
+    return compareStringsUtf8(left, right);
+  }
+  if (left !== null) {
+    return -1;
+  }
+  if (right !== null) {
+    return 1;
+  }
+  return 0;
+}
+
+function compareBacklogPresenceWithinEpoch(
+  left: WorkspaceBacklogWorkerPresence,
+  right: WorkspaceBacklogWorkerPresence,
+): number {
+  return (
+    compareOptionalNumberDesc(left.sequence, right.sequence) ||
+    compareOptionalNumberDesc(left.sampled_at_ms, right.sampled_at_ms) ||
+    backlogPresenceStateRank(right) - backlogPresenceStateRank(left) ||
+    compareOptionalNumberDesc(left.expires_at_ms, right.expires_at_ms) ||
+    compareOptionalNumberAsc(left.sample_age_ms, right.sample_age_ms) ||
+    (left.max_sample_age_ms === right.max_sample_age_ms
+      ? 0
+      : left.max_sample_age_ms > right.max_sample_age_ms
+        ? -1
+        : 1) ||
+    backlogPresenceAvailabilityRank(right.availability) -
+      backlogPresenceAvailabilityRank(left.availability) ||
+    backlogPresenceFreshnessRank(right.freshness) -
+      backlogPresenceFreshnessRank(left.freshness) ||
+    (left.live === right.live ? 0 : left.live ? -1 : 1)
+  );
+}
+
+function compareBacklogPresenceCrossEpoch(
+  left: WorkspaceBacklogWorkerPresence,
+  right: WorkspaceBacklogWorkerPresence,
+): number {
+  return (
+    compareOptionalNumberDesc(left.sampled_at_ms, right.sampled_at_ms) ||
+    backlogPresenceStateRank(right) - backlogPresenceStateRank(left) ||
+    compareOptionalNumberDesc(left.sequence, right.sequence) ||
+    compareOptionalNumberDesc(left.expires_at_ms, right.expires_at_ms) ||
+    compareOptionalNumberAsc(left.sample_age_ms, right.sample_age_ms) ||
+    (left.max_sample_age_ms === right.max_sample_age_ms
+      ? 0
+      : left.max_sample_age_ms > right.max_sample_age_ms
+        ? -1
+        : 1) ||
+    backlogPresenceAvailabilityRank(right.availability) -
+      backlogPresenceAvailabilityRank(left.availability) ||
+    backlogPresenceFreshnessRank(right.freshness) -
+      backlogPresenceFreshnessRank(left.freshness) ||
+    (left.live === right.live ? 0 : left.live ? -1 : 1) ||
+    compareOptionalStringsUtf8SomeFirst(left.host_instance_id, right.host_instance_id) ||
+    compareOptionalStringsUtf8SomeFirst(left.invocation_id, right.invocation_id) ||
+    compareOptionalStringsUtf8SomeFirst(left.claim_id, right.claim_id)
+  );
+}
+
+function reconcileBacklogPresenceAttempt(
+  samples: readonly WorkspaceBacklogWorkerPresence[],
+): { winner: WorkspaceBacklogWorkerPresence; omitted: number } | null {
+  if (samples.length === 0) {
+    return null;
+  }
+  const omitted = samples.length - 1;
+  const sequencedByEpoch = new Map<string, WorkspaceBacklogWorkerPresence>();
+  const crossEpochCandidates: WorkspaceBacklogWorkerPresence[] = [];
+
+  for (const sample of samples) {
+    if (sample.invocation_id !== null && sample.sequence !== null) {
+      const epochKey = backlogPresenceEpochKey(sample, sample.invocation_id);
+      const existing = sequencedByEpoch.get(epochKey);
+      if (
+        existing === undefined ||
+        compareBacklogPresenceWithinEpoch(sample, existing) < 0
+      ) {
+        sequencedByEpoch.set(epochKey, sample);
+      }
+    } else {
+      crossEpochCandidates.push(sample);
+    }
+  }
+
+  for (const winner of sequencedByEpoch.values()) {
+    crossEpochCandidates.push(winner);
+  }
+
+  let best: WorkspaceBacklogWorkerPresence | null = null;
+  for (const candidate of crossEpochCandidates) {
+    if (best === null || compareBacklogPresenceCrossEpoch(candidate, best) < 0) {
+      best = candidate;
+    }
+  }
+  return best === null ? null : { winner: best, omitted };
+}
+
 function compareBacklogPresence(
   left: WorkspaceBacklogWorkerPresence,
   right: WorkspaceBacklogWorkerPresence,
 ): number {
-  if (left.live !== right.live) {
-    return left.live ? -1 : 1;
-  }
-  const leftSampled = left.sampled_at_ms ?? Number.MIN_SAFE_INTEGER;
-  const rightSampled = right.sampled_at_ms ?? Number.MIN_SAFE_INTEGER;
-  if (leftSampled !== rightSampled) {
-    return rightSampled - leftSampled;
-  }
-  const leftSequence = left.sequence ?? 0;
-  const rightSequence = right.sequence ?? 0;
-  if (leftSequence !== rightSequence) {
-    return rightSequence - leftSequence;
-  }
   return (
+    compareOptionalNumberDesc(left.sampled_at_ms, right.sampled_at_ms) ||
+    compareOptionalNumberDesc(left.sequence, right.sequence) ||
+    (left.live === right.live ? 0 : left.live ? -1 : 1) ||
+    backlogPresenceStateRank(right) - backlogPresenceStateRank(left) ||
     compareStringsUtf8(left.item_id, right.item_id) ||
-    compareStringsUtf8(left.execution_ref, right.execution_ref)
+    compareStringsUtf8(left.execution_ref, right.execution_ref) ||
+    compareStringsUtf8(left.approval_id, right.approval_id) ||
+    compareStringsUtf8(left.task_id, right.task_id) ||
+    compareStringsUtf8(left.run_id, right.run_id) ||
+    compareStringsUtf8(left.worker_id, right.worker_id) ||
+    compareOptionalStringsUtf8SomeFirst(left.host_instance_id, right.host_instance_id) ||
+    compareOptionalStringsUtf8SomeFirst(left.invocation_id, right.invocation_id) ||
+    compareOptionalStringsUtf8SomeFirst(left.claim_id, right.claim_id)
   );
 }
 

@@ -1,10 +1,12 @@
 import type { CodexChatTarget } from './app-contract.ts';
 import {
   isCanonicalUuid,
+  parseWorkspaceChatIdentityKey,
   projectDesktopWorkspace,
   projectWorkspaceSnapshot,
   type DesktopWorkspaceProjection,
   type WorkspaceProductionProjection,
+  type WorkspaceSelectedChatLabelHint,
 } from './app-model.ts';
 import type {
   ObservationJob,
@@ -40,6 +42,7 @@ import {
   parseWorkspaceSnapshot,
   readWorkspaceChatArchivePreferences,
   reconcileWorkspaceNativeSample,
+  resolveWorkspaceChatLifecycle,
   setWorkspaceChatArchivePreference,
   upgradeLegacyObservationSnapshot,
   validateCorrelationId,
@@ -56,13 +59,12 @@ import {
   type WorkspaceSnapshot,
 } from './workspace-contract.ts';
 
+export { parseWorkspaceChatIdentityKey } from './app-model.ts';
+
 export const OBSERVATION_POLL_INTERVAL_MS = 2_000;
 export const REGISTRY_POLL_EVERY_N_TICKS = 15;
 
 const NIL_UUID_LOWER = '00000000-0000-0000-0000-000000000000';
-const CANONICAL_CHAT_KEY_PREFIX = 'wchat:v1:';
-const CHAT_KEY_ENCODER = new TextEncoder();
-const CHAT_KEY_DECODER = new TextDecoder('utf-8', { fatal: true });
 
 export interface ToolDiscoveryEntry {
   id: string;
@@ -245,90 +247,6 @@ function isForbiddenIdentitySubstitute(value: string): boolean {
     lower.startsWith('session:') ||
     lower.startsWith('sessionid')
   );
-}
-
-/**
- * Parses and validates a canonical four-part workspace chat key
- * (`wchat:v1:<len>:<source_id>:<len>:<binding_id>:<len>:<thread_uuid>:<len>:<canonical_project_scope>`).
- * Non-canonical keys (titles, job IDs, session IDs, malformed UUIDs) return `null`.
- */
-export function parseWorkspaceChatIdentityKey(
-  rawKey: string | null | undefined,
-): WorkspaceChatIdentity | null {
-  if (typeof rawKey !== 'string') {
-    return null;
-  }
-  const trimmed = rawKey.trim();
-  if (!trimmed.startsWith(CANONICAL_CHAT_KEY_PREFIX)) {
-    return null;
-  }
-
-  const bytes = CHAT_KEY_ENCODER.encode(trimmed);
-  let offset = CANONICAL_CHAT_KEY_PREFIX.length;
-  const parts: string[] = [];
-
-  for (let idx = 0; idx < 4; idx += 1) {
-    let lengthStr = '';
-    while (offset < bytes.byteLength && bytes[offset] !== 0x3a) {
-      const byte = bytes[offset]!;
-      if (byte < 0x30 || byte > 0x39 || lengthStr.length >= 4) {
-        return null;
-      }
-      lengthStr += String.fromCharCode(byte);
-      offset += 1;
-    }
-    if (
-      lengthStr.length === 0 ||
-      offset >= bytes.byteLength ||
-      bytes[offset] !== 0x3a
-    ) {
-      return null;
-    }
-    offset += 1; // consume ':'
-
-    const fieldByteLen = Number.parseInt(lengthStr, 10);
-    if (
-      !Number.isSafeInteger(fieldByteLen) ||
-      fieldByteLen <= 0 ||
-      offset + fieldByteLen > bytes.byteLength
-    ) {
-      return null;
-    }
-
-    let decodedField: string;
-    try {
-      decodedField = CHAT_KEY_DECODER.decode(
-        bytes.subarray(offset, offset + fieldByteLen),
-      );
-    } catch {
-      return null;
-    }
-    parts.push(decodedField);
-    offset += fieldByteLen;
-
-    if (idx < 3) {
-      if (offset >= bytes.byteLength || bytes[offset] !== 0x3a) {
-        return null;
-      }
-      offset += 1; // consume separator ':'
-    } else if (offset !== bytes.byteLength) {
-      return null;
-    }
-  }
-
-  try {
-    const validated = validateWorkspaceChatIdentity({
-      source_id: parts[0],
-      binding_id: parts[1],
-      thread_uuid: parts[2],
-      canonical_project_scope: parts[3],
-    });
-    return formatWorkspaceChatIdentityKey(validated) === trimmed
-      ? validated
-      : null;
-  } catch {
-    return null;
-  }
 }
 
 function normalizeSelectedChatKeyOption(
@@ -637,6 +555,8 @@ export class DesktopAppCoordinator {
 
   private discoveryTicketSeq = 0;
   private pollTickCounter = 0;
+  private lastSelectedChatLabelHint: WorkspaceSelectedChatLabelHint | null =
+    null;
 
   constructor(
     ports: DesktopCoordinatorPorts,
@@ -715,6 +635,7 @@ export class DesktopAppCoordinator {
       lifecycleFilter: this.state.workspaceLifecycle,
       archivePreferences: this.state.archivePreferences,
       selectedChatKey: this.state.selectedChatKey,
+      selectedChatLabelHint: this.lastSelectedChatLabelHint,
       selectedTab: this.state.selectedTab,
       activityJobId: this.state.observationScope?.job_id ?? null,
       loading: this.state.observationLoading,
@@ -767,6 +688,35 @@ export class DesktopAppCoordinator {
     this.onChange(this.state);
   }
 
+  private syncSelectedChatLabelHint(
+    chatKey: string | null,
+    labelsByKey?: ReadonlyMap<string, WorkspaceSelectedChatLabelHint>,
+  ): void {
+    if (chatKey === null) {
+      this.lastSelectedChatLabelHint = null;
+      return;
+    }
+    const directHint = labelsByKey?.get(chatKey) ?? null;
+    if (directHint !== null) {
+      this.lastSelectedChatLabelHint = directHint;
+      return;
+    }
+    if (this.lastSelectedChatLabelHint?.chatKey === chatKey) {
+      return;
+    }
+    if (this.state.workspaceSnapshot !== null && labelsByKey === undefined) {
+      const resolved = this.resolveFirstVisibleChatKey(
+        this.state.workspaceSnapshot,
+        this.state.workspaceLifecycle,
+        this.state.archivePreferences,
+      );
+      this.lastSelectedChatLabelHint =
+        resolved.labelsByKey.get(chatKey) ?? null;
+      return;
+    }
+    this.lastSelectedChatLabelHint = null;
+  }
+
   private resolveFirstVisibleChatKey(
     snapshot: WorkspaceSnapshot | null,
     lifecycle: WorkspaceChatLifecycle,
@@ -775,12 +725,14 @@ export class DesktopAppCoordinator {
     firstVisibleKey: string | null;
     visibleKeys: Set<string>;
     allKnownKeys: Set<string>;
+    labelsByKey: Map<string, WorkspaceSelectedChatLabelHint>;
   } {
     if (snapshot === null) {
       return {
         firstVisibleKey: null,
         visibleKeys: new Set<string>(),
         allKnownKeys: new Set<string>(),
+        labelsByKey: new Map<string, WorkspaceSelectedChatLabelHint>(),
       };
     }
 
@@ -803,12 +755,18 @@ export class DesktopAppCoordinator {
     }
 
     const allKnownKeys = new Set<string>();
+    const labelsByKey = new Map<string, WorkspaceSelectedChatLabelHint>();
     for (const group of [
       ...projected.activeProjects,
       ...projected.archivedProjects,
     ]) {
       for (const chat of group.chats) {
         allKnownKeys.add(chat.chatKey);
+        labelsByKey.set(chat.chatKey, {
+          chatKey: chat.chatKey,
+          threadLabel: chat.threadLabel,
+          projectLabel: chat.projectLabel,
+        });
       }
     }
 
@@ -816,6 +774,7 @@ export class DesktopAppCoordinator {
       firstVisibleKey: projected.visibleProjects[0]?.chats[0]?.chatKey ?? null,
       visibleKeys,
       allKnownKeys,
+      labelsByKey,
     };
   }
 
@@ -906,6 +865,7 @@ export class DesktopAppCoordinator {
       }
     }
 
+    this.syncSelectedChatLabelHint(nextChatKey);
     this.updateState({
       selectedChatKey: nextChatKey,
       observationGeneration: nextGeneration,
@@ -936,17 +896,21 @@ export class DesktopAppCoordinator {
     }
 
     let nextSelectedChatKey = this.state.selectedChatKey;
+    let labelsByKey:
+      | ReadonlyMap<string, WorkspaceSelectedChatLabelHint>
+      | undefined;
     if (this.state.workspaceSnapshot !== null) {
-      const { firstVisibleKey, visibleKeys } = this.resolveFirstVisibleChatKey(
+      const resolved = this.resolveFirstVisibleChatKey(
         this.state.workspaceSnapshot,
         nextLifecycle,
         this.state.archivePreferences,
       );
+      labelsByKey = resolved.labelsByKey;
       if (
         nextSelectedChatKey === null ||
-        !visibleKeys.has(nextSelectedChatKey)
+        !resolved.visibleKeys.has(nextSelectedChatKey)
       ) {
-        nextSelectedChatKey = firstVisibleKey;
+        nextSelectedChatKey = resolved.firstVisibleKey;
       }
     } else if (nextSelectedChatKey !== null) {
       const entry = this.state.archivePreferences[nextSelectedChatKey];
@@ -962,6 +926,7 @@ export class DesktopAppCoordinator {
       this.inFlightCodexOpenTicket = null;
     }
 
+    this.syncSelectedChatLabelHint(nextSelectedChatKey, labelsByKey);
     this.updateState({
       workspaceLifecycle: nextLifecycle,
       selectedChatKey: nextSelectedChatKey,
@@ -1027,17 +992,21 @@ export class DesktopAppCoordinator {
     }
 
     let nextSelectedChatKey = this.state.selectedChatKey;
+    let labelsByKey:
+      | ReadonlyMap<string, WorkspaceSelectedChatLabelHint>
+      | undefined;
     if (
       nextSelectedChatKey === targetChatKey &&
       targetLifecycle !== this.state.workspaceLifecycle
     ) {
       if (this.state.workspaceSnapshot !== null) {
-        const { firstVisibleKey } = this.resolveFirstVisibleChatKey(
+        const resolved = this.resolveFirstVisibleChatKey(
           this.state.workspaceSnapshot,
           this.state.workspaceLifecycle,
           nextPreferences,
         );
-        nextSelectedChatKey = firstVisibleKey;
+        labelsByKey = resolved.labelsByKey;
+        nextSelectedChatKey = resolved.firstVisibleKey;
       } else {
         nextSelectedChatKey = null;
       }
@@ -1053,6 +1022,7 @@ export class DesktopAppCoordinator {
       this.inFlightCodexOpenTicket = null;
     }
 
+    this.syncSelectedChatLabelHint(nextSelectedChatKey, labelsByKey);
     this.updateState({
       archivePreferences: nextPreferences,
       archiveError: null,
@@ -1094,6 +1064,7 @@ export class DesktopAppCoordinator {
       }
     }
 
+    this.syncSelectedChatLabelHint(nextSelectedChatKey);
     this.updateState({
       observationScope: normalizedScope,
       observationGeneration: nextGeneration,
@@ -1249,17 +1220,35 @@ export class DesktopAppCoordinator {
           : fetchedSnapshot;
       const nextSnapshot = reconcileSnapshotSourceHealth(sampleReconciled);
 
-      const { firstVisibleKey, allKnownKeys } = this.resolveFirstVisibleChatKey(
-        nextSnapshot,
-        this.state.workspaceLifecycle,
-        this.state.archivePreferences,
-      );
+      const { firstVisibleKey, allKnownKeys, labelsByKey } =
+        this.resolveFirstVisibleChatKey(
+          nextSnapshot,
+          this.state.workspaceLifecycle,
+          this.state.archivePreferences,
+        );
 
       let nextSelectedChatKey = this.state.selectedChatKey;
       if (nextSelectedChatKey === null) {
         nextSelectedChatKey = firstVisibleKey;
       } else if (!allKnownKeys.has(nextSelectedChatKey)) {
-        nextSelectedChatKey = firstVisibleKey;
+        const parsedSelected = parseWorkspaceChatIdentityKey(
+          nextSelectedChatKey,
+        );
+        const scope = this.state.observationScope;
+        // `setObservationScope` clears `workspaceSnapshot` on actual scope
+        // changes; same-scope `replace` reads keep `currentSnapshot` non-null.
+        if (
+          parsedSelected === null ||
+          resolveWorkspaceChatLifecycle(
+            this.state.archivePreferences,
+            parsedSelected,
+          ) !== this.state.workspaceLifecycle ||
+          (scope !== null &&
+            (currentSnapshot === null ||
+              parsedSelected.source_id !== scope.source_id))
+        ) {
+          nextSelectedChatKey = firstVisibleKey;
+        }
       }
 
       const chatChanged = nextSelectedChatKey !== this.state.selectedChatKey;
@@ -1267,6 +1256,7 @@ export class DesktopAppCoordinator {
         this.inFlightCodexOpenTicket = null;
       }
 
+      this.syncSelectedChatLabelHint(nextSelectedChatKey, labelsByKey);
       this.updateState({
         workspaceSnapshot: nextSnapshot,
         observationSnapshot: nextSnapshot.observation,
@@ -1633,53 +1623,64 @@ export class DesktopAppCoordinator {
 
     if (this.state.workspaceSnapshot !== null) {
       const projected = this.projectWorkspace();
+      if (
+        projected.selectedChatUnavailable !== null &&
+        projected.selectedChatUnavailable.identity.source_id === rawSourceId &&
+        projected.selectedChatUnavailable.identity.thread_uuid ===
+          canonicalThreadUuid
+      ) {
+        return {
+          ok: false,
+          error:
+            'Cannot open Codex chat: the selected chat is temporarily unavailable in the latest refresh.',
+        };
+      }
+
       const allVerifiedChats = [
         ...projected.activeProjects,
         ...projected.archivedProjects,
       ].flatMap((group) => group.chats);
 
-      if (allVerifiedChats.length > 0) {
-        const matchingChats = allVerifiedChats.filter(
-          (chat) =>
-            chat.identity.source_id === rawSourceId &&
-            chat.identity.thread_uuid === canonicalThreadUuid,
-        );
-        if (matchingChats.length === 0) {
-          return {
-            ok: false,
-            error:
-              'Cannot open Codex chat: target does not match a verified workspace chat.',
-          };
-        }
+      const matchingChats = allVerifiedChats.filter(
+        (chat) =>
+          chat.identity.source_id === rawSourceId &&
+          chat.identity.thread_uuid === canonicalThreadUuid,
+      );
+      if (matchingChats.length === 0) {
+        return {
+          ok: false,
+          error:
+            'Cannot open Codex chat: target does not match a verified workspace chat.',
+        };
+      }
 
-        if (cleanJobId !== null) {
-          for (const history of this.state.workspaceSnapshot.job_histories) {
-            if (
-              history.job.source_id === rawSourceId &&
-              history.job.job_id === cleanJobId &&
-              history.job.chat_identity !== null &&
-              history.job.chat_identity.thread_uuid !== canonicalThreadUuid
-            ) {
-              return {
-                ok: false,
-                error:
-                  'Cannot open Codex chat: job does not belong to the target thread.',
-              };
-            }
+      if (cleanJobId !== null) {
+        for (const history of this.state.workspaceSnapshot.job_histories) {
+          if (
+            history.job.source_id === rawSourceId &&
+            history.job.job_id === cleanJobId &&
+            history.job.chat_identity !== null &&
+            history.job.chat_identity.thread_uuid !== canonicalThreadUuid
+          ) {
+            return {
+              ok: false,
+              error:
+                'Cannot open Codex chat: job does not belong to the target thread.',
+            };
           }
-          for (const obsJob of this.state.workspaceSnapshot.observation.jobs) {
-            if (
-              obsJob.source_id === rawSourceId &&
-              obsJob.id === cleanJobId &&
-              obsJob.thread_uuid !== null &&
-              obsJob.thread_uuid.toLowerCase() !== canonicalThreadUuid
-            ) {
-              return {
-                ok: false,
-                error:
-                  'Cannot open Codex chat: job does not belong to the target thread.',
-              };
-            }
+        }
+        for (const obsJob of this.state.workspaceSnapshot.observation.jobs) {
+          if (
+            obsJob.source_id === rawSourceId &&
+            obsJob.id === cleanJobId &&
+            obsJob.thread_uuid !== null &&
+            obsJob.thread_uuid.toLowerCase() !== canonicalThreadUuid
+          ) {
+            return {
+              ok: false,
+              error:
+                'Cannot open Codex chat: job does not belong to the target thread.',
+            };
           }
         }
       }

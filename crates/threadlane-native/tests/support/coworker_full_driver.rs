@@ -2959,6 +2959,7 @@ async fn driver_preflight_rejects_oversized_later_task_before_host_startup_and_p
                     file_permissions: Some(threadlane_workers::WorkerFilePermissions::TaskFiles),
                     depends_on: ct.depends_on.clone(),
                     allowed_write_paths: ct.allowed_write_paths.clone(),
+                    required_changed_paths: None,
                     task_digest: ct.task_digest.clone(),
                     profile_id: None,
                     command_key: None,

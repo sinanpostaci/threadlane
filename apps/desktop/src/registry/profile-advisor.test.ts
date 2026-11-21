@@ -6,6 +6,7 @@ import {
   decisionAdvisorFromProfile,
   decisionAdvisorSignature,
   eligibleDecisionAdvisors,
+  isSupportedDecisionAdvisorModel,
   normalizeDecisionAdvisor,
   profileSignatureWithDecisionAdvisor,
   profileWithDecisionAdvisor,
@@ -311,5 +312,188 @@ describe('profile decision advisor', () => {
       decisionAdvisorSignature(jev.decision_advisor),
       decisionAdvisorSignature(openai.decision_advisor)
     );
+  });
+
+  it('aligns picker and validator with Rust model_arg rules for Jev and OpenAI', () => {
+    const jevMax = `jev-${'a'.repeat(124)}`;
+    const jevOver = `jev-${'a'.repeat(125)}`;
+    const openaiMax = `gpt-6-luna-${'b'.repeat(117)}`;
+    const openaiOver = `gpt-6-luna-${'b'.repeat(118)}`;
+
+    const positiveModels: ModelDefinition[] = [
+      model({ id: 'jev-main:min', model_arg: 'jev-x' }),
+      model({ id: 'jev-main:alias', model_arg: 'jev-v1.14_0:rc-2' }),
+      model({ id: 'jev-main:max', model_arg: jevMax }),
+      model({ id: 'openai-main:base', tool_id: 'openai-main', model_arg: 'gpt-6-luna' }),
+      model({
+        id: 'openai-main:dated',
+        tool_id: 'openai-main',
+        model_arg: 'gpt-6-luna-2026-10-01',
+      }),
+      model({
+        id: 'openai-main:prefix',
+        tool_id: 'openai-main',
+        model_arg: 'gpt-6-luna-',
+      }),
+      model({ id: 'openai-main:max', tool_id: 'openai-main', model_arg: openaiMax }),
+    ];
+
+    const negativeModels: ModelDefinition[] = [
+      model({ id: 'jev-empty-arg', model_arg: '' }),
+      model({ id: 'jev-bare-prefix', model_arg: 'jev-' }),
+      model({ id: 'jev-upper', model_arg: 'JEV-1.14.0' }),
+      model({ id: 'jev-leading-space', model_arg: ' jev-1.14.0' }),
+      model({ id: 'jev-trailing-space', model_arg: 'jev-1.14.0 ' }),
+      model({ id: 'jev-slash', model_arg: 'jev-api/jev-1.14.0' }),
+      model({ id: 'jev-non-ascii', model_arg: 'jev-1.14.0é' }),
+      model({ id: 'jev-too-long', label: `${jevOver}\nctrl`, model_arg: jevOver }),
+      model({ id: 'jev-with-openai-arg', model_arg: 'gpt-6-luna' }),
+      model({
+        id: 'openai-main:gpt-6.2-sol',
+        tool_id: 'openai-main',
+        label: 'GPT-6.2 Sol',
+        model_arg: 'gpt-6.2-sol',
+      }),
+      model({
+        id: 'openai-main:gpt-6-luna',
+        tool_id: 'openai-main',
+        label: 'Misleading Luna ID',
+        model_arg: 'gpt-6.2-sol',
+      }),
+      model({
+        id: 'openai-main:suffix-no-dash',
+        tool_id: 'openai-main',
+        model_arg: 'gpt-6-luna2',
+      }),
+      model({
+        id: 'openai-main:leading-space',
+        tool_id: 'openai-main',
+        model_arg: ' gpt-6-luna',
+      }),
+      model({
+        id: 'openai-main:trailing-space',
+        tool_id: 'openai-main',
+        model_arg: 'gpt-6-luna ',
+      }),
+      model({
+        id: 'openai-main:slash',
+        tool_id: 'openai-main',
+        model_arg: 'openai/gpt-6-luna',
+      }),
+      model({
+        id: 'openai-main:too-long',
+        tool_id: 'openai-main',
+        model_arg: openaiOver,
+      }),
+      model({
+        id: 'openai-main:jev-arg',
+        tool_id: 'openai-main',
+        model_arg: 'jev-1.14.0',
+      }),
+    ];
+
+    const boundaryRegistry: DecisionAdvisorRegistry = {
+      tools: TOOLS,
+      models: [...positiveModels, ...negativeModels],
+    };
+
+    assert.deepEqual(
+      eligibleDecisionAdvisors(boundaryRegistry).map((choice) => choice.model.id),
+      positiveModels.map((entry) => entry.id)
+    );
+
+    for (const entry of positiveModels) {
+      const validation = validateDecisionAdvisor(boundaryRegistry, {
+        model_id: entry.id,
+        mode: 'shadow',
+      });
+      assert.equal(validation.state, 'ready', `expected ready for ${entry.id}`);
+    }
+
+    for (const entry of negativeModels) {
+      const validation = validateDecisionAdvisor(boundaryRegistry, {
+        model_id: entry.id,
+        mode: 'shadow',
+      });
+      assert.equal(validation.state, 'invalid', `expected invalid for ${entry.id}`);
+      if (validation.state === 'invalid') {
+        assert.equal(validation.issue.code, 'unsupported_model');
+        assert.equal(validation.advisor.model_id, entry.id);
+        assert.equal(validation.model?.id, entry.id);
+        assert.ok(validation.issue.message.length <= 240);
+        assert.equal(/[\u0000-\u001f\u007f]/.test(validation.issue.message), false);
+        assert.match(validation.issue.message, /supported API model/i);
+        assert.match(validation.issue.message, /clear the advisor/i);
+      }
+    }
+
+    assert.equal(isSupportedDecisionAdvisorModel('codex_cli', 'gpt-6-luna'), false);
+  });
+
+  it('refuses supported model_args when the owning tool is disabled or wrong', () => {
+    const tools: ToolDefinition[] = [
+      ...TOOLS,
+      {
+        id: 'openai-disabled',
+        label: 'Disabled OpenAI Decisions',
+        adapter: 'openai_decisions_api',
+        executable_path: null,
+        enabled: false,
+      },
+    ];
+    const models: ModelDefinition[] = [
+      model({
+        id: 'openai-disabled:gpt-6-luna',
+        tool_id: 'openai-disabled',
+        model_arg: 'gpt-6-luna',
+      }),
+      model({
+        id: 'codex-main:gpt-6-luna',
+        tool_id: 'codex-main',
+        model_arg: 'gpt-6-luna',
+      }),
+      model({
+        id: 'jev-main:gpt-6-luna',
+        tool_id: 'jev-main',
+        model_arg: 'gpt-6-luna',
+      }),
+      model({
+        id: 'openai-main:jev-1.14.0',
+        tool_id: 'openai-main',
+        model_arg: 'jev-1.14.0',
+      }),
+    ];
+    const registry: DecisionAdvisorRegistry = { tools, models };
+
+    assert.deepEqual(eligibleDecisionAdvisors(registry), []);
+
+    const disabledOpenAi = validateDecisionAdvisor(registry, {
+      model_id: 'openai-disabled:gpt-6-luna',
+      mode: 'shadow',
+    });
+    assert.equal(disabledOpenAi.state, 'invalid');
+    if (disabledOpenAi.state === 'invalid') {
+      assert.equal(disabledOpenAi.issue.code, 'disabled_tool');
+    }
+
+    const cliOwner = validateDecisionAdvisor(registry, {
+      model_id: 'codex-main:gpt-6-luna',
+      mode: 'shadow',
+    });
+    assert.equal(cliOwner.state, 'invalid');
+    if (cliOwner.state === 'invalid') {
+      assert.equal(cliOwner.issue.code, 'wrong_adapter');
+    }
+
+    for (const crossProviderId of ['jev-main:gpt-6-luna', 'openai-main:jev-1.14.0']) {
+      const result = validateDecisionAdvisor(registry, {
+        model_id: crossProviderId,
+        mode: 'shadow',
+      });
+      assert.equal(result.state, 'invalid');
+      if (result.state === 'invalid') {
+        assert.equal(result.issue.code, 'unsupported_model');
+      }
+    }
   });
 });

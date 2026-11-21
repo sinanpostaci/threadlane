@@ -2681,3 +2681,920 @@ async fn consult_advisor_persists_canonical_identity_refuses_legacy_authority_an
 
     fixture.shutdown().await;
 }
+
+async fn invoke_mcp_err_code_and_message(
+    mcp: &PairedMcpServer,
+    tool: &str,
+    args: Value,
+) -> (String, String) {
+    let err = mcp
+        .invoke_tool_json(tool, args, None)
+        .await
+        .expect_err("expected MCP tool error")
+        .structured_content
+        .expect("error structured_content");
+    let code = err["error"]["code"]
+        .as_str()
+        .expect("error.code string")
+        .to_string();
+    let message = err["error"]["message"]
+        .as_str()
+        .expect("error.message string")
+        .to_string();
+    (code, message)
+}
+
+#[tokio::test]
+async fn consult_architect_refuses_new_request_on_advisor_only_grant_with_zero_side_effects_and_preserves_exact_replay(
+) {
+    use threadlane_native::coworker_workflow::{PlanningArtifactOutcomeKind, PlanningGrantStatus};
+    use threadlane_native::planning_driver::open_planning_driver_for_plans_dir;
+
+    let mut fixture = GatewayFixture::start().await;
+    // Commit a second repository file so dependency_files mutation tests use two valid blobs.
+    fs::write(
+        fixture.repo_dir.join("src/extra.rs"),
+        "pub fn gateway_extra() -> u32 { 22 }\n",
+    )
+    .expect("write src/extra.rs");
+    for args in [
+        &["add", "src/extra.rs"][..],
+        &["commit", "-m", "add extra dependency file", "--quiet"][..],
+    ] {
+        run_sanitized_git(&fixture.repo_dir, args, DEFAULT_GIT_COMMAND_TIMEOUT_MS)
+            .expect("commit src/extra.rs");
+    }
+    let repo_dir = &fixture.repo_dir;
+    let commit = resolve_exact_commit_sha(repo_dir, "HEAD", DEFAULT_GIT_COMMAND_TIMEOUT_MS)
+        .expect("resolve HEAD commit");
+    let tree = resolve_exact_tree_sha(repo_dir, &commit, DEFAULT_GIT_COMMAND_TIMEOUT_MS)
+        .expect("resolve HEAD tree");
+    fixture.project_base = CanonicalProjectBaseRef {
+        repository_path: repo_dir.to_string_lossy().into_owned(),
+        base_commit: commit,
+        base_tree_sha: tree,
+    };
+
+    let mcp = fixture.enrolled_mcp();
+    let now_ms = current_wall_clock_ms().expect("wall clock");
+    let advisor_grant = fixture.create_grant_with_policy(
+        "req-grant-advisor-only-1",
+        advisor_policy(),
+        now_ms.saturating_sub(5_000),
+        now_ms + 3_600_000,
+    );
+    let advisor_grant_alt = fixture.create_grant_with_policy(
+        "req-grant-advisor-only-alt",
+        advisor_policy(),
+        now_ms.saturating_sub(5_000),
+        now_ms + 3_600_000,
+    );
+    let legacy_grant = fixture.create_grant(
+        "req-grant-pre-transition-architect",
+        now_ms.saturating_sub(5_000),
+        now_ms + 3_600_000,
+    );
+
+    let wf_store =
+        CoworkerWorkflowStore::new(&fixture.plans_dir).expect("open CoworkerWorkflowStore");
+    let advisor_grant_one_call = wf_store
+        .create_planning_grant(&CreatePlanningGrantRequest {
+            binding_id: fixture.binding_id.clone(),
+            thread_uuid: THREAD_UUID.to_string(),
+            request_key: "req-grant-advisor-only-one-call".to_string(),
+            expected_ledger_revision: None,
+            project_base: fixture.project_base.clone(),
+            profile_id: PROFILE_ID.to_string(),
+            registry_revision: 3,
+            policy: advisor_policy(),
+            capabilities: PlanningReadOnlyCapabilities::strict_read_only(),
+            budget: PlanningCallBudget {
+                max_total_calls: 1,
+                max_orchestrator_calls: 0,
+                max_architect_calls: 1,
+                max_timeout_ms_per_call: 60_000,
+                max_output_bytes_per_call: 65_536,
+            },
+            created_at_ms: now_ms.saturating_sub(5_000),
+            expires_at_ms: now_ms + 3_600_000,
+            operator_attested: true,
+        })
+        .expect("create single-call advisor-only grant")
+        .grant_id;
+
+    let prep_primary: PrepareWorkResponse = invoke_mcp_ok(
+        &mcp,
+        "prepare_work",
+        json!({
+            "grant_id": advisor_grant.clone(),
+            "request_key": "req-prep-primary-role-check",
+            "summary": "Verify exact role boundary on consult_architect",
+            "confirmed_requirements": ["Refuse new legacy architect consults under advisor-only grants"]
+        }),
+    )
+    .await;
+    let prep_other: PrepareWorkResponse = invoke_mcp_ok(
+        &mcp,
+        "prepare_work",
+        json!({
+            "grant_id": advisor_grant.clone(),
+            "request_key": "req-prep-other-role-check",
+            "summary": "Distinct job for replay isolation",
+            "confirmed_requirements": ["Prevent cross-job legacy replay bypass"]
+        }),
+    )
+    .await;
+    assert_ne!(prep_primary.job_id, prep_other.job_id);
+
+    // 1. Wrong current entrypoint: a NEW legacy `consult_architect` request on an advisor-only
+    //    grant must be refused with clear guidance and ZERO side effects.
+    let plans_entries_before = directory_entries(&fixture.plans_dir);
+    let ledger_before = wf_store
+        .read_binding_ledger(&fixture.binding_id)
+        .expect("read workflow ledger before refusal");
+    assert!(!planning_commands_dir(&fixture.plans_dir).exists());
+    assert!(!planning_artifacts_dir(&fixture.plans_dir).exists());
+
+    let (mcp_code, mcp_message) = invoke_mcp_err_code_and_message(
+        &mcp,
+        "consult_architect",
+        json!({
+            "grant_id": advisor_grant.clone(),
+            "job_id": prep_primary.job_id.clone(),
+            "request_key": "req-wrong-entrypoint-mcp",
+            "question": "Fresh legacy call under advisor-only authority",
+            "dependency_files": ["src/lib.rs"],
+            "difficulty": "hard"
+        }),
+    )
+    .await;
+    assert_eq!(mcp_code, "validation_failed");
+    assert!(
+        mcp_message.contains("consult_advisor") && mcp_message.contains("advisor"),
+        "expected clear guidance directing caller to consult_advisor, got: {mcp_message}"
+    );
+
+    let gw_err = fixture
+        .gateway()
+        .consult_architect(&ConsultArchitectParams {
+            grant_id: advisor_grant.clone(),
+            job_id: prep_primary.job_id.clone(),
+            request_key: "req-wrong-entrypoint-gw".to_string(),
+            expected_ledger_revision: None,
+            question: "Fresh legacy gateway call under advisor-only authority".to_string(),
+            dependency_files: vec!["src/lib.rs".to_string()],
+            prior_advice_ids: Vec::new(),
+            difficulty: Some(Difficulty::Hard),
+        })
+        .await
+        .expect_err("gateway consult_architect must refuse new request on advisor-only grant");
+    assert_eq!(gw_err.error_code(), NativeErrorCode::ValidationFailed);
+    assert!(
+        gw_err.message.contains("consult_advisor"),
+        "expected clear guidance directing caller to consult_advisor, got: {}",
+        gw_err.message
+    );
+
+    assert!(!planning_commands_dir(&fixture.plans_dir).exists());
+    assert!(!planning_artifacts_dir(&fixture.plans_dir).exists());
+    assert_eq!(directory_entries(&fixture.plans_dir), plans_entries_before);
+    let ledger_after_refusal = wf_store
+        .read_binding_ledger(&fixture.binding_id)
+        .expect("read workflow ledger after refusal");
+    assert_eq!(
+        ledger_after_refusal.ledger_revision,
+        ledger_before.ledger_revision
+    );
+    let advisor_grant_after_refusal = ledger_after_refusal
+        .planning_grants
+        .iter()
+        .find(|g| g.grant_id == advisor_grant)
+        .expect("advisor grant");
+    assert!(advisor_grant_after_refusal.reservations.is_empty());
+    assert_eq!(advisor_grant_after_refusal.usage.reserved_total_calls, 0);
+    assert_eq!(
+        advisor_grant_after_refusal.usage.reserved_architect_calls,
+        0
+    );
+    assert!(ledger_after_refusal.architect_advice.is_empty());
+    assert_eq!(provider_invocation_count(&fixture.worker_marker), 0);
+
+    // 2. Canonical `consult_advisor` good path on the advisor-only grant persists `Advisor`, and
+    //    `consult_architect` cannot replay that canonical `Advisor` command key.
+    let canonical_args = json!({
+        "grant_id": advisor_grant.clone(),
+        "job_id": prep_primary.job_id.clone(),
+        "request_key": "req-canonical-advisor-good",
+        "question": "Canonical advisor check under advisor-only authority",
+        "dependency_files": ["src/lib.rs"],
+        "difficulty": "hard"
+    });
+    let canonical_submit: PlanningCommandSubmissionResponse =
+        invoke_mcp_ok(&mcp, "consult_advisor", canonical_args.clone()).await;
+    assert_eq!(canonical_submit.role, WorkflowRole::Advisor);
+    let canonical_detail = wait_for_command_completion(&mcp, &canonical_submit.command_id).await;
+    assert_eq!(
+        canonical_detail.status,
+        PlanningCommandStatus::Completed,
+        "canonical_detail did not complete cleanly: {}",
+        format_command_detail_context(&canonical_detail)
+    );
+    assert_eq!(canonical_detail.role, WorkflowRole::Advisor);
+    assert_eq!(provider_invocation_count(&fixture.worker_marker), 1);
+
+    let (cross_role_code, _) =
+        invoke_mcp_err_code_and_message(&mcp, "consult_architect", canonical_args).await;
+    assert_eq!(cross_role_code, "validation_failed");
+    assert_eq!(provider_invocation_count(&fixture.worker_marker), 1);
+
+    // 3. Pre-transition `architect` grant keeps its valid legacy `consult_architect` path and exact
+    //    replay, while still refusing `consult_advisor`.
+    let legacy_args = json!({
+        "grant_id": legacy_grant.clone(),
+        "job_id": prep_primary.job_id.clone(),
+        "request_key": "req-legacy-architect-good",
+        "question": "Pre-transition architect consultation",
+        "dependency_files": ["src/lib.rs"],
+        "difficulty": "hard"
+    });
+    let legacy_submit: PlanningCommandSubmissionResponse =
+        invoke_mcp_ok(&mcp, "consult_architect", legacy_args.clone()).await;
+    assert_eq!(legacy_submit.role, WorkflowRole::Architect);
+    let legacy_detail = wait_for_command_completion(&mcp, &legacy_submit.command_id).await;
+    assert_eq!(
+        legacy_detail.status,
+        PlanningCommandStatus::Completed,
+        "legacy_detail did not complete cleanly: {}",
+        format_command_detail_context(&legacy_detail)
+    );
+    assert_eq!(legacy_detail.role, WorkflowRole::Architect);
+    assert_eq!(provider_invocation_count(&fixture.worker_marker), 2);
+
+    let legacy_replay: PlanningCommandSubmissionResponse =
+        invoke_mcp_ok(&mcp, "consult_architect", legacy_args).await;
+    assert_eq!(legacy_replay.command_id, legacy_submit.command_id);
+    assert_eq!(legacy_replay.role, WorkflowRole::Architect);
+    assert_eq!(
+        legacy_replay.submission_status,
+        PlanningCommandStartStatus::AlreadyCompleted
+    );
+    assert!(!legacy_replay.launched);
+    assert!(!legacy_replay.submission_requested);
+    assert_eq!(provider_invocation_count(&fixture.worker_marker), 2);
+
+    let legacy_advisor_err = invoke_mcp_err_code(
+        &mcp,
+        "consult_advisor",
+        json!({
+            "grant_id": legacy_grant.clone(),
+            "job_id": prep_primary.job_id.clone(),
+            "request_key": "req-advisor-on-legacy-must-fail",
+            "question": "Must refuse canonical advisor on architect-only grant",
+            "dependency_files": ["src/lib.rs"],
+            "difficulty": "hard"
+        }),
+    )
+    .await;
+    assert_eq!(legacy_advisor_err, "validation_failed");
+    assert_eq!(provider_invocation_count(&fixture.worker_marker), 2);
+
+    // 4. Seed an already-accepted historical confirmed (`Completed`) legacy `Architect` command on
+    //    the 1-call advisor-only grant (which exhausts its budget upon completion) via the lower
+    //    command store + driver, simulating persisted pre-fix history.
+    let driver = open_planning_driver_for_plans_dir(&fixture.plans_dir, &fixture.registry_dir)
+        .expect("open planning driver");
+    let cmd_store = driver.command_store();
+    let wf_ledger_before_seed = wf_store
+        .read_binding_ledger(&fixture.binding_id)
+        .expect("read workflow ledger before seeding historical command");
+    let one_call_grant = wf_ledger_before_seed
+        .planning_grants
+        .iter()
+        .find(|g| g.grant_id == advisor_grant_one_call)
+        .expect("single-call advisor grant");
+    let dep_blobs = CoworkerPlanningService::compute_dependency_file_blobs(
+        &prep_primary.project_base,
+        &["src/lib.rs".to_string()],
+    )
+    .expect("compute src/lib.rs dependency blob");
+    let historical_key = "req-historical-confirmed-architect-on-advisor-grant";
+    let historical_question = "Historical confirmed architect advice accepted before role check";
+    let seeded_cmd = cmd_store
+        .enqueue_command(&EnqueuePlanningCommandRequest::from_architect(
+            RunArchitectAdviceRequest {
+                binding_id: fixture.binding_id.clone(),
+                thread_uuid: THREAD_UUID.to_string(),
+                grant_id: advisor_grant_one_call.clone(),
+                request_key: historical_key.to_string(),
+                expected_ledger_revision: None,
+                difficulty: Some(Difficulty::Hard),
+                context_dependencies: ArchitectContextDependencies {
+                    project_base: prep_primary.project_base.clone(),
+                    work_brief_digest: prep_primary.work_brief_digest.clone(),
+                    plan_digest: None,
+                    policy_digest: one_call_grant.policy_digest.clone(),
+                    dependency_file_blobs: dep_blobs.clone(),
+                    interface_ownership_digests: BTreeMap::new(),
+                    accepted_predecessor_trees: BTreeMap::new(),
+                },
+                question_summary: historical_question.to_string(),
+                prior_advice_context: Vec::new(),
+                accept_into_brief: false,
+                current_time_ms: current_wall_clock_ms().expect("wall clock"),
+            },
+        ))
+        .expect("enqueue historical architect command");
+    assert_eq!(seeded_cmd.role, WorkflowRole::Architect);
+    let seeded_exec = tokio::time::timeout(
+        Duration::from_secs(30),
+        Box::pin(driver.execute_command(&fixture.binding_id, THREAD_UUID, &seeded_cmd.command_id)),
+    )
+    .await
+    .expect("historical command execution timeout")
+    .expect("historical command execution outcome");
+    assert_eq!(seeded_exec.command.status, PlanningCommandStatus::Completed);
+    assert_eq!(seeded_exec.command.role, WorkflowRole::Architect);
+    let (seeded_reservation_id, seeded_artifact_id) = match seeded_exec.command.result_ref.as_ref()
+    {
+        Some(PlanningCommandResultRef::ArchitectAdvice {
+            reservation_id,
+            report_artifact_id,
+            ..
+        }) => (reservation_id.clone(), report_artifact_id.clone()),
+        other => panic!("unexpected historical result_ref: {other:?}"),
+    };
+
+    let ledger_after_seed = wf_store
+        .read_binding_ledger(&fixture.binding_id)
+        .expect("read workflow ledger after historical seed");
+    let exhausted_one_call = ledger_after_seed
+        .planning_grants
+        .iter()
+        .find(|g| g.grant_id == advisor_grant_one_call)
+        .expect("exhausted single-call advisor grant");
+    assert_eq!(exhausted_one_call.status, PlanningGrantStatus::Exhausted);
+    assert_eq!(exhausted_one_call.reservations.len(), 1);
+    assert_eq!(
+        exhausted_one_call.reservations[0].role,
+        WorkflowRole::Architect
+    );
+    assert_eq!(
+        exhausted_one_call.reservations[0].reservation_id,
+        seeded_reservation_id
+    );
+    let planning_service = CoworkerPlanningService::new(
+        wf_store.clone(),
+        &fixture.registry_dir,
+        planning_artifacts_dir(&fixture.plans_dir),
+    )
+    .expect("open planning service");
+    let seeded_artifact = planning_service
+        .read_planning_artifact(&seeded_artifact_id)
+        .expect("read historical architect artifact");
+    assert_eq!(seeded_artifact.role, WorkflowRole::Architect);
+    assert!(matches!(
+        seeded_artifact.outcome,
+        PlanningArtifactOutcomeKind::ArchitectAdvice { .. }
+    ));
+
+    let calls_after_seed = provider_invocation_count(&fixture.worker_marker);
+    assert_eq!(calls_after_seed, 3);
+    let cmd_ledger_before_replay = cmd_store
+        .read_binding_ledger(&fixture.binding_id)
+        .expect("read command ledger before replay");
+
+    // 5. Genuine EXACT immutable replay of the confirmed historical `Architect` command on the
+    //    advisor-only (now Exhausted) grant succeeds via both Paired MCP and direct gateway with
+    //    ZERO new provider effects or ledger writes.
+    let exact_historical_args = json!({
+        "grant_id": advisor_grant_one_call,
+        "job_id": prep_primary.job_id,
+        "request_key": historical_key,
+        "question": historical_question,
+        "dependency_files": ["src/lib.rs"],
+        "difficulty": "hard"
+    });
+    let mcp_replay: PlanningCommandSubmissionResponse =
+        invoke_mcp_ok(&mcp, "consult_architect", exact_historical_args).await;
+    assert_eq!(mcp_replay.command_id, seeded_cmd.command_id);
+    assert_eq!(mcp_replay.role, WorkflowRole::Architect);
+    assert_eq!(mcp_replay.status, PlanningCommandStatus::Completed);
+    assert_eq!(
+        mcp_replay.submission_status,
+        PlanningCommandStartStatus::AlreadyCompleted
+    );
+    assert!(!mcp_replay.submission_requested);
+    assert!(!mcp_replay.launched);
+    assert!(mcp_replay.pid_hint.is_none());
+
+    let gw_replay = fixture
+        .gateway()
+        .consult_architect(&ConsultArchitectParams {
+            grant_id: advisor_grant_one_call.clone(),
+            job_id: prep_primary.job_id.clone(),
+            request_key: historical_key.to_string(),
+            expected_ledger_revision: None,
+            question: historical_question.to_string(),
+            dependency_files: vec!["src/lib.rs".to_string()],
+            prior_advice_ids: Vec::new(),
+            difficulty: Some(Difficulty::Hard),
+        })
+        .await
+        .expect("exact gateway replay of confirmed historical architect command must succeed");
+    assert_eq!(gw_replay.command_id, seeded_cmd.command_id);
+    assert_eq!(gw_replay.role, WorkflowRole::Architect);
+    assert_eq!(
+        gw_replay.submission_status,
+        PlanningCommandStartStatus::AlreadyCompleted
+    );
+    assert!(!gw_replay.launched);
+    assert_eq!(
+        provider_invocation_count(&fixture.worker_marker),
+        calls_after_seed
+    );
+    let cmd_ledger_after_replay = cmd_store
+        .read_binding_ledger(&fixture.binding_id)
+        .expect("read command ledger after replay");
+    assert_eq!(
+        cmd_ledger_after_replay.revision,
+        cmd_ledger_before_replay.revision
+    );
+    assert_eq!(
+        cmd_ledger_after_replay.commands.len(),
+        cmd_ledger_before_replay.commands.len()
+    );
+    let wf_ledger_after_replay = wf_store
+        .read_binding_ledger(&fixture.binding_id)
+        .expect("read workflow ledger after replay");
+    assert_eq!(
+        wf_ledger_after_replay.ledger_revision,
+        ledger_after_seed.ledger_revision
+    );
+
+    // 6. No bypass for mutated payload, changed key, changed job, changed grant, or foreign thread.
+    let mutation_cases = [
+        (
+            "mutated question",
+            json!({
+                "grant_id": advisor_grant_one_call,
+                "job_id": prep_primary.job_id,
+                "request_key": historical_key,
+                "question": "Mutated question trying to reuse historical key",
+                "dependency_files": ["src/lib.rs"],
+                "difficulty": "hard"
+            }),
+        ),
+        (
+            "mutated dependency_files",
+            json!({
+                "grant_id": advisor_grant_one_call,
+                "job_id": prep_primary.job_id,
+                "request_key": historical_key,
+                "question": historical_question,
+                "dependency_files": ["src/lib.rs", "src/extra.rs"],
+                "difficulty": "hard"
+            }),
+        ),
+        (
+            "mutated difficulty",
+            json!({
+                "grant_id": advisor_grant_one_call,
+                "job_id": prep_primary.job_id,
+                "request_key": historical_key,
+                "question": historical_question,
+                "dependency_files": ["src/lib.rs"],
+                "difficulty": "medium"
+            }),
+        ),
+        (
+            "mutated expected_ledger_revision",
+            json!({
+                "grant_id": advisor_grant_one_call,
+                "job_id": prep_primary.job_id,
+                "request_key": historical_key,
+                "expected_ledger_revision": ledger_after_seed.ledger_revision,
+                "question": historical_question,
+                "dependency_files": ["src/lib.rs"],
+                "difficulty": "hard"
+            }),
+        ),
+        (
+            "different job_id",
+            json!({
+                "grant_id": advisor_grant_one_call,
+                "job_id": prep_other.job_id,
+                "request_key": historical_key,
+                "question": historical_question,
+                "dependency_files": ["src/lib.rs"],
+                "difficulty": "hard"
+            }),
+        ),
+        (
+            "different advisor-only grant_id",
+            json!({
+                "grant_id": advisor_grant_alt,
+                "job_id": prep_primary.job_id,
+                "request_key": historical_key,
+                "question": historical_question,
+                "dependency_files": ["src/lib.rs"],
+                "difficulty": "hard"
+            }),
+        ),
+        (
+            "different legacy grant_id with historical key",
+            json!({
+                "grant_id": legacy_grant,
+                "job_id": prep_primary.job_id,
+                "request_key": historical_key,
+                "question": historical_question,
+                "dependency_files": ["src/lib.rs"],
+                "difficulty": "hard"
+            }),
+        ),
+        (
+            "new request_key with identical payload on advisor-only grant",
+            json!({
+                "grant_id": advisor_grant,
+                "job_id": prep_primary.job_id,
+                "request_key": "req-new-key-must-refuse",
+                "question": historical_question,
+                "dependency_files": ["src/lib.rs"],
+                "difficulty": "hard"
+            }),
+        ),
+    ];
+    for (label, args) in mutation_cases {
+        let err_code = invoke_mcp_err_code(&mcp, "consult_architect", args).await;
+        assert_eq!(
+            err_code, "validation_failed",
+            "expected validation_failed for `{label}`, got `{err_code}`"
+        );
+    }
+
+    let foreign_gateway = CoworkerPlanningGateway::new(
+        &fixture.state_dir,
+        &fixture.registry_dir,
+        &fixture.plans_dir,
+        &fixture.authority_dir,
+        &fixture.sessions_dir,
+        &fixture.binding_id,
+        "0196ed00-0000-7000-8000-0000000000b9",
+    )
+    .expect("create foreign-thread gateway")
+    .with_sibling_anchor_exe(PathBuf::from(env!("CARGO_BIN_EXE_threadlane-flow")));
+    let foreign_err = foreign_gateway
+        .consult_architect(&ConsultArchitectParams {
+            grant_id: advisor_grant_one_call,
+            job_id: prep_primary.job_id.clone(),
+            request_key: historical_key.to_string(),
+            expected_ledger_revision: None,
+            question: historical_question.to_string(),
+            dependency_files: vec!["src/lib.rs".to_string()],
+            prior_advice_ids: Vec::new(),
+            difficulty: Some(Difficulty::Hard),
+        })
+        .await
+        .expect_err("foreign thread must not replay persisted legacy architect command");
+    assert!(
+        [
+            NativeErrorCode::SecurityViolation.as_str(),
+            NativeErrorCode::ValidationFailed.as_str(),
+        ]
+        .contains(&foreign_err.code()),
+        "foreign thread replay must fail closed, got {:?}",
+        foreign_err.code()
+    );
+    assert_eq!(
+        provider_invocation_count(&fixture.worker_marker),
+        calls_after_seed
+    );
+
+    // 7. An unconfirmed (`Queued`) legacy `Architect` command on an active advisor-only grant must
+    //    never be launched by `consult_architect` (no new provider effect or reservation).
+    let active_advisor_grant_record = wf_store
+        .read_binding_ledger(&fixture.binding_id)
+        .expect("read workflow ledger before queued seed")
+        .planning_grants
+        .into_iter()
+        .find(|g| g.grant_id == advisor_grant)
+        .expect("active advisor grant");
+    let reservations_before_queued = active_advisor_grant_record.reservations.len();
+    let queued_key = "req-unconfirmed-queued-architect-on-advisor";
+    let queued_question = "Unconfirmed queued architect command must not launch";
+    let queued_cmd = cmd_store
+        .enqueue_command(&EnqueuePlanningCommandRequest::from_architect(
+            RunArchitectAdviceRequest {
+                binding_id: fixture.binding_id.clone(),
+                thread_uuid: THREAD_UUID.to_string(),
+                grant_id: advisor_grant.clone(),
+                request_key: queued_key.to_string(),
+                expected_ledger_revision: None,
+                difficulty: Some(Difficulty::Hard),
+                context_dependencies: ArchitectContextDependencies {
+                    project_base: prep_primary.project_base,
+                    work_brief_digest: prep_primary.work_brief_digest,
+                    plan_digest: None,
+                    policy_digest: active_advisor_grant_record.policy_digest,
+                    dependency_file_blobs: dep_blobs,
+                    interface_ownership_digests: BTreeMap::new(),
+                    accepted_predecessor_trees: BTreeMap::new(),
+                },
+                question_summary: queued_question.to_string(),
+                prior_advice_context: Vec::new(),
+                accept_into_brief: false,
+                current_time_ms: current_wall_clock_ms().expect("wall clock"),
+            },
+        ))
+        .expect("seed queued architect command");
+    assert_eq!(queued_cmd.status, PlanningCommandStatus::Queued);
+
+    let (queued_err_code, queued_err_msg) = invoke_mcp_err_code_and_message(
+        &mcp,
+        "consult_architect",
+        json!({
+            "grant_id": advisor_grant,
+            "job_id": prep_primary.job_id,
+            "request_key": queued_key,
+            "question": queued_question,
+            "dependency_files": ["src/lib.rs"],
+            "difficulty": "hard"
+        }),
+    )
+    .await;
+    assert_eq!(queued_err_code, "validation_failed");
+    assert!(
+        queued_err_msg.contains("consult_advisor"),
+        "expected guidance to use consult_advisor for unconfirmed queued command, got: {queued_err_msg}"
+    );
+    assert_eq!(
+        provider_invocation_count(&fixture.worker_marker),
+        calls_after_seed
+    );
+    let queued_after = cmd_store
+        .get_command(&fixture.binding_id, THREAD_UUID, &queued_cmd.command_id)
+        .expect("read queued command after refusal")
+        .expect("queued command remains stored");
+    assert_eq!(queued_after.status, PlanningCommandStatus::Queued);
+    let reservations_after_queued = wf_store
+        .read_binding_ledger(&fixture.binding_id)
+        .expect("read workflow ledger after queued refusal")
+        .planning_grants
+        .into_iter()
+        .find(|g| g.grant_id == advisor_grant)
+        .expect("active advisor grant after queued refusal")
+        .reservations
+        .len();
+    assert_eq!(reservations_after_queued, reservations_before_queued);
+
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn consult_mixed_policy_explicit_role_rules_route_each_target_precisely() {
+    let mut fixture = GatewayFixture::start().await;
+    const MODEL_ID_LEGACY: &str = "model-argon-legacy";
+    const PROFILE_MIXED: &str = "profile-coworker-mixed";
+
+    let registry = RegistryStore::open(&fixture.registry_dir).expect("open gateway registry");
+    let rev = registry.snapshot().expect("registry snapshot").revision;
+    let s_model = registry
+        .apply(
+            rev,
+            RegistryChange::UpsertModel {
+                model: ModelDefinition {
+                    id: MODEL_ID_LEGACY.to_string(),
+                    tool_id: TOOL_ID.to_string(),
+                    label: "Gemini 4 Argon Legacy Target".to_string(),
+                    model_arg: "gemini-4-argon-high".to_string(),
+                    efforts: vec!["high".to_string()],
+                    allow_no_effort: false,
+                },
+            },
+        )
+        .expect("upsert legacy target model");
+    let s_profile = registry
+        .apply(
+            s_model.revision,
+            RegistryChange::UpsertProfile {
+                profile: WorkflowProfile {
+                    decision_advisor: None,
+                    id: PROFILE_MIXED.to_string(),
+                    name: "Mixed advisory policy profile".to_string(),
+                    assignments: vec![
+                        RoleAssignment {
+                            role: WorkflowRole::Orchestrator,
+                            difficulty: Some(Difficulty::Hard),
+                            choice: ModelChoice {
+                                model_id: MODEL_ID.to_string(),
+                                effort: Some("high".to_string()),
+                            },
+                        },
+                        RoleAssignment {
+                            role: WorkflowRole::Advisor,
+                            difficulty: Some(Difficulty::Hard),
+                            choice: ModelChoice {
+                                model_id: MODEL_ID.to_string(),
+                                effort: Some("high".to_string()),
+                            },
+                        },
+                        RoleAssignment {
+                            role: WorkflowRole::Architect,
+                            difficulty: Some(Difficulty::Medium),
+                            choice: ModelChoice {
+                                model_id: MODEL_ID_LEGACY.to_string(),
+                                effort: Some("high".to_string()),
+                            },
+                        },
+                        RoleAssignment {
+                            role: WorkflowRole::Coder,
+                            difficulty: Some(Difficulty::Hard),
+                            choice: ModelChoice {
+                                model_id: MODEL_ID.to_string(),
+                                effort: Some("high".to_string()),
+                            },
+                        },
+                    ],
+                },
+            },
+        )
+        .expect("upsert mixed advisory profile");
+    let registry_lock = fixture.registry_dir.join("registry.lock");
+    if registry_lock.exists() {
+        fs::remove_file(&registry_lock).expect("remove registry.lock");
+    }
+
+    let mixed_policy = ExecutionPolicy {
+        schema_version: EXECUTION_POLICY_SCHEMA_VERSION,
+        policy_id: "policy-gateway-mixed-advisory".to_string(),
+        allow_rules: vec![
+            PolicyAllowRule {
+                tool_id: TOOL_ID.to_string(),
+                model_id: MODEL_ID.to_string(),
+                efforts: vec!["high".to_string()],
+                allow_no_effort: false,
+                roles: vec![WorkflowRole::Orchestrator, WorkflowRole::Advisor],
+            },
+            PolicyAllowRule {
+                tool_id: TOOL_ID.to_string(),
+                model_id: MODEL_ID_LEGACY.to_string(),
+                efforts: vec!["high".to_string()],
+                allow_no_effort: false,
+                roles: vec![WorkflowRole::Architect],
+            },
+        ],
+    };
+    mixed_policy
+        .validate()
+        .expect("distinct-target explicit mixed policy must be valid");
+
+    let now_ms = current_wall_clock_ms().expect("wall clock");
+    let wf_store =
+        CoworkerWorkflowStore::new(&fixture.plans_dir).expect("open CoworkerWorkflowStore");
+    let mixed_grant = wf_store
+        .create_planning_grant(&CreatePlanningGrantRequest {
+            binding_id: fixture.binding_id.clone(),
+            thread_uuid: THREAD_UUID.to_string(),
+            request_key: "req-grant-mixed-advisory".to_string(),
+            expected_ledger_revision: None,
+            project_base: fixture.project_base.clone(),
+            profile_id: PROFILE_MIXED.to_string(),
+            registry_revision: s_profile.revision,
+            policy: mixed_policy,
+            capabilities: PlanningReadOnlyCapabilities::strict_read_only(),
+            budget: PlanningCallBudget {
+                max_total_calls: 6,
+                max_orchestrator_calls: 2,
+                max_architect_calls: 4,
+                max_timeout_ms_per_call: 60_000,
+                max_output_bytes_per_call: 65_536,
+            },
+            created_at_ms: now_ms.saturating_sub(5_000),
+            expires_at_ms: now_ms + 3_600_000,
+            operator_attested: true,
+        })
+        .expect("create mixed-policy planning grant")
+        .grant_id;
+
+    let mcp = fixture.enrolled_mcp();
+    let prep: PrepareWorkResponse = invoke_mcp_ok(
+        &mcp,
+        "prepare_work",
+        json!({
+            "grant_id": mixed_grant,
+            "request_key": "req-prep-mixed-advisory",
+            "summary": "Verify explicit mixed-policy rule precision",
+            "confirmed_requirements": ["Route each target strictly to its explicitly authorized role"]
+        }),
+    )
+    .await;
+
+    // 1. Wrong entrypoint for each target is refused with zero side effects.
+    let (arch_on_advisor_code, arch_on_advisor_msg) = invoke_mcp_err_code_and_message(
+        &mcp,
+        "consult_architect",
+        json!({
+            "grant_id": mixed_grant,
+            "job_id": prep.job_id,
+            "request_key": "req-mixed-arch-on-advisor-target",
+            "question": "Must refuse architect on advisor-only target rule",
+            "dependency_files": ["src/lib.rs"],
+            "difficulty": "hard"
+        }),
+    )
+    .await;
+    assert_eq!(arch_on_advisor_code, "validation_failed");
+    assert!(
+        arch_on_advisor_msg.contains("consult_advisor"),
+        "expected guidance to use consult_advisor, got: {arch_on_advisor_msg}"
+    );
+
+    let (adv_on_arch_code, adv_on_arch_msg) = invoke_mcp_err_code_and_message(
+        &mcp,
+        "consult_advisor",
+        json!({
+            "grant_id": mixed_grant,
+            "job_id": prep.job_id,
+            "request_key": "req-mixed-adv-on-arch-target",
+            "question": "Must refuse advisor on architect-only target rule",
+            "dependency_files": ["src/lib.rs"],
+            "difficulty": "medium"
+        }),
+    )
+    .await;
+    assert_eq!(adv_on_arch_code, "validation_failed");
+    assert!(
+        adv_on_arch_msg.contains("consult_architect"),
+        "expected guidance to use consult_architect, got: {adv_on_arch_msg}"
+    );
+
+    assert!(!planning_commands_dir(&fixture.plans_dir).exists());
+    assert!(!planning_artifacts_dir(&fixture.plans_dir).exists());
+    assert_eq!(provider_invocation_count(&fixture.worker_marker), 0);
+
+    // 2. Each explicitly authorized target succeeds with its exact role identity.
+    let advisor_args = json!({
+        "grant_id": mixed_grant,
+        "job_id": prep.job_id,
+        "request_key": "req-mixed-advisor-hard",
+        "question": "Canonical advisor target in mixed policy",
+        "dependency_files": ["src/lib.rs"],
+        "difficulty": "hard"
+    });
+    let advisor_submit: PlanningCommandSubmissionResponse =
+        invoke_mcp_ok(&mcp, "consult_advisor", advisor_args.clone()).await;
+    assert_eq!(advisor_submit.role, WorkflowRole::Advisor);
+    let advisor_detail = wait_for_command_completion(&mcp, &advisor_submit.command_id).await;
+    assert_eq!(
+        advisor_detail.status,
+        PlanningCommandStatus::Completed,
+        "mixed advisor detail did not complete cleanly: {}",
+        format_command_detail_context(&advisor_detail)
+    );
+    assert_eq!(advisor_detail.role, WorkflowRole::Advisor);
+    assert_eq!(advisor_detail.selected_choice.model_id, MODEL_ID);
+    assert_eq!(provider_invocation_count(&fixture.worker_marker), 1);
+
+    let architect_args = json!({
+        "grant_id": mixed_grant,
+        "job_id": prep.job_id,
+        "request_key": "req-mixed-architect-medium",
+        "question": "Explicit legacy architect target in mixed policy",
+        "dependency_files": ["src/lib.rs"],
+        "difficulty": "medium"
+    });
+    let architect_submit: PlanningCommandSubmissionResponse =
+        invoke_mcp_ok(&mcp, "consult_architect", architect_args.clone()).await;
+    assert_eq!(architect_submit.role, WorkflowRole::Architect);
+    let architect_detail = wait_for_command_completion(&mcp, &architect_submit.command_id).await;
+    assert_eq!(
+        architect_detail.status,
+        PlanningCommandStatus::Completed,
+        "mixed architect detail did not complete cleanly: {}",
+        format_command_detail_context(&architect_detail)
+    );
+    assert_eq!(architect_detail.role, WorkflowRole::Architect);
+    assert_eq!(architect_detail.selected_choice.model_id, MODEL_ID_LEGACY);
+    assert_eq!(provider_invocation_count(&fixture.worker_marker), 2);
+
+    // Exact replay of both returns immutable receipts without extra provider invocations.
+    let advisor_replay: PlanningCommandSubmissionResponse =
+        invoke_mcp_ok(&mcp, "consult_advisor", advisor_args).await;
+    assert_eq!(advisor_replay.command_id, advisor_submit.command_id);
+    assert_eq!(
+        advisor_replay.submission_status,
+        PlanningCommandStartStatus::AlreadyCompleted
+    );
+    assert!(!advisor_replay.launched);
+
+    let architect_replay: PlanningCommandSubmissionResponse =
+        invoke_mcp_ok(&mcp, "consult_architect", architect_args).await;
+    assert_eq!(architect_replay.command_id, architect_submit.command_id);
+    assert_eq!(
+        architect_replay.submission_status,
+        PlanningCommandStartStatus::AlreadyCompleted
+    );
+    assert!(!architect_replay.launched);
+    assert_eq!(provider_invocation_count(&fixture.worker_marker), 2);
+
+    fixture.shutdown().await;
+}

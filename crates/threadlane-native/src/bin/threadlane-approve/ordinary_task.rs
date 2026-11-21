@@ -6,6 +6,7 @@
 //! authoritative private preview flow. It never records authority, reserves execution, starts a
 //! worker, or silently recovers an unknown effect.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -13,10 +14,13 @@ use serde::Deserialize;
 use threadlane::SupervisorClient;
 use threadlane_authority::validation::{
     validate_canonical_thread_uuid, validate_executable_worker_instruction, validate_identifier,
-    validate_repository_and_base_commit, validate_revision, validate_worker_task_static,
-    validate_write_scope_entry_at_base_commit,
+    validate_repository_and_base_commit, validate_required_changed_paths_at_base_commit,
+    validate_revision, validate_worker_task_static, validate_write_scope_entry_at_base_commit,
 };
-use threadlane_authority::{resolve_and_validate_worker_executable, OperatorApprovalIntent};
+use threadlane_authority::{
+    resolve_and_validate_worker_executable, OperatorApprovalIntent, OperatorApprovalIntentV2,
+    AUTHORITY_REQUEST_V2_SCHEMA_VERSION,
+};
 use threadlane_native::open_workflow_stores;
 use threadlane_workers::ExecutionBudgets;
 use threadlane_workflow::{
@@ -26,7 +30,8 @@ use threadlane_workflow::{
 };
 
 use super::{
-    enforce_fixed_scope_on_request, load_stdin_json, prepare_operator_preview, verify_live_binding,
+    enforce_fixed_scope_on_request, load_stdin_json, optional_record_request,
+    prepare_operator_preview, prepare_operator_preview_v2, verify_live_binding,
     write_private_preview_file, write_stdout_json, CliError, ExplicitBudgets, FixedApprovalScope,
     PrivatePreviewReceipt, RecoveryContext, ValidatedStoreDirs,
 };
@@ -37,10 +42,10 @@ const RECEIPT_OUTCOME_UNKNOWN: &str = "the workflow plan or private preview may 
 const DRAFT_SAVED_PHASE: &str = "draft_saved";
 const PUBLISHED_PHASE: &str = "published";
 
-/// Strict stdin request accepted by the scoped single-task fast path.
+/// Strict stdin request accepted by the legacy `prepare-task` single-task fast path.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct PrepareTaskRequest<B = ExecutionBudgets> {
+struct PrepareTaskRequest {
     binding_id: String,
     thread_uuid: String,
     repository_path: PathBuf,
@@ -50,23 +55,61 @@ struct PrepareTaskRequest<B = ExecutionBudgets> {
     command_key: String,
     summary: String,
     task: PrepareTaskTask,
-    budgets: B,
+    budgets: ExecutionBudgets,
 }
 
-impl From<PrepareTaskRequest<ExplicitBudgets>> for PrepareTaskRequest {
-    fn from(request: PrepareTaskRequest<ExplicitBudgets>) -> Self {
-        Self {
-            binding_id: request.binding_id,
-            thread_uuid: request.thread_uuid,
-            repository_path: request.repository_path,
-            base_commit: request.base_commit,
-            profile_id: request.profile_id,
-            profile_revision: request.profile_revision,
-            command_key: request.command_key,
-            summary: request.summary,
-            task: request.task,
-            budgets: request.budgets.into(),
-        }
+/// Strict stdin request accepted by `prepare-task-exact`, requiring all five explicit budgets and
+/// supporting opt-in exact-file `task.required_changed_paths`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PrepareTaskExactRequest {
+    binding_id: String,
+    thread_uuid: String,
+    repository_path: PathBuf,
+    base_commit: String,
+    profile_id: String,
+    profile_revision: u64,
+    command_key: String,
+    summary: String,
+    task: PrepareTaskExactTask,
+    budgets: ExplicitBudgets,
+}
+
+impl PrepareTaskExactRequest {
+    fn into_parts(self) -> (PrepareTaskRequest, Option<Vec<String>>) {
+        let PrepareTaskExactTask {
+            id,
+            title,
+            instruction,
+            role,
+            difficulty,
+            depends_on,
+            allowed_write_paths,
+            required_changed_paths,
+        } = self.task;
+        (
+            PrepareTaskRequest {
+                binding_id: self.binding_id,
+                thread_uuid: self.thread_uuid,
+                repository_path: self.repository_path,
+                base_commit: self.base_commit,
+                profile_id: self.profile_id,
+                profile_revision: self.profile_revision,
+                command_key: self.command_key,
+                summary: self.summary,
+                task: PrepareTaskTask {
+                    id,
+                    title,
+                    instruction,
+                    role,
+                    difficulty,
+                    depends_on,
+                    allowed_write_paths,
+                },
+                budgets: self.budgets.into(),
+            },
+            required_changed_paths,
+        )
     }
 }
 
@@ -81,6 +124,22 @@ struct PrepareTaskTask {
     difficulty: Difficulty,
     depends_on: Vec<String>,
     allowed_write_paths: Vec<String>,
+}
+
+/// Strict single-task object accepted by `prepare-task-exact`, extending [`PrepareTaskTask`] with
+/// opt-in exact-file `required_changed_paths`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PrepareTaskExactTask {
+    id: String,
+    title: String,
+    instruction: String,
+    role: PrepareTaskRole,
+    difficulty: Difficulty,
+    depends_on: Vec<String>,
+    allowed_write_paths: Vec<String>,
+    #[serde(default)]
+    required_changed_paths: Option<Vec<String>>,
 }
 
 /// Narrow role input accepted only on the `prepare-task` stdin boundary.
@@ -138,12 +197,13 @@ pub(super) async fn run_prepare_task(
     fixed_scope: &FixedApprovalScope,
     exact_budgets: bool,
 ) -> Result<(), CliError> {
-    let request: PrepareTaskRequest = if exact_budgets {
-        let explicit: PrepareTaskRequest<ExplicitBudgets> = load_stdin_json()?;
-        explicit.into()
-    } else {
-        load_stdin_json()?
-    };
+    let (request, required_changed_paths): (PrepareTaskRequest, Option<Vec<String>>) =
+        if exact_budgets {
+            let explicit: PrepareTaskExactRequest = load_stdin_json()?;
+            explicit.into_parts()
+        } else {
+            (load_stdin_json()?, None)
+        };
     let task = PlanTask::from(request.task.clone());
     let scope = prevalidate_request(dirs, fixed_scope, &request, &task)?;
 
@@ -164,10 +224,11 @@ pub(super) async fn run_prepare_task(
     )
     .map_err(|err| workflow_error(&err))?;
 
-    let validated_task_paths = prevalidate_compiled_task(
+    let (validated_task_paths, validated_required_paths) = prevalidate_compiled_task(
         &workflow,
         &request,
         &task,
+        required_changed_paths.as_deref(),
         &scope.canonical_repo,
         &scope.base_commit,
         dirs,
@@ -197,6 +258,7 @@ pub(super) async fn run_prepare_task(
         &scope,
         &workflow,
         &validated_task_paths,
+        validated_required_paths.as_deref(),
         &saved,
         &mut recovery,
     )
@@ -215,6 +277,7 @@ async fn finish_prepare_task(
     scope: &ValidatedRequestScope,
     workflow: &ScopedWorkflow,
     validated_task_paths: &[String],
+    validated_required_paths: Option<&[String]>,
     saved: &PlanSummary,
     recovery: &mut Option<RecoveryContext>,
 ) -> Result<(), CliError> {
@@ -246,7 +309,23 @@ async fn finish_prepare_task(
         budgets: request.budgets.clone(),
     };
 
-    let preview = prepare_operator_preview(dirs, Some(fixed_scope), intent).await?;
+    let preview = match validated_required_paths {
+        Some(required_paths) => {
+            let mut task_required_changed_paths = BTreeMap::new();
+            task_required_changed_paths.insert(task.id.clone(), required_paths.to_vec());
+            prepare_operator_preview_v2(
+                dirs,
+                Some(fixed_scope),
+                OperatorApprovalIntentV2 {
+                    schema_version: AUTHORITY_REQUEST_V2_SCHEMA_VERSION,
+                    intent,
+                    task_required_changed_paths,
+                },
+            )
+            .await?
+        }
+        None => prepare_operator_preview(dirs, Some(fixed_scope), intent).await?,
+    };
     validate_preview(
         &preview,
         request,
@@ -254,13 +333,16 @@ async fn finish_prepare_task(
         &scope.canonical_repo,
         &scope.base_commit,
         validated_task_paths,
+        validated_required_paths,
         &published_header,
     )?;
 
+    let record_request = optional_record_request(&preview)?;
     let (preview_path, directory) = write_private_preview_file(&preview)?;
     let receipt = PrivatePreviewReceipt {
         preview_path,
         preview,
+        record_request,
     };
 
     // The receipt is serialized before stdout so an oversized or failed response leaves no
@@ -343,16 +425,18 @@ fn prevalidate_request(
     })
 }
 
-/// Validates the single task compiles against the pinned registry revision and its write scopes
-/// and worker contract are executable at the base commit.
+/// Validates the single task compiles against the pinned registry revision and its write scopes,
+/// optional `required_changed_paths`, and worker contract are executable at the base commit.
+#[allow(clippy::too_many_arguments)]
 fn prevalidate_compiled_task(
     workflow: &ScopedWorkflow,
     request: &PrepareTaskRequest,
     task: &PlanTask,
+    required_changed_paths: Option<&[String]>,
     canonical_repo: &Path,
     base_commit: &str,
     dirs: &ValidatedStoreDirs,
-) -> Result<Vec<String>, CliError> {
+) -> Result<(Vec<String>, Option<Vec<String>>), CliError> {
     let snapshot = workflow
         .registry()
         .snapshot()
@@ -408,6 +492,19 @@ fn prevalidate_compiled_task(
             .map_err(|err| CliError::from_authority(&err))?,
         );
     }
+    let validated_required_paths = match required_changed_paths {
+        Some(raw_required) => Some(
+            validate_required_changed_paths_at_base_commit(
+                &compiled_task.id,
+                raw_required,
+                &validated_task_paths,
+                canonical_repo,
+                base_commit,
+            )
+            .map_err(|err| CliError::from_authority(&err))?,
+        ),
+        None => None,
+    };
     validate_executable_worker_instruction(&compiled_task.instruction)
         .map_err(|err| CliError::from_authority(&err))?;
 
@@ -432,7 +529,7 @@ fn prevalidate_compiled_task(
     )
     .map_err(|err| CliError::from_authority(&err))?;
 
-    Ok(validated_task_paths)
+    Ok((validated_task_paths, validated_required_paths))
 }
 
 /// Verifies the persisted original draft for this command key exactly matches the request before
@@ -529,6 +626,7 @@ fn validate_preview(
     canonical_repo: &Path,
     base_commit: &str,
     validated_task_paths: &[String],
+    validated_required_paths: Option<&[String]>,
     published_header: &PlanSummary,
 ) -> Result<(), CliError> {
     let preview_request = &preview.request;
@@ -556,6 +654,7 @@ fn validate_preview(
         || approved_task.role != WorkflowRole::Coder
         || !approved_task.depends_on.is_empty()
         || approved_task.allowed_write_paths.as_slice() != validated_task_paths
+        || approved_task.required_changed_paths.as_deref() != validated_required_paths
     {
         return Err(original_mismatch_error());
     }

@@ -18,6 +18,7 @@
 //! Callers must use [`recheck_delivery_for_verified_task`] immediately before recording `Done`
 //! and must treat a mismatch as a changed delivery rather than silently choosing an old result.
 
+use std::cmp::Ordering;
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::Read;
@@ -29,7 +30,7 @@ use threadlane::{WorkerAcceptanceState, WorkerOutcomeSummary, WorkerSnapshot, Wo
 use threadlane_authority::{ApprovalRecord, ApprovedTaskRecord};
 use threadlane_workers::{
     ensure_worktree_job_inactive_readonly, evaluate_diff_gate, is_commit_ancestor,
-    load_and_verify_manifest, resolve_exact_commit_sha, run_sanitized_git,
+    is_control_config_path, load_and_verify_manifest, resolve_exact_commit_sha, run_sanitized_git,
     validate_exact_40_hex_sha, validate_repo_relative_path, validate_simple_identifier,
     ChangedPathEntry, CleanupRefusalReason, DiffChangeKind, DiffGateReport, WorkAcceptanceState,
     WorkerError, WorkerProvider, WorktreeKind, CHECKOUTS_SUBDIR, DEFAULT_GIT_COMMAND_TIMEOUT_MS,
@@ -116,6 +117,121 @@ pub struct DeliveryInspection {
     pub changed_path_set_digest: String,
     /// Total bytes read from present changed regular files.
     pub content_bytes: u64,
+}
+
+/// Fixed physical presence of a changed path in the v1 delivery digest manifest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliveryPathPresence {
+    /// Existing regular non-symlink file whose bytes were read and hashed.
+    RegularFile,
+    /// Tracked file deleted from the checkout.
+    Deleted,
+}
+
+impl DeliveryPathPresence {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::RegularFile => "regular_file",
+            Self::Deleted => "deleted",
+        }
+    }
+}
+
+/// Ordered per-path physical evidence bound into the immutable v1 host delivery digest.
+///
+/// Carries path identity, change kind, optional rename or copy origin, physical presence,
+/// Unix regular-file executable bit, exact byte length, and lowercase SHA-256 content hash.
+/// Never carries raw file bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeliveryChangedPathEvidence {
+    /// Clean repository-relative path (destination path for renames or copies).
+    pub path: String,
+    /// Optional clean repository-relative origin path for renames or copies.
+    pub orig_path: Option<String>,
+    /// Git change classification for this path.
+    pub change_kind: DiffChangeKind,
+    /// Physical presence of the path (`RegularFile` or `Deleted`).
+    pub presence: DeliveryPathPresence,
+    /// Regular-file executable mode bit (`mode & 0o111 != 0` on Unix; `None` for deleted files or non-Unix).
+    pub executable: Option<bool>,
+    /// Exact byte size (`0` for deleted files).
+    pub size_bytes: u64,
+    /// Lowercase 64-hex SHA-256 of the exact regular-file bytes (`None` for deleted files).
+    pub content_sha256: Option<String>,
+}
+
+/// Deterministic v1 delivery digests derived from exact ordered changed-path evidence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeliveryEvidenceDigests {
+    /// Finite physical delivery category derived from the changed-path list.
+    pub delivery_kind: DeliveryKind,
+    /// Exact v1 SHA-256 digest over delivery identity and ordered changed-path evidence.
+    pub delivery_digest: String,
+    /// Exact v1 SHA-256 digest over ordered changed-path identities.
+    pub changed_path_set_digest: String,
+    /// Number of changed paths bound into the digest.
+    pub changed_paths_count: u32,
+    /// Total byte length across present changed regular files.
+    pub content_bytes: u64,
+}
+
+/// Computes the deterministic v1 delivery digests for `inspection`'s immutable task and worktree
+/// identity together with the supplied canonically ordered changed-path evidence.
+///
+/// Entries must be strictly ordered by `(path, orig_path, change_kind)` with unique valid
+/// repository-relative paths and consistent presence, origin, size, and SHA-256 invariants.
+/// Unsupported or malformed entries are refused rather than skipped.
+pub fn compute_delivery_digests_for_inspection(
+    inspection: &DeliveryInspection,
+    entries: &[DeliveryChangedPathEvidence],
+) -> Result<DeliveryEvidenceDigests, HostError> {
+    let (encoded, total_content_bytes) = validate_and_encode_path_evidence(entries)?;
+    let run_worktree_tag = compact_worktree_tag(&inspection.run_id, "r");
+    let task_worktree_tag = compact_worktree_tag(&inspection.worker_id, "w");
+    let header = DeliveryDigestHeader {
+        approval_id: &inspection.approval_id,
+        subject_digest: &inspection.subject_digest,
+        binding_id: &inspection.binding_id,
+        thread_uuid: &inspection.thread_uuid,
+        session_binding_id: &inspection.session_binding_id,
+        task_id: &inspection.task_id,
+        task_digest: &inspection.task_digest,
+        profile_id: &inspection.profile_id,
+        profile_digest: &inspection.profile_digest,
+        command_key: &inspection.command_key,
+        run_id: &inspection.run_id,
+        worker_id: &inspection.worker_id,
+        run_worktree_tag: &run_worktree_tag,
+        task_worktree_tag: &task_worktree_tag,
+        worktree_id: &inspection.worktree_id,
+        base_commit: &inspection.base_commit,
+        head_commit: &inspection.head_commit,
+    };
+    encode_delivery_digests(&header, &encoded, total_content_bytes)
+}
+
+/// Verifies that exact ordered changed-path evidence matches an immutable v1
+/// [`DeliveryInspection`] receipt (`delivery_kind`, `changed_paths_count`, `content_bytes`,
+/// `changed_path_set_digest`, and `delivery_digest`).
+pub fn verify_delivery_inspection_evidence(
+    inspection: &DeliveryInspection,
+    entries: &[DeliveryChangedPathEvidence],
+) -> Result<(), HostError> {
+    let computed = compute_delivery_digests_for_inspection(inspection, entries)?;
+    if inspection.delivery_kind != computed.delivery_kind
+        || inspection.changed_paths_count != computed.changed_paths_count
+        || inspection.content_bytes != computed.content_bytes
+        || inspection.changed_path_set_digest != computed.changed_path_set_digest
+        || inspection.delivery_digest != computed.delivery_digest
+    {
+        return Err(HostError::SecurityViolation {
+            path: "task-delivery".to_string(),
+            reason: "changed-path evidence does not match the immutable v1 host delivery digest"
+                .to_string(),
+        });
+    }
+    Ok(())
 }
 
 /// Recomputes the physical delivery and confirms it still equals a prior inspection receipt.
@@ -682,52 +798,156 @@ struct ResultDigestEncoding<'a> {
     outcome: TerminalOutcomeEncoding,
 }
 
-fn capture_delivery(
-    context: &VerifiedDeliveryContext<'_>,
-) -> Result<DeliveryInspection, HostError> {
-    let delivery_kind = if context.diff_gate.changed_paths.is_empty() {
+struct DeliveryDigestHeader<'a> {
+    approval_id: &'a str,
+    subject_digest: &'a str,
+    binding_id: &'a str,
+    thread_uuid: &'a str,
+    session_binding_id: &'a str,
+    task_id: &'a str,
+    task_digest: &'a str,
+    profile_id: &'a str,
+    profile_digest: &'a str,
+    command_key: &'a str,
+    run_id: &'a str,
+    worker_id: &'a str,
+    run_worktree_tag: &'a str,
+    task_worktree_tag: &'a str,
+    worktree_id: &'a str,
+    base_commit: &'a str,
+    head_commit: &'a str,
+}
+
+fn cmp_evidence_key(left: &DeliveryPathEvidence, right: &DeliveryPathEvidence) -> Ordering {
+    left.path
+        .cmp(&right.path)
+        .then_with(|| left.orig_path.cmp(&right.orig_path))
+        .then_with(|| left.change_kind.cmp(&right.change_kind))
+}
+
+fn validate_and_encode_path_evidence(
+    entries: &[DeliveryChangedPathEvidence],
+) -> Result<(Vec<DeliveryPathEvidence>, u64), HostError> {
+    if entries.len() > MAX_DELIVERY_CHANGED_PATHS {
+        return Err(invalid_delivery(
+            "delivery changed-path count exceeded the bounded limit",
+        ));
+    }
+    let mut total_content_bytes = 0u64;
+    let mut encoded: Vec<DeliveryPathEvidence> = Vec::with_capacity(entries.len());
+    for entry in entries {
+        validate_repo_relative_path(&entry.path, "changed path")
+            .map_err(|_| invalid_delivery("delivery contains an invalid relative changed path"))?;
+        if is_control_config_path(&entry.path) {
+            return Err(invalid_delivery(
+                "delivery changed path targets protected control metadata",
+            ));
+        }
+        if let Some(orig_path) = entry.orig_path.as_deref() {
+            validate_repo_relative_path(orig_path, "changed original path").map_err(|_| {
+                invalid_delivery("delivery contains an invalid relative original path")
+            })?;
+            if is_control_config_path(orig_path) {
+                return Err(invalid_delivery(
+                    "delivery original path targets protected control metadata",
+                ));
+            }
+        }
+        let expects_orig_path = matches!(
+            entry.change_kind,
+            DiffChangeKind::Renamed | DiffChangeKind::Copied
+        );
+        if expects_orig_path != entry.orig_path.is_some() {
+            return Err(invalid_delivery(
+                "delivery changed-path origin does not match its change kind",
+            ));
+        }
+        match entry.presence {
+            DeliveryPathPresence::Deleted => {
+                if entry.change_kind != DiffChangeKind::Deleted
+                    || entry.executable.is_some()
+                    || entry.size_bytes != 0
+                    || entry.content_sha256.is_some()
+                {
+                    return Err(invalid_delivery(
+                        "deleted delivery path evidence has invalid metadata",
+                    ));
+                }
+            }
+            DeliveryPathPresence::RegularFile => {
+                if entry.change_kind == DiffChangeKind::Deleted {
+                    return Err(invalid_delivery(
+                        "regular-file delivery path evidence cannot have deleted change kind",
+                    ));
+                }
+                let Some(content_sha256) = entry.content_sha256.as_deref() else {
+                    return Err(invalid_delivery(
+                        "regular-file delivery path evidence is missing content SHA-256",
+                    ));
+                };
+                validate_hex_digest("content_sha256", content_sha256)?;
+                total_content_bytes = total_content_bytes
+                    .checked_add(entry.size_bytes)
+                    .filter(|total| *total <= MAX_DELIVERY_CONTENT_BYTES)
+                    .ok_or_else(|| {
+                        invalid_delivery("delivery content exceeded the bounded total byte budget")
+                    })?;
+            }
+        }
+        let current = DeliveryPathEvidence {
+            path: entry.path.clone(),
+            orig_path: entry.orig_path.clone(),
+            change_kind: entry.change_kind,
+            presence: entry.presence.as_str(),
+            executable: entry.executable,
+            size_bytes: entry.size_bytes,
+            content_sha256: entry.content_sha256.clone(),
+        };
+        if let Some(previous) = encoded.last() {
+            if previous.path == current.path
+                || cmp_evidence_key(previous, &current) != Ordering::Less
+            {
+                return Err(invalid_delivery(
+                    "delivery changed-path evidence must be unique and canonically ordered",
+                ));
+            }
+        }
+        encoded.push(current);
+    }
+    Ok((encoded, total_content_bytes))
+}
+
+fn encode_delivery_digests(
+    header: &DeliveryDigestHeader<'_>,
+    paths: &[DeliveryPathEvidence],
+    total_content_bytes: u64,
+) -> Result<DeliveryEvidenceDigests, HostError> {
+    let delivery_kind = if paths.is_empty() {
         DeliveryKind::NoChanges
     } else {
         DeliveryKind::Patch
     };
-
-    let mut total_content_bytes = 0u64;
-    let mut paths = Vec::with_capacity(context.diff_gate.changed_paths.len());
-    for entry in &context.diff_gate.changed_paths {
-        paths.push(capture_changed_path(
-            &context.canonical_checkout,
-            entry,
-            &mut total_content_bytes,
-        )?);
-    }
-    paths.sort_by(|left, right| {
-        left.path
-            .cmp(&right.path)
-            .then_with(|| left.orig_path.cmp(&right.orig_path))
-            .then_with(|| left.change_kind.cmp(&right.change_kind))
-    });
-
     let delivery_encoding = DeliveryDigestEncoding {
         schema: DELIVERY_DIGEST_SCHEMA,
-        approval_id: &context.record.approval_id,
-        subject_digest: &context.record.subject_digest,
-        binding_id: &context.record.binding_id,
-        thread_uuid: &context.record.thread_uuid,
-        session_binding_id: &context.snapshot.session_binding_id,
-        task_id: &context.task.task_id,
-        task_digest: &context.task.task_digest,
-        profile_id: &context.worker.profile_id,
-        profile_digest: &context.worker.profile_digest,
-        command_key: context.task.command_key.as_deref().unwrap_or(""),
-        run_id: &context.worker.run_id,
-        worker_id: &context.worker.worker_id,
-        run_worktree_tag: &context.expected_run_tag,
-        task_worktree_tag: &context.expected_task_tag,
-        worktree_id: &context.worktree_id,
-        base_commit: &context.expected_base_commit,
-        head_commit: &context.head_commit,
+        approval_id: header.approval_id,
+        subject_digest: header.subject_digest,
+        binding_id: header.binding_id,
+        thread_uuid: header.thread_uuid,
+        session_binding_id: header.session_binding_id,
+        task_id: header.task_id,
+        task_digest: header.task_digest,
+        profile_id: header.profile_id,
+        profile_digest: header.profile_digest,
+        command_key: header.command_key,
+        run_id: header.run_id,
+        worker_id: header.worker_id,
+        run_worktree_tag: header.run_worktree_tag,
+        task_worktree_tag: header.task_worktree_tag,
+        worktree_id: header.worktree_id,
+        base_commit: header.base_commit,
+        head_commit: header.head_commit,
         delivery_kind,
-        changed_paths: &paths,
+        changed_paths: paths,
     };
     let delivery_digest = canonical_json_digest(&delivery_encoding)?;
 
@@ -746,6 +966,57 @@ fn capture_delivery(
         paths: path_identities,
     };
     let changed_path_set_digest = canonical_json_digest(&path_set_encoding)?;
+
+    let changed_paths_count = u32::try_from(paths.len())
+        .map_err(|_| invalid_delivery("delivery changed-path count overflowed its bound"))?;
+    Ok(DeliveryEvidenceDigests {
+        delivery_kind,
+        delivery_digest,
+        changed_path_set_digest,
+        changed_paths_count,
+        content_bytes: total_content_bytes,
+    })
+}
+
+fn capture_delivery(
+    context: &VerifiedDeliveryContext<'_>,
+) -> Result<DeliveryInspection, HostError> {
+    let mut total_content_bytes = 0u64;
+    let mut paths = Vec::with_capacity(context.diff_gate.changed_paths.len());
+    for entry in &context.diff_gate.changed_paths {
+        paths.push(capture_changed_path(
+            &context.canonical_checkout,
+            entry,
+            &mut total_content_bytes,
+        )?);
+    }
+    paths.sort_by(cmp_evidence_key);
+    if paths.windows(2).any(|pair| pair[0].path == pair[1].path) {
+        return Err(invalid_delivery(
+            "delivery contains duplicate changed path entries",
+        ));
+    }
+
+    let header = DeliveryDigestHeader {
+        approval_id: &context.record.approval_id,
+        subject_digest: &context.record.subject_digest,
+        binding_id: &context.record.binding_id,
+        thread_uuid: &context.record.thread_uuid,
+        session_binding_id: &context.snapshot.session_binding_id,
+        task_id: &context.task.task_id,
+        task_digest: &context.task.task_digest,
+        profile_id: &context.worker.profile_id,
+        profile_digest: &context.worker.profile_digest,
+        command_key: context.task.command_key.as_deref().unwrap_or(""),
+        run_id: &context.worker.run_id,
+        worker_id: &context.worker.worker_id,
+        run_worktree_tag: &context.expected_run_tag,
+        task_worktree_tag: &context.expected_task_tag,
+        worktree_id: &context.worktree_id,
+        base_commit: &context.expected_base_commit,
+        head_commit: &context.head_commit,
+    };
+    let digests = encode_delivery_digests(&header, &paths, total_content_bytes)?;
 
     let outcome =
         context.worker.outcome.as_ref().ok_or_else(|| {
@@ -794,8 +1065,6 @@ fn capture_delivery(
     };
     let result_digest = canonical_json_digest(&result_encoding)?;
 
-    let changed_paths_count = u32::try_from(paths.len())
-        .map_err(|_| invalid_delivery("delivery changed-path count overflowed its bound"))?;
     Ok(DeliveryInspection {
         approval_id: context.record.approval_id.clone(),
         subject_digest: context.record.subject_digest.clone(),
@@ -812,12 +1081,12 @@ fn capture_delivery(
         worktree_id: context.worktree_id.clone(),
         base_commit: context.expected_base_commit.clone(),
         head_commit: context.head_commit.clone(),
-        delivery_kind,
-        delivery_digest,
+        delivery_kind: digests.delivery_kind,
+        delivery_digest: digests.delivery_digest,
         result_digest,
-        changed_paths_count,
-        changed_path_set_digest,
-        content_bytes: total_content_bytes,
+        changed_paths_count: digests.changed_paths_count,
+        changed_path_set_digest: digests.changed_path_set_digest,
+        content_bytes: digests.content_bytes,
     })
 }
 
@@ -892,7 +1161,10 @@ fn capture_changed_path(
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        if opened_metadata.dev() != metadata.dev() || opened_metadata.ino() != metadata.ino() {
+        if opened_metadata.dev() != metadata.dev()
+            || opened_metadata.ino() != metadata.ino()
+            || opened_metadata.mode() != metadata.mode()
+        {
             return Err(invalid_delivery(
                 "delivery file identity changed during read-only inspection",
             ));
@@ -919,7 +1191,10 @@ fn capture_changed_path(
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        if after.dev() != metadata.dev() || after.ino() != metadata.ino() {
+        if after.dev() != metadata.dev()
+            || after.ino() != metadata.ino()
+            || after.mode() != opened_metadata.mode()
+        {
             return Err(invalid_delivery(
                 "delivery file identity changed during read-only inspection",
             ));
@@ -1257,6 +1532,7 @@ mod tests {
             file_permissions: Some(WorkerFilePermissions::TaskFiles),
             depends_on: Vec::new(),
             allowed_write_paths: vec!["src/".to_string()],
+            required_changed_paths: None,
             task_digest: sha256_hex(b"compiled-delivery-task"),
             profile_id: Some("profile-worker-delivery".to_string()),
             command_key: Some("cmd-delivery-fixture".to_string()),
@@ -1902,5 +2178,253 @@ mod tests {
             .expect("binding")
             .execution_base_commit = "2222222222222222222222222222222222222222".to_string();
         assert!(fixture.inspect().is_err());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn delivery_evidence_manifest_matches_live_inspection_and_rejects_equal_size_or_identity_mismatches(
+    ) {
+        let mut fixture = DeliveryFixture::new();
+        let no_changes = fixture.inspect().expect("inspect no-changes delivery");
+        verify_delivery_inspection_evidence(&no_changes, &[])
+            .expect("empty evidence must match NoChanges v1 digest");
+
+        let lib_updated = b"pub fn alpha() -> u32 { 2 }\n";
+        let lib_same_len_diff = b"pub fn alpha() -> u32 { 9 }\n";
+        assert_eq!(lib_updated.len(), lib_same_len_diff.len());
+        let new_bytes = b"pub fn new_helper() -> bool { true }\n";
+
+        fixture.apply_patch();
+        fs::set_permissions(
+            fixture.checkout.join("src/new.rs"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .expect("chmod executable untracked file");
+        fixture.refresh_terminal_snapshot();
+        let patch = fixture.inspect().expect("inspect patched delivery");
+
+        let valid_entries = vec![
+            DeliveryChangedPathEvidence {
+                path: "src/extra.rs".to_string(),
+                orig_path: None,
+                change_kind: DiffChangeKind::Deleted,
+                presence: DeliveryPathPresence::Deleted,
+                executable: None,
+                size_bytes: 0,
+                content_sha256: None,
+            },
+            DeliveryChangedPathEvidence {
+                path: "src/lib.rs".to_string(),
+                orig_path: None,
+                change_kind: DiffChangeKind::Modified,
+                presence: DeliveryPathPresence::RegularFile,
+                executable: Some(false),
+                size_bytes: lib_updated.len() as u64,
+                content_sha256: Some(sha256_hex(lib_updated)),
+            },
+            DeliveryChangedPathEvidence {
+                path: "src/new.rs".to_string(),
+                orig_path: None,
+                change_kind: DiffChangeKind::Untracked,
+                presence: DeliveryPathPresence::RegularFile,
+                executable: Some(true),
+                size_bytes: new_bytes.len() as u64,
+                content_sha256: Some(sha256_hex(new_bytes)),
+            },
+        ];
+        verify_delivery_inspection_evidence(&patch, &valid_entries)
+            .expect("exact ordered changed-path evidence must match live v1 delivery digest");
+        assert!(matches!(
+            verify_delivery_inspection_evidence(&no_changes, &valid_entries),
+            Err(HostError::SecurityViolation { .. })
+        ));
+
+        // Equal file count and equal total size, different content hash.
+        let mut diff_content = valid_entries.clone();
+        diff_content[1].content_sha256 = Some(sha256_hex(lib_same_len_diff));
+        assert!(matches!(
+            verify_delivery_inspection_evidence(&patch, &diff_content),
+            Err(HostError::SecurityViolation { .. })
+        ));
+
+        // Equal file count and equal total size, different path identity (identical content).
+        let mut diff_path = valid_entries.clone();
+        diff_path[2].path = "src/oth.rs".to_string();
+        assert!(matches!(
+            verify_delivery_inspection_evidence(&patch, &diff_path),
+            Err(HostError::SecurityViolation { .. })
+        ));
+
+        // Equal file count and equal total size, different change kind.
+        let mut diff_kind = valid_entries.clone();
+        diff_kind[2].change_kind = DiffChangeKind::Added;
+        assert!(matches!(
+            verify_delivery_inspection_evidence(&patch, &diff_kind),
+            Err(HostError::SecurityViolation { .. })
+        ));
+
+        // Equal file count and equal total size, different regular executable bit.
+        let mut diff_exec_false = valid_entries.clone();
+        diff_exec_false[2].executable = Some(false);
+        assert!(matches!(
+            verify_delivery_inspection_evidence(&patch, &diff_exec_false),
+            Err(HostError::SecurityViolation { .. })
+        ));
+        let mut diff_exec_none = valid_entries.clone();
+        diff_exec_none[2].executable = None;
+        assert!(matches!(
+            verify_delivery_inspection_evidence(&patch, &diff_exec_none),
+            Err(HostError::SecurityViolation { .. })
+        ));
+
+        // Unsorted or duplicate entries must fail validation rather than silently reordering/dropping.
+        let mut unsorted = valid_entries.clone();
+        unsorted.swap(0, 1);
+        assert!(matches!(
+            verify_delivery_inspection_evidence(&patch, &unsorted),
+            Err(HostError::Validation { .. })
+        ));
+        let mut duplicate = valid_entries.clone();
+        duplicate[1].path = duplicate[0].path.clone();
+        assert!(matches!(
+            verify_delivery_inspection_evidence(&patch, &duplicate),
+            Err(HostError::Validation { .. })
+        ));
+
+        // Unsupported or malformed entries must fail validation, never be silently dropped.
+        let invalid_single_cases = [
+            DeliveryChangedPathEvidence {
+                path: "src/moved.rs".to_string(),
+                orig_path: None,
+                change_kind: DiffChangeKind::Renamed,
+                presence: DeliveryPathPresence::RegularFile,
+                executable: Some(false),
+                size_bytes: 1,
+                content_sha256: Some(sha256_hex(b"a")),
+            },
+            DeliveryChangedPathEvidence {
+                path: "src/lib.rs".to_string(),
+                orig_path: Some("src/old.rs".to_string()),
+                change_kind: DiffChangeKind::Modified,
+                presence: DeliveryPathPresence::RegularFile,
+                executable: Some(false),
+                size_bytes: 1,
+                content_sha256: Some(sha256_hex(b"a")),
+            },
+            DeliveryChangedPathEvidence {
+                path: "src/extra.rs".to_string(),
+                orig_path: None,
+                change_kind: DiffChangeKind::Deleted,
+                presence: DeliveryPathPresence::Deleted,
+                executable: None,
+                size_bytes: 1,
+                content_sha256: None,
+            },
+            DeliveryChangedPathEvidence {
+                path: "src/extra.rs".to_string(),
+                orig_path: None,
+                change_kind: DiffChangeKind::Deleted,
+                presence: DeliveryPathPresence::Deleted,
+                executable: Some(false),
+                size_bytes: 0,
+                content_sha256: None,
+            },
+            DeliveryChangedPathEvidence {
+                path: "src/extra.rs".to_string(),
+                orig_path: None,
+                change_kind: DiffChangeKind::Deleted,
+                presence: DeliveryPathPresence::Deleted,
+                executable: None,
+                size_bytes: 0,
+                content_sha256: Some(sha256_hex(b"")),
+            },
+            DeliveryChangedPathEvidence {
+                path: "src/extra.rs".to_string(),
+                orig_path: None,
+                change_kind: DiffChangeKind::Deleted,
+                presence: DeliveryPathPresence::RegularFile,
+                executable: Some(false),
+                size_bytes: 0,
+                content_sha256: Some(sha256_hex(b"")),
+            },
+            DeliveryChangedPathEvidence {
+                path: "src/lib.rs".to_string(),
+                orig_path: None,
+                change_kind: DiffChangeKind::Modified,
+                presence: DeliveryPathPresence::RegularFile,
+                executable: Some(false),
+                size_bytes: 1,
+                content_sha256: None,
+            },
+            DeliveryChangedPathEvidence {
+                path: "src/lib.rs".to_string(),
+                orig_path: None,
+                change_kind: DiffChangeKind::Modified,
+                presence: DeliveryPathPresence::RegularFile,
+                executable: Some(false),
+                size_bytes: 1,
+                content_sha256: Some("NOT-A-VALID-HEX-DIGEST".to_string()),
+            },
+            DeliveryChangedPathEvidence {
+                path: ".git/config".to_string(),
+                orig_path: None,
+                change_kind: DiffChangeKind::Modified,
+                presence: DeliveryPathPresence::RegularFile,
+                executable: Some(false),
+                size_bytes: 1,
+                content_sha256: Some(sha256_hex(b"a")),
+            },
+            DeliveryChangedPathEvidence {
+                path: "../escape.rs".to_string(),
+                orig_path: None,
+                change_kind: DiffChangeKind::Untracked,
+                presence: DeliveryPathPresence::RegularFile,
+                executable: Some(false),
+                size_bytes: 1,
+                content_sha256: Some(sha256_hex(b"a")),
+            },
+        ];
+        for invalid in invalid_single_cases {
+            assert!(
+                matches!(
+                    compute_delivery_digests_for_inspection(&patch, &[invalid]),
+                    Err(HostError::Validation { .. })
+                ),
+                "malformed or unsupported evidence entry must fail validation"
+            );
+        }
+
+        // Real Git rename binds exact origin path (`orig_path`) into v1 delivery digests.
+        let mut rename_fixture = DeliveryFixture::new();
+        run_sanitized_git(
+            &rename_fixture.checkout,
+            &["mv", "src/extra.rs", "src/moved.rs"],
+            DEFAULT_GIT_COMMAND_TIMEOUT_MS,
+        )
+        .expect("git mv fixture file");
+        rename_fixture.commit_patch();
+        rename_fixture.refresh_terminal_snapshot();
+        let renamed_inspection = rename_fixture.inspect().expect("inspect renamed delivery");
+        let extra_bytes = b"pub fn extra() {}\n";
+        let renamed_entry = DeliveryChangedPathEvidence {
+            path: "src/moved.rs".to_string(),
+            orig_path: Some("src/extra.rs".to_string()),
+            change_kind: DiffChangeKind::Renamed,
+            presence: DeliveryPathPresence::RegularFile,
+            executable: Some(false),
+            size_bytes: extra_bytes.len() as u64,
+            content_sha256: Some(sha256_hex(extra_bytes)),
+        };
+        verify_delivery_inspection_evidence(
+            &renamed_inspection,
+            std::slice::from_ref(&renamed_entry),
+        )
+        .expect("exact rename evidence including orig_path must match v1 digest");
+        let mut wrong_origin = renamed_entry;
+        wrong_origin.orig_path = Some("src/other.rs".to_string());
+        assert!(matches!(
+            verify_delivery_inspection_evidence(&renamed_inspection, &[wrong_origin]),
+            Err(HostError::SecurityViolation { .. })
+        ));
     }
 }

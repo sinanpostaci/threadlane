@@ -2225,3 +2225,668 @@ fn observation_request_project_path_round_trips_and_remains_wire_compatible_when
         );
     }
 }
+
+fn sample_worker_backlog_item(
+    binding_id: &str,
+    item_id: &str,
+    execution_ref: &str,
+) -> threadlane_core::BacklogItem {
+    threadlane_core::BacklogItem {
+        item_id: item_id.to_string(),
+        binding_id: binding_id.to_string(),
+        revision: 3,
+        title: "Execute scoped worker slice".to_string(),
+        acceptance_condition: "Live presence reflects newest valid evidence.".to_string(),
+        delivery_description: "Deliver verified worker evidence selection.".to_string(),
+        kind: threadlane_core::BacklogItemKind::Worker,
+        status: threadlane_core::BacklogStatus::Doing,
+        blocked_reason: None,
+        current_execution_ref: Some(execution_ref.to_string()),
+        completion_note: None,
+        completion_evidence: None,
+        completed_at_ms: None,
+        created_at_ms: 1_700_000_000_100,
+        updated_at_ms: 1_700_000_000_900,
+    }
+}
+
+fn sample_worker_presence(
+    item_id: &str,
+    execution_ref: &str,
+    sequence: Option<u64>,
+    sampled_at_ms: Option<i64>,
+    availability: WorkspaceBacklogPresenceAvailability,
+    freshness: WorkspaceBacklogPresenceFreshness,
+    live: bool,
+) -> WorkspaceBacklogWorkerPresence {
+    let max_age_i64 =
+        i64::try_from(MAX_WORKSPACE_BACKLOG_PRESENCE_SAMPLE_AGE_MS).expect("max age fits i64");
+    WorkspaceBacklogWorkerPresence {
+        item_id: item_id.to_string(),
+        execution_ref: execution_ref.to_string(),
+        approval_id: "apr_live_evidence".to_string(),
+        task_id: "tsk_live_evidence".to_string(),
+        run_id: "run_live_evidence".to_string(),
+        worker_id: "wrk_live_evidence".to_string(),
+        claim_id: Some("wcl_live_evidence".to_string()),
+        host_instance_id: Some("hst_live_evidence_1".to_string()),
+        invocation_id: Some("0196ed00-0000-7000-8000-000000000601".to_string()),
+        sequence,
+        availability,
+        freshness,
+        live,
+        sampled_at_ms,
+        sample_age_ms: sampled_at_ms.map(|_| 100),
+        max_sample_age_ms: MAX_WORKSPACE_BACKLOG_PRESENCE_SAMPLE_AGE_MS,
+        expires_at_ms: sampled_at_ms.map(|ts| ts.saturating_add(max_age_i64)),
+    }
+}
+
+#[test]
+fn chat_work_worker_presence_compares_ordering_and_identity_before_liveness() {
+    let identity = sample_identity();
+    let item_id = "blg_live_evidence";
+    let exec_ref = "wbe_live_evidence_1";
+    let item = sample_worker_backlog_item(&identity.binding_id, item_id, exec_ref);
+
+    let live_seq4 = sample_worker_presence(
+        item_id,
+        exec_ref,
+        Some(4),
+        Some(10_000),
+        WorkspaceBacklogPresenceAvailability::Live,
+        WorkspaceBacklogPresenceFreshness::Fresh,
+        true,
+    );
+    let non_live_seq5 = sample_worker_presence(
+        item_id,
+        exec_ref,
+        Some(5),
+        Some(10_200),
+        WorkspaceBacklogPresenceAvailability::NonLive,
+        WorkspaceBacklogPresenceFreshness::NotApplicable,
+        false,
+    );
+
+    // 1. Newest explicit non_live (sequence 5) beats still-fresh older live (sequence 4)
+    // regardless of input order and even when timestamps tie within the same epoch.
+    let mut non_live_seq5_same_ts = non_live_seq5.clone();
+    non_live_seq5_same_ts.sampled_at_ms = Some(10_000);
+    for (label, samples) in [
+        (
+            "live_then_stop",
+            vec![live_seq4.clone(), non_live_seq5.clone()],
+        ),
+        (
+            "stop_then_live",
+            vec![non_live_seq5.clone(), live_seq4.clone()],
+        ),
+        (
+            "same_ts_seq5_stop_wins",
+            vec![live_seq4.clone(), non_live_seq5_same_ts.clone()],
+        ),
+        (
+            "same_ts_seq5_stop_first",
+            vec![non_live_seq5_same_ts, live_seq4.clone()],
+        ),
+    ] {
+        let normalized = WorkspaceChatWork {
+            identity: identity.clone(),
+            availability: WorkspaceChatWorkAvailability::Available,
+            items: vec![item.clone()],
+            worker_presence: samples,
+            ..WorkspaceChatWork::default()
+        }
+        .normalized();
+        assert_eq!(normalized.worker_presence.len(), 1, "{label}");
+        let winner = &normalized.worker_presence[0];
+        assert_eq!(
+            winner.availability,
+            WorkspaceBacklogPresenceAvailability::NonLive,
+            "{label}"
+        );
+        assert_eq!(winner.sequence, Some(5), "{label}");
+        assert!(!winner.live, "{label}");
+        assert_eq!(normalized.bounds.presence_omitted, 1, "{label}");
+        assert_eq!(normalized.normalized(), normalized, "idempotent {label}");
+    }
+
+    // 2. Inverse ordering: older non_live or unavailable (seq 4) loses to newer live (seq 5)
+    // in either input order.
+    let non_live_seq4 = sample_worker_presence(
+        item_id,
+        exec_ref,
+        Some(4),
+        Some(10_000),
+        WorkspaceBacklogPresenceAvailability::NonLive,
+        WorkspaceBacklogPresenceFreshness::NotApplicable,
+        false,
+    );
+    let unavailable_seq4 = sample_worker_presence(
+        item_id,
+        exec_ref,
+        Some(4),
+        Some(10_000),
+        WorkspaceBacklogPresenceAvailability::Unavailable,
+        WorkspaceBacklogPresenceFreshness::NotApplicable,
+        false,
+    );
+    let live_seq5 = sample_worker_presence(
+        item_id,
+        exec_ref,
+        Some(5),
+        Some(10_200),
+        WorkspaceBacklogPresenceAvailability::Live,
+        WorkspaceBacklogPresenceFreshness::Fresh,
+        true,
+    );
+    for (label, samples) in [
+        (
+            "stop4_then_live5",
+            vec![non_live_seq4.clone(), live_seq5.clone()],
+        ),
+        ("live5_then_stop4", vec![live_seq5.clone(), non_live_seq4]),
+        (
+            "unavail4_then_live5",
+            vec![unavailable_seq4.clone(), live_seq5.clone()],
+        ),
+        (
+            "live5_then_unavail4",
+            vec![live_seq5.clone(), unavailable_seq4],
+        ),
+    ] {
+        let normalized = WorkspaceChatWork {
+            identity: identity.clone(),
+            availability: WorkspaceChatWorkAvailability::Available,
+            items: vec![item.clone()],
+            worker_presence: samples,
+            ..WorkspaceChatWork::default()
+        }
+        .normalized();
+        assert_eq!(normalized.worker_presence.len(), 1, "{label}");
+        let winner = &normalized.worker_presence[0];
+        assert_eq!(
+            winner.availability,
+            WorkspaceBacklogPresenceAvailability::Live,
+            "{label}"
+        );
+        assert_eq!(winner.sequence, Some(5), "{label}");
+        assert!(winner.live, "{label}");
+    }
+
+    // 3. Newer unknown/unavailable observation (seq 5) clears older live (seq 4) without
+    // falsely asserting live or explicit non_live.
+    let unavailable_seq5 = sample_worker_presence(
+        item_id,
+        exec_ref,
+        Some(5),
+        Some(10_200),
+        WorkspaceBacklogPresenceAvailability::Unavailable,
+        WorkspaceBacklogPresenceFreshness::NotApplicable,
+        false,
+    );
+    for samples in [
+        vec![live_seq4.clone(), unavailable_seq5.clone()],
+        vec![unavailable_seq5.clone(), live_seq4.clone()],
+    ] {
+        let normalized = WorkspaceChatWork {
+            identity: identity.clone(),
+            availability: WorkspaceChatWorkAvailability::Available,
+            items: vec![item.clone()],
+            worker_presence: samples,
+            ..WorkspaceChatWork::default()
+        }
+        .normalized();
+        assert_eq!(normalized.worker_presence.len(), 1);
+        assert_eq!(
+            normalized.worker_presence[0].availability,
+            WorkspaceBacklogPresenceAvailability::Unavailable
+        );
+        assert_eq!(normalized.worker_presence[0].sequence, Some(5));
+        assert!(!normalized.worker_presence[0].live);
+    }
+
+    // 4. Deterministic exact ordering tie (same epoch, sequence 4, sampled_at_ms 10_000):
+    // explicit non_live beats live in either order; fresh live beats stale in either order.
+    let non_live_tie = sample_worker_presence(
+        item_id,
+        exec_ref,
+        Some(4),
+        Some(10_000),
+        WorkspaceBacklogPresenceAvailability::NonLive,
+        WorkspaceBacklogPresenceFreshness::NotApplicable,
+        false,
+    );
+    for samples in [
+        vec![live_seq4.clone(), non_live_tie.clone()],
+        vec![non_live_tie, live_seq4.clone()],
+    ] {
+        let normalized = WorkspaceChatWork {
+            identity: identity.clone(),
+            availability: WorkspaceChatWorkAvailability::Available,
+            items: vec![item.clone()],
+            worker_presence: samples,
+            ..WorkspaceChatWork::default()
+        }
+        .normalized();
+        assert_eq!(
+            normalized.worker_presence[0].availability,
+            WorkspaceBacklogPresenceAvailability::NonLive
+        );
+        assert!(!normalized.worker_presence[0].live);
+    }
+
+    let stale_tie = sample_worker_presence(
+        item_id,
+        exec_ref,
+        Some(4),
+        Some(10_000),
+        WorkspaceBacklogPresenceAvailability::Live,
+        WorkspaceBacklogPresenceFreshness::Stale,
+        true,
+    );
+    for samples in [
+        vec![stale_tie.clone(), live_seq4.clone()],
+        vec![live_seq4.clone(), stale_tie],
+    ] {
+        let normalized = WorkspaceChatWork {
+            identity: identity.clone(),
+            availability: WorkspaceChatWorkAvailability::Available,
+            items: vec![item.clone()],
+            worker_presence: samples,
+            ..WorkspaceChatWork::default()
+        }
+        .normalized();
+        assert_eq!(
+            normalized.worker_presence[0].freshness,
+            WorkspaceBacklogPresenceFreshness::Fresh
+        );
+        assert!(normalized.worker_presence[0].live);
+    }
+
+    // 5. Restarted epoch with reset sequence=1 uses supported epoch semantics (wall-clock
+    // sampled_at_ms across epochs), while an older or untimestamped epoch cannot override it.
+    let mut restarted_stop = sample_worker_presence(
+        item_id,
+        exec_ref,
+        Some(1),
+        Some(10_300),
+        WorkspaceBacklogPresenceAvailability::NonLive,
+        WorkspaceBacklogPresenceFreshness::NotApplicable,
+        false,
+    );
+    restarted_stop.host_instance_id = Some("hst_live_evidence_2".to_string());
+    restarted_stop.invocation_id = Some("0196ed00-0000-7000-8000-000000000602".to_string());
+
+    let mut older_epoch_high_seq = live_seq4.clone();
+    older_epoch_high_seq.invocation_id = Some("0196ed00-0000-7000-8000-000000000600".to_string());
+    older_epoch_high_seq.sequence = Some(99);
+    older_epoch_high_seq.sampled_at_ms = Some(9_000);
+
+    for samples in [
+        vec![
+            live_seq4.clone(),
+            older_epoch_high_seq.clone(),
+            restarted_stop.clone(),
+        ],
+        vec![
+            restarted_stop.clone(),
+            older_epoch_high_seq,
+            live_seq4.clone(),
+        ],
+    ] {
+        let normalized = WorkspaceChatWork {
+            identity: identity.clone(),
+            availability: WorkspaceChatWorkAvailability::Available,
+            items: vec![item.clone()],
+            worker_presence: samples,
+            ..WorkspaceChatWork::default()
+        }
+        .normalized();
+        assert_eq!(normalized.worker_presence.len(), 1);
+        assert_eq!(
+            normalized.worker_presence[0].availability,
+            WorkspaceBacklogPresenceAvailability::NonLive
+        );
+        assert_eq!(normalized.worker_presence[0].sequence, Some(1));
+        assert_eq!(
+            normalized.worker_presence[0].host_instance_id.as_deref(),
+            Some("hst_live_evidence_2")
+        );
+        assert!(!normalized.worker_presence[0].live);
+    }
+
+    // Restarted epoch live with reset sequence=1 supersedes old epoch stop at older timestamp.
+    let mut restarted_live = restarted_stop.clone();
+    restarted_live.availability = WorkspaceBacklogPresenceAvailability::Live;
+    restarted_live.freshness = WorkspaceBacklogPresenceFreshness::Fresh;
+    restarted_live.live = true;
+    restarted_live.sampled_at_ms = Some(10_400);
+    restarted_live.expires_at_ms = Some(15_400);
+    for samples in [
+        vec![non_live_seq5.clone(), restarted_live.clone()],
+        vec![restarted_live, non_live_seq5.clone()],
+    ] {
+        let normalized = WorkspaceChatWork {
+            identity: identity.clone(),
+            availability: WorkspaceChatWorkAvailability::Available,
+            items: vec![item.clone()],
+            worker_presence: samples,
+            ..WorkspaceChatWork::default()
+        }
+        .normalized();
+        assert_eq!(normalized.worker_presence.len(), 1);
+        assert!(normalized.worker_presence[0].live);
+        assert_eq!(normalized.worker_presence[0].sequence, Some(1));
+    }
+
+    // An untimestamped different epoch must not supersede a timestamped epoch.
+    let mut untimestamped_restarted = restarted_stop;
+    untimestamped_restarted.sampled_at_ms = None;
+    untimestamped_restarted.sample_age_ms = None;
+    untimestamped_restarted.expires_at_ms = None;
+    for samples in [
+        vec![live_seq4.clone(), untimestamped_restarted.clone()],
+        vec![untimestamped_restarted, live_seq4.clone()],
+    ] {
+        let normalized = WorkspaceChatWork {
+            identity: identity.clone(),
+            availability: WorkspaceChatWorkAvailability::Available,
+            items: vec![item.clone()],
+            worker_presence: samples,
+            ..WorkspaceChatWork::default()
+        }
+        .normalized();
+        assert_eq!(normalized.worker_presence.len(), 1);
+        assert!(normalized.worker_presence[0].live);
+        assert_eq!(normalized.worker_presence[0].sequence, Some(4));
+    }
+
+    // 6. Separate attempts (different run_id / approval_id / worker_id / item_id) stay isolated,
+    // and malformed newer samples are omitted without clearing a valid live sample.
+    let mut other_attempt_stop = non_live_seq5.clone();
+    other_attempt_stop.run_id = "run_live_evidence_other".to_string();
+
+    let item_b = sample_worker_backlog_item(&identity.binding_id, "blg_live_evidence_b", "wbe_b");
+    let item_b_live = sample_worker_presence(
+        "blg_live_evidence_b",
+        "wbe_b",
+        Some(2),
+        Some(10_000),
+        WorkspaceBacklogPresenceAvailability::Live,
+        WorkspaceBacklogPresenceFreshness::Fresh,
+        true,
+    );
+
+    let mut malformed_empty_approval = non_live_seq5.clone();
+    malformed_empty_approval.approval_id.clear();
+    let mut malformed_secret_worker = non_live_seq5.clone();
+    malformed_secret_worker.worker_id = "sk-secret-worker".to_string();
+    let mut malformed_zero_ts = non_live_seq5.clone();
+    malformed_zero_ts.sampled_at_ms = Some(0);
+    let mut malformed_bad_claim = non_live_seq5.clone();
+    malformed_bad_claim.claim_id = Some("bad claim id".to_string());
+
+    let isolated = WorkspaceChatWork {
+        identity: identity.clone(),
+        availability: WorkspaceChatWorkAvailability::Available,
+        items: vec![item.clone(), item_b],
+        worker_presence: vec![
+            live_seq4.clone(),
+            other_attempt_stop,
+            item_b_live,
+            malformed_empty_approval,
+            malformed_secret_worker,
+            malformed_zero_ts,
+            malformed_bad_claim,
+        ],
+        ..WorkspaceChatWork::default()
+    }
+    .normalized();
+    assert_eq!(isolated.worker_presence.len(), 3);
+    assert_eq!(isolated.bounds.presence_omitted, 4);
+    let has_primary_live = isolated
+        .worker_presence
+        .iter()
+        .any(|p| p.item_id == item_id && p.run_id == "run_live_evidence" && p.live);
+    let has_other_attempt_stop = isolated
+        .worker_presence
+        .iter()
+        .any(|p| p.item_id == item_id && p.run_id == "run_live_evidence_other" && !p.live);
+    let has_item_b_live = isolated
+        .worker_presence
+        .iter()
+        .any(|p| p.item_id == "blg_live_evidence_b" && p.live);
+    assert!(has_primary_live);
+    assert!(has_other_attempt_stop);
+    assert!(has_item_b_live);
+
+    // 7. Mixed-source multi-entry chat_work composition across WorkspaceSnapshot::normalized:
+    // entry 1 has items + seq 4 live, entry 2 has seq 5 non_live (without repeating items),
+    // and another canonical chat stays completely isolated.
+    let beta_identity = WorkspaceChatIdentity::new(
+        "default",
+        "bnd_chat_beta",
+        VALID_UUID_B,
+        "/home/dev/repos/beta-app",
+    )
+    .expect("beta identity");
+    let beta_item = sample_worker_backlog_item(&beta_identity.binding_id, item_id, exec_ref);
+    let beta_live = sample_worker_presence(
+        item_id,
+        exec_ref,
+        Some(4),
+        Some(10_000),
+        WorkspaceBacklogPresenceAvailability::Live,
+        WorkspaceBacklogPresenceFreshness::Fresh,
+        true,
+    );
+    let mut snapshot = WorkspaceSnapshot::new(10_500, sample_legacy_observation_snapshot());
+    snapshot.chat_work = vec![
+        WorkspaceChatWork {
+            identity: identity.clone(),
+            availability: WorkspaceChatWorkAvailability::Available,
+            items: vec![item],
+            worker_presence: vec![live_seq4],
+            ..WorkspaceChatWork::default()
+        },
+        WorkspaceChatWork {
+            identity: identity.clone(),
+            availability: WorkspaceChatWorkAvailability::Available,
+            worker_presence: vec![non_live_seq5],
+            ..WorkspaceChatWork::default()
+        },
+        WorkspaceChatWork {
+            identity: beta_identity.clone(),
+            availability: WorkspaceChatWorkAvailability::Available,
+            items: vec![beta_item],
+            worker_presence: vec![beta_live],
+            ..WorkspaceChatWork::default()
+        },
+    ];
+    let normalized_snap = snapshot.normalized();
+    assert_eq!(normalized_snap.chat_work.len(), 2);
+    let alpha_work = normalized_snap
+        .chat_work
+        .iter()
+        .find(|work| work.identity == identity)
+        .expect("alpha chat_work");
+    assert_eq!(alpha_work.worker_presence.len(), 1);
+    assert_eq!(
+        alpha_work.worker_presence[0].availability,
+        WorkspaceBacklogPresenceAvailability::NonLive
+    );
+    assert_eq!(alpha_work.worker_presence[0].sequence, Some(5));
+    assert!(!alpha_work.worker_presence[0].live);
+    let beta_work = normalized_snap
+        .chat_work
+        .iter()
+        .find(|work| work.identity == beta_identity)
+        .expect("beta chat_work");
+    assert_eq!(beta_work.worker_presence.len(), 1);
+    assert!(beta_work.worker_presence[0].live);
+    assert_eq!(beta_work.worker_presence[0].sequence, Some(4));
+
+    // 8. Shared JSON fixture mirrored 1:1 in `apps/desktop/src/workspace-contract.test.ts`.
+    let shared_presence_fixture = r#"{
+        "schema_version": 1,
+        "generated_at_ms": 1700000010500,
+        "chat_work": [
+            {
+                "identity": {
+                    "source_id": "default",
+                    "binding_id": "bnd_chat_alpha",
+                    "thread_uuid": "0196ed00-0000-7000-8000-000000000042",
+                    "canonical_project_scope": "/home/dev/repos/alpha-app"
+                },
+                "availability": "available",
+                "items": [
+                    {
+                        "item_id": "blg_shared_stop",
+                        "binding_id": "bnd_chat_alpha",
+                        "revision": 3,
+                        "title": "Shared fixture stop",
+                        "acceptance_condition": "Newest explicit non_live wins.",
+                        "delivery_description": "Verify Rust/TS presence parity.",
+                        "kind": "worker",
+                        "status": "doing",
+                        "blocked_reason": null,
+                        "current_execution_ref": "wbe_shared_stop",
+                        "completion_note": null,
+                        "completion_evidence": null,
+                        "completed_at_ms": null,
+                        "created_at_ms": 1700000000100,
+                        "updated_at_ms": 1700000000900
+                    },
+                    {
+                        "item_id": "blg_shared_restarted",
+                        "binding_id": "bnd_chat_alpha",
+                        "revision": 3,
+                        "title": "Shared fixture restarted epoch",
+                        "acceptance_condition": "Restarted epoch reset sequence wins.",
+                        "delivery_description": "Verify epoch reconciliation parity.",
+                        "kind": "worker",
+                        "status": "doing",
+                        "blocked_reason": null,
+                        "current_execution_ref": "wbe_shared_restarted",
+                        "completion_note": null,
+                        "completion_evidence": null,
+                        "completed_at_ms": null,
+                        "created_at_ms": 1700000000200,
+                        "updated_at_ms": 1700000000950
+                    }
+                ],
+                "events": [],
+                "worker_presence": [
+                    {
+                        "item_id": "blg_shared_stop",
+                        "execution_ref": "wbe_shared_stop",
+                        "approval_id": "apr_shared_1",
+                        "task_id": "tsk_shared_1",
+                        "run_id": "run_shared_1",
+                        "worker_id": "wrk_shared_1",
+                        "claim_id": "wcl_shared_1",
+                        "host_instance_id": "hst_shared_1",
+                        "invocation_id": "0196ed00-0000-7000-8000-000000000701",
+                        "sequence": 4,
+                        "availability": "live",
+                        "freshness": "fresh",
+                        "live": true,
+                        "sampled_at_ms": 1700000010000,
+                        "sample_age_ms": 100,
+                        "max_sample_age_ms": 5000,
+                        "expires_at_ms": 1700000015000
+                    },
+                    {
+                        "item_id": "blg_shared_restarted",
+                        "execution_ref": "wbe_shared_restarted",
+                        "approval_id": "apr_shared_2",
+                        "task_id": "tsk_shared_2",
+                        "run_id": "run_shared_2",
+                        "worker_id": "wrk_shared_2",
+                        "claim_id": "wcl_shared_2",
+                        "host_instance_id": "hst_shared_1",
+                        "invocation_id": "0196ed00-0000-7000-8000-000000000702",
+                        "sequence": 4,
+                        "availability": "non_live",
+                        "freshness": "not_applicable",
+                        "live": false,
+                        "sampled_at_ms": 1700000010000,
+                        "sample_age_ms": 100,
+                        "max_sample_age_ms": 5000,
+                        "expires_at_ms": 1700000015000
+                    }
+                ],
+                "bounds": { "items_omitted": 0, "events_omitted": 0, "presence_omitted": 0 }
+            },
+            {
+                "identity": {
+                    "source_id": "default",
+                    "binding_id": "bnd_chat_alpha",
+                    "thread_uuid": "0196ed00-0000-7000-8000-000000000042",
+                    "canonical_project_scope": "/home/dev/repos/alpha-app"
+                },
+                "availability": "available",
+                "items": [],
+                "events": [],
+                "worker_presence": [
+                    {
+                        "item_id": "blg_shared_stop",
+                        "execution_ref": "wbe_shared_stop",
+                        "approval_id": "apr_shared_1",
+                        "task_id": "tsk_shared_1",
+                        "run_id": "run_shared_1",
+                        "worker_id": "wrk_shared_1",
+                        "claim_id": "wcl_shared_1",
+                        "host_instance_id": "hst_shared_1",
+                        "invocation_id": "0196ed00-0000-7000-8000-000000000701",
+                        "sequence": 5,
+                        "availability": "non_live",
+                        "freshness": "not_applicable",
+                        "live": false,
+                        "sampled_at_ms": 1700000010200,
+                        "sample_age_ms": 50,
+                        "max_sample_age_ms": 5000,
+                        "expires_at_ms": 1700000015200
+                    },
+                    {
+                        "item_id": "blg_shared_restarted",
+                        "execution_ref": "wbe_shared_restarted",
+                        "approval_id": "apr_shared_2",
+                        "task_id": "tsk_shared_2",
+                        "run_id": "run_shared_2",
+                        "worker_id": "wrk_shared_2",
+                        "claim_id": "wcl_shared_2",
+                        "host_instance_id": "hst_shared_2",
+                        "invocation_id": "0196ed00-0000-7000-8000-000000000703",
+                        "sequence": 1,
+                        "availability": "live",
+                        "freshness": "fresh",
+                        "live": true,
+                        "sampled_at_ms": 1700000010300,
+                        "sample_age_ms": 50,
+                        "max_sample_age_ms": 5000,
+                        "expires_at_ms": 1700000015300
+                    }
+                ],
+                "bounds": { "items_omitted": 0, "events_omitted": 0, "presence_omitted": 0 }
+            }
+        ]
+    }"#;
+    let parsed_shared = parse_workspace_snapshot_json(shared_presence_fixture)
+        .expect("parse shared presence fixture");
+    assert_eq!(parsed_shared.chat_work.len(), 1);
+    let shared_presence = &parsed_shared.chat_work[0].worker_presence;
+    assert_eq!(shared_presence.len(), 2);
+    assert_eq!(shared_presence[0].item_id, "blg_shared_restarted");
+    assert!(shared_presence[0].live);
+    assert_eq!(shared_presence[0].sequence, Some(1));
+    assert_eq!(shared_presence[1].item_id, "blg_shared_stop");
+    assert!(!shared_presence[1].live);
+    assert_eq!(
+        shared_presence[1].availability,
+        WorkspaceBacklogPresenceAvailability::NonLive
+    );
+    assert_eq!(shared_presence[1].sequence, Some(5));
+    assert_eq!(parsed_shared.chat_work[0].bounds.presence_omitted, 2);
+}

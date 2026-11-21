@@ -2054,6 +2054,7 @@ mod tests {
                 file_permissions: is_worker.then_some(WorkerFilePermissions::TaskFiles),
                 depends_on: plan_task.depends_on.clone(),
                 allowed_write_paths: plan_task.allowed_write_paths.clone(),
+                required_changed_paths: None,
                 task_digest,
                 profile_id: None,
                 command_key: None,

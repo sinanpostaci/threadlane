@@ -21,9 +21,10 @@ use uuid::Uuid;
 
 use crate::error::AuthorityError;
 use crate::types::{
-    ApprovalRecord, ApprovedTaskRecord, AUTHORITY_POLICY_VERSION, AUTHORITY_SCHEMA_VERSION,
-    MAX_APPROVAL_MAX_PARALLEL, MAX_APPROVED_TASKS, MAX_APPROVED_WRITE_PATHS,
-    MAX_EXECUTABLE_PROFILES_PER_APPROVAL, MIN_APPROVAL_MAX_PARALLEL,
+    ApprovalRecord, ApprovedTaskRecord, AUTHORITY_POLICY_VERSION,
+    AUTHORITY_REQUEST_V2_SCHEMA_VERSION, AUTHORITY_SCHEMA_VERSION, MAX_APPROVAL_MAX_PARALLEL,
+    MAX_APPROVED_TASKS, MAX_APPROVED_WRITE_PATHS, MAX_EXECUTABLE_PROFILES_PER_APPROVAL,
+    MAX_REQUIRED_CHANGED_PATHS, MIN_APPROVAL_MAX_PARALLEL,
 };
 
 /// Validates a non-empty bounded identifier using `threadlane-plans` rules.
@@ -77,6 +78,20 @@ pub fn validate_sha256_hex(field: &'static str, raw: &str) -> Result<String, Aut
         ));
     }
     Ok(raw.to_string())
+}
+
+/// Validates the schema version marker on [`crate::OperatorApprovalIntentV2`] and
+/// [`crate::OperatorApprovalRequestV2`].
+pub fn validate_v2_schema_version(schema_version: u32) -> Result<(), AuthorityError> {
+    if schema_version != AUTHORITY_REQUEST_V2_SCHEMA_VERSION {
+        return Err(AuthorityError::validation(
+            "schema_version",
+            format!(
+                "unsupported v2 request schema_version {schema_version} (expected {AUTHORITY_REQUEST_V2_SCHEMA_VERSION})"
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// Validates an executable headless worker task `instruction` against the runtime
@@ -427,6 +442,67 @@ pub fn is_task_scope_contained_in_operator_allowlist(
             !task_is_dir && task_scope == op_scope
         }
     })
+}
+
+/// Validates an opt-in per-task `required_changed_paths` selection against nonempty, bounded,
+/// duplicate-free, exact-file, base-commit/repository, and task `allowed_write_paths` subset
+/// invariants.
+///
+/// Every entry must name an exact repository-relative file (never a trailing-`/` directory scope
+/// or a directory at `base_commit`/working tree) and must be covered componentwise by
+/// `task_allowed_write_paths`.
+pub fn validate_required_changed_paths_at_base_commit(
+    task_id: &str,
+    required_paths: &[String],
+    task_allowed_write_paths: &[String],
+    canonical_repo: &Path,
+    base_commit: &str,
+) -> Result<Vec<String>, AuthorityError> {
+    if required_paths.is_empty() || required_paths.len() > MAX_REQUIRED_CHANGED_PATHS {
+        return Err(AuthorityError::validation(
+            "required_changed_paths",
+            format!(
+                "task `{task_id}` required_changed_paths must contain between 1 and {MAX_REQUIRED_CHANGED_PATHS} entries (got {})",
+                required_paths.len()
+            ),
+        ));
+    }
+
+    let mut validated = Vec::with_capacity(required_paths.len());
+    let mut seen = BTreeSet::new();
+    for entry in required_paths {
+        if entry.ends_with('/') {
+            return Err(AuthorityError::validation(
+                "required_changed_paths",
+                format!(
+                    "task `{task_id}` required_changed_paths entry `{entry}` must name an exact file, not a directory scope"
+                ),
+            ));
+        }
+        let checked = validate_write_scope_entry_at_base_commit(
+            entry,
+            canonical_repo,
+            base_commit,
+            "task required_changed_paths entry",
+        )?;
+        if !seen.insert(checked.clone()) {
+            return Err(AuthorityError::validation(
+                "required_changed_paths",
+                format!("duplicate entry `{checked}` in task `{task_id}` required_changed_paths"),
+            ));
+        }
+        if !is_task_scope_contained_in_operator_allowlist(&checked, task_allowed_write_paths) {
+            return Err(AuthorityError::validation(
+                "required_changed_paths",
+                format!(
+                    "task `{task_id}` required_changed_paths entry `{checked}` is not contained in task allowed_write_paths"
+                ),
+            ));
+        }
+        validated.push(checked);
+    }
+
+    Ok(validated)
 }
 
 /// Resolves a CLI worker tool executable once at approval time to its canonical regular
@@ -827,7 +903,7 @@ pub fn compute_authority_core_digest(record: &ApprovalRecord) -> Result<String, 
         .tasks
         .iter()
         .map(|task| {
-            serde_json::json!({
+            let mut obj = serde_json::json!({
                 "task_id": task.task_id,
                 "title": task.title,
                 "instruction": task.instruction,
@@ -848,7 +924,16 @@ pub fn compute_authority_core_digest(record: &ApprovalRecord) -> Result<String, 
                 "depends_on": task.depends_on,
                 "allowed_write_paths": task.allowed_write_paths,
                 "task_digest": task.task_digest,
-            })
+            });
+            if let (Some(required_changed_paths), Some(map)) =
+                (&task.required_changed_paths, obj.as_object_mut())
+            {
+                map.insert(
+                    "required_changed_paths".to_string(),
+                    serde_json::json!(required_changed_paths),
+                );
+            }
+            obj
         })
         .collect();
 
@@ -894,7 +979,7 @@ pub fn compute_record_subject_digest(record: &ApprovalRecord) -> Result<String, 
         .tasks
         .iter()
         .map(|task| {
-            serde_json::json!({
+            let mut obj = serde_json::json!({
                 "task_id": task.task_id,
                 "title": task.title,
                 "instruction": task.instruction,
@@ -917,7 +1002,16 @@ pub fn compute_record_subject_digest(record: &ApprovalRecord) -> Result<String, 
                 "task_digest": task.task_digest,
                 "profile_id": task.profile_id,
                 "command_key": task.command_key,
-            })
+            });
+            if let (Some(required_changed_paths), Some(map)) =
+                (&task.required_changed_paths, obj.as_object_mut())
+            {
+                map.insert(
+                    "required_changed_paths".to_string(),
+                    serde_json::json!(required_changed_paths),
+                );
+            }
+            obj
         })
         .collect();
 
@@ -1257,6 +1351,57 @@ fn verify_task_record_structure(
                     task.task_id
                 ),
             });
+        }
+    }
+    if let Some(ref required_paths) = task.required_changed_paths {
+        if required_paths.is_empty() || required_paths.len() > MAX_REQUIRED_CHANGED_PATHS {
+            return Err(AuthorityError::CorruptStore {
+                path: store_path.display().to_string(),
+                reason: format!(
+                    "approval `{approval_id}` task `{}` required_changed_paths count {} is invalid",
+                    task.task_id,
+                    required_paths.len()
+                ),
+            });
+        }
+        let mut seen_required = BTreeSet::new();
+        for required_path in required_paths {
+            if required_path.ends_with('/') {
+                return Err(AuthorityError::CorruptStore {
+                    path: store_path.display().to_string(),
+                    reason: format!(
+                        "approval `{approval_id}` task `{}` required_changed_paths entry `{required_path}` must name an exact file, not a directory scope",
+                        task.task_id
+                    ),
+                });
+            }
+            validate_stored_write_scope_syntax(
+                required_path,
+                "task required_changed_paths entry",
+                approval_id,
+                store_path,
+            )?;
+            if !seen_required.insert(required_path.clone()) {
+                return Err(AuthorityError::CorruptStore {
+                    path: store_path.display().to_string(),
+                    reason: format!(
+                        "approval `{approval_id}` task `{}` contains duplicate required_changed_paths entry `{required_path}`",
+                        task.task_id
+                    ),
+                });
+            }
+            if !is_task_scope_contained_in_operator_allowlist(
+                required_path,
+                &task.allowed_write_paths,
+            ) {
+                return Err(AuthorityError::CorruptStore {
+                    path: store_path.display().to_string(),
+                    reason: format!(
+                        "approval `{approval_id}` task `{}` required_changed_paths entry `{required_path}` is not contained in task allowed_write_paths",
+                        task.task_id
+                    ),
+                });
+            }
         }
     }
 

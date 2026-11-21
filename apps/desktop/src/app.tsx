@@ -10,8 +10,10 @@ import {
   Blocks,
   ChevronDown,
   ChevronRight,
+  ExternalLink,
   FolderGit2,
   FolderOpen,
+  History,
   Inbox,
   Loader2,
   Menu,
@@ -70,7 +72,11 @@ import {
 } from './ipc.ts';
 import {
   buildChatWorkLivenessIndex,
+  formatSidebarLifecycleWaitingLabel,
+  formatSidebarWaitingCounter,
+  formatSidebarWorkingCounter,
   readWorkspaceChatWork,
+  resolveSidebarChatStatus,
   summarizeChatWorkLiveness,
   type ChatWorkLiveness,
 } from './message-scroll.ts';
@@ -154,6 +160,7 @@ interface SidebarContentProps {
   selectedChatKey: string | null;
   collapsedProjects: ReadonlySet<string>;
   chatLiveness: ReadonlyMap<string, ChatWorkLiveness>;
+  livenessSuppressed: boolean;
   workingAgentCount: number;
   needsHumanCount: number;
   activeNeedsHumanCount: number;
@@ -176,6 +183,7 @@ function SidebarContent({
   selectedChatKey,
   collapsedProjects,
   chatLiveness,
+  livenessSuppressed,
   workingAgentCount,
   needsHumanCount,
   activeNeedsHumanCount,
@@ -197,7 +205,16 @@ function SidebarContent({
     { id: 'settings', label: 'Settings', icon: Settings2 },
   ];
 
-  const totalWorkingCount = workingAgentCount;
+  const globalWorkingCounter = formatSidebarWorkingCounter(workingAgentCount);
+  const globalWaitingCounter = formatSidebarWaitingCounter(needsHumanCount);
+  const activeWaitingLabel = formatSidebarLifecycleWaitingLabel(
+    'active',
+    activeNeedsHumanCount
+  );
+  const archivedWaitingLabel = formatSidebarLifecycleWaitingLabel(
+    'archived',
+    archivedNeedsHumanCount
+  );
 
   return (
     <div
@@ -208,6 +225,10 @@ function SidebarContent({
         {navItems.map((item) => {
           const Icon = item.icon;
           const isCurrent = activeSection === item.id;
+          const showProjectBadges =
+            item.id === 'projects' &&
+            !collapsed &&
+            (globalWorkingCounter !== null || globalWaitingCounter !== null);
           return (
             <div key={item.id} className="tl-nav-group">
               <button
@@ -216,46 +237,47 @@ function SidebarContent({
                 data-active={isCurrent ? 'true' : 'false'}
                 aria-current={isCurrent ? 'page' : undefined}
                 aria-label={item.label}
+                style={
+                  showProjectBadges ? { flexWrap: 'wrap', rowGap: 4 } : undefined
+                }
                 onClick={() => onSelectSection(item.id)}
               >
                 <Icon size={17} aria-hidden="true" />
                 {!collapsed ? (
                   <>
-                    <span className="tl-nav-btn-label">{item.label}</span>
-                    {item.id === 'projects' ? (
-                      <span className="tl-nav-badges">
-                        {totalWorkingCount > 0 ? (
+                    <span
+                      className="tl-nav-btn-label"
+                      style={
+                        showProjectBadges
+                          ? { minWidth: 'max-content' }
+                          : undefined
+                      }
+                    >
+                      {item.label}
+                    </span>
+                    {showProjectBadges ? (
+                      <span
+                        className="tl-nav-badges"
+                        style={{ flexWrap: 'wrap', maxWidth: '100%' }}
+                      >
+                        {globalWorkingCounter !== null ? (
                           <span
                             className="tl-mini-pill tl-nav-count"
                             data-tone="working"
-                            aria-label={`${totalWorkingCount} working`}
+                            data-nav-counter="working-agents"
+                            aria-label={globalWorkingCounter.ariaLabel}
                           >
-                            <span
-                              className="tl-status-dot"
-                              data-tone="working"
-                              aria-hidden="true"
-                            />
-                            <span aria-hidden="true">{totalWorkingCount}</span>
+                            {globalWorkingCounter.label}
                           </span>
                         ) : null}
-                        {needsHumanCount > 0 ? (
+                        {globalWaitingCounter !== null ? (
                           <span
                             className="tl-mini-pill tl-nav-count"
                             data-tone="attention"
-                            aria-label={
-                              needsHumanCount === 1
-                                ? '1 chat waiting for you'
-                                : `${needsHumanCount} chats waiting for you`
-                            }
+                            data-nav-counter="waiting-chats"
+                            aria-label={globalWaitingCounter.ariaLabel}
                           >
-                            <span
-                              className="tl-status-dot"
-                              data-tone="attention"
-                              aria-hidden="true"
-                            />
-                            <span aria-hidden="true">
-                              {needsHumanCount}
-                            </span>
+                            {globalWaitingCounter.label}
                           </span>
                         ) : null}
                       </span>
@@ -290,11 +312,11 @@ function SidebarContent({
                     <Inbox size={14} aria-hidden="true" />
                     <span className="tl-projects-subnav-label">Active</span>
                     <span className="tl-projects-subnav-badges">
-                      {activeNeedsHumanCount > 0 ? (
+                      {activeWaitingLabel !== null ? (
                         <span
                           className="tl-status-dot"
                           data-tone="attention"
-                          aria-label={`${activeNeedsHumanCount} active chat(s) waiting for you`}
+                          aria-label={activeWaitingLabel}
                         />
                       ) : null}
                       <span className="tl-projects-subnav-count">
@@ -323,11 +345,11 @@ function SidebarContent({
                     <Archive size={14} aria-hidden="true" />
                     <span className="tl-projects-subnav-label">Archive</span>
                     <span className="tl-projects-subnav-badges">
-                      {archivedNeedsHumanCount > 0 ? (
+                      {archivedWaitingLabel !== null ? (
                         <span
                           className="tl-status-dot"
                           data-tone="attention"
-                          aria-label={`${archivedNeedsHumanCount} archived chat(s) waiting for you`}
+                          aria-label={archivedWaitingLabel}
                         />
                       ) : null}
                       <span className="tl-projects-subnav-count">
@@ -377,16 +399,19 @@ function SidebarContent({
                 const isProjectCollapsed = collapsedProjects.has(
                   project.projectKey
                 );
-                const projectLiveness = project.chats.map((chat) =>
-                  chatLiveness.get(chat.chatKey)
+                const projectSummary = summarizeChatWorkLiveness(
+                  chatLiveness,
+                  project.chats.map((chat) => chat.chatKey)
                 );
-                const projectWorkingCount = projectLiveness.reduce(
-                  (total, entry) => total + (entry?.workingAgentCount ?? 0),
-                  0
+                const projectWorkingCounter = formatSidebarWorkingCounter(
+                  projectSummary.workingAgentCount
                 );
-                const projectWaitingCount = projectLiveness.filter(
-                  (entry) => entry?.waitingForHuman
-                ).length;
+                const projectWaitingCounter = formatSidebarWaitingCounter(
+                  projectSummary.waitingChatCount
+                );
+                const hasProjectCounts =
+                  projectWorkingCounter !== null ||
+                  projectWaitingCounter !== null;
                 return (
                   <section
                     key={project.projectKey}
@@ -397,6 +422,11 @@ function SidebarContent({
                       type="button"
                       className="tl-project-header"
                       aria-expanded={!isProjectCollapsed}
+                      style={
+                        hasProjectCounts
+                          ? { flexWrap: 'wrap', rowGap: 4 }
+                          : undefined
+                      }
                       onClick={() => onToggleProject(project.projectKey)}
                     >
                       {isProjectCollapsed ? (
@@ -405,27 +435,43 @@ function SidebarContent({
                         <ChevronDown size={14} aria-hidden="true" />
                       )}
                       <FolderGit2 size={14} aria-hidden="true" />
-                      <span className="tl-project-name">{project.label}</span>
-                      <span className="tl-project-counts">
-                        {projectWorkingCount > 0 ? (
-                          <span
-                            className="tl-mini-pill"
-                            data-tone="working"
-                            aria-label={`${projectWorkingCount} working`}
-                          >
-                            {projectWorkingCount}
-                          </span>
-                        ) : null}
-                        {projectWaitingCount > 0 ? (
-                          <span
-                            className="tl-mini-pill"
-                            data-tone="attention"
-                            aria-label={`${projectWaitingCount} waiting for you`}
-                          >
-                            {projectWaitingCount}
-                          </span>
-                        ) : null}
+                      <span
+                        className="tl-project-name"
+                        style={
+                          hasProjectCounts
+                            ? { flex: '1 1 64px', minWidth: 64 }
+                            : undefined
+                        }
+                      >
+                        {project.label}
                       </span>
+                      {hasProjectCounts ? (
+                        <span
+                          className="tl-project-counts"
+                          style={{ flexWrap: 'wrap', maxWidth: '100%' }}
+                        >
+                          {projectWorkingCounter !== null ? (
+                            <span
+                              className="tl-mini-pill"
+                              data-tone="working"
+                              data-project-counter="working-agents"
+                              aria-label={projectWorkingCounter.ariaLabel}
+                            >
+                              {projectWorkingCounter.label}
+                            </span>
+                          ) : null}
+                          {projectWaitingCounter !== null ? (
+                            <span
+                              className="tl-mini-pill"
+                              data-tone="attention"
+                              data-project-counter="waiting-chats"
+                              aria-label={projectWaitingCounter.ariaLabel}
+                            >
+                              {projectWaitingCounter.label}
+                            </span>
+                          ) : null}
+                        </span>
+                      ) : null}
                     </button>
 
                     {!isProjectCollapsed ? (
@@ -435,16 +481,16 @@ function SidebarContent({
                             activeSection === 'projects' &&
                             selectedChatKey === chat.chatKey;
                           const chatWorkLiveness = chatLiveness.get(chat.chatKey);
-                          const chatIsWorking = chatWorkLiveness?.isWorking ?? false;
-                          const chatIsWaiting =
-                            chatWorkLiveness?.waitingForHuman ?? false;
-                          const chatPrimaryTone: StatusDotTone = chatIsWaiting
-                            ? 'attention'
-                            : chatIsWorking
-                              ? 'working'
-                              : 'neutral';
-                          const chatStatusLabel =
-                            chatWorkLiveness?.statusLabel ?? 'No live agent';
+                          const chatStatus = resolveSidebarChatStatus(
+                            chatWorkLiveness,
+                            { suppressed: livenessSuppressed }
+                          );
+                          const chatPrimaryTone: StatusDotTone =
+                            chatStatus.tone === 'attention'
+                              ? 'attention'
+                              : chatStatus.tone === 'working'
+                                ? 'working'
+                                : 'neutral';
                           const configuredModelLabel =
                             chat.configuredSelection.evidence ===
                             'verified_configuration'
@@ -473,16 +519,20 @@ function SidebarContent({
                                 </div>
 
                                 <div className="tl-chat-item-meta">
-                                  {chatIsWaiting ? (
+                                  {chatStatus.kind === 'waiting' ? (
                                     <span
                                       className="tl-mini-pill"
                                       data-tone="attention"
+                                      data-sidebar-status={chatStatus.kind}
                                     >
-                                      Waiting for you in Codex
+                                      {chatStatus.label}
                                     </span>
                                   ) : (
-                                    <span className="tl-chat-status-text">
-                                      {chatStatusLabel}
+                                    <span
+                                      className="tl-chat-status-text"
+                                      data-sidebar-status={chatStatus.kind}
+                                    >
+                                      {chatStatus.label}
                                     </span>
                                   )}
                                   {configuredModelLabel ? (
@@ -870,6 +920,12 @@ export function ThreadlaneDesktopShell() {
     workspace.selectedChat.lifecycle === workspace.lifecycleFilter
       ? workspace.selectedChat
       : null;
+  const selectedChatUnavailable =
+    activeSelectedChat === null &&
+    workspace.selectedChatUnavailable !== null &&
+    workspace.selectedChatUnavailable.lifecycle === workspace.lifecycleFilter
+      ? workspace.selectedChatUnavailable
+      : null;
   const selectedIdentity: WorkspaceChatIdentity | null =
     activeSelectedChat?.identity ?? null;
 
@@ -1007,6 +1063,13 @@ export function ThreadlaneDesktopShell() {
     '--tl-surface-opacity': `${effectiveOpacity}%`,
   };
   const totalWorkingCount = workingAgentCount;
+  const livenessSuppressed =
+    workspace.isStale || coordState.observationError !== null;
+  const titlebarWorkingCounter = formatSidebarWorkingCounter(totalWorkingCount);
+  const titlebarWaitingCounter = formatSidebarWaitingCounter(needsHumanCount);
+  const showTitlebarPills =
+    (compact || sidebarCollapsed) &&
+    (titlebarWorkingCounter !== null || titlebarWaitingCounter !== null);
   const visibleArchiveError =
     coordState.archiveError && !archiveErrorDismissed
       ? coordState.archiveError
@@ -1028,8 +1091,20 @@ export function ThreadlaneDesktopShell() {
         style={shellStyle}
       >
         {/* Custom Desktop Titlebar — single home for sidebar toggle */}
-        <header className="tl-titlebar" data-tauri-drag-region="true">
-          <div className="tl-titlebar-left" data-tauri-drag-region="true">
+        <header
+          className="tl-titlebar"
+          data-tauri-drag-region="true"
+          style={compact && showTitlebarPills ? { paddingBlock: 4 } : undefined}
+        >
+          <div
+            className="tl-titlebar-left"
+            data-tauri-drag-region="true"
+            style={
+              compact && showTitlebarPills
+                ? { flexWrap: 'wrap', rowGap: 4 }
+                : undefined
+            }
+          >
             <IconButton
               size="2"
               variant="ghost"
@@ -1076,36 +1151,33 @@ export function ThreadlaneDesktopShell() {
               Threadlane
             </span>
 
-            {(compact || sidebarCollapsed) ? (
-              <span className="tl-titlebar-pills">
-                {totalWorkingCount > 0 ? (
+            {showTitlebarPills ? (
+              <span
+                className="tl-titlebar-pills"
+                style={
+                  compact
+                    ? { flexWrap: 'wrap', overflow: 'visible' }
+                    : undefined
+                }
+              >
+                {titlebarWorkingCounter !== null ? (
                   <span
                     className="tl-mini-pill tl-nav-count"
                     data-tone="working"
-                    aria-label={`${totalWorkingCount} working`}
+                    data-nav-counter="working-agents"
+                    aria-label={titlebarWorkingCounter.ariaLabel}
                   >
-                    <span
-                      className="tl-status-dot"
-                      data-tone="working"
-                      aria-hidden="true"
-                    />
-                    <span aria-hidden="true">{totalWorkingCount}</span>
+                    {titlebarWorkingCounter.label}
                   </span>
                 ) : null}
-                {needsHumanCount > 0 ? (
+                {titlebarWaitingCounter !== null ? (
                   <span
                     className="tl-mini-pill tl-nav-count"
                     data-tone="attention"
-                    aria-label={`${needsHumanCount} chats waiting for you`}
+                    data-nav-counter="waiting-chats"
+                    aria-label={titlebarWaitingCounter.ariaLabel}
                   >
-                    <span
-                      className="tl-status-dot"
-                      data-tone="attention"
-                      aria-hidden="true"
-                    />
-                    <span aria-hidden="true">
-                      {needsHumanCount}
-                    </span>
+                    {titlebarWaitingCounter.label}
                   </span>
                 ) : null}
               </span>
@@ -1212,6 +1284,7 @@ export function ThreadlaneDesktopShell() {
               selectedChatKey={activeSelectedChat?.chatKey ?? null}
               collapsedProjects={collapsedProjects}
               chatLiveness={chatWorkState.index}
+              livenessSuppressed={livenessSuppressed}
               workingAgentCount={workingAgentCount}
               needsHumanCount={needsHumanCount}
               activeNeedsHumanCount={activeNeedsHumanCount}
@@ -1242,6 +1315,7 @@ export function ThreadlaneDesktopShell() {
                 selectedChatKey={activeSelectedChat?.chatKey ?? null}
                 collapsedProjects={collapsedProjects}
                 chatLiveness={chatWorkState.index}
+                livenessSuppressed={livenessSuppressed}
                 workingAgentCount={workingAgentCount}
                 needsHumanCount={needsHumanCount}
                 activeNeedsHumanCount={activeNeedsHumanCount}
@@ -1365,20 +1439,97 @@ export function ThreadlaneDesktopShell() {
                 </div>
               ) : null}
 
-              <WorkspaceChatWorkSurface
-                chat={selectedChatSummary}
-                nativeSample={selectedNativeSample}
-                snapshot={
-                  selectedChatSummary ? coordState.workspaceSnapshot : null
-                }
-                nowMs={workspace.referenceNowMs}
-                loading={coordState.observationLoading}
-                error={coordState.observationError}
-                isStale={workspace.isStale}
-                onRefresh={handleWorkspaceRefresh}
-                onOpenCodex={handleOpenCodex}
-                codexOpenInFlight={coordState.codexOpenInFlight}
-              />
+              {selectedChatUnavailable !== null ? (
+                <div
+                  className="tl-cw-root"
+                  data-chat-work-surface="true"
+                  data-selected-chat-unavailable="true"
+                  data-unavailable-reason={selectedChatUnavailable.reason}
+                >
+                  <header className="tl-cw-header">
+                    <div className="tl-cw-heading">
+                      <div className="tl-cw-title-row">
+                        <h2 className="tl-cw-title">
+                          {selectedChatUnavailable.threadLabel}
+                        </h2>
+                        <span
+                          className="tl-cw-status"
+                          data-tone="neutral"
+                          role="status"
+                        >
+                          <span>{selectedChatUnavailable.statusLabel}</span>
+                        </span>
+                      </div>
+                      <div className="tl-cw-subtitle">
+                        <span className="tl-cw-meta-item">
+                          <FolderGit2 size={13} aria-hidden="true" />
+                          <span>{selectedChatUnavailable.projectLabel}</span>
+                        </span>
+                      </div>
+                    </div>
+
+                    <div className="tl-cw-actions">
+                      <IconButton
+                        size="2"
+                        variant="ghost"
+                        color="gray"
+                        aria-label="Refresh workspace"
+                        onClick={handleWorkspaceRefresh}
+                      >
+                        <RefreshCw size={14} aria-hidden="true" />
+                      </IconButton>
+                      <button
+                        type="button"
+                        className="tl-cw-btn"
+                        disabled
+                        aria-haspopup="dialog"
+                        aria-expanded={false}
+                      >
+                        <History size={14} aria-hidden="true" />
+                        <span>Backlog</span>
+                      </button>
+                      <button
+                        type="button"
+                        className="tl-cw-btn tl-cw-btn--primary"
+                        disabled
+                      >
+                        <ExternalLink size={14} aria-hidden="true" />
+                        <span>Open in Codex</span>
+                      </button>
+                    </div>
+                  </header>
+
+                  <div className="tl-cw-stage">
+                    <div
+                      className="tl-cw-stream-scroller"
+                      data-chat-stream-scroller="true"
+                      aria-label="Chat activity stream"
+                      role="log"
+                      tabIndex={0}
+                    >
+                      <div className="tl-cw-empty" role="status">
+                        <AlertCircle size={15} aria-hidden="true" />
+                        <span>{selectedChatUnavailable.message}</span>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                <WorkspaceChatWorkSurface
+                  chat={selectedChatSummary}
+                  nativeSample={selectedNativeSample}
+                  snapshot={
+                    selectedChatSummary ? coordState.workspaceSnapshot : null
+                  }
+                  nowMs={workspace.referenceNowMs}
+                  loading={coordState.observationLoading}
+                  error={coordState.observationError}
+                  isStale={workspace.isStale}
+                  onRefresh={handleWorkspaceRefresh}
+                  onOpenCodex={handleOpenCodex}
+                  codexOpenInFlight={coordState.codexOpenInFlight}
+                />
+              )}
             </section>
 
             <section

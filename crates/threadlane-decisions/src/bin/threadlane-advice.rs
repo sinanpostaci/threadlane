@@ -42,7 +42,7 @@ struct AdviceCli {
     #[arg(long = "cache-ttl-seconds", value_name = "SECONDS", global = true)]
     cache_ttl_seconds: Option<u64>,
 
-    /// Optional workflow profile identifier whose configured Jev shadow decision advisor must match the request.
+    /// Workflow profile whose shadow decision advisor must match the requested API tool and model.
     #[arg(long = "profile-id", value_name = "ID", global = true)]
     profile_id: Option<String>,
 

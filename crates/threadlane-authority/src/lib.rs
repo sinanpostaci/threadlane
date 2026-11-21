@@ -44,24 +44,26 @@ pub use store::{
 };
 pub use types::{
     ApprovalRecord, ApprovalSummary, ApprovedTaskDispatch, ApprovedTaskRecord, MaterializedPlan,
-    NativeRoute, OperatorApprovalIntent, OperatorApprovalPreview, OperatorApprovalRequest,
-    APPROVALS_FILE_NAME, APPROVALS_LOCK_FILE_NAME, AUTHORITY_POLICY_VERSION,
+    NativeRoute, OperatorApprovalIntent, OperatorApprovalIntentV2, OperatorApprovalPreview,
+    OperatorApprovalRequest, OperatorApprovalRequestV2, APPROVALS_FILE_NAME,
+    APPROVALS_LOCK_FILE_NAME, AUTHORITY_POLICY_VERSION, AUTHORITY_REQUEST_V2_SCHEMA_VERSION,
     AUTHORITY_SCHEMA_VERSION, MAX_APPROVALS_IN_STORE, MAX_APPROVAL_MAX_PARALLEL,
     MAX_APPROVED_TASKS, MAX_APPROVED_WRITE_PATHS, MAX_AUTHORITY_STORE_BYTES,
-    MAX_EXECUTABLE_PROFILES_PER_APPROVAL, MIN_APPROVAL_MAX_PARALLEL,
+    MAX_EXECUTABLE_PROFILES_PER_APPROVAL, MAX_REQUIRED_CHANGED_PATHS, MIN_APPROVAL_MAX_PARALLEL,
 };
 pub use validation::{
     compute_authority_core_digest, compute_record_subject_digest, derive_approval_id,
     derive_command_key, derive_profile_id, is_task_scope_contained_in_operator_allowlist,
     resolve_and_validate_worker_executable, validate_approved_executable_task_instructions,
     validate_canonical_thread_uuid, validate_executable_worker_instruction,
-    validate_repository_and_base_commit, validate_write_scope_entry,
+    validate_repository_and_base_commit, validate_required_changed_paths_at_base_commit,
+    validate_v2_schema_version, validate_write_scope_entry,
     validate_write_scope_entry_at_base_commit, verify_approval_record_integrity,
 };
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::fs::{self, File};
     use std::io::Write;
     use std::os::unix::fs::{symlink, PermissionsExt};
@@ -3143,6 +3145,7 @@ mod tests {
                     file_permissions: Some(WorkerFilePermissions::TaskFiles),
                     depends_on: ct.depends_on.clone(),
                     allowed_write_paths: ct.allowed_write_paths.clone(),
+                    required_changed_paths: None,
                     task_digest: ct.task_digest.clone(),
                     profile_id: None,
                     command_key: None,
@@ -3206,6 +3209,764 @@ mod tests {
         assert_eq!(
             materialized_legacy.task_dispatch[1].instruction.len(),
             4_365
+        );
+    }
+
+    #[test]
+    fn required_changed_paths_omitted_preserves_legacy_digests_and_byte_compatible_serialization() {
+        let fixture = setup_fixture();
+        let reg_rev = fixture.registry.snapshot().unwrap().revision;
+        let (plan_rev, _plan_digest) = save_and_publish_plan(
+            &fixture,
+            "plan-req-legacy-compat",
+            "binding-1",
+            reg_rev,
+            vec![PlanTask {
+                id: "task-legacy".to_string(),
+                title: "Legacy unconstrained task".to_string(),
+                instruction: "Update src/lib.rs and optionally src/extra.rs.".to_string(),
+                role: WorkflowRole::Coder,
+                difficulty: Difficulty::Hard,
+                depends_on: Vec::new(),
+                allowed_write_paths: vec!["src/lib.rs".to_string(), "src/extra.rs".to_string()],
+            }],
+        );
+
+        let intent = OperatorApprovalIntent {
+            binding_id: "binding-1".to_string(),
+            thread_uuid: THREAD_UUID_A.to_string(),
+            plan_id: "plan-req-legacy-compat".to_string(),
+            plan_revision: plan_rev,
+            expected_registry_revision: reg_rev,
+            repository_path: fixture.repo_dir.clone(),
+            base_commit: fixture.base_commit.clone(),
+            approved_task_ids: vec!["task-legacy".to_string()],
+            approved_write_paths: vec!["src/lib.rs".to_string(), "src/extra.rs".to_string()],
+            max_parallel: 1,
+            budgets: ExecutionBudgets::default(),
+        };
+
+        let preview = fixture
+            .authority
+            .prepare_for_operator(intent.clone())
+            .expect("legacy prepare succeeds");
+        assert!(preview.tasks[0].required_changed_paths.is_none());
+        let preview_json = serde_json::to_string(&preview).expect("serialize preview");
+        assert!(
+            !preview_json.contains("required_changed_paths"),
+            "legacy preview JSON must omit required_changed_paths when None"
+        );
+
+        let summary = fixture
+            .authority
+            .approve_confirmed(preview.request.clone(), &preview.subject_digest)
+            .expect("legacy approve_confirmed succeeds");
+        let record = fixture
+            .authority
+            .get_for_operator(&summary.approval_id)
+            .expect("load persisted legacy record");
+        assert!(record.tasks[0].required_changed_paths.is_none());
+        let record_json = serde_json::to_string(&record).expect("serialize record");
+        assert!(
+            !record_json.contains("required_changed_paths"),
+            "legacy ApprovalRecord JSON must omit required_changed_paths when None"
+        );
+
+        // Compute the exact legacy pre-change core and subject digests (without required_changed_paths).
+        let t = &record.tasks[0];
+        let legacy_core_canonical = serde_json::json!({
+            "domain": "threadlane-authority-core-v1",
+            "schema_version": AUTHORITY_SCHEMA_VERSION,
+            "policy_version": record.policy_version,
+            "binding_id": record.binding_id,
+            "thread_uuid": record.thread_uuid,
+            "plan_id": record.plan_id,
+            "plan_revision": record.plan_revision,
+            "profile_id": record.profile_id,
+            "registry_revision": record.registry_revision,
+            "plan_digest": record.plan_digest,
+            "repository_path": record.repository_path.to_string_lossy(),
+            "base_commit": record.base_commit,
+            "approved_task_ids": record.approved_task_ids,
+            "approved_write_paths": record.approved_write_paths,
+            "max_parallel": record.max_parallel,
+            "budgets": {
+                "timeout_ms": record.budgets.timeout_ms,
+                "max_line_bytes": record.budgets.max_line_bytes,
+                "max_stdout_bytes": record.budgets.max_stdout_bytes,
+                "max_stderr_bytes": record.budgets.max_stderr_bytes,
+                "max_events": record.budgets.max_events,
+            },
+            "tasks": [{
+                "task_id": t.task_id,
+                "title": t.title,
+                "instruction": t.instruction,
+                "instruction_digest": t.instruction_digest,
+                "role": t.role.as_str(),
+                "difficulty": t.difficulty.as_str(),
+                "tool_id": t.tool_id,
+                "adapter": t.adapter.as_str(),
+                "provider": t.provider.map(WorkerProvider::as_str),
+                "canonical_executable": t.canonical_executable.as_ref().map(|p| p.to_string_lossy().to_string()),
+                "model_id": t.model_id,
+                "model_arg": t.model_arg,
+                "base_model": t.base_model,
+                "effort": t.effort,
+                "cli_model_arg": t.cli_model_arg,
+                "standalone": t.standalone,
+                "file_permissions": t.file_permissions.map(WorkerFilePermissions::as_str),
+                "depends_on": t.depends_on,
+                "allowed_write_paths": t.allowed_write_paths,
+                "task_digest": t.task_digest,
+            }],
+        });
+        let expected_legacy_core =
+            validation::sha256_hex(&serde_json::to_vec(&legacy_core_canonical).unwrap());
+        assert_eq!(
+            compute_authority_core_digest(&record).unwrap(),
+            expected_legacy_core
+        );
+        assert_eq!(
+            t.profile_id.as_deref(),
+            Some(derive_profile_id(&expected_legacy_core, &t.task_id, &t.task_digest).as_str())
+        );
+        assert_eq!(
+            t.command_key.as_deref(),
+            Some(derive_command_key(&expected_legacy_core, &t.task_id, &t.task_digest).as_str())
+        );
+
+        let legacy_subject_canonical = serde_json::json!({
+            "domain": "threadlane-authority-subject-v1",
+            "schema_version": AUTHORITY_SCHEMA_VERSION,
+            "policy_version": record.policy_version,
+            "binding_id": record.binding_id,
+            "thread_uuid": record.thread_uuid,
+            "plan_id": record.plan_id,
+            "plan_revision": record.plan_revision,
+            "profile_id": record.profile_id,
+            "registry_revision": record.registry_revision,
+            "plan_digest": record.plan_digest,
+            "repository_path": record.repository_path.to_string_lossy(),
+            "base_commit": record.base_commit,
+            "approved_task_ids": record.approved_task_ids,
+            "approved_write_paths": record.approved_write_paths,
+            "max_parallel": record.max_parallel,
+            "budgets": {
+                "timeout_ms": record.budgets.timeout_ms,
+                "max_line_bytes": record.budgets.max_line_bytes,
+                "max_stdout_bytes": record.budgets.max_stdout_bytes,
+                "max_stderr_bytes": record.budgets.max_stderr_bytes,
+                "max_events": record.budgets.max_events,
+            },
+            "tasks": [{
+                "task_id": t.task_id,
+                "title": t.title,
+                "instruction": t.instruction,
+                "instruction_digest": t.instruction_digest,
+                "role": t.role.as_str(),
+                "difficulty": t.difficulty.as_str(),
+                "tool_id": t.tool_id,
+                "adapter": t.adapter.as_str(),
+                "provider": t.provider.map(WorkerProvider::as_str),
+                "canonical_executable": t.canonical_executable.as_ref().map(|p| p.to_string_lossy().to_string()),
+                "model_id": t.model_id,
+                "model_arg": t.model_arg,
+                "base_model": t.base_model,
+                "effort": t.effort,
+                "cli_model_arg": t.cli_model_arg,
+                "standalone": t.standalone,
+                "file_permissions": t.file_permissions.map(WorkerFilePermissions::as_str),
+                "depends_on": t.depends_on,
+                "allowed_write_paths": t.allowed_write_paths,
+                "task_digest": t.task_digest,
+                "profile_id": t.profile_id,
+                "command_key": t.command_key,
+            }],
+        });
+        let expected_legacy_subject =
+            validation::sha256_hex(&serde_json::to_vec(&legacy_subject_canonical).unwrap());
+        assert_eq!(record.subject_digest, expected_legacy_subject);
+        assert_eq!(
+            record.approval_id,
+            derive_approval_id(&expected_legacy_subject)
+        );
+
+        // Old serialized ApprovalRecord JSON without required_changed_paths deserializes and verifies cleanly.
+        let deserialized: ApprovalRecord =
+            serde_json::from_str(&record_json).expect("deserialize old ApprovalRecord JSON");
+        assert_eq!(deserialized, record);
+        verify_approval_record_integrity(&deserialized, fixture.authority.approvals_path())
+            .expect("legacy record integrity succeeds");
+
+        // V2 intent/request with empty task_required_changed_paths matches the exact legacy digest.
+        let v2_empty_preview = fixture
+            .authority
+            .prepare_for_operator_v2(OperatorApprovalIntentV2 {
+                schema_version: AUTHORITY_REQUEST_V2_SCHEMA_VERSION,
+                intent,
+                task_required_changed_paths: BTreeMap::new(),
+            })
+            .expect("v2 empty map prepare succeeds");
+        assert_eq!(v2_empty_preview, preview);
+        let idempotent_v2 = fixture
+            .authority
+            .approve_confirmed_v2(preview.to_request_v2().unwrap(), &preview.subject_digest)
+            .expect("v2 empty map approve_confirmed matches legacy idempotently");
+        assert_eq!(idempotent_v2, summary);
+    }
+
+    #[test]
+    fn required_changed_paths_selection_binds_digests_round_trips_and_keeps_permissions_a() {
+        let fixture = setup_fixture();
+        let reg_rev = fixture.registry.snapshot().unwrap().revision;
+        let (plan_rev, _plan_digest) = save_and_publish_plan(
+            &fixture,
+            "plan-req-selected",
+            "binding-1",
+            reg_rev,
+            vec![
+                PlanTask {
+                    id: "task-exact-a".to_string(),
+                    title: "Exact file subset task".to_string(),
+                    instruction: "Modify src/lib.rs and optionally touch src/extra.rs.".to_string(),
+                    role: WorkflowRole::Coder,
+                    difficulty: Difficulty::Hard,
+                    depends_on: Vec::new(),
+                    allowed_write_paths: vec!["src/lib.rs".to_string(), "src/extra.rs".to_string()],
+                },
+                PlanTask {
+                    id: "task-dir-b".to_string(),
+                    title: "Directory scope with exact required files".to_string(),
+                    instruction: "Update src/sub/mod.rs and add src/sub/new_file.rs.".to_string(),
+                    role: WorkflowRole::Coder,
+                    difficulty: Difficulty::Easy,
+                    depends_on: Vec::new(),
+                    allowed_write_paths: vec!["src/sub/".to_string()],
+                },
+            ],
+        );
+
+        let base_intent = OperatorApprovalIntent {
+            binding_id: "binding-1".to_string(),
+            thread_uuid: THREAD_UUID_A.to_string(),
+            plan_id: "plan-req-selected".to_string(),
+            plan_revision: plan_rev,
+            expected_registry_revision: reg_rev,
+            repository_path: fixture.repo_dir.clone(),
+            base_commit: fixture.base_commit.clone(),
+            approved_task_ids: vec!["task-exact-a".to_string(), "task-dir-b".to_string()],
+            approved_write_paths: vec![
+                "src/lib.rs".to_string(),
+                "src/extra.rs".to_string(),
+                "src/sub/".to_string(),
+            ],
+            max_parallel: 2,
+            budgets: ExecutionBudgets::default(),
+        };
+
+        let legacy_preview = fixture
+            .authority
+            .prepare_for_operator(base_intent.clone())
+            .expect("legacy preview without R");
+
+        let mut required_map = BTreeMap::new();
+        required_map.insert("task-exact-a".to_string(), vec!["src/lib.rs".to_string()]);
+        required_map.insert(
+            "task-dir-b".to_string(),
+            vec![
+                "src/sub/mod.rs".to_string(),
+                "src/sub/new_file.rs".to_string(),
+            ],
+        );
+        let r_preview = fixture
+            .authority
+            .prepare_for_operator_v2(OperatorApprovalIntentV2 {
+                schema_version: AUTHORITY_REQUEST_V2_SCHEMA_VERSION,
+                intent: base_intent,
+                task_required_changed_paths: required_map.clone(),
+            })
+            .expect("v2 preview with accepted R selection");
+
+        assert_eq!(
+            r_preview.tasks[0].allowed_write_paths,
+            vec!["src/lib.rs".to_string(), "src/extra.rs".to_string()]
+        );
+        assert_eq!(
+            r_preview.tasks[0].required_changed_paths,
+            Some(vec!["src/lib.rs".to_string()])
+        );
+        assert_eq!(
+            r_preview.tasks[1].allowed_write_paths,
+            vec!["src/sub/".to_string()]
+        );
+        assert_eq!(
+            r_preview.tasks[1].required_changed_paths,
+            Some(vec![
+                "src/sub/mod.rs".to_string(),
+                "src/sub/new_file.rs".to_string()
+            ])
+        );
+
+        // Selecting R must change BOTH core digest (profile_id / command_key) and subject digest.
+        assert_ne!(r_preview.subject_digest, legacy_preview.subject_digest);
+        assert_ne!(
+            r_preview.tasks[0].profile_id,
+            legacy_preview.tasks[0].profile_id
+        );
+        assert_ne!(
+            r_preview.tasks[0].command_key,
+            legacy_preview.tasks[0].command_key
+        );
+
+        // Original request v2 round-trip reproduces the exact preview.
+        let req_v2 = r_preview.to_request_v2().expect("to_request_v2");
+        assert_eq!(req_v2.schema_version, AUTHORITY_REQUEST_V2_SCHEMA_VERSION);
+        assert_eq!(req_v2.task_required_changed_paths, required_map);
+        let reconstructed_preview = fixture
+            .authority
+            .preview_for_operator_v2(req_v2.clone())
+            .expect("preview_for_operator_v2 round-trip");
+        assert_eq!(reconstructed_preview, r_preview);
+
+        // Commit via approve_confirmed_preview and verify idempotent replay via approve_confirmed_v2.
+        let summary_preview = fixture
+            .authority
+            .approve_confirmed_preview(r_preview.clone(), &r_preview.subject_digest)
+            .expect("approve_confirmed_preview with R succeeds");
+        let summary_req_v2 = fixture
+            .authority
+            .approve_confirmed_v2(req_v2, &r_preview.subject_digest)
+            .expect("approve_confirmed_v2 replays idempotently");
+        assert_eq!(summary_req_v2, summary_preview);
+
+        // Reopen store from disk and verify persisted required_changed_paths + integrity.
+        let reopened = AuthorityStore::open(
+            fixture.authority.dir(),
+            Arc::clone(&fixture.registry),
+            Arc::clone(&fixture.plans),
+        )
+        .expect("reopen AuthorityStore with persisted R");
+        let record = reopened
+            .get_for_operator(&summary_preview.approval_id)
+            .expect("load persisted record with R");
+        assert_eq!(
+            record.tasks[0].required_changed_paths,
+            Some(vec!["src/lib.rs".to_string()])
+        );
+        assert_eq!(
+            record.tasks[1].required_changed_paths,
+            Some(vec![
+                "src/sub/mod.rs".to_string(),
+                "src/sub/new_file.rs".to_string()
+            ])
+        );
+
+        // Normal worker write permissions in materialized WorkersConfig MUST remain A, not R.
+        let materialized = reopened
+            .materialize(
+                &record.approval_id,
+                &sample_binding("bnd_mat_r", THREAD_UUID_A),
+                &fixture.root.join("mat-r-work-area"),
+            )
+            .expect("materialize approval with R");
+        let workers = materialized.workers.expect("materialized workers config");
+        assert_eq!(workers.profiles.len(), 2);
+        assert_eq!(
+            workers.profiles[0].spec.allowed_write_paths,
+            BTreeSet::from(["src/lib.rs".to_string(), "src/extra.rs".to_string()]),
+            "worker write permissions must remain A, not narrowed to R"
+        );
+        assert_eq!(
+            workers.profiles[1].spec.allowed_write_paths,
+            BTreeSet::from(["src/sub/".to_string()]),
+            "directory worker write permissions must remain A, not narrowed to R"
+        );
+    }
+
+    #[test]
+    fn required_changed_paths_rejects_missing_overbound_duplicate_directory_and_foreign() {
+        let fixture = setup_fixture();
+        let reg_rev = fixture.registry.snapshot().unwrap().revision;
+        let (plan_rev, plan_digest) = save_and_publish_plan(
+            &fixture,
+            "plan-req-invalid",
+            "binding-1",
+            reg_rev,
+            vec![
+                PlanTask {
+                    id: "task-a".to_string(),
+                    title: "Task A".to_string(),
+                    instruction: "Modify src/lib.rs or src/extra.rs.".to_string(),
+                    role: WorkflowRole::Coder,
+                    difficulty: Difficulty::Hard,
+                    depends_on: Vec::new(),
+                    allowed_write_paths: vec!["src/lib.rs".to_string(), "src/extra.rs".to_string()],
+                },
+                PlanTask {
+                    id: "task-b".to_string(),
+                    title: "Task B".to_string(),
+                    instruction: "Modify files under src/sub/.".to_string(),
+                    role: WorkflowRole::Coder,
+                    difficulty: Difficulty::Easy,
+                    depends_on: Vec::new(),
+                    allowed_write_paths: vec!["src/sub/".to_string()],
+                },
+            ],
+        );
+
+        let make_intent = |approved_tasks: Vec<String>| OperatorApprovalIntent {
+            binding_id: "binding-1".to_string(),
+            thread_uuid: THREAD_UUID_A.to_string(),
+            plan_id: "plan-req-invalid".to_string(),
+            plan_revision: plan_rev,
+            expected_registry_revision: reg_rev,
+            repository_path: fixture.repo_dir.clone(),
+            base_commit: fixture.base_commit.clone(),
+            approved_task_ids: approved_tasks,
+            approved_write_paths: vec![
+                "src/lib.rs".to_string(),
+                "src/extra.rs".to_string(),
+                "src/sub/".to_string(),
+            ],
+            max_parallel: 2,
+            budgets: ExecutionBudgets::default(),
+        };
+
+        let make_request = |approved_tasks: Vec<String>| OperatorApprovalRequest {
+            binding_id: "binding-1".to_string(),
+            thread_uuid: THREAD_UUID_A.to_string(),
+            plan_id: "plan-req-invalid".to_string(),
+            plan_revision: plan_rev,
+            expected_registry_revision: reg_rev,
+            expected_plan_digest: plan_digest.clone(),
+            repository_path: fixture.repo_dir.clone(),
+            base_commit: fixture.base_commit.clone(),
+            approved_task_ids: approved_tasks,
+            approved_write_paths: vec![
+                "src/lib.rs".to_string(),
+                "src/extra.rs".to_string(),
+                "src/sub/".to_string(),
+            ],
+            max_parallel: 2,
+            budgets: ExecutionBudgets::default(),
+        };
+
+        let both_tasks = vec!["task-a".to_string(), "task-b".to_string()];
+        let overbound_paths: Vec<String> = (0..=MAX_REQUIRED_CHANGED_PATHS)
+            .map(|i| format!("src/sub/file_{i}.rs"))
+            .collect();
+
+        let invalid_cases = [
+            (
+                "empty required_changed_paths",
+                both_tasks.clone(),
+                BTreeMap::from([("task-a".to_string(), Vec::new())]),
+                "validation",
+            ),
+            (
+                "empty path entry in required_changed_paths",
+                both_tasks.clone(),
+                BTreeMap::from([("task-a".to_string(), vec![String::new()])]),
+                "invalid_write_scope",
+            ),
+            (
+                "over-bound required_changed_paths",
+                both_tasks.clone(),
+                BTreeMap::from([("task-b".to_string(), overbound_paths)]),
+                "validation",
+            ),
+            (
+                "duplicate required_changed_paths",
+                both_tasks.clone(),
+                BTreeMap::from([(
+                    "task-a".to_string(),
+                    vec!["src/lib.rs".to_string(), "src/lib.rs".to_string()],
+                )]),
+                "validation",
+            ),
+            (
+                "directory trailing slash in required_changed_paths",
+                both_tasks.clone(),
+                BTreeMap::from([("task-b".to_string(), vec!["src/sub/".to_string()])]),
+                "validation",
+            ),
+            (
+                "bare existing directory in required_changed_paths",
+                both_tasks.clone(),
+                BTreeMap::from([("task-b".to_string(), vec!["src/sub".to_string()])]),
+                "invalid_write_scope",
+            ),
+            (
+                "foreign path outside repository allowlist",
+                both_tasks.clone(),
+                BTreeMap::from([(
+                    "task-a".to_string(),
+                    vec!["unapproved/secret.rs".to_string()],
+                )]),
+                "validation",
+            ),
+            (
+                "foreign path owned by another task outside this task allowed_write_paths",
+                both_tasks.clone(),
+                BTreeMap::from([("task-a".to_string(), vec!["src/sub/mod.rs".to_string()])]),
+                "validation",
+            ),
+            (
+                "missing/unknown task_id key",
+                both_tasks.clone(),
+                BTreeMap::from([("task-missing".to_string(), vec!["src/lib.rs".to_string()])]),
+                "validation",
+            ),
+            (
+                "unselected task_id key",
+                vec!["task-a".to_string()],
+                BTreeMap::from([("task-b".to_string(), vec!["src/sub/mod.rs".to_string()])]),
+                "validation",
+            ),
+            (
+                "protected control path in required_changed_paths",
+                both_tasks.clone(),
+                BTreeMap::from([("task-a".to_string(), vec![".git/config".to_string()])]),
+                "invalid_write_scope",
+            ),
+        ];
+
+        for (label, approved_tasks, required_map, expected_code) in invalid_cases {
+            let Err(prep_err) =
+                fixture
+                    .authority
+                    .prepare_for_operator_v2(OperatorApprovalIntentV2 {
+                        schema_version: AUTHORITY_REQUEST_V2_SCHEMA_VERSION,
+                        intent: make_intent(approved_tasks.clone()),
+                        task_required_changed_paths: required_map.clone(),
+                    })
+            else {
+                panic!("prepare_for_operator_v2 must reject {label}");
+            };
+            assert_eq!(
+                prep_err.code(),
+                expected_code,
+                "prepare {label}: {prep_err}"
+            );
+
+            let Err(rec_err) = fixture.authority.approve_v2(OperatorApprovalRequestV2 {
+                schema_version: AUTHORITY_REQUEST_V2_SCHEMA_VERSION,
+                request: make_request(approved_tasks),
+                task_required_changed_paths: required_map,
+            }) else {
+                panic!("approve_v2 must reject {label}");
+            };
+            assert_eq!(rec_err.code(), expected_code, "approve {label}: {rec_err}");
+        }
+
+        // Unsupported schema_version in v2 wrappers is rejected on both prepare and record.
+        for bad_version in [0u32, 1, 3] {
+            let prep_ver = fixture
+                .authority
+                .prepare_for_operator_v2(OperatorApprovalIntentV2 {
+                    schema_version: bad_version,
+                    intent: make_intent(both_tasks.clone()),
+                    task_required_changed_paths: BTreeMap::from([(
+                        "task-a".to_string(),
+                        vec!["src/lib.rs".to_string()],
+                    )]),
+                })
+                .expect_err("bad schema_version prepare must fail");
+            assert_eq!(prep_ver.code(), "validation");
+
+            let rec_ver = fixture
+                .authority
+                .approve_v2(OperatorApprovalRequestV2 {
+                    schema_version: bad_version,
+                    request: make_request(both_tasks.clone()),
+                    task_required_changed_paths: BTreeMap::from([(
+                        "task-a".to_string(),
+                        vec!["src/lib.rs".to_string()],
+                    )]),
+                })
+                .expect_err("bad schema_version approve must fail");
+            assert_eq!(rec_ver.code(), "validation");
+        }
+
+        assert!(
+            !fixture.authority.approvals_path().exists(),
+            "rejected preparations and approvals must not create approvals.json"
+        );
+
+        // Stored-record integrity rejects corrupt required_changed_paths shapes on disk.
+        let valid_preview = fixture
+            .authority
+            .prepare_for_operator_v2(OperatorApprovalIntentV2 {
+                schema_version: AUTHORITY_REQUEST_V2_SCHEMA_VERSION,
+                intent: make_intent(vec!["task-a".to_string()]),
+                task_required_changed_paths: BTreeMap::from([(
+                    "task-a".to_string(),
+                    vec!["src/lib.rs".to_string()],
+                )]),
+            })
+            .expect("valid preview for integrity checks");
+        let valid_summary = fixture
+            .authority
+            .approve_confirmed_preview(valid_preview.clone(), &valid_preview.subject_digest)
+            .expect("persist valid record for integrity mutation tests");
+        let base_record = fixture
+            .authority
+            .get_for_operator(&valid_summary.approval_id)
+            .expect("load valid record");
+
+        let corrupt_variants: Vec<(&str, Option<Vec<String>>)> = vec![
+            ("empty stored R", Some(Vec::new())),
+            (
+                "duplicate stored R",
+                Some(vec!["src/lib.rs".to_string(), "src/lib.rs".to_string()]),
+            ),
+            ("directory stored R", Some(vec!["src/".to_string()])),
+            ("foreign stored R", Some(vec!["src/sub/mod.rs".to_string()])),
+        ];
+        for (label, bad_r) in corrupt_variants {
+            let mut mutated = base_record.clone();
+            mutated.tasks[0].required_changed_paths = bad_r;
+            let Err(err) =
+                verify_approval_record_integrity(&mutated, fixture.authority.approvals_path())
+            else {
+                panic!("integrity must reject {label}");
+            };
+            assert_eq!(err.code(), "corrupt_store", "{label}: {err}");
+        }
+    }
+
+    #[test]
+    fn required_changed_paths_rejects_tampered_preview_and_request_even_when_subset_of_allowed() {
+        let fixture = setup_fixture();
+        let reg_rev = fixture.registry.snapshot().unwrap().revision;
+        let (plan_rev, _plan_digest) = save_and_publish_plan(
+            &fixture,
+            "plan-req-tamper",
+            "binding-1",
+            reg_rev,
+            vec![PlanTask {
+                id: "task-a".to_string(),
+                title: "Two-file task".to_string(),
+                instruction: "Edit src/lib.rs and optionally src/extra.rs.".to_string(),
+                role: WorkflowRole::Coder,
+                difficulty: Difficulty::Hard,
+                depends_on: Vec::new(),
+                allowed_write_paths: vec!["src/lib.rs".to_string(), "src/extra.rs".to_string()],
+            }],
+        );
+
+        let intent = OperatorApprovalIntent {
+            binding_id: "binding-1".to_string(),
+            thread_uuid: THREAD_UUID_A.to_string(),
+            plan_id: "plan-req-tamper".to_string(),
+            plan_revision: plan_rev,
+            expected_registry_revision: reg_rev,
+            repository_path: fixture.repo_dir.clone(),
+            base_commit: fixture.base_commit.clone(),
+            approved_task_ids: vec!["task-a".to_string()],
+            approved_write_paths: vec!["src/lib.rs".to_string(), "src/extra.rs".to_string()],
+            max_parallel: 1,
+            budgets: ExecutionBudgets::default(),
+        };
+
+        let preview_a = fixture
+            .authority
+            .prepare_for_operator_v2(OperatorApprovalIntentV2 {
+                schema_version: AUTHORITY_REQUEST_V2_SCHEMA_VERSION,
+                intent: intent.clone(),
+                task_required_changed_paths: BTreeMap::from([(
+                    "task-a".to_string(),
+                    vec!["src/lib.rs".to_string()],
+                )]),
+            })
+            .expect("preview with R=[src/lib.rs]");
+        let preview_b = fixture
+            .authority
+            .prepare_for_operator_v2(OperatorApprovalIntentV2 {
+                schema_version: AUTHORITY_REQUEST_V2_SCHEMA_VERSION,
+                intent,
+                task_required_changed_paths: BTreeMap::from([(
+                    "task-a".to_string(),
+                    vec!["src/extra.rs".to_string()],
+                )]),
+            })
+            .expect("preview with R=[src/extra.rs]");
+        assert_ne!(preview_a.subject_digest, preview_b.subject_digest);
+
+        // 1. Tampered preview changing R to another valid subset of A while keeping original digest.
+        let mut tampered_preview = preview_a.clone();
+        tampered_preview.tasks[0].required_changed_paths = Some(vec!["src/extra.rs".to_string()]);
+        let err = fixture
+            .authority
+            .approve_confirmed_preview(tampered_preview, &preview_a.subject_digest)
+            .expect_err("tampered preview R must be rejected before commit");
+        assert_eq!(err.code(), "validation");
+
+        // 2. Self-consistent preview for R=[src/extra.rs] submitted with R=[src/lib.rs] subject digest.
+        let err = fixture
+            .authority
+            .approve_confirmed_preview(preview_b, &preview_a.subject_digest)
+            .expect_err("different R preview with old subject digest must be rejected");
+        assert_eq!(err.code(), "validation");
+
+        // 3. Preview with R silently stripped to None.
+        let mut stripped_preview = preview_a.clone();
+        stripped_preview.tasks[0].required_changed_paths = None;
+        let err = fixture
+            .authority
+            .approve_confirmed_preview(stripped_preview, &preview_a.subject_digest)
+            .expect_err("preview with stripped R must be rejected");
+        assert_eq!(err.code(), "validation");
+
+        // 4. Preview with duplicated task entry.
+        let mut dup_task_preview = preview_a.clone();
+        dup_task_preview.tasks.push(preview_a.tasks[0].clone());
+        let err = fixture
+            .authority
+            .approve_confirmed_preview(dup_task_preview, &preview_a.subject_digest)
+            .expect_err("preview with duplicate task_id must be rejected");
+        assert_eq!(err.code(), "validation");
+
+        // 5. Tampered OperatorApprovalRequestV2 changing R to another valid subset of A.
+        let mut tampered_req_v2 = preview_a.to_request_v2().unwrap();
+        tampered_req_v2
+            .task_required_changed_paths
+            .insert("task-a".to_string(), vec!["src/extra.rs".to_string()]);
+        let err = fixture
+            .authority
+            .approve_confirmed_v2(tampered_req_v2, &preview_a.subject_digest)
+            .expect_err("tampered request v2 R must be rejected before commit");
+        assert_eq!(err.code(), "validation");
+
+        // 6. Legacy OperatorApprovalRequest omitting R submitted with R-bound subject digest.
+        let err = fixture
+            .authority
+            .approve_confirmed(preview_a.request.clone(), &preview_a.subject_digest)
+            .expect_err("legacy request dropping R must be rejected");
+        assert_eq!(err.code(), "validation");
+
+        assert!(
+            !fixture.authority.approvals_path().exists(),
+            "all tampered commit attempts must leave zero approvals on disk"
+        );
+
+        // Genuine untampered preview commits cleanly with exact R.
+        let committed = fixture
+            .authority
+            .approve_confirmed_preview(preview_a.clone(), &preview_a.subject_digest)
+            .expect("genuine preview_a commits cleanly");
+        assert_eq!(committed.subject_digest, preview_a.subject_digest);
+        let persisted = fixture
+            .authority
+            .get_for_operator(&committed.approval_id)
+            .expect("load committed approval");
+        assert_eq!(
+            persisted.tasks[0].required_changed_paths,
+            Some(vec!["src/lib.rs".to_string()])
+        );
+        assert_eq!(
+            persisted.tasks[0].allowed_write_paths,
+            vec!["src/lib.rs".to_string(), "src/extra.rs".to_string()]
         );
     }
 }

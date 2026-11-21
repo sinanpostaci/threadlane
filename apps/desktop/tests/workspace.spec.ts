@@ -1636,6 +1636,217 @@ test.describe('Minimal chat stream, archive, scroll, and read-only backlog drawe
       0,
     );
   });
+
+  test('keeps selected chat stable with temporary-unavailable feedback across incomplete refresh and restores on wide and narrow viewports', async ({
+    page,
+  }) => {
+    const controller = await installMinimal(page, { width: 1040, height: 760 });
+    const baseSnapshot = await controller.getWorkspaceSnapshot();
+    expect(baseSnapshot).not.toBeNull();
+
+    const workspace = workspaceSection(page);
+    await expect(chatHeader(page, 'Workspace UI Contract')).toBeVisible();
+    await expect(
+      resolveStreamEventRow(page, MINIMAL_CHAT_READING_ANCHOR_TITLE),
+    ).toBeVisible();
+
+    const dropAlphaAt = (generatedAtMs: number): WorkspaceSnapshot =>
+      parseWorkspaceSnapshot({
+        ...baseSnapshot!,
+        generated_at_ms: generatedAtMs,
+        observation: {
+          ...baseSnapshot!.observation,
+          generated_at_ms: generatedAtMs,
+          jobs: baseSnapshot!.observation.jobs.filter(
+            (job) =>
+              !(
+                job.source_id === CHAT_ALPHA_IDENTITY.source_id &&
+                job.thread_uuid?.toLowerCase() ===
+                  CHAT_ALPHA_IDENTITY.thread_uuid
+              ),
+          ),
+          requests: baseSnapshot!.observation.requests.filter(
+            (req) =>
+              !(
+                req.source_id === CHAT_ALPHA_IDENTITY.source_id &&
+                req.thread_uuid?.toLowerCase() ===
+                  CHAT_ALPHA_IDENTITY.thread_uuid
+              ),
+          ),
+        },
+        chats: baseSnapshot!.chats
+          .filter(
+            (chat) =>
+              !workspaceChatIdentitiesEqual(chat.identity, CHAT_ALPHA_IDENTITY),
+          )
+          .map((chat) =>
+            workspaceChatIdentitiesEqual(
+              chat.identity,
+              CHAT_BETA_SAME_PROJECT_IDENTITY,
+            )
+              ? { ...chat, updated_at_ms: generatedAtMs - 100 }
+              : chat,
+          ),
+        native_samples: baseSnapshot!.native_samples.filter(
+          (sample) =>
+            !workspaceChatIdentitiesEqual(
+              sample.chat_identity,
+              CHAT_ALPHA_IDENTITY,
+            ),
+        ),
+        chat_work: (baseSnapshot!.chat_work ?? []).filter(
+          (entry) =>
+            !workspaceChatIdentitiesEqual(entry.identity, CHAT_ALPHA_IDENTITY),
+        ),
+        job_histories: baseSnapshot!.job_histories.filter(
+          (history) =>
+            history.job.chat_identity === null ||
+            !workspaceChatIdentitiesEqual(
+              history.job.chat_identity,
+              CHAT_ALPHA_IDENTITY,
+            ),
+        ),
+        messages: {
+          ...baseSnapshot!.messages,
+          items: baseSnapshot!.messages.items.filter(
+            (item) =>
+              item.scope.chat_identity === null ||
+              !workspaceChatIdentitiesEqual(
+                item.scope.chat_identity,
+                CHAT_ALPHA_IDENTITY,
+              ),
+          ),
+        },
+        bounds: {
+          ...baseSnapshot!.bounds,
+          native_samples_omitted:
+            baseSnapshot!.bounds.native_samples_omitted + 1,
+        },
+      });
+
+    const restoreReorderedAt = (generatedAtMs: number): WorkspaceSnapshot =>
+      parseWorkspaceSnapshot({
+        ...baseSnapshot!,
+        generated_at_ms: generatedAtMs,
+        observation: {
+          ...baseSnapshot!.observation,
+          generated_at_ms: generatedAtMs,
+        },
+        chats: baseSnapshot!.chats.map((chat) =>
+          workspaceChatIdentitiesEqual(
+            chat.identity,
+            CHAT_BETA_SAME_PROJECT_IDENTITY,
+          )
+            ? { ...chat, updated_at_ms: generatedAtMs - 100 }
+            : chat,
+        ),
+      });
+
+    // 1. Wide viewport (1040x760): incomplete refresh omits Alpha while Beta is newer.
+    await controller.clearInvocations();
+    await controller.setWorkspaceSnapshot(
+      dropAlphaAt(baseSnapshot!.generated_at_ms + 1_000),
+    );
+    await triggerWorkspaceRefresh(page);
+
+    const unavailableSurface = workspace.locator(
+      '[data-selected-chat-unavailable="true"]',
+    );
+    await expect(unavailableSurface).toBeVisible();
+    await expect(chatHeader(page, 'Workspace UI Contract')).toBeVisible();
+    await expect(
+      workspace.getByText('Temporarily unavailable', { exact: true }),
+    ).toBeVisible();
+    await expect(
+      workspace.getByText(/temporarily unavailable in the latest refresh/i),
+    ).toBeVisible();
+    await expect(
+      workspace.getByText(/\b(?:archived?|deleted?|removed?)\b/i),
+    ).toHaveCount(0);
+
+    // Never show Beta's data or mark Beta selected while Alpha is preserved.
+    await expect(chatHeader(page, 'Release Verification Gate')).toHaveCount(0);
+    await expect(
+      workspace.getByText(MINIMAL_CHAT_BETA_BACKLOG_SENTINEL),
+    ).toHaveCount(0);
+    await expect(workspace.getByText(BETA_CHAT_ONLY_SENTINEL)).toHaveCount(0);
+    await expect(
+      sidebar(page)
+        .locator('.tl-chat-item')
+        .filter({ hasText: 'Release Verification Gate' })
+        .first(),
+    ).toHaveAttribute('data-selected', 'false');
+
+    // Actions depending on missing chat evidence stay disabled.
+    const backlogBtn = backlogButton(page);
+    const openCodexBtn = workspace.getByRole('button', {
+      name: 'Open in Codex',
+      exact: true,
+    });
+    await expect(backlogBtn).toBeDisabled();
+    await expect(openCodexBtn).toBeDisabled();
+    expect(await controller.readArchivePreferencesRaw()).toBeNull();
+    await expectNoNeedsYou(page);
+    await expectNoHorizontalOverflow(page, 'wide unavailable selected chat');
+
+    // 2. Narrow viewport (390x740): temporary-unavailable feedback and disabled actions stay usable.
+    await page.setViewportSize({ width: 390, height: 740 });
+    await expect(unavailableSurface).toBeVisible();
+    await expect(chatHeader(page, 'Workspace UI Contract')).toBeVisible();
+    await expect(backlogBtn).toBeDisabled();
+    await expect(openCodexBtn).toBeDisabled();
+    await expectNoHorizontalOverflow(page, 'narrow unavailable selected chat');
+
+    // 3. Returning snapshot (with Beta still newer/reordered first) restores Alpha automatically.
+    await controller.setWorkspaceSnapshot(
+      restoreReorderedAt(baseSnapshot!.generated_at_ms + 2_000),
+    );
+    await triggerWorkspaceRefresh(page);
+
+    await expect(unavailableSurface).toHaveCount(0);
+    await expect(chatHeader(page, 'Workspace UI Contract')).toBeVisible();
+    await expect(
+      resolveStreamEventRow(page, MINIMAL_CHAT_READING_ANCHOR_TITLE),
+    ).toBeVisible();
+    await expect(
+      workspace.getByText(MINIMAL_CHAT_BETA_BACKLOG_SENTINEL),
+    ).toHaveCount(0);
+    await expect(backlogBtn).toBeEnabled();
+    await expect(openCodexBtn).toBeEnabled();
+    await expectNoHorizontalOverflow(page, 'narrow automatically restored chat');
+
+    // 4. If the user manually selects Beta while Alpha is unavailable, Beta stays selected when Alpha returns.
+    await page.setViewportSize({ width: 1040, height: 760 });
+    await controller.setWorkspaceSnapshot(
+      dropAlphaAt(baseSnapshot!.generated_at_ms + 3_000),
+    );
+    await triggerWorkspaceRefresh(page);
+    await expect(unavailableSurface).toBeVisible();
+
+    await selectChat(page, 'Release Verification Gate');
+    await expect(unavailableSurface).toHaveCount(0);
+    await expect(chatHeader(page, 'Release Verification Gate')).toBeVisible();
+    await expect(
+      resolveStreamEventRow(page, MINIMAL_CHAT_BETA_BACKLOG_SENTINEL),
+    ).toBeVisible();
+
+    await controller.setWorkspaceSnapshot(
+      restoreReorderedAt(baseSnapshot!.generated_at_ms + 4_000),
+    );
+    await triggerWorkspaceRefresh(page);
+    await expect(chatHeader(page, 'Release Verification Gate')).toBeVisible();
+    await expect(
+      resolveStreamEventRow(page, MINIMAL_CHAT_BETA_BACKLOG_SENTINEL),
+    ).toBeVisible();
+    await expect(
+      workspace.getByText(MINIMAL_CHAT_READING_ANCHOR_TITLE),
+    ).toHaveCount(0);
+
+    const openCalls = (await controller.getInvocations()).filter(
+      (call) => call.cmd === 'desktop_open_codex_chat',
+    );
+    expect(openCalls).toHaveLength(0);
+  });
 });
 
 test('keeps scoped planning rows and Active chats consistent across refresh and reopen', async ({ page }) => {
@@ -2441,6 +2652,469 @@ test.describe('Workspace liveness, attention, and committed completion', () => {
 
     await expectCommittedBacklogStatus(dialog, MINIMAL_CHAT_DONE_TITLE, 'done');
     await closeBacklogWithEscape(page);
+  });
+});
+
+test.describe('Sidebar status presentation and navigation counters', () => {
+  function escapeRegExp(value: string): string {
+    return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  }
+
+  function sidebarChatButton(scope: Locator, threadLabel: string): Locator {
+    const exactLabel = new RegExp(`^\\s*${escapeRegExp(threadLabel)}\\s*$`);
+    return scope
+      .locator('button.tl-chat-item')
+      .filter({
+        has: scope.page().locator('.tl-chat-item-label', { hasText: exactLabel }),
+      });
+  }
+
+  function projectHeaderButton(scope: Locator, projectLabel: string): Locator {
+    return scope
+      .locator(`section.tl-project-group[aria-label="${projectLabel}"] > button.tl-project-header`)
+      .first();
+  }
+
+  async function expectUnclippedPill(
+    pill: Locator,
+    expectedText: string,
+    expectedAriaLabel: string,
+    maxRightX?: number,
+  ): Promise<void> {
+    await expect(pill).toHaveCount(1);
+    await expect(pill).toBeVisible();
+    await expect(pill).toHaveText(expectedText);
+    await expect(pill).toHaveAttribute('aria-label', expectedAriaLabel);
+    await expect(pill).not.toHaveAttribute('title');
+    expect(
+      await pill.evaluate((element) => element.scrollWidth <= element.clientWidth + 1),
+    ).toBe(true);
+    if (maxRightX !== undefined) {
+      const box = await pill.boundingBox();
+      expect(box).not.toBeNull();
+      expect(box!.x).toBeGreaterThanOrEqual(0);
+      expect(box!.x + box!.width).toBeLessThanOrEqual(maxRightX + 1);
+    }
+  }
+
+  test('distinguishes confirmed idle and terminal samples from missing, unknown, and stale observations while preserving working, waiting, and passive events', async ({
+    page,
+  }) => {
+    const base = buildMinimalChatWorkspaceSnapshot();
+    const missingGammaSampleSnapshot = parseWorkspaceSnapshot({
+      ...base,
+      native_samples: base.native_samples.filter(
+        (sample) => !workspaceChatIdentitiesEqual(sample.chat_identity, CHAT_GAMMA_IDENTITY),
+      ),
+    });
+
+    const controller = await installMinimal(page, { width: 1040, height: 760 }, {
+      workspaceSnapshot: missingGammaSampleSnapshot,
+    });
+    const sidebarEl = sidebar(page);
+
+    // Alpha has live Worker presence (Working); passive events stay readable.
+    const alphaRow = sidebarChatButton(sidebarEl, 'Workspace UI Contract');
+    await expect(alphaRow).toHaveCount(1);
+    await expect(alphaRow.locator('[data-sidebar-status="working"]')).toHaveText('Working');
+    await expect(alphaRow.locator('.tl-status-dot')).toHaveAttribute('data-tone', 'working');
+    await expect(
+      resolveStreamEventRow(page, `Blocked: ${MINIMAL_CHAT_BLOCKED_TITLE}`),
+    ).toBeVisible();
+    await expect(
+      resolveStreamEventRow(
+        page,
+        `Worker result recorded: Failed for ${MINIMAL_CHAT_FAILED_TITLE}`,
+      ),
+    ).toBeVisible();
+    await expect(
+      resolveStreamEventRow(
+        page,
+        `Worker result recorded: Awaiting check for ${MINIMAL_CHAT_DOING_TITLE}`,
+      ),
+    ).toBeVisible();
+    await expect(
+      resolveStreamEventRow(
+        page,
+        `Preparing Worker execution for ${MINIMAL_CHAT_PREPARING_TITLE}`,
+      ),
+    ).toBeVisible();
+
+    // Beta has a real fresh idle native sample -> confirmed Idle (neutral).
+    const betaRow = sidebarChatButton(sidebarEl, 'Release Verification Gate');
+    await expect(betaRow).toHaveCount(1);
+    await expect(betaRow.locator('[data-sidebar-status="idle"]')).toHaveText('Idle');
+    await expect(betaRow.locator('.tl-status-dot')).toHaveAttribute('data-tone', 'neutral');
+
+    // Gamma has no native sample and no worker presence -> Status unavailable,
+    // never fabricating "No live agent" or any human-attention warning.
+    const gammaRow = sidebarChatButton(sidebarEl, 'Archived Migration Audit');
+    await expect(gammaRow).toHaveCount(1);
+    await expect(gammaRow.locator('[data-sidebar-status="unknown"]')).toHaveText(
+      'Status unavailable',
+    );
+    await expect(gammaRow.locator('.tl-status-dot')).toHaveAttribute('data-tone', 'neutral');
+    await expect(gammaRow.locator('[data-tone="attention"]')).toHaveCount(0);
+    await expect(gammaRow.getByText('No live agent')).toHaveCount(0);
+    await expectNoNeedsYou(page);
+
+    // Current explicit terminal worker presence (non_live, no native sample, no
+    // unconfirmed Doing worker) renders No live agent alongside real confirmed
+    // Idle (Beta) and missing observation (Gamma).
+    const alphaWork = getChatWorkFixture(missingGammaSampleSnapshot, CHAT_ALPHA_IDENTITY);
+    const alphaTerminalPresence = alphaWork.worker_presence.filter(
+      (entry) => entry.availability === 'non_live' && entry.live === false,
+    );
+    expect(alphaTerminalPresence.length).toBeGreaterThan(0);
+    const terminalAlphaSnapshot = advanceWorkspaceGeneratedAtFixture(
+      parseWorkspaceSnapshot({
+        ...updateChatWorkFixture(missingGammaSampleSnapshot, CHAT_ALPHA_IDENTITY, {
+          items: alphaWork.items.filter((item) => item.status !== 'doing'),
+          worker_presence: alphaTerminalPresence,
+        }),
+        native_samples: missingGammaSampleSnapshot.native_samples.filter(
+          (sample) => !workspaceChatIdentitiesEqual(sample.chat_identity, CHAT_ALPHA_IDENTITY),
+        ),
+      }),
+      FIXTURE_BASE_NOW_MS + 1_000,
+    );
+    await controller.setWorkspaceSnapshot(terminalAlphaSnapshot);
+    await triggerWorkspaceRefresh(page);
+
+    await expect(alphaRow.locator('[data-sidebar-status="terminal"]')).toHaveText('No live agent');
+    await expect(alphaRow.locator('.tl-status-dot')).toHaveAttribute('data-tone', 'neutral');
+    await expect(alphaRow.locator('[data-tone="attention"]')).toHaveCount(0);
+    await expect(betaRow.locator('[data-sidebar-status="idle"]')).toHaveText('Idle');
+    await expect(betaRow.locator('.tl-status-dot')).toHaveAttribute('data-tone', 'neutral');
+    await expect(gammaRow.locator('[data-sidebar-status="unknown"]')).toHaveText(
+      'Status unavailable',
+    );
+    await expect(gammaRow.locator('.tl-status-dot')).toHaveAttribute('data-tone', 'neutral');
+    await expectNoNeedsYou(page);
+
+    // Waiting presentation is preserved while unknown native activity stays unavailable.
+    const waitingBetaBase = updateNativeActivityFixture(
+      updateNativeActivityFixture(base, CHAT_BETA_SAME_PROJECT_IDENTITY, 'waiting_for_approval'),
+      CHAT_GAMMA_IDENTITY,
+      'unknown',
+    );
+    const waitingBetaAndUnknownGamma = advanceWorkspaceGeneratedAtFixture(
+      parseWorkspaceSnapshot({
+        ...waitingBetaBase,
+        native_samples: waitingBetaBase.native_samples.map((sample) =>
+          workspaceChatIdentitiesEqual(sample.chat_identity, CHAT_BETA_SAME_PROJECT_IDENTITY)
+            ? { ...sample, sequence: sample.sequence + 1 }
+            : sample,
+        ),
+      }),
+      FIXTURE_BASE_NOW_MS + 2_000,
+    );
+    await controller.setWorkspaceSnapshot(waitingBetaAndUnknownGamma);
+    await triggerWorkspaceRefresh(page);
+
+    await expect(alphaRow.locator('[data-sidebar-status="working"]')).toHaveText('Working');
+    await expect(alphaRow.locator('.tl-status-dot')).toHaveAttribute('data-tone', 'working');
+    await expect(betaRow.locator('[data-sidebar-status="waiting"]')).toHaveText(
+      'Waiting for you in Codex',
+    );
+    await expect(betaRow.locator('[data-sidebar-status="waiting"]')).toHaveAttribute(
+      'data-tone',
+      'attention',
+    );
+    await expect(betaRow.locator('.tl-status-dot')).toHaveAttribute('data-tone', 'attention');
+    await expect(gammaRow.locator('[data-sidebar-status="unknown"]')).toHaveText(
+      'Status unavailable',
+    );
+    await expect(gammaRow.locator('.tl-status-dot')).toHaveAttribute('data-tone', 'neutral');
+    await expect(gammaRow.locator('[data-tone="attention"]')).toHaveCount(0);
+    await expect(gammaRow.getByText('No live agent')).toHaveCount(0);
+    await expectSingleNeedsYou(page);
+
+    // Aging past the stale threshold clears working/waiting and switches all
+    // sidebar rows to neutral Status unavailable without warnings.
+    await page.clock.setFixedTime(FIXTURE_BASE_NOW_MS + STALE_ADVANCE_MS);
+    await expect(alphaRow.locator('[data-sidebar-status="unknown"]')).toHaveText(
+      'Status unavailable',
+    );
+    await expect(alphaRow.locator('.tl-status-dot')).toHaveAttribute('data-tone', 'neutral');
+    await expect(alphaRow.getByText('No live agent')).toHaveCount(0);
+    await expect(betaRow.locator('[data-sidebar-status="unknown"]')).toHaveText(
+      'Status unavailable',
+    );
+    await expect(betaRow.locator('.tl-status-dot')).toHaveAttribute('data-tone', 'neutral');
+    await expect(gammaRow.locator('[data-sidebar-status="unknown"]')).toHaveText(
+      'Status unavailable',
+    );
+    await expect(gammaRow.locator('.tl-status-dot')).toHaveAttribute('data-tone', 'neutral');
+    await expect(sidebarEl.locator('[data-tone="attention"]')).toHaveCount(0);
+    await expect(sidebarEl.locator('[data-nav-counter], [data-project-counter]')).toHaveCount(0);
+    await expectNoNeedsYou(page);
+  });
+
+  test('counts working agents separately from waiting chats with singular and plural visible and accessible units', async ({
+    page,
+  }) => {
+    const base = buildMinimalChatWorkspaceSnapshot();
+    // One chat (Alpha) with two working agents: live Worker + working Coworker.
+    const twoWorkingAgentsOneChat = updateNativeActivityFixture(
+      base,
+      CHAT_ALPHA_IDENTITY,
+      'working',
+    );
+
+    const controller = await installMinimal(page, { width: 1040, height: 760 }, {
+      workspaceSnapshot: twoWorkingAgentsOneChat,
+    });
+    const sidebarEl = sidebar(page);
+    const projectsNavBtn = sidebarEl.getByRole('button', { name: 'Projects', exact: true });
+    const alphaProjectBtn = projectHeaderButton(sidebarEl, 'threadlane-alpha');
+    const legacyProjectBtn = projectHeaderButton(sidebarEl, 'threadlane-legacy');
+
+    // Global and project working counters report 2 working agents for 1 chat.
+    await expectUnclippedPill(
+      projectsNavBtn.locator('[data-nav-counter="working-agents"]'),
+      '2 working agents',
+      '2 working agents',
+    );
+    await expect(projectsNavBtn.locator('[data-nav-counter="waiting-chats"]')).toHaveCount(0);
+    await expectUnclippedPill(
+      alphaProjectBtn.locator('[data-project-counter="working-agents"]'),
+      '2 working agents',
+      '2 working agents',
+    );
+    await expect(alphaProjectBtn.locator('[data-project-counter="waiting-chats"]')).toHaveCount(0);
+    await expect(legacyProjectBtn.locator('[data-project-counter]')).toHaveCount(0);
+
+    // Single-counter sidebar rows stay compact on one row.
+    const singleNavBox = await projectsNavBtn.boundingBox();
+    const singleProjectBox = await alphaProjectBtn.boundingBox();
+    expect(singleNavBox).not.toBeNull();
+    expect(singleProjectBox).not.toBeNull();
+    expect(singleNavBox!.height).toBeLessThanOrEqual(52);
+    expect(singleProjectBox!.height).toBeLessThanOrEqual(48);
+    await expectNoHorizontalOverflow(page, 'desktop sidebar with 2 working agents');
+
+    // Adding one waiting chat in the same project keeps working agents (2) and
+    // waiting chats (1) separate without mixing units.
+    const twoWorkingOneWaiting = updateNativeActivityFixture(
+      twoWorkingAgentsOneChat,
+      CHAT_BETA_SAME_PROJECT_IDENTITY,
+      'waiting_for_approval',
+    );
+    await controller.setWorkspaceSnapshot(twoWorkingOneWaiting);
+    await triggerWorkspaceRefresh(page);
+
+    await expectUnclippedPill(
+      projectsNavBtn.locator('[data-nav-counter="working-agents"]'),
+      '2 working agents',
+      '2 working agents',
+    );
+    await expectUnclippedPill(
+      projectsNavBtn.locator('[data-nav-counter="waiting-chats"]'),
+      '1 waiting chat',
+      '1 chat waiting for you',
+    );
+    await expect(
+      lifecycleFilterControl(page, 'active').locator('.tl-status-dot[data-tone="attention"]'),
+    ).toHaveAttribute('aria-label', '1 active chat waiting for you');
+    await expectUnclippedPill(
+      alphaProjectBtn.locator('[data-project-counter="working-agents"]'),
+      '2 working agents',
+      '2 working agents',
+    );
+    await expectUnclippedPill(
+      alphaProjectBtn.locator('[data-project-counter="waiting-chats"]'),
+      '1 waiting chat',
+      '1 chat waiting for you',
+    );
+    const projectNameBox = await alphaProjectBtn.locator('.tl-project-name').boundingBox();
+    expect(projectNameBox).not.toBeNull();
+    expect(projectNameBox!.width).toBeGreaterThanOrEqual(72);
+    const twoCounterProjectBox = await alphaProjectBtn.boundingBox();
+    expect(twoCounterProjectBox).not.toBeNull();
+    expect(twoCounterProjectBox!.height).toBeLessThanOrEqual(76);
+    await expectSingleNeedsYou(page);
+    await expectNoHorizontalOverflow(page, 'desktop sidebar with mixed working and waiting counters');
+
+    // Singular working agent (1 live Worker on Alpha) + plural waiting chats
+    // (Beta in threadlane-alpha and Gamma in threadlane-legacy).
+    const oneWorkingTwoWaiting = updateNativeActivityFixture(
+      updateNativeActivityFixture(base, CHAT_BETA_SAME_PROJECT_IDENTITY, 'waiting_for_approval'),
+      CHAT_GAMMA_IDENTITY,
+      'waiting_for_input',
+    );
+    await controller.setWorkspaceSnapshot(oneWorkingTwoWaiting);
+    await triggerWorkspaceRefresh(page);
+
+    await expectUnclippedPill(
+      projectsNavBtn.locator('[data-nav-counter="working-agents"]'),
+      '1 working agent',
+      '1 working agent',
+    );
+    await expectUnclippedPill(
+      projectsNavBtn.locator('[data-nav-counter="waiting-chats"]'),
+      '2 waiting chats',
+      '2 chats waiting for you',
+    );
+    await expect(
+      lifecycleFilterControl(page, 'active').locator('.tl-status-dot[data-tone="attention"]'),
+    ).toHaveAttribute('aria-label', '2 active chats waiting for you');
+    await expectUnclippedPill(
+      alphaProjectBtn.locator('[data-project-counter="working-agents"]'),
+      '1 working agent',
+      '1 working agent',
+    );
+    await expectUnclippedPill(
+      alphaProjectBtn.locator('[data-project-counter="waiting-chats"]'),
+      '1 waiting chat',
+      '1 chat waiting for you',
+    );
+    await expect(
+      legacyProjectBtn.locator('[data-project-counter="working-agents"]'),
+    ).toHaveCount(0);
+    await expectUnclippedPill(
+      legacyProjectBtn.locator('[data-project-counter="waiting-chats"]'),
+      '1 waiting chat',
+      '1 chat waiting for you',
+    );
+
+    // Collapsed desktop sidebar surfaces the exact same units in the titlebar.
+    await page.getByRole('button', { name: /collapse sidebar/i }).first().click();
+    const titlebar = page.locator('header.tl-titlebar').first();
+    await expectUnclippedPill(
+      titlebar.locator('[data-nav-counter="working-agents"]'),
+      '1 working agent',
+      '1 working agent',
+      1040,
+    );
+    await expectUnclippedPill(
+      titlebar.locator('[data-nav-counter="waiting-chats"]'),
+      '2 waiting chats',
+      '2 chats waiting for you',
+      1040,
+    );
+    await expectNoHorizontalOverflow(page, 'collapsed sidebar titlebar counters');
+  });
+
+  test('keeps working-agent and waiting-chat units readable and unclipped in narrow navigation at 760px and 390px', async ({
+    page,
+  }) => {
+    const base = buildMinimalChatWorkspaceSnapshot();
+    const narrowBase = updateNativeActivityFixture(
+      updateNativeActivityFixture(base, CHAT_ALPHA_IDENTITY, 'working'),
+      CHAT_BETA_SAME_PROJECT_IDENTITY,
+      'waiting_for_approval',
+    );
+    const narrowSnapshot = parseWorkspaceSnapshot({
+      ...narrowBase,
+      native_samples: narrowBase.native_samples.filter(
+        (sample) => !workspaceChatIdentitiesEqual(sample.chat_identity, CHAT_GAMMA_IDENTITY),
+      ),
+    });
+
+    await installMinimal(page, { width: 760, height: 760 }, {
+      workspaceSnapshot: narrowSnapshot,
+    });
+
+    const titlebar = page.locator('header.tl-titlebar').first();
+    const titlebarPills = titlebar.locator('.tl-titlebar-pills');
+    await expectUnclippedPill(
+      titlebarPills.locator('[data-nav-counter="working-agents"]'),
+      '2 working agents',
+      '2 working agents',
+      760,
+    );
+    await expectUnclippedPill(
+      titlebarPills.locator('[data-nav-counter="waiting-chats"]'),
+      '1 waiting chat',
+      '1 chat waiting for you',
+      760,
+    );
+    await expectNoHorizontalOverflow(page, '760px narrow titlebar navigation counters');
+
+    await page.setViewportSize({ width: 390, height: 740 });
+    await expectUnclippedPill(
+      titlebarPills.locator('[data-nav-counter="working-agents"]'),
+      '2 working agents',
+      '2 working agents',
+      390,
+    );
+    await expectUnclippedPill(
+      titlebarPills.locator('[data-nav-counter="waiting-chats"]'),
+      '1 waiting chat',
+      '1 chat waiting for you',
+      390,
+    );
+    expect(
+      await titlebarPills.evaluate((element) => element.scrollWidth <= element.clientWidth + 1),
+    ).toBe(true);
+    await expectNoHorizontalOverflow(page, '390px narrow titlebar navigation counters');
+
+    const drawerTrigger = titlebar.getByRole('button', { name: /open navigation drawer/i }).first();
+    await drawerTrigger.click();
+    const drawer = page.locator('#tl-navigation-drawer');
+    await expect(drawer).toBeVisible();
+
+    const drawerProjectsBtn = drawer.getByRole('button', { name: 'Projects', exact: true });
+    await expectUnclippedPill(
+      drawerProjectsBtn.locator('[data-nav-counter="working-agents"]'),
+      '2 working agents',
+      '2 working agents',
+      390,
+    );
+    await expectUnclippedPill(
+      drawerProjectsBtn.locator('[data-nav-counter="waiting-chats"]'),
+      '1 waiting chat',
+      '1 chat waiting for you',
+      390,
+    );
+
+    const drawerAlphaProject = projectHeaderButton(drawer, 'threadlane-alpha');
+    await expectUnclippedPill(
+      drawerAlphaProject.locator('[data-project-counter="working-agents"]'),
+      '2 working agents',
+      '2 working agents',
+      390,
+    );
+    await expectUnclippedPill(
+      drawerAlphaProject.locator('[data-project-counter="waiting-chats"]'),
+      '1 waiting chat',
+      '1 chat waiting for you',
+      390,
+    );
+
+    const drawerAlphaRow = sidebarChatButton(drawer, 'Workspace UI Contract');
+    await expect(drawerAlphaRow).toHaveCount(1);
+    await expect(drawerAlphaRow.locator('[data-sidebar-status="working"]')).toHaveText('Working');
+    await expect(drawerAlphaRow.locator('.tl-status-dot')).toHaveAttribute('data-tone', 'working');
+
+    const drawerBetaRow = sidebarChatButton(drawer, 'Release Verification Gate');
+    await expect(drawerBetaRow).toHaveCount(1);
+    await expect(drawerBetaRow.locator('[data-sidebar-status="waiting"]')).toHaveText(
+      'Waiting for you in Codex',
+    );
+    await expect(drawerBetaRow.locator('[data-sidebar-status="waiting"]')).toHaveAttribute(
+      'data-tone',
+      'attention',
+    );
+    await expect(drawerBetaRow.locator('.tl-status-dot')).toHaveAttribute('data-tone', 'attention');
+
+    const drawerGammaRow = sidebarChatButton(drawer, 'Archived Migration Audit');
+    await expect(drawerGammaRow).toHaveCount(1);
+    await expect(drawerGammaRow.locator('[data-sidebar-status="unknown"]')).toHaveText(
+      'Status unavailable',
+    );
+    await expect(drawerGammaRow.locator('.tl-status-dot')).toHaveAttribute('data-tone', 'neutral');
+    await expect(drawerGammaRow.locator('[data-tone="attention"]')).toHaveCount(0);
+    await expect(drawerGammaRow.getByText('No live agent')).toHaveCount(0);
+
+    expect(
+      await drawer.evaluate((element) => element.scrollWidth <= element.clientWidth + 1),
+    ).toBe(true);
+    await expectNoHorizontalOverflow(page, '390px narrow navigation drawer');
+
+    await page.keyboard.press('Escape');
+    await expect(drawer).toHaveCount(0);
   });
 });
 

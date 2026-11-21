@@ -9397,6 +9397,7 @@ exit 0
                             .then_some(threadlane_workers::WorkerFilePermissions::TaskFiles),
                         depends_on: ct.depends_on.clone(),
                         allowed_write_paths: ct.allowed_write_paths.clone(),
+                        required_changed_paths: None,
                         task_digest,
                         profile_id: None,
                         command_key: None,

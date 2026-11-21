@@ -63,12 +63,13 @@ use crate::coworker_workflow::{
 };
 use crate::error::{NativeError, NativeErrorCode};
 use crate::fs_safety::{
-    ensure_platform_supported, prepare_private_dir, read_private_file_bounded,
-    validate_absolute_no_symlink_components, validate_bounded_identifier,
+    constant_time_str_eq, ensure_platform_supported, prepare_private_dir,
+    read_private_file_bounded, validate_absolute_no_symlink_components,
+    validate_bounded_identifier,
 };
 use crate::planning_commands::{
     current_wall_clock_ms, EnqueuePlanningCommandRequest, PlanningCommandPayload,
-    PlanningCommandResultRef, PlanningCommandStatus, PlanningCommandStore,
+    PlanningCommandRecord, PlanningCommandResultRef, PlanningCommandStatus, PlanningCommandStore,
 };
 use crate::planning_driver::{
     enqueue_planning_command_summary, get_planning_command_summary_readonly,
@@ -78,7 +79,8 @@ use crate::planning_driver::{
     PlanningCommandVerificationIssueKind,
 };
 use crate::profile_flow::{
-    preflight, PreflightRequest, RoleExecutionRoute, RolePreflightRequest, SelectedRoleChoice,
+    preflight, ExecutionPolicy, PreflightRequest, RoleExecutionRoute, RolePreflightRequest,
+    SelectedRoleChoice,
 };
 use crate::role_flow::read_registry_snapshot_readonly;
 
@@ -2382,8 +2384,13 @@ impl CoworkerPlanningGateway {
         })
     }
 
-    /// Enqueues a dependency-bound Architect consultation command for `(grant_id, job_id)` and
-    /// triggers detached execution via the canonical same-package sibling `threadlane-flow` CLI.
+    /// Enqueues a dependency-bound legacy Architect consultation command for `(grant_id, job_id)`
+    /// and triggers detached execution via the canonical same-package sibling `threadlane-flow` CLI.
+    ///
+    /// Refuses new legacy requests when the standing planning grant policy authorizes only canonical
+    /// `advisor` (guiding callers to [`Self::consult_advisor`]) while preserving pre-transition
+    /// `architect` grants, explicit mixed-policy targets naming `architect`, and exact immutable
+    /// replay of already-persisted confirmed legacy `architect` commands without new provider calls.
     pub async fn consult_architect(
         &self,
         params: &ConsultArchitectParams,
@@ -2650,21 +2657,53 @@ impl CoworkerPlanningGateway {
         let now_ms = current_wall_clock_ms()?;
         let workflow_store = CoworkerWorkflowStore::new(&self.plans_dir)?;
         let wf_ledger = workflow_store.read_binding_ledger(&self.binding_id)?;
-        let grant = require_active_grant_for_scope(
+        let grant = require_scoped_grant(
             &wf_ledger,
             &self.binding_id,
             &self.thread_uuid,
             &params.grant_id,
-            now_ms,
         )?;
-        if role == WorkflowRole::Advisor && !grant.policy.explicitly_authorizes_advisor() {
-            return Err(NativeError::new(
-                NativeErrorCode::ValidationFailed,
-                "canonical Advisor consultation requires planning authority that explicitly names the advisor role; use consult_architect for a pre-transition architect-only grant",
-            ));
+        ensure_grant_not_revoked_or_expired(grant, now_ms)?;
+
+        let existing_cmd =
+            self.lookup_existing_planning_command_readonly(&workflow_store, &params.request_key)?;
+        let policy_new_consult_check =
+            self.ensure_policy_explicitly_authorizes_new_consult(grant, role, params.difficulty);
+
+        match existing_cmd {
+            None => {
+                policy_new_consult_check?;
+                ensure_grant_has_remaining_budget(grant)?;
+                let (enqueue_req, _) = self
+                    .construct_consult_enqueue_request(&wf_ledger, grant, params, role, now_ms)?;
+                Ok(enqueue_req)
+            }
+            Some((command_store, existing)) => {
+                let (enqueue_req, context_digest) = self
+                    .construct_consult_enqueue_request(&wf_ledger, grant, params, role, now_ms)?;
+                validate_existing_consult_replay(
+                    &command_store,
+                    &existing,
+                    grant,
+                    &enqueue_req,
+                    &context_digest,
+                    policy_new_consult_check,
+                )?;
+                Ok(enqueue_req)
+            }
         }
+    }
+
+    fn construct_consult_enqueue_request(
+        &self,
+        wf_ledger: &CoworkerBindingLedger,
+        grant: &PlanningAdviceGrant,
+        params: &ConsultArchitectParams,
+        role: WorkflowRole,
+        now_ms: u64,
+    ) -> Result<(EnqueuePlanningCommandRequest, String), NativeError> {
         let job = require_scoped_job(
-            &wf_ledger,
+            wf_ledger,
             &self.binding_id,
             &self.thread_uuid,
             &params.job_id,
@@ -2690,7 +2729,7 @@ impl CoworkerPlanningGateway {
         }
 
         let prior_advice_context = resolve_prior_advice_records(
-            &wf_ledger,
+            wf_ledger,
             grant,
             &self.binding_id,
             &self.thread_uuid,
@@ -2718,7 +2757,7 @@ impl CoworkerPlanningGateway {
             interface_ownership_digests,
             accepted_predecessor_trees,
         };
-        let _ = context_dependencies.context_digest()?;
+        let context_digest = context_dependencies.context_digest()?;
 
         let arch_req = RunArchitectAdviceRequest {
             binding_id: self.binding_id.clone(),
@@ -2734,11 +2773,138 @@ impl CoworkerPlanningGateway {
             current_time_ms: now_ms,
         };
 
-        if role == WorkflowRole::Advisor {
-            Ok(EnqueuePlanningCommandRequest::from_advisor(arch_req))
+        let enqueue_req = if role == WorkflowRole::Advisor {
+            EnqueuePlanningCommandRequest::from_advisor(arch_req)
         } else {
-            Ok(EnqueuePlanningCommandRequest::from_architect(arch_req))
+            EnqueuePlanningCommandRequest::from_architect(arch_req)
+        };
+        Ok((enqueue_req, context_digest))
+    }
+
+    fn lookup_existing_planning_command_readonly(
+        &self,
+        workflow_store: &CoworkerWorkflowStore,
+        request_key: &str,
+    ) -> Result<Option<(PlanningCommandStore, PlanningCommandRecord)>, NativeError> {
+        let commands_dir = planning_commands_dir(workflow_store.plans_dir());
+        if !inspect_existing_private_subdir_readonly(&commands_dir, "planning_commands_dir")? {
+            return Ok(None);
         }
+        let mut command_store = PlanningCommandStore::open_existing(
+            &commands_dir,
+            workflow_store.clone(),
+            &self.registry_dir,
+        )?;
+        let artifacts_dir = planning_artifacts_dir(workflow_store.plans_dir());
+        if inspect_existing_private_subdir_readonly(&artifacts_dir, "planning_artifacts_dir")? {
+            command_store = command_store.with_artifacts_dir(&artifacts_dir)?;
+        }
+        let Some(existing) =
+            command_store.get_command_by_key(&self.binding_id, &self.thread_uuid, request_key)?
+        else {
+            return Ok(None);
+        };
+        existing.validate()?;
+        if existing.binding_id != self.binding_id || existing.thread_uuid != self.thread_uuid {
+            return Err(NativeError::new(
+                NativeErrorCode::SecurityViolation,
+                "planning command scope does not match verified binding_id and thread_uuid",
+            ));
+        }
+        Ok(Some((command_store, existing)))
+    }
+
+    fn ensure_policy_explicitly_authorizes_new_consult(
+        &self,
+        grant: &PlanningAdviceGrant,
+        role: WorkflowRole,
+        difficulty: Option<Difficulty>,
+    ) -> Result<(), NativeError> {
+        let has_advisor = grant.policy.explicitly_authorizes_advisor();
+        let has_architect = policy_explicitly_authorizes_architect(&grant.policy);
+
+        match role {
+            WorkflowRole::Advisor => {
+                if !has_advisor {
+                    return Err(NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        "canonical Advisor consultation requires planning authority that explicitly names the advisor role; use consult_architect for a pre-transition architect-only grant",
+                    ));
+                }
+                if has_architect {
+                    self.ensure_mixed_policy_target_explicitly_authorizes_role(
+                        grant,
+                        WorkflowRole::Advisor,
+                        difficulty,
+                    )?;
+                }
+                Ok(())
+            }
+            WorkflowRole::Architect => {
+                if !has_architect {
+                    let message = if has_advisor {
+                        "legacy consult_architect cannot create a new Architect command under planning authority that explicitly names only the advisor role; use consult_advisor for new consultations (consult_architect remains available for pre-transition architect grants and exact immutable replay of already-persisted legacy commands)"
+                    } else {
+                        "legacy consult_architect requires planning authority that explicitly names the architect role; this standing planning grant policy does not authorize advisory consultations"
+                    };
+                    return Err(NativeError::new(NativeErrorCode::ValidationFailed, message));
+                }
+                if has_advisor {
+                    self.ensure_mixed_policy_target_explicitly_authorizes_role(
+                        grant,
+                        WorkflowRole::Architect,
+                        difficulty,
+                    )?;
+                }
+                Ok(())
+            }
+            _ => Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "consultation command requires the advisory role",
+            )),
+        }
+    }
+
+    fn ensure_mixed_policy_target_explicitly_authorizes_role(
+        &self,
+        grant: &PlanningAdviceGrant,
+        role: WorkflowRole,
+        difficulty: Option<Difficulty>,
+    ) -> Result<(), NativeError> {
+        let live_reg_snapshot = read_registry_snapshot_readonly(&self.registry_dir)?;
+        let reg_snapshot = verify_grant_registry_dependencies(&live_reg_snapshot, grant)?;
+        let report = preflight(
+            &reg_snapshot,
+            &PreflightRequest {
+                profile_id: Some(grant.profile_id.clone()),
+                roles: vec![RolePreflightRequest::new(role, difficulty)],
+            },
+            &grant.policy,
+        )?;
+        let outcome = report.roles.first().ok_or_else(|| {
+            NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "mixed planning grant policy preflight returned no role outcome",
+            )
+        })?;
+        let (true, Some(selected)) = (outcome.ready, outcome.selected.as_ref()) else {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                format!(
+                    "standing planning grant does not authorize role `{role}` for the requested difficulty: {}",
+                    outcome.detail
+                ),
+            ));
+        };
+        if !policy_explicitly_authorizes_choice(&grant.policy, role, selected) {
+            let message = if role == WorkflowRole::Architect {
+                "legacy consult_architect cannot create a new Architect command for a target whose mixed-policy rule explicitly names only the advisor role; use consult_advisor for that target or select a difficulty whose rule explicitly names architect"
+            } else {
+                "canonical Advisor consultation cannot create a new Advisor command for a target whose mixed-policy rule explicitly names only the legacy architect role; use consult_architect for that target or select a difficulty whose rule explicitly names advisor"
+            };
+            return Err(NativeError::new(NativeErrorCode::ValidationFailed, message));
+        }
+        Ok(())
     }
 
     fn build_request_technical_plan_enqueue_request(
@@ -2937,55 +3103,58 @@ impl CoworkerPlanningGateway {
                 )
             })??;
 
-        if let Some((ref reconnect_cfg, backend_pid)) = self.managed_native_notice {
-            let notice_key = crate::coworker_workflow::CoworkerJobOwnershipKey::new(
-                self.binding_id.clone(),
-                self.thread_uuid.clone(),
-                enqueued.command_id.clone(),
-            )?;
-            let stream = reconnect_cfg
-                .connect_verified_stream_for_backend(Some(backend_pid))
-                .await
-                .map_err(|err| {
-                    let code = match err {
-                        threadlane::Error::SecurityViolation(_) => {
-                            NativeErrorCode::SecurityViolation
-                        }
-                        _ => NativeErrorCode::NotConfigured,
-                    };
-                    NativeError::new(code, "failed to verify managed native notice endpoint")
-                })?;
-            let socket_path = stream
-                .peer_addr()
-                .map_err(|_| {
-                    NativeError::new(
-                        NativeErrorCode::IoError,
-                        "failed to inspect verified native notice peer address",
-                    )
-                })?
-                .as_pathname()
-                .ok_or_else(|| {
-                    NativeError::new(
-                        NativeErrorCode::ValidationFailed,
-                        "verified native notice endpoint socket must have a pathname",
-                    )
-                })?
-                .to_path_buf();
-            drop(stream);
-            let target =
-                threadlane::native_tool_output::NativeToolOutputConfig::new_user_message_steer(
-                    socket_path,
+        if enqueued.status != PlanningCommandStatus::Completed {
+            if let Some((ref reconnect_cfg, backend_pid)) = self.managed_native_notice {
+                let notice_key = crate::coworker_workflow::CoworkerJobOwnershipKey::new(
+                    self.binding_id.clone(),
                     self.thread_uuid.clone(),
-                    PathBuf::from(&enqueued.call_project_base.repository_path),
-                )
-                .with_reconnect(Some(reconnect_cfg.clone()));
-            let notice_cfg = crate::coworker_notice::PlanningNoticeConfig::new(
-                notice_key,
-                enqueued.command_digest.clone(),
-                target,
-            )?;
-            let notice_dir = crate::coworker_notice::planning_notice_dir(&plans_dir);
-            crate::coworker_notice::PlanningNoticeStore::new(&notice_dir)?.configure(notice_cfg)?;
+                    enqueued.command_id.clone(),
+                )?;
+                let stream = reconnect_cfg
+                    .connect_verified_stream_for_backend(Some(backend_pid))
+                    .await
+                    .map_err(|err| {
+                        let code = match err {
+                            threadlane::Error::SecurityViolation(_) => {
+                                NativeErrorCode::SecurityViolation
+                            }
+                            _ => NativeErrorCode::NotConfigured,
+                        };
+                        NativeError::new(code, "failed to verify managed native notice endpoint")
+                    })?;
+                let socket_path = stream
+                    .peer_addr()
+                    .map_err(|_| {
+                        NativeError::new(
+                            NativeErrorCode::IoError,
+                            "failed to inspect verified native notice peer address",
+                        )
+                    })?
+                    .as_pathname()
+                    .ok_or_else(|| {
+                        NativeError::new(
+                            NativeErrorCode::ValidationFailed,
+                            "verified native notice endpoint socket must have a pathname",
+                        )
+                    })?
+                    .to_path_buf();
+                drop(stream);
+                let target =
+                    threadlane::native_tool_output::NativeToolOutputConfig::new_user_message_steer(
+                        socket_path,
+                        self.thread_uuid.clone(),
+                        PathBuf::from(&enqueued.call_project_base.repository_path),
+                    )
+                    .with_reconnect(Some(reconnect_cfg.clone()));
+                let notice_cfg = crate::coworker_notice::PlanningNoticeConfig::new(
+                    notice_key,
+                    enqueued.command_digest.clone(),
+                    target,
+                )?;
+                let notice_dir = crate::coworker_notice::planning_notice_dir(&plans_dir);
+                crate::coworker_notice::PlanningNoticeStore::new(&notice_dir)?
+                    .configure(notice_cfg)?;
+            }
         }
 
         let start_outcome = invoke_sibling_flow_start_command(&FlowStartCommandInvocation {
@@ -3626,12 +3795,138 @@ fn is_grant_summary_currently_active(grant: &PlanningGrantSummary, now_ms: u64) 
         && grant.usage.unknown_effect_calls == 0
 }
 
-fn require_active_grant_for_scope<'a>(
+fn policy_explicitly_authorizes_architect(policy: &ExecutionPolicy) -> bool {
+    policy
+        .allow_rules
+        .iter()
+        .any(|rule| rule.roles.contains(&WorkflowRole::Architect))
+}
+
+fn policy_explicitly_authorizes_choice(
+    policy: &ExecutionPolicy,
+    role: WorkflowRole,
+    selected: &SelectedRoleChoice,
+) -> bool {
+    policy.allow_rules.iter().any(|rule| {
+        rule.tool_id == selected.tool_id
+            && rule.model_id == selected.model_id
+            && rule.allows_effort(selected.effort.as_deref())
+            && rule.roles.contains(&role)
+    })
+}
+
+fn inspect_existing_private_subdir_readonly(dir: &Path, label: &str) -> Result<bool, NativeError> {
+    let clean = validate_absolute_no_symlink_components(dir, label)?;
+    let meta = match fs::symlink_metadata(&clean) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(_) => {
+            return Err(NativeError::new(
+                NativeErrorCode::IoError,
+                format!("failed to inspect {label} directory metadata"),
+            ));
+        }
+    };
+    if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
+        return Err(NativeError::new(
+            NativeErrorCode::SecurityViolation,
+            format!("{label} must be a private non-symlink directory"),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if (meta.permissions().mode() & 0o077) != 0 {
+            return Err(NativeError::new(
+                NativeErrorCode::SecurityViolation,
+                format!("{label} directory has insecure permissions (expected 0700)"),
+            ));
+        }
+    }
+    Ok(true)
+}
+
+fn validate_existing_consult_replay(
+    command_store: &PlanningCommandStore,
+    existing: &PlanningCommandRecord,
+    grant: &PlanningAdviceGrant,
+    enqueue_req: &EnqueuePlanningCommandRequest,
+    context_digest: &str,
+    policy_new_consult_check: Result<(), NativeError>,
+) -> Result<(), NativeError> {
+    let role = enqueue_req.payload.role();
+    let candidate_body_digest = enqueue_req
+        .payload
+        .compute_request_body_digest(&enqueue_req.command_key)?;
+
+    let exact_identity_match = existing.binding_id == enqueue_req.binding_id
+        && existing.thread_uuid == enqueue_req.thread_uuid
+        && existing.grant_id == enqueue_req.grant_id
+        && existing.role == role
+        && constant_time_str_eq(&existing.request_body_digest, &candidate_body_digest)
+        && constant_time_str_eq(&existing.context_digest, context_digest);
+
+    if !exact_identity_match {
+        return match policy_new_consult_check {
+            Ok(()) => Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "planning command_key was already used with a different request payload",
+            )),
+            Err(policy_err) => Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                format!(
+                    "planning command_key was already used with a different grant, job, role, or request payload; {}",
+                    policy_err.message
+                ),
+            )),
+        };
+    }
+
+    match (existing.status, policy_new_consult_check) {
+        (PlanningCommandStatus::Completed, _) => {
+            let _ = command_store.verify_completed_command(existing)?;
+            Ok(())
+        }
+        (_, Ok(())) => {
+            ensure_grant_has_remaining_budget(grant)?;
+            Ok(())
+        }
+        (PlanningCommandStatus::Unknown, Err(_)) => Err(NativeError::new(
+            NativeErrorCode::AmbiguousWakeupPendingReconciliation,
+            format!(
+                "existing planning command `{}` is Unknown pending reconciliation and cannot be replayed or launched",
+                existing.command_id
+            ),
+        )),
+        (PlanningCommandStatus::Queued, Err(policy_err)) => Err(NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            format!(
+                "existing planning command `{}` is Queued (not confirmed Completed) and cannot be launched; {}",
+                existing.command_id, policy_err.message
+            ),
+        )),
+        (PlanningCommandStatus::Running, Err(_)) => Err(NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            format!(
+                "existing planning command `{}` is still Running (not confirmed Completed); inspect it via planning_command instead of re-submitting",
+                existing.command_id
+            ),
+        )),
+        (PlanningCommandStatus::KnownFailed, Err(policy_err)) => Err(NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            format!(
+                "existing planning command `{}` already terminated in KnownFailed and cannot be replayed; {}",
+                existing.command_id, policy_err.message
+            ),
+        )),
+    }
+}
+
+fn require_scoped_grant<'a>(
     wf_ledger: &'a CoworkerBindingLedger,
     binding_id: &str,
     thread_uuid: &str,
     grant_id: &str,
-    now_ms: u64,
 ) -> Result<&'a PlanningAdviceGrant, NativeError> {
     if wf_ledger.binding_id != binding_id {
         return Err(NativeError::new(
@@ -3677,6 +3972,13 @@ fn require_active_grant_for_scope<'a>(
             "PlanningAdviceGrant scope does not match verified binding_id and thread_uuid",
         ));
     }
+    Ok(grant)
+}
+
+fn ensure_grant_not_revoked_or_expired(
+    grant: &PlanningAdviceGrant,
+    now_ms: u64,
+) -> Result<(), NativeError> {
     if grant.status == PlanningGrantStatus::Revoked
         || grant.revoked_at_ms.is_some()
         || grant.revoked_reason.is_some()
@@ -3698,6 +4000,10 @@ fn require_active_grant_for_scope<'a>(
             "local wall clock precedes standing planning grant created_at_ms",
         ));
     }
+    Ok(())
+}
+
+fn ensure_grant_has_remaining_budget(grant: &PlanningAdviceGrant) -> Result<(), NativeError> {
     if grant.status != PlanningGrantStatus::Active
         || grant.usage.reserved_total_calls >= grant.budget.max_total_calls
     {
@@ -3706,6 +4012,19 @@ fn require_active_grant_for_scope<'a>(
             "standing planning grant call budget is exhausted",
         ));
     }
+    Ok(())
+}
+
+fn require_active_grant_for_scope<'a>(
+    wf_ledger: &'a CoworkerBindingLedger,
+    binding_id: &str,
+    thread_uuid: &str,
+    grant_id: &str,
+    now_ms: u64,
+) -> Result<&'a PlanningAdviceGrant, NativeError> {
+    let grant = require_scoped_grant(wf_ledger, binding_id, thread_uuid, grant_id)?;
+    ensure_grant_not_revoked_or_expired(grant, now_ms)?;
+    ensure_grant_has_remaining_budget(grant)?;
     Ok(grant)
 }
 

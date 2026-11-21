@@ -1,13 +1,14 @@
 # Shadow difficulty advice (Jev and OpenAI Decisions)
 
-Date: 2026-11-01; OpenAI Decisions explicit preview/classify support added
-2026-11-21. `threadlane-advice` exposes the existing `DecisionClient` to an
-explicit native planning step. It is packaged from `crates/threadlane-decisions`
-and runs only when an operator invokes it. Explicit unscoped `preview` and
-`classify` requests support enabled Jev (`jev_api`) and OpenAI Decisions
-(`openai_decisions_api`) registry tools and models. The `models` catalog
-command and `--profile-id` profile-bound advice remain scoped to Jev (`jev_api`)
-only.
+Date: 2026-11-01; OpenAI Decisions explicit and `--profile-id` profile-bound
+preview/classify support added 2026-11-21. `threadlane-advice` exposes the
+existing `DecisionClient` to an explicit native planning step. It is packaged
+from `crates/threadlane-decisions` and runs only when an operator invokes it.
+Both explicit unscoped and `--profile-id` profile-bound `preview` and `classify`
+requests support enabled Jev (`jev_api`) and OpenAI Decisions
+(`openai_decisions_api`) registry tools and models. Only the `models` catalog
+command remains scoped to Jev (`jev_api`) only (and does not accept
+`--profile-id`).
 
 ## Authority boundary
 
@@ -79,13 +80,18 @@ authorize changing an existing explicit model selection.
 
 In the registry, an API decision model uses the tool's ID as `tool_id`,
 `tool_id:model_arg` as its model `id`, and the exact provider model identifier
-as `model_arg`. For unscoped `preview` and `classify`, `threadlane-advice`
-resolves an enabled tool whose adapter is `jev_api` or `openai_decisions_api`
-and a model owned by that tool from a read-only `registry.json` snapshot. It
-derives the provider (`"jev"` or `"openai"`) and `model_arg` from that snapshot;
-the request cannot override either. A mismatched expected registry revision, a
-disabled tool, an unsupported adapter, a model that does not belong to the tool,
-or a `model_arg` unsupported by the resolved provider (for example, a Jev model
+as `model_arg`. For both explicit unscoped and `--profile-id` profile-bound
+`preview` and `classify`, `threadlane-advice` resolves an enabled tool whose
+adapter is `jev_api` or `openai_decisions_api` and a model owned by that tool
+from a read-only `registry.json` snapshot. It derives the provider (`"jev"` or
+`"openai"`) and `model_arg` from that snapshot; the request cannot override
+either. When `--profile-id` is supplied, the saved workflow profile's shadow
+advisor model must also permit no effort (`allow_no_effort: true`), its owning
+tool must be an enabled `jev_api` or `openai_decisions_api` tool, and the
+request's `tool_id` and `model_id` must match that saved selection exactly. A
+mismatched expected registry revision, a disabled tool, an unsupported adapter,
+a model that does not belong to the tool, a profile/request mismatch, or a
+`model_arg` unsupported by the resolved provider (for example, a Jev model
 under an OpenAI Decisions tool, an unsupported non-Decisions OpenAI model such
 as `gpt-5-nano`, or an OpenAI model under a Jev tool) is refused before cache
 creation, credential lookup, or API access. Existing explicitly configured model
@@ -127,14 +133,18 @@ completed-result cache lifetime. The default is 3600 seconds; the accepted
 maximum is 86400 seconds. Values outside the accepted bound are rejected.
 
 An optional `--profile-id ID` binds `preview` or `classify` to that profile's
-configured Jev shadow advisor. Profile-bound advice remains scoped to Jev
-(`jev_api`) only: the request's explicit tool/model IDs must match the profile's
-Jev advisor, and an off, missing, mismatched, disabled, or non-Jev (including
-OpenAI Decisions) profile selection is refused before cache creation, vault, or
-provider access. `models` does not accept a profile selection. See
+configured shadow decision advisor (an enabled `jev_api` or enabled
+`openai_decisions_api` advisor model that permits no effort). It routes by the
+saved advisor model's enabled owning adapter and requires the request's explicit
+`tool_id` and `model_id` to match that saved selection exactly. An off, missing,
+mismatched (including cross-provider Jev versus OpenAI Decisions), disabled,
+effort-requiring, unsupported-adapter, or unsupported-model profile selection is
+refused before cache creation, vault, or provider access, and no provider is
+ever automatically selected or used as a fallback. `models` does not accept a
+profile selection and remains scoped to enabled `jev_api` tools only. See
 [profile decision advisors](PROFILE-ADVISOR.md). Without `--profile-id`,
 existing Jev version-1 cache keys and pending-attempt protections remain
-unchanged.
+unchanged, and `default_profile_id` is never auto-selected.
 
 - `--registry-dir` selects the read-only registry snapshot.
 - `--cache-dir` selects the private completed-result cache. Only `classify` may
@@ -292,8 +302,8 @@ blindly retried.
 The cache key binds the provider-specific versioned advice prompt/schema,
 canonical local project scope, context ID, task ID and revision, normalized
 summary digest, registry revision, resolved provider, and exact tool/model
-argument (plus optional `profile_id` for Jev profile-scoped calls). Changing any
-of these invalidates the result.
+argument (plus optional `profile_id` for profile-scoped Jev and OpenAI Decisions
+calls). Changing any of these invalidates the result.
 
 - Existing Jev version-1 prompt digests, cache keys, and persisted Jev records
   (including legacy records without a top-level `provider` field) retain their
@@ -301,11 +311,13 @@ of these invalidates the result.
 - OpenAI Decisions uses an OpenAI-specific prompt digest
   (`threadlane-openai-shadow-v1`), a provider domain-separated cache key, and an
   explicit `"provider": "openai"` field on all persisted records (`pending`,
-  `uncertain`, and `completed`).
-- Cross-provider reuse of completed, pending, or uncertain records is prevented.
-  Cached record and advice validation verifies the resolved provider, model echo
-  compatibility, and provider-valid result shape (allowing validated OpenAI
-  refusals while rejecting Jev refusals or cross-provider records with
+  `uncertain`, and `completed`), plus `"profile_id"` when `--profile-id` was
+  supplied.
+- Cross-provider and cross-profile reuse of completed, pending, or uncertain
+  records is prevented. Cached record and advice validation verifies the
+  resolved provider, optional `profile_id`, model echo compatibility, and
+  provider-valid result shape (allowing validated OpenAI refusals while
+  rejecting Jev refusals or cross-provider/cross-profile records with
   `corrupt_cache`).
 - The default completed-result lifetime is 3600 seconds; the lifetime applies
   only to completed results, and pending attempt markers are not reusable
@@ -414,18 +426,21 @@ classification result; latency, cost, accuracy, low-confidence frequency,
 refusal rate, and cached savings remain unmeasured.
 
 Acceptance for this interface requires offline checks for: help and preview
-(for both Jev and OpenAI Decisions) without network, vault, or cache mutation;
-server-only Jev catalog contents and Jev-only `models`/`--profile-id` scoping;
-rejection of a wrong answer type; four-level Choice parsing and OpenAI refusal
-handling; enabled tool/model/revision checks and mismatched tool/model or
-disabled tool refusals; cache hits with no extra API or vault read; cross-provider
-cache and pending/uncertain isolation with preserved legacy Jev cache identities;
-invalidation by summary, scope, revision, provider, or model changes; concurrent
-single ownership; pending and timeout refresh with no automatic retry; stale
-registry or adapter drift after a call; keychain absence; symlink, FIFO,
-insecure, wrong-UID, and oversize cache or request refusal; byte and count
-bounds; secret and summary redaction; and no plan or profile mutation. Context
-fixtures in
+(for both Jev and OpenAI Decisions, explicit and `--profile-id`) without
+network, vault, or cache mutation; server-only Jev catalog contents and Jev-only
+`models` scoping; profile-bound Jev and OpenAI Decisions exact-match routing
+with no automatic provider selection or fallback; rejection of a wrong answer
+type; four-level Choice parsing and OpenAI refusal handling; enabled
+tool/model/revision/no-effort checks and mismatched tool/model/provider or
+disabled/unavailable refusals; cache hits with no extra API or vault read;
+cross-provider and cross-profile cache and pending/uncertain isolation with
+preserved legacy Jev cache identities; invalidation by summary, scope, revision,
+profile, provider, or model changes; concurrent single ownership; pending and
+timeout refresh with no automatic retry; stale registry, profile, or adapter
+drift after a call; keychain absence; symlink, FIFO, insecure, wrong-UID, and
+oversize cache or request refusal; byte and count bounds; secret and summary
+redaction; and side-effect-free baseline comparison with no plan, profile, or
+model-routing mutation. Context fixtures in
 [`crates/threadlane-native/tests/context_cli.rs`](../crates/threadlane-native/tests/context_cli.rs)
 cover canonical argv order, protected override forms, offline advice help, legacy
 families, and failures without calling external providers.

@@ -3,11 +3,19 @@ import {
   type DecisionAdvisor,
   type DecisionAdvisorMode,
   type ModelDefinition,
+  type ToolAdapter,
   type ToolDefinition,
   type WorkflowProfile,
 } from './types.ts';
 
 export const DECISION_ADVISOR_MODE: DecisionAdvisorMode = 'shadow';
+
+const MAX_DECISION_MODEL_BYTES = 128;
+const JEV_DECISION_MODEL_PREFIX = 'jev-';
+const DEFAULT_OPENAI_DECISION_MODEL = 'gpt-6-luna';
+const OPENAI_DECISION_MODEL_PREFIX = 'gpt-6-luna-';
+const DECISION_MODEL_TOKEN_PATTERN = /^[A-Za-z0-9._:-]+$/;
+const MAX_ISSUE_TOKEN_CHARS = 44;
 
 export interface DecisionAdvisorRegistry {
   readonly tools: readonly ToolDefinition[];
@@ -24,7 +32,8 @@ export type DecisionAdvisorIssueCode =
   | 'missing_tool'
   | 'disabled_tool'
   | 'wrong_adapter'
-  | 'effort_required';
+  | 'effort_required'
+  | 'unsupported_model';
 
 export interface DecisionAdvisorIssue {
   code: DecisionAdvisorIssueCode;
@@ -148,9 +157,82 @@ function findTool(
   );
 }
 
+function isValidDecisionModelToken(value: string): boolean {
+  return (
+    value.length > 0 &&
+    value.length <= MAX_DECISION_MODEL_BYTES &&
+    DECISION_MODEL_TOKEN_PATTERN.test(value)
+  );
+}
+
 /**
- * Enabled Jev/OpenAI decision models that permit no effort. These are the only
- * valid advisor choices and are never offered as workflow-role models.
+ * Matches `crates/threadlane-decisions/src/schema.rs` (`is_valid_model_token`,
+ * `is_supported_jev_model`, `is_supported_openai_decision_model`) against the
+ * exact native `model_arg` without trimming invalid whitespace.
+ */
+export function isSupportedDecisionAdvisorModel(
+  adapter: ToolAdapter,
+  modelArg: unknown
+): boolean {
+  if (typeof modelArg !== 'string' || !isValidDecisionModelToken(modelArg)) {
+    return false;
+  }
+  if (adapter === 'jev_api') {
+    return (
+      modelArg.startsWith(JEV_DECISION_MODEL_PREFIX) &&
+      modelArg.length > JEV_DECISION_MODEL_PREFIX.length
+    );
+  }
+  if (adapter === 'openai_decisions_api') {
+    return (
+      modelArg === DEFAULT_OPENAI_DECISION_MODEL ||
+      modelArg.startsWith(OPENAI_DECISION_MODEL_PREFIX)
+    );
+  }
+  return false;
+}
+
+function formatBoundedIssueToken(value: unknown, fallback: string): string {
+  if (typeof value !== 'string') {
+    return fallback;
+  }
+  const sanitized = value.replace(/[\u0000-\u001f\u007f]+/g, ' ').trim();
+  if (!sanitized) {
+    return fallback;
+  }
+  const chars = Array.from(sanitized);
+  if (chars.length <= MAX_ISSUE_TOKEN_CHARS) {
+    return sanitized;
+  }
+  return `${chars.slice(0, MAX_ISSUE_TOKEN_CHARS - 3).join('')}...`;
+}
+
+function unsupportedModelMessage(
+  tool: ToolDefinition,
+  model: ModelDefinition
+): string {
+  const safeLabel = formatBoundedIssueToken(
+    model.label || model.id,
+    'selected model'
+  );
+  const safeTool = formatBoundedIssueToken(
+    tool.label || tool.id,
+    'this API tool'
+  );
+  const requirement =
+    tool.adapter === 'jev_api'
+      ? 'a jev-... model argument'
+      : 'gpt-6-luna or a gpt-6-luna-... model argument';
+  return (
+    `Advisor model "${safeLabel}" is not supported by "${safeTool}" ` +
+    `(requires ${requirement}). Choose a supported API model or clear the advisor.`
+  );
+}
+
+/**
+ * Enabled Jev/OpenAI decision models that permit no effort and carry a
+ * runtime-supported native `model_arg`. These are the only valid advisor
+ * choices and are never offered as workflow-role models.
  */
 export function eligibleDecisionAdvisors(
   registry: DecisionAdvisorRegistry
@@ -164,7 +246,12 @@ export function eligibleDecisionAdvisors(
       continue;
     }
     const tool = findTool(registry.tools, model.tool_id);
-    if (!tool || !tool.enabled || !isApiToolAdapter(tool.adapter)) {
+    if (
+      !tool ||
+      !tool.enabled ||
+      !isApiToolAdapter(tool.adapter) ||
+      !isSupportedDecisionAdvisorModel(tool.adapter, model.model_arg)
+    ) {
       continue;
     }
     seen.add(modelId);
@@ -257,6 +344,19 @@ export function validateDecisionAdvisor(
         message:
           `Advisor model "${modelLabel}" requires an effort, but decision advisors ` +
           'have no effort setting. Choose a model that allows no effort.',
+      },
+    };
+  }
+
+  if (!isSupportedDecisionAdvisorModel(tool.adapter, model.model_arg)) {
+    return {
+      state: 'invalid',
+      advisor,
+      tool,
+      model,
+      issue: {
+        code: 'unsupported_model',
+        message: unsupportedModelMessage(tool, model),
       },
     };
   }

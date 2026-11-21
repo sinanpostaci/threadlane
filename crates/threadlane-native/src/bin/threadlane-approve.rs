@@ -5,13 +5,19 @@
 //!
 //! Prepares a read-only digest-bound [`threadlane_authority::OperatorApprovalPreview`] (`prepare`) and records an
 //! operator-confirmed [`ApprovalSummary`] (`record`) via [`AuthorityStore::approve_confirmed`].
+//! When any selected task freezes `required_changed_paths` (`Some(R)`), `prepare` also exposes a
+//! top-level typed v2 `record_request` ([`threadlane_authority::OperatorApprovalRequestV2`]); when
+//! all tasks leave `required_changed_paths` as `None`, `prepare` emits the unchanged legacy
+//! [`threadlane_authority::OperatorApprovalPreview`] wire bytes.
 //!
 //! `prepare-private` is the opt-in stdin route: it accepts one bounded strict
-//! [`threadlane_authority::OperatorApprovalIntent`] JSON document on stdin (never argv), runs the
+//! [`threadlane_authority::OperatorApprovalIntent`] (or strict v2
+//! [`threadlane_authority::OperatorApprovalIntentV2`]) JSON document on stdin (never argv), runs the
 //! same authoritative prepare and live/fixed-scope validation as `prepare`, then persists the
 //! unchanged typed preview plus newline as `preview.json` (`0600`) in a new unique private
-//! (`0700`) temp directory and returns a bounded `{preview_path, preview}` receipt. It writes no
-//! approval ledger entry and dispatches no work.
+//! (`0700`) temp directory and returns a bounded `{preview_path, preview}` receipt (adding typed
+//! v2 `record_request` only when any task sets `required_changed_paths`). It writes no approval
+//! ledger entry and dispatches no work.
 //! `prepare-private-exact` uses the same flow but requires all five budget fields on stdin.
 //!
 //! `prepare-task` is the scoped single-task fast path: it accepts one bounded strict JSON request
@@ -19,14 +25,18 @@
 //! `ScopedWorkflow`, and then runs the same authoritative private preview flow. It creates only
 //! the draft/publication and private preview; it never records authority, reserves execution, or
 //! starts a worker.
-//! `prepare-task-exact` uses the same flow but requires all five budget fields on stdin.
+//! `prepare-task-exact` uses the same flow, requires all five budget fields on stdin, and accepts
+//! opt-in exact-file `task.required_changed_paths` (presented separately from `allowed_write_paths`,
+//! and accompanied by top-level `record_request` on stdout when set).
 //!
 //! `record` accepts exactly one private input: the unchanged normalized
-//! [`threadlane_authority::OperatorApprovalRequest`] (`--request`) or the complete typed
-//! [`threadlane_authority::OperatorApprovalPreview`] returned by `prepare` (`--preview`). The preview
-//! route recompiles its unchanged normalized request and requires the fresh authoritative preview
-//! to match the whole typed preview before the same persistence checks run; it grants no new
-//! authority.
+//! [`threadlane_authority::OperatorApprovalRequest`] (when `required_changed_paths` is `None`) or
+//! strict v2 `record_request` / [`threadlane_authority::OperatorApprovalRequestV2`] (`--request`),
+//! or the complete typed [`threadlane_authority::OperatorApprovalPreview`] returned by `prepare` or
+//! `prepare-private*`/`prepare-task*` (`--preview`, including the consistent `record_request`
+//! emitted by `prepare` for `Some(R)`). The preview route reconstructs and verifies the exact
+//! normalized approval (including any per-task `required_changed_paths`) both before and while
+//! holding the exclusive authority lock; it grants no new authority.
 //!
 //! ## Security and Authority Boundaries
 //!
@@ -39,6 +49,7 @@
 //!   authenticated local [`SupervisorClient`] before validation and again immediately before
 //!   returning `prepare` or persisting `record`.
 
+use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
@@ -51,10 +62,12 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use threadlane::{ErrorCode as RuntimeErrorCode, SupervisorClient};
 use threadlane_authority::validation::{
     validate_canonical_thread_uuid, validate_identifier, validate_sha256_hex,
+    validate_v2_schema_version,
 };
 use threadlane_authority::{
-    ApprovalSummary, AuthorityError, AuthorityStore, OperatorApprovalIntent,
-    OperatorApprovalPreview, OperatorApprovalRequest,
+    ApprovalSummary, ApprovedTaskRecord, AuthorityError, AuthorityStore, OperatorApprovalIntent,
+    OperatorApprovalIntentV2, OperatorApprovalPreview, OperatorApprovalRequest,
+    OperatorApprovalRequestV2, AUTHORITY_REQUEST_V2_SCHEMA_VERSION,
 };
 use threadlane_native::fs_safety::{
     ensure_platform_supported, read_private_file_bounded, validate_absolute_no_symlink_components,
@@ -109,18 +122,22 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 #[command(rename_all = "kebab-case")]
 enum ApproveCommand {
-    /// Prepare and validate a read-only `OperatorApprovalPreview` from a private `OperatorApprovalIntent` JSON file.
+    /// Prepare and validate a read-only preview from a private `OperatorApprovalIntent` (or v2) JSON file.
+    ///
+    /// Emits `OperatorApprovalPreview` unchanged when `required_changed_paths` is `None`, and
+    /// adds top-level typed v2 `record_request` only when any task sets `required_changed_paths`.
     Prepare {
-        /// Normalized absolute path to the private JSON request file (`OperatorApprovalIntent`).
+        /// Normalized absolute path to the private JSON request file (`OperatorApprovalIntent` or v2).
         #[arg(long = "request", value_name = "ABS_PRIVATE_JSON")]
         request: PathBuf,
     },
-    /// Prepare a validated preview from one bounded strict `OperatorApprovalIntent` JSON document on stdin.
+    /// Prepare a validated preview from one bounded strict `OperatorApprovalIntent` (or v2) JSON document on stdin.
     ///
     /// Runs the same authoritative prepare and live/fixed-scope validation as `prepare`, then
     /// writes the unchanged typed preview plus newline to a new `0600` `preview.json` in a unique
-    /// private `0700` temp directory and returns `{preview_path, preview}`. This route accepts no
-    /// output path argument and writes no authority ledger entry.
+    /// private `0700` temp directory and returns `{preview_path, preview}` (plus top-level typed
+    /// v2 `record_request` only when any task sets `required_changed_paths`). This route accepts
+    /// no output path argument and writes no authority ledger entry.
     PreparePrivate,
     /// Prepare a private preview, requiring all five execution budget values on stdin.
     PreparePrivateExact,
@@ -135,9 +152,10 @@ enum ApproveCommand {
     PrepareTaskExact,
     /// Validate and persist a confirmed operator approval into `approvals.json`.
     ///
-    /// Requires exactly one input: `--request` (unchanged normalized `OperatorApprovalRequest`)
-    /// or `--preview` (the complete typed `OperatorApprovalPreview` returned by `prepare` or
-    /// `prepare-private`).
+    /// Requires exactly one input: `--request` (unchanged normalized `OperatorApprovalRequest` for
+    /// `None`, or `record_request` / `OperatorApprovalRequestV2` when `required_changed_paths` is
+    /// set) or `--preview` (the complete typed `OperatorApprovalPreview` returned by `prepare` or
+    /// `prepare-private*`/`prepare-task*`).
     #[command(group(
         clap::ArgGroup::new("record_input")
             .required(true)
@@ -145,7 +163,7 @@ enum ApproveCommand {
             .args(["request", "preview"])
     ))]
     Record {
-        /// Normalized absolute path to the private JSON request file (`OperatorApprovalRequest`).
+        /// Normalized absolute path to the private JSON request file (`OperatorApprovalRequest` or `record_request` v2).
         #[arg(long = "request", value_name = "ABS_PRIVATE_JSON")]
         request: Option<PathBuf>,
         /// Normalized absolute path to the private JSON preview file (`OperatorApprovalPreview`).
@@ -296,6 +314,15 @@ impl CliError {
                     "approved_write_paths" => {
                         "approved_write_paths failed count or entry validation"
                     }
+                    "required_changed_paths"
+                    | "task_required_changed_paths"
+                    | "task_required_changed_paths entry" => {
+                        "required_changed_paths failed validation (empty, over-bound, duplicate, non-file, or outside task allowed_write_paths)"
+                    }
+                    "schema_version" => "approval request schema_version is unsupported",
+                    "preview" => {
+                        "private approval preview does not match the fresh authoritative preview; re-run prepare"
+                    }
                     "approvals" => {
                         "authority store approval capacity or serialization limit exceeded"
                     }
@@ -393,6 +420,22 @@ impl CliError {
 struct PrivatePreviewReceipt {
     preview_path: PathBuf,
     preview: OperatorApprovalPreview,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    record_request: Option<OperatorApprovalRequestV2>,
+}
+
+/// Extended `prepare` stdout shape emitted only when at least one selected task freezes
+/// `required_changed_paths` (`Some(R)`).
+///
+/// Legacy `None` approvals continue to serialize [`OperatorApprovalPreview`] directly without
+/// `record_request` so legacy wire bytes remain unchanged.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PreparePreviewWithRecordRequest {
+    request: OperatorApprovalRequest,
+    subject_digest: String,
+    tasks: Vec<ApprovedTaskRecord>,
+    record_request: OperatorApprovalRequestV2,
 }
 
 /// Explicit stdin budgets. Unlike the persisted type, these five limits cannot default.
@@ -456,8 +499,48 @@ impl From<ExplicitApprovalIntent> for OperatorApprovalIntent {
     }
 }
 
-/// Reads one bounded strict JSON DTO from stdin without accepting any argv JSON.
-fn load_stdin_json<T: DeserializeOwned>() -> Result<T, CliError> {
+/// Stdin v2 intent with explicit budgets and optional per-task `required_changed_paths`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExplicitApprovalIntentV2 {
+    schema_version: u32,
+    intent: ExplicitApprovalIntent,
+    task_required_changed_paths: BTreeMap<String, Vec<String>>,
+}
+
+impl From<ExplicitApprovalIntentV2> for OperatorApprovalIntentV2 {
+    fn from(value: ExplicitApprovalIntentV2) -> Self {
+        Self {
+            schema_version: value.schema_version,
+            intent: value.intent.into(),
+            task_required_changed_paths: value.task_required_changed_paths,
+        }
+    }
+}
+
+enum LoadedIntent {
+    Legacy(OperatorApprovalIntent),
+    V2(OperatorApprovalIntentV2),
+}
+
+enum LoadedRecordInput {
+    LegacyRequest(OperatorApprovalRequest),
+    RequestV2(OperatorApprovalRequestV2),
+    Preview(OperatorApprovalPreview),
+}
+
+impl LoadedRecordInput {
+    fn base_request(&self) -> &OperatorApprovalRequest {
+        match self {
+            Self::LegacyRequest(request) => request,
+            Self::RequestV2(request_v2) => &request_v2.request,
+            Self::Preview(preview) => &preview.request,
+        }
+    }
+}
+
+/// Reads bounded raw bytes from stdin without accepting any argv JSON.
+fn read_stdin_bytes() -> Result<Vec<u8>, CliError> {
     let mut buf = Vec::new();
     io::stdin()
         .lock()
@@ -469,16 +552,143 @@ fn load_stdin_json<T: DeserializeOwned>() -> Result<T, CliError> {
             "stdin request exceeds maximum size of 1 MiB",
         ));
     }
+    Ok(buf)
+}
 
+/// Reads one bounded strict JSON DTO from stdin without accepting any argv JSON.
+fn load_stdin_json<T: DeserializeOwned>() -> Result<T, CliError> {
+    let buf = read_stdin_bytes()?;
     serde_json::from_slice(&buf)
         .map_err(|_| CliError::invalid_input("stdin JSON is malformed or violates the schema"))
 }
 
-/// Runs the single authoritative prepare flow shared by `prepare` and `prepare-private`.
+fn parse_intent_bytes(buf: &[u8], error_message: &'static str) -> Result<LoadedIntent, CliError> {
+    if let Ok(intent_v2) = serde_json::from_slice::<OperatorApprovalIntentV2>(buf) {
+        return Ok(LoadedIntent::V2(intent_v2));
+    }
+    if let Ok(intent) = serde_json::from_slice::<OperatorApprovalIntent>(buf) {
+        return Ok(LoadedIntent::Legacy(intent));
+    }
+    Err(CliError::invalid_input(error_message))
+}
+
+fn parse_explicit_intent_bytes(buf: &[u8]) -> Result<LoadedIntent, CliError> {
+    if let Ok(intent_v2) = serde_json::from_slice::<ExplicitApprovalIntentV2>(buf) {
+        return Ok(LoadedIntent::V2(intent_v2.into()));
+    }
+    if let Ok(intent) = serde_json::from_slice::<ExplicitApprovalIntent>(buf) {
+        return Ok(LoadedIntent::Legacy(intent.into()));
+    }
+    Err(CliError::invalid_input(
+        "stdin JSON is malformed or violates the schema",
+    ))
+}
+
+fn parse_record_request_bytes(buf: &[u8]) -> Result<LoadedRecordInput, CliError> {
+    if let Ok(request_v2) = serde_json::from_slice::<OperatorApprovalRequestV2>(buf) {
+        return Ok(LoadedRecordInput::RequestV2(request_v2));
+    }
+    if let Ok(request) = serde_json::from_slice::<OperatorApprovalRequest>(buf) {
+        return Ok(LoadedRecordInput::LegacyRequest(request));
+    }
+    Err(CliError::invalid_input(
+        "request file contains invalid JSON",
+    ))
+}
+
+/// Builds the typed v2 `record_request` exposed to clients only when at least one task freezes
+/// `required_changed_paths`. Returns `Ok(None)` for legacy `None` approvals so their wire bytes
+/// remain unchanged.
+fn optional_record_request(
+    preview: &OperatorApprovalPreview,
+) -> Result<Option<OperatorApprovalRequestV2>, CliError> {
+    let request_v2 = preview
+        .to_request_v2()
+        .map_err(|e| CliError::from_authority(&e))?;
+    if request_v2.task_required_changed_paths.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(request_v2))
+    }
+}
+
+/// Parses a private preview file passed to `record --preview`.
+///
+/// Accepts both plain [`OperatorApprovalPreview`] (as persisted in `preview.json` and emitted by
+/// legacy `prepare`) and [`PreparePreviewWithRecordRequest`] (as emitted on stdout by `prepare`
+/// when `required_changed_paths` is `Some`), verifying that any embedded `record_request` uses a
+/// supported schema version and matches `preview` exactly.
+fn parse_preview_bytes(buf: &[u8]) -> Result<OperatorApprovalPreview, CliError> {
+    if let Ok(preview) = serde_json::from_slice::<OperatorApprovalPreview>(buf) {
+        return Ok(preview);
+    }
+    if let Ok(with_request) = serde_json::from_slice::<PreparePreviewWithRecordRequest>(buf) {
+        validate_v2_schema_version(with_request.record_request.schema_version)
+            .map_err(|e| CliError::from_authority(&e))?;
+        let preview = OperatorApprovalPreview {
+            request: with_request.request,
+            subject_digest: with_request.subject_digest,
+            tasks: with_request.tasks,
+        };
+        if optional_record_request(&preview)?.as_ref() != Some(&with_request.record_request) {
+            return Err(CliError::new(
+                "validation",
+                "private approval preview does not match the fresh authoritative preview; re-run prepare",
+            ));
+        }
+        return Ok(preview);
+    }
+    Err(CliError::invalid_input(
+        "request file contains invalid JSON",
+    ))
+}
+
+/// Runs the single authoritative prepare flow shared by `prepare`, `prepare-private`, and
+/// `prepare-task` for legacy intents.
 async fn prepare_operator_preview(
     dirs: &ValidatedStoreDirs,
     fixed_scope: Option<&FixedApprovalScope>,
     intent: OperatorApprovalIntent,
+) -> Result<OperatorApprovalPreview, CliError> {
+    prepare_operator_preview_inner(dirs, fixed_scope, intent, None).await
+}
+
+/// Runs the single authoritative prepare flow for strict v2 intents carrying per-task
+/// `required_changed_paths`.
+async fn prepare_operator_preview_v2(
+    dirs: &ValidatedStoreDirs,
+    fixed_scope: Option<&FixedApprovalScope>,
+    intent_v2: OperatorApprovalIntentV2,
+) -> Result<OperatorApprovalPreview, CliError> {
+    validate_v2_schema_version(intent_v2.schema_version)
+        .map_err(|e| CliError::from_authority(&e))?;
+    prepare_operator_preview_inner(
+        dirs,
+        fixed_scope,
+        intent_v2.intent,
+        Some(intent_v2.task_required_changed_paths),
+    )
+    .await
+}
+
+async fn prepare_loaded_intent(
+    dirs: &ValidatedStoreDirs,
+    fixed_scope: Option<&FixedApprovalScope>,
+    loaded: LoadedIntent,
+) -> Result<OperatorApprovalPreview, CliError> {
+    match loaded {
+        LoadedIntent::Legacy(intent) => prepare_operator_preview(dirs, fixed_scope, intent).await,
+        LoadedIntent::V2(intent_v2) => {
+            prepare_operator_preview_v2(dirs, fixed_scope, intent_v2).await
+        }
+    }
+}
+
+async fn prepare_operator_preview_inner(
+    dirs: &ValidatedStoreDirs,
+    fixed_scope: Option<&FixedApprovalScope>,
+    intent: OperatorApprovalIntent,
+    task_required_changed_paths: Option<BTreeMap<String, Vec<String>>>,
 ) -> Result<OperatorApprovalPreview, CliError> {
     let binding_id = validate_identifier("binding_id", &intent.binding_id)
         .map_err(|e| CliError::from_authority(&e))?;
@@ -500,9 +710,18 @@ async fn prepare_operator_preview(
     verify_live_binding(&supervisor, &binding_id, &thread_uuid).await?;
 
     let authority = open_validated_authority_store(dirs)?;
-    let preview = authority
-        .prepare_for_operator(intent)
-        .map_err(|e| CliError::from_authority(&e))?;
+    let preview = match task_required_changed_paths {
+        Some(task_required_changed_paths) => authority
+            .prepare_for_operator_v2(OperatorApprovalIntentV2 {
+                schema_version: AUTHORITY_REQUEST_V2_SCHEMA_VERSION,
+                intent,
+                task_required_changed_paths,
+            })
+            .map_err(|e| CliError::from_authority(&e))?,
+        None => authority
+            .prepare_for_operator(intent)
+            .map_err(|e| CliError::from_authority(&e))?,
+    };
 
     if let Some(fixed) = fixed_scope {
         enforce_fixed_scope_on_request(
@@ -653,28 +872,41 @@ async fn run(cli: Cli) -> Result<(), CliError> {
                 validate_four_store_dirs(&state_dir, &registry_dir, &plans_dir, &authority_dir)?;
             let fixed_scope =
                 resolve_fixed_scope(raw_binding, raw_thread, raw_project_root, &dirs)?;
-            let intent: OperatorApprovalIntent = load_request_json(&request)?;
-            let preview = prepare_operator_preview(&dirs, fixed_scope.as_ref(), intent).await?;
+            let bytes = read_private_request_bytes(&request)?;
+            let loaded = parse_intent_bytes(&bytes, "request file contains invalid JSON")?;
+            let preview = prepare_loaded_intent(&dirs, fixed_scope.as_ref(), loaded).await?;
 
-            write_stdout_json(&preview, false)
+            if let Some(record_request) = optional_record_request(&preview)? {
+                let output = PreparePreviewWithRecordRequest {
+                    request: preview.request,
+                    subject_digest: preview.subject_digest,
+                    tasks: preview.tasks,
+                    record_request,
+                };
+                write_stdout_json(&output, false)
+            } else {
+                write_stdout_json(&preview, false)
+            }
         }
         ApproveCommand::PreparePrivate | ApproveCommand::PreparePrivateExact => {
             let dirs =
                 validate_four_store_dirs(&state_dir, &registry_dir, &plans_dir, &authority_dir)?;
             let fixed_scope =
                 resolve_fixed_scope(raw_binding, raw_thread, raw_project_root, &dirs)?;
-            let intent = if matches!(cli.command, ApproveCommand::PreparePrivateExact) {
-                let explicit: ExplicitApprovalIntent = load_stdin_json()?;
-                explicit.into()
+            let bytes = read_stdin_bytes()?;
+            let loaded = if matches!(cli.command, ApproveCommand::PreparePrivateExact) {
+                parse_explicit_intent_bytes(&bytes)?
             } else {
-                load_stdin_json()?
+                parse_intent_bytes(&bytes, "stdin JSON is malformed or violates the schema")?
             };
-            let preview = prepare_operator_preview(&dirs, fixed_scope.as_ref(), intent).await?;
+            let preview = prepare_loaded_intent(&dirs, fixed_scope.as_ref(), loaded).await?;
+            let record_request = optional_record_request(&preview)?;
             let (preview_path, directory) = write_private_preview_file(&preview)?;
 
             let receipt = PrivatePreviewReceipt {
                 preview_path,
                 preview,
+                record_request,
             };
 
             // The receipt is serialized before stdout so an oversized or failed response leaves
@@ -725,14 +957,15 @@ async fn run(cli: Cli) -> Result<(), CliError> {
                     ));
                 }
             }
-            let (req, supplied_preview): (
-                OperatorApprovalRequest,
-                Option<OperatorApprovalPreview>,
-            ) = match (request, preview) {
-                (Some(request), None) => (load_request_json(&request)?, None),
+            let loaded_input = match (request, preview) {
+                (Some(request), None) => {
+                    let bytes = read_private_request_bytes(&request)?;
+                    parse_record_request_bytes(&bytes)?
+                }
                 (None, Some(preview)) => {
-                    let supplied: OperatorApprovalPreview = load_request_json(&preview)?;
-                    (supplied.request.clone(), Some(supplied))
+                    let bytes = read_private_request_bytes(&preview)?;
+                    let supplied = parse_preview_bytes(&bytes)?;
+                    LoadedRecordInput::Preview(supplied)
                 }
                 _ => {
                     return Err(CliError::invalid_input(
@@ -740,7 +973,12 @@ async fn run(cli: Cli) -> Result<(), CliError> {
                     ));
                 }
             };
+            if let LoadedRecordInput::RequestV2(ref req_v2) = loaded_input {
+                validate_v2_schema_version(req_v2.schema_version)
+                    .map_err(|e| CliError::from_authority(&e))?;
+            }
 
+            let req = loaded_input.base_request();
             let binding_id = validate_identifier("binding_id", &req.binding_id)
                 .map_err(|e| CliError::from_authority(&e))?;
             let thread_uuid = validate_canonical_thread_uuid("thread_uuid", &req.thread_uuid)
@@ -766,15 +1004,29 @@ async fn run(cli: Cli) -> Result<(), CliError> {
             verify_live_binding(&supervisor, &binding_id, &thread_uuid).await?;
 
             let authority = open_validated_authority_store(&dirs)?;
-            let fresh_preview = authority
-                .preview_for_operator(req.clone())
-                .map_err(|e| CliError::from_authority(&e))?;
-            if supplied_preview.is_some_and(|supplied| supplied != fresh_preview) {
-                return Err(CliError::new(
-                    "validation",
-                    "private approval preview does not match the fresh authoritative preview; re-run prepare",
-                ));
-            }
+            let fresh_preview = match &loaded_input {
+                LoadedRecordInput::LegacyRequest(req) => authority
+                    .preview_for_operator(req.clone())
+                    .map_err(|e| CliError::from_authority(&e))?,
+                LoadedRecordInput::RequestV2(req_v2) => authority
+                    .preview_for_operator_v2(req_v2.clone())
+                    .map_err(|e| CliError::from_authority(&e))?,
+                LoadedRecordInput::Preview(supplied) => {
+                    let req_v2 = supplied
+                        .to_request_v2()
+                        .map_err(|e| CliError::from_authority(&e))?;
+                    let fresh = authority
+                        .preview_for_operator_v2(req_v2)
+                        .map_err(|e| CliError::from_authority(&e))?;
+                    if supplied != &fresh {
+                        return Err(CliError::new(
+                            "validation",
+                            "private approval preview does not match the fresh authoritative preview; re-run prepare",
+                        ));
+                    }
+                    fresh
+                }
+            };
             if fresh_preview.subject_digest != checked_subject {
                 return Err(CliError::new(
                     "validation",
@@ -793,9 +1045,17 @@ async fn run(cli: Cli) -> Result<(), CliError> {
 
             verify_live_binding(&supervisor, &binding_id, &thread_uuid).await?;
 
-            let summary: ApprovalSummary = authority
-                .approve_confirmed(req, &checked_subject)
-                .map_err(|e| CliError::from_authority(&e))?;
+            let summary: ApprovalSummary = match loaded_input {
+                LoadedRecordInput::LegacyRequest(req) => authority
+                    .approve_confirmed(req, &checked_subject)
+                    .map_err(|e| CliError::from_authority(&e))?,
+                LoadedRecordInput::RequestV2(req_v2) => authority
+                    .approve_confirmed_v2(req_v2, &checked_subject)
+                    .map_err(|e| CliError::from_authority(&e))?,
+                LoadedRecordInput::Preview(supplied) => authority
+                    .approve_confirmed_preview(supplied, &checked_subject)
+                    .map_err(|e| CliError::from_authority(&e))?,
+            };
 
             write_stdout_json(&summary, true)
         }
@@ -1287,7 +1547,7 @@ async fn verify_live_binding(
 }
 
 #[cfg(unix)]
-fn load_request_json<T: DeserializeOwned>(path: &Path) -> Result<T, CliError> {
+fn read_private_request_bytes(path: &Path) -> Result<Vec<u8>, CliError> {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
@@ -1450,12 +1710,11 @@ fn load_request_json<T: DeserializeOwned>(path: &Path) -> Result<T, CliError> {
         ));
     }
 
-    serde_json::from_slice(&buf)
-        .map_err(|_| CliError::invalid_input("request file contains invalid JSON"))
+    Ok(buf)
 }
 
 #[cfg(not(unix))]
-fn load_request_json<T: DeserializeOwned>(_path: &Path) -> Result<T, CliError> {
+fn read_private_request_bytes(_path: &Path) -> Result<Vec<u8>, CliError> {
     Err(CliError::new(
         "unsupported_platform",
         "threadlane-approve is only supported on Unix platforms",
@@ -1833,5 +2092,262 @@ mod tests {
         )
         .expect_err("wrong repository_path must fail");
         assert_eq!(wrong_repo.code, "invalid_repository");
+    }
+
+    #[test]
+    fn strict_v2_intent_and_request_parsers_accept_v2_and_legacy_and_reject_unknown_fields() {
+        let base_intent = serde_json::json!({
+            "binding_id": "bnd_1",
+            "thread_uuid": "550e8400-e29b-41d4-a716-446655440000",
+            "plan_id": "plan_1",
+            "plan_revision": 2,
+            "expected_registry_revision": 3,
+            "repository_path": "/tmp/repo",
+            "base_commit": "0123456789abcdef0123456789abcdef01234567",
+            "approved_task_ids": ["task-a"],
+            "approved_write_paths": ["src/a.rs", "src/b.rs"],
+            "max_parallel": 1,
+            "budgets": {
+                "timeout_ms": 90000,
+                "max_line_bytes": 16384,
+                "max_stdout_bytes": 2097152,
+                "max_stderr_bytes": 100000,
+                "max_events": 321
+            }
+        });
+        let v2_intent = serde_json::json!({
+            "schema_version": AUTHORITY_REQUEST_V2_SCHEMA_VERSION,
+            "intent": base_intent,
+            "task_required_changed_paths": {"task-a": ["src/a.rs"]}
+        });
+        assert!(matches!(
+            parse_intent_bytes(&serde_json::to_vec(&base_intent).unwrap(), "bad"),
+            Ok(LoadedIntent::Legacy(_))
+        ));
+        assert!(matches!(
+            parse_intent_bytes(&serde_json::to_vec(&v2_intent).unwrap(), "bad"),
+            Ok(LoadedIntent::V2(_))
+        ));
+        assert!(matches!(
+            parse_explicit_intent_bytes(&serde_json::to_vec(&v2_intent).unwrap()),
+            Ok(LoadedIntent::V2(_))
+        ));
+
+        let mut bad_v2_intent = v2_intent.clone();
+        bad_v2_intent["extra"] = serde_json::json!(true);
+        let bad_v2_bytes = serde_json::to_vec(&bad_v2_intent).unwrap();
+        assert!(parse_intent_bytes(&bad_v2_bytes, "bad").is_err());
+        assert!(parse_explicit_intent_bytes(&bad_v2_bytes).is_err());
+
+        let base_request = serde_json::json!({
+            "binding_id": "bnd_1",
+            "thread_uuid": "550e8400-e29b-41d4-a716-446655440000",
+            "plan_id": "plan_1",
+            "plan_revision": 2,
+            "expected_registry_revision": 3,
+            "expected_plan_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "repository_path": "/tmp/repo",
+            "base_commit": "0123456789abcdef0123456789abcdef01234567",
+            "approved_task_ids": ["task-a"],
+            "approved_write_paths": ["src/a.rs", "src/b.rs"],
+            "max_parallel": 1,
+            "budgets": {
+                "timeout_ms": 90000,
+                "max_line_bytes": 16384,
+                "max_stdout_bytes": 2097152,
+                "max_stderr_bytes": 100000,
+                "max_events": 321
+            }
+        });
+        let v2_request = serde_json::json!({
+            "schema_version": AUTHORITY_REQUEST_V2_SCHEMA_VERSION,
+            "request": base_request,
+            "task_required_changed_paths": {"task-a": ["src/a.rs"]}
+        });
+        assert!(matches!(
+            parse_record_request_bytes(&serde_json::to_vec(&base_request).unwrap()),
+            Ok(LoadedRecordInput::LegacyRequest(_))
+        ));
+        assert!(matches!(
+            parse_record_request_bytes(&serde_json::to_vec(&v2_request).unwrap()),
+            Ok(LoadedRecordInput::RequestV2(_))
+        ));
+        let mut missing_map = v2_request.clone();
+        missing_map
+            .as_object_mut()
+            .unwrap()
+            .remove("task_required_changed_paths");
+        let missing_bytes = serde_json::to_vec(&missing_map).unwrap();
+        assert!(parse_record_request_bytes(&missing_bytes).is_err());
+    }
+
+    #[test]
+    fn optional_record_request_and_preview_parser_enforce_v2_consistency() {
+        let base_request = OperatorApprovalRequest {
+            binding_id: "bnd_1".to_string(),
+            thread_uuid: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+            plan_id: "plan_1".to_string(),
+            plan_revision: 2,
+            expected_registry_revision: 3,
+            expected_plan_digest: "a".repeat(64),
+            repository_path: PathBuf::from("/tmp/repo"),
+            base_commit: "0123456789abcdef0123456789abcdef01234567".to_string(),
+            approved_task_ids: vec!["task-a".to_string()],
+            approved_write_paths: vec!["src/a.rs".to_string(), "src/b.rs".to_string()],
+            max_parallel: 1,
+            budgets: ExecutionBudgets::default(),
+        };
+        let make_task = |required: Option<Vec<String>>| ApprovedTaskRecord {
+            task_id: "task-a".to_string(),
+            title: "Task A".to_string(),
+            instruction: "Edit src/a.rs".to_string(),
+            instruction_digest: "b".repeat(64),
+            role: threadlane_workflow::WorkflowRole::Coder,
+            difficulty: threadlane_workflow::Difficulty::Easy,
+            tool_id: "tool-opencode".to_string(),
+            adapter: threadlane_workflow::ToolAdapter::OpencodeV2,
+            provider: None,
+            canonical_executable: None,
+            model_id: "model-a".to_string(),
+            model_arg: "provider/model".to_string(),
+            base_model: "provider/model".to_string(),
+            effort: None,
+            cli_model_arg: None,
+            standalone: None,
+            file_permissions: None,
+            depends_on: Vec::new(),
+            allowed_write_paths: vec!["src/a.rs".to_string(), "src/b.rs".to_string()],
+            required_changed_paths: required,
+            task_digest: "c".repeat(64),
+            profile_id: None,
+            command_key: None,
+        };
+
+        let legacy_preview = OperatorApprovalPreview {
+            request: base_request.clone(),
+            subject_digest: "d".repeat(64),
+            tasks: vec![make_task(None)],
+        };
+        assert_eq!(optional_record_request(&legacy_preview).unwrap(), None);
+        let legacy_receipt = serde_json::to_value(PrivatePreviewReceipt {
+            preview_path: PathBuf::from("/tmp/preview.json"),
+            preview: legacy_preview.clone(),
+            record_request: None,
+        })
+        .unwrap();
+        let legacy_obj = legacy_receipt.as_object().unwrap();
+        assert_eq!(legacy_obj.len(), 2);
+        assert!(legacy_obj.get("record_request").is_none());
+
+        let r_preview = OperatorApprovalPreview {
+            request: base_request,
+            subject_digest: "e".repeat(64),
+            tasks: vec![make_task(Some(vec!["src/a.rs".to_string()]))],
+        };
+        let record_request = optional_record_request(&r_preview)
+            .unwrap()
+            .expect("Some(R) preview emits typed v2 record_request");
+        assert_eq!(
+            record_request.schema_version,
+            AUTHORITY_REQUEST_V2_SCHEMA_VERSION
+        );
+        assert_eq!(record_request.request, r_preview.request);
+        assert_eq!(
+            record_request.task_required_changed_paths,
+            BTreeMap::from([("task-a".to_string(), vec!["src/a.rs".to_string()])])
+        );
+        let r_receipt = serde_json::to_value(PrivatePreviewReceipt {
+            preview_path: PathBuf::from("/tmp/preview.json"),
+            preview: r_preview.clone(),
+            record_request: Some(record_request.clone()),
+        })
+        .unwrap();
+        let r_obj = r_receipt.as_object().unwrap();
+        assert_eq!(r_obj.len(), 3);
+        assert_eq!(
+            r_obj.get("record_request"),
+            Some(&serde_json::to_value(&record_request).unwrap())
+        );
+
+        // Plain preview and consistent prepare+record_request both parse back to the exact preview.
+        let plain_bytes = serde_json::to_vec(&r_preview).unwrap();
+        assert_eq!(parse_preview_bytes(&plain_bytes).unwrap(), r_preview);
+        let extended = PreparePreviewWithRecordRequest {
+            request: r_preview.request.clone(),
+            subject_digest: r_preview.subject_digest.clone(),
+            tasks: r_preview.tasks.clone(),
+            record_request,
+        };
+        let extended_bytes = serde_json::to_vec(&extended).unwrap();
+        assert_eq!(parse_preview_bytes(&extended_bytes).unwrap(), r_preview);
+
+        // Tampered R inside record_request fails closed.
+        let mut tampered_r = extended.clone();
+        tampered_r
+            .record_request
+            .task_required_changed_paths
+            .insert("task-a".to_string(), vec!["src/b.rs".to_string()]);
+        assert_eq!(
+            parse_preview_bytes(&serde_json::to_vec(&tampered_r).unwrap())
+                .unwrap_err()
+                .code,
+            "validation"
+        );
+
+        // Tampered base request inside record_request fails closed.
+        let mut tampered_req = extended.clone();
+        tampered_req.record_request.request.max_parallel = 2;
+        assert_eq!(
+            parse_preview_bytes(&serde_json::to_vec(&tampered_req).unwrap())
+                .unwrap_err()
+                .code,
+            "validation"
+        );
+
+        // Unsupported schema_version inside embedded record_request fails closed.
+        let mut bad_version = extended.clone();
+        bad_version.record_request.schema_version = 99;
+        assert_eq!(
+            parse_preview_bytes(&serde_json::to_vec(&bad_version).unwrap())
+                .unwrap_err()
+                .code,
+            "validation"
+        );
+
+        // Smuggling record_request onto a legacy None preview fails closed.
+        let smuggled_on_legacy = PreparePreviewWithRecordRequest {
+            request: legacy_preview.request.clone(),
+            subject_digest: legacy_preview.subject_digest,
+            tasks: legacy_preview.tasks,
+            record_request: OperatorApprovalRequestV2 {
+                schema_version: AUTHORITY_REQUEST_V2_SCHEMA_VERSION,
+                request: legacy_preview.request,
+                task_required_changed_paths: BTreeMap::new(),
+            },
+        };
+        assert_eq!(
+            parse_preview_bytes(&serde_json::to_vec(&smuggled_on_legacy).unwrap())
+                .unwrap_err()
+                .code,
+            "validation"
+        );
+
+        // Null record_request and unknown fields fail closed as invalid_input.
+        let mut null_req = serde_json::to_value(&extended).unwrap();
+        null_req["record_request"] = serde_json::Value::Null;
+        assert_eq!(
+            parse_preview_bytes(&serde_json::to_vec(&null_req).unwrap())
+                .unwrap_err()
+                .code,
+            "invalid_input"
+        );
+        let mut extra_field = serde_json::to_value(&extended).unwrap();
+        extra_field["unexpected"] = serde_json::json!(true);
+        assert_eq!(
+            parse_preview_bytes(&serde_json::to_vec(&extra_field).unwrap())
+                .unwrap_err()
+                .code,
+            "invalid_input"
+        );
     }
 }

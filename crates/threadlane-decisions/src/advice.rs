@@ -2156,32 +2156,29 @@ fn resolve_advice_tool_and_model(
             .find(|candidate| candidate.id == advisor.model_id)
             .ok_or_else(AdviceError::model_not_found)?;
 
-        let advisor_tool = snapshot
-            .tools
-            .iter()
-            .find(|candidate| candidate.id == advisor_model.tool_id)
-            .ok_or_else(AdviceError::tool_not_found)?;
-
-        if advisor_tool.adapter != ToolAdapter::JevApi {
-            return Err(AdviceError::unsupported_jev_adapter());
-        }
-
-        if !advisor_tool.enabled {
-            return Err(AdviceError::tool_disabled());
-        }
+        let advisor_provider = validate_enabled_decision_tool(snapshot, &advisor_model.tool_id)?;
 
         if !advisor_model.allow_no_effort {
             return Err(AdviceError::invalid_model());
         }
 
-        validate_enabled_jev_tool(snapshot, &request.raw.tool_id)?;
+        let advisor_requested_model = advisor_model.model_arg.trim();
+        if advisor_requested_model != advisor_model.model_arg
+            || !is_supported_model_for_provider(advisor_provider, advisor_requested_model)
+        {
+            return Err(AdviceError::invalid_model());
+        }
 
-        if advisor_model.tool_id != request.raw.tool_id || advisor.model_id != request.raw.model_id
+        let request_provider = validate_enabled_decision_tool(snapshot, &request.raw.tool_id)?;
+
+        if advisor_provider != request_provider
+            || advisor_model.tool_id != request.raw.tool_id
+            || advisor.model_id != request.raw.model_id
         {
             return Err(AdviceError::profile_advisor_mismatch());
         }
 
-        (Some(profile.id.clone()), DecisionProvider::Jev)
+        (Some(profile.id.clone()), advisor_provider)
     } else {
         let provider = validate_enabled_decision_tool(snapshot, &request.raw.tool_id)?;
         (None, provider)
@@ -3149,7 +3146,10 @@ mod tests {
         read_journal_records_readonly, ENV_OBSERVATION_PARENT_REQUEST_ID, ENV_OBSERVATION_PLAN_ID,
         OBSERVATION_JOURNAL_FILE_NAME,
     };
-    use threadlane_registry::{ModelDefinition, RegistryChange, ToolDefinition};
+    use threadlane_registry::{
+        DecisionAdvisor, ModelChoice, ModelDefinition, RegistryChange, RoleAssignment,
+        ToolDefinition, WorkflowProfile, WorkflowRole, REGISTRY_SCHEMA_VERSION,
+    };
 
     use crate::transport::{
         DecisionTransport, TransportFuture, TransportMethod, TransportRequest, TransportResponse,
@@ -3241,6 +3241,13 @@ mod tests {
                 context_id: context_id.to_string(),
                 cache_ttl_seconds: DEFAULT_CACHE_TTL_SECONDS,
                 profile_id: None,
+            }
+        }
+
+        fn scope_with_profile(&self, context_id: &str, profile_id: &str) -> AdviceScope {
+            AdviceScope {
+                profile_id: Some(profile_id.to_string()),
+                ..self.scope(context_id)
             }
         }
 
@@ -3344,6 +3351,7 @@ mod tests {
     struct MockVault {
         secrets: Mutex<HashMap<String, String>>,
         reads: Mutex<usize>,
+        fail_reads: Mutex<bool>,
     }
 
     impl MockVault {
@@ -3359,6 +3367,7 @@ mod tests {
             Arc::new(Self {
                 secrets: Mutex::new(map),
                 reads: Mutex::new(0),
+                fail_reads: Mutex::new(false),
             })
         }
 
@@ -3366,6 +3375,15 @@ mod tests {
             Arc::new(Self {
                 secrets: Mutex::new(HashMap::new()),
                 reads: Mutex::new(0),
+                fail_reads: Mutex::new(false),
+            })
+        }
+
+        fn failing() -> Arc<Self> {
+            Arc::new(Self {
+                secrets: Mutex::new(HashMap::new()),
+                reads: Mutex::new(0),
+                fail_reads: Mutex::new(true),
             })
         }
 
@@ -3385,6 +3403,11 @@ mod tests {
 
         fn get(&self, tool_id: &str) -> Result<Option<String>, ConnectorError> {
             *self.reads.lock().expect("reads lock") += 1;
+            if *self.fail_reads.lock().expect("fail_reads lock") {
+                return Err(ConnectorError::CredentialStoreUnavailable(
+                    "OS credential store is unavailable.",
+                ));
+            }
             Ok(self
                 .secrets
                 .lock()
@@ -3399,6 +3422,11 @@ mod tests {
         }
 
         fn status(&self, tool_id: &str) -> Result<String, ConnectorError> {
+            if *self.fail_reads.lock().expect("fail_reads lock") {
+                return Err(ConnectorError::CredentialStoreUnavailable(
+                    "OS credential store is unavailable.",
+                ));
+            }
             let configured = self
                 .secrets
                 .lock()
@@ -4470,5 +4498,836 @@ mod tests {
         assert_eq!(jev_refusal_err.code(), "corrupt_cache");
         assert_eq!(vault.read_count(), reads_before_hit);
         assert_eq!(transport.recorded_requests().len(), 2);
+    }
+
+    #[test]
+    fn resolve_profile_routes_by_enabled_owning_adapter_and_enforces_exact_match_and_no_effort() {
+        let rev = 9u64;
+        let snapshot = RegistrySnapshot {
+            schema_version: REGISTRY_SCHEMA_VERSION,
+            revision: rev,
+            tools: vec![
+                ToolDefinition {
+                    id: "jev-api".to_string(),
+                    label: "TypeSafe Jev".to_string(),
+                    adapter: ToolAdapter::JevApi,
+                    executable_path: None,
+                    enabled: true,
+                },
+                ToolDefinition {
+                    id: "openai-decisions".to_string(),
+                    label: "OpenAI Decisions".to_string(),
+                    adapter: ToolAdapter::OpenaiDecisionsApi,
+                    executable_path: None,
+                    enabled: true,
+                },
+                ToolDefinition {
+                    id: "openai-alt".to_string(),
+                    label: "Alternate OpenAI Decisions".to_string(),
+                    adapter: ToolAdapter::OpenaiDecisionsApi,
+                    executable_path: None,
+                    enabled: true,
+                },
+                ToolDefinition {
+                    id: "openai-disabled".to_string(),
+                    label: "Disabled OpenAI Decisions".to_string(),
+                    adapter: ToolAdapter::OpenaiDecisionsApi,
+                    executable_path: None,
+                    enabled: false,
+                },
+                ToolDefinition {
+                    id: "codex-cli".to_string(),
+                    label: "Codex CLI".to_string(),
+                    adapter: ToolAdapter::CodexCli,
+                    executable_path: Some(PathBuf::from("/usr/local/bin/codex")),
+                    enabled: true,
+                },
+            ],
+            models: vec![
+                ModelDefinition {
+                    id: "jev-api:jev-latest".to_string(),
+                    tool_id: "jev-api".to_string(),
+                    label: "jev-latest".to_string(),
+                    model_arg: "jev-latest".to_string(),
+                    efforts: Vec::new(),
+                    allow_no_effort: true,
+                },
+                ModelDefinition {
+                    id: "openai-decisions:gpt-6-luna".to_string(),
+                    tool_id: "openai-decisions".to_string(),
+                    label: "gpt-6-luna".to_string(),
+                    model_arg: "gpt-6-luna".to_string(),
+                    efforts: Vec::new(),
+                    allow_no_effort: true,
+                },
+                ModelDefinition {
+                    id: "openai-decisions:gpt-6-luna-2026-10-01".to_string(),
+                    tool_id: "openai-decisions".to_string(),
+                    label: "gpt-6-luna-2026-10-01".to_string(),
+                    model_arg: "gpt-6-luna-2026-10-01".to_string(),
+                    efforts: Vec::new(),
+                    allow_no_effort: true,
+                },
+                ModelDefinition {
+                    id: "openai-decisions:gpt-6-luna-effort-only".to_string(),
+                    tool_id: "openai-decisions".to_string(),
+                    label: "gpt-6-luna-effort-only".to_string(),
+                    model_arg: "gpt-6-luna".to_string(),
+                    efforts: vec!["high".to_string()],
+                    allow_no_effort: false,
+                },
+                ModelDefinition {
+                    id: "openai-decisions:gpt-5-nano".to_string(),
+                    tool_id: "openai-decisions".to_string(),
+                    label: "gpt-5-nano".to_string(),
+                    model_arg: "gpt-5-nano".to_string(),
+                    efforts: Vec::new(),
+                    allow_no_effort: true,
+                },
+                ModelDefinition {
+                    id: "openai-alt:gpt-6-luna".to_string(),
+                    tool_id: "openai-alt".to_string(),
+                    label: "gpt-6-luna".to_string(),
+                    model_arg: "gpt-6-luna".to_string(),
+                    efforts: Vec::new(),
+                    allow_no_effort: true,
+                },
+                ModelDefinition {
+                    id: "openai-disabled:gpt-6-luna".to_string(),
+                    tool_id: "openai-disabled".to_string(),
+                    label: "gpt-6-luna".to_string(),
+                    model_arg: "gpt-6-luna".to_string(),
+                    efforts: Vec::new(),
+                    allow_no_effort: true,
+                },
+                ModelDefinition {
+                    id: "codex-cli:gpt-6-luna".to_string(),
+                    tool_id: "codex-cli".to_string(),
+                    label: "gpt-6-luna".to_string(),
+                    model_arg: "gpt-6-luna".to_string(),
+                    efforts: Vec::new(),
+                    allow_no_effort: true,
+                },
+                ModelDefinition {
+                    id: "ghost-tool:gpt-6-luna".to_string(),
+                    tool_id: "ghost-tool".to_string(),
+                    label: "gpt-6-luna".to_string(),
+                    model_arg: "gpt-6-luna".to_string(),
+                    efforts: Vec::new(),
+                    allow_no_effort: true,
+                },
+            ],
+            profiles: vec![
+                WorkflowProfile {
+                    id: "profile-openai".to_string(),
+                    name: "OpenAI Profile".to_string(),
+                    assignments: Vec::new(),
+                    decision_advisor: Some(DecisionAdvisor {
+                        model_id: "openai-decisions:gpt-6-luna".to_string(),
+                        mode: DecisionAdvisorMode::Shadow,
+                    }),
+                },
+                WorkflowProfile {
+                    id: "profile-openai-dated".to_string(),
+                    name: "OpenAI Dated Profile".to_string(),
+                    assignments: Vec::new(),
+                    decision_advisor: Some(DecisionAdvisor {
+                        model_id: "openai-decisions:gpt-6-luna-2026-10-01".to_string(),
+                        mode: DecisionAdvisorMode::Shadow,
+                    }),
+                },
+                WorkflowProfile {
+                    id: "profile-jev".to_string(),
+                    name: "Jev Profile".to_string(),
+                    assignments: Vec::new(),
+                    decision_advisor: Some(DecisionAdvisor {
+                        model_id: "jev-api:jev-latest".to_string(),
+                        mode: DecisionAdvisorMode::Shadow,
+                    }),
+                },
+                WorkflowProfile {
+                    id: "profile-off".to_string(),
+                    name: "Off Profile".to_string(),
+                    assignments: Vec::new(),
+                    decision_advisor: None,
+                },
+                WorkflowProfile {
+                    id: "profile-openai-disabled".to_string(),
+                    name: "Disabled OpenAI Profile".to_string(),
+                    assignments: Vec::new(),
+                    decision_advisor: Some(DecisionAdvisor {
+                        model_id: "openai-disabled:gpt-6-luna".to_string(),
+                        mode: DecisionAdvisorMode::Shadow,
+                    }),
+                },
+                WorkflowProfile {
+                    id: "profile-openai-effort-only".to_string(),
+                    name: "Effort Required OpenAI Profile".to_string(),
+                    assignments: Vec::new(),
+                    decision_advisor: Some(DecisionAdvisor {
+                        model_id: "openai-decisions:gpt-6-luna-effort-only".to_string(),
+                        mode: DecisionAdvisorMode::Shadow,
+                    }),
+                },
+                WorkflowProfile {
+                    id: "profile-openai-unsupported-arg".to_string(),
+                    name: "Unsupported Model Arg OpenAI Profile".to_string(),
+                    assignments: Vec::new(),
+                    decision_advisor: Some(DecisionAdvisor {
+                        model_id: "openai-decisions:gpt-5-nano".to_string(),
+                        mode: DecisionAdvisorMode::Shadow,
+                    }),
+                },
+                WorkflowProfile {
+                    id: "profile-codex".to_string(),
+                    name: "Non-Decision Adapter Profile".to_string(),
+                    assignments: Vec::new(),
+                    decision_advisor: Some(DecisionAdvisor {
+                        model_id: "codex-cli:gpt-6-luna".to_string(),
+                        mode: DecisionAdvisorMode::Shadow,
+                    }),
+                },
+                WorkflowProfile {
+                    id: "profile-missing-model".to_string(),
+                    name: "Missing Advisor Model Profile".to_string(),
+                    assignments: Vec::new(),
+                    decision_advisor: Some(DecisionAdvisor {
+                        model_id: "openai-decisions:missing".to_string(),
+                        mode: DecisionAdvisorMode::Shadow,
+                    }),
+                },
+                WorkflowProfile {
+                    id: "profile-missing-tool".to_string(),
+                    name: "Missing Advisor Tool Profile".to_string(),
+                    assignments: Vec::new(),
+                    decision_advisor: Some(DecisionAdvisor {
+                        model_id: "ghost-tool:gpt-6-luna".to_string(),
+                        mode: DecisionAdvisorMode::Shadow,
+                    }),
+                },
+            ],
+            default_profile_id: Some("profile-openai".to_string()),
+        };
+
+        let make_req = |expected_rev: u64, tool_id: &str, model_id: &str| ValidatedAdviceRequest {
+            raw: AdviceRequest {
+                schema_version: ADVICE_REQUEST_SCHEMA_VERSION,
+                expected_registry_revision: expected_rev,
+                tool_id: tool_id.to_string(),
+                model_id: model_id.to_string(),
+                task_id: "task-resolve".to_string(),
+                task_revision: 1,
+                task_summary: "Resolve target.".to_string(),
+                baseline_difficulty: Some(Difficulty::Easy),
+            },
+            normalized_summary: "Resolve target.".to_string(),
+        };
+
+        let req_openai = make_req(rev, "openai-decisions", "openai-decisions:gpt-6-luna");
+        let req_openai_dated = make_req(
+            rev,
+            "openai-decisions",
+            "openai-decisions:gpt-6-luna-2026-10-01",
+        );
+        let req_openai_alt = make_req(rev, "openai-alt", "openai-alt:gpt-6-luna");
+        let req_openai_disabled = make_req(rev, "openai-disabled", "openai-disabled:gpt-6-luna");
+        let req_openai_unsupported =
+            make_req(rev, "openai-decisions", "openai-decisions:gpt-5-nano");
+        let req_jev = make_req(rev, "jev-api", "jev-api:jev-latest");
+        let req_codex = make_req(rev, "codex-cli", "codex-cli:gpt-6-luna");
+        let req_stale = make_req(rev + 1, "openai-decisions", "openai-decisions:gpt-6-luna");
+
+        // Positive OpenAI, dated OpenAI, and native Jev profile resolutions.
+        let resolved_openai =
+            resolve_advice_tool_and_model(&snapshot, &req_openai, Some("profile-openai"))
+                .expect("profile-openai must resolve OpenAI Decisions");
+        assert_eq!(
+            resolved_openai.profile_id.as_deref(),
+            Some("profile-openai")
+        );
+        assert_eq!(resolved_openai.provider, DecisionProvider::Openai);
+        assert_eq!(resolved_openai.tool_id, "openai-decisions");
+        assert_eq!(resolved_openai.model_id, "openai-decisions:gpt-6-luna");
+        assert_eq!(resolved_openai.requested_model, "gpt-6-luna");
+
+        let resolved_dated = resolve_advice_tool_and_model(
+            &snapshot,
+            &req_openai_dated,
+            Some("profile-openai-dated"),
+        )
+        .expect("dated OpenAI profile must resolve");
+        assert_eq!(resolved_dated.provider, DecisionProvider::Openai);
+        assert_eq!(resolved_dated.requested_model, "gpt-6-luna-2026-10-01");
+
+        let resolved_jev = resolve_advice_tool_and_model(&snapshot, &req_jev, Some("profile-jev"))
+            .expect("native Jev profile must continue resolving Jev");
+        assert_eq!(resolved_jev.profile_id.as_deref(), Some("profile-jev"));
+        assert_eq!(resolved_jev.provider, DecisionProvider::Jev);
+        assert_eq!(resolved_jev.requested_model, "jev-latest");
+
+        // Explicit choice (`profile_id: None`) never auto-selects `default_profile_id`.
+        let explicit_jev = resolve_advice_tool_and_model(&snapshot, &req_jev, None)
+            .expect("explicit Jev must ignore default_profile_id");
+        assert_eq!(explicit_jev.profile_id, None);
+        assert_eq!(explicit_jev.provider, DecisionProvider::Jev);
+
+        let explicit_openai_dated =
+            resolve_advice_tool_and_model(&snapshot, &req_openai_dated, None)
+                .expect("explicit dated OpenAI must ignore default_profile_id");
+        assert_eq!(explicit_openai_dated.profile_id, None);
+        assert_eq!(explicit_openai_dated.provider, DecisionProvider::Openai);
+
+        // Disabled, unavailable, invalid-effort, unsupported-model, stale-rev, and mismatch cases.
+        for (label, profile_id, req, expected_code) in [
+            (
+                "stale-rev-on-openai-profile",
+                Some("profile-openai"),
+                &req_stale,
+                "stale_registry_revision",
+            ),
+            (
+                "missing-profile",
+                Some("profile-unknown"),
+                &req_openai,
+                "profile_not_found",
+            ),
+            (
+                "off-profile-never-falls-back-to-default",
+                Some("profile-off"),
+                &req_openai,
+                "decision_advisor_not_configured",
+            ),
+            (
+                "disabled-openai-advisor-tool",
+                Some("profile-openai-disabled"),
+                &req_openai_disabled,
+                "tool_disabled",
+            ),
+            (
+                "disabled-openai-advisor-tool-even-with-enabled-request",
+                Some("profile-openai-disabled"),
+                &req_openai,
+                "tool_disabled",
+            ),
+            (
+                "effort-required-openai-advisor-model",
+                Some("profile-openai-effort-only"),
+                &req_openai,
+                "invalid_model",
+            ),
+            (
+                "unsupported-openai-advisor-model-arg-matching",
+                Some("profile-openai-unsupported-arg"),
+                &req_openai_unsupported,
+                "invalid_model",
+            ),
+            (
+                "unsupported-openai-advisor-model-arg-mismatched",
+                Some("profile-openai-unsupported-arg"),
+                &req_jev,
+                "invalid_model",
+            ),
+            (
+                "non-decision-adapter-on-profile",
+                Some("profile-codex"),
+                &req_codex,
+                "unsupported_adapter",
+            ),
+            (
+                "missing-advisor-model-on-profile",
+                Some("profile-missing-model"),
+                &req_openai,
+                "model_not_found",
+            ),
+            (
+                "missing-advisor-tool-on-profile",
+                Some("profile-missing-tool"),
+                &req_openai,
+                "tool_not_found",
+            ),
+            (
+                "openai-profile-mismatched-model",
+                Some("profile-openai"),
+                &req_openai_dated,
+                "profile_advisor_mismatch",
+            ),
+            (
+                "openai-profile-mismatched-tool",
+                Some("profile-openai"),
+                &req_openai_alt,
+                "profile_advisor_mismatch",
+            ),
+            (
+                "openai-profile-cross-provider-jev-request",
+                Some("profile-openai"),
+                &req_jev,
+                "profile_advisor_mismatch",
+            ),
+            (
+                "jev-profile-cross-provider-openai-request",
+                Some("profile-jev"),
+                &req_openai,
+                "profile_advisor_mismatch",
+            ),
+            (
+                "openai-profile-disabled-request-tool",
+                Some("profile-openai"),
+                &req_openai_disabled,
+                "tool_disabled",
+            ),
+            (
+                "openai-profile-codex-request-tool",
+                Some("profile-openai"),
+                &req_codex,
+                "unsupported_adapter",
+            ),
+            (
+                "explicit-choice-disabled-openai",
+                None,
+                &req_openai_disabled,
+                "tool_disabled",
+            ),
+            (
+                "explicit-choice-unsupported-openai-model",
+                None,
+                &req_openai_unsupported,
+                "invalid_model",
+            ),
+            (
+                "explicit-choice-codex-adapter",
+                None,
+                &req_codex,
+                "unsupported_adapter",
+            ),
+        ] {
+            let Err(err) = resolve_advice_tool_and_model(&snapshot, req, profile_id) else {
+                panic!("{label} must be refused");
+            };
+            assert_eq!(
+                err.code(),
+                expected_code,
+                "unexpected error code for {label}: {}",
+                err.message()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn openai_profile_classify_isolates_pending_and_cache_resumes_detects_post_api_drift_and_keeps_routing_unchanged(
+    ) {
+        let _env_guard = ADVICE_ENV_LOCK.lock().await;
+        let _scoped_env = ScopedEnvVars::set(&[
+            (ENV_OBSERVATION_PARENT_REQUEST_ID, None),
+            (ENV_OBSERVATION_PLAN_ID, None),
+        ]);
+
+        let ws = AdviceObsTestWorkspace::new("openai-profile-lifecycle");
+        let mut reg_rev = ws.seed_jev_and_openai_registry();
+        let store = RegistryStore::open(ws.registry_dir.clone()).expect("open registry");
+
+        let s1 = store
+            .apply(
+                reg_rev,
+                RegistryChange::UpsertTool {
+                    tool: ToolDefinition {
+                        id: "codex-cli".to_string(),
+                        label: "Codex CLI".to_string(),
+                        adapter: ToolAdapter::CodexCli,
+                        executable_path: Some(PathBuf::from("/usr/local/bin/codex")),
+                        enabled: true,
+                    },
+                },
+            )
+            .expect("upsert codex tool");
+        let s2 = store
+            .apply(
+                s1.revision,
+                RegistryChange::UpsertModel {
+                    model: ModelDefinition {
+                        id: "codex-cli:gpt-6-astra".to_string(),
+                        tool_id: "codex-cli".to_string(),
+                        label: "gpt-6-astra".to_string(),
+                        model_arg: "gpt-6-astra".to_string(),
+                        efforts: vec!["high".to_string()],
+                        allow_no_effort: false,
+                    },
+                },
+            )
+            .expect("upsert codex model");
+        let s3 = store
+            .apply(
+                s2.revision,
+                RegistryChange::UpsertProfile {
+                    profile: WorkflowProfile {
+                        id: "profile-openai-a".to_string(),
+                        name: "OpenAI Profile A".to_string(),
+                        assignments: vec![RoleAssignment {
+                            role: WorkflowRole::Coder,
+                            difficulty: Some(Difficulty::Easy),
+                            choice: ModelChoice {
+                                model_id: "codex-cli:gpt-6-astra".to_string(),
+                                effort: Some("high".to_string()),
+                            },
+                        }],
+                        decision_advisor: Some(DecisionAdvisor {
+                            model_id: "openai-decisions:gpt-6-luna".to_string(),
+                            mode: DecisionAdvisorMode::Shadow,
+                        }),
+                    },
+                },
+            )
+            .expect("upsert profile-openai-a");
+        let s4 = store
+            .apply(
+                s3.revision,
+                RegistryChange::UpsertProfile {
+                    profile: WorkflowProfile {
+                        id: "profile-openai-b".to_string(),
+                        name: "OpenAI Profile B".to_string(),
+                        assignments: Vec::new(),
+                        decision_advisor: Some(DecisionAdvisor {
+                            model_id: "openai-decisions:gpt-6-luna".to_string(),
+                            mode: DecisionAdvisorMode::Shadow,
+                        }),
+                    },
+                },
+            )
+            .expect("upsert profile-openai-b");
+        let s5 = store
+            .apply(
+                s4.revision,
+                RegistryChange::UpsertProfile {
+                    profile: WorkflowProfile {
+                        id: "profile-jev".to_string(),
+                        name: "Jev Profile".to_string(),
+                        assignments: Vec::new(),
+                        decision_advisor: Some(DecisionAdvisor {
+                            model_id: "jev-api:jev-latest".to_string(),
+                            mode: DecisionAdvisorMode::Shadow,
+                        }),
+                    },
+                },
+            )
+            .expect("upsert profile-jev");
+        reg_rev = s5.revision;
+
+        let registry_file = ws.registry_dir.join("registry.json");
+        let reg_bytes_before = fs::read(&registry_file).expect("read registry bytes");
+
+        let ctx_id = "0196ed00-0000-7000-8000-000000000201";
+        let scope_unscoped = ws.scope(ctx_id);
+        let scope_a = ws.scope_with_profile(ctx_id, "profile-openai-a");
+        let scope_b = ws.scope_with_profile(ctx_id, "profile-openai-b");
+        let scope_jev = ws.scope_with_profile(ctx_id, "profile-jev");
+
+        let openai_secret = "sk-openai-profile-unit-secret-777";
+        let jev_secret = "ts-jev-profile-unit-secret-888";
+        let raw_summary = "Sensitive OpenAI profile summary that must stay redacted.";
+
+        let req_openai = ws.write_private_file(
+            "req-openai.json",
+            format!(
+                r#"{{
+                    "schema_version": 1,
+                    "expected_registry_revision": {reg_rev},
+                    "tool_id": "openai-decisions",
+                    "model_id": "openai-decisions:gpt-6-luna",
+                    "task_id": "task-openai-prof",
+                    "task_revision": 1,
+                    "task_summary": "{raw_summary}",
+                    "baseline_difficulty": "easy"
+                }}"#
+            )
+            .as_bytes(),
+        );
+        let req_jev = ws.write_private_file(
+            "req-jev.json",
+            format!(
+                r#"{{
+                    "schema_version": 1,
+                    "expected_registry_revision": {reg_rev},
+                    "tool_id": "jev-api",
+                    "model_id": "jev-api:jev-latest",
+                    "task_id": "task-openai-prof",
+                    "task_revision": 1,
+                    "task_summary": "{raw_summary}",
+                    "baseline_difficulty": "easy"
+                }}"#
+            )
+            .as_bytes(),
+        );
+
+        // 1. Preflight refusal before cache/vault/network/journal.
+        let failing_vault = MockVault::failing();
+        let transport = MockTransport::with_responses([
+            mock_openai_choice_response("gpt-6-luna-2026-10-01", "hard", 0.95, 110, 0),
+            mock_openai_refusal_response("gpt-6-luna", 62),
+            mock_jev_response("jev-1.14.0", "easy", 0.94, (0.94, 0.03, 0.02, 0.01), 90, 8),
+            mock_openai_choice_response("gpt-6-luna", "medium", 0.91, 100, 0),
+            mock_openai_choice_response("gpt-6-luna", "hard", 0.93, 105, 0),
+        ]);
+        let failing_client =
+            DecisionClient::with_transport(failing_vault.clone(), transport.clone())
+                .expect("client");
+
+        let preflight_err = classify_advice(
+            &scope_a,
+            &req_jev,
+            false,
+            failing_vault.clone(),
+            &failing_client,
+        )
+        .await
+        .expect_err("cross-provider profile mismatch must fail in preflight");
+        assert_eq!(preflight_err.code(), "profile_advisor_mismatch");
+        assert_eq!(failing_vault.read_count(), 0);
+        assert!(transport.recorded_requests().is_empty());
+        assert!(!ws.cache_dir.exists());
+
+        // 2. Preview confirms provider/profile isolation without creating cache_dir.
+        let prev_a = preview_advice(&scope_a, &req_openai).expect("preview a");
+        let prev_b = preview_advice(&scope_b, &req_openai).expect("preview b");
+        let prev_unscoped = preview_advice(&scope_unscoped, &req_openai).expect("preview unscoped");
+        let prev_jev = preview_advice(&scope_jev, &req_jev).expect("preview jev");
+        assert_eq!(prev_a.provider, DecisionProvider::Openai);
+        assert_eq!(prev_a.profile_id.as_deref(), Some("profile-openai-a"));
+        assert_ne!(prev_a.cache_key, prev_b.cache_key);
+        assert_ne!(prev_a.cache_key, prev_unscoped.cache_key);
+        assert_ne!(prev_a.cache_key, prev_jev.cache_key);
+        assert!(!ws.cache_dir.exists());
+
+        // 3. Abandoned Pending record on `profile-openai-a` blocks `profile-openai-a` without
+        //    `--refresh`, persists both `profile_id` and `provider: "openai"`, and does NOT
+        //    block `profile-openai-b` or `profile-jev`.
+        let vault = MockVault::with_secrets(&[
+            ("openai-decisions", openai_secret),
+            ("jev-api", jev_secret),
+        ]);
+        let client =
+            DecisionClient::with_transport(vault.clone(), transport.clone()).expect("client");
+
+        let _ = classify_advice_with_options(
+            &scope_a,
+            &req_openai,
+            false,
+            vault.clone(),
+            &client,
+            &AdviceRuntimeOptions {
+                now_ms_override: Some(1_700_000_000_000),
+                abort_after_pending_seal: true,
+                ..AdviceRuntimeOptions::default()
+            },
+        )
+        .await
+        .expect_err("simulated crash after pending seal");
+        let record_a_path = ws.cache_dir.join(format!("{}.json", prev_a.cache_key));
+        let pending_a_val: serde_json::Value =
+            serde_json::from_slice(&fs::read(&record_a_path).expect("read pending a"))
+                .expect("parse pending a");
+        assert_eq!(pending_a_val["profile_id"], "profile-openai-a");
+        assert_eq!(pending_a_val["provider"], "openai");
+        assert_eq!(pending_a_val["state"]["status"], "pending");
+
+        let blocked_a = classify_advice(
+            &scope_a,
+            &req_openai,
+            false,
+            failing_vault.clone(),
+            &failing_client,
+        )
+        .await
+        .expect_err("pending record must require --refresh");
+        assert_eq!(blocked_a.code(), "pending_attempt_requires_refresh");
+        assert_eq!(failing_vault.read_count(), 0);
+        assert!(transport.recorded_requests().is_empty());
+
+        // Explicit `--refresh` recovers `profile-openai-a`, records observation journal, and leaves routing untouched.
+        let completed_a = classify_advice_with_options(
+            &scope_a,
+            &req_openai,
+            true,
+            vault.clone(),
+            &client,
+            &AdviceRuntimeOptions {
+                now_ms_override: Some(1_700_000_002_000),
+                ..AdviceRuntimeOptions::default()
+            },
+        )
+        .await
+        .expect("refresh on profile-openai-a should succeed");
+        assert_eq!(completed_a.source, AdviceSource::Provider);
+        assert_eq!(completed_a.profile_id.as_deref(), Some("profile-openai-a"));
+        assert_eq!(completed_a.advice.provider, DecisionProvider::Openai);
+        assert_eq!(completed_a.advice.difficulty, Some(Difficulty::Hard));
+        assert_eq!(completed_a.agrees_with_baseline, Some(false));
+        assert_eq!(transport.recorded_requests().len(), 1);
+        assert_eq!(transport.recorded_requests()[0].url, OPENAI_CLASSIFY_URL);
+        assert_eq!(
+            fs::read(&registry_file).expect("registry unchanged after disagreeing classify"),
+            reg_bytes_before
+        );
+
+        // Cache resume on `profile-openai-a` uses zero vault/network calls even with a failing vault.
+        let resumed_a = classify_advice_with_options(
+            &scope_a,
+            &req_openai,
+            false,
+            failing_vault.clone(),
+            &failing_client,
+            &AdviceRuntimeOptions {
+                now_ms_override: Some(1_700_000_007_000),
+                ..AdviceRuntimeOptions::default()
+            },
+        )
+        .await
+        .expect("profile-openai-a cache resume must succeed offline");
+        assert_eq!(resumed_a.source, AdviceSource::Cache);
+        assert_eq!(resumed_a.profile_id.as_deref(), Some("profile-openai-a"));
+        assert!(!resumed_a.provider_call_performed);
+        assert_eq!(resumed_a.cache_age_ms, Some(5_000));
+        assert_eq!(resumed_a.advice, completed_a.advice);
+        assert_eq!(failing_vault.read_count(), 0);
+        assert_eq!(transport.recorded_requests().len(), 1);
+
+        // `profile-openai-b` (same OpenAI model) and `profile-jev` stay isolated.
+        let completed_b = classify_advice_with_options(
+            &scope_b,
+            &req_openai,
+            false,
+            vault.clone(),
+            &client,
+            &AdviceRuntimeOptions {
+                now_ms_override: Some(1_700_000_008_000),
+                ..AdviceRuntimeOptions::default()
+            },
+        )
+        .await
+        .expect("profile-openai-b must classify independently");
+        assert_eq!(completed_b.source, AdviceSource::Provider);
+        assert_eq!(completed_b.advice.reason_code, "refusal");
+        assert_eq!(completed_b.agrees_with_baseline, None);
+
+        let completed_jev = classify_advice_with_options(
+            &scope_jev,
+            &req_jev,
+            false,
+            vault.clone(),
+            &client,
+            &AdviceRuntimeOptions {
+                now_ms_override: Some(1_700_000_009_000),
+                ..AdviceRuntimeOptions::default()
+            },
+        )
+        .await
+        .expect("profile-jev must classify independently");
+        assert_eq!(completed_jev.source, AdviceSource::Provider);
+        assert_eq!(completed_jev.advice.provider, DecisionProvider::Jev);
+        assert_eq!(transport.recorded_requests().len(), 3);
+        assert_eq!(transport.recorded_requests()[2].url, JEV_CLASSIFY_URL);
+
+        // Observation journal must redact secrets and raw summary while recording provider metadata.
+        let raw_journal = fs::read_to_string(ws.plans_dir.join(OBSERVATION_JOURNAL_FILE_NAME))
+            .expect("read journal");
+        assert!(!raw_journal.contains(openai_secret));
+        assert!(!raw_journal.contains(jev_secret));
+        assert!(!raw_journal.contains(raw_summary));
+        let (journal_recs, warnings) =
+            read_journal_records_readonly(&ws.plans_dir).expect("parse journal");
+        assert!(warnings.is_empty());
+        assert_eq!(journal_recs.len(), 8);
+        assert_eq!(
+            journal_recs[1]
+                .executor
+                .as_ref()
+                .and_then(|e| e.provider.as_deref()),
+            Some("openai")
+        );
+        assert_eq!(
+            journal_recs[3]
+                .usage
+                .as_ref()
+                .map(|u| u.provenance.as_str()),
+            Some("cache_hit")
+        );
+
+        // 4. Post-API profile advisor drift during an OpenAI provider await (both same-revision
+        //    advisor swap and store-applied revision advance) fails closed and seals Uncertain.
+        let req_drift = ws.write_private_file(
+            "req-openai-drift.json",
+            format!(
+                r#"{{
+                    "schema_version": 1,
+                    "expected_registry_revision": {reg_rev},
+                    "tool_id": "openai-decisions",
+                    "model_id": "openai-decisions:gpt-6-luna",
+                    "task_id": "task-openai-drift",
+                    "task_revision": 1,
+                    "task_summary": "Detect OpenAI profile drift after provider await."
+                }}"#
+            )
+            .as_bytes(),
+        );
+        let prev_drift = preview_advice(&scope_a, &req_drift).expect("preview drift");
+
+        let mut drifted_same_rev = s5.clone();
+        drifted_same_rev.profiles[0].decision_advisor = Some(DecisionAdvisor {
+            model_id: "openai-decisions:gpt-6-luna-2026-10-01".to_string(),
+            mode: DecisionAdvisorMode::Shadow,
+        });
+        let drifted_bytes =
+            serde_json::to_vec_pretty(&drifted_same_rev).expect("serialize drifted snapshot");
+        let reg_file_clone = registry_file.clone();
+        transport.set_on_execute(move || {
+            fs::write(&reg_file_clone, &drifted_bytes).expect("write drifted registry");
+            fs::set_permissions(&reg_file_clone, fs::Permissions::from_mode(0o600))
+                .expect("chmod 0600 drifted registry");
+        });
+
+        let drift_err = classify_advice(&scope_a, &req_drift, false, vault.clone(), &client)
+            .await
+            .expect_err("same-revision OpenAI profile drift during await must fail");
+        assert_eq!(drift_err.code(), "profile_advisor_mismatch");
+
+        fs::write(&registry_file, &reg_bytes_before).expect("restore original registry");
+        fs::set_permissions(&registry_file, fs::Permissions::from_mode(0o600))
+            .expect("chmod 0600 restored registry");
+
+        let drift_record_path = ws.cache_dir.join(format!("{}.json", prev_drift.cache_key));
+        let drift_val: serde_json::Value =
+            serde_json::from_slice(&fs::read(&drift_record_path).expect("read drift record"))
+                .expect("parse drift record");
+        assert_eq!(drift_val["profile_id"], "profile-openai-a");
+        assert_eq!(drift_val["provider"], "openai");
+        assert_eq!(drift_val["state"]["status"], "uncertain");
+        assert_eq!(drift_val["state"]["error_code"], "profile_advisor_mismatch");
+
+        let replay_err = classify_advice(
+            &scope_a,
+            &req_drift,
+            false,
+            failing_vault.clone(),
+            &failing_client,
+        )
+        .await
+        .expect_err("uncertain OpenAI profile record must require --refresh");
+        assert_eq!(replay_err.code(), "uncertain_attempt_requires_refresh");
+
+        let reg_dir_for_hook = ws.registry_dir.clone();
+        transport.set_on_execute(move || {
+            let store = RegistryStore::open(reg_dir_for_hook.clone()).expect("open registry");
+            let _ = store
+                .apply(
+                    reg_rev,
+                    RegistryChange::SetDefaultProfile {
+                        profile_id: Some("profile-jev".to_string()),
+                    },
+                )
+                .expect("advance registry during provider await");
+        });
+        let rev_drift_err = classify_advice(&scope_a, &req_drift, true, vault, &client)
+            .await
+            .expect_err("revision advance during OpenAI profile await must fail");
+        assert_eq!(rev_drift_err.code(), "stale_registry_revision");
+        assert_eq!(transport.recorded_requests().len(), 5);
     }
 }

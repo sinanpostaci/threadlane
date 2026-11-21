@@ -116,12 +116,16 @@ task plan, and real recorded authorization; no `Advisor`, `Orchestrator`, or
 `threadlane-context --context <CONTEXT> approve prepare-task-exact`: one bounded stdin
 JSON object (`binding_id`, `thread_uuid`, `repository_path`, `base_commit`,
 `profile_id`, `profile_revision`, `command_key`, `summary`, `task` with
-SavePlanDraft fields (one `worker` role, no dependencies), and `budgets` as
+SavePlanDraft fields (one `worker` role, no dependencies, optional
+`task.required_changed_paths`), and `budgets` as
 `ExecutionBudgets`, with all five of `timeout_ms`, `max_line_bytes`,
 `max_stdout_bytes`, `max_stderr_bytes`, and `max_events` explicit;
 `progress_watchdog` is optional) which saves and publishes one exact plan and returns the
-actual full private `{preview_path,preview}`. It grants no authority and
-dispatches nothing. For an already published plan use `approve prepare-private-exact` without
+actual full private `{preview_path,preview}` (plain legacy output shape for
+`None`, adding top-level typed v2 `record_request` only when
+`required_changed_paths` is `Some(R)`). It grants no authority and
+dispatches nothing. For an already published plan use `approve prepare-private-exact`
+(`OperatorApprovalIntent` or v2 `{schema_version: 2, intent, task_required_changed_paths}`) without
 duplicating the plan; the original `save_draft`/`publish` and legacy
 `approve prepare`/`record --request` routes stay supported. Present the concrete
 single-task scope and obtain explicit human execution authorization. On
@@ -139,31 +143,55 @@ data, never authority. Verified same-scope review findings may use the
 human-authorized bounded correction without another `Orchestrator`; changed task
 or base needs fresh real `preview`/`record`, actual plan/dependency/file-ownership
 changes need an `Orchestrator` update, and architectural ambiguity uses
-`Advisor`. Optional-role job repository/current `HEAD`, grant base/tree, and
-dependency inputs must match before `prepare_work`; never silently change base.
+`Advisor`. Read-only `Orchestrator` and `Advisor` stages remain optional (never
+mandatory, and no new job is required for ordinary single-task Worker work).
+When a read-only `Orchestrator` or `Advisor` step is genuinely needed, inspect
+live `coworker_status` first: reuse an existing suitable scoped job whose
+binding, project, base/tree, requirements, and profile match, or—when an active
+matching live standing role grant already authorizes read-only preparation and
+the repository/current `HEAD`, grant base/tree, binding/project, confirmed
+requirements, and profile match under the live guide—call metadata-only
+`prepare_work` rather than asking the human for a `job_id`, then pass the
+actual returned `job_id` together with the matching live role grant
+(`orchestrator` for `request_technical_plan`; explicit `advisor` for
+`consult_advisor`, or retained `architect` for pre-transition
+`consult_architect`) to `request_technical_plan` or `consult_advisor`.
+Optional-role job repository/current `HEAD`, grant base/tree, and dependency
+inputs must match before `prepare_work`; never silently change base.
+`prepare_work` makes no model calls, creates no grants, grants no execution
+approval, and dispatches nothing. Changing authorities, missing necessary
+user-owned requirements, or prior ambiguity remain explicit with the human;
+never invent a `job_id`, infer implicit grants, auto-dispatch, or auto-approve.
 Never self-approve or treat a profile, advice, planning, backlog edit, worker
 prose, or CLI flag as authority.
 
 The quickstart prepares a NEW ordinary task with `approve prepare-task-exact`, which
 takes one bounded stdin task object through the context router, saves and
 publishes one exact plan, and returns the same verified `{preview_path,preview}`
-without authority or dispatch. For an already published plan it composes one
-strict `OperatorApprovalIntent` in client JSON and prefers
+(plain legacy shape for `None`, plus top-level typed v2 `record_request` only
+for `Some(required_changed_paths)`) without authority or dispatch. For an
+already published plan it composes one strict `OperatorApprovalIntent` (or v2
+`{schema_version: 2, intent, task_required_changed_paths}`) in client JSON and prefers
 `approve prepare-private-exact`, which accepts that one bounded intent on stdin (never
 argv JSON) through the context router and runs the same authoritative prepare
 plus live/fixed-scope validation as `approve prepare`. It returns
-`{preview_path,preview}` after writing the unchanged full typed
+`{preview_path,preview}` (adding top-level typed v2 `record_request` only when
+any task freezes `required_changed_paths`) after writing the unchanged full typed
 `OperatorApprovalPreview` plus newline as `0600` `preview.json` in a new unique
 canonical `0700` temp directory; it writes no authority ledger entry and
 dispatches nothing. The CLI already reads the file back and verifies command
 success, canonical path, directory/file modes, regular-file type, byte bounds,
 and identical bytes. Compare the returned actual typed `preview` with the actual
 authorized scope (full `preview.request` (`OperatorApprovalRequest`) INCLUDING
-`expected_plan_digest`, `subject_digest`, and tasks), retain `preview_path`, and
-use that same file directly for `approve record --preview`; do not add helper
+`expected_plan_digest`, `subject_digest`, and tasks including any frozen
+`required_changed_paths`), retain `preview_path`, and
+use that same frozen canonical file directly for preferred
+`approve record --preview` (which works for both legacy `None` and
+`Some(required_changed_paths)`); do not add helper
 scripts or re-read, restate, rewrite, or reconstruct the verified private JSON.
-The CLI recompiles the unchanged normalized request, requires the whole typed
-preview to match a fresh authoritative preview, and keeps the existing
+The CLI recompiles the unchanged normalized request (and any per-task
+`required_changed_paths`), requires the whole typed
+preview (and any emitted `record_request`) to match a fresh authoritative preview, and keeps the existing
 binding/live, registry/plan/digest/fixed-scope, final `approve_confirmed`, and
 idempotence checks. The preview adds no authority. Reuse explicit matching scope
 consent already granted; never infer consent or run in advance. Feed stdin with a POSIX single-quoted literal through the shell builtin
@@ -172,11 +200,22 @@ consent already granted; never infer consent or run in advance. Feed stdin with 
 `python3`/`node`/`jq`, retyping, overwriting, or package/hash/path searches.
 Legacy fallback: create one private `0700` directory, save the unchanged intent
 as a new `0600` `<INTENT_JSON>`, run `approve prepare --request <INTENT_JSON>`
-and save stdout as a new exclusive `0600` preview file with `umask 077` and
-`set -C`, then verify the same facts. Also keep the fallback that saves ONLY the
-unchanged normalized `preview.request` to a private `0600` file for
-`record --request` with the existing safeguards: prefer exposed structured
-private-file tools; otherwise `JSON.stringify` the actual unchanged DTO in
+(preserving the plain legacy `OperatorApprovalPreview` output shape for `None`
+and adding top-level typed v2 `record_request` only for
+`Some(required_changed_paths)`) and save stdout as a new exclusive `0600`
+preview file with `umask 077` and `set -C`, then verify the same facts and
+prefer `approve record --preview`. Also keep the fallback `--request` route to
+a private `0600` file with the existing safeguards: save ONLY the actual
+emitted unchanged typed v2 `record_request` (`OperatorApprovalRequestV2`) when
+any task in `preview.tasks` freezes `required_changed_paths`, or the complete
+unchanged legacy `preview.request` (`OperatorApprovalRequest`, including
+`expected_plan_digest`) when all tasks leave `required_changed_paths` unset
+(`None`, rejecting any unexpected `record_request`). Fail closed if a frozen
+`required_changed_paths` set exists on any task while the actual emitted v2
+`record_request` is absent or invalid — never rebuild it, silently drop
+`required_changed_paths` or `expected_plan_digest`, or authorize/start a new
+run. Preserve all safeguards: prefer exposed structured
+private-file tools; otherwise `JSON.stringify` the actual emitted unchanged DTO in
 client composition, apply proper POSIX single-quote shell quoting to that string
 (`JSON.stringify` is not shell escaping), and write via `umask 077`, a unique
 private `0700` parent canonicalized with physical
@@ -373,8 +412,15 @@ Existing multi-role planning, admission, controller, review, and closure routes
 remain available only when the human explicitly selects them or continues an old
 job. Old jobs stay readable under their frozen contracts. Do not require
 `prepare_work`, `request_technical_plan`, Orchestrator, Advisor, Reviewer,
-Closure, or complete-job admission for ordinary backlog work. The current
-advisory identity is `advisor` (`consult_advisor`); the retained frozen
+Closure, or complete-job admission for ordinary backlog work. When an optional
+read-only `Orchestrator` or `Advisor` call is selected under a matching active
+live standing role grant, inspect `coworker_status` first to reuse a suitable
+scoped job or call metadata-only `prepare_work` (exact binding/project/base/requirements/profile
+under the live guide; no model calls, grant creation, approval, or dispatch)
+instead of asking the human for a `job_id`, then pass the actual returned
+`job_id` to `request_technical_plan` or `consult_advisor`; keep changing
+authorities, missing user-owned requirements, and prior ambiguity explicit. The
+current advisory identity is `advisor` (`consult_advisor`); the retained frozen
 `architect`/`consult_architect` identifiers remain valid for old jobs and exact
 command replay. Advice remains optional and grants no Worker authority. See
 `docs/MCP-LEGACY-OPERATING-GUIDE.md`.

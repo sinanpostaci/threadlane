@@ -7,6 +7,7 @@
 //! marker if it is ever launched; preparing or recording an approval must never invoke a worker,
 //! start a provider, create a worktree, or call a paid model.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -20,7 +21,8 @@ use tempfile::TempDir;
 use threadlane::{Supervisor, SupervisorClient, SupervisorConfig, SupervisorHandle};
 use threadlane_authority::{
     ApprovalRecord, ApprovalSummary, AuthorityError, AuthorityStore, OperatorApprovalIntent,
-    OperatorApprovalPreview,
+    OperatorApprovalIntentV2, OperatorApprovalPreview, OperatorApprovalRequestV2,
+    AUTHORITY_REQUEST_V2_SCHEMA_VERSION,
 };
 use threadlane_native::{PlanStore, RegistryStore};
 use threadlane_workers::{
@@ -1073,14 +1075,14 @@ async fn prepare_freezes_exact_scope_without_approval_execution_or_worktree_side
 async fn quickstart_example_prepares_exact_task_without_worker_invocation() {
     let mut fx = ApprovalFixture::start().await;
 
-    let marker = "const request = ";
+    let marker = "const req = ";
     let start = ORDINARY_WORKER_QUICKSTART
         .find(marker)
         .expect("quickstart strict JSON example")
         + marker.len();
     let rest = &ORDINARY_WORKER_QUICKSTART[start..];
     let end = rest
-        .find(";\nconst router")
+        .find(";\nconst q")
         .expect("quickstart JSON example terminator");
     let mut request: Value =
         serde_json::from_str(&rest[..end]).expect("documented quickstart JSON");
@@ -3303,6 +3305,988 @@ async fn prepare_task_rejects_malformed_requests_and_conflicting_keys_without_si
     assert_eq!(prepare_task_plan_revision_count(&fx, &plan_id), 2);
     assert_eq!(directory_entries(&temp_dir).len(), 1);
     assert_eq!(fx.approval_count(), 0);
+    fx.assert_no_worker_invocation();
+
+    fx.shutdown().await;
+}
+
+fn prepare_task_exact_args(fx: &ApprovalFixture) -> Vec<String> {
+    let mut args = prepare_task_args(fx);
+    args[0] = "prepare-task-exact".to_string();
+    args
+}
+
+fn prepare_task_exact_request(
+    fx: &ApprovalFixture,
+    command_key: &str,
+    allowed_write_paths: Vec<&str>,
+    required_changed_paths: Option<Vec<&str>>,
+) -> Value {
+    let mut request = prepare_task_request(fx, command_key);
+    request["task"]["allowed_write_paths"] = serde_json::json!(allowed_write_paths);
+    if let Some(required) = required_changed_paths {
+        request["task"]["required_changed_paths"] = serde_json::json!(required);
+    }
+    request["budgets"] = serde_json::json!({
+        "timeout_ms": 90_000,
+        "max_line_bytes": 16_384,
+        "max_stdout_bytes": 2_097_152,
+        "max_stderr_bytes": 100_000,
+        "max_events": 321
+    });
+    request
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prepare_task_exact_with_required_changed_paths_round_trips_preview_and_request_v2() {
+    let mut fx = ApprovalFixture::start().await;
+    let temp_dir = fx.private_preview_temp_dir();
+    let context_path = write_prepare_task_context(&fx, "prepare-task-exact-r-context.json");
+    let context_args = vec![
+        "--context".to_string(),
+        context_path.display().to_string(),
+        "approve".to_string(),
+        "prepare-task-exact".to_string(),
+    ];
+
+    // Legacy `prepare-task` (non-exact) must reject `required_changed_paths` strictly before mutation.
+    let before = total_plan_revision_count(&fx);
+    let mut legacy_with_r = prepare_task_request(&fx, "legacy-rejects-r-1");
+    legacy_with_r["task"]["required_changed_paths"] = serde_json::json!(["src/lib.rs"]);
+    let legacy_rejected = fx
+        .run_cli_with_stdin(
+            &prepare_task_args(&fx),
+            &prepare_task_bytes(&legacy_with_r),
+            Some(&temp_dir),
+        )
+        .await;
+    assert_eq!(
+        expect_failure(&legacy_rejected, "legacy prepare-task rejects R").code,
+        "invalid_input"
+    );
+    assert_eq!(total_plan_revision_count(&fx), before);
+    assert!(directory_entries(&temp_dir).is_empty());
+
+    // 1. Omitted `required_changed_paths` on `prepare-task-exact` stays legacy-compatible (`None`, omitted in JSON, no `record_request`).
+    let omitted_req = prepare_task_exact_request(
+        &fx,
+        "exact-same-plan-r-1",
+        vec!["src/lib.rs", "src/extra.rs"],
+        None,
+    );
+    let omitted_output = run_command_with_stdin(
+        context_command(),
+        &context_args,
+        &prepare_task_bytes(&omitted_req),
+        Some(&temp_dir),
+    )
+    .await;
+    let omitted_receipt: PrivatePreviewReceipt = parse_success(
+        &omitted_output,
+        "prepare-task-exact without required_changed_paths",
+    );
+    let omitted_raw: Value =
+        serde_json::from_slice(&omitted_output.stdout).expect("omitted receipt raw JSON");
+    let omitted_obj = omitted_raw.as_object().expect("omitted receipt is object");
+    assert_eq!(
+        omitted_obj.len(),
+        2,
+        "legacy None prepare-task-exact receipt must keep exact 2-key wire shape without record_request"
+    );
+    assert!(omitted_obj.get("record_request").is_none());
+    assert!(omitted_receipt.preview.tasks[0]
+        .required_changed_paths
+        .is_none());
+    let omitted_preview_text =
+        fs::read_to_string(&omitted_receipt.preview_path).expect("read omitted preview.json");
+    assert!(
+        !omitted_preview_text.contains("required_changed_paths"),
+        "omitted required_changed_paths must not appear in serialized preview JSON"
+    );
+
+    // 2. Opt-in `required_changed_paths` (`R`) on the exact same plan presents R separately from A,
+    // alters both subject_digest and core-derived profile_id without changing base request, and
+    // exposes typed v2 `record_request` directly on stdout.
+    let with_r_req = prepare_task_exact_request(
+        &fx,
+        "exact-same-plan-r-1",
+        vec!["src/lib.rs", "src/extra.rs"],
+        Some(vec!["src/lib.rs"]),
+    );
+    let with_r_output = run_command_with_stdin(
+        context_command(),
+        &context_args,
+        &prepare_task_bytes(&with_r_req),
+        Some(&temp_dir),
+    )
+    .await;
+    let with_r_receipt: PrivatePreviewReceipt = parse_success(
+        &with_r_output,
+        "prepare-task-exact with required_changed_paths",
+    );
+    let with_r_raw: Value =
+        serde_json::from_slice(&with_r_output.stdout).expect("with-R receipt raw JSON");
+    let with_r_obj = with_r_raw.as_object().expect("with-R receipt is object");
+    assert_eq!(
+        with_r_obj.len(),
+        3,
+        "Some(R) prepare-task-exact receipt must expose preview_path, preview, and record_request"
+    );
+    let with_r_wire_record_request = with_r_obj
+        .get("record_request")
+        .expect("Some(R) prepare-task-exact must expose record_request directly to client");
+    let parsed_wire_req_v2: OperatorApprovalRequestV2 =
+        serde_json::from_value(with_r_wire_record_request.clone())
+            .expect("wire record_request must match OperatorApprovalRequestV2");
+    assert_eq!(
+        parsed_wire_req_v2.schema_version,
+        AUTHORITY_REQUEST_V2_SCHEMA_VERSION
+    );
+    assert_eq!(parsed_wire_req_v2.request, with_r_receipt.preview.request);
+    assert_eq!(
+        parsed_wire_req_v2.task_required_changed_paths,
+        BTreeMap::from([("task-fast".to_string(), vec!["src/lib.rs".to_string()])])
+    );
+
+    assert_eq!(
+        with_r_receipt.preview.request,
+        omitted_receipt.preview.request
+    );
+    assert_eq!(
+        with_r_receipt.preview.request.approved_write_paths,
+        vec!["src/lib.rs".to_string(), "src/extra.rs".to_string()]
+    );
+    assert_eq!(
+        with_r_receipt.preview.tasks[0].allowed_write_paths,
+        vec!["src/lib.rs".to_string(), "src/extra.rs".to_string()]
+    );
+    assert_eq!(
+        with_r_receipt.preview.tasks[0].required_changed_paths,
+        Some(vec!["src/lib.rs".to_string()])
+    );
+    assert_ne!(
+        with_r_receipt.preview.subject_digest, omitted_receipt.preview.subject_digest,
+        "selecting R must alter subject_digest"
+    );
+    assert_ne!(
+        with_r_receipt.preview.tasks[0].profile_id, omitted_receipt.preview.tasks[0].profile_id,
+        "selecting R must alter core-derived profile_id"
+    );
+    let preview_file_text =
+        fs::read_to_string(&with_r_receipt.preview_path).expect("read preview.json with R");
+    assert!(preview_file_text.contains("\"required_changed_paths\":[\"src/lib.rs\"]"));
+    let preview_file_parsed: OperatorApprovalPreview =
+        serde_json::from_str(&preview_file_text).expect("preview.json remains pure preview");
+    assert_eq!(preview_file_parsed, with_r_receipt.preview);
+    fx.assert_no_approval_artifacts();
+
+    // 3. Record via default `--preview` persists R while keeping allowed_write_paths = A.
+    let summary_preview: ApprovalSummary = parse_success(
+        &fx.run_record_preview(
+            &with_r_receipt.preview_path,
+            &with_r_receipt.preview.subject_digest,
+            THREAD_UUID,
+            true,
+        )
+        .await,
+        "record --preview with required_changed_paths",
+    );
+    assert_eq!(
+        summary_preview.subject_digest,
+        with_r_receipt.preview.subject_digest
+    );
+    let persisted = fx.persisted_record();
+    assert_eq!(
+        persisted.tasks[0].allowed_write_paths,
+        vec!["src/lib.rs".to_string(), "src/extra.rs".to_string()]
+    );
+    assert_eq!(
+        persisted.tasks[0].required_changed_paths,
+        Some(vec!["src/lib.rs".to_string()])
+    );
+
+    // 4. Write the raw `record_request` JSON received directly from CLI stdout (no Rust synthesis)
+    // and verify `record --request` replays identically with the same scope and original digest.
+    let req_v2_path = fx.write_request("record-v2-roundtrip.json", with_r_wire_record_request);
+    let summary_req_v2: ApprovalSummary = parse_success(
+        &fx.run_record(
+            &req_v2_path,
+            &with_r_receipt.preview.subject_digest,
+            THREAD_UUID,
+            true,
+        )
+        .await,
+        "record --request with raw CLI record_request idempotent replay",
+    );
+    assert_eq!(summary_req_v2, summary_preview);
+    assert_eq!(fx.approval_count(), 1);
+
+    // 5. Commit a second R-constrained task via `record --request` FIRST using the raw CLI
+    // `record_request` received from stdout, then replay default `--preview`.
+    let dir_r_req = prepare_task_exact_request(
+        &fx,
+        "exact-dir-r-2",
+        vec!["src/"],
+        Some(vec!["src/lib.rs", "src/new_exact.rs"]),
+    );
+    let dir_r_output = fx
+        .run_cli_with_stdin(
+            &prepare_task_exact_args(&fx),
+            &prepare_task_bytes(&dir_r_req),
+            Some(&temp_dir),
+        )
+        .await;
+    let dir_r_receipt: PrivatePreviewReceipt = parse_success(
+        &dir_r_output,
+        "prepare-task-exact with directory A and exact-file R",
+    );
+    let dir_r_raw: Value =
+        serde_json::from_slice(&dir_r_output.stdout).expect("dir-R receipt raw JSON");
+    let dir_wire_record_request = dir_r_raw
+        .get("record_request")
+        .expect("dir-R receipt exposes record_request");
+    assert_eq!(
+        dir_r_receipt.preview.tasks[0].allowed_write_paths,
+        vec!["src/".to_string()]
+    );
+    assert_eq!(
+        dir_r_receipt.preview.tasks[0].required_changed_paths,
+        Some(vec![
+            "src/lib.rs".to_string(),
+            "src/new_exact.rs".to_string()
+        ])
+    );
+    let dir_req_v2_path = fx.write_request("record-v2-dir.json", dir_wire_record_request);
+    let dir_summary_req: ApprovalSummary = parse_success(
+        &fx.run_record(
+            &dir_req_v2_path,
+            &dir_r_receipt.preview.subject_digest,
+            THREAD_UUID,
+            true,
+        )
+        .await,
+        "record --request with raw CLI record_request commits directly",
+    );
+    let dir_summary_preview: ApprovalSummary = parse_success(
+        &fx.run_record_preview(
+            &dir_r_receipt.preview_path,
+            &dir_r_receipt.preview.subject_digest,
+            THREAD_UUID,
+            true,
+        )
+        .await,
+        "record --preview replays v2 commit idempotently",
+    );
+    assert_eq!(dir_summary_preview, dir_summary_req);
+    assert_eq!(
+        dir_summary_req.subject_digest,
+        dir_r_receipt.preview.subject_digest
+    );
+    assert_eq!(fx.approval_count(), 2);
+    let dir_persisted = fx
+        .authority_store()
+        .get_for_operator(&dir_summary_req.approval_id)
+        .expect("load dir R approval");
+    assert_eq!(
+        dir_persisted.tasks[0].allowed_write_paths,
+        vec!["src/".to_string()]
+    );
+    assert_eq!(
+        dir_persisted.tasks[0].required_changed_paths,
+        Some(vec![
+            "src/lib.rs".to_string(),
+            "src/new_exact.rs".to_string()
+        ])
+    );
+    fx.assert_no_worker_invocation();
+
+    fx.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prepare_task_exact_rejects_invalid_required_changed_paths_before_mutation() {
+    let mut fx = ApprovalFixture::start().await;
+    let temp_dir = fx.private_preview_temp_dir();
+    let args = prepare_task_exact_args(&fx);
+    let before = total_plan_revision_count(&fx);
+
+    let overbound: Vec<String> = (0..=threadlane_authority::MAX_REQUIRED_CHANGED_PATHS)
+        .map(|i| format!("src/generated_{i}.rs"))
+        .collect();
+    let overbound_refs: Vec<&str> = overbound.iter().map(String::as_str).collect();
+
+    let invalid_cases: Vec<(&str, Vec<&str>, Vec<&str>, &str)> = vec![
+        (
+            "empty required_changed_paths",
+            vec!["src/lib.rs", "src/extra.rs"],
+            vec![],
+            "validation",
+        ),
+        (
+            "empty path entry in required_changed_paths",
+            vec!["src/lib.rs", "src/extra.rs"],
+            vec![""],
+            "invalid_write_scope",
+        ),
+        (
+            "duplicate required_changed_paths",
+            vec!["src/lib.rs", "src/extra.rs"],
+            vec!["src/lib.rs", "src/lib.rs"],
+            "validation",
+        ),
+        (
+            "foreign path outside allowed_write_paths",
+            vec!["src/lib.rs", "src/extra.rs"],
+            vec!["src/other.rs"],
+            "validation",
+        ),
+        (
+            "directory trailing slash in required_changed_paths",
+            vec!["src/"],
+            vec!["src/"],
+            "validation",
+        ),
+        (
+            "bare existing directory in required_changed_paths",
+            vec!["src/"],
+            vec!["src"],
+            "invalid_write_scope",
+        ),
+        (
+            "over-bound required_changed_paths",
+            vec!["src/"],
+            overbound_refs,
+            "validation",
+        ),
+    ];
+
+    for (idx, (label, allowed, required, expected_code)) in invalid_cases.into_iter().enumerate() {
+        let req = prepare_task_exact_request(
+            &fx,
+            &format!("exact-invalid-r-{idx}"),
+            allowed,
+            Some(required),
+        );
+        let out = fx
+            .run_cli_with_stdin(&args, &prepare_task_bytes(&req), Some(&temp_dir))
+            .await;
+        assert_eq!(
+            expect_failure(&out, label).code,
+            expected_code,
+            "unexpected code for {label}"
+        );
+    }
+
+    assert_eq!(
+        total_plan_revision_count(&fx),
+        before,
+        "invalid required_changed_paths must fail before saving any plan draft"
+    );
+    assert!(
+        directory_entries(&temp_dir).is_empty(),
+        "invalid required_changed_paths must leave zero private preview directories"
+    );
+    fx.assert_no_approval_artifacts();
+
+    fx.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn record_rejects_tampered_required_changed_paths_in_preview_and_request_v2_before_commit() {
+    let mut fx = ApprovalFixture::start().await;
+    let temp_dir = fx.private_preview_temp_dir();
+    let args = prepare_task_exact_args(&fx);
+
+    let req_lib = prepare_task_exact_request(
+        &fx,
+        "exact-tamper-r-1",
+        vec!["src/lib.rs", "src/extra.rs"],
+        Some(vec!["src/lib.rs"]),
+    );
+    let output_lib = fx
+        .run_cli_with_stdin(&args, &prepare_task_bytes(&req_lib), Some(&temp_dir))
+        .await;
+    let receipt_lib: PrivatePreviewReceipt =
+        parse_success(&output_lib, "prepare-task-exact with R=[src/lib.rs]");
+    let raw_lib: Value =
+        serde_json::from_slice(&output_lib.stdout).expect("raw JSON for R=[src/lib.rs]");
+    let raw_record_request = raw_lib
+        .get("record_request")
+        .expect("prepare-task-exact exposes record_request for R=[src/lib.rs]")
+        .clone();
+
+    // Replaying the same command_key/task with a different valid subset R=[src/extra.rs] yields a different digest.
+    let req_extra = prepare_task_exact_request(
+        &fx,
+        "exact-tamper-r-1",
+        vec!["src/lib.rs", "src/extra.rs"],
+        Some(vec!["src/extra.rs"]),
+    );
+    let receipt_extra: PrivatePreviewReceipt = parse_success(
+        &fx.run_cli_with_stdin(&args, &prepare_task_bytes(&req_extra), Some(&temp_dir))
+            .await,
+        "prepare-task-exact with R=[src/extra.rs]",
+    );
+    assert_ne!(
+        receipt_lib.preview.subject_digest,
+        receipt_extra.preview.subject_digest
+    );
+
+    // 1. Tamper preview.json in place (copy) changing R to another valid subset of A while keeping old digest.
+    let mut tampered_preview = receipt_lib.preview.clone();
+    tampered_preview.tasks[0].required_changed_paths = Some(vec!["src/extra.rs".to_string()]);
+    let tampered_preview_path = fx.write_request("tampered-r-preview.json", &tampered_preview);
+    let out = fx
+        .run_record_preview(
+            &tampered_preview_path,
+            &receipt_lib.preview.subject_digest,
+            THREAD_UUID,
+            true,
+        )
+        .await;
+    assert_eq!(
+        expect_failure(&out, "tampered preview R with old digest").code,
+        "validation"
+    );
+
+    // 2. Tamper preview.json by stripping R to None.
+    let mut stripped_preview = receipt_lib.preview.clone();
+    stripped_preview.tasks[0].required_changed_paths = None;
+    let stripped_preview_path = fx.write_request("stripped-r-preview.json", &stripped_preview);
+    let out = fx
+        .run_record_preview(
+            &stripped_preview_path,
+            &receipt_lib.preview.subject_digest,
+            THREAD_UUID,
+            true,
+        )
+        .await;
+    assert_eq!(
+        expect_failure(&out, "preview with stripped R").code,
+        "validation"
+    );
+
+    // 3. Submit self-consistent preview for R=[src/extra.rs] against --confirm-subject for R=[src/lib.rs].
+    let out = fx
+        .run_record_preview(
+            &receipt_extra.preview_path,
+            &receipt_lib.preview.subject_digest,
+            THREAD_UUID,
+            true,
+        )
+        .await;
+    assert_eq!(
+        expect_failure(&out, "different R preview with confirmed lib digest").code,
+        "validation"
+    );
+
+    // 4. Tamper the raw CLI `record_request` JSON changing R to another valid subset of A,
+    // dropping R, or introducing an out-of-scope path against the confirmed lib digest.
+    let mut tampered_req_v2 = raw_record_request.clone();
+    tampered_req_v2["task_required_changed_paths"]["task-fast"] =
+        serde_json::json!(["src/extra.rs"]);
+    let tampered_req_v2_path = fx.write_request("tampered-r-request-v2.json", &tampered_req_v2);
+    let out = fx
+        .run_record(
+            &tampered_req_v2_path,
+            &receipt_lib.preview.subject_digest,
+            THREAD_UUID,
+            true,
+        )
+        .await;
+    assert_eq!(
+        expect_failure(&out, "tampered raw record_request R with old digest").code,
+        "validation"
+    );
+
+    let mut dropped_r_req = raw_record_request.clone();
+    dropped_r_req["task_required_changed_paths"] = serde_json::json!({});
+    let dropped_r_path = fx.write_request("dropped-r-request-v2.json", &dropped_r_req);
+    let out = fx
+        .run_record(
+            &dropped_r_path,
+            &receipt_lib.preview.subject_digest,
+            THREAD_UUID,
+            true,
+        )
+        .await;
+    assert_eq!(
+        expect_failure(&out, "raw record_request with dropped R against R digest").code,
+        "validation"
+    );
+
+    let mut foreign_r_req = raw_record_request.clone();
+    foreign_r_req["task_required_changed_paths"]["task-fast"] = serde_json::json!(["src/other.rs"]);
+    let foreign_r_path = fx.write_request("foreign-r-request-v2.json", &foreign_r_req);
+    let out = fx
+        .run_record(
+            &foreign_r_path,
+            &receipt_lib.preview.subject_digest,
+            THREAD_UUID,
+            true,
+        )
+        .await;
+    assert_eq!(
+        expect_failure(&out, "raw record_request with out-of-scope R").code,
+        "validation"
+    );
+
+    // 5. Reject unsupported schema_version on raw record_request / OperatorApprovalRequestV2.
+    let mut bad_ver_raw = raw_record_request.clone();
+    bad_ver_raw["schema_version"] = serde_json::json!(99);
+    let bad_ver_path = fx.write_request("bad-version-request-v2.json", &bad_ver_raw);
+    let out = fx
+        .run_record(
+            &bad_ver_path,
+            &receipt_lib.preview.subject_digest,
+            THREAD_UUID,
+            true,
+        )
+        .await;
+    assert_eq!(
+        expect_failure(&out, "unsupported v2 schema_version").code,
+        "validation"
+    );
+
+    // 6. Reject legacy OperatorApprovalRequest (`preview.request`, without R) against the R-bound digest.
+    let legacy_req_path = fx.write_request("legacy-dropped-r.json", &receipt_lib.preview.request);
+    let out = fx
+        .run_record(
+            &legacy_req_path,
+            &receipt_lib.preview.subject_digest,
+            THREAD_UUID,
+            true,
+        )
+        .await;
+    assert_eq!(
+        expect_failure(&out, "legacy request dropping R against R digest").code,
+        "validation"
+    );
+
+    // Zero approvals may exist after every tamper attempt.
+    fx.assert_no_approval_artifacts();
+
+    // 7. Genuine untampered raw `record_request` commits cleanly via `--request`, and default
+    // `--preview` replays idempotently with identical scope and original digest.
+    let genuine_req_path = fx.write_request("genuine-record-request-v2.json", &raw_record_request);
+    let summary_req: ApprovalSummary = parse_success(
+        &fx.run_record(
+            &genuine_req_path,
+            &receipt_lib.preview.subject_digest,
+            THREAD_UUID,
+            true,
+        )
+        .await,
+        "genuine untampered raw record_request commits cleanly",
+    );
+    let summary_preview: ApprovalSummary = parse_success(
+        &fx.run_record_preview(
+            &receipt_lib.preview_path,
+            &receipt_lib.preview.subject_digest,
+            THREAD_UUID,
+            true,
+        )
+        .await,
+        "genuine untampered preview replays idempotently",
+    );
+    assert_eq!(summary_preview, summary_req);
+    assert_eq!(
+        summary_req.subject_digest,
+        receipt_lib.preview.subject_digest
+    );
+    let record = fx.persisted_record();
+    assert_eq!(
+        record.tasks[0].required_changed_paths,
+        Some(vec!["src/lib.rs".to_string()])
+    );
+    assert_eq!(
+        record.tasks[0].allowed_write_paths,
+        vec!["src/lib.rs".to_string(), "src/extra.rs".to_string()]
+    );
+    assert_eq!(
+        AUTHORITY_REQUEST_V2_SCHEMA_VERSION, 2,
+        "v2 request wrapper schema_version must remain pinned to 2"
+    );
+
+    fx.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prepare_and_prepare_private_expose_record_request_only_for_some_r_and_round_trip_wire_json(
+) {
+    let mut fx = ApprovalFixture::start().await;
+    let temp_dir = fx.private_preview_temp_dir();
+
+    // 1. Legacy None intent and v2 intent with empty task_required_changed_paths preserve exact
+    // legacy wire bytes (no `record_request`) across `prepare`, `prepare-private`, and
+    // `prepare-private-exact`.
+    let mut base_intent = fx.intent();
+    base_intent.budgets = serde_json::from_value(serde_json::json!({
+        "timeout_ms": 90_000,
+        "max_line_bytes": 16_384,
+        "max_stdout_bytes": 2_097_152,
+        "max_stderr_bytes": 100_000,
+        "max_events": 321
+    }))
+    .expect("explicit valid budgets");
+
+    let legacy_intent_path = fx.write_request("prepare-legacy-intent.json", &base_intent);
+    let legacy_prepare_out = fx.run_prepare(&legacy_intent_path).await;
+    let legacy_preview: OperatorApprovalPreview =
+        parse_success(&legacy_prepare_out, "prepare legacy None intent");
+    let legacy_raw: Value =
+        serde_json::from_slice(&legacy_prepare_out.stdout).expect("legacy prepare raw JSON");
+    let legacy_obj = legacy_raw.as_object().expect("legacy prepare is object");
+    assert_eq!(
+        legacy_obj.len(),
+        3,
+        "legacy None prepare must emit only request, subject_digest, and tasks"
+    );
+    assert!(legacy_obj.get("record_request").is_none());
+
+    let empty_v2_intent = OperatorApprovalIntentV2 {
+        schema_version: AUTHORITY_REQUEST_V2_SCHEMA_VERSION,
+        intent: base_intent.clone(),
+        task_required_changed_paths: BTreeMap::new(),
+    };
+    let empty_v2_path = fx.write_request("prepare-v2-empty-r.json", &empty_v2_intent);
+    let empty_v2_out = fx.run_prepare(&empty_v2_path).await;
+    assert_eq!(
+        empty_v2_out.stdout, legacy_prepare_out.stdout,
+        "v2 intent with empty R map must produce byte-for-byte identical legacy prepare stdout"
+    );
+
+    let mut exact_args = fx.prepare_private_args();
+    exact_args[0] = "prepare-private-exact".to_string();
+    let empty_v2_bytes = serde_json::to_vec(&empty_v2_intent).expect("serialize empty v2 intent");
+    for (label, args) in [
+        ("prepare-private empty R", fx.prepare_private_args()),
+        ("prepare-private-exact empty R", exact_args.clone()),
+    ] {
+        let out = fx
+            .run_cli_with_stdin(&args, &empty_v2_bytes, Some(&temp_dir))
+            .await;
+        let receipt: PrivatePreviewReceipt = parse_success(&out, label);
+        let raw: Value = serde_json::from_slice(&out.stdout).expect("empty-R receipt raw JSON");
+        let obj = raw.as_object().expect("empty-R receipt is object");
+        assert_eq!(obj.len(), 2, "{label} must omit record_request");
+        assert!(obj.get("record_request").is_none());
+        assert_eq!(
+            fs::read(&receipt.preview_path).expect("read empty-R preview.json"),
+            legacy_prepare_out.stdout,
+            "{label} preview.json bytes must match legacy prepare stdout"
+        );
+    }
+
+    // 2. `prepare --request` with Some(R) on task-root (and None on task-child) exposes
+    // `record_request` directly on stdout; both `--request` (from raw `record_request`) and
+    // `--preview` (from raw `prepare` stdout bytes) record identical scope and original digest,
+    // while tampered R or inconsistent embedded `record_request` fails closed.
+    let v2_partial_intent = OperatorApprovalIntentV2 {
+        schema_version: AUTHORITY_REQUEST_V2_SCHEMA_VERSION,
+        intent: base_intent.clone(),
+        task_required_changed_paths: BTreeMap::from([(
+            "task-root".to_string(),
+            vec!["src/lib.rs".to_string()],
+        )]),
+    };
+    let v2_partial_path = fx.write_request("prepare-v2-partial-r.json", &v2_partial_intent);
+    let v2_prepare_out = fx.run_prepare(&v2_partial_path).await;
+    assert!(
+        v2_prepare_out.status.success(),
+        "prepare --request v2 intent must succeed: {}",
+        String::from_utf8_lossy(&v2_prepare_out.stderr)
+    );
+    let v2_prepare_raw: Value =
+        serde_json::from_slice(&v2_prepare_out.stdout).expect("v2 prepare raw JSON");
+    let v2_prepare_obj = v2_prepare_raw
+        .as_object()
+        .expect("v2 prepare stdout is object");
+    assert_eq!(
+        v2_prepare_obj.len(),
+        4,
+        "Some(R) prepare stdout must expose request, subject_digest, tasks, and record_request"
+    );
+    let v2_subject = v2_prepare_obj["subject_digest"]
+        .as_str()
+        .expect("v2 prepare subject_digest string")
+        .to_string();
+    assert_ne!(
+        v2_subject, legacy_preview.subject_digest,
+        "Some(R) must change subject_digest relative to legacy None"
+    );
+    let v2_wire_record_request = v2_prepare_obj["record_request"].clone();
+    let v2_typed_record_request: OperatorApprovalRequestV2 =
+        serde_json::from_value(v2_wire_record_request.clone())
+            .expect("prepare stdout record_request matches OperatorApprovalRequestV2");
+    assert_eq!(
+        v2_typed_record_request.schema_version,
+        AUTHORITY_REQUEST_V2_SCHEMA_VERSION
+    );
+    assert_eq!(
+        serde_json::to_value(&v2_typed_record_request.request).unwrap(),
+        v2_prepare_obj["request"]
+    );
+    assert_eq!(
+        v2_typed_record_request.task_required_changed_paths,
+        BTreeMap::from([("task-root".to_string(), vec!["src/lib.rs".to_string()])])
+    );
+
+    // Tamper checks before any commit: all must fail closed with zero approvals.
+    let mut changed_r = v2_wire_record_request.clone();
+    changed_r["task_required_changed_paths"] = serde_json::json!({
+        "task-root": ["src/lib.rs"],
+        "task-child": ["src/extra.rs"]
+    });
+    let changed_r_path = fx.write_request("prepare-v2-changed-r.json", &changed_r);
+    assert_eq!(
+        expect_failure(
+            &fx.run_record(&changed_r_path, &v2_subject, THREAD_UUID, true)
+                .await,
+            "record --request with changed valid R against original digest",
+        )
+        .code,
+        "validation"
+    );
+
+    let legacy_req_only_path = fx.write_request(
+        "prepare-v2-legacy-req-only.json",
+        &v2_prepare_obj["request"],
+    );
+    assert_eq!(
+        expect_failure(
+            &fx.run_record(&legacy_req_only_path, &v2_subject, THREAD_UUID, true)
+                .await,
+            "record --request with v1 preview.request dropping R against R digest",
+        )
+        .code,
+        "validation"
+    );
+
+    let mut preview_tampered_embedded = v2_prepare_raw.clone();
+    preview_tampered_embedded["record_request"]["task_required_changed_paths"] =
+        serde_json::json!({});
+    let preview_tampered_path = fx.write_request(
+        "prepare-v2-tampered-embedded-record-request.json",
+        &preview_tampered_embedded,
+    );
+    assert_eq!(
+        expect_failure(
+            &fx.run_record_preview(&preview_tampered_path, &v2_subject, THREAD_UUID, true)
+                .await,
+            "record --preview with inconsistent embedded record_request",
+        )
+        .code,
+        "validation"
+    );
+
+    let mut preview_bad_ver = v2_prepare_raw.clone();
+    preview_bad_ver["record_request"]["schema_version"] = serde_json::json!(99);
+    let preview_bad_ver_path =
+        fx.write_request("prepare-v2-bad-embedded-version.json", &preview_bad_ver);
+    assert_eq!(
+        expect_failure(
+            &fx.run_record_preview(&preview_bad_ver_path, &v2_subject, THREAD_UUID, true)
+                .await,
+            "record --preview with unsupported embedded record_request schema_version",
+        )
+        .code,
+        "validation"
+    );
+
+    let mut preview_null_req = v2_prepare_raw;
+    preview_null_req["record_request"] = Value::Null;
+    let preview_null_req_path =
+        fx.write_request("prepare-v2-null-record-request.json", &preview_null_req);
+    assert_eq!(
+        expect_failure(
+            &fx.run_record_preview(&preview_null_req_path, &v2_subject, THREAD_UUID, true)
+                .await,
+            "record --preview with null record_request",
+        )
+        .code,
+        "invalid_input"
+    );
+
+    let mut legacy_smuggled = legacy_raw.clone();
+    legacy_smuggled["record_request"] = serde_json::json!({
+        "schema_version": AUTHORITY_REQUEST_V2_SCHEMA_VERSION,
+        "request": legacy_raw["request"],
+        "task_required_changed_paths": {}
+    });
+    let legacy_smuggled_path = fx.write_request(
+        "prepare-legacy-smuggled-record-request.json",
+        &legacy_smuggled,
+    );
+    assert_eq!(
+        expect_failure(
+            &fx.run_record_preview(
+                &legacy_smuggled_path,
+                &legacy_preview.subject_digest,
+                THREAD_UUID,
+                true,
+            )
+            .await,
+            "record --preview with record_request smuggled onto legacy None preview",
+        )
+        .code,
+        "validation"
+    );
+    fx.assert_no_approval_artifacts();
+
+    // Commit directly from raw `prepare` stdout's `record_request`, then replay verbatim `prepare`
+    // stdout bytes via `--preview`.
+    let raw_req_v2_path = fx.write_request(
+        "prepare-v2-raw-record-request.json",
+        &v2_wire_record_request,
+    );
+    let summary_from_request: ApprovalSummary = parse_success(
+        &fx.run_record(&raw_req_v2_path, &v2_subject, THREAD_UUID, true)
+            .await,
+        "record --request from prepare stdout record_request",
+    );
+    assert_eq!(summary_from_request.subject_digest, v2_subject);
+    let piped_prepare_preview_path =
+        fx.write_request_bytes("prepare-v2-piped-stdout.json", &v2_prepare_out.stdout);
+    let summary_from_piped_preview: ApprovalSummary = parse_success(
+        &fx.run_record_preview(&piped_prepare_preview_path, &v2_subject, THREAD_UUID, true)
+            .await,
+        "record --preview from raw piped prepare stdout bytes",
+    );
+    assert_eq!(summary_from_piped_preview, summary_from_request);
+    assert_eq!(fx.approval_count(), 1);
+    let persisted_partial = fx.persisted_record();
+    let persisted_root = persisted_partial
+        .tasks
+        .iter()
+        .find(|t| t.task_id == "task-root")
+        .expect("task-root persisted");
+    let persisted_child = persisted_partial
+        .tasks
+        .iter()
+        .find(|t| t.task_id == "task-child")
+        .expect("task-child persisted");
+    assert_eq!(
+        persisted_root.allowed_write_paths,
+        vec!["src/lib.rs".to_string()]
+    );
+    assert_eq!(
+        persisted_root.required_changed_paths,
+        Some(vec!["src/lib.rs".to_string()])
+    );
+    assert_eq!(
+        persisted_child.allowed_write_paths,
+        vec!["src/extra.rs".to_string()]
+    );
+    assert_eq!(persisted_child.required_changed_paths, None);
+
+    // 3. `prepare-private` and `prepare-private-exact` with Some(R) on both tasks expose
+    // `record_request` on stdout while keeping `preview.json` pure `OperatorApprovalPreview`.
+    let v2_both_intent = OperatorApprovalIntentV2 {
+        schema_version: AUTHORITY_REQUEST_V2_SCHEMA_VERSION,
+        intent: base_intent,
+        task_required_changed_paths: BTreeMap::from([
+            ("task-root".to_string(), vec!["src/lib.rs".to_string()]),
+            ("task-child".to_string(), vec!["src/extra.rs".to_string()]),
+        ]),
+    };
+    let v2_both_bytes = serde_json::to_vec(&v2_both_intent).expect("serialize both-R v2 intent");
+    let priv_out = fx
+        .run_cli_with_stdin(&fx.prepare_private_args(), &v2_both_bytes, Some(&temp_dir))
+        .await;
+    let priv_exact_out = fx
+        .run_cli_with_stdin(&exact_args, &v2_both_bytes, Some(&temp_dir))
+        .await;
+    let priv_receipt: PrivatePreviewReceipt = parse_success(&priv_out, "prepare-private Some(R)");
+    let priv_exact_receipt: PrivatePreviewReceipt =
+        parse_success(&priv_exact_out, "prepare-private-exact Some(R)");
+    assert_eq!(priv_receipt.preview, priv_exact_receipt.preview);
+
+    let priv_raw: Value =
+        serde_json::from_slice(&priv_out.stdout).expect("prepare-private raw JSON");
+    let priv_exact_raw: Value =
+        serde_json::from_slice(&priv_exact_out.stdout).expect("prepare-private-exact raw JSON");
+    assert_eq!(priv_raw.as_object().unwrap().len(), 3);
+    assert_eq!(priv_exact_raw.as_object().unwrap().len(), 3);
+    assert_eq!(priv_raw["record_request"], priv_exact_raw["record_request"]);
+    let priv_subject = priv_exact_receipt.preview.subject_digest.clone();
+    assert_ne!(priv_subject, v2_subject);
+    let priv_preview_file_val: Value = serde_json::from_slice(
+        &fs::read(&priv_exact_receipt.preview_path).expect("read prepare-private-exact preview"),
+    )
+    .expect("preview.json is valid JSON");
+    assert!(
+        priv_preview_file_val
+            .as_object()
+            .unwrap()
+            .get("record_request")
+            .is_none(),
+        "preview.json written by prepare-private-exact must remain pure OperatorApprovalPreview"
+    );
+
+    // Mutating R on raw stdout record_request (dropping task-child) fails closed against original digest.
+    let mut priv_mutated = priv_exact_raw["record_request"].clone();
+    priv_mutated["task_required_changed_paths"]
+        .as_object_mut()
+        .unwrap()
+        .remove("task-child");
+    let priv_mutated_path = fx.write_request("prepare-private-mutated-r.json", &priv_mutated);
+    assert_eq!(
+        expect_failure(
+            &fx.run_record(&priv_mutated_path, &priv_subject, THREAD_UUID, true)
+                .await,
+            "record --request with mutated prepare-private-exact record_request",
+        )
+        .code,
+        "validation"
+    );
+    assert_eq!(fx.approval_count(), 1);
+
+    // Genuine raw `record_request` commits approval #2, and default `--preview` replays idempotently.
+    let priv_req_path = fx.write_request(
+        "prepare-private-raw-record-request.json",
+        &priv_exact_raw["record_request"],
+    );
+    let priv_summary_req: ApprovalSummary = parse_success(
+        &fx.run_record(&priv_req_path, &priv_subject, THREAD_UUID, true)
+            .await,
+        "record --request from prepare-private-exact stdout record_request",
+    );
+    let priv_summary_preview: ApprovalSummary = parse_success(
+        &fx.run_record_preview(
+            &priv_exact_receipt.preview_path,
+            &priv_subject,
+            THREAD_UUID,
+            true,
+        )
+        .await,
+        "record --preview from prepare-private-exact replays idempotently",
+    );
+    assert_eq!(priv_summary_preview, priv_summary_req);
+    assert_eq!(priv_summary_req.subject_digest, priv_subject);
+    assert_eq!(fx.approval_count(), 2);
+    let persisted_both = fx
+        .authority_store()
+        .get_for_operator(&priv_summary_req.approval_id)
+        .expect("load persisted both-R approval");
+    let both_root = persisted_both
+        .tasks
+        .iter()
+        .find(|t| t.task_id == "task-root")
+        .expect("both task-root");
+    let both_child = persisted_both
+        .tasks
+        .iter()
+        .find(|t| t.task_id == "task-child")
+        .expect("both task-child");
+    assert_eq!(
+        both_root.required_changed_paths,
+        Some(vec!["src/lib.rs".to_string()])
+    );
+    assert_eq!(
+        both_child.required_changed_paths,
+        Some(vec!["src/extra.rs".to_string()])
+    );
     fx.assert_no_worker_invocation();
 
     fx.shutdown().await;

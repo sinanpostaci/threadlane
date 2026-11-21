@@ -7,6 +7,10 @@ import {
   type RegistrySnapshot,
   type WorkflowProfile,
 } from './ipc.ts';
+import {
+  eligibleDecisionAdvisors,
+  validateDecisionAdvisor,
+} from './profile-advisor.ts';
 
 function makeBaseSnapshot(): RegistrySnapshot {
   return {
@@ -490,5 +494,100 @@ describe('DEV preview registry decision advisor adapter', () => {
       'invalid_advisor'
     );
     assert.equal(JSON.stringify(frozen), sourceBefore);
+  });
+
+  it('keeps stored unsupported-capability advisors readable across unrelated edits while UI validation reports unsupported_model', () => {
+    const base = makeBaseSnapshot();
+    const storedLegacy: RegistrySnapshot = {
+      ...base,
+      profiles: [
+        ...base.profiles,
+        makeProfile('legacy-openai', 'Legacy OpenAI advisor', {
+          model_id: 'openai-shadow',
+          mode: 'shadow',
+        }),
+      ],
+    };
+    const sourceBefore = structuredClone(storedLegacy);
+
+    // Picker excludes unsupported model_arg entries, and shared UI validation marks them invalid.
+    assert.deepEqual(
+      eligibleDecisionAdvisors(storedLegacy).map((choice) => choice.model.id),
+      ['jev-shadow']
+    );
+    const initialUiCheck = validateDecisionAdvisor(
+      storedLegacy,
+      profileById(storedLegacy, 'legacy-openai').decision_advisor
+    );
+    assert.equal(initialUiCheck.state, 'invalid');
+    if (initialUiCheck.state === 'invalid') {
+      assert.equal(initialUiCheck.issue.code, 'unsupported_model');
+    }
+
+    // Unrelated profile edits succeed without blocking on or mutating the stored legacy advisor.
+    const afterProfileEdit = apply(storedLegacy, {
+      op: 'upsert_profile',
+      profile: makeProfile('unrelated-profile', 'Unrelated profile'),
+    });
+    assert.equal(afterProfileEdit.revision, storedLegacy.revision + 1);
+    assert.deepEqual(profileById(afterProfileEdit, 'legacy-openai').decision_advisor, {
+      model_id: 'openai-shadow',
+      mode: 'shadow',
+    });
+
+    // Unrelated tool edits (which revalidate all profile advisors) also succeed.
+    const afterToolEdit = apply(afterProfileEdit, {
+      op: 'upsert_tool',
+      tool: { ...toolById(afterProfileEdit, 'jev-api'), label: 'Jev API renamed' },
+    });
+    assert.equal(afterToolEdit.revision, afterProfileEdit.revision + 1);
+    assert.equal(toolById(afterToolEdit, 'jev-api').label, 'Jev API renamed');
+    assert.deepEqual(profileById(afterToolEdit, 'legacy-openai').decision_advisor, {
+      model_id: 'openai-shadow',
+      mode: 'shadow',
+    });
+
+    // Structural persistence invariants still protect the stored legacy reference.
+    throwsCode(
+      () =>
+        apply(afterToolEdit, {
+          op: 'upsert_tool',
+          tool: { ...toolById(afterToolEdit, 'openai-api'), enabled: false },
+        }),
+      'disabled_tool'
+    );
+    throwsCode(
+      () =>
+        apply(afterToolEdit, {
+          op: 'upsert_model',
+          model: {
+            ...modelById(afterToolEdit, 'openai-shadow'),
+            efforts: ['low'],
+            allow_no_effort: false,
+          },
+        }),
+      'effort_required'
+    );
+    throwsCode(
+      () => apply(afterToolEdit, { op: 'delete_model', model_id: 'openai-shadow' }),
+      'model_in_use'
+    );
+
+    // After unrelated persistence changes, shared UI validation still flags unsupported_model
+    // and the picker still excludes the legacy model until explicitly cleared or replaced.
+    assert.deepEqual(
+      eligibleDecisionAdvisors(afterToolEdit).map((choice) => choice.model.id),
+      ['jev-shadow']
+    );
+    const uiCheckAfterEdits = validateDecisionAdvisor(
+      afterToolEdit,
+      profileById(afterToolEdit, 'legacy-openai').decision_advisor
+    );
+    assert.equal(uiCheckAfterEdits.state, 'invalid');
+    if (uiCheckAfterEdits.state === 'invalid') {
+      assert.equal(uiCheckAfterEdits.issue.code, 'unsupported_model');
+    }
+
+    assert.deepEqual(storedLegacy, sourceBefore);
   });
 });

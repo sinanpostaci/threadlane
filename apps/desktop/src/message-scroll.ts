@@ -12,6 +12,7 @@ import {
   projectDuration,
 } from './pages/activity-feed-model.ts';
 import {
+  MAX_WORKSPACE_BACKLOG_PRESENCE_SAMPLE_AGE_MS,
   WORKSPACE_SAMPLE_STALE_THRESHOLD_MS,
   evaluateWorkspaceNativeSampleAt,
   formatWorkspaceChatIdentityKey,
@@ -322,16 +323,159 @@ function isUsableChatWorkEvent(event: unknown): event is ChatWorkEvent {
   );
 }
 
-function isUsableChatWorkPresence(presence: unknown): presence is ChatWorkPresence {
-  if (!isRecord(presence)) {
-    return false;
+function containsPresenceSensitiveMarker(lower: string): boolean {
+  for (let idx = 0; idx + 2 < lower.length; idx += 1) {
+    if (
+      lower[idx] === 's' &&
+      lower[idx + 1] === 'k' &&
+      lower[idx + 2] === '-' &&
+      (idx === 0 || !/[a-z0-9]/.test(lower[idx - 1] ?? ''))
+    ) {
+      return true;
+    }
   }
   return (
-    typeof presence.item_id === 'string' &&
-    presence.item_id.trim().length > 0 &&
-    typeof presence.execution_ref === 'string' &&
-    presence.execution_ref.trim().length > 0
+    lower.includes('bearer') ||
+    lower.includes('api_key') ||
+    lower.includes('apikey') ||
+    lower.includes('authorization') ||
+    lower.includes('secret') ||
+    lower.includes('password') ||
+    lower.includes('token') ||
+    lower.includes('prompt') ||
+    lower.includes('instruction')
   );
+}
+
+function cleanPresenceToken(value: unknown, maxBytes: number): string | null {
+  if (typeof value !== 'string') {
+    return null;
+  }
+  if (
+    value.length === 0 ||
+    value.trim() !== value ||
+    UTF8_ENCODER.encode(value).byteLength > maxBytes ||
+    !/^[A-Za-z0-9_.:-]+$/.test(value) ||
+    containsPresenceSensitiveMarker(value.toLowerCase())
+  ) {
+    return null;
+  }
+  return value;
+}
+
+function cleanOptionalPresenceToken(
+  value: unknown,
+  maxBytes: number,
+): string | null | undefined {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  const clean = cleanPresenceToken(value, maxBytes);
+  return clean === null ? undefined : clean;
+}
+
+function cleanStrictOptionalNonNegativeInt(value: unknown): number | null | undefined {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) {
+    return undefined;
+  }
+  return value;
+}
+
+function cleanStrictOptionalPositiveInt(value: unknown): number | null | undefined {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value <= 0) {
+    return undefined;
+  }
+  return value;
+}
+
+function cleanStrictPresenceMaxSampleAgeMs(value: unknown): number | undefined {
+  if (value === undefined) {
+    return MAX_WORKSPACE_BACKLOG_PRESENCE_SAMPLE_AGE_MS;
+  }
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) {
+    return undefined;
+  }
+  return value;
+}
+
+function normalizeChatWorkPresence(raw: unknown): ChatWorkPresence | null {
+  if (!isRecord(raw)) {
+    return null;
+  }
+  const itemId = cleanPresenceToken(raw.item_id, 128);
+  const executionRef = cleanPresenceToken(raw.execution_ref, 512);
+  const approvalId = cleanPresenceToken(raw.approval_id, 128);
+  const taskId = cleanPresenceToken(raw.task_id, 128);
+  const runId = cleanPresenceToken(raw.run_id, 128);
+  const workerId = cleanPresenceToken(raw.worker_id, 128);
+  const claimId = cleanOptionalPresenceToken(raw.claim_id, 128);
+  const hostInstanceId = cleanOptionalPresenceToken(raw.host_instance_id, 128);
+  const invocationId = cleanOptionalPresenceToken(raw.invocation_id, 128);
+  const sequence = cleanStrictOptionalNonNegativeInt(raw.sequence);
+  const availability =
+    raw.availability === 'live' ||
+    raw.availability === 'non_live' ||
+    raw.availability === 'unavailable'
+      ? raw.availability
+      : null;
+  const freshness =
+    raw.freshness === 'fresh' ||
+    raw.freshness === 'stale' ||
+    raw.freshness === 'not_applicable'
+      ? raw.freshness
+      : null;
+  const sampledAtMs = cleanStrictOptionalPositiveInt(raw.sampled_at_ms);
+  const sampleAgeMs = cleanStrictOptionalNonNegativeInt(raw.sample_age_ms);
+  const maxSampleAgeMs = cleanStrictPresenceMaxSampleAgeMs(raw.max_sample_age_ms);
+  const expiresAtMs = cleanStrictOptionalPositiveInt(raw.expires_at_ms);
+  const rawLive =
+    raw.live === undefined ? false : typeof raw.live === 'boolean' ? raw.live : undefined;
+  if (
+    itemId === null ||
+    executionRef === null ||
+    approvalId === null ||
+    taskId === null ||
+    runId === null ||
+    workerId === null ||
+    claimId === undefined ||
+    hostInstanceId === undefined ||
+    invocationId === undefined ||
+    sequence === undefined ||
+    availability === null ||
+    freshness === null ||
+    sampledAtMs === undefined ||
+    sampleAgeMs === undefined ||
+    maxSampleAgeMs === undefined ||
+    expiresAtMs === undefined ||
+    rawLive === undefined
+  ) {
+    return null;
+  }
+  return {
+    item_id: itemId,
+    execution_ref: executionRef,
+    approval_id: approvalId,
+    task_id: taskId,
+    run_id: runId,
+    worker_id: workerId,
+    claim_id: claimId,
+    host_instance_id: hostInstanceId,
+    invocation_id: invocationId,
+    sequence,
+    availability,
+    freshness,
+    live: rawLive && availability === 'live' && freshness === 'fresh',
+    sampled_at_ms: sampledAtMs,
+    sample_age_ms: sampleAgeMs,
+    max_sample_age_ms: maxSampleAgeMs,
+    expires_at_ms: expiresAtMs,
+  };
 }
 
 function compareChatWorkEvents(left: ChatWorkEvent, right: ChatWorkEvent): number {
@@ -395,25 +539,246 @@ function reconcileChatWorkItems(
   return { items: Array.from(byIdentity.values()), omitted };
 }
 
+function chatWorkPresenceEpochKey(
+  presence: ChatWorkPresence,
+  invocationId: string,
+): string {
+  return [
+    presence.host_instance_id === null ? '0:' : `1:${presence.host_instance_id}`,
+    `1:${invocationId}`,
+    presence.claim_id === null ? '0:' : `1:${presence.claim_id}`,
+  ].join('\u0000');
+}
+
+function chatWorkPresenceStateRank(presence: ChatWorkPresence): number {
+  if (presence.availability === 'non_live') {
+    return 3;
+  }
+  if (
+    presence.live === true &&
+    presence.availability === 'live' &&
+    presence.freshness === 'fresh'
+  ) {
+    return 2;
+  }
+  if (presence.availability === 'unavailable' && presence.freshness !== 'stale') {
+    return 1;
+  }
+  return 0;
+}
+
+function chatWorkPresenceAvailabilityRank(
+  availability: ChatWorkPresence['availability'],
+): number {
+  if (availability === 'non_live') {
+    return 2;
+  }
+  if (availability === 'live') {
+    return 1;
+  }
+  return 0;
+}
+
+function chatWorkPresenceFreshnessRank(
+  freshness: ChatWorkPresence['freshness'],
+): number {
+  if (freshness === 'fresh') {
+    return 2;
+  }
+  if (freshness === 'not_applicable') {
+    return 1;
+  }
+  return 0;
+}
+
+function compareOptionalNumberDesc(left: number | null, right: number | null): number {
+  if (left !== null && right !== null) {
+    return left === right ? 0 : left > right ? -1 : 1;
+  }
+  if (left !== null) {
+    return -1;
+  }
+  if (right !== null) {
+    return 1;
+  }
+  return 0;
+}
+
+function compareOptionalNumberAsc(left: number | null, right: number | null): number {
+  if (left !== null && right !== null) {
+    return left === right ? 0 : left < right ? -1 : 1;
+  }
+  if (left !== null) {
+    return -1;
+  }
+  if (right !== null) {
+    return 1;
+  }
+  return 0;
+}
+
+function compareOptionalStringsUtf8SomeFirst(
+  left: string | null,
+  right: string | null,
+): number {
+  if (left !== null && right !== null) {
+    return compareStringsUtf8(left, right);
+  }
+  if (left !== null) {
+    return -1;
+  }
+  if (right !== null) {
+    return 1;
+  }
+  return 0;
+}
+
+function compareChatWorkPresenceWithinEpoch(
+  left: ChatWorkPresence,
+  right: ChatWorkPresence,
+): number {
+  return (
+    compareOptionalNumberDesc(left.sequence, right.sequence) ||
+    compareOptionalNumberDesc(left.sampled_at_ms, right.sampled_at_ms) ||
+    chatWorkPresenceStateRank(right) - chatWorkPresenceStateRank(left) ||
+    compareOptionalNumberDesc(left.expires_at_ms, right.expires_at_ms) ||
+    compareOptionalNumberAsc(left.sample_age_ms, right.sample_age_ms) ||
+    (left.max_sample_age_ms === right.max_sample_age_ms
+      ? 0
+      : left.max_sample_age_ms > right.max_sample_age_ms
+        ? -1
+        : 1) ||
+    chatWorkPresenceAvailabilityRank(right.availability) -
+      chatWorkPresenceAvailabilityRank(left.availability) ||
+    chatWorkPresenceFreshnessRank(right.freshness) -
+      chatWorkPresenceFreshnessRank(left.freshness) ||
+    (left.live === right.live ? 0 : left.live ? -1 : 1)
+  );
+}
+
+function compareChatWorkPresenceCrossEpoch(
+  left: ChatWorkPresence,
+  right: ChatWorkPresence,
+): number {
+  return (
+    compareOptionalNumberDesc(left.sampled_at_ms, right.sampled_at_ms) ||
+    chatWorkPresenceStateRank(right) - chatWorkPresenceStateRank(left) ||
+    compareOptionalNumberDesc(left.sequence, right.sequence) ||
+    compareOptionalNumberDesc(left.expires_at_ms, right.expires_at_ms) ||
+    compareOptionalNumberAsc(left.sample_age_ms, right.sample_age_ms) ||
+    (left.max_sample_age_ms === right.max_sample_age_ms
+      ? 0
+      : left.max_sample_age_ms > right.max_sample_age_ms
+        ? -1
+        : 1) ||
+    chatWorkPresenceAvailabilityRank(right.availability) -
+      chatWorkPresenceAvailabilityRank(left.availability) ||
+    chatWorkPresenceFreshnessRank(right.freshness) -
+      chatWorkPresenceFreshnessRank(left.freshness) ||
+    (left.live === right.live ? 0 : left.live ? -1 : 1) ||
+    compareOptionalStringsUtf8SomeFirst(left.host_instance_id, right.host_instance_id) ||
+    compareOptionalStringsUtf8SomeFirst(left.invocation_id, right.invocation_id) ||
+    compareOptionalStringsUtf8SomeFirst(left.claim_id, right.claim_id)
+  );
+}
+
+function compareChatWorkPresenceListOrder(
+  left: ChatWorkPresence,
+  right: ChatWorkPresence,
+): number {
+  return (
+    compareOptionalNumberDesc(left.sampled_at_ms, right.sampled_at_ms) ||
+    compareOptionalNumberDesc(left.sequence, right.sequence) ||
+    (left.live === right.live ? 0 : left.live ? -1 : 1) ||
+    chatWorkPresenceStateRank(right) - chatWorkPresenceStateRank(left) ||
+    compareStringsUtf8(left.item_id, right.item_id) ||
+    compareStringsUtf8(left.execution_ref, right.execution_ref) ||
+    compareStringsUtf8(left.approval_id, right.approval_id) ||
+    compareStringsUtf8(left.task_id, right.task_id) ||
+    compareStringsUtf8(left.run_id, right.run_id) ||
+    compareStringsUtf8(left.worker_id, right.worker_id) ||
+    compareOptionalStringsUtf8SomeFirst(left.host_instance_id, right.host_instance_id) ||
+    compareOptionalStringsUtf8SomeFirst(left.invocation_id, right.invocation_id) ||
+    compareOptionalStringsUtf8SomeFirst(left.claim_id, right.claim_id)
+  );
+}
+
+function reconcileChatWorkPresenceAttempt(
+  samples: readonly ChatWorkPresence[],
+): { winner: ChatWorkPresence; omitted: number } | null {
+  if (samples.length === 0) {
+    return null;
+  }
+  const omitted = samples.length - 1;
+  const sequencedByEpoch = new Map<string, ChatWorkPresence>();
+  const crossEpochCandidates: ChatWorkPresence[] = [];
+
+  for (const sample of samples) {
+    if (sample.invocation_id !== null && sample.sequence !== null) {
+      const epochKey = chatWorkPresenceEpochKey(sample, sample.invocation_id);
+      const existing = sequencedByEpoch.get(epochKey);
+      if (
+        existing === undefined ||
+        compareChatWorkPresenceWithinEpoch(sample, existing) < 0
+      ) {
+        sequencedByEpoch.set(epochKey, sample);
+      }
+    } else {
+      crossEpochCandidates.push(sample);
+    }
+  }
+
+  for (const winner of sequencedByEpoch.values()) {
+    crossEpochCandidates.push(winner);
+  }
+
+  let best: ChatWorkPresence | null = null;
+  for (const candidate of crossEpochCandidates) {
+    if (best === null || compareChatWorkPresenceCrossEpoch(candidate, best) < 0) {
+      best = candidate;
+    }
+  }
+  return best === null ? null : { winner: best, omitted };
+}
+
 /**
- * Collapses duplicate samples of the same immutable attempt after the existing
- * deterministic presence ordering, so repeated samples cannot consume bounded
- * slots or hide an unrelated Worker. Distinct attempts remain distinct.
+ * Reconciles duplicate samples of the same immutable Worker attempt using
+ * two-stage epoch-aware ordering (`sequence` within a concrete invocation
+ * epoch, wall-clock `sampled_at_ms` across epochs) before liveness/state
+ * tie-breakers, then sorts distinct winning attempts deterministically before
+ * the bounded per-chat cap. Distinct attempts remain isolated.
  */
 function reconcileChatWorkPresence(
   presence: readonly ChatWorkPresence[],
 ): { presence: ChatWorkPresence[]; omitted: number } {
-  const byAttempt = new Map<string, ChatWorkPresence>();
-  let omitted = 0;
+  const byAttempt = new Map<string, ChatWorkPresence[]>();
   for (const entry of presence) {
-    const key = `${entry.item_id}\u0000${entry.execution_ref}`;
-    if (byAttempt.has(key)) {
-      omitted += 1;
-      continue;
+    const key = chatWorkPresenceJoinKey(
+      entry.item_id,
+      entry.execution_ref,
+      entry.approval_id,
+      entry.task_id,
+      entry.run_id,
+      entry.worker_id,
+    );
+    const group = byAttempt.get(key);
+    if (group === undefined) {
+      byAttempt.set(key, [entry]);
+    } else {
+      group.push(entry);
     }
-    byAttempt.set(key, entry);
   }
-  return { presence: Array.from(byAttempt.values()), omitted };
+  const winners: ChatWorkPresence[] = [];
+  let omitted = 0;
+  for (const group of byAttempt.values()) {
+    const reconciled = reconcileChatWorkPresenceAttempt(group);
+    if (reconciled !== null) {
+      winners.push(reconciled.winner);
+      omitted += reconciled.omitted;
+    }
+  }
+  winners.sort(compareChatWorkPresenceListOrder);
+  return { presence: winners, omitted };
 }
 
 export interface ChatWorkBoundsView {
@@ -841,30 +1206,13 @@ function buildChatWorkSelectionFromWork(
   const rawPresence: readonly unknown[] = Array.isArray(work.worker_presence)
     ? work.worker_presence
     : [];
-  const usablePresence = rawPresence
-    .filter(isUsableChatWorkPresence)
-    .sort((left, right) => {
-      const leftPriority =
-        (left.live === true ? 4 : 0) +
-        (left.freshness === 'fresh' ? 2 : 0) +
-        (left.availability === 'live' ? 1 : 0);
-      const rightPriority =
-        (right.live === true ? 4 : 0) +
-        (right.freshness === 'fresh' ? 2 : 0) +
-        (right.availability === 'live' ? 1 : 0);
-      if (leftPriority !== rightPriority) {
-        return rightPriority - leftPriority;
-      }
-      const leftSampledAtMs = cleanOptionalTimestamp(left.sampled_at_ms) ?? 0;
-      const rightSampledAtMs = cleanOptionalTimestamp(right.sampled_at_ms) ?? 0;
-      if (leftSampledAtMs !== rightSampledAtMs) {
-        return rightSampledAtMs - leftSampledAtMs;
-      }
-      if (left.item_id !== right.item_id) {
-        return left.item_id < right.item_id ? -1 : 1;
-      }
-      return left.execution_ref < right.execution_ref ? -1 : 1;
-    });
+  const usablePresence: ChatWorkPresence[] = [];
+  for (const entry of rawPresence) {
+    const normalized = normalizeChatWorkPresence(entry);
+    if (normalized !== null) {
+      usablePresence.push(normalized);
+    }
+  }
   const presenceResult = reconcileChatWorkPresence(usablePresence);
   const presenceCap = capChatWorkHead(presenceResult.presence, MAX_CHAT_WORK_PRESENCE);
 
@@ -1358,8 +1706,15 @@ export function buildChatWorkExecutionSummaries(
   const itemById = new Map<string, ChatWorkItem>(
     selection.items.map((item) => [item.item_id, item] as const),
   );
+  const normalizedPresence: ChatWorkPresence[] = [];
+  for (const raw of selection.presence) {
+    const normalized = normalizeChatWorkPresence(raw);
+    if (normalized !== null) {
+      normalizedPresence.push(normalized);
+    }
+  }
   const presenceByExecution = new Map<string, ChatWorkPresence>();
-  for (const presence of selection.presence) {
+  for (const presence of reconcileChatWorkPresence(normalizedPresence).presence) {
     const key = chatWorkPresenceJoinKey(
       presence.item_id,
       presence.execution_ref,
@@ -1764,16 +2119,69 @@ function collectLiveChatWorkWorkerAgents(
   for (const item of selection.items) {
     itemsById.set(item.item_id, item);
   }
+  const executionIdentityByJoinKey = new Map<string, string>();
+  const expectedAttemptByExecution = new Map<string, string>();
+  const conflictingExecutions = new Set<string>();
+  for (const execution of selection.executions) {
+    const joinKey = chatWorkExecutionJoinKey(
+      execution.item_id,
+      execution.execution_ref,
+    );
+    const identityKey = chatWorkExecutionIdentityKey(execution);
+    const existingIdentity = executionIdentityByJoinKey.get(joinKey);
+    if (existingIdentity === undefined) {
+      executionIdentityByJoinKey.set(joinKey, identityKey);
+      expectedAttemptByExecution.set(
+        joinKey,
+        chatWorkPresenceJoinKey(
+          execution.item_id,
+          execution.execution_ref,
+          execution.approval_id,
+          execution.task_id,
+          execution.run_id,
+          execution.worker_id,
+        ),
+      );
+    } else if (existingIdentity !== identityKey) {
+      conflictingExecutions.add(joinKey);
+    }
+  }
+  const normalizedPresence: ChatWorkPresence[] = [];
+  for (const raw of selection.presence) {
+    const normalized = normalizeChatWorkPresence(raw);
+    if (normalized !== null) {
+      normalizedPresence.push(normalized);
+    }
+  }
   const agents: ChatWorkAgentView[] = [];
   const seen = new Set<string>();
-  for (const presence of selection.presence) {
+  for (const presence of reconcileChatWorkPresence(normalizedPresence).presence) {
     const item = itemsById.get(presence.item_id);
     if (
       !item ||
+      item.kind !== 'worker' ||
       item.binding_id !== expectedBindingId ||
       !isLiveChatWorkWorkerPresence(presence, item, nowMs)
     ) {
       continue;
+    }
+    const joinKey = chatWorkExecutionJoinKey(item.item_id, presence.execution_ref);
+    if (conflictingExecutions.has(joinKey)) {
+      continue;
+    }
+    const expectedAttemptKey = expectedAttemptByExecution.get(joinKey);
+    if (expectedAttemptKey !== undefined) {
+      const actualAttemptKey = chatWorkPresenceJoinKey(
+        presence.item_id,
+        presence.execution_ref,
+        presence.approval_id,
+        presence.task_id,
+        presence.run_id,
+        presence.worker_id,
+      );
+      if (actualAttemptKey !== expectedAttemptKey) {
+        continue;
+      }
     }
     const key = `${selection.chatKey ?? 'unscoped'}\u0000worker\u0000${item.item_id}\u0000${item.current_execution_ref ?? ''}`;
     if (seen.has(key)) {
@@ -1976,6 +2384,229 @@ export function summarizeChatWorkLiveness(
     }
   }
   return { workingAgentCount, workingChatCount, waitingChatCount };
+}
+
+export type SidebarChatStatusKind =
+  | 'waiting'
+  | 'working'
+  | 'idle'
+  | 'terminal'
+  | 'unknown';
+
+export interface SidebarChatStatusView {
+  kind: SidebarChatStatusKind;
+  label: string;
+  tone: ChatWorkTone;
+}
+
+export interface SidebarChatStatusOptions {
+  suppressed?: boolean;
+}
+
+function hasDegradedCurrentWorkerPresence(liveness: ChatWorkLiveness): boolean {
+  if (!liveness.workAvailable || liveness.identity === null) {
+    return false;
+  }
+  const expectedBindingId = liveness.identity.binding_id;
+  const doingWorkerItems = new Map<string, ChatWorkItem>();
+  for (const item of liveness.items) {
+    if (
+      item.binding_id === expectedBindingId &&
+      item.kind === 'worker' &&
+      item.status === 'doing' &&
+      item.current_execution_ref !== null
+    ) {
+      doingWorkerItems.set(item.item_id, item);
+    }
+  }
+  if (doingWorkerItems.size === 0) {
+    return false;
+  }
+  for (const presence of liveness.presence) {
+    const item = doingWorkerItems.get(presence.item_id);
+    if (!item || presence.execution_ref !== item.current_execution_ref) {
+      continue;
+    }
+    if (presence.availability !== 'non_live' || presence.live) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function hasConfirmedTerminalWorkerPresence(liveness: ChatWorkLiveness): boolean {
+  if (
+    !liveness.workAvailable ||
+    liveness.identity === null ||
+    liveness.coworker.samplePresent
+  ) {
+    return false;
+  }
+  const expectedBindingId = liveness.identity.binding_id;
+  const workerItemsById = new Map<string, ChatWorkItem>();
+  const doingWorkerIds = new Set<string>();
+  for (const item of liveness.items) {
+    if (item.binding_id !== expectedBindingId || item.kind !== 'worker') {
+      continue;
+    }
+    if (item.status === 'doing' || item.status === 'blocked') {
+      workerItemsById.set(item.item_id, item);
+      if (item.status === 'doing') {
+        doingWorkerIds.add(item.item_id);
+      }
+    }
+  }
+  if (workerItemsById.size === 0) {
+    return false;
+  }
+  let confirmedTerminalCount = 0;
+  const terminalDoingIds = new Set<string>();
+  for (const presence of liveness.presence) {
+    const item = workerItemsById.get(presence.item_id);
+    if (
+      !item ||
+      item.current_execution_ref === null ||
+      presence.execution_ref !== item.current_execution_ref
+    ) {
+      continue;
+    }
+    if (presence.availability === 'non_live' && !presence.live) {
+      confirmedTerminalCount += 1;
+      if (item.status === 'doing') {
+        terminalDoingIds.add(item.item_id);
+      }
+    } else {
+      return false;
+    }
+  }
+  for (const doingId of doingWorkerIds) {
+    if (!terminalDoingIds.has(doingId)) {
+      return false;
+    }
+  }
+  return confirmedTerminalCount > 0;
+}
+
+/**
+ * Resolves concise sidebar chat status text and tone without conflating an
+ * absent, stale, disconnected, or unknown observation with a current explicit
+ * idle or terminal sample. Absent evidence stays neutral (`Status unavailable`)
+ * and never emits a human-attention warning or fabricates `No live agent`.
+ */
+export function resolveSidebarChatStatus(
+  liveness: ChatWorkLiveness | null | undefined,
+  options: SidebarChatStatusOptions = {},
+): SidebarChatStatusView {
+  if (
+    liveness === null ||
+    liveness === undefined ||
+    options.suppressed === true
+  ) {
+    return {
+      kind: 'unknown',
+      label: 'Status unavailable',
+      tone: 'neutral',
+    };
+  }
+  if (liveness.waitingForHuman) {
+    return {
+      kind: 'waiting',
+      label: 'Waiting for you in Codex',
+      tone: 'attention',
+    };
+  }
+  if (liveness.isWorking) {
+    return {
+      kind: 'working',
+      label: 'Working',
+      tone: 'working',
+    };
+  }
+  const hasConfirmedIdleNativeSample =
+    liveness.statusLabel !== null &&
+    liveness.coworker.samplePresent &&
+    liveness.coworker.availability === 'available' &&
+    liveness.coworker.freshness === 'fresh' &&
+    liveness.coworker.activity === 'idle';
+  if (
+    hasConfirmedIdleNativeSample &&
+    !hasDegradedCurrentWorkerPresence(liveness)
+  ) {
+    return {
+      kind: 'idle',
+      label: 'Idle',
+      tone: 'neutral',
+    };
+  }
+  if (hasConfirmedTerminalWorkerPresence(liveness)) {
+    return {
+      kind: 'terminal',
+      label: 'No live agent',
+      tone: 'neutral',
+    };
+  }
+  return {
+    kind: 'unknown',
+    label: 'Status unavailable',
+    tone: 'neutral',
+  };
+}
+
+export interface SidebarNavCounterView {
+  count: number;
+  label: string;
+  ariaLabel: string;
+  tone: 'working' | 'attention';
+}
+
+export function formatSidebarWorkingCounter(
+  workingAgentCount: number,
+): SidebarNavCounterView | null {
+  const count = Number.isFinite(workingAgentCount)
+    ? Math.max(0, Math.trunc(workingAgentCount))
+    : 0;
+  if (count <= 0) {
+    return null;
+  }
+  const label = count === 1 ? '1 working agent' : `${count} working agents`;
+  return {
+    count,
+    label,
+    ariaLabel: label,
+    tone: 'working',
+  };
+}
+
+export function formatSidebarWaitingCounter(
+  waitingChatCount: number,
+): SidebarNavCounterView | null {
+  const count = Number.isFinite(waitingChatCount)
+    ? Math.max(0, Math.trunc(waitingChatCount))
+    : 0;
+  if (count <= 0) {
+    return null;
+  }
+  return {
+    count,
+    label: count === 1 ? '1 waiting chat' : `${count} waiting chats`,
+    ariaLabel:
+      count === 1 ? '1 chat waiting for you' : `${count} chats waiting for you`,
+    tone: 'attention',
+  };
+}
+
+export function formatSidebarLifecycleWaitingLabel(
+  lifecycle: 'active' | 'archived',
+  waitingChatCount: number,
+): string | null {
+  const count = Number.isFinite(waitingChatCount)
+    ? Math.max(0, Math.trunc(waitingChatCount))
+    : 0;
+  if (count <= 0) {
+    return null;
+  }
+  const unit = count === 1 ? 'chat' : 'chats';
+  return `${count} ${lifecycle} ${unit} waiting for you`;
 }
 
 function compareStringsUtf8(left: string, right: string): number {

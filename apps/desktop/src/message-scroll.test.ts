@@ -22,6 +22,9 @@ import {
   filterJobsForChat,
   filterMessagesForChat,
   filterObservationRequestsForActivity,
+  formatSidebarLifecycleWaitingLabel,
+  formatSidebarWaitingCounter,
+  formatSidebarWorkingCounter,
   getActiveChatScrollState,
   getChatScrollState,
   handleMessageViewportScroll,
@@ -34,6 +37,7 @@ import {
   resolveChatWorkExecutionFooterState,
   resolveMessageScrollChatKey,
   resolveMessageViewportResize,
+  resolveSidebarChatStatus,
   resolveVerifiedChatJobIds,
   selectWorkspaceChatWork,
   setChatScrollState,
@@ -1336,7 +1340,12 @@ function makeExecution(
 
 function makeNativeSample(
   identity: WorkspaceChatIdentity,
-  activity: 'working' | 'waiting_for_approval' | 'waiting_for_input' | 'idle',
+  activity:
+    | 'working'
+    | 'waiting_for_approval'
+    | 'waiting_for_input'
+    | 'idle'
+    | 'unknown',
   observedAtMs = 10_000,
   availability: 'available' | 'stale' | 'disconnected' | 'unavailable' = 'available',
 ): WorkspaceNativeSample {
@@ -4089,45 +4098,48 @@ test('raw duplicate chat_work rows reconcile item and presence identities before
   );
 });
 
-test('raw duplicate reconciliation keeps the newest item revision, fresh sample winner, and exact chats separate', () => {
+test('raw duplicate reconciliation keeps the newest item revision, ordering-first sample winner, and exact chats separate', () => {
   const alphaIdentity = makeIdentity('bnd_alpha_raw_revision', UUID_ALPHA);
   const betaIdentity = makeIdentity('bnd_beta_raw_revision', UUID_BETA);
   const attempt = {
     item_id: 'blg_raw_revision',
     execution_ref: 'exec-raw-revision',
   };
-  const staleNewer = makePresence({
+  const staleOlder = makePresence({
     ...attempt,
+    sequence: 3,
     freshness: 'stale',
-    sampled_at_ms: 10_400,
-    sample_age_ms: 100,
+    sampled_at_ms: 9_600,
+    sample_age_ms: 900,
   });
-  const freshOlder = makePresence({
+  const freshNewer = makePresence({
     ...attempt,
+    sequence: 4,
     freshness: 'fresh',
     sampled_at_ms: 10_000,
     sample_age_ms: 500,
   });
+  const alphaItems = [
+    makeBacklogItem({
+      item_id: attempt.item_id,
+      binding_id: alphaIdentity.binding_id,
+      kind: 'worker',
+      status: 'todo',
+      revision: 1,
+      current_execution_ref: null,
+    }),
+    makeBacklogItem({
+      item_id: attempt.item_id,
+      binding_id: alphaIdentity.binding_id,
+      kind: 'worker',
+      status: 'doing',
+      revision: 2,
+      current_execution_ref: attempt.execution_ref,
+    }),
+  ];
   const alphaWork = makeChatWork(alphaIdentity, {
-    items: [
-      makeBacklogItem({
-        item_id: attempt.item_id,
-        binding_id: alphaIdentity.binding_id,
-        kind: 'worker',
-        status: 'todo',
-        revision: 1,
-        current_execution_ref: null,
-      }),
-      makeBacklogItem({
-        item_id: attempt.item_id,
-        binding_id: alphaIdentity.binding_id,
-        kind: 'worker',
-        status: 'doing',
-        revision: 2,
-        current_execution_ref: attempt.execution_ref,
-      }),
-    ],
-    worker_presence: [staleNewer, freshOlder],
+    items: alphaItems,
+    worker_presence: [staleOlder, freshNewer],
   });
   const betaWork = makeChatWork(betaIdentity, {
     items: [
@@ -4161,6 +4173,46 @@ test('raw duplicate reconciliation keeps the newest item revision, fresh sample 
     evaluateChatWorkLiveness(alpha, null, { nowMs: CHAT_WORK_NOW_MS })
       .workingAgentCount,
     1,
+  );
+
+  // On an exact ordering tie (same epoch, sequence, sampled_at_ms), fresh beats stale,
+  // whereas a newer stale sample (larger sampled_at_ms at the same sequence) supersedes
+  // the older fresh sample and clears Working.
+  const staleTie = makePresence({
+    ...attempt,
+    sequence: 4,
+    freshness: 'stale',
+    sampled_at_ms: 10_000,
+    sample_age_ms: 500,
+  });
+  const tiedAlpha = selectWorkspaceChatWork(
+    [makeChatWork(alphaIdentity, { items: alphaItems, worker_presence: [staleTie, freshNewer] })],
+    alphaIdentity,
+  );
+  assert.equal(tiedAlpha.presence[0]!.freshness, 'fresh');
+  assert.equal(
+    evaluateChatWorkLiveness(tiedAlpha, null, { nowMs: CHAT_WORK_NOW_MS }).workingAgentCount,
+    1,
+  );
+
+  const staleNewer = makePresence({
+    ...attempt,
+    sequence: 4,
+    freshness: 'stale',
+    sampled_at_ms: 10_400,
+    sample_age_ms: 100,
+  });
+  const degradedAlpha = selectWorkspaceChatWork(
+    [makeChatWork(alphaIdentity, { items: alphaItems, worker_presence: [freshNewer, staleNewer] })],
+    alphaIdentity,
+  );
+  assert.equal(degradedAlpha.presence.length, 1);
+  assert.equal(degradedAlpha.presence[0]!.freshness, 'stale');
+  assert.equal(degradedAlpha.presence[0]!.live, false);
+  assert.equal(degradedAlpha.presence[0]!.sampled_at_ms, 10_400);
+  assert.equal(
+    evaluateChatWorkLiveness(degradedAlpha, null, { nowMs: CHAT_WORK_NOW_MS }).workingAgentCount,
+    0,
   );
 
   const beta = selectWorkspaceChatWork([alphaWork, betaWork], betaIdentity);
@@ -4639,4 +4691,925 @@ test('mismatched execution ref never auto-completes on item Done and keeps human
   );
   assert.equal(staleWaiting.waitingForHuman, false);
   assert.equal(staleWaiting.isWorking, false);
+});
+
+test('newer explicit non_live clears Working over a still-fresh older live sample and inverse ordering works in both input orders', () => {
+  const identity = makeIdentity('bnd_alpha_newest_stop', UUID_ALPHA);
+  const itemId = 'blg_newest_stop';
+  const execRef = 'exec-newest-stop';
+  const doingItem = makeBacklogItem({
+    item_id: itemId,
+    binding_id: identity.binding_id,
+    kind: 'worker',
+    status: 'doing',
+    revision: 3,
+    current_execution_ref: execRef,
+    title: 'Run live evidence selection',
+  });
+  const dispatchEvent = makeBacklogEvent({
+    event_id: `${itemId}:3`,
+    sequence: 3,
+    item_id: itemId,
+    revision: 3,
+    action: 'worker_execution_attached',
+    status: 'doing',
+    execution_ref: execRef,
+    recorded_at_ms: 9_100,
+  });
+  const execution = makeExecution(identity.binding_id, {
+    item_id: itemId,
+    execution_ref: execRef,
+    worker_status: 'running',
+    outcome: null,
+    started_at_ms: 9_000,
+  });
+
+  const liveSeq4 = makePresence({
+    item_id: itemId,
+    execution_ref: execRef,
+    sequence: 4,
+    availability: 'live',
+    freshness: 'fresh',
+    live: true,
+    sampled_at_ms: 10_000,
+    sample_age_ms: 100,
+    max_sample_age_ms: 5_000,
+    expires_at_ms: 15_000,
+  });
+  const nonLiveSeq5 = makePresence({
+    item_id: itemId,
+    execution_ref: execRef,
+    sequence: 5,
+    availability: 'non_live',
+    freshness: 'not_applicable',
+    live: false,
+    sampled_at_ms: 10_200,
+    sample_age_ms: 50,
+    max_sample_age_ms: 5_000,
+    expires_at_ms: 15_200,
+  });
+
+  // Same canonical binding/item/execution/attempt/epoch: sequence 5 explicit non_live
+  // clears Working even while sequence 4 live is still fresh at CHAT_WORK_NOW_MS (10_500).
+  const singleEntryOrders: ReadonlyArray<readonly WorkspaceChatWork[]> = [
+    [
+      makeChatWork(identity, {
+        items: [doingItem],
+        events: [dispatchEvent],
+        worker_executions: [execution],
+        worker_presence: [liveSeq4, nonLiveSeq5],
+      }),
+    ],
+    [
+      makeChatWork(identity, {
+        items: [doingItem],
+        events: [dispatchEvent],
+        worker_executions: [execution],
+        worker_presence: [nonLiveSeq5, liveSeq4],
+      }),
+    ],
+    // Mixed-source split across two raw chat_work entries for the same canonical identity.
+    [
+      makeChatWork(identity, {
+        items: [doingItem],
+        events: [dispatchEvent],
+        worker_executions: [execution],
+        worker_presence: [liveSeq4],
+      }),
+      makeChatWork(identity, {
+        items: [],
+        events: [],
+        worker_executions: [],
+        worker_presence: [nonLiveSeq5],
+      }),
+    ],
+  ];
+
+  for (const entries of singleEntryOrders) {
+    const selection = selectWorkspaceChatWork(entries, identity);
+    assert.equal(selection.presence.length, 1);
+    assert.equal(selection.presence[0]!.availability, 'non_live');
+    assert.equal(selection.presence[0]!.sequence, 5);
+    assert.equal(selection.presence[0]!.live, false);
+    assert.equal(selection.bounds.presenceOmitted, 1);
+
+    const liveness = evaluateChatWorkLiveness(selection, null, {
+      nowMs: CHAT_WORK_NOW_MS,
+    });
+    assert.equal(liveness.isWorking, false);
+    assert.equal(liveness.workingAgentCount, 0);
+    assert.deepEqual(liveness.agents, []);
+    assert.equal(liveness.statusLabel, null);
+
+    const indexEntry = buildChatWorkLivenessIndex(entries, [], {
+      nowMs: CHAT_WORK_NOW_MS,
+    }).get(resolveMessageScrollChatKey(identity))!;
+    assert.equal(indexEntry.isWorking, false);
+    assert.equal(indexEntry.workingAgentCount, 0);
+
+    const footer = buildChatWorkEventViews(selection)[0]!.workerExecution!;
+    const footerState = resolveChatWorkExecutionFooterState(footer, CHAT_WORK_NOW_MS);
+    assert.equal(footerState.statusKey, 'unavailable');
+    assert.equal(footerState.statusLabel, 'Status unavailable');
+    assert.equal(footerState.duration, null);
+    assert.equal(footerState.durationLabel, null);
+  }
+
+  // Caller-constructed unreconciled selection also clears Working when seq 5 non_live is present.
+  const baseLiveSelection = selectWorkspaceChatWork(
+    [
+      makeChatWork(identity, {
+        items: [doingItem],
+        events: [dispatchEvent],
+        worker_executions: [execution],
+        worker_presence: [liveSeq4],
+      }),
+    ],
+    identity,
+  );
+  const manualUnreconciled = {
+    ...baseLiveSelection,
+    presence: [liveSeq4, nonLiveSeq5],
+  };
+  assert.equal(
+    evaluateChatWorkLiveness(manualUnreconciled, null, { nowMs: CHAT_WORK_NOW_MS }).isWorking,
+    false,
+  );
+  const manualFooter = buildChatWorkEventViews(manualUnreconciled)[0]!.workerExecution!;
+  assert.equal(
+    resolveChatWorkExecutionFooterState(manualFooter, CHAT_WORK_NOW_MS).statusKey,
+    'unavailable',
+  );
+
+  // Inverse ordering: older non_live or unavailable (seq 4) loses to newer live (seq 5),
+  // showing Working until wall-clock freshness expires.
+  const nonLiveSeq4 = makePresence({
+    item_id: itemId,
+    execution_ref: execRef,
+    sequence: 4,
+    availability: 'non_live',
+    freshness: 'not_applicable',
+    live: false,
+    sampled_at_ms: 10_000,
+  });
+  const unavailableSeq4 = makePresence({
+    item_id: itemId,
+    execution_ref: execRef,
+    sequence: 4,
+    availability: 'unavailable',
+    freshness: 'not_applicable',
+    live: false,
+    sampled_at_ms: 10_000,
+  });
+  const liveSeq5 = makePresence({
+    item_id: itemId,
+    execution_ref: execRef,
+    sequence: 5,
+    availability: 'live',
+    freshness: 'fresh',
+    live: true,
+    sampled_at_ms: 10_200,
+    sample_age_ms: 50,
+    max_sample_age_ms: 5_000,
+    expires_at_ms: 15_200,
+  });
+
+  for (const presenceRows of [
+    [nonLiveSeq4, liveSeq5],
+    [liveSeq5, nonLiveSeq4],
+    [unavailableSeq4, liveSeq5],
+    [liveSeq5, unavailableSeq4],
+  ]) {
+    const selection = selectWorkspaceChatWork(
+      [
+        makeChatWork(identity, {
+          items: [doingItem],
+          events: [dispatchEvent],
+          worker_executions: [execution],
+          worker_presence: presenceRows,
+        }),
+      ],
+      identity,
+    );
+    assert.equal(selection.presence.length, 1);
+    assert.equal(selection.presence[0]!.availability, 'live');
+    assert.equal(selection.presence[0]!.sequence, 5);
+    assert.equal(selection.presence[0]!.live, true);
+
+    const liveEval = evaluateChatWorkLiveness(selection, null, {
+      nowMs: CHAT_WORK_NOW_MS,
+    });
+    assert.equal(liveEval.isWorking, true);
+    assert.equal(liveEval.workingAgentCount, 1);
+    assert.equal(liveEval.statusLabel, 'Working');
+
+    const footer = buildChatWorkEventViews(selection)[0]!.workerExecution!;
+    const freshFooter = resolveChatWorkExecutionFooterState(footer, CHAT_WORK_NOW_MS);
+    assert.equal(freshFooter.statusKey, 'working');
+    assert.equal(freshFooter.durationLabel, 'Elapsed 1.5s');
+
+    // Freshness TTL is preserved on the winning live sample.
+    const expiredAtMs = 15_201;
+    assert.equal(
+      evaluateChatWorkLiveness(selection, null, { nowMs: expiredAtMs }).isWorking,
+      false,
+    );
+    const expiredFooter = resolveChatWorkExecutionFooterState(footer, expiredAtMs);
+    assert.equal(expiredFooter.statusKey, 'unavailable');
+    assert.equal(expiredFooter.durationLabel, null);
+  }
+});
+
+test('restarted epoch reset sequence, unknown observation, separate attempts, and stale/malformed isolation stay accurate end-to-end', () => {
+  const alphaIdentity = makeIdentity('bnd_alpha_epoch_isolation', UUID_ALPHA);
+  const betaIdentity = makeIdentity('bnd_beta_epoch_isolation', UUID_BETA);
+  const itemId = 'blg_epoch_isolation';
+  const execRef = 'exec-epoch-1';
+  const doingItem = makeBacklogItem({
+    item_id: itemId,
+    binding_id: alphaIdentity.binding_id,
+    kind: 'worker',
+    status: 'doing',
+    revision: 4,
+    current_execution_ref: execRef,
+  });
+  const dispatchEvent = makeBacklogEvent({
+    event_id: `${itemId}:4`,
+    sequence: 4,
+    item_id: itemId,
+    revision: 4,
+    action: 'worker_execution_attached',
+    status: 'doing',
+    execution_ref: execRef,
+    recorded_at_ms: 9_100,
+  });
+  const execution = makeExecution(alphaIdentity.binding_id, {
+    item_id: itemId,
+    execution_ref: execRef,
+    worker_status: 'running',
+    outcome: null,
+    started_at_ms: 9_000,
+  });
+
+  const oldEpochLive = makePresence({
+    item_id: itemId,
+    execution_ref: execRef,
+    host_instance_id: 'host-1',
+    invocation_id: 'invocation-1',
+    claim_id: 'claim-1',
+    sequence: 4,
+    availability: 'live',
+    freshness: 'fresh',
+    live: true,
+    sampled_at_ms: 10_000,
+    expires_at_ms: 15_000,
+  });
+  const restartedEpochStop = makePresence({
+    item_id: itemId,
+    execution_ref: execRef,
+    host_instance_id: 'host-2',
+    invocation_id: 'invocation-2',
+    claim_id: 'claim-2',
+    sequence: 1,
+    availability: 'non_live',
+    freshness: 'not_applicable',
+    live: false,
+    sampled_at_ms: 10_300,
+    expires_at_ms: 15_300,
+  });
+  const olderEpochHighSeq = makePresence({
+    item_id: itemId,
+    execution_ref: execRef,
+    host_instance_id: 'host-0',
+    invocation_id: 'invocation-0',
+    claim_id: 'claim-0',
+    sequence: 99,
+    availability: 'live',
+    freshness: 'fresh',
+    live: true,
+    sampled_at_ms: 9_000,
+    expires_at_ms: 14_000,
+  });
+
+  // 1. Restarted epoch with reset sequence=1 at newer sampled_at_ms clears Working.
+  for (const rows of [
+    [oldEpochLive, olderEpochHighSeq, restartedEpochStop],
+    [restartedEpochStop, olderEpochHighSeq, oldEpochLive],
+  ]) {
+    const selection = selectWorkspaceChatWork(
+      [
+        makeChatWork(alphaIdentity, {
+          items: [doingItem],
+          events: [dispatchEvent],
+          worker_executions: [execution],
+          worker_presence: rows,
+        }),
+      ],
+      alphaIdentity,
+    );
+    assert.equal(selection.presence.length, 1);
+    assert.equal(selection.presence[0]!.availability, 'non_live');
+    assert.equal(selection.presence[0]!.sequence, 1);
+    assert.equal(
+      evaluateChatWorkLiveness(selection, null, { nowMs: CHAT_WORK_NOW_MS }).isWorking,
+      false,
+    );
+  }
+
+  // Restarted epoch live with reset sequence=1 supersedes old epoch stop at older timestamp.
+  const oldEpochStop = makePresence({
+    ...oldEpochLive,
+    sequence: 5,
+    availability: 'non_live',
+    freshness: 'not_applicable',
+    live: false,
+  });
+  const restartedEpochLive = makePresence({
+    ...restartedEpochStop,
+    availability: 'live',
+    freshness: 'fresh',
+    live: true,
+    sampled_at_ms: 10_400,
+    expires_at_ms: 15_400,
+  });
+  for (const rows of [
+    [oldEpochStop, restartedEpochLive],
+    [restartedEpochLive, oldEpochStop],
+  ]) {
+    const selection = selectWorkspaceChatWork(
+      [
+        makeChatWork(alphaIdentity, {
+          items: [doingItem],
+          events: [dispatchEvent],
+          worker_executions: [execution],
+          worker_presence: rows,
+        }),
+      ],
+      alphaIdentity,
+    );
+    assert.equal(selection.presence[0]!.sequence, 1);
+    assert.equal(selection.presence[0]!.live, true);
+    assert.equal(
+      evaluateChatWorkLiveness(selection, null, { nowMs: CHAT_WORK_NOW_MS }).isWorking,
+      true,
+    );
+  }
+
+  // 2. Unknown (unavailable) observation neither falsely asserts active (Working) nor idle.
+  const newerUnknown = makePresence({
+    ...oldEpochLive,
+    sequence: 5,
+    availability: 'unavailable',
+    freshness: 'not_applicable',
+    live: false,
+    sampled_at_ms: 10_200,
+    expires_at_ms: 15_200,
+  });
+  for (const rows of [
+    [newerUnknown],
+    [oldEpochLive, newerUnknown],
+    [newerUnknown, oldEpochLive],
+  ]) {
+    const selection = selectWorkspaceChatWork(
+      [
+        makeChatWork(alphaIdentity, {
+          items: [doingItem],
+          events: [dispatchEvent],
+          worker_executions: [execution],
+          worker_presence: rows,
+        }),
+      ],
+      alphaIdentity,
+    );
+    assert.equal(selection.presence[0]!.availability, 'unavailable');
+    assert.equal(selection.presence[0]!.live, false);
+    const liveness = evaluateChatWorkLiveness(selection, null, {
+      nowMs: CHAT_WORK_NOW_MS,
+    });
+    assert.equal(liveness.isWorking, false);
+    assert.equal(liveness.workingAgentCount, 0);
+    assert.equal(liveness.statusLabel, null);
+    assert.equal(liveness.statusTone, 'neutral');
+    const footer = buildChatWorkEventViews(selection)[0]!.workerExecution!;
+    const footerState = resolveChatWorkExecutionFooterState(footer, CHAT_WORK_NOW_MS);
+    assert.equal(footerState.statusKey, 'unavailable');
+    assert.equal(footerState.statusLabel, 'Status unavailable');
+    assert.equal(footerState.durationLabel, null);
+  }
+
+  // 3. Separate attempts stay isolated (stop on foreign attempt never clears active attempt;
+  // foreign live attempt never marks a stopped verified execution as Working).
+  const foreignAttemptStop = makePresence({
+    ...oldEpochLive,
+    run_id: 'run-foreign',
+    sequence: 9,
+    availability: 'non_live',
+    freshness: 'not_applicable',
+    live: false,
+    sampled_at_ms: 10_400,
+  });
+  const attemptIsolationSelection = selectWorkspaceChatWork(
+    [
+      makeChatWork(alphaIdentity, {
+        items: [doingItem],
+        events: [dispatchEvent],
+        worker_executions: [execution],
+        worker_presence: [oldEpochLive, foreignAttemptStop],
+      }),
+    ],
+    alphaIdentity,
+  );
+  assert.equal(attemptIsolationSelection.presence.length, 2);
+  assert.equal(
+    evaluateChatWorkLiveness(attemptIsolationSelection, null, { nowMs: CHAT_WORK_NOW_MS })
+      .workingAgentCount,
+    1,
+  );
+  const isolatedFooter = buildChatWorkEventViews(attemptIsolationSelection)[0]!.workerExecution!;
+  assert.equal(
+    resolveChatWorkExecutionFooterState(isolatedFooter, CHAT_WORK_NOW_MS).statusKey,
+    'working',
+  );
+
+  const foreignAttemptLive = makePresence({
+    ...oldEpochLive,
+    worker_id: 'worker-foreign',
+    sequence: 9,
+    sampled_at_ms: 10_400,
+    expires_at_ms: 15_400,
+  });
+  const activeAttemptStop = makePresence({
+    ...oldEpochLive,
+    sequence: 5,
+    availability: 'non_live',
+    freshness: 'not_applicable',
+    live: false,
+    sampled_at_ms: 10_200,
+  });
+  const verifiedAttemptSelection = selectWorkspaceChatWork(
+    [
+      makeChatWork(alphaIdentity, {
+        items: [doingItem],
+        events: [dispatchEvent],
+        worker_executions: [execution],
+        worker_presence: [activeAttemptStop, foreignAttemptLive],
+      }),
+    ],
+    alphaIdentity,
+  );
+  assert.equal(
+    evaluateChatWorkLiveness(verifiedAttemptSelection, null, { nowMs: CHAT_WORK_NOW_MS })
+      .isWorking,
+    false,
+  );
+
+  // 4. Cross-execution, cross-chat, malformed, and deterministic tie isolation.
+  const secondItem = makeBacklogItem({
+    item_id: 'blg_epoch_other_item',
+    binding_id: alphaIdentity.binding_id,
+    kind: 'worker',
+    status: 'doing',
+    current_execution_ref: 'exec-epoch-2',
+  });
+  const secondItemLive = makePresence({
+    item_id: secondItem.item_id,
+    execution_ref: secondItem.current_execution_ref!,
+    sequence: 2,
+    sampled_at_ms: 10_000,
+    expires_at_ms: 15_000,
+  });
+  const betaItem = makeBacklogItem({
+    item_id: itemId,
+    binding_id: betaIdentity.binding_id,
+    kind: 'worker',
+    status: 'doing',
+    current_execution_ref: execRef,
+  });
+  const malformedRows: unknown[] = [
+    makePresence({ ...activeAttemptStop, approval_id: '' }),
+    { ...activeAttemptStop, availability: 'bogus_status' },
+    { ...activeAttemptStop, freshness: 'bogus_freshness' },
+    { ...activeAttemptStop, sequence: -1 },
+    { ...activeAttemptStop, sampled_at_ms: -5 },
+    { ...activeAttemptStop, live: 'false' },
+  ];
+  const alphaMalformedSelection = selectWorkspaceChatWork(
+    [
+      makeChatWork(alphaIdentity, {
+        items: [doingItem, secondItem],
+        worker_presence: [
+          oldEpochLive,
+          secondItemLive,
+          ...(malformedRows as ChatWorkPresence[]),
+        ],
+      }),
+      makeChatWork(betaIdentity, {
+        items: [betaItem],
+        worker_presence: [activeAttemptStop],
+      }),
+    ],
+    alphaIdentity,
+  );
+  assert.equal(alphaMalformedSelection.presence.length, 2);
+  assert.equal(alphaMalformedSelection.bounds.presenceOmitted, malformedRows.length);
+  assert.equal(
+    evaluateChatWorkLiveness(alphaMalformedSelection, null, { nowMs: CHAT_WORK_NOW_MS })
+      .workingAgentCount,
+    2,
+  );
+
+  // Exact ordering tie (same epoch, sequence 4, sampled_at_ms 10_000): explicit non_live
+  // deterministically beats live in either input order.
+  const exactTieStop = makePresence({
+    ...oldEpochLive,
+    availability: 'non_live',
+    freshness: 'not_applicable',
+    live: false,
+  });
+  for (const rows of [
+    [oldEpochLive, exactTieStop],
+    [exactTieStop, oldEpochLive],
+  ]) {
+    const tied = selectWorkspaceChatWork(
+      [makeChatWork(alphaIdentity, { items: [doingItem], worker_presence: rows })],
+      alphaIdentity,
+    );
+    assert.equal(tied.presence[0]!.availability, 'non_live');
+    assert.equal(tied.presence[0]!.live, false);
+    assert.equal(
+      evaluateChatWorkLiveness(tied, null, { nowMs: CHAT_WORK_NOW_MS }).isWorking,
+      false,
+    );
+  }
+});
+
+test('resolveSidebarChatStatus distinguishes confirmed idle and explicit terminal samples from missing, unknown, stale, disconnected, and suppressed observations', () => {
+  const identity = makeIdentity('bnd_sidebar_status', UUID_ALPHA);
+  const todoItem = makeBacklogItem({
+    item_id: 'blg_todo',
+    binding_id: identity.binding_id,
+    kind: 'coworker',
+    status: 'todo',
+  });
+  const doingWorkerItem = makeBacklogItem({
+    item_id: 'blg_doing_worker',
+    binding_id: identity.binding_id,
+    kind: 'worker',
+    status: 'doing',
+    current_execution_ref: 'exec-doing-1',
+  });
+  const blockedFailedWorkerItem = makeBacklogItem({
+    item_id: 'blg_failed_worker',
+    binding_id: identity.binding_id,
+    kind: 'worker',
+    status: 'blocked',
+    blocked_reason: 'Worker failed without requesting human input.',
+    current_execution_ref: 'exec-failed-1',
+  });
+  const nonLiveTerminalPresence = makePresence({
+    item_id: blockedFailedWorkerItem.item_id,
+    execution_ref: 'exec-failed-1',
+    availability: 'non_live',
+    freshness: 'not_applicable',
+    live: false,
+    sampled_at_ms: 9_800,
+    sample_age_ms: null,
+    expires_at_ms: null,
+  });
+
+  // Absent liveness entry never claims No live agent or warns the human.
+  assert.deepEqual(resolveSidebarChatStatus(undefined), {
+    kind: 'unknown',
+    label: 'Status unavailable',
+    tone: 'neutral',
+  });
+  assert.deepEqual(resolveSidebarChatStatus(null), {
+    kind: 'unknown',
+    label: 'Status unavailable',
+    tone: 'neutral',
+  });
+
+  // Missing native sample with passive backlog items (Todo/Doing/Blocked) stays unavailable.
+  const passiveSelection = selectWorkspaceChatWork(
+    [
+      makeChatWork(identity, {
+        items: [todoItem, doingWorkerItem, blockedFailedWorkerItem],
+      }),
+    ],
+    identity,
+  );
+  const missingSampleLiveness = evaluateChatWorkLiveness(passiveSelection, null, {
+    nowMs: CHAT_WORK_NOW_MS,
+  });
+  assert.deepEqual(resolveSidebarChatStatus(missingSampleLiveness), {
+    kind: 'unknown',
+    label: 'Status unavailable',
+    tone: 'neutral',
+  });
+
+  // Real confirmed fresh idle native sample renders Idle with neutral tone.
+  const confirmedIdle = evaluateChatWorkLiveness(
+    passiveSelection,
+    makeNativeSample(identity, 'idle'),
+    { nowMs: CHAT_WORK_NOW_MS },
+  );
+  assert.deepEqual(resolveSidebarChatStatus(confirmedIdle), {
+    kind: 'idle',
+    label: 'Idle',
+    tone: 'neutral',
+  });
+
+  // Fresh native sample with unknown activity is NOT confirmed idle.
+  const unknownActivity = evaluateChatWorkLiveness(
+    passiveSelection,
+    makeNativeSample(identity, 'unknown'),
+    { nowMs: CHAT_WORK_NOW_MS },
+  );
+  assert.deepEqual(resolveSidebarChatStatus(unknownActivity), {
+    kind: 'unknown',
+    label: 'Status unavailable',
+    tone: 'neutral',
+  });
+
+  // Stale, disconnected, and unavailable native samples stay Status unavailable
+  // even if a blocked worker carries a terminal non_live presence record.
+  const terminalOnlySelection = selectWorkspaceChatWork(
+    [
+      makeChatWork(identity, {
+        items: [todoItem, blockedFailedWorkerItem],
+        worker_presence: [nonLiveTerminalPresence],
+      }),
+    ],
+    identity,
+  );
+  for (const degradedLiveness of [
+    evaluateChatWorkLiveness(
+      terminalOnlySelection,
+      makeNativeSample(identity, 'idle'),
+      { nowMs: CHAT_WORK_NOW_MS + 60_000 },
+    ),
+    evaluateChatWorkLiveness(
+      terminalOnlySelection,
+      makeNativeSample(identity, 'idle', 10_000, 'disconnected'),
+      { nowMs: CHAT_WORK_NOW_MS },
+    ),
+    evaluateChatWorkLiveness(
+      terminalOnlySelection,
+      makeNativeSample(identity, 'idle', 10_000, 'unavailable'),
+      { nowMs: CHAT_WORK_NOW_MS },
+    ),
+  ]) {
+    assert.deepEqual(resolveSidebarChatStatus(degradedLiveness), {
+      kind: 'unknown',
+      label: 'Status unavailable',
+      tone: 'neutral',
+    });
+  }
+
+  // Current explicit terminal worker presence (non_live, no contradicting native
+  // sample, no unconfirmed Doing worker) renders No live agent.
+  const terminalLiveness = evaluateChatWorkLiveness(terminalOnlySelection, null, {
+    nowMs: CHAT_WORK_NOW_MS,
+  });
+  assert.deepEqual(resolveSidebarChatStatus(terminalLiveness), {
+    kind: 'terminal',
+    label: 'No live agent',
+    tone: 'neutral',
+  });
+
+  // Snapshot staleness or refresh failure suppresses terminal presence too.
+  assert.deepEqual(resolveSidebarChatStatus(terminalLiveness, { suppressed: true }), {
+    kind: 'unknown',
+    label: 'Status unavailable',
+    tone: 'neutral',
+  });
+  assert.deepEqual(
+    resolveSidebarChatStatus(
+      evaluateChatWorkLiveness(
+        passiveSelection,
+        makeNativeSample(identity, 'idle'),
+        { nowMs: CHAT_WORK_NOW_MS, isStale: true },
+      ),
+    ),
+    {
+      kind: 'unknown',
+      label: 'Status unavailable',
+      tone: 'neutral',
+    },
+  );
+
+  // Terminal presence on a blocked item must not mask an unconfirmed Doing worker
+  // when no native sample exists.
+  const mixedTerminalAndUnconfirmedDoing = selectWorkspaceChatWork(
+    [
+      makeChatWork(identity, {
+        items: [doingWorkerItem, blockedFailedWorkerItem],
+        worker_presence: [nonLiveTerminalPresence],
+      }),
+    ],
+    identity,
+  );
+  assert.deepEqual(
+    resolveSidebarChatStatus(
+      evaluateChatWorkLiveness(mixedTerminalAndUnconfirmedDoing, null, {
+        nowMs: CHAT_WORK_NOW_MS,
+      }),
+    ),
+    {
+      kind: 'unknown',
+      label: 'Status unavailable',
+      tone: 'neutral',
+    },
+  );
+
+  // An expired or stale worker presence on an active Doing item prevents
+  // claiming Idle even when Coworker is fresh idle.
+  const expiredWorkerSelection = selectWorkspaceChatWork(
+    [
+      makeChatWork(identity, {
+        items: [doingWorkerItem],
+        worker_presence: [
+          makePresence({
+            item_id: doingWorkerItem.item_id,
+            execution_ref: 'exec-doing-1',
+            expires_at_ms: CHAT_WORK_NOW_MS - 1,
+          }),
+        ],
+      }),
+    ],
+    identity,
+  );
+  assert.deepEqual(
+    resolveSidebarChatStatus(
+      evaluateChatWorkLiveness(
+        expiredWorkerSelection,
+        makeNativeSample(identity, 'idle'),
+        { nowMs: CHAT_WORK_NOW_MS },
+      ),
+    ),
+    {
+      kind: 'unknown',
+      label: 'Status unavailable',
+      tone: 'neutral',
+    },
+  );
+
+  // Existing waiting and working presentations are preserved verbatim.
+  const waitingLiveness = evaluateChatWorkLiveness(
+    passiveSelection,
+    makeNativeSample(identity, 'waiting_for_approval'),
+    { nowMs: CHAT_WORK_NOW_MS },
+  );
+  assert.deepEqual(resolveSidebarChatStatus(waitingLiveness), {
+    kind: 'waiting',
+    label: 'Waiting for you in Codex',
+    tone: 'attention',
+  });
+
+  const workingLiveness = evaluateChatWorkLiveness(
+    passiveSelection,
+    makeNativeSample(identity, 'working'),
+    { nowMs: CHAT_WORK_NOW_MS },
+  );
+  assert.deepEqual(resolveSidebarChatStatus(workingLiveness), {
+    kind: 'working',
+    label: 'Working',
+    tone: 'working',
+  });
+});
+
+test('sidebar navigation counters separate working agents from waiting chats with singular and plural labels', () => {
+  assert.equal(formatSidebarWorkingCounter(0), null);
+  assert.equal(formatSidebarWorkingCounter(-2), null);
+  assert.equal(formatSidebarWorkingCounter(Number.NaN), null);
+  assert.deepEqual(formatSidebarWorkingCounter(1), {
+    count: 1,
+    label: '1 working agent',
+    ariaLabel: '1 working agent',
+    tone: 'working',
+  });
+  assert.deepEqual(formatSidebarWorkingCounter(2), {
+    count: 2,
+    label: '2 working agents',
+    ariaLabel: '2 working agents',
+    tone: 'working',
+  });
+
+  assert.equal(formatSidebarWaitingCounter(0), null);
+  assert.equal(formatSidebarWaitingCounter(-1), null);
+  assert.deepEqual(formatSidebarWaitingCounter(1), {
+    count: 1,
+    label: '1 waiting chat',
+    ariaLabel: '1 chat waiting for you',
+    tone: 'attention',
+  });
+  assert.deepEqual(formatSidebarWaitingCounter(2), {
+    count: 2,
+    label: '2 waiting chats',
+    ariaLabel: '2 chats waiting for you',
+    tone: 'attention',
+  });
+
+  assert.equal(formatSidebarLifecycleWaitingLabel('active', 0), null);
+  assert.equal(
+    formatSidebarLifecycleWaitingLabel('active', 1),
+    '1 active chat waiting for you',
+  );
+  assert.equal(
+    formatSidebarLifecycleWaitingLabel('active', 2),
+    '2 active chats waiting for you',
+  );
+  assert.equal(
+    formatSidebarLifecycleWaitingLabel('archived', 1),
+    '1 archived chat waiting for you',
+  );
+  assert.equal(
+    formatSidebarLifecycleWaitingLabel('archived', 3),
+    '3 archived chats waiting for you',
+  );
+
+  // One chat with two working agents (Coworker + Worker) plus one separate
+  // waiting chat keeps working agents (2) and waiting chats (1) distinct.
+  const alphaIdentity = makeIdentity('bnd_nav_alpha', UUID_ALPHA);
+  const betaIdentity = makeIdentity('bnd_nav_beta', UUID_BETA);
+  const workerA = makeBacklogItem({
+    item_id: 'blg_worker_a',
+    binding_id: alphaIdentity.binding_id,
+    kind: 'worker',
+    status: 'doing',
+    current_execution_ref: 'exec-a',
+  });
+  const workerB = makeBacklogItem({
+    item_id: 'blg_worker_b',
+    binding_id: alphaIdentity.binding_id,
+    kind: 'worker',
+    status: 'doing',
+    current_execution_ref: 'exec-b',
+  });
+
+  const coworkerAndWorkerIndex = buildChatWorkLivenessIndex(
+    [
+      makeChatWork(alphaIdentity, {
+        items: [workerA],
+        worker_presence: [
+          makePresence({ item_id: workerA.item_id, execution_ref: 'exec-a' }),
+        ],
+      }),
+    ],
+    [
+      makeNativeSample(alphaIdentity, 'working'),
+      makeNativeSample(betaIdentity, 'waiting_for_approval'),
+    ],
+    { nowMs: CHAT_WORK_NOW_MS },
+  );
+  const summary = summarizeChatWorkLiveness(coworkerAndWorkerIndex);
+  assert.equal(summary.workingChatCount, 1);
+  assert.equal(summary.workingAgentCount, 2);
+  assert.equal(summary.waitingChatCount, 1);
+  assert.equal(
+    formatSidebarWorkingCounter(summary.workingAgentCount)?.label,
+    '2 working agents',
+  );
+  assert.equal(
+    formatSidebarWaitingCounter(summary.waitingChatCount)?.label,
+    '1 waiting chat',
+  );
+  assert.equal(
+    formatSidebarWaitingCounter(summary.waitingChatCount)?.ariaLabel,
+    '1 chat waiting for you',
+  );
+
+  // One chat with two live Worker agents also counts 2 working agents without
+  // fabricating any waiting chat.
+  const twoWorkersIndex = buildChatWorkLivenessIndex(
+    [
+      makeChatWork(alphaIdentity, {
+        items: [workerA, workerB],
+        worker_presence: [
+          makePresence({ item_id: workerA.item_id, execution_ref: 'exec-a' }),
+          makePresence({
+            item_id: workerB.item_id,
+            execution_ref: 'exec-b',
+            worker_id: 'worker-2',
+            run_id: 'run-2',
+            task_id: 'task-2',
+          }),
+        ],
+      }),
+    ],
+    [makeNativeSample(alphaIdentity, 'idle')],
+    { nowMs: CHAT_WORK_NOW_MS },
+  );
+  const twoWorkersSummary = summarizeChatWorkLiveness(twoWorkersIndex);
+  assert.equal(twoWorkersSummary.workingChatCount, 1);
+  assert.equal(twoWorkersSummary.workingAgentCount, 2);
+  assert.equal(twoWorkersSummary.waitingChatCount, 0);
+  assert.equal(
+    formatSidebarWorkingCounter(twoWorkersSummary.workingAgentCount)?.label,
+    '2 working agents',
+  );
+  assert.equal(
+    formatSidebarWaitingCounter(twoWorkersSummary.waitingChatCount),
+    null,
+  );
 });

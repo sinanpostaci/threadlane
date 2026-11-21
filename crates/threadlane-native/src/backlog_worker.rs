@@ -8,6 +8,7 @@
 //! rejection only after rechecking the same physically verified delivery. It never
 //! creates a job, controller, reviewer, closure stage, or automatic acceptance decision.
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -24,8 +25,9 @@ use threadlane_core::{
     BacklogItem, BacklogItemKind, BacklogStatus, WorkerAcceptanceState,
     WorkerBacklogAcceptanceRejection, WorkerBacklogAcceptanceRejectionReceipt,
     WorkerBacklogAuthority, WorkerBacklogCompletion, WorkerBacklogCompletionReceipt,
-    WorkerBacklogDispatchReceipt, WorkerBacklogExecution, WorkerBacklogNoticeSnapshot,
-    WorkerBacklogOutcome, WorkerBacklogOutcomeReport, WorkerEvidenceFailure, WorkerStatus,
+    WorkerBacklogCompletionRecord, WorkerBacklogDispatchReceipt, WorkerBacklogExecution,
+    WorkerBacklogNoticeSnapshot, WorkerBacklogOutcome, WorkerBacklogOutcomeReport,
+    WorkerEvidenceFailure, WorkerStatus,
 };
 use threadlane_host::{
     ApprovedHostClient, DeliveryInspection, HostError, TaskExecutionStatus, TaskStateSnapshot,
@@ -158,7 +160,7 @@ pub struct WorkerBacklogItemSnapshot {
 }
 
 /// Frozen approval/task facts needed for independent delivery inspection.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerBacklogNoticeScope {
     /// Canonical repository path frozen in the scoped approval record.
     pub repository_path: PathBuf,
@@ -170,6 +172,9 @@ pub struct WorkerBacklogNoticeScope {
     pub requested_effort: String,
     /// Exact approved task write paths.
     pub write_paths: Vec<String>,
+    /// Optional frozen subset of exact write paths that must change; `None` requires every write path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required_changed_paths: Option<Vec<String>>,
 }
 
 /// Read-only durable recovery context; no field grants new execution authority.
@@ -492,6 +497,87 @@ pub(crate) struct WorkerBacklogService {
     host_launcher: Option<Arc<ApprovedHostLauncher>>,
 }
 
+/// Validates that a repository-relative path uses clean literal exact-file spelling.
+pub(crate) fn is_clean_exact_relative_path(path: &str) -> bool {
+    if path.is_empty()
+        || path.trim() != path
+        || path.starts_with('/')
+        || path.ends_with('/')
+        || path.contains('\\')
+        || path.contains("//")
+        || path.contains('\0')
+    {
+        return false;
+    }
+    path.split('/').all(|component| {
+        !component.is_empty()
+            && component != "."
+            && component != ".."
+            && !component.chars().all(|ch| ch == '.')
+            && !component.chars().any(char::is_control)
+            && !component
+                .chars()
+                .any(|ch| matches!(ch, '*' | '?' | '[' | ']' | '{' | '}'))
+    })
+}
+
+/// Validates frozen `required_changed_paths` for exact-file ordinary review (`R subset A`).
+pub(crate) fn valid_exact_required_changed_paths(
+    write_paths: &[String],
+    required_changed_paths: Option<&[String]>,
+) -> bool {
+    if write_paths.is_empty() {
+        return false;
+    }
+    let Some(required) = required_changed_paths else {
+        return true;
+    };
+    if required.is_empty() {
+        return false;
+    }
+    let mut allowed = BTreeSet::new();
+    for path in write_paths {
+        if !is_clean_exact_relative_path(path) || !allowed.insert(path.as_str()) {
+            return false;
+        }
+    }
+    let mut seen_required = BTreeSet::new();
+    for path in required {
+        if !is_clean_exact_relative_path(path)
+            || !allowed.contains(path.as_str())
+            || !seen_required.insert(path.as_str())
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn valid_notice_required_changed_paths(
+    write_paths: &[String],
+    required_changed_paths: Option<&[String]>,
+) -> bool {
+    if write_paths.is_empty() {
+        return false;
+    }
+    let Some(required) = required_changed_paths else {
+        return true;
+    };
+    let mut seen_required = BTreeSet::new();
+    for path in required {
+        if !is_clean_exact_relative_path(path)
+            || !seen_required.insert(path.as_str())
+            || !threadlane_authority::is_task_scope_contained_in_operator_allowlist(
+                path,
+                write_paths,
+            )
+        {
+            return false;
+        }
+    }
+    true
+}
+
 impl WorkerBacklogService {
     /// Validates the frozen approval and an unstarted Worker item while the caller
     /// holds the same per-binding dispatch guard as guarded Worker start.
@@ -502,16 +588,20 @@ impl WorkerBacklogService {
         approval_id: &str,
         task_id: &str,
         item_id: &str,
-    ) -> Result<(PathBuf, String), WorkerBacklogError> {
+    ) -> Result<(PathBuf, String, Option<Vec<String>>), WorkerBacklogError> {
         let record = self
             .load_record_until(binding_id, thread_uuid, approval_id, None)
             .await?;
         let task = resolve_approved_task(&record, task_id)?;
         let item = self.load_item(binding_id, item_id).await?;
         if item.kind != BacklogItemKind::Worker
-            || item.status != BacklogStatus::Todo
+            || !matches!(item.status, BacklogStatus::Todo | BacklogStatus::Blocked)
             || item.current_execution_ref.is_some()
             || task.allowed_write_paths.is_empty()
+            || !valid_exact_required_changed_paths(
+                &task.allowed_write_paths,
+                task.required_changed_paths.as_deref(),
+            )
             || self
                 .get_notice_snapshot(binding_id, thread_uuid, approval_id)
                 .await?
@@ -522,7 +612,12 @@ impl WorkerBacklogService {
                 "Review source scope requires the original unstarted Worker item and approval.",
             ));
         }
-        Ok((record.repository_path, record.base_commit))
+        let required_changed_paths = task.required_changed_paths.clone();
+        Ok((
+            record.repository_path,
+            record.base_commit,
+            required_changed_paths,
+        ))
     }
 
     /// Resolve a native notice from durable scoped records without consulting or starting a host.
@@ -566,6 +661,10 @@ impl WorkerBacklogService {
             // dispatch receipt stores only its digest, not that base commit.
             || !task.depends_on.is_empty()
             || task.allowed_write_paths.is_empty()
+            || !valid_notice_required_changed_paths(
+                &task.allowed_write_paths,
+                task.required_changed_paths.as_deref(),
+            )
         {
             return Err(WorkerBacklogError::new(
                 "authority_mismatch",
@@ -630,6 +729,7 @@ impl WorkerBacklogService {
                 requested_model: task.base_model.clone(),
                 requested_effort: effort,
                 write_paths: task.allowed_write_paths.clone(),
+                required_changed_paths: task.required_changed_paths.clone(),
             },
             completion,
         })
@@ -1097,39 +1197,19 @@ impl WorkerBacklogService {
         }
 
         if let Some(stored) = execution.completion.as_ref() {
-            if item.status != BacklogStatus::Done {
-                return Err(WorkerBacklogError::new(
-                    "corrupt_worker_state",
-                    "A stored Worker completion does not have a Done backlog item.",
-                ));
-            }
-            if stored.result_digest != params.expected_result_digest
-                || stored.delivery_digest != params.expected_delivery_digest
-                || stored.acceptance_note != params.acceptance_note
-                || stored.acceptance_evidence != params.acceptance_evidence
-            {
-                return Err(WorkerBacklogError::new(
-                    "completion_conflict",
-                    "The backlog item is already completed with a different durable payload.",
-                ));
-            }
-            final_recheck
-                .take()
-                .expect("completion recheck closure must be available")()?;
-            let completion = self
-                .complete_core(binding_id, &record.thread_uuid, &params)
-                .await
-                .map_err(|error| match error.code {
-                    "worker_backlog_unavailable" | "supervisor_unavailable" => error,
-                    _ => WorkerBacklogError::new(
-                        "completion_conflict",
-                        "The durable completion cannot be replayed with this command key or payload.",
-                    ),
-                })?;
-            return Ok(WorkerBacklogCompleteOutcome {
-                completion,
-                delivery: None,
-            });
+            return self
+                .replay_committed_completion(
+                    binding_id,
+                    &record.thread_uuid,
+                    item,
+                    &execution,
+                    stored,
+                    &params,
+                    final_recheck
+                        .take()
+                        .expect("completion recheck closure must be available"),
+                )
+                .await;
         }
 
         let outcome = execution.outcome.as_ref().ok_or_else(|| {
@@ -1197,24 +1277,134 @@ impl WorkerBacklogService {
         let completion = self
             .complete_core(binding_id, &record.thread_uuid, &params)
             .await?;
-        let completion_matches = matches!(
-            completion.execution.completion.as_ref(),
-            Some(stored)
-                if stored.delivery_digest == params.expected_delivery_digest
-                    && stored.result_digest == params.expected_result_digest
-        );
-        if completion.item.status != BacklogStatus::Done
-            || completion.execution.execution_ref != params.execution_ref
-            || !completion_matches
-        {
+        validate_completion_receipt(&completion, binding_id, &params)?;
+        Ok(WorkerBacklogCompleteOutcome {
+            completion,
+            delivery: Some(inspection),
+        })
+    }
+
+    /// Verifies that an already committed durable `Done` receipt was recorded in core under
+    /// the exact caller `command_key`, `expected_revision`, execution reference, and completion
+    /// payload. This never issues a new `Doing -> Done` transition and never reads a mutable
+    /// checkout.
+    pub(crate) async fn verify_committed_completion<F>(
+        &self,
+        binding_id: &str,
+        thread_uuid: &str,
+        params: WorkerBacklogCompleteParams,
+        final_recheck: F,
+    ) -> Result<WorkerBacklogCompletionReceipt, WorkerBacklogError>
+    where
+        F: FnOnce() -> Result<(), WorkerBacklogError> + Send,
+    {
+        let item = self.load_item(binding_id, &params.item_id).await?;
+        let execution = self
+            .get_execution(
+                binding_id,
+                thread_uuid,
+                &params.item_id,
+                &params.execution_ref,
+            )
+            .await?;
+        validate_execution_identity(&execution, binding_id, &params.item_id)?;
+        let (record, _task) = self
+            .load_execution_authority(binding_id, thread_uuid, &execution)
+            .await?;
+        if item.current_execution_ref.as_deref() != Some(execution.execution_ref.as_str()) {
+            return Err(WorkerBacklogError::new(
+                "execution_not_current",
+                "The stored Worker execution is not the current execution for this backlog item.",
+            ));
+        }
+        let Some(stored) = execution.completion.as_ref() else {
+            return Err(WorkerBacklogError::new(
+                "completion_conflict",
+                "The backlog item does not have a matching durable completion.",
+            ));
+        };
+        let outcome = self
+            .replay_committed_completion(
+                binding_id,
+                &record.thread_uuid,
+                item,
+                &execution,
+                stored,
+                &params,
+                final_recheck,
+            )
+            .await?;
+        Ok(outcome.completion)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn replay_committed_completion<F>(
+        &self,
+        binding_id: &str,
+        thread_uuid: &str,
+        item: BacklogItem,
+        execution: &WorkerBacklogExecution,
+        stored: &WorkerBacklogCompletionRecord,
+        params: &WorkerBacklogCompleteParams,
+        final_recheck: F,
+    ) -> Result<WorkerBacklogCompleteOutcome, WorkerBacklogError>
+    where
+        F: FnOnce() -> Result<(), WorkerBacklogError> + Send,
+    {
+        // `load_item` and `get_execution` are separate reads; if a concurrent commit completed
+        // the item between them, refresh the item once before treating the mismatch as corrupt.
+        let item = if item.status != BacklogStatus::Done {
+            self.load_item(binding_id, &params.item_id).await?
+        } else {
+            item
+        };
+        if item.status != BacklogStatus::Done {
             return Err(WorkerBacklogError::new(
                 "corrupt_worker_state",
-                "The durable Worker completion receipt did not match the requested completion.",
+                "A stored Worker completion does not have a Done backlog item.",
+            ));
+        }
+        if item.current_execution_ref.as_deref() != Some(execution.execution_ref.as_str()) {
+            return Err(WorkerBacklogError::new(
+                "execution_not_current",
+                "The stored Worker execution is not the current execution for this backlog item.",
+            ));
+        }
+        if params.expected_revision.checked_add(1) != Some(item.revision)
+            || stored.result_digest != params.expected_result_digest
+            || stored.delivery_digest != params.expected_delivery_digest
+            || stored.acceptance_note != params.acceptance_note
+            || stored.acceptance_evidence != params.acceptance_evidence
+        {
+            return Err(WorkerBacklogError::new(
+                "completion_conflict",
+                "The backlog item is already completed with a different durable payload.",
+            ));
+        }
+        final_recheck()?;
+        let completion = self
+            .complete_core(binding_id, thread_uuid, params)
+            .await
+            .map_err(|error| match error.code {
+                "worker_backlog_unavailable"
+                | "supervisor_unavailable"
+                | "corrupt_state"
+                | "security_violation" => error,
+                _ => WorkerBacklogError::new(
+                    "completion_conflict",
+                    "The durable completion cannot be replayed with this command key or payload.",
+                ),
+            })?;
+        validate_completion_receipt(&completion, binding_id, params)?;
+        if completion.item != item || completion.execution != *execution {
+            return Err(WorkerBacklogError::new(
+                "corrupt_worker_state",
+                "The durable Worker completion replay does not match the current Done state.",
             ));
         }
         Ok(WorkerBacklogCompleteOutcome {
             completion,
-            delivery: Some(inspection),
+            delivery: None,
         })
     }
 
@@ -2495,6 +2685,55 @@ fn verify_delivery_identity(
     Ok(())
 }
 
+fn validate_completion_receipt(
+    receipt: &WorkerBacklogCompletionReceipt,
+    binding_id: &str,
+    params: &WorkerBacklogCompleteParams,
+) -> Result<(), WorkerBacklogError> {
+    validate_execution_identity(&receipt.execution, binding_id, &params.item_id)?;
+    if receipt.item.binding_id != binding_id
+        || receipt.item.item_id != params.item_id
+        || receipt.item.kind != BacklogItemKind::Worker
+        || receipt.item.status != BacklogStatus::Done
+        || receipt.item.blocked_reason.is_some()
+        || params.expected_revision.checked_add(1) != Some(receipt.item.revision)
+        || receipt.item.current_execution_ref.as_deref() != Some(params.execution_ref.as_str())
+        || receipt.item.completion_note.as_deref() != Some(params.acceptance_note.as_str())
+        || receipt.item.completion_evidence.as_deref() != Some(params.acceptance_evidence.as_str())
+        || receipt.execution.execution_ref != params.execution_ref
+        || receipt.execution.acceptance_rejection.is_some()
+        || receipt
+            .execution
+            .outcome
+            .as_ref()
+            .map(|outcome| outcome.outcome)
+            != Some(WorkerBacklogOutcome::Success)
+    {
+        return Err(WorkerBacklogError::new(
+            "corrupt_worker_state",
+            "The durable Worker completion receipt did not match the requested completion.",
+        ));
+    }
+    let stored = receipt.execution.completion.as_ref().ok_or_else(|| {
+        WorkerBacklogError::new(
+            "corrupt_worker_state",
+            "The durable Worker completion receipt has no completion record.",
+        )
+    })?;
+    if stored.result_digest != params.expected_result_digest
+        || stored.delivery_digest != params.expected_delivery_digest
+        || stored.acceptance_note != params.acceptance_note
+        || stored.acceptance_evidence != params.acceptance_evidence
+        || receipt.item.completed_at_ms != Some(stored.completed_at_ms)
+    {
+        return Err(WorkerBacklogError::new(
+            "corrupt_worker_state",
+            "The durable Worker completion receipt did not match the requested completion.",
+        ));
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn validate_rejection_receipt(
     receipt: &WorkerBacklogAcceptanceRejectionReceipt,
@@ -2826,8 +3065,11 @@ pub(crate) const WORKER_BACKLOG_REJECT_TOOL: &str = REJECT_TOOL;
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::{
-        failure_note_for, worker_evidence_from_snapshot, FailureNoteEvidence,
+        failure_note_for, valid_exact_required_changed_paths, valid_notice_required_changed_paths,
+        worker_evidence_from_snapshot, FailureNoteEvidence, WorkerBacklogNoticeScope,
         WorkerBacklogResultOutcome, WorkerBacklogWorkerEvidence,
     };
     use serde_json::json;
@@ -3208,5 +3450,84 @@ mod tests {
         for (status, evidence, expected) in cases {
             assert_eq!(failure_note_for(status, evidence), expected);
         }
+    }
+
+    #[test]
+    fn notice_scope_omits_none_required_changed_paths_and_round_trips_some() {
+        let legacy = WorkerBacklogNoticeScope {
+            repository_path: PathBuf::from("/repo"),
+            base_commit: "a".repeat(40),
+            requested_model: "model-a".to_string(),
+            requested_effort: "high".to_string(),
+            write_paths: vec!["src/lib.rs".to_string(), "src/extra.rs".to_string()],
+            required_changed_paths: None,
+        };
+        let encoded = serde_json::to_value(&legacy).expect("serialize legacy notice scope");
+        let object = encoded.as_object().expect("notice scope object");
+        assert!(
+            !object.contains_key("required_changed_paths"),
+            "None required_changed_paths must be omitted to preserve legacy bytes/digests"
+        );
+        let decoded: WorkerBacklogNoticeScope =
+            serde_json::from_value(encoded).expect("deserialize legacy notice scope without field");
+        assert_eq!(decoded, legacy);
+
+        let with_required = WorkerBacklogNoticeScope {
+            required_changed_paths: Some(vec!["src/lib.rs".to_string()]),
+            ..legacy
+        };
+        let encoded_some =
+            serde_json::to_value(&with_required).expect("serialize notice scope with required");
+        assert_eq!(
+            encoded_some["required_changed_paths"],
+            serde_json::json!(["src/lib.rs"])
+        );
+        let decoded_some: WorkerBacklogNoticeScope =
+            serde_json::from_value(encoded_some).expect("round-trip notice scope with required");
+        assert_eq!(decoded_some, with_required);
+    }
+
+    #[test]
+    fn required_changed_paths_validation_enforces_exact_subsets() {
+        let exact_allowed = vec!["src/lib.rs".to_string(), "src/extra.rs".to_string()];
+        assert!(valid_exact_required_changed_paths(&exact_allowed, None));
+        assert!(valid_exact_required_changed_paths(
+            &exact_allowed,
+            Some(&["src/lib.rs".to_string()])
+        ));
+        assert!(!valid_exact_required_changed_paths(
+            &exact_allowed,
+            Some(&[])
+        ));
+        assert!(!valid_exact_required_changed_paths(
+            &exact_allowed,
+            Some(&["src/other.rs".to_string()])
+        ));
+        assert!(!valid_exact_required_changed_paths(
+            &exact_allowed,
+            Some(&["src/lib.rs".to_string(), "src/lib.rs".to_string()])
+        ));
+        assert!(!valid_exact_required_changed_paths(
+            &exact_allowed,
+            Some(&["src/".to_string()])
+        ));
+        assert!(!valid_exact_required_changed_paths(
+            &exact_allowed,
+            Some(&["../escape.rs".to_string()])
+        ));
+
+        let dir_allowed = vec!["src/".to_string()];
+        assert!(!valid_exact_required_changed_paths(
+            &dir_allowed,
+            Some(&["src/lib.rs".to_string()])
+        ));
+        assert!(valid_notice_required_changed_paths(
+            &dir_allowed,
+            Some(&["src/lib.rs".to_string()])
+        ));
+        assert!(!valid_notice_required_changed_paths(
+            &dir_allowed,
+            Some(&["other/lib.rs".to_string()])
+        ));
     }
 }

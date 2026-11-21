@@ -7245,6 +7245,78 @@ fn default_workspace_backlog_presence_max_sample_age_ms() -> u64 {
     MAX_WORKSPACE_BACKLOG_PRESENCE_SAMPLE_AGE_MS
 }
 
+fn validate_backlog_presence_token(raw: &str, max_bytes: usize) -> Option<String> {
+    if raw.is_empty()
+        || raw.trim() != raw
+        || raw.len() > max_bytes
+        || !raw
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b':'))
+        || contains_sensitive_marker(&raw.to_ascii_lowercase())
+    {
+        return None;
+    }
+    Some(raw.to_string())
+}
+
+impl WorkspaceBacklogWorkerPresence {
+    /// Returns a validated, sanitized copy of this presence sample, or `None` when required
+    /// attempt identities, optional epoch tokens, or timestamp fields are malformed.
+    fn normalized_safe(&self) -> Option<Self> {
+        let item_id = validate_backlog_presence_token(&self.item_id, crate::MAX_LABEL_LEN)?;
+        let execution_ref = validate_backlog_presence_token(&self.execution_ref, 512)?;
+        let approval_id = validate_backlog_presence_token(&self.approval_id, crate::MAX_LABEL_LEN)?;
+        let task_id = validate_backlog_presence_token(&self.task_id, crate::MAX_LABEL_LEN)?;
+        let run_id = validate_backlog_presence_token(&self.run_id, crate::MAX_LABEL_LEN)?;
+        let worker_id = validate_backlog_presence_token(&self.worker_id, crate::MAX_LABEL_LEN)?;
+        let claim_id = match self.claim_id.as_deref() {
+            None => None,
+            Some(raw) => Some(validate_backlog_presence_token(raw, crate::MAX_LABEL_LEN)?),
+        };
+        let host_instance_id = match self.host_instance_id.as_deref() {
+            None => None,
+            Some(raw) => Some(validate_backlog_presence_token(raw, crate::MAX_LABEL_LEN)?),
+        };
+        let invocation_id = match self.invocation_id.as_deref() {
+            None => None,
+            Some(raw) => Some(validate_backlog_presence_token(raw, crate::MAX_LABEL_LEN)?),
+        };
+        let sampled_at_ms = match self.sampled_at_ms {
+            None => None,
+            Some(ts) if ts > 0 => Some(ts),
+            Some(_) => return None,
+        };
+        let expires_at_ms = match self.expires_at_ms {
+            None => None,
+            Some(ts) if ts > 0 => Some(ts),
+            Some(_) => return None,
+        };
+        let live = self.live
+            && self.availability == WorkspaceBacklogPresenceAvailability::Live
+            && self.freshness == WorkspaceBacklogPresenceFreshness::Fresh;
+
+        Some(Self {
+            item_id,
+            execution_ref,
+            approval_id,
+            task_id,
+            run_id,
+            worker_id,
+            claim_id,
+            host_instance_id,
+            invocation_id,
+            sequence: self.sequence,
+            availability: self.availability,
+            freshness: self.freshness,
+            live,
+            sampled_at_ms,
+            sample_age_ms: self.sample_age_ms,
+            max_sample_age_ms: self.max_sample_age_ms,
+            expires_at_ms,
+        })
+    }
+}
+
 /// Lifecycle status of one verified Worker execution attempt projected into workspace work.
 ///
 /// This mirrors the durable runtime [`crate::worker::WorkerStatus`] exactly. A reservation or
@@ -7617,17 +7689,19 @@ impl WorkspaceChatWork {
             bounds.events_omitted = bounds.events_omitted.saturating_add(overflow);
         }
 
-        let mut presence_by_key: BTreeMap<(String, String), WorkspaceBacklogWorkerPresence> =
+        let mut presence_groups: BTreeMap<PresenceAttemptKey, Vec<WorkspaceBacklogWorkerPresence>> =
             BTreeMap::new();
-        for presence in &self.worker_presence {
+        for raw_presence in &self.worker_presence {
+            let Some(presence) = raw_presence.normalized_safe() else {
+                bounds.presence_omitted = bounds.presence_omitted.saturating_add(1);
+                continue;
+            };
             let Some(owner_item) = items.iter().find(|item| item.item_id == presence.item_id)
             else {
                 bounds.presence_omitted = bounds.presence_omitted.saturating_add(1);
                 continue;
             };
-            if presence.item_id.trim().is_empty()
-                || presence.execution_ref.trim().is_empty()
-                || owner_item.kind != crate::backlog::BacklogItemKind::Worker
+            if owner_item.kind != crate::backlog::BacklogItemKind::Worker
                 || !matches!(
                     owner_item.status,
                     crate::backlog::BacklogStatus::Doing | crate::backlog::BacklogStatus::Blocked
@@ -7638,35 +7712,25 @@ impl WorkspaceChatWork {
                 bounds.presence_omitted = bounds.presence_omitted.saturating_add(1);
                 continue;
             }
-            let mut presence = presence.clone();
-            if presence.availability != WorkspaceBacklogPresenceAvailability::Live
-                || presence.freshness != WorkspaceBacklogPresenceFreshness::Fresh
-            {
-                presence.live = false;
-            }
-            let key = (presence.item_id.clone(), presence.execution_ref.clone());
-            match presence_by_key.get(&key) {
-                Some(existing) => {
-                    if presence_sort_key(&presence) < presence_sort_key(existing) {
-                        bounds.presence_omitted = bounds.presence_omitted.saturating_add(1);
-                        presence_by_key.insert(key, presence);
-                    } else {
-                        bounds.presence_omitted = bounds.presence_omitted.saturating_add(1);
-                    }
-                }
-                None => {
-                    presence_by_key.insert(key, presence);
-                }
-            }
+            let key = PresenceAttemptKey {
+                item_id: presence.item_id.clone(),
+                execution_ref: presence.execution_ref.clone(),
+                approval_id: presence.approval_id.clone(),
+                task_id: presence.task_id.clone(),
+                run_id: presence.run_id.clone(),
+                worker_id: presence.worker_id.clone(),
+            };
+            presence_groups.entry(key).or_default().push(presence);
         }
         let mut worker_presence: Vec<WorkspaceBacklogWorkerPresence> =
-            presence_by_key.into_values().collect();
-        worker_presence.sort_by(|left, right| {
-            presence_sort_key(left)
-                .cmp(&presence_sort_key(right))
-                .then_with(|| left.item_id.cmp(&right.item_id))
-                .then_with(|| left.execution_ref.cmp(&right.execution_ref))
-        });
+            Vec::with_capacity(presence_groups.len());
+        for group in presence_groups.into_values() {
+            if let Some((winner, omitted)) = reconcile_presence_attempt_samples(group) {
+                bounds.presence_omitted = bounds.presence_omitted.saturating_add(omitted);
+                worker_presence.push(winner);
+            }
+        }
+        worker_presence.sort_by(compare_presence_list_order);
         if worker_presence.len() > MAX_WORKSPACE_CHAT_WORK_PRESENCE_PER_CHAT {
             let overflow = worker_presence.len() - MAX_WORKSPACE_CHAT_WORK_PRESENCE_PER_CHAT;
             let keep = worker_presence.len() - overflow;
@@ -7879,18 +7943,237 @@ fn workspace_backlog_execution_identity(
     )
 }
 
-fn presence_sort_key(
-    presence: &WorkspaceBacklogWorkerPresence,
-) -> (
-    std::cmp::Reverse<bool>,
-    std::cmp::Reverse<i64>,
-    std::cmp::Reverse<u64>,
-) {
-    (
-        std::cmp::Reverse(presence.live),
-        std::cmp::Reverse(presence.sampled_at_ms.unwrap_or(i64::MIN)),
-        std::cmp::Reverse(presence.sequence.unwrap_or(0)),
-    )
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct PresenceAttemptKey {
+    item_id: String,
+    execution_ref: String,
+    approval_id: String,
+    task_id: String,
+    run_id: String,
+    worker_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct PresenceEpochKey {
+    host_instance_id: Option<String>,
+    invocation_id: String,
+    claim_id: Option<String>,
+}
+
+fn presence_state_rank(presence: &WorkspaceBacklogWorkerPresence) -> u8 {
+    if presence.availability == WorkspaceBacklogPresenceAvailability::NonLive {
+        3
+    } else if presence.live
+        && presence.availability == WorkspaceBacklogPresenceAvailability::Live
+        && presence.freshness == WorkspaceBacklogPresenceFreshness::Fresh
+    {
+        2
+    } else if presence.availability == WorkspaceBacklogPresenceAvailability::Unavailable
+        && presence.freshness != WorkspaceBacklogPresenceFreshness::Stale
+    {
+        1
+    } else {
+        0
+    }
+}
+
+fn presence_availability_rank(availability: WorkspaceBacklogPresenceAvailability) -> u8 {
+    match availability {
+        WorkspaceBacklogPresenceAvailability::NonLive => 2,
+        WorkspaceBacklogPresenceAvailability::Live => 1,
+        WorkspaceBacklogPresenceAvailability::Unavailable => 0,
+    }
+}
+
+fn presence_freshness_rank(freshness: WorkspaceBacklogPresenceFreshness) -> u8 {
+    match freshness {
+        WorkspaceBacklogPresenceFreshness::Fresh => 2,
+        WorkspaceBacklogPresenceFreshness::NotApplicable => 1,
+        WorkspaceBacklogPresenceFreshness::Stale => 0,
+    }
+}
+
+fn compare_opt_i64_desc(left: Option<i64>, right: Option<i64>) -> std::cmp::Ordering {
+    match (left, right) {
+        (Some(l), Some(r)) => r.cmp(&l),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    }
+}
+
+fn compare_opt_u64_desc(left: Option<u64>, right: Option<u64>) -> std::cmp::Ordering {
+    match (left, right) {
+        (Some(l), Some(r)) => r.cmp(&l),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    }
+}
+
+fn compare_opt_u64_asc(left: Option<u64>, right: Option<u64>) -> std::cmp::Ordering {
+    match (left, right) {
+        (Some(l), Some(r)) => l.cmp(&r),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    }
+}
+
+fn compare_opt_str_some_first(left: Option<&str>, right: Option<&str>) -> std::cmp::Ordering {
+    match (left, right) {
+        (Some(l), Some(r)) => l.cmp(r),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    }
+}
+
+/// Strict total ordering for samples sharing the same attempt identity and concrete invocation
+/// epoch (`host_instance_id`, `Some(invocation_id)`, `claim_id`) with `sequence: Some(_)`.
+///
+/// Monotonic `sequence` takes precedence first, followed by `sampled_at_ms`, and only on an exact
+/// ordering tie falls back to fail-closed state rank (`non_live` > fresh `live` > `unavailable` >
+/// stale/degraded) and deterministic field tie-breakers.
+fn compare_presence_within_epoch(
+    left: &WorkspaceBacklogWorkerPresence,
+    right: &WorkspaceBacklogWorkerPresence,
+) -> std::cmp::Ordering {
+    compare_opt_u64_desc(left.sequence, right.sequence)
+        .then_with(|| compare_opt_i64_desc(left.sampled_at_ms, right.sampled_at_ms))
+        .then_with(|| presence_state_rank(right).cmp(&presence_state_rank(left)))
+        .then_with(|| compare_opt_i64_desc(left.expires_at_ms, right.expires_at_ms))
+        .then_with(|| compare_opt_u64_asc(left.sample_age_ms, right.sample_age_ms))
+        .then_with(|| right.max_sample_age_ms.cmp(&left.max_sample_age_ms))
+        .then_with(|| {
+            presence_availability_rank(right.availability)
+                .cmp(&presence_availability_rank(left.availability))
+        })
+        .then_with(|| {
+            presence_freshness_rank(right.freshness).cmp(&presence_freshness_rank(left.freshness))
+        })
+        .then_with(|| right.live.cmp(&left.live))
+}
+
+/// Strict total ordering across distinct epochs (for example a restarted epoch whose `sequence`
+/// reset to `1`) or unsequenced/epochless samples of the same attempt.
+///
+/// Wall-clock `sampled_at_ms` orders epochs first (an untimestamped epoch never supersedes a
+/// timestamped epoch), followed by fail-closed state rank, `sequence`, remaining metadata, and
+/// canonical epoch tokens.
+fn compare_presence_cross_epoch(
+    left: &WorkspaceBacklogWorkerPresence,
+    right: &WorkspaceBacklogWorkerPresence,
+) -> std::cmp::Ordering {
+    compare_opt_i64_desc(left.sampled_at_ms, right.sampled_at_ms)
+        .then_with(|| presence_state_rank(right).cmp(&presence_state_rank(left)))
+        .then_with(|| compare_opt_u64_desc(left.sequence, right.sequence))
+        .then_with(|| compare_opt_i64_desc(left.expires_at_ms, right.expires_at_ms))
+        .then_with(|| compare_opt_u64_asc(left.sample_age_ms, right.sample_age_ms))
+        .then_with(|| right.max_sample_age_ms.cmp(&left.max_sample_age_ms))
+        .then_with(|| {
+            presence_availability_rank(right.availability)
+                .cmp(&presence_availability_rank(left.availability))
+        })
+        .then_with(|| {
+            presence_freshness_rank(right.freshness).cmp(&presence_freshness_rank(left.freshness))
+        })
+        .then_with(|| right.live.cmp(&left.live))
+        .then_with(|| {
+            compare_opt_str_some_first(
+                left.host_instance_id.as_deref(),
+                right.host_instance_id.as_deref(),
+            )
+        })
+        .then_with(|| {
+            compare_opt_str_some_first(
+                left.invocation_id.as_deref(),
+                right.invocation_id.as_deref(),
+            )
+        })
+        .then_with(|| {
+            compare_opt_str_some_first(left.claim_id.as_deref(), right.claim_id.as_deref())
+        })
+}
+
+/// Strict total ordering across distinct reconciled Worker attempts for bounded per-chat retention.
+///
+/// Ordering (`sampled_at_ms`, then `sequence`) precedes liveness; remaining fields break ties
+/// deterministically by full attempt and epoch identity.
+fn compare_presence_list_order(
+    left: &WorkspaceBacklogWorkerPresence,
+    right: &WorkspaceBacklogWorkerPresence,
+) -> std::cmp::Ordering {
+    compare_opt_i64_desc(left.sampled_at_ms, right.sampled_at_ms)
+        .then_with(|| compare_opt_u64_desc(left.sequence, right.sequence))
+        .then_with(|| right.live.cmp(&left.live))
+        .then_with(|| presence_state_rank(right).cmp(&presence_state_rank(left)))
+        .then_with(|| left.item_id.cmp(&right.item_id))
+        .then_with(|| left.execution_ref.cmp(&right.execution_ref))
+        .then_with(|| left.approval_id.cmp(&right.approval_id))
+        .then_with(|| left.task_id.cmp(&right.task_id))
+        .then_with(|| left.run_id.cmp(&right.run_id))
+        .then_with(|| left.worker_id.cmp(&right.worker_id))
+        .then_with(|| {
+            compare_opt_str_some_first(
+                left.host_instance_id.as_deref(),
+                right.host_instance_id.as_deref(),
+            )
+        })
+        .then_with(|| {
+            compare_opt_str_some_first(
+                left.invocation_id.as_deref(),
+                right.invocation_id.as_deref(),
+            )
+        })
+        .then_with(|| {
+            compare_opt_str_some_first(left.claim_id.as_deref(), right.claim_id.as_deref())
+        })
+}
+
+/// Two-stage transitive reconciliation for all valid samples of one immutable Worker attempt.
+///
+/// Stage 1 selects the highest-sequence sample within each concrete invocation epoch
+/// `(host_instance_id, Some(invocation_id), claim_id)` when `sequence` is present.
+/// Stage 2 selects the winning epoch (or unsequenced/epochless sample) by wall-clock
+/// `sampled_at_ms` before state/liveness tie-breakers.
+fn reconcile_presence_attempt_samples(
+    samples: Vec<WorkspaceBacklogWorkerPresence>,
+) -> Option<(WorkspaceBacklogWorkerPresence, usize)> {
+    let omitted = samples.len().saturating_sub(1);
+    let mut sequenced_by_epoch: BTreeMap<PresenceEpochKey, WorkspaceBacklogWorkerPresence> =
+        BTreeMap::new();
+    let mut cross_epoch_candidates: Vec<WorkspaceBacklogWorkerPresence> = Vec::new();
+
+    for sample in samples {
+        if let (Some(invocation_id), Some(_)) = (sample.invocation_id.as_ref(), sample.sequence) {
+            let epoch_key = PresenceEpochKey {
+                host_instance_id: sample.host_instance_id.clone(),
+                invocation_id: invocation_id.clone(),
+                claim_id: sample.claim_id.clone(),
+            };
+            let replace = sequenced_by_epoch.get(&epoch_key).is_none_or(|existing| {
+                compare_presence_within_epoch(&sample, existing) == std::cmp::Ordering::Less
+            });
+            if replace {
+                sequenced_by_epoch.insert(epoch_key, sample);
+            }
+        } else {
+            cross_epoch_candidates.push(sample);
+        }
+    }
+
+    cross_epoch_candidates.extend(sequenced_by_epoch.into_values());
+    let mut best: Option<WorkspaceBacklogWorkerPresence> = None;
+    for candidate in cross_epoch_candidates {
+        let replace = best.as_ref().is_none_or(|existing| {
+            compare_presence_cross_epoch(&candidate, existing) == std::cmp::Ordering::Less
+        });
+        if replace {
+            best = Some(candidate);
+        }
+    }
+    best.map(|winner| (winner, omitted))
 }
 
 /// Separate read-only workspace observation envelope that embeds [`ObservationSnapshot`] without
@@ -8162,16 +8445,18 @@ impl WorkspaceSnapshot {
             bound_workspace_job_histories(self.job_histories.clone());
         let messages = self.messages.normalized();
 
+        // Group raw `chat_work` rows by their complete canonical chat identity before normalizing
+        // items, events, presence, and executions so multi-entry / mixed-source updates compose
+        // without prematurely dropping presence or splitting conflicting execution identities.
         let mut chat_work_by_key: BTreeMap<String, WorkspaceChatWork> = BTreeMap::new();
         for work in &self.chat_work {
-            let normalized = work.normalized();
-            let Some(chat_key) = normalized.identity.canonical_key() else {
+            let Some(chat_key) = work.identity.canonical_key() else {
                 continue;
             };
             match chat_work_by_key.get_mut(&chat_key) {
-                Some(existing) => existing.merge_from(&normalized),
+                Some(existing) => existing.merge_from(work),
                 None => {
-                    chat_work_by_key.insert(chat_key, normalized);
+                    chat_work_by_key.insert(chat_key, work.clone());
                 }
             }
         }

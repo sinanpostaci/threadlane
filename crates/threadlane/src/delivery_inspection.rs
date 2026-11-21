@@ -340,13 +340,16 @@ pub struct DeliveryFileInspection {
     pub physical: DeliveryFilePhysicalCode,
     /// True only for an existing regular non-symlink file.
     pub regular_file: bool,
+    /// Regular-file executable mode bit (`mode & 0o111 != 0` on Unix) for a stably read file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executable: Option<bool>,
     /// UTF-8 validity for a present regular file.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub utf8: Option<bool>,
     /// True when a present regular file ends with a final `\n` byte.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub final_lf: Option<bool>,
-    /// File size in bytes for a present regular file.
+    /// File size in bytes for a present regular file read within budget.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub size_bytes: Option<u64>,
     /// Lowercase SHA-256 hex digest for a present regular file read within budget.
@@ -462,6 +465,12 @@ pub struct SourceInspection {
     pub files: Vec<SourceFileInspection>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TextSelectionMode {
+    Explicit,
+    ChangedAllowed,
+}
+
 /// Performs one bounded physical inspection with the default production limits.
 pub fn inspect_delivery(request: &DeliveryInspectionRequest) -> DeliveryInspectionReport {
     inspect_delivery_with_limits(request, &DeliveryInspectionLimits::default())
@@ -474,6 +483,35 @@ pub fn inspect_delivery(request: &DeliveryInspectionRequest) -> DeliveryInspecti
 pub fn inspect_delivery_with_limits(
     request: &DeliveryInspectionRequest,
     limits: &DeliveryInspectionLimits,
+) -> DeliveryInspectionReport {
+    inspect_delivery_with_limits_mode(request, limits, TextSelectionMode::Explicit)
+}
+
+/// Performs one coherent bounded physical inspection that includes bounded UTF-8 text and
+/// SHA-256 digests for every actual changed allowed path while observing unchanged or absent
+/// allowed paths without reading their contents.
+///
+/// Requires a non-empty `allowed_paths` set and an empty `text_files` list so every changed
+/// allowed file in the candidate checkout is captured under the same snapshot and observation
+/// revalidation pass.
+pub fn inspect_delivery_changed_text(
+    request: &DeliveryInspectionRequest,
+) -> DeliveryInspectionReport {
+    inspect_delivery_changed_text_with_limits(request, &DeliveryInspectionLimits::default())
+}
+
+/// Performs one coherent changed-files physical inspection with explicit limits.
+pub fn inspect_delivery_changed_text_with_limits(
+    request: &DeliveryInspectionRequest,
+    limits: &DeliveryInspectionLimits,
+) -> DeliveryInspectionReport {
+    inspect_delivery_with_limits_mode(request, limits, TextSelectionMode::ChangedAllowed)
+}
+
+fn inspect_delivery_with_limits_mode(
+    request: &DeliveryInspectionRequest,
+    limits: &DeliveryInspectionLimits,
+    text_mode: TextSelectionMode,
 ) -> DeliveryInspectionReport {
     let started = Instant::now();
     let mut progress = InspectionProgress::default();
@@ -501,7 +539,17 @@ pub fn inspect_delivery_with_limits(
     let mut failure = match validate_limits(limits) {
         Err(failure) => Some(failure),
         Ok(()) => match validate_request(request, limits) {
-            Ok(validated) => inspect_validated(&validated, limits, started, &mut progress),
+            Ok(validated) => {
+                if text_mode == TextSelectionMode::ChangedAllowed
+                    && (validated.allowed_paths.is_empty() || !validated.text_files.is_empty())
+                {
+                    Some(InspectionFailure::new(
+                        DeliveryInspectionRefusalCode::InvalidRequest,
+                    ))
+                } else {
+                    inspect_validated(&validated, limits, started, text_mode, &mut progress)
+                }
+            }
             Err(failure) => Some(failure),
         },
     };
@@ -553,7 +601,14 @@ pub fn inspect_delivery_with_source_and_limits(
     source_files: &[String],
     limits: &DeliveryInspectionLimits,
 ) -> DeliveryInspectionReport {
-    inspect_delivery_with_source_mode(request, source_root, source_files, limits, false)
+    inspect_delivery_with_source_mode(
+        request,
+        source_root,
+        source_files,
+        limits,
+        false,
+        TextSelectionMode::Explicit,
+    )
 }
 
 /// Inspects explicitly named source files with their bounded, untrusted UTF-8 text.
@@ -580,7 +635,47 @@ pub fn inspect_delivery_with_source_text_and_limits(
     source_files: &[String],
     limits: &DeliveryInspectionLimits,
 ) -> DeliveryInspectionReport {
-    inspect_delivery_with_source_mode(request, source_root, source_files, limits, true)
+    inspect_delivery_with_source_mode(
+        request,
+        source_root,
+        source_files,
+        limits,
+        true,
+        TextSelectionMode::Explicit,
+    )
+}
+
+/// Inspects every actual changed allowed file (without requiring explicit `text_files`) and
+/// explicitly named source files with their bounded, untrusted UTF-8 text under shared budgets.
+pub fn inspect_delivery_changed_text_with_source_text(
+    request: &DeliveryInspectionRequest,
+    source_root: &Path,
+    source_files: &[String],
+) -> DeliveryInspectionReport {
+    inspect_delivery_changed_text_with_source_text_and_limits(
+        request,
+        source_root,
+        source_files,
+        &DeliveryInspectionLimits::default(),
+    )
+}
+
+/// Inspects every actual changed allowed file and explicitly named source files under explicit
+/// shared deadline, read, text and output budgets.
+pub fn inspect_delivery_changed_text_with_source_text_and_limits(
+    request: &DeliveryInspectionRequest,
+    source_root: &Path,
+    source_files: &[String],
+    limits: &DeliveryInspectionLimits,
+) -> DeliveryInspectionReport {
+    inspect_delivery_with_source_mode(
+        request,
+        source_root,
+        source_files,
+        limits,
+        true,
+        TextSelectionMode::ChangedAllowed,
+    )
 }
 
 /// Observes an explicit source baseline before a task checkout exists, without returning text.
@@ -709,9 +804,10 @@ fn inspect_delivery_with_source_mode(
     source_files: &[String],
     limits: &DeliveryInspectionLimits,
     include_source_text: bool,
+    text_mode: TextSelectionMode,
 ) -> DeliveryInspectionReport {
     let started = Instant::now();
-    let mut report = inspect_delivery_with_limits(request, limits);
+    let mut report = inspect_delivery_with_limits_mode(request, limits, text_mode);
     if report.ok {
         let task_bytes = report.files.iter().filter_map(|file| file.size_bytes).sum();
         let task_text_bytes = report
@@ -1212,6 +1308,7 @@ fn inspect_validated(
     request: &ValidatedRequest,
     limits: &DeliveryInspectionLimits,
     started: Instant,
+    text_mode: TextSelectionMode,
     progress: &mut InspectionProgress,
 ) -> Option<InspectionFailure> {
     if let Err(failure) = check_deadline(started, limits) {
@@ -1314,18 +1411,37 @@ fn inspect_validated(
             record_failure(&mut failure, deadline);
             return failure;
         }
-        let text_requested = request.text_files.contains(path);
-        let (file, file_failure) = inspect_file(
-            &request.root,
-            path,
-            first.changes.get(path),
-            text_requested,
-            limits,
-            started,
-            &mut total_read,
-            &mut total_text,
-            &mut observations,
-        );
+        let change = first.changes.get(path);
+        let (file, file_failure) = match text_mode {
+            TextSelectionMode::Explicit => inspect_file(
+                &request.root,
+                path,
+                change,
+                request.text_files.contains(path),
+                limits,
+                started,
+                &mut total_read,
+                &mut total_text,
+                &mut observations,
+            ),
+            TextSelectionMode::ChangedAllowed => {
+                if change.is_some() {
+                    inspect_file(
+                        &request.root,
+                        path,
+                        change,
+                        true,
+                        limits,
+                        started,
+                        &mut total_read,
+                        &mut total_text,
+                        &mut observations,
+                    )
+                } else {
+                    observe_unchanged_file(&request.root, path, &mut observations)
+                }
+            }
+        };
         if let Some(file_failure) = file_failure {
             record_failure(&mut failure, file_failure);
         }
@@ -1613,6 +1729,7 @@ fn changed_paths(
 struct FileEvidence {
     dev: u64,
     ino: u64,
+    mode: u32,
     len: u64,
     mtime: i64,
     mtime_nsec: i64,
@@ -1655,6 +1772,7 @@ fn inspect_file(
             .unwrap_or_default(),
         physical: DeliveryFilePhysicalCode::Missing,
         regular_file: false,
+        executable: None,
         utf8: None,
         final_lf: None,
         size_bytes: None,
@@ -1884,6 +2002,7 @@ fn inspect_file(
             )),
         );
     }
+    entry.executable = regular_file_executable(&after_read);
 
     if text_requested {
         if !utf8 {
@@ -1937,6 +2056,82 @@ fn inspect_file(
     }
 
     (entry, None)
+}
+
+fn observe_unchanged_file(
+    root: &Path,
+    path: &str,
+    observations: &mut Vec<FileObservation>,
+) -> (DeliveryFileInspection, Option<InspectionFailure>) {
+    let mut entry = DeliveryFileInspection {
+        path: path.to_string(),
+        changed: false,
+        change_kinds: Vec::new(),
+        physical: DeliveryFilePhysicalCode::Missing,
+        regular_file: false,
+        executable: None,
+        utf8: None,
+        final_lf: None,
+        size_bytes: None,
+        sha256: None,
+        text_status: DeliveryTextStatus::NotRequested,
+        text: None,
+        text_untrusted: false,
+    };
+    match open_inspection_file(root, path) {
+        Ok((_file, metadata)) => {
+            entry.physical = DeliveryFilePhysicalCode::RegularFile;
+            entry.regular_file = true;
+            observations.push(FileObservation {
+                path: path.to_string(),
+                evidence: Some(file_evidence(&metadata)),
+            });
+            (entry, None)
+        }
+        Err(SafeOpenFailure::Missing) => {
+            observations.push(FileObservation {
+                path: path.to_string(),
+                evidence: None,
+            });
+            (entry, None)
+        }
+        Err(SafeOpenFailure::Symlink) => {
+            entry.physical = DeliveryFilePhysicalCode::Symlink;
+            (
+                entry,
+                Some(InspectionFailure::at(
+                    DeliveryInspectionRefusalCode::SymlinkEscape,
+                    path,
+                )),
+            )
+        }
+        Err(SafeOpenFailure::NotRegularFile) => {
+            entry.physical = DeliveryFilePhysicalCode::NotRegularFile;
+            (
+                entry,
+                Some(InspectionFailure::at(
+                    DeliveryInspectionRefusalCode::NotRegularFile,
+                    path,
+                )),
+            )
+        }
+        Err(SafeOpenFailure::Changed) => (
+            entry,
+            Some(InspectionFailure::new(
+                DeliveryInspectionRefusalCode::ChangingRead,
+            )),
+        ),
+        Err(SafeOpenFailure::Unreadable) => {
+            entry.physical = DeliveryFilePhysicalCode::Unreadable;
+            (
+                entry,
+                Some(InspectionFailure::at(
+                    DeliveryInspectionRefusalCode::FileReadFailed,
+                    path,
+                )),
+            )
+        }
+    }
 }
 
 fn expects_present_file(change: &ChangeAccumulator) -> bool {
@@ -2082,11 +2277,23 @@ fn omit_unstable_text(files: &mut [DeliveryFileInspection]) {
 }
 
 #[cfg(unix)]
+fn regular_file_executable(metadata: &fs::Metadata) -> Option<bool> {
+    use std::os::unix::fs::PermissionsExt;
+    Some(metadata.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn regular_file_executable(_metadata: &fs::Metadata) -> Option<bool> {
+    None
+}
+
+#[cfg(unix)]
 fn file_evidence(metadata: &fs::Metadata) -> FileEvidence {
     use std::os::unix::fs::MetadataExt;
     FileEvidence {
         dev: metadata.dev(),
         ino: metadata.ino(),
+        mode: metadata.mode(),
         len: metadata.len(),
         mtime: metadata.mtime(),
         mtime_nsec: metadata.mtime_nsec(),
@@ -2100,6 +2307,7 @@ fn file_evidence(metadata: &fs::Metadata) -> FileEvidence {
     FileEvidence {
         dev: 0,
         ino: 0,
+        mode: 0,
         len: metadata.len(),
         mtime: 0,
         mtime_nsec: 0,
@@ -2463,6 +2671,7 @@ fn same_file_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
 fn same_file_snapshot(left: &fs::Metadata, right: &fs::Metadata) -> bool {
     use std::os::unix::fs::MetadataExt;
     same_file_identity(left, right)
+        && left.mode() == right.mode()
         && left.len() == right.len()
         && left.mtime() == right.mtime()
         && left.mtime_nsec() == right.mtime_nsec()
@@ -2718,6 +2927,7 @@ mod tests {
             change_kinds: vec![DeliveryChangeKind::Modified],
             physical: DeliveryFilePhysicalCode::RegularFile,
             regular_file: true,
+            executable: None,
             utf8: Some(true),
             final_lf: Some(true),
             size_bytes: Some(4),
@@ -2730,5 +2940,327 @@ mod tests {
         assert!(files[0].text.is_none());
         assert!(!files[0].text_untrusted);
         assert_eq!(files[0].text_status, DeliveryTextStatus::ChangingRead);
+    }
+
+    fn init_changed_text_fixture_repo() -> (tempfile::TempDir, PathBuf, String) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = fs::canonicalize(tmp.path()).expect("canonicalize tempdir");
+        fs::create_dir_all(root.join("src")).expect("create src");
+        fs::write(root.join("src/lib.rs"), "pub fn alpha() -> u32 { 1 }\n").expect("write lib.rs");
+        fs::write(root.join("src/extra.rs"), "pub fn extra() {}\n").expect("write extra.rs");
+        fs::write(root.join("src/unchanged.bin"), [0xffu8, 0x00, 0xfe])
+            .expect("write unchanged.bin");
+        for args in [
+            &["init", "--quiet"][..],
+            &["config", "user.email", "test@threadlane.local"][..],
+            &["config", "user.name", "Threadlane Test"][..],
+            &["add", "."][..],
+            &["commit", "-m", "initial", "--quiet"][..],
+        ] {
+            threadlane_workers::run_sanitized_git(
+                &root,
+                args,
+                threadlane_workers::DEFAULT_GIT_COMMAND_TIMEOUT_MS,
+            )
+            .expect("git fixture setup");
+        }
+        let base = threadlane_workers::resolve_exact_commit_sha(
+            &root,
+            "HEAD",
+            threadlane_workers::DEFAULT_GIT_COMMAND_TIMEOUT_MS,
+        )
+        .expect("resolve base commit");
+        (tmp, root, base)
+    }
+
+    #[test]
+    fn changed_text_inspection_reads_changed_files_and_observes_unchanged_or_absent_optional_files()
+    {
+        let (_tmp, root, base) = init_changed_text_fixture_repo();
+        let updated_lib = "pub fn alpha() -> u32 { 42 }\n";
+        let added_opt = "pub fn optional_fn() -> u32 { 7 }\n";
+        fs::write(root.join("src/lib.rs"), updated_lib).expect("update lib.rs");
+        fs::write(root.join("src/opt_changed.rs"), added_opt).expect("create opt_changed.rs");
+
+        let report = inspect_delivery_changed_text(&DeliveryInspectionRequest {
+            root,
+            expected_base: base,
+            allowed_paths: vec![
+                "src/lib.rs".to_string(),
+                "src/extra.rs".to_string(),
+                "src/unchanged.bin".to_string(),
+                "src/opt_changed.rs".to_string(),
+                "src/opt_missing.rs".to_string(),
+            ],
+            text_files: Vec::new(),
+        });
+        assert!(report.ok, "unexpected refusal: {:?}", report.refusal_code);
+        assert!(report.text_included);
+        assert!(report.untrusted_data);
+        let changed: Vec<&str> = report
+            .changed_paths
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect();
+        assert_eq!(changed, vec!["src/lib.rs", "src/opt_changed.rs"]);
+        assert_eq!(report.files.len(), 5);
+
+        let file = |path: &str| {
+            report
+                .files
+                .iter()
+                .find(|entry| entry.path == path)
+                .unwrap_or_else(|| panic!("missing file entry `{path}`"))
+        };
+
+        let lib = file("src/lib.rs");
+        assert!(lib.changed);
+        assert_eq!(lib.physical, DeliveryFilePhysicalCode::RegularFile);
+        assert!(lib.regular_file);
+        assert_eq!(lib.utf8, Some(true));
+        assert_eq!(lib.final_lf, Some(true));
+        assert_eq!(lib.size_bytes, Some(updated_lib.len() as u64));
+        assert_eq!(
+            lib.sha256.as_deref(),
+            Some(sha256_hex(updated_lib.as_bytes()).as_str())
+        );
+        assert_eq!(lib.text_status, DeliveryTextStatus::Included);
+        assert_eq!(lib.text.as_deref(), Some(updated_lib));
+        assert!(lib.text_untrusted);
+
+        let opt_changed = file("src/opt_changed.rs");
+        assert!(opt_changed.changed);
+        assert_eq!(opt_changed.physical, DeliveryFilePhysicalCode::RegularFile);
+        assert!(opt_changed.regular_file);
+        assert_eq!(opt_changed.utf8, Some(true));
+        assert_eq!(opt_changed.final_lf, Some(true));
+        assert_eq!(opt_changed.size_bytes, Some(added_opt.len() as u64));
+        assert_eq!(
+            opt_changed.sha256.as_deref(),
+            Some(sha256_hex(added_opt.as_bytes()).as_str())
+        );
+        assert_eq!(opt_changed.text_status, DeliveryTextStatus::Included);
+        assert_eq!(opt_changed.text.as_deref(), Some(added_opt));
+        assert!(opt_changed.text_untrusted);
+
+        for unchanged_path in ["src/extra.rs", "src/unchanged.bin"] {
+            let entry = file(unchanged_path);
+            assert!(!entry.changed);
+            assert!(entry.change_kinds.is_empty());
+            assert_eq!(entry.physical, DeliveryFilePhysicalCode::RegularFile);
+            assert!(entry.regular_file);
+            assert_eq!(entry.text_status, DeliveryTextStatus::NotRequested);
+            assert!(entry.text.is_none());
+            assert!(!entry.text_untrusted);
+            assert!(entry.size_bytes.is_none());
+            assert!(entry.sha256.is_none());
+        }
+
+        let missing = file("src/opt_missing.rs");
+        assert!(!missing.changed);
+        assert!(missing.change_kinds.is_empty());
+        assert_eq!(missing.physical, DeliveryFilePhysicalCode::Missing);
+        assert!(!missing.regular_file);
+        assert_eq!(missing.text_status, DeliveryTextStatus::NotRequested);
+        assert!(missing.text.is_none());
+        assert!(!missing.text_untrusted);
+    }
+
+    #[test]
+    fn changed_text_inspection_refuses_explicit_text_files_deletion_binary_oversized_and_out_of_scope(
+    ) {
+        let (_tmp, root, base) = init_changed_text_fixture_repo();
+        let allowed = vec!["src/lib.rs".to_string(), "src/extra.rs".to_string()];
+
+        let bad_text_files = inspect_delivery_changed_text(&DeliveryInspectionRequest {
+            root: root.clone(),
+            expected_base: base.clone(),
+            allowed_paths: allowed.clone(),
+            text_files: vec!["src/lib.rs".to_string()],
+        });
+        assert!(!bad_text_files.ok);
+        assert_eq!(
+            bad_text_files.refusal_code,
+            Some(DeliveryInspectionRefusalCode::InvalidRequest)
+        );
+
+        let empty_allowed = inspect_delivery_changed_text(&DeliveryInspectionRequest {
+            root: root.clone(),
+            expected_base: base.clone(),
+            allowed_paths: Vec::new(),
+            text_files: Vec::new(),
+        });
+        assert!(!empty_allowed.ok);
+        assert_eq!(
+            empty_allowed.refusal_code,
+            Some(DeliveryInspectionRefusalCode::InvalidRequest)
+        );
+
+        fs::write(root.join("src/lib.rs"), "pub fn alpha() -> u32 { 42 }\n").expect("update lib");
+
+        // Deleted optional file must be refused and withhold all text.
+        fs::remove_file(root.join("src/extra.rs")).expect("delete extra.rs");
+        let deleted = inspect_delivery_changed_text(&DeliveryInspectionRequest {
+            root: root.clone(),
+            expected_base: base.clone(),
+            allowed_paths: allowed.clone(),
+            text_files: Vec::new(),
+        });
+        assert!(!deleted.ok);
+        assert_eq!(
+            deleted.refusal_code,
+            Some(DeliveryInspectionRefusalCode::TextFileMissing)
+        );
+        assert!(!deleted.text_included);
+        assert!(deleted.files.iter().all(|file| file.text.is_none()));
+
+        // Binary optional change must be refused and withhold all text.
+        fs::write(root.join("src/extra.rs"), [0xffu8, 0x00, 0xfe]).expect("write binary extra");
+        let binary = inspect_delivery_changed_text(&DeliveryInspectionRequest {
+            root: root.clone(),
+            expected_base: base.clone(),
+            allowed_paths: allowed.clone(),
+            text_files: Vec::new(),
+        });
+        assert!(!binary.ok);
+        assert_eq!(
+            binary.refusal_code,
+            Some(DeliveryInspectionRefusalCode::TextFileNotUtf8)
+        );
+        assert!(!binary.text_included);
+        assert!(binary.files.iter().all(|file| file.text.is_none()));
+
+        // Oversized UTF-8 optional change must be refused and withhold all text.
+        fs::write(root.join("src/extra.rs"), "a".repeat(200)).expect("write oversized extra");
+        let tight_limits = DeliveryInspectionLimits {
+            max_text_file_bytes: 64,
+            ..DeliveryInspectionLimits::default()
+        };
+        let oversized = inspect_delivery_changed_text_with_limits(
+            &DeliveryInspectionRequest {
+                root: root.clone(),
+                expected_base: base.clone(),
+                allowed_paths: allowed.clone(),
+                text_files: Vec::new(),
+            },
+            &tight_limits,
+        );
+        assert!(!oversized.ok);
+        assert_eq!(
+            oversized.refusal_code,
+            Some(DeliveryInspectionRefusalCode::TextFileTooLarge)
+        );
+        assert!(!oversized.text_included);
+        assert!(oversized.files.iter().all(|file| file.text.is_none()));
+
+        // Out-of-scope change must be refused and withhold all text.
+        fs::write(root.join("src/extra.rs"), "pub fn extra() {}\n").expect("restore extra");
+        fs::write(root.join("src/wrong.rs"), "pub fn wrong() {}\n").expect("write wrong");
+        let out_of_scope = inspect_delivery_changed_text(&DeliveryInspectionRequest {
+            root,
+            expected_base: base,
+            allowed_paths: allowed,
+            text_files: Vec::new(),
+        });
+        assert!(!out_of_scope.ok);
+        assert_eq!(
+            out_of_scope.refusal_code,
+            Some(DeliveryInspectionRefusalCode::OutOfScopeChange)
+        );
+        assert!(!out_of_scope.text_included);
+        assert!(out_of_scope.files.iter().all(|file| file.text.is_none()));
+    }
+
+    #[test]
+    fn revalidation_detects_optional_absent_appearing_and_unchanged_swapping() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = fs::canonicalize(tmp.path()).expect("canonicalize tempdir");
+        let unchanged = root.join("unchanged.rs");
+        let absent = root.join("absent.rs");
+        fs::write(&unchanged, "pub fn unchanged() {}\n").expect("write unchanged");
+
+        let mut observations = Vec::new();
+        let (entry_present, failure_present) =
+            observe_unchanged_file(&root, "unchanged.rs", &mut observations);
+        assert!(failure_present.is_none());
+        assert_eq!(
+            entry_present.physical,
+            DeliveryFilePhysicalCode::RegularFile
+        );
+        let (entry_missing, failure_missing) =
+            observe_unchanged_file(&root, "absent.rs", &mut observations);
+        assert!(failure_missing.is_none());
+        assert_eq!(entry_missing.physical, DeliveryFilePhysicalCode::Missing);
+
+        let limits = DeliveryInspectionLimits::default();
+        assert!(revalidate_observations(&root, &observations, &limits, Instant::now()).is_ok());
+
+        // An absent optional file appearing during inspection must fail revalidation.
+        fs::write(&absent, "pub fn appeared() {}\n").expect("create absent file");
+        let appeared = revalidate_observations(&root, &observations, &limits, Instant::now())
+            .expect_err("appearing optional file must fail revalidation");
+        assert_eq!(appeared.code, DeliveryInspectionRefusalCode::ChangingRead);
+
+        // Removing the absent file and swapping the unchanged file must also fail revalidation.
+        fs::remove_file(&absent).expect("remove absent file");
+        fs::write(&unchanged, "pub fn swapped_during_inspection() {}\n").expect("swap unchanged");
+        let swapped = revalidate_observations(&root, &observations, &limits, Instant::now())
+            .expect_err("swapped unchanged optional file must fail revalidation");
+        assert_eq!(swapped.code, DeliveryInspectionRefusalCode::ChangingRead);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn changed_text_inspection_records_executable_mode_and_detects_mode_change_during_revalidation()
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_tmp, root, base) = init_changed_text_fixture_repo();
+        fs::write(root.join("src/lib.rs"), "pub fn alpha() -> u32 { 42 }\n").expect("update lib");
+        fs::write(root.join("src/run.sh"), "#!/bin/sh\necho ok\n").expect("write script");
+        fs::set_permissions(root.join("src/run.sh"), fs::Permissions::from_mode(0o755))
+            .expect("chmod +x script");
+
+        let report = inspect_delivery_changed_text(&DeliveryInspectionRequest {
+            root: root.clone(),
+            expected_base: base,
+            allowed_paths: vec![
+                "src/lib.rs".to_string(),
+                "src/extra.rs".to_string(),
+                "src/run.sh".to_string(),
+                "src/opt_missing.rs".to_string(),
+            ],
+            text_files: Vec::new(),
+        });
+        assert!(report.ok, "unexpected refusal: {:?}", report.refusal_code);
+        let file = |path: &str| {
+            report
+                .files
+                .iter()
+                .find(|entry| entry.path == path)
+                .unwrap_or_else(|| panic!("missing file entry `{path}`"))
+        };
+        assert_eq!(file("src/lib.rs").executable, Some(false));
+        assert_eq!(file("src/run.sh").executable, Some(true));
+        assert_eq!(file("src/extra.rs").executable, None);
+        assert_eq!(file("src/opt_missing.rs").executable, None);
+
+        // Changing only the executable mode bit without altering bytes or length must be caught.
+        let (_file, metadata) =
+            open_inspection_file(&root, "src/lib.rs").expect("open src/lib.rs before chmod");
+        let observations = vec![FileObservation {
+            path: "src/lib.rs".to_string(),
+            evidence: Some(file_evidence(&metadata)),
+        }];
+        fs::set_permissions(root.join("src/lib.rs"), fs::Permissions::from_mode(0o755))
+            .expect("chmod +x src/lib.rs");
+        let failure = revalidate_observations(
+            &root,
+            &observations,
+            &DeliveryInspectionLimits::default(),
+            Instant::now(),
+        )
+        .expect_err("mode change during inspection must fail revalidation");
+        assert_eq!(failure.code, DeliveryInspectionRefusalCode::ChangingRead);
     }
 }

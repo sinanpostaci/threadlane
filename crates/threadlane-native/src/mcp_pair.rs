@@ -102,6 +102,364 @@ const HOST_NOT_READY_STARTUP_TIMEOUT_MESSAGE: &str =
     "Approved host session is not running or has not reached authenticated ready state.";
 const CLOSURE_COMPACT_ATTESTATION: &str = "threadlane ordinary closure bootstrap verified v1";
 
+#[derive(Clone)]
+struct PendingNoticeInspectionInput {
+    authority: Arc<AuthorityStore>,
+    sessions_dir: PathBuf,
+    control_binding_id: String,
+    thread_uuid: String,
+    approval_id: String,
+    subject_digest: String,
+    task_id: String,
+    task_digest: String,
+    session_binding_id: String,
+    run_id: String,
+    worker_id: String,
+    profile_id: String,
+    prior_cursor: u64,
+    pending_batch: threadlane_core::EventBatch,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingNoticeBatchState {
+    AlreadyAcked,
+    StillUnacked,
+    ReadFailed,
+    IdentityMismatch,
+    BatchMissingOrMismatch,
+    DifferentBatchCredited,
+    OverlappingBatches,
+    EventMismatch,
+    AmbiguousCursor,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingNoticeEventsError {
+    ReadFailed,
+    IdentityMismatch,
+    ContentMismatch,
+}
+
+struct PendingNoticeReconcileCtx<'a> {
+    binding: &'a str,
+    thread: &'a str,
+    stores: &'a HostStores,
+    origin: &'a ClosureOrigin,
+    scope: &'a ReviewScope,
+    store: &'a ReviewStore,
+    service: &'a WorkerBacklogService,
+    client: &'a threadlane_host::ApprovedHostClient,
+    context: &'a crate::backlog_worker::WorkerBacklogNoticeContextOutcome,
+    expected_context: &'a Value,
+    live: &'a threadlane_core::Binding,
+    started: Instant,
+}
+
+fn read_core_state_readonly_bounded(
+    db_path: &Path,
+) -> Result<
+    threadlane_core::observation::ReadonlyCoreStateSnapshot,
+    threadlane_core::observation::ObservationJournalError,
+> {
+    // `read_core_state_readonly` treats a missing database as an empty snapshot;
+    // require `state.db` to exist before inspecting pending ACK state.
+    std::fs::symlink_metadata(db_path)
+        .map_err(threadlane_core::observation::ObservationJournalError::Io)?;
+    for attempt in 0..3 {
+        match threadlane_core::observation::read_core_state_readonly(db_path) {
+            Ok(snapshot) => return Ok(snapshot),
+            Err(threadlane_core::observation::ObservationJournalError::Io(io_err))
+                if attempt < 2
+                    && io_err
+                        .to_string()
+                        .contains("sqlite read-only detected concurrent") =>
+            {
+                std::thread::sleep(Duration::from_millis(15));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    threadlane_core::observation::read_core_state_readonly(db_path)
+}
+
+fn inspect_pending_notice_batch(input: &PendingNoticeInspectionInput) -> PendingNoticeBatchState {
+    if input.pending_batch.events.is_empty()
+        || threadlane_host::validate_identifier("batch_id", &input.pending_batch.batch_id).is_err()
+    {
+        return PendingNoticeBatchState::BatchMissingOrMismatch;
+    }
+    if input.subject_digest.is_empty()
+        || input.task_digest.is_empty()
+        || input.worker_id.is_empty()
+        || input.profile_id.is_empty()
+        || input.session_binding_id.is_empty()
+        || input.session_binding_id == input.control_binding_id
+    {
+        return PendingNoticeBatchState::IdentityMismatch;
+    }
+
+    let Ok(record) = input.authority.get_for_operator(&input.approval_id) else {
+        return PendingNoticeBatchState::ReadFailed;
+    };
+    if record.approval_id != input.approval_id
+        || record.binding_id != input.control_binding_id
+        || record.thread_uuid != input.thread_uuid
+        || record.subject_digest != input.subject_digest
+        || !record
+            .tasks
+            .iter()
+            .any(|task| task.task_id == input.task_id && task.task_digest == input.task_digest)
+    {
+        return PendingNoticeBatchState::IdentityMismatch;
+    }
+
+    let Ok(session_dir) =
+        threadlane_host::verify_existing_session_dir(&input.sessions_dir, &input.approval_id)
+    else {
+        return PendingNoticeBatchState::ReadFailed;
+    };
+    let manifest = match threadlane_host::read_host_manifest_optional(&session_dir, &record) {
+        Ok(Some(manifest)) => manifest,
+        Ok(None) | Err(_) => return PendingNoticeBatchState::ReadFailed,
+    };
+    if manifest.approval_id != input.approval_id
+        || manifest.control_binding_id != input.control_binding_id
+        || manifest.thread_uuid != input.thread_uuid
+        || manifest.subject_digest != input.subject_digest
+        || manifest.session_binding_id.as_deref() != Some(input.session_binding_id.as_str())
+    {
+        return PendingNoticeBatchState::IdentityMismatch;
+    }
+    if manifest.phase != threadlane_host::HostPhase::Ready
+        || !manifest.gates.supervisor_authenticated_ready
+    {
+        return PendingNoticeBatchState::ReadFailed;
+    }
+    if !matches!(threadlane_host::is_host_lock_held(&session_dir), Ok(true)) {
+        return PendingNoticeBatchState::ReadFailed;
+    }
+
+    let ledger = match threadlane_host::read_session_task_ledger_readonly(
+        &session_dir,
+        &record,
+        &input.session_binding_id,
+    ) {
+        Ok(ledger) => ledger,
+        Err(_) => return PendingNoticeBatchState::ReadFailed,
+    };
+    let Some((_intents, receipts)) = ledger else {
+        return PendingNoticeBatchState::IdentityMismatch;
+    };
+    let matching_receipts: Vec<_> = receipts
+        .iter()
+        .filter(|entry| entry.task_id == input.task_id)
+        .collect();
+    if matching_receipts.len() != 1 {
+        return PendingNoticeBatchState::IdentityMismatch;
+    }
+    let sealed_receipt = matching_receipts[0];
+    if sealed_receipt.task_digest != input.task_digest
+        || sealed_receipt.run_id != input.run_id
+        || sealed_receipt.worker_id != input.worker_id
+        || sealed_receipt.profile_id != input.profile_id
+    {
+        return PendingNoticeBatchState::IdentityMismatch;
+    }
+
+    let Ok(runtime) = threadlane_host::verify_existing_private_dir(
+        &session_dir.join(threadlane_host::RUNTIME_STATE_SUBDIR),
+    ) else {
+        return PendingNoticeBatchState::ReadFailed;
+    };
+    let db_path = runtime.join(threadlane::DATABASE_FILENAME);
+    let Ok(snapshot) = read_core_state_readonly_bounded(&db_path) else {
+        return PendingNoticeBatchState::ReadFailed;
+    };
+
+    if snapshot.bindings.len() != 1 {
+        return PendingNoticeBatchState::IdentityMismatch;
+    }
+    let db_binding = &snapshot.bindings[0];
+    if db_binding.binding_id != input.session_binding_id
+        || db_binding.thread_uuid != input.thread_uuid
+        || db_binding.binding_id == input.control_binding_id
+    {
+        return PendingNoticeBatchState::IdentityMismatch;
+    }
+    if snapshot
+        .runs
+        .iter()
+        .filter(|run| run.run_id == input.run_id && run.binding_id == input.session_binding_id)
+        .count()
+        != 1
+    {
+        return PendingNoticeBatchState::IdentityMismatch;
+    }
+    if snapshot
+        .workers
+        .iter()
+        .filter(|worker| {
+            worker.worker_id == input.worker_id
+                && worker.run_id == input.run_id
+                && worker.binding_id == input.session_binding_id
+        })
+        .count()
+        != 1
+    {
+        return PendingNoticeBatchState::IdentityMismatch;
+    }
+    if db_binding.acked_seq > db_binding.delivered_seq {
+        return PendingNoticeBatchState::AmbiguousCursor;
+    }
+
+    let stored_events: Vec<_> = snapshot
+        .events
+        .iter()
+        .filter(|event| {
+            event.binding_id == input.session_binding_id
+                && (input.pending_batch.from_seq..=input.pending_batch.to_seq).contains(&event.seq)
+        })
+        .collect();
+    if stored_events.len() != input.pending_batch.events.len()
+        || !stored_events
+            .iter()
+            .zip(input.pending_batch.events.iter())
+            .all(|(stored, expected)| {
+                stored.event_id == expected.event_id
+                    && stored.binding_id == expected.binding_id
+                    && stored.seq == expected.seq
+                    && stored.run_id == expected.run_id
+                    && stored.revision == expected.revision
+                    && stored.kind == expected.kind.as_str()
+                    && stored.important == expected.important
+                    && stored.created_at_ms == expected.created_at_ms
+            })
+    {
+        return PendingNoticeBatchState::EventMismatch;
+    }
+
+    if snapshot
+        .event_batches
+        .iter()
+        .any(|record| record.binding_id != input.session_binding_id)
+    {
+        return PendingNoticeBatchState::IdentityMismatch;
+    }
+
+    let by_id: Vec<_> = snapshot
+        .event_batches
+        .iter()
+        .filter(|record| record.batch_id == input.pending_batch.batch_id)
+        .collect();
+    if by_id.is_empty() {
+        return PendingNoticeBatchState::BatchMissingOrMismatch;
+    }
+    if by_id.len() != 1 {
+        return PendingNoticeBatchState::OverlappingBatches;
+    }
+    let row = by_id[0];
+    if row.binding_id != input.session_binding_id {
+        return PendingNoticeBatchState::IdentityMismatch;
+    }
+    if row.from_seq != input.pending_batch.from_seq
+        || row.to_seq != input.pending_batch.to_seq
+        || row.event_count != input.pending_batch.events.len()
+    {
+        return PendingNoticeBatchState::BatchMissingOrMismatch;
+    }
+
+    let other_credited_same_or_later = snapshot.event_batches.iter().any(|record| {
+        record.batch_id != input.pending_batch.batch_id
+            && record.event_count > 0
+            && record.acked_at_ms.is_some()
+            && record.to_seq >= input.pending_batch.from_seq
+    });
+    if other_credited_same_or_later {
+        return PendingNoticeBatchState::DifferentBatchCredited;
+    }
+
+    let other_overlapping = snapshot.event_batches.iter().any(|record| {
+        record.batch_id != input.pending_batch.batch_id
+            && record.event_count > 0
+            && record.from_seq <= input.pending_batch.to_seq
+            && record.to_seq >= input.pending_batch.from_seq
+    });
+    if other_overlapping {
+        return PendingNoticeBatchState::OverlappingBatches;
+    }
+
+    if db_binding.delivered_seq < input.pending_batch.delivered_seq
+        || db_binding.delivered_seq < input.pending_batch.to_seq
+    {
+        return PendingNoticeBatchState::AmbiguousCursor;
+    }
+
+    if row.acked_at_ms.is_some() {
+        if db_binding.acked_seq == input.pending_batch.to_seq {
+            PendingNoticeBatchState::AlreadyAcked
+        } else {
+            PendingNoticeBatchState::AmbiguousCursor
+        }
+    } else if db_binding.acked_seq == input.prior_cursor {
+        PendingNoticeBatchState::StillUnacked
+    } else {
+        PendingNoticeBatchState::AmbiguousCursor
+    }
+}
+
+async fn verify_pending_batch_events_live(
+    client: &threadlane_host::ApprovedHostClient,
+    approval_id: &str,
+    receipt: &NoticeReceipt,
+    pending: &ApprovedEventBatch,
+) -> Result<(), PendingNoticeEventsError> {
+    let expected_len = pending.batch.events.len();
+    if expected_len == 0 {
+        return Err(PendingNoticeEventsError::ContentMismatch);
+    }
+    let mut authoritative = Vec::with_capacity(expected_len);
+    let mut cursor: Option<String> = None;
+    for _ in 0..expected_len {
+        let remaining = expected_len.saturating_sub(authoritative.len());
+        if remaining == 0 {
+            break;
+        }
+        let page_cursor = cursor.take();
+        let after_seq = if page_cursor.is_none() {
+            Some(receipt.cursor)
+        } else {
+            None
+        };
+        let page = client
+            .list_activity(approval_id, after_seq, page_cursor, Some(remaining), None)
+            .await
+            .map_err(|_| PendingNoticeEventsError::ReadFailed)?;
+        if page.binding_id != receipt.session_binding_id {
+            return Err(PendingNoticeEventsError::IdentityMismatch);
+        }
+        if page.events.is_empty() {
+            break;
+        }
+        authoritative.extend(page.events);
+        if authoritative.len() >= expected_len || !page.has_more {
+            break;
+        }
+        let Some(next_cursor) = page.next_cursor else {
+            return Err(PendingNoticeEventsError::ReadFailed);
+        };
+        cursor = Some(next_cursor);
+    }
+    if authoritative.len() != expected_len
+        || authoritative
+            .iter()
+            .zip(pending.batch.events.iter())
+            .any(|(actual, expected)| actual != expected)
+    {
+        return Err(PendingNoticeEventsError::ContentMismatch);
+    }
+    Ok(())
+}
+
 /// Parameters for the bootstrap `connection_identity` MCP tool (accepts no arguments).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -4169,7 +4527,7 @@ impl PairedMcpServer {
                     })?;
                     return Ok((previous, scope_id));
                 }
-                let (repository_path, base_commit) = service
+                let (repository_path, base_commit, required_changed_paths) = service
                     .review_scope_before_start(
                         binding,
                         thread,
@@ -4282,6 +4640,7 @@ impl PairedMcpServer {
                     repository_path,
                     source_worktree: params.source_worktree.clone(),
                     base_commit,
+                    required_changed_paths,
                     source_files: params.source_files.clone(),
                     baseline_observed_at_ms: baseline.as_ref().map(|_| observed_at),
                     created_at_ms: observed_at,
@@ -4395,6 +4754,7 @@ impl PairedMcpServer {
             || context.execution.authority.task_id != scope.task_id
             || context.scope.repository_path != scope.repository_path
             || context.scope.base_commit != scope.base_commit
+            || context.scope.required_changed_paths != scope.required_changed_paths
             || context.item_snapshot.item_id != scope.item_id
             || context.item_snapshot.current_execution_ref.as_deref()
                 != Some(context.execution.execution_ref.as_str())
@@ -4408,6 +4768,15 @@ impl PairedMcpServer {
             ));
         }
         if context.item_snapshot.status == threadlane_core::BacklogStatus::Done {
+            if let Some(read_id) = store
+                .indexed_read(binding, &params.approval_id)
+                .map_err(|e| Self::format_planning_gateway_error(binding, TOOL, e))?
+            {
+                self.verify_committed_indexed_read(
+                    TOOL, binding, thread, &origin, &store, &service, &scope, &context, &read_id,
+                )
+                .await?;
+            }
             // Do not repeat result, inspection, or completion for a late notice.
             return Self::format_planning_gateway_result(
                 binding,
@@ -4446,7 +4815,10 @@ impl PairedMcpServer {
                     "Verified live event cursor is unavailable.",
                 )
             })?;
-        if live.binding_id != dispatch.session_binding_id || live.acked_seq > live.delivered_seq {
+        if live.binding_id != dispatch.session_binding_id
+            || live.thread_uuid != thread
+            || live.acked_seq > live.delivered_seq
+        {
             return Err(fail(
                 "session_binding_mismatch",
                 "Live event cursor does not match the original dispatch.",
@@ -4482,69 +4854,22 @@ impl PairedMcpServer {
             ));
         }
         if let Some(pending) = receipt.pending.clone() {
-            ordinary_review::validate_notice_page(&receipt, &scope, &pending).map_err(|code| {
-                fail(
-                    code,
-                    "Retained pending page is invalid; reconcile the original receipt.",
-                )
-            })?;
-            let sessions_dir = stores.sessions_dir.clone();
-            let approval = params.approval_id.clone();
-            let pending_batch = pending.batch.clone();
-            let exact_ack = tokio::task::spawn_blocking(move || {
-                let session =
-                    threadlane_host::verify_existing_session_dir(&sessions_dir, &approval).ok()?;
-                let runtime = threadlane_host::verify_existing_private_dir(
-                    &session.join(threadlane_host::RUNTIME_STATE_SUBDIR),
-                )
-                .ok()?;
-                let snapshot = threadlane_core::observation::read_core_state_readonly(
-                    &runtime.join(threadlane::DATABASE_FILENAME),
-                )
-                .ok()?;
-                let matches: Vec<_> = snapshot
-                    .event_batches
-                    .iter()
-                    .filter(|record| {
-                        record.batch_id == pending_batch.batch_id
-                            && record.binding_id == pending_batch.binding_id
-                            && record.from_seq == pending_batch.from_seq
-                            && record.to_seq == pending_batch.to_seq
-                            && record.event_count == pending_batch.events.len()
-                            && record.acked_at_ms.is_some()
-                    })
-                    .collect();
-                Some(matches.len() == 1)
-            })
-            .await
-            .ok()
-            .flatten()
-            .unwrap_or(false);
-            let rechecked = client
-                .verify_live_ready_binding(&params.approval_id)
-                .await
-                .map_err(|_| {
-                    fail(
-                        "ack_outcome_unknown",
-                        "Live ACK state cannot be reverified.",
-                    )
-                })?;
-            if !pending.batch.events.is_empty()
-                && live.acked_seq == pending.batch.to_seq
-                && rechecked.binding_id == receipt.session_binding_id
-                && rechecked.acked_seq == pending.batch.to_seq
-                && exact_ack
-                && self.review_origin(TOOL, binding, thread)? == origin
-            {
-                // The exact delivered batch has a durable ACK record, independently of
-                // the live cursor. Never resend the original uncertain ACK.
-                ordinary_review::commit_notice_page(&mut receipt, &pending);
-                store
-                    .store_notice(binding, &params.approval_id, &receipt)
-                    .map_err(|e| Self::format_planning_gateway_error(binding, TOOL, e))?;
-            } else {
-                return Err(fail("ack_outcome_unknown", "Pending ACK cannot be reconciled from the live cursor; do not retry it blindly."));
-            }
+            let reconcile_ctx = PendingNoticeReconcileCtx {
+                binding,
+                thread,
+                stores: &stores,
+                origin: &origin,
+                scope: &scope,
+                store: &store,
+                service: &service,
+                client: &client,
+                context: &context,
+                expected_context: &expected_context,
+                live: &live,
+                started,
+            };
+            self.reconcile_pending_notice_ack(&reconcile_ctx, &mut receipt, pending)
+                .await?;
         } else if live.acked_seq != receipt.cursor {
             return Err(fail(
                 "cursor_mismatch",
@@ -4774,6 +5099,345 @@ impl PairedMcpServer {
         Self::format_planning_gateway_result(binding, TOOL, view)
     }
 
+    async fn recheck_pending_notice_identity(
+        &self,
+        ctx: &PendingNoticeReconcileCtx<'_>,
+    ) -> Result<(), CallToolResult> {
+        const TOOL: &str = "ordinary_review_notice";
+        let fail = |code, message| Self::format_scoped_error(ctx.binding, TOOL, code, message);
+        if &self.review_origin(TOOL, ctx.binding, ctx.thread)? != ctx.origin {
+            return Err(fail(
+                "execution_not_current",
+                "Original execution or origin changed during pending ACK reconciliation; retain the original pending receipt.",
+            ));
+        }
+        let current_context = ctx
+            .service
+            .notice_context(
+                ctx.binding,
+                ctx.thread,
+                WorkerBacklogNoticeContextParams {
+                    approval_id: ctx.scope.approval_id.clone(),
+                },
+                self.backlog_worker_final_recheck(
+                    TOOL,
+                    ctx.binding.to_string(),
+                    ctx.thread.to_string(),
+                ),
+            )
+            .await
+            .map_err(|e| fail(e.code(), e.message()))?;
+        if serde_json::to_value(current_context).ok().as_ref() != Some(ctx.expected_context) {
+            return Err(fail(
+                "execution_not_current",
+                "Original execution or origin changed during pending ACK reconciliation; retain the original pending receipt.",
+            ));
+        }
+        Ok(())
+    }
+
+    async fn reconcile_pending_notice_ack(
+        &self,
+        ctx: &PendingNoticeReconcileCtx<'_>,
+        receipt: &mut NoticeReceipt,
+        pending: ApprovedEventBatch,
+    ) -> Result<(), CallToolResult> {
+        const TOOL: &str = "ordinary_review_notice";
+        let fail = |code, message| Self::format_scoped_error(ctx.binding, TOOL, code, message);
+
+        ordinary_review::validate_notice_page(receipt, ctx.scope, &pending).map_err(|code| {
+            fail(
+                code,
+                "Retained pending page is invalid; reconcile the original receipt.",
+            )
+        })?;
+        if pending.batch.events.is_empty() {
+            return Err(fail(
+                "ack_outcome_unknown",
+                "Retained pending page has no events and cannot be reconciled; inspect the original notice receipt.",
+            ));
+        }
+        if threadlane_host::validate_identifier("batch_id", &pending.batch.batch_id).is_err() {
+            return Err(fail(
+                "ack_outcome_unknown",
+                "Retained pending batch identifier is invalid; retain the original pending receipt without retrying.",
+            ));
+        }
+        let dispatch = ctx
+            .context
+            .execution
+            .dispatch_receipt
+            .as_ref()
+            .ok_or_else(|| {
+                fail(
+                    "worker_start_unconfirmed",
+                    "Original dispatch receipt is unavailable.",
+                )
+            })?;
+
+        let inspection_input = PendingNoticeInspectionInput {
+            authority: Arc::clone(&ctx.stores.authority),
+            sessions_dir: ctx.stores.sessions_dir.clone(),
+            control_binding_id: ctx.binding.to_string(),
+            thread_uuid: ctx.thread.to_string(),
+            approval_id: ctx.scope.approval_id.clone(),
+            subject_digest: ctx.context.execution.authority.subject_digest.clone(),
+            task_id: ctx.scope.task_id.clone(),
+            task_digest: ctx.context.execution.authority.task_digest.clone(),
+            session_binding_id: receipt.session_binding_id.clone(),
+            run_id: receipt.run_id.clone(),
+            worker_id: dispatch.worker_id.clone(),
+            profile_id: dispatch.profile_id.clone(),
+            prior_cursor: receipt.cursor,
+            pending_batch: pending.batch.clone(),
+        };
+
+        let initial_input = inspection_input.clone();
+        let initial_state =
+            tokio::task::spawn_blocking(move || inspect_pending_notice_batch(&initial_input))
+                .await
+                .unwrap_or(PendingNoticeBatchState::ReadFailed);
+
+        match initial_state {
+            PendingNoticeBatchState::AlreadyAcked | PendingNoticeBatchState::StillUnacked => {}
+            PendingNoticeBatchState::ReadFailed => {
+                return Err(fail(
+                    "ack_outcome_unknown",
+                    "Pending ACK state could not be read from the host session; retain the original pending receipt and verify host state before retrying.",
+                ));
+            }
+            PendingNoticeBatchState::IdentityMismatch => {
+                return Err(fail(
+                    "ack_outcome_unknown",
+                    "Pending ACK identity does not match the original approved execution; retain the original pending receipt without retrying or restarting.",
+                ));
+            }
+            PendingNoticeBatchState::BatchMissingOrMismatch => {
+                return Err(fail(
+                    "ack_outcome_unknown",
+                    "Retained pending batch is missing or does not match the host batch record; retain the original pending receipt without pulling or retrying.",
+                ));
+            }
+            PendingNoticeBatchState::DifferentBatchCredited => {
+                return Err(fail(
+                    "ack_outcome_unknown",
+                    "A different batch was already acknowledged for this event range; retain the original pending receipt and reconcile manually without retrying.",
+                ));
+            }
+            PendingNoticeBatchState::OverlappingBatches => {
+                return Err(fail(
+                    "ack_outcome_unknown",
+                    "Multiple overlapping host batches cover the pending event range; retain the original pending receipt and reconcile manually without retrying.",
+                ));
+            }
+            PendingNoticeBatchState::EventMismatch => {
+                return Err(fail(
+                    "ack_outcome_unknown",
+                    "Retained pending events do not match authoritative stored host events; retain the original pending receipt without retrying.",
+                ));
+            }
+            PendingNoticeBatchState::AmbiguousCursor => {
+                return Err(fail(
+                    "ack_outcome_unknown",
+                    "Durable ACK cursor is ambiguous for the retained pending batch; retain the original pending receipt without retrying.",
+                ));
+            }
+        }
+
+        verify_pending_batch_events_live(ctx.client, &ctx.scope.approval_id, receipt, &pending)
+            .await
+            .map_err(|err| match err {
+                PendingNoticeEventsError::ReadFailed => fail(
+                    "ack_outcome_unknown",
+                    "Authoritative host events could not be read to verify the pending batch; retain the original pending receipt and retry only after host state is readable.",
+                ),
+                PendingNoticeEventsError::IdentityMismatch => fail(
+                    "ack_outcome_unknown",
+                    "Pending ACK event stream does not match the original session binding; retain the original pending receipt without retrying or restarting.",
+                ),
+                PendingNoticeEventsError::ContentMismatch => fail(
+                    "ack_outcome_unknown",
+                    "Retained pending events do not match authoritative stored host events; retain the original pending receipt without retrying.",
+                ),
+            })?;
+
+        let rechecked = ctx
+            .client
+            .verify_live_ready_binding(&ctx.scope.approval_id)
+            .await
+            .map_err(|_| {
+                fail(
+                    "ack_outcome_unknown",
+                    "Live ACK state cannot be reverified; retain the original pending receipt.",
+                )
+            })?;
+        if rechecked.binding_id != receipt.session_binding_id
+            || rechecked.thread_uuid != ctx.thread
+            || rechecked.acked_seq > rechecked.delivered_seq
+            || rechecked.delivered_seq < pending.batch.delivered_seq
+            || ctx.live.delivered_seq < pending.batch.delivered_seq
+        {
+            return Err(fail(
+                "ack_outcome_unknown",
+                "Live session binding or cursor changed during pending ACK reconciliation; retain the original pending receipt without retrying.",
+            ));
+        }
+
+        self.recheck_pending_notice_identity(ctx).await?;
+
+        if initial_state == PendingNoticeBatchState::AlreadyAcked
+            && ctx.live.acked_seq == pending.batch.to_seq
+            && rechecked.acked_seq == pending.batch.to_seq
+        {
+            // Original proved ACK path: the exact delivered batch has a durable ACK record
+            // and verified events matching the live cursor. Never resend the original ACK.
+            ordinary_review::commit_notice_page(receipt, &pending);
+            ctx.store
+                .store_notice(ctx.binding, &ctx.scope.approval_id, receipt)
+                .map_err(|e| Self::format_planning_gateway_error(ctx.binding, TOOL, e))?;
+            return Ok(());
+        }
+
+        let can_apply_or_converge_ack = if initial_state == PendingNoticeBatchState::StillUnacked
+            && ctx.live.acked_seq == receipt.cursor
+            && rechecked.acked_seq == receipt.cursor
+        {
+            true
+        } else if ctx.live.acked_seq == receipt.cursor
+            && rechecked.acked_seq == pending.batch.to_seq
+        {
+            // An identical host ACK may have committed in flight between the initial live check
+            // and recheck. Re-inspect durable batch state first so a different credited batch is
+            // refused before calling the host ACK dedup path.
+            let mid_input = inspection_input.clone();
+            let mid_state =
+                tokio::task::spawn_blocking(move || inspect_pending_notice_batch(&mid_input))
+                    .await
+                    .unwrap_or(PendingNoticeBatchState::ReadFailed);
+            if mid_state != PendingNoticeBatchState::AlreadyAcked {
+                return Err(fail(
+                    "ack_outcome_unknown",
+                    match mid_state {
+                        PendingNoticeBatchState::DifferentBatchCredited => {
+                            "A different batch was already acknowledged for this event range; retain the original pending receipt and reconcile manually without retrying."
+                        }
+                        PendingNoticeBatchState::OverlappingBatches => {
+                            "Multiple overlapping host batches cover the pending event range; retain the original pending receipt and reconcile manually without retrying."
+                        }
+                        PendingNoticeBatchState::ReadFailed => {
+                            "Pending ACK state could not be read from the host session; retain the original pending receipt and verify host state before retrying."
+                        }
+                        _ => {
+                            "Live or durable ACK cursor changed ambiguously during pending ACK reconciliation; retain the original pending receipt without retrying."
+                        }
+                    },
+                ));
+            }
+            true
+        } else {
+            false
+        };
+
+        if !can_apply_or_converge_ack {
+            return Err(fail(
+                "ack_outcome_unknown",
+                "Live ACK cursor is ambiguous for the retained pending batch; retain the original pending receipt without retrying.",
+            ));
+        }
+
+        if ctx.started.elapsed() >= Duration::from_secs(60) {
+            return Err(fail(
+                "deadline_exceeded",
+                "Notice budget expired before pending ACK reconciliation; retain the original pending receipt.",
+            ));
+        }
+
+        // Reuse the exact existing host ACK dedup path and command key derived in
+        // `ApprovedHostClient::ack_events`. An already in-flight identical ACK converges
+        // via core's `command_dedup` and returns the original `advanced: true` proof.
+        let raw = execute_approved_ack_events(
+            Arc::clone(&ctx.stores.authority),
+            ctx.stores.sessions_dir.clone(),
+            ctx.binding.to_string(),
+            ctx.thread.to_string(),
+            ApprovedAckEventsParams {
+                approval_id: ctx.scope.approval_id.clone(),
+                batch_id: pending.batch.batch_id.clone(),
+            },
+        )
+        .await
+        .map_err(|_| {
+            fail(
+                "ack_outcome_unknown",
+                "Pending ACK reconciliation could not confirm host ACK; retain the original pending receipt.",
+            )
+        })?;
+        let ack: ApprovedEventAck = (raw.is_error != Some(true))
+            .then_some(raw.structured_content)
+            .flatten()
+            .and_then(|value| value.get("data").cloned())
+            .and_then(|value| serde_json::from_value(value).ok())
+            .ok_or_else(|| {
+                fail(
+                    "ack_outcome_unknown",
+                    "Pending ACK response is unavailable; retain the original pending receipt.",
+                )
+            })?;
+        if !ordinary_review::validate_notice_ack(receipt, ctx.scope, &pending, &ack) {
+            return Err(fail(
+                "ack_outcome_unknown",
+                "Pending ACK response did not match the retained batch or keyed advance proof; retain the original pending receipt.",
+            ));
+        }
+
+        let post_live = ctx
+            .client
+            .verify_live_ready_binding(&ctx.scope.approval_id)
+            .await
+            .map_err(|_| {
+                fail(
+                    "ack_outcome_unknown",
+                    "Live ACK cursor could not be reverified after pending ACK; retain the original pending receipt.",
+                )
+            })?;
+        if post_live.binding_id != receipt.session_binding_id
+            || post_live.thread_uuid != ctx.thread
+            || post_live.acked_seq != pending.batch.to_seq
+            || post_live.acked_seq > post_live.delivered_seq
+            || post_live.delivered_seq < pending.batch.delivered_seq
+        {
+            return Err(fail(
+                "ack_outcome_unknown",
+                "Live ACK cursor did not match the expected post-ACK boundary; retain the original pending receipt.",
+            ));
+        }
+
+        let post_input = inspection_input;
+        let post_state =
+            tokio::task::spawn_blocking(move || inspect_pending_notice_batch(&post_input))
+                .await
+                .unwrap_or(PendingNoticeBatchState::ReadFailed);
+        if post_state != PendingNoticeBatchState::AlreadyAcked {
+            return Err(fail(
+                "ack_outcome_unknown",
+                "Durable ACK proof could not be verified after pending ACK; retain the original pending receipt.",
+            ));
+        }
+
+        self.recheck_pending_notice_identity(ctx).await?;
+
+        ordinary_review::commit_notice_page(receipt, &pending);
+        ctx.store
+            .store_notice(ctx.binding, &ctx.scope.approval_id, receipt)
+            .map_err(|_| {
+                fail(
+                    "ack_outcome_unknown",
+                    "Pending ACK was applied but receipt persistence is uncertain; reconcile the original pending receipt.",
+                )
+            })?;
+        Ok(())
+    }
+
     fn ordinary_review_prepare_boxed(
         &self,
         params: ReviewPrepareParams,
@@ -4816,10 +5480,12 @@ impl PairedMcpServer {
                     "Original pre-start review scope is unavailable.",
                 )
             })?;
-        if scope.binding_id != binding
+        if scope.schema_version != 1
+            || scope.binding_id != binding
             || scope.thread_id != thread
             || scope.approval_id != params.approval_id
             || scope.origin != origin
+            || scope.repository_path != origin.project_root
         {
             return Err(Self::format_scoped_error(
                 binding,
@@ -4846,19 +5512,63 @@ impl PairedMcpServer {
             .indexed_read(binding, &params.approval_id)
             .map_err(|e| Self::format_planning_gateway_error(binding, TOOL, e))?
         {
+            if context.item_snapshot.status == threadlane_core::BacklogStatus::Done {
+                self.verify_committed_indexed_read(
+                    TOOL, binding, thread, &origin, &store, &service, &scope, &context, &id,
+                )
+                .await?;
+                return Self::format_planning_gateway_result(
+                    binding,
+                    TOOL,
+                    json!({"status":"already_done", "item_id":scope.item_id,
+                        "execution_ref":context.execution.execution_ref,
+                        "revision":context.item_snapshot.revision}),
+                );
+            }
             let read = store
                 .read(&id)
                 .map_err(|e| Self::format_planning_gateway_error(binding, TOOL, e))?;
-            if read.scope != scope
-                || context.item_snapshot != read.context.item_snapshot
-                || !ordinary_review::valid_read(&read)
-            {
+            let read_matches = read.scope == scope
+                && context.scope == read.context.scope
+                && context.item_snapshot == read.context.item_snapshot
+                && ordinary_review::valid_read(&read)
+                && ordinary_review::completion_binding(&id, &read).is_ok_and(|expected_binding| {
+                    expected_binding.binding_id == binding
+                        && expected_binding.thread_id == thread
+                        && expected_binding.origin == origin
+                        && ordinary_review::notice_context_matches_read(
+                            &read,
+                            &expected_binding,
+                            &context,
+                        )
+                });
+            if !read_matches {
                 return Err(Self::format_scoped_error(
                     binding,
                     TOOL,
                     "review_stale",
                     "Original review is stale or conflicts with the current execution.",
                 ));
+            }
+            if ordinary_review::is_legacy_v1_read(&read) {
+                if self.verify_legacy_v1_checkout(&read).await.is_err() {
+                    return Err(Self::format_scoped_error(
+                        binding,
+                        TOOL,
+                        "review_stale",
+                        "Original legacy review no longer matches the current task checkout.",
+                    ));
+                }
+                self.backlog_worker_final_recheck(TOOL, binding.to_string(), thread.to_string())()
+                    .map_err(|e| Self::format_scoped_error(binding, TOOL, e.code(), e.message()))?;
+                if self.review_origin(TOOL, binding, thread)? != origin {
+                    return Err(Self::format_scoped_error(
+                        binding,
+                        TOOL,
+                        "rebind_rejected",
+                        "Review package changed during legacy review verification.",
+                    ));
+                }
             }
             let view = ordinary_review::view(&id, &read)
                 .map_err(|e| Self::format_planning_gateway_error(binding, TOOL, e))?;
@@ -4984,6 +5694,8 @@ impl PairedMcpServer {
             || context.scope.repository_path != refreshed.scope.repository_path
             || context.scope.base_commit != refreshed.scope.base_commit
             || context.scope.write_paths != refreshed.scope.write_paths
+            || context.scope.required_changed_paths != refreshed.scope.required_changed_paths
+            || context.scope.required_changed_paths != scope.required_changed_paths
             || context.scope.requested_model != refreshed.scope.requested_model
             || context.scope.requested_effort != refreshed.scope.requested_effort
         {
@@ -5011,29 +5723,49 @@ impl PairedMcpServer {
                 "Exact task worktree is unavailable.",
             )
         })?;
+        let has_optional_paths = context.scope.required_changed_paths.is_some();
         let request = threadlane::DeliveryInspectionRequest {
             root: PathBuf::from(root),
             expected_base: scope.base_commit.clone(),
             allowed_paths: context.scope.write_paths.clone(),
-            text_files: context.scope.write_paths.clone(),
+            text_files: if has_optional_paths {
+                Vec::new()
+            } else {
+                context.scope.write_paths.clone()
+            },
         };
         let source_files = scope.source_files.clone();
         let repository = scope.repository_path.clone();
         let selected = scope.source_worktree.clone();
         let physical = tokio::task::spawn_blocking(move || {
+            use threadlane::delivery_inspection::{
+                inspect_delivery_changed_text, inspect_delivery_changed_text_with_source_text,
+            };
             if source_files.is_empty() {
-                Ok(threadlane::inspect_delivery(&request))
+                if has_optional_paths {
+                    Ok(inspect_delivery_changed_text(&request))
+                } else {
+                    Ok(threadlane::inspect_delivery(&request))
+                }
             } else {
                 ordinary_review::inspect_review_source(
                     &repository,
                     &request.expected_base,
                     selected.as_deref(),
                     |source| {
-                        threadlane::inspect_delivery_with_source_text(
-                            &request,
-                            source,
-                            &source_files,
-                        )
+                        if has_optional_paths {
+                            inspect_delivery_changed_text_with_source_text(
+                                &request,
+                                source,
+                                &source_files,
+                            )
+                        } else {
+                            threadlane::inspect_delivery_with_source_text(
+                                &request,
+                                source,
+                                &source_files,
+                            )
+                        }
                     },
                 )
             }
@@ -5059,7 +5791,7 @@ impl PairedMcpServer {
                 "The selected source checkout changed after scope registration. Review requires clean source evidence at the approved commit."));
         }
         let read = ReviewRead {
-            schema_version: 1,
+            schema_version: ordinary_review::REVIEW_READ_SCHEMA_V2,
             scope: scope.clone(),
             context,
             result,
@@ -5073,6 +5805,29 @@ impl PairedMcpServer {
                 TOOL,
                 "review_evidence_incomplete",
                 "Original result, acknowledgement, or physical evidence did not verify.",
+            ));
+        }
+        // Re-verify the host delivery identity after physical inspection so a checkout swap
+        // between result reconciliation and physical text reading cannot enter a ready read.
+        let rechecked_delivery = client
+            .inspect_task_delivery(&scope.approval_id, &scope.task_id)
+            .await
+            .map_err(|_| {
+                Self::format_scoped_error(
+                    binding,
+                    TOOL,
+                    "review_evidence_incomplete",
+                    "Original delivery identity could not be reverified after inspection.",
+                )
+            })?;
+        if read.result.delivery.as_ref() != Some(&rechecked_delivery)
+            || !ordinary_review::delivery_evidence_matches_host(&rechecked_delivery, &read.physical)
+        {
+            return Err(Self::format_scoped_error(
+                binding,
+                TOOL,
+                "review_evidence_incomplete",
+                "Original delivery changed during physical review inspection.",
             ));
         }
         self.backlog_worker_final_recheck(TOOL, binding.to_string(), thread.to_string())()
@@ -5159,70 +5914,42 @@ impl PairedMcpServer {
         }
         let evidence = ordinary_review::acceptance_evidence(&params.read_id, &read)
             .map_err(|e| Self::format_planning_gateway_error(binding, TOOL, e))?;
+        let expected_binding = ordinary_review::completion_binding(&params.read_id, &read)
+            .map_err(|e| Self::format_planning_gateway_error(binding, TOOL, e))?;
+        if expected_binding.binding_id != binding
+            || expected_binding.thread_id != thread
+            || expected_binding.origin != origin
+        {
+            return Err(Self::format_scoped_error(
+                binding,
+                TOOL,
+                "review_mismatch",
+                "Original review scope, package, or evidence changed.",
+            ));
+        }
         let service = self
             .backlog_worker_service(&stores)
             .map_err(|e| Self::format_scoped_error(binding, TOOL, e.code(), e.message()))?;
-        let previous = store
+        if let Some(previous) = store
             .decision(&params.read_id)
-            .map_err(|e| Self::format_planning_gateway_error(binding, TOOL, e))?;
-        let mut intent = DecisionIntent {
-            schema_version: 1,
-            read_id: params.read_id.clone(),
-            reason: params.reason.clone(),
-            acceptance_evidence: evidence.clone(),
-            refusal: None,
-            refusal_message: None,
-            completion: None,
-        };
-        if let Some(previous) = previous {
-            if previous.schema_version != 1
-                || previous.read_id != intent.read_id
-                || previous.reason != intent.reason
-                || previous.acceptance_evidence != intent.acceptance_evidence
-            {
-                return Err(Self::format_scoped_error(
+            .map_err(|e| Self::format_planning_gateway_error(binding, TOOL, e))?
+        {
+            return self
+                .reconcile_previous_review_decision(
                     binding,
-                    TOOL,
-                    "decision_conflict",
-                    "This review already has a different decision.",
-                ));
-            }
-            if let Some(refusal) = previous.refusal {
-                let Some(message) = previous
-                    .refusal_message
-                    .as_deref()
-                    .filter(|v| !v.is_empty() && v.len() <= 512)
-                else {
-                    return Err(Self::format_scoped_error(
-                        binding,
-                        TOOL,
-                        "completion_conflict",
-                        "Stored refusal state is incomplete.",
-                    ));
-                };
-                if previous.completion.is_some() {
-                    return Err(Self::format_scoped_error(
-                        binding,
-                        TOOL,
-                        "completion_conflict",
-                        "Stored decision state is inconsistent.",
-                    ));
-                }
-                return Err(Self::format_scoped_error(
-                    binding,
-                    TOOL,
-                    refusal.code(),
-                    message,
-                ));
-            }
-            if previous.refusal_message.is_some() {
-                return Err(Self::format_scoped_error(
-                    binding,
-                    TOOL,
-                    "completion_conflict",
-                    "Stored refusal state is inconsistent.",
-                ));
-            }
+                    thread,
+                    &origin,
+                    &store,
+                    &service,
+                    &read,
+                    &expected_binding,
+                    &params,
+                    &evidence,
+                    previous,
+                )
+                .await;
+        }
+        if ordinary_review::is_legacy_v1_read(&read) {
             let current = service
                 .notice_context(
                     binding,
@@ -5230,91 +5957,668 @@ impl PairedMcpServer {
                     WorkerBacklogNoticeContextParams {
                         approval_id: read.scope.approval_id.clone(),
                     },
-                    self.backlog_worker_final_recheck(
-                        TOOL,
-                        binding.to_string(),
-                        thread.to_string(),
-                    ),
+                    self.review_complete_final_recheck(binding, thread, origin.clone()),
                 )
                 .await
                 .map_err(|e| Self::format_scoped_error(binding, TOOL, e.code(), e.message()))?;
-            let Some(receipt) = current.completion else {
+            if !ordinary_review::notice_context_matches_read(&read, &expected_binding, &current) {
+                return Err(Self::format_scoped_error(
+                    binding,
+                    TOOL,
+                    "completion_conflict",
+                    "Current durable execution no longer matches the original review.",
+                ));
+            }
+            if current.item_snapshot.status == threadlane_core::BacklogStatus::Done {
+                return Err(Self::format_scoped_error(
+                    binding,
+                    TOOL,
+                    "completion_conflict",
+                    "Durable completion already exists without a matching review decision intent.",
+                ));
+            }
+            if current.item_snapshot.status != threadlane_core::BacklogStatus::Doing
+                || current.execution.completion.is_some()
+                || current.completion.is_some()
+                || current.execution.acceptance_rejection.is_some()
+            {
+                return Err(Self::format_scoped_error(
+                    binding,
+                    TOOL,
+                    "invalid_state",
+                    "Worker completion requires the backlog item to still be in Doing.",
+                ));
+            }
+            if current.item_snapshot.revision != expected_binding.expected_revision {
+                return Err(Self::format_scoped_error(
+                    binding,
+                    TOOL,
+                    "stale_revision",
+                    "The Worker backlog item revision is stale; refresh it before retrying.",
+                ));
+            }
+            match self.verify_legacy_v1_checkout(&read).await {
+                Ok(()) => {}
+                Err(ordinary_review::LegacyCheckoutCheckError::Mismatch) => {
+                    return Err(Self::format_scoped_error(
+                        binding,
+                        TOOL,
+                        "delivery_digest_mismatch",
+                        "Current task checkout no longer matches the reviewed legacy delivery.",
+                    ));
+                }
+                Err(ordinary_review::LegacyCheckoutCheckError::Unavailable) => {
+                    return Err(Self::format_scoped_error(
+                        binding,
+                        TOOL,
+                        "review_evidence_incomplete",
+                        "Current task checkout could not be verified for the legacy review.",
+                    ));
+                }
+            }
+            self.review_complete_final_recheck(binding, thread, origin.clone())()
+                .map_err(|e| Self::format_scoped_error(binding, TOOL, e.code(), e.message()))?;
+        }
+        let intent = DecisionIntent {
+            schema_version: ordinary_review::DECISION_INTENT_SCHEMA_V2,
+            read_id: params.read_id.clone(),
+            reason: params.reason.clone(),
+            acceptance_evidence: evidence.clone(),
+            binding: Some(expected_binding.clone()),
+            refusal: None,
+            refusal_message: None,
+            completion: None,
+        };
+        // Persist the exact v2 intent binding before the guarded effect so an
+        // interruption before or after core commit can reconcile strictly against
+        // the original immutable identity, revision, digests, and deterministic key.
+        store
+            .store_decision(&intent)
+            .map_err(|e| Self::format_planning_gateway_error(binding, TOOL, e))?;
+        let completion_params = expected_binding.complete_params(&params.reason, &evidence);
+        self.execute_guarded_review_completion(
+            binding,
+            thread,
+            &origin,
+            &store,
+            &service,
+            &read,
+            intent,
+            completion_params,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn reconcile_previous_review_decision(
+        &self,
+        binding: &str,
+        thread: &str,
+        origin: &ClosureOrigin,
+        store: &ReviewStore,
+        service: &WorkerBacklogService,
+        read: &ReviewRead,
+        expected_binding: &ordinary_review::DecisionCompletionBinding,
+        params: &ReviewCompleteParams,
+        evidence: &str,
+        previous: DecisionIntent,
+    ) -> Result<CallToolResult, CallToolResult> {
+        const TOOL: &str = "ordinary_review_complete";
+        if previous.read_id != params.read_id
+            || previous.reason != params.reason
+            || previous.acceptance_evidence != evidence
+        {
+            return Err(Self::format_scoped_error(
+                binding,
+                TOOL,
+                "decision_conflict",
+                "This review already has a different decision.",
+            ));
+        }
+        let is_verifiable_v2 = match previous.schema_version {
+            ordinary_review::DECISION_INTENT_SCHEMA_V1 => {
+                if previous.binding.is_some() {
+                    return Err(Self::format_scoped_error(
+                        binding,
+                        TOOL,
+                        "completion_conflict",
+                        "Stored decision intent state is inconsistent.",
+                    ));
+                }
+                false
+            }
+            ordinary_review::DECISION_INTENT_SCHEMA_V2 => {
+                if previous.binding.as_ref() != Some(expected_binding) {
+                    return Err(Self::format_scoped_error(
+                        binding,
+                        TOOL,
+                        "completion_conflict",
+                        "Stored decision intent does not match the original immutable review binding.",
+                    ));
+                }
+                true
+            }
+            _ => {
+                return Err(Self::format_scoped_error(
+                    binding,
+                    TOOL,
+                    "completion_conflict",
+                    "Stored decision intent schema is unsupported.",
+                ));
+            }
+        };
+        if let Some(refusal) = previous.refusal {
+            let Some(message) = previous
+                .refusal_message
+                .as_deref()
+                .filter(|v| !v.is_empty() && v.len() <= 512)
+            else {
+                return Err(Self::format_scoped_error(
+                    binding,
+                    TOOL,
+                    "completion_conflict",
+                    "Stored refusal state is incomplete.",
+                ));
+            };
+            if previous.completion.is_some() {
+                return Err(Self::format_scoped_error(
+                    binding,
+                    TOOL,
+                    "completion_conflict",
+                    "Stored decision state is inconsistent.",
+                ));
+            }
+            return Err(Self::format_scoped_error(
+                binding,
+                TOOL,
+                refusal.code(),
+                message,
+            ));
+        }
+        if previous.refusal_message.is_some() {
+            return Err(Self::format_scoped_error(
+                binding,
+                TOOL,
+                "completion_conflict",
+                "Stored refusal state is inconsistent.",
+            ));
+        }
+        if let Some(saved) = previous.completion.as_ref() {
+            if !ordinary_review::receipt_matches(read, &previous, saved) {
+                return Err(Self::format_scoped_error(
+                    binding,
+                    TOOL,
+                    "completion_conflict",
+                    "Stored completion differs from the original decision.",
+                ));
+            }
+        }
+        let current = match service
+            .notice_context(
+                binding,
+                thread,
+                WorkerBacklogNoticeContextParams {
+                    approval_id: read.scope.approval_id.clone(),
+                },
+                self.review_complete_final_recheck(binding, thread, origin.clone()),
+            )
+            .await
+        {
+            Ok(current) => current,
+            Err(error) => {
+                if matches!(
+                    error.code(),
+                    "supervisor_unavailable" | "worker_backlog_unavailable"
+                ) {
+                    return Err(Self::format_scoped_error(
+                        binding,
+                        TOOL,
+                        "completion_outcome_unknown",
+                        "Original completion intent requires reconciliation; no retry was sent.",
+                    ));
+                }
+                return Err(Self::format_scoped_error(
+                    binding,
+                    TOOL,
+                    error.code(),
+                    error.message(),
+                ));
+            }
+        };
+        if !ordinary_review::notice_context_matches_read(read, expected_binding, &current) {
+            return Err(Self::format_scoped_error(
+                binding,
+                TOOL,
+                "completion_conflict",
+                "Current durable execution no longer matches the original review.",
+            ));
+        }
+        let completion_params = expected_binding.complete_params(&params.reason, evidence);
+        if current.item_snapshot.status == threadlane_core::BacklogStatus::Done {
+            return self
+                .reconcile_done_review_decision(
+                    binding,
+                    thread,
+                    origin,
+                    store,
+                    service,
+                    read,
+                    expected_binding,
+                    params,
+                    is_verifiable_v2,
+                    previous,
+                    &current,
+                    completion_params,
+                )
+                .await;
+        }
+        if previous.completion.is_some() {
+            return Err(Self::format_scoped_error(
+                binding,
+                TOOL,
+                "completion_conflict",
+                "Stored completion conflicts with the current backlog item state.",
+            ));
+        }
+        // Legacy v1 intents lack the pinned completion binding (origin, authority,
+        // revision, digests, and deterministic command key) and never issue a new effect.
+        if !is_verifiable_v2 {
+            return Err(Self::format_scoped_error(
+                binding,
+                TOOL,
+                "completion_outcome_unknown",
+                "Original completion intent requires reconciliation; no retry was sent.",
+            ));
+        }
+        match (
+            current.item_snapshot.status,
+            current.execution.completion.as_ref(),
+            current.completion.as_ref(),
+            current.execution.acceptance_rejection.as_ref(),
+        ) {
+            (threadlane_core::BacklogStatus::Doing, None, None, None) => {
+                if current.item_snapshot.revision != expected_binding.expected_revision {
+                    let message =
+                        "The Worker backlog item revision is stale; refresh it before retrying.";
+                    let mut updated = previous;
+                    updated.refusal = Some(ordinary_review::DefiniteRefusal::StaleRevision);
+                    updated.refusal_message = Some(message.to_string());
+                    store
+                        .store_decision(&updated)
+                        .map_err(|e| Self::format_planning_gateway_error(binding, TOOL, e))?;
+                    return Err(Self::format_scoped_error(
+                        binding,
+                        TOOL,
+                        "stale_revision",
+                        message,
+                    ));
+                }
+                if ordinary_review::is_legacy_v1_read(read) {
+                    match self.verify_legacy_v1_checkout(read).await {
+                        Ok(()) => {}
+                        Err(ordinary_review::LegacyCheckoutCheckError::Mismatch) => {
+                            let message =
+                                "Current task checkout no longer matches the reviewed delivery.";
+                            let mut updated = previous;
+                            updated.refusal =
+                                Some(ordinary_review::DefiniteRefusal::DeliveryDigestMismatch);
+                            updated.refusal_message = Some(message.to_string());
+                            store.store_decision(&updated).map_err(|e| {
+                                Self::format_planning_gateway_error(binding, TOOL, e)
+                            })?;
+                            return Err(Self::format_scoped_error(
+                                binding,
+                                TOOL,
+                                "delivery_digest_mismatch",
+                                message,
+                            ));
+                        }
+                        Err(ordinary_review::LegacyCheckoutCheckError::Unavailable) => {
+                            return Err(Self::format_scoped_error(
+                                binding,
+                                TOOL,
+                                "completion_outcome_unknown",
+                                "Original completion intent requires reconciliation; no retry was sent.",
+                            ));
+                        }
+                    }
+                    self.review_complete_final_recheck(binding, thread, origin.clone())().map_err(
+                        |e| Self::format_scoped_error(binding, TOOL, e.code(), e.message()),
+                    )?;
+                }
+                self.execute_guarded_review_completion(
+                    binding,
+                    thread,
+                    origin,
+                    store,
+                    service,
+                    read,
+                    previous,
+                    completion_params,
+                )
+                .await
+            }
+            (
+                threadlane_core::BacklogStatus::Blocked | threadlane_core::BacklogStatus::Todo,
+                None,
+                None,
+                _,
+            )
+            | (threadlane_core::BacklogStatus::Doing, None, None, Some(_)) => {
+                let message = "Worker completion requires the backlog item to still be in Doing.";
+                let mut updated = previous;
+                updated.refusal = Some(ordinary_review::DefiniteRefusal::InvalidState);
+                updated.refusal_message = Some(message.to_string());
+                store
+                    .store_decision(&updated)
+                    .map_err(|e| Self::format_planning_gateway_error(binding, TOOL, e))?;
+                Err(Self::format_scoped_error(
+                    binding,
+                    TOOL,
+                    "invalid_state",
+                    message,
+                ))
+            }
+            _ => Err(Self::format_scoped_error(
+                binding,
+                TOOL,
+                "completion_conflict",
+                "Durable completion state is inconsistent with the original review.",
+            )),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn reconcile_done_review_decision(
+        &self,
+        binding: &str,
+        thread: &str,
+        origin: &ClosureOrigin,
+        store: &ReviewStore,
+        service: &WorkerBacklogService,
+        read: &ReviewRead,
+        expected_binding: &ordinary_review::DecisionCompletionBinding,
+        params: &ReviewCompleteParams,
+        is_verifiable_v2: bool,
+        previous: DecisionIntent,
+        current: &crate::backlog_worker::WorkerBacklogNoticeContextOutcome,
+        completion_params: WorkerBacklogCompleteParams,
+    ) -> Result<CallToolResult, CallToolResult> {
+        const TOOL: &str = "ordinary_review_complete";
+        let (Some(_), Some(current_receipt), None) = (
+            current.execution.completion.as_ref(),
+            current.completion.as_ref(),
+            current.execution.acceptance_rejection.as_ref(),
+        ) else {
+            return Err(Self::format_scoped_error(
+                binding,
+                TOOL,
+                "completion_conflict",
+                "Durable completion state is inconsistent with the original review.",
+            ));
+        };
+        let saved_mismatch = previous
+            .completion
+            .as_ref()
+            .is_some_and(|saved| saved != current_receipt);
+        if saved_mismatch
+            || expected_binding.expected_revision.checked_add(1)
+                != Some(current.item_snapshot.revision)
+            || !ordinary_review::receipt_matches(read, &previous, current_receipt)
+        {
+            if is_verifiable_v2 && previous.completion.is_none() {
+                let mut updated = previous;
+                updated.refusal = Some(ordinary_review::DefiniteRefusal::CompletionConflict);
+                updated.refusal_message =
+                    Some("Durable completion differs from the original decision.".to_string());
+                store
+                    .store_decision(&updated)
+                    .map_err(|e| Self::format_planning_gateway_error(binding, TOOL, e))?;
+            }
+            return Err(Self::format_scoped_error(
+                binding,
+                TOOL,
+                "completion_conflict",
+                "Durable completion differs from the original decision.",
+            ));
+        }
+        // Content equality alone does not prove this command committed Done; verify
+        // core's durable deduplication record for `ordinary-review:<read_id>`.
+        let verified = match service
+            .verify_committed_completion(
+                binding,
+                thread,
+                completion_params,
+                self.review_complete_final_recheck(binding, thread, origin.clone()),
+            )
+            .await
+        {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                if let Some(refusal) = ordinary_review::DefiniteRefusal::from_code(error.code()) {
+                    if is_verifiable_v2 && previous.completion.is_none() {
+                        let mut updated = previous;
+                        updated.refusal = Some(refusal);
+                        updated.refusal_message = Some(error.message().to_string());
+                        store
+                            .store_decision(&updated)
+                            .map_err(|e| Self::format_planning_gateway_error(binding, TOOL, e))?;
+                    }
+                    return Err(Self::format_scoped_error(
+                        binding,
+                        TOOL,
+                        error.code(),
+                        error.message(),
+                    ));
+                }
+                if error.code() == "expired_epoch" {
+                    return Err(Self::format_scoped_error(
+                        binding,
+                        TOOL,
+                        error.code(),
+                        error.message(),
+                    ));
+                }
                 return Err(Self::format_scoped_error(
                     binding,
                     TOOL,
                     "completion_outcome_unknown",
                     "Original completion intent requires reconciliation; no retry was sent.",
                 ));
-            };
-            if !ordinary_review::receipt_matches(&read, &previous, &receipt)
-                || previous
-                    .completion
-                    .as_ref()
-                    .is_some_and(|saved| saved != &receipt)
-            {
-                return Err(Self::format_scoped_error(
-                    binding,
-                    TOOL,
-                    "completion_conflict",
-                    "Durable completion differs from the original decision.",
-                ));
             }
-            intent.completion = Some(receipt.clone());
-            store
-                .store_decision(&intent)
-                .map_err(|e| Self::format_planning_gateway_error(binding, TOOL, e))?;
-            return Self::format_planning_gateway_result(
+        };
+        if verified != *current_receipt
+            || !ordinary_review::receipt_matches(read, &previous, &verified)
+            || previous
+                .completion
+                .as_ref()
+                .is_some_and(|saved| saved != &verified)
+        {
+            return Err(Self::format_scoped_error(
                 binding,
                 TOOL,
-                ordinary_review::done_view(&params.read_id, &params.reason, &receipt),
-            );
+                "completion_conflict",
+                "Durable completion differs from the original decision.",
+            ));
         }
-        // Persist the exact semantic intent before the guarded effect. A missing
-        // response is reconciled from the original durable completion, never replayed.
-        store
-            .store_decision(&intent)
-            .map_err(|e| Self::format_planning_gateway_error(binding, TOOL, e))?;
-        let snapshot = read
-            .result
-            .item_snapshot
-            .as_ref()
-            .expect("validated review snapshot");
-        let delivery = read
-            .result
-            .delivery
-            .as_ref()
-            .expect("validated review delivery");
-        let completion_params = WorkerBacklogCompleteParams {
-            item_id: read.scope.item_id.clone(),
-            execution_ref: read.result.execution.execution_ref.clone(),
-            command_key: format!("ordinary-review:{}", params.read_id),
-            expected_revision: snapshot.revision,
-            expected_result_digest: delivery.result_digest.clone(),
-            expected_delivery_digest: delivery.delivery_digest.clone(),
-            acceptance_note: params.reason.clone(),
-            acceptance_evidence: evidence,
+        if previous.completion.is_none() {
+            let mut updated = previous;
+            updated.completion = Some(verified.clone());
+            store
+                .store_decision(&updated)
+                .map_err(|e| Self::format_planning_gateway_error(binding, TOOL, e))?;
+        }
+        Self::format_planning_gateway_result(
+            binding,
+            TOOL,
+            ordinary_review::done_view(&params.read_id, &params.reason, &verified),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn verify_committed_indexed_read(
+        &self,
+        tool: &'static str,
+        binding: &str,
+        thread: &str,
+        origin: &ClosureOrigin,
+        store: &ReviewStore,
+        service: &WorkerBacklogService,
+        scope: &ReviewScope,
+        context: &crate::backlog_worker::WorkerBacklogNoticeContextOutcome,
+        read_id: &str,
+    ) -> Result<(), CallToolResult> {
+        let fail = |code, message| Self::format_scoped_error(binding, tool, code, message);
+        let read = store
+            .read(read_id)
+            .map_err(|e| Self::format_planning_gateway_error(binding, tool, e))?;
+        if read.scope != *scope || !ordinary_review::valid_read(&read) {
+            return Err(fail(
+                "completion_conflict",
+                "Original review scope or evidence conflicts with the durable completion.",
+            ));
+        }
+        let evidence = ordinary_review::acceptance_evidence(read_id, &read)
+            .map_err(|e| Self::format_planning_gateway_error(binding, tool, e))?;
+        let expected_binding = ordinary_review::completion_binding(read_id, &read)
+            .map_err(|e| Self::format_planning_gateway_error(binding, tool, e))?;
+        if expected_binding.binding_id != binding
+            || expected_binding.thread_id != thread
+            || expected_binding.origin != *origin
+            || !ordinary_review::notice_context_matches_read(&read, &expected_binding, context)
+        {
+            return Err(fail(
+                "completion_conflict",
+                "Current durable execution no longer matches the original review.",
+            ));
+        }
+        let Some(intent) = store
+            .decision(read_id)
+            .map_err(|e| Self::format_planning_gateway_error(binding, tool, e))?
+        else {
+            return Err(fail(
+                "completion_conflict",
+                "Durable completion exists without a matching review decision intent.",
+            ));
         };
-        let enrollment_recheck =
-            self.backlog_worker_final_recheck(TOOL, binding.to_string(), thread.to_string());
-        let server = self.clone();
-        let expected_origin = origin.clone();
-        let checked_binding = binding.to_string();
-        let checked_thread = thread.to_string();
-        let final_recheck = move || {
-            enrollment_recheck()?;
-            let actual = server
-                .review_origin(TOOL, &checked_binding, &checked_thread)
-                .map_err(|_| {
-                    WorkerBacklogError::new("rebind_rejected", "Review package recheck failed.")
-                })?;
-            if actual != expected_origin {
-                return Err(WorkerBacklogError::new(
-                    "rebind_rejected",
-                    "Review package changed before completion.",
+        if intent.read_id != read_id
+            || intent.acceptance_evidence != evidence
+            || intent.refusal.is_some()
+            || intent.refusal_message.is_some()
+            || ordinary_review::validate_decision(&ReviewCompleteParams {
+                read_id: read_id.to_string(),
+                verdict: "accept".to_string(),
+                reason: intent.reason.clone(),
+            })
+            .is_err()
+        {
+            return Err(fail(
+                "completion_conflict",
+                "Stored decision intent does not match the original review.",
+            ));
+        }
+        let intent_schema_ok = match intent.schema_version {
+            ordinary_review::DECISION_INTENT_SCHEMA_V1 => intent.binding.is_none(),
+            ordinary_review::DECISION_INTENT_SCHEMA_V2 => {
+                intent.binding.as_ref() == Some(&expected_binding)
+            }
+            _ => false,
+        };
+        if !intent_schema_ok {
+            return Err(fail(
+                "completion_conflict",
+                "Stored decision intent does not match the original immutable review binding.",
+            ));
+        }
+        let (Some(_), Some(current_receipt), None) = (
+            context.execution.completion.as_ref(),
+            context.completion.as_ref(),
+            context.execution.acceptance_rejection.as_ref(),
+        ) else {
+            return Err(fail(
+                "completion_conflict",
+                "Durable completion state is inconsistent with the original review.",
+            ));
+        };
+        let saved_mismatch = intent
+            .completion
+            .as_ref()
+            .is_some_and(|saved| saved != current_receipt);
+        if saved_mismatch
+            || expected_binding.expected_revision.checked_add(1)
+                != Some(context.item_snapshot.revision)
+            || !ordinary_review::receipt_matches(&read, &intent, current_receipt)
+        {
+            return Err(fail(
+                "completion_conflict",
+                "Durable completion differs from the original decision.",
+            ));
+        }
+        let completion_params = expected_binding.complete_params(&intent.reason, &evidence);
+        let verified = match service
+            .verify_committed_completion(
+                binding,
+                thread,
+                completion_params,
+                self.review_final_recheck(tool, binding, thread, origin.clone()),
+            )
+            .await
+        {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                if ordinary_review::DefiniteRefusal::from_code(error.code()).is_some()
+                    || error.code() == "expired_epoch"
+                {
+                    return Err(fail(error.code(), error.message()));
+                }
+                return Err(fail(
+                    "completion_outcome_unknown",
+                    "Original completion intent requires reconciliation; no retry was sent.",
                 ));
             }
-            Ok(())
         };
+        if verified != *current_receipt
+            || !ordinary_review::receipt_matches(&read, &intent, &verified)
+            || intent
+                .completion
+                .as_ref()
+                .is_some_and(|saved| saved != &verified)
+        {
+            return Err(fail(
+                "completion_conflict",
+                "Durable completion differs from the original decision.",
+            ));
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::unused_self)]
+    async fn verify_legacy_v1_checkout(
+        &self,
+        read: &ReviewRead,
+    ) -> Result<(), ordinary_review::LegacyCheckoutCheckError> {
+        let request = ordinary_review::legacy_v1_checkout_inspection_request(read)
+            .map_err(|_| ordinary_review::LegacyCheckoutCheckError::Mismatch)?;
+        let live = tokio::task::spawn_blocking(move || threadlane::inspect_delivery(&request))
+            .await
+            .map_err(|_| ordinary_review::LegacyCheckoutCheckError::Unavailable)?;
+        ordinary_review::classify_legacy_v1_checkout_inspection(read, &live)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_guarded_review_completion(
+        &self,
+        binding: &str,
+        thread: &str,
+        origin: &ClosureOrigin,
+        store: &ReviewStore,
+        service: &WorkerBacklogService,
+        read: &ReviewRead,
+        mut intent: DecisionIntent,
+        completion_params: WorkerBacklogCompleteParams,
+    ) -> Result<CallToolResult, CallToolResult> {
+        const TOOL: &str = "ordinary_review_complete";
+        let final_recheck = self.review_complete_final_recheck(binding, thread, origin.clone());
         let outcome = match service
             .complete(binding, thread, completion_params, final_recheck)
             .await
@@ -5334,10 +6638,15 @@ impl PairedMcpServer {
                         error.message(),
                     ));
                 }
-                return Err(Self::format_scoped_error(binding, TOOL, "completion_outcome_unknown", "Guarded completion requires original-receipt reconciliation; no retry was sent."));
+                return Err(Self::format_scoped_error(
+                    binding,
+                    TOOL,
+                    "completion_outcome_unknown",
+                    "Guarded completion requires original-receipt reconciliation; no retry was sent.",
+                ));
             }
         };
-        if !ordinary_review::receipt_matches(&read, &intent, &outcome.completion) {
+        if !ordinary_review::receipt_matches(read, &intent, &outcome.completion) {
             return Err(Self::format_scoped_error(
                 binding,
                 TOOL,
@@ -5352,8 +6661,46 @@ impl PairedMcpServer {
         Self::format_planning_gateway_result(
             binding,
             TOOL,
-            ordinary_review::done_view(&params.read_id, &params.reason, &outcome.completion),
+            ordinary_review::done_view(&intent.read_id, &intent.reason, &outcome.completion),
         )
+    }
+
+    fn review_complete_final_recheck(
+        &self,
+        binding: &str,
+        thread: &str,
+        expected_origin: ClosureOrigin,
+    ) -> impl Fn() -> Result<(), WorkerBacklogError> + Send + 'static {
+        self.review_final_recheck("ordinary_review_complete", binding, thread, expected_origin)
+    }
+
+    fn review_final_recheck(
+        &self,
+        tool: &'static str,
+        binding: &str,
+        thread: &str,
+        expected_origin: ClosureOrigin,
+    ) -> impl Fn() -> Result<(), WorkerBacklogError> + Send + 'static {
+        let enrollment_recheck =
+            self.backlog_worker_final_recheck(tool, binding.to_string(), thread.to_string());
+        let server = self.clone();
+        let checked_binding = binding.to_string();
+        let checked_thread = thread.to_string();
+        move || {
+            enrollment_recheck()?;
+            let actual = server
+                .review_origin(tool, &checked_binding, &checked_thread)
+                .map_err(|_| {
+                    WorkerBacklogError::new("rebind_rejected", "Review package recheck failed.")
+                })?;
+            if actual != expected_origin {
+                return Err(WorkerBacklogError::new(
+                    "rebind_rejected",
+                    "Review package changed before completion.",
+                ));
+            }
+            Ok(())
+        }
     }
 
     fn backlog_worker_final_recheck(
