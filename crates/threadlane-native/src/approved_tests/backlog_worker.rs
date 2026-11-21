@@ -3073,7 +3073,7 @@ async fn ordinary_notice_pending_refuses_wrong_batch_tampered_overlapping_and_un
 
     // 6. Legacy multiple/overlapping UNACKED batches must not fabricate identity.
     let partial: ApprovedEventBatch = serde_json::from_value(
-        f.mcp
+        reopened
             .invoke_tool_json(
                 "approved_pull_events",
                 json!({"approval_id": f.approval_id, "after_seq": 0, "limit": 1}),
@@ -3119,7 +3119,7 @@ async fn ordinary_notice_pending_refuses_wrong_batch_tampered_overlapping_and_un
     assert!(ack_dedup_command_keys(&db).is_empty());
 
     // 7. Partial-range wrong-batch crossing (ambiguous mid-batch cursor: acked_seq = 1).
-    f.mcp
+    reopened
         .invoke_tool_json(
             "approved_ack_events",
             json!({"approval_id": f.approval_id, "batch_id": partial.batch.batch_id}),
@@ -3161,7 +3161,7 @@ async fn ordinary_notice_pending_refuses_wrong_batch_tampered_overlapping_and_un
 
     // 8. Full-range wrong-batch crossing (different batch already credited for 1..=to_seq).
     let other: ApprovedEventBatch = serde_json::from_value(
-        f.mcp
+        reopened
             .invoke_tool_json(
                 "approved_pull_events",
                 json!({"approval_id": f.approval_id, "after_seq": 0}),
@@ -3179,7 +3179,7 @@ async fn ordinary_notice_pending_refuses_wrong_batch_tampered_overlapping_and_un
         (other.batch.from_seq, other.batch.to_seq),
         (first.batch.from_seq, first.batch.to_seq)
     );
-    f.mcp
+    reopened
         .invoke_tool_json(
             "approved_ack_events",
             json!({"approval_id": f.approval_id, "batch_id": other.batch.batch_id}),
