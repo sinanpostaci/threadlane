@@ -3,7 +3,9 @@ import test from 'node:test';
 
 import {
   DEFAULT_BOTTOM_FOLLOW_THRESHOLD_PX,
+  MAX_CHAT_WORK_EVENTS,
   MAX_CHAT_WORK_EXECUTIONS,
+  MAX_CHAT_WORK_ITEMS,
   buildChatActivityEventViews,
   buildChatWorkBacklogGroups,
   buildChatWorkEventViews,
@@ -5932,6 +5934,108 @@ test('resolveSidebarChatStatus renders Idle when Coworker is fresh idle with no 
       tone: 'neutral',
     },
   );
+});
+
+test('item truncation prevents unproven Idle and terminal labels without hiding live activity', () => {
+  const identity = makeIdentity('bnd_sidebar_truncated_items', UUID_ALPHA);
+  const completedItems = Array.from({ length: MAX_CHAT_WORK_ITEMS }, (_, index) =>
+    makeBacklogItem({
+      item_id: `blg_done_${index}`,
+      binding_id: identity.binding_id,
+      kind: 'worker',
+      status: 'done',
+      revision: 2,
+      created_at_ms: 2_000 + index,
+      updated_at_ms: 2_100 + index,
+      completed_at_ms: 2_100 + index,
+    }),
+  );
+  const olderWorker = makeBacklogItem({
+    item_id: 'blg_older_doing_worker',
+    binding_id: identity.binding_id,
+    kind: 'worker',
+    status: 'doing',
+    current_execution_ref: 'exec-older-doing',
+    created_at_ms: 1_000,
+    updated_at_ms: 1_500,
+  });
+  const itemBounds = { items_omitted: 1, events_omitted: 0, presence_omitted: 0 };
+  const eventBounds = { ...itemBounds, items_omitted: 0, events_omitted: 3 };
+  const selection = (work: Partial<WorkspaceChatWork>) =>
+    selectWorkspaceChatWork([makeChatWork(identity, work)], identity);
+  const observe = (
+    page: ReturnType<typeof selectWorkspaceChatWork>,
+    activity: Parameters<typeof makeNativeSample>[1] | null,
+  ) => evaluateChatWorkLiveness(page, activity === null ? null : makeNativeSample(identity, activity), {
+    nowMs: CHAT_WORK_NOW_MS,
+  });
+  const unavailable = { kind: 'unknown', label: 'Status unavailable', tone: 'neutral' };
+  const idle = { kind: 'idle', label: 'Idle', tone: 'neutral' };
+  const working = { kind: 'working', label: 'Working', tone: 'working' };
+
+  const truncated = selection({ items: [...completedItems, olderWorker] });
+  const fromBackend = selection({ items: completedItems, bounds: itemBounds });
+  for (const page of [truncated, fromBackend]) {
+    assert.equal(page.items.length, MAX_CHAT_WORK_ITEMS);
+    assert.ok(page.items.every((item) => item.status === 'done'));
+    assert.equal(page.bounds.itemsOmitted, 1);
+    const current = observe(page, 'idle');
+    assert.equal(current.isWorking, false);
+    assert.equal(current.workingAgentCount, 0);
+    assert.equal(current.waitingForHuman, false);
+    assert.deepEqual(resolveSidebarChatStatus(current), unavailable);
+  }
+
+  const blocked = makeBacklogItem({
+    item_id: 'blg_visible_blocked', binding_id: identity.binding_id,
+    kind: 'worker', status: 'blocked', current_execution_ref: 'exec-visible-blocked',
+    blocked_reason: 'Worker exited without requesting input.',
+  });
+  const visibleWorkers = [olderWorker, blocked];
+  const terminalPresence = visibleWorkers.map((item) => makePresence({
+    item_id: item.item_id, execution_ref: item.current_execution_ref!,
+    availability: 'non_live', freshness: 'not_applicable', live: false,
+    sampled_at_ms: 10_200, sample_age_ms: null, expires_at_ms: null,
+  }));
+  const visibleNonLive = { items: visibleWorkers, worker_presence: terminalPresence };
+  const incomplete = selection({ ...visibleNonLive, bounds: itemBounds });
+  assert.deepEqual(resolveSidebarChatStatus(observe(incomplete, 'idle')), unavailable);
+  assert.deepEqual(resolveSidebarChatStatus(observe(incomplete, null)), unavailable);
+
+  assert.deepEqual(resolveSidebarChatStatus(observe(fromBackend, 'working')), working);
+  assert.deepEqual(resolveSidebarChatStatus(observe(fromBackend, 'waiting_for_approval')), {
+    kind: 'waiting', label: 'Waiting for you in Codex', tone: 'attention',
+  });
+  const withLiveWorker = selection({
+    items: [olderWorker, ...completedItems.slice(1)],
+    worker_presence: [makePresence({
+      item_id: olderWorker.item_id, execution_ref: olderWorker.current_execution_ref!,
+    })],
+    bounds: itemBounds,
+  });
+  const live = observe(withLiveWorker, 'idle');
+  assert.equal(live.isWorking, true);
+  assert.equal(live.workingAgentCount, 1);
+  assert.deepEqual(resolveSidebarChatStatus(live), working);
+
+  // Stream history can be incomplete independently of the current item list.
+  const events = Array.from({ length: MAX_CHAT_WORK_EVENTS + 1 }, (_, index) =>
+    makeBacklogEvent({
+      event_id: `blg_done_0:${index + 1}`, sequence: index + 1,
+      item_id: 'blg_done_0', revision: index + 1, action: 'completed',
+      status: 'done', recorded_at_ms: 2_000 + index,
+    }),
+  );
+  const eventOverflow = selection({ items: completedItems, events });
+  assert.equal(eventOverflow.bounds.itemsOmitted, 0);
+  assert.equal(eventOverflow.bounds.eventsOmitted, 1);
+  assert.deepEqual(resolveSidebarChatStatus(observe(eventOverflow, 'idle')), idle);
+
+  const completeItems = selection({ ...visibleNonLive, bounds: eventBounds });
+  assert.deepEqual(resolveSidebarChatStatus(observe(completeItems, 'idle')), idle);
+  assert.deepEqual(resolveSidebarChatStatus(observe(completeItems, null)), {
+    kind: 'terminal', label: 'No live agent', tone: 'neutral',
+  });
 });
 
 test('sidebar navigation counters separate working agents from waiting chats with singular and plural labels', () => {

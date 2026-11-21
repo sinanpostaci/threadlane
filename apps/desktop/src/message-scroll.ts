@@ -2494,9 +2494,24 @@ function resolveCurrentWorkerNonLiveEvidence(
   return 'degraded';
 }
 
+/**
+ * Any omitted backlog item prevents ruling out an unconfirmed Doing Worker
+ * outside the bounded item page. Omitted stream events do not hide current
+ * backlog items and therefore do not trigger this guard.
+ */
+function hasOmittedChatWorkItems(liveness: ChatWorkLiveness): boolean {
+  return !(
+    Number.isFinite(liveness.bounds.itemsOmitted) &&
+    liveness.bounds.itemsOmitted === 0
+  );
+}
+
 function hasConfirmedNonLiveCurrentDoingWorkers(
   liveness: ChatWorkLiveness,
 ): boolean {
+  if (hasOmittedChatWorkItems(liveness)) {
+    return false;
+  }
   if (liveness.identity === null) {
     return !liveness.items.some(
       (item) =>
@@ -2520,8 +2535,7 @@ function hasConfirmedNonLiveCurrentDoingWorkers(
   if (doingWorkerItems.length === 0) {
     return (
       liveness.workAvailable ||
-      (liveness.bounds.itemsOmitted === 0 &&
-        liveness.bounds.presenceOmitted === 0 &&
+      (liveness.bounds.presenceOmitted === 0 &&
         liveness.bounds.executionsOmitted === 0)
     );
   }
@@ -2541,7 +2555,8 @@ function hasConfirmedTerminalWorkerPresence(liveness: ChatWorkLiveness): boolean
   if (
     !liveness.workAvailable ||
     liveness.identity === null ||
-    liveness.coworker.samplePresent
+    liveness.coworker.samplePresent ||
+    hasOmittedChatWorkItems(liveness)
   ) {
     return false;
   }
