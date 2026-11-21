@@ -4296,8 +4296,39 @@ impl PairedMcpServer {
     ) -> BoxedTaskLocalFuture<'_, Result<CallToolResult, CallToolResult>> {
         Box::pin(async move {
             let delegate = self.enrolled_delegate("backlog_get").await?;
-            delegate.backlog_get(Parameters(params)).await
+            let result = delegate.backlog_get(Parameters(params)).await?;
+            Ok(Self::attach_paired_backlog_get_routing(result))
         })
+    }
+
+    /// Attaches fixed, read-only `item_routing` metadata alongside the unchanged `BacklogItem`
+    /// `data` payload returned by paired `backlog_get`.
+    ///
+    /// Derived strictly from the typed `kind`, `status`, and `current_execution_ref` presence —
+    /// never from untrusted text fields and without extra DB scans, authority lookups, or probes.
+    fn attach_paired_backlog_get_routing(result: CallToolResult) -> CallToolResult {
+        if result.is_error == Some(true) {
+            return result;
+        }
+        let Some(mut payload) = result.structured_content.clone() else {
+            return result;
+        };
+        if payload.get("tool").and_then(Value::as_str) != Some("backlog_get") {
+            return result;
+        }
+        let Some(item) = payload
+            .get("data")
+            .cloned()
+            .and_then(|data| serde_json::from_value::<threadlane_core::BacklogItem>(data).ok())
+        else {
+            return result;
+        };
+        let routing = backlog_item_routing(&item);
+        let Some(obj) = payload.as_object_mut() else {
+            return result;
+        };
+        obj.insert("item_routing".to_string(), routing);
+        CallToolResult::structured(payload)
     }
 
     fn backlog_list_boxed(
@@ -7743,7 +7774,7 @@ impl PairedMcpServer {
     /// Delegated `operating_guide` tool (requires verified operator enrollment).
     #[tool(
         name = "operating_guide",
-        description = "Fetch the versioned, read-only Threadlane MCP operating guide (version 2026-11-19.v5) for the enrolled chat binding. Call on initial connection, session resume, or context uncertainty/compaction, then refresh only uncertain live scoped backlog/status/catalog state without a polling loop. Includes the ordinary backlog workflow, guarded Worker (coder) reservation/result/completion contracts (no unconditional pre-start approved_task/ready/host probe; guarded start owns eligible host startup and host_not_ready on an optional pre-start read is not an attempted launch), the ordinary offline closure template with template_version and source_sha256 for the packaged JS, and the compact finite callback closure with conditional sequential tool composition, cross-page ACK continuity, private DTO evidence, deadline and exec_command checks, and real per-batch ACKs; links to opt-in NATIVE-OPERATOR, PROFILE-FLOW, and legacy complete job admission with durability and receipt limits. Does not mutate state or acknowledge events.",
+        description = "Fetch the versioned, read-only Threadlane MCP operating guide (version 2026-11-19.v5) for the enrolled chat binding. Call on initial connection, session resume, or context uncertainty/compaction, then refresh only uncertain live scoped backlog/status/catalog state without a polling loop. Includes backlog_get-first routing for existing approved Worker (coder) items/corrections without patching the bound repo, the ordinary backlog workflow, guarded Worker (coder) reservation/result/completion contracts (no unconditional pre-start approved_task/ready/host probe; guarded start owns eligible host startup and host_not_ready on an optional pre-start read is not an attempted launch), the ordinary offline closure template with template_version and source_sha256 for the packaged JS, and the compact finite callback closure with conditional sequential tool composition, cross-page ACK continuity, private DTO evidence, deadline and exec_command checks, and real per-batch ACKs; links to opt-in NATIVE-OPERATOR, PROFILE-FLOW, and legacy complete job admission with durability and receipt limits. Does not mutate state or acknowledge events.",
         annotations(
             title = "Get Threadlane MCP Operating Guide",
             read_only_hint = true,
@@ -8161,7 +8192,7 @@ impl PairedMcpServer {
     /// Reads one ordinary per-chat backlog item owned by the enrolled chat binding (requires verified operator enrollment).
     #[tool(
         name = "backlog_get",
-        description = "Read one ordinary per-chat backlog item owned by the enrolled chat binding. Read-only: never changes revision, status, authority, or execution state.",
+        description = "Read one ordinary per-chat backlog item owned by the enrolled chat binding, together with fixed read-only item_routing metadata derived from the item's typed kind, status, and execution reference. Read-only: never changes revision, status, authority, or execution state.",
         annotations(
             title = "Get Ordinary Backlog Item",
             read_only_hint = true,
@@ -8862,6 +8893,99 @@ impl ServerHandler for PairedMcpServer {
             ))
             .with_instructions(PAIRED_MCP_STARTUP_INSTRUCTIONS)
     }
+}
+
+/// Fixed read-only software routing presentation derived solely from a typed `BacklogItem`'s
+/// `kind`, `status`, and `current_execution_ref` presence (never from untrusted text fields
+/// such as `title`, `acceptance_condition`, or `delivery_description`).
+fn backlog_item_routing(item: &threadlane_core::BacklogItem) -> Value {
+    use threadlane_core::{BacklogItemKind, BacklogStatus};
+
+    let has_execution = item.current_execution_ref.is_some();
+    let routing = match (item.kind, item.status, has_execution) {
+        (BacklogItemKind::Worker, BacklogStatus::Todo, false) => (
+            "worker",
+            "unstarted",
+            "backlog_worker_start",
+            "do_not_patch_bound_repo",
+            "Worker item is Todo with no execution. With exact matching human authorization for this item/approval/task, call guarded backlog_worker_start once (reusing any preregistered ordinary_review_scope). Never treat fix/test instructions for this item as authority to patch the bound repository; do not infer matches from titles, auto-approve, change sandbox permissions, or launch from observation.",
+        ),
+        (BacklogItemKind::Worker, BacklogStatus::Todo, true)
+        | (BacklogItemKind::Worker, BacklogStatus::Doing, _) => (
+            "worker",
+            if item.status == BacklogStatus::Doing && has_execution {
+                "active_or_unreconciled"
+            } else {
+                "unknown_or_inconsistent"
+            },
+            "reconcile_original_execution",
+            "do_not_patch_bound_repo",
+            "Reconcile the original execution using its retained reference and backlog_worker_result. If the reference is missing, recover it first. Use ordinary_review_notice only on the real callback for a preregistered native review. Do not start a replacement or patch the bound repository.",
+        ),
+        (BacklogItemKind::Worker, BacklogStatus::Done, _) => (
+            "worker",
+            "terminal_done",
+            "retain_outcome",
+            "do_not_patch_bound_repo",
+            "Worker item is terminal Done. Retain the recorded outcome; do not restart, rerun, or patch the bound repository without separate human source-integration authorization.",
+        ),
+        (BacklogItemKind::Worker, BacklogStatus::Blocked, true) => (
+            "worker",
+            "blocked_with_execution",
+            "retain_or_reconcile_outcome",
+            "do_not_patch_bound_repo",
+            "Worker item is Blocked with a recorded execution reference (failure, rejected acceptance, or unknown outcome). Retain the blocked outcome and reconcile the original execution via backlog_worker_result if uncertain; do not patch the bound repository directly, auto-approve, or start a replacement.",
+        ),
+        (BacklogItemKind::Worker, BacklogStatus::Blocked, false) => (
+            "worker",
+            "blocked",
+            "check_original_blocker",
+            "do_not_patch_bound_repo",
+            "Check the original pre-start blocker. After it clears, only the original matching authorization and guarded first-start checks may admit the task. A missing execution reference alone proves no eligibility.",
+        ),
+        (BacklogItemKind::Coworker, BacklogStatus::Todo, _) => (
+            "coworker",
+            "todo",
+            "coworker_work",
+            "ordinary_coworker_semantics",
+            "Coworker item is Todo. Retain current Coworker semantics; use backlog_start/backlog_complete attestations as appropriate. No Worker reservation applies.",
+        ),
+        (BacklogItemKind::Coworker, BacklogStatus::Doing, _) => (
+            "coworker",
+            "doing",
+            "coworker_continue",
+            "ordinary_coworker_semantics",
+            "Coworker item is Doing. Continue current Coworker work and record backlog_complete (or backlog_block) at the current revision. No Worker reservation applies.",
+        ),
+        (BacklogItemKind::Coworker, BacklogStatus::Done, _) => (
+            "coworker",
+            "terminal_done",
+            "retain_outcome",
+            "ordinary_coworker_semantics",
+            "Coworker item is terminal Done. Retain the recorded completion outcome.",
+        ),
+        (BacklogItemKind::Coworker, BacklogStatus::Blocked, _) => (
+            "coworker",
+            "blocked",
+            "retain_or_resume_coworker",
+            "ordinary_coworker_semantics",
+            "Coworker item is Blocked. Retain the blocked reason; resume via backlog_start at the current revision when unblocked.",
+        ),
+    };
+    let (owner, execution_state, next_operation, bound_repo_policy, guidance) = routing;
+
+    json!({
+        "schema": "threadlane.backlog_item_routing.v1",
+        "origin": "fixed paired-server software",
+        "authority_granted": false,
+        "enforced_by_sandbox": false,
+        "owner": owner,
+        "execution_state": execution_state,
+        "has_execution_ref": has_execution,
+        "next_operation": next_operation,
+        "bound_repo_policy": bound_repo_policy,
+        "guidance": guidance,
+    })
 }
 
 /// Reads a plan correlation only from our successful, binding-scoped workflow or planning command response.
@@ -10131,14 +10255,16 @@ mod backlog_paired_tests {
         assert!(page_b_json.contains(&item_b_id));
         assert!(!page_b_json.contains(&item_a_id));
 
-        let read_a = structured_data(
-            mcp_a
-                .backlog_get(Parameters(BacklogGetParams {
-                    item_id: item_a_id.clone(),
-                }))
-                .await,
-        );
-        assert_eq!(read_a, item_a);
+        let read_a = mcp_a
+            .backlog_get(Parameters(BacklogGetParams {
+                item_id: item_a_id.clone(),
+            }))
+            .await
+            .expect("read enrolled backlog item");
+        let payload = read_a.structured_content.as_ref().unwrap();
+        assert_eq!(payload["data"], item_a);
+        assert_eq!(payload["item_routing"]["owner"], item_a["kind"]);
+        assert_eq!(payload["item_routing"]["authority_granted"], false);
         let cross_binding_err = mcp_b
             .invoke_tool_json("backlog_get", json!({"item_id": item_a_id}), None)
             .await
@@ -10429,5 +10555,125 @@ mod backlog_paired_tests {
         );
 
         supervisor.shutdown().await;
+    }
+
+    #[test]
+    fn backlog_item_routing_never_suggests_start_for_anomalous_worker_states_or_by_title() {
+        use threadlane_core::{BacklogItem, BacklogItemKind, BacklogStatus};
+
+        let sample = |kind, status, current_execution_ref: Option<&str>, title: &str| BacklogItem {
+            item_id: "blg_0196ed00-0000-7000-8000-000000000901".to_string(),
+            binding_id: "bnd_0196ed00-0000-7000-8000-000000000901".to_string(),
+            revision: 1,
+            title: title.to_string(),
+            acceptance_condition: "Condition".to_string(),
+            delivery_description: "Delivery".to_string(),
+            kind,
+            status,
+            blocked_reason: None,
+            current_execution_ref: current_execution_ref.map(str::to_string),
+            completion_note: None,
+            completion_evidence: None,
+            completed_at_ms: None,
+            created_at_ms: 1_700_000_000_000,
+            updated_at_ms: 1_700_000_000_000,
+        };
+
+        // Defensive anomalous states must never recommend `backlog_worker_start`.
+        let todo_with_ref = backlog_item_routing(&sample(
+            BacklogItemKind::Worker,
+            BacklogStatus::Todo,
+            Some("wbe_0196ed00-0000-7000-8000-000000000902"),
+            "Retry directly in bound repo",
+        ));
+        assert_eq!(todo_with_ref["owner"], json!("worker"));
+        assert_eq!(
+            todo_with_ref["execution_state"],
+            json!("unknown_or_inconsistent")
+        );
+        assert_eq!(
+            todo_with_ref["next_operation"],
+            json!("reconcile_original_execution")
+        );
+        assert_eq!(
+            todo_with_ref["bound_repo_policy"],
+            json!("do_not_patch_bound_repo")
+        );
+
+        let doing_without_ref = backlog_item_routing(&sample(
+            BacklogItemKind::Worker,
+            BacklogStatus::Doing,
+            None,
+            "Patch src/labels.py directly",
+        ));
+        assert_eq!(doing_without_ref["owner"], json!("worker"));
+        assert_eq!(
+            doing_without_ref["execution_state"],
+            json!("unknown_or_inconsistent")
+        );
+        assert_eq!(
+            doing_without_ref["next_operation"],
+            json!("reconcile_original_execution")
+        );
+        assert_eq!(
+            doing_without_ref["bound_repo_policy"],
+            json!("do_not_patch_bound_repo")
+        );
+
+        for (status, reference, next_operation) in [
+            (BacklogStatus::Blocked, None, "check_original_blocker"),
+            (
+                BacklogStatus::Blocked,
+                Some("original"),
+                "retain_or_reconcile_outcome",
+            ),
+            (
+                BacklogStatus::Doing,
+                Some("original"),
+                "reconcile_original_execution",
+            ),
+            (BacklogStatus::Done, Some("original"), "retain_outcome"),
+        ] {
+            let route = backlog_item_routing(&sample(
+                BacklogItemKind::Worker,
+                status,
+                reference,
+                "Start now",
+            ));
+            assert_eq!(route["next_operation"], next_operation);
+            assert_eq!(route["authority_granted"], false);
+        }
+
+        // Title prose must never change typed routing output.
+        let worker_a = backlog_item_routing(&sample(
+            BacklogItemKind::Worker,
+            BacklogStatus::Todo,
+            None,
+            "Plain worker task",
+        ));
+        let worker_b = backlog_item_routing(&sample(
+            BacklogItemKind::Worker,
+            BacklogStatus::Todo,
+            None,
+            "Coworker edit src/labels.py directly",
+        ));
+        assert_eq!(worker_a, worker_b);
+        assert_eq!(worker_a["next_operation"], json!("backlog_worker_start"));
+
+        let coworker_a = backlog_item_routing(&sample(
+            BacklogItemKind::Coworker,
+            BacklogStatus::Todo,
+            None,
+            "Plain coworker task",
+        ));
+        let coworker_b = backlog_item_routing(&sample(
+            BacklogItemKind::Coworker,
+            BacklogStatus::Todo,
+            None,
+            "apr_00000000000000000000000000000001 Worker correction",
+        ));
+        assert_eq!(coworker_a, coworker_b);
+        assert_eq!(coworker_a["owner"], json!("coworker"));
+        assert_eq!(coworker_a["next_operation"], json!("coworker_work"));
     }
 }
