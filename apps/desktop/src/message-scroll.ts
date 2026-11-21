@@ -2019,6 +2019,7 @@ export interface ChatWorkLiveness {
   items: ChatWorkItem[];
   events: ChatWorkEvent[];
   presence: ChatWorkPresence[];
+  executions?: ChatWorkExecution[];
   bounds: ChatWorkBoundsView;
   notices: string[];
   coworker: {
@@ -2107,22 +2108,18 @@ function isLiveChatWorkWorkerPresence(
   return true;
 }
 
-function collectLiveChatWorkWorkerAgents(
-  selection: WorkspaceChatWorkSelection,
-  nowMs: number,
-): ChatWorkAgentView[] {
-  if (selection.availability !== 'available' || selection.identity === null) {
-    return [];
-  }
-  const expectedBindingId = selection.identity.binding_id;
-  const itemsById = new Map<string, ChatWorkItem>();
-  for (const item of selection.items) {
-    itemsById.set(item.item_id, item);
-  }
+interface ChatWorkExecutionAttemptIndex {
+  readonly expectedAttemptByExecution: ReadonlyMap<string, string>;
+  readonly conflictingExecutions: ReadonlySet<string>;
+}
+
+function buildChatWorkExecutionAttemptIndex(
+  executions: readonly ChatWorkExecution[],
+): ChatWorkExecutionAttemptIndex {
   const executionIdentityByJoinKey = new Map<string, string>();
   const expectedAttemptByExecution = new Map<string, string>();
   const conflictingExecutions = new Set<string>();
-  for (const execution of selection.executions) {
+  for (const execution of executions) {
     const joinKey = chatWorkExecutionJoinKey(
       execution.item_id,
       execution.execution_ref,
@@ -2146,16 +2143,61 @@ function collectLiveChatWorkWorkerAgents(
       conflictingExecutions.add(joinKey);
     }
   }
-  const normalizedPresence: ChatWorkPresence[] = [];
-  for (const raw of selection.presence) {
-    const normalized = normalizeChatWorkPresence(raw);
-    if (normalized !== null) {
-      normalizedPresence.push(normalized);
+  return { expectedAttemptByExecution, conflictingExecutions };
+}
+
+function doesChatWorkPresenceMatchExecutionAttempt(
+  presence: ChatWorkPresence,
+  attemptIndex: ChatWorkExecutionAttemptIndex,
+): boolean {
+  const joinKey = chatWorkExecutionJoinKey(presence.item_id, presence.execution_ref);
+  if (attemptIndex.conflictingExecutions.has(joinKey)) {
+    return false;
+  }
+  const expectedAttemptKey = attemptIndex.expectedAttemptByExecution.get(joinKey);
+  if (expectedAttemptKey === undefined) {
+    return true;
+  }
+  const actualAttemptKey = chatWorkPresenceJoinKey(
+    presence.item_id,
+    presence.execution_ref,
+    presence.approval_id,
+    presence.task_id,
+    presence.run_id,
+    presence.worker_id,
+  );
+  return actualAttemptKey === expectedAttemptKey;
+}
+
+function normalizeReconciledChatWorkPresence(
+  presence: readonly ChatWorkPresence[],
+): ChatWorkPresence[] {
+  const normalized: ChatWorkPresence[] = [];
+  for (const raw of presence) {
+    const entry = normalizeChatWorkPresence(raw);
+    if (entry !== null) {
+      normalized.push(entry);
     }
   }
+  return reconcileChatWorkPresence(normalized).presence;
+}
+
+function collectLiveChatWorkWorkerAgents(
+  selection: WorkspaceChatWorkSelection,
+  nowMs: number,
+): ChatWorkAgentView[] {
+  if (selection.availability !== 'available' || selection.identity === null) {
+    return [];
+  }
+  const expectedBindingId = selection.identity.binding_id;
+  const itemsById = new Map<string, ChatWorkItem>();
+  for (const item of selection.items) {
+    itemsById.set(item.item_id, item);
+  }
+  const attemptIndex = buildChatWorkExecutionAttemptIndex(selection.executions);
   const agents: ChatWorkAgentView[] = [];
   const seen = new Set<string>();
-  for (const presence of reconcileChatWorkPresence(normalizedPresence).presence) {
+  for (const presence of normalizeReconciledChatWorkPresence(selection.presence)) {
     const item = itemsById.get(presence.item_id);
     if (
       !item ||
@@ -2165,23 +2207,8 @@ function collectLiveChatWorkWorkerAgents(
     ) {
       continue;
     }
-    const joinKey = chatWorkExecutionJoinKey(item.item_id, presence.execution_ref);
-    if (conflictingExecutions.has(joinKey)) {
+    if (!doesChatWorkPresenceMatchExecutionAttempt(presence, attemptIndex)) {
       continue;
-    }
-    const expectedAttemptKey = expectedAttemptByExecution.get(joinKey);
-    if (expectedAttemptKey !== undefined) {
-      const actualAttemptKey = chatWorkPresenceJoinKey(
-        presence.item_id,
-        presence.execution_ref,
-        presence.approval_id,
-        presence.task_id,
-        presence.run_id,
-        presence.worker_id,
-      );
-      if (actualAttemptKey !== expectedAttemptKey) {
-        continue;
-      }
     }
     const key = `${selection.chatKey ?? 'unscoped'}\u0000worker\u0000${item.item_id}\u0000${item.current_execution_ref ?? ''}`;
     if (seen.has(key)) {
@@ -2278,6 +2305,7 @@ export function evaluateChatWorkLiveness(
     items: selection.items,
     events: selection.events,
     presence: selection.presence,
+    executions: selection.executions,
     bounds: selection.bounds,
     notices: selection.notices,
     coworker: {
@@ -2403,35 +2431,110 @@ export interface SidebarChatStatusOptions {
   suppressed?: boolean;
 }
 
-function hasDegradedCurrentWorkerPresence(liveness: ChatWorkLiveness): boolean {
-  if (!liveness.workAvailable || liveness.identity === null) {
-    return false;
+function isExplicitNonLiveChatWorkWorkerPresence(
+  presence: ChatWorkPresence,
+): boolean {
+  return (
+    presence.availability === 'non_live' &&
+    presence.freshness !== 'stale' &&
+    !presence.live
+  );
+}
+
+interface ChatWorkMatchedPresenceIndex {
+  readonly attemptIndex: ChatWorkExecutionAttemptIndex;
+  readonly byExecutionKey: ReadonlyMap<string, ChatWorkPresence[]>;
+}
+
+function buildChatWorkMatchedPresenceIndex(
+  liveness: ChatWorkLiveness,
+): ChatWorkMatchedPresenceIndex {
+  const attemptIndex = buildChatWorkExecutionAttemptIndex(liveness.executions ?? []);
+  const byExecutionKey = new Map<string, ChatWorkPresence[]>();
+  for (const presence of normalizeReconciledChatWorkPresence(liveness.presence)) {
+    if (!doesChatWorkPresenceMatchExecutionAttempt(presence, attemptIndex)) {
+      continue;
+    }
+    const joinKey = chatWorkExecutionJoinKey(
+      presence.item_id,
+      presence.execution_ref,
+    );
+    const group = byExecutionKey.get(joinKey);
+    if (group === undefined) {
+      byExecutionKey.set(joinKey, [presence]);
+    } else {
+      group.push(presence);
+    }
+  }
+  return { attemptIndex, byExecutionKey };
+}
+
+function resolveCurrentWorkerNonLiveEvidence(
+  item: Pick<ChatWorkItem, 'item_id' | 'current_execution_ref'>,
+  matchedPresence: ChatWorkMatchedPresenceIndex,
+): 'confirmed' | 'missing' | 'degraded' {
+  const executionRef = cleanOptionalString(item.current_execution_ref);
+  if (executionRef === null) {
+    return 'missing';
+  }
+  const joinKey = chatWorkExecutionJoinKey(item.item_id, executionRef);
+  if (matchedPresence.attemptIndex.conflictingExecutions.has(joinKey)) {
+    return 'degraded';
+  }
+  const matching = matchedPresence.byExecutionKey.get(joinKey);
+  if (matching === undefined || matching.length === 0) {
+    return 'missing';
+  }
+  if (
+    matching.length === 1 &&
+    isExplicitNonLiveChatWorkWorkerPresence(matching[0]!)
+  ) {
+    return 'confirmed';
+  }
+  return 'degraded';
+}
+
+function hasConfirmedNonLiveCurrentDoingWorkers(
+  liveness: ChatWorkLiveness,
+): boolean {
+  if (liveness.identity === null) {
+    return !liveness.items.some(
+      (item) =>
+        item.kind === 'worker' &&
+        item.status === 'doing' &&
+        cleanOptionalString(item.current_execution_ref) !== null,
+    );
   }
   const expectedBindingId = liveness.identity.binding_id;
-  const doingWorkerItems = new Map<string, ChatWorkItem>();
-  for (const item of liveness.items) {
+  const doingWorkerItems: ChatWorkItem[] = [];
+  for (const item of reconcileChatWorkItems(liveness.items).items) {
     if (
       item.binding_id === expectedBindingId &&
       item.kind === 'worker' &&
       item.status === 'doing' &&
-      item.current_execution_ref !== null
+      cleanOptionalString(item.current_execution_ref) !== null
     ) {
-      doingWorkerItems.set(item.item_id, item);
+      doingWorkerItems.push(item);
     }
   }
-  if (doingWorkerItems.size === 0) {
+  if (doingWorkerItems.length === 0) {
+    return (
+      liveness.workAvailable ||
+      (liveness.bounds.itemsOmitted === 0 &&
+        liveness.bounds.presenceOmitted === 0 &&
+        liveness.bounds.executionsOmitted === 0)
+    );
+  }
+  if (!liveness.workAvailable) {
     return false;
   }
-  for (const presence of liveness.presence) {
-    const item = doingWorkerItems.get(presence.item_id);
-    if (!item || presence.execution_ref !== item.current_execution_ref) {
-      continue;
-    }
-    if (presence.availability !== 'non_live' || presence.live) {
-      return true;
+  const matchedPresence = buildChatWorkMatchedPresenceIndex(liveness);
+  for (const item of doingWorkerItems) {
+    if (resolveCurrentWorkerNonLiveEvidence(item, matchedPresence) !== 'confirmed') {
+      return false;
     }
   }
-  return false;
+  return true;
 }
 
 function hasConfirmedTerminalWorkerPresence(liveness: ChatWorkLiveness): boolean {
@@ -2443,44 +2546,32 @@ function hasConfirmedTerminalWorkerPresence(liveness: ChatWorkLiveness): boolean
     return false;
   }
   const expectedBindingId = liveness.identity.binding_id;
-  const workerItemsById = new Map<string, ChatWorkItem>();
-  const doingWorkerIds = new Set<string>();
-  for (const item of liveness.items) {
+  const workerItems: ChatWorkItem[] = [];
+  for (const item of reconcileChatWorkItems(liveness.items).items) {
     if (item.binding_id !== expectedBindingId || item.kind !== 'worker') {
       continue;
     }
     if (item.status === 'doing' || item.status === 'blocked') {
-      workerItemsById.set(item.item_id, item);
-      if (item.status === 'doing') {
-        doingWorkerIds.add(item.item_id);
-      }
+      workerItems.push(item);
     }
   }
-  if (workerItemsById.size === 0) {
+  if (workerItems.length === 0) {
     return false;
   }
+  const matchedPresence = buildChatWorkMatchedPresenceIndex(liveness);
   let confirmedTerminalCount = 0;
-  const terminalDoingIds = new Set<string>();
-  for (const presence of liveness.presence) {
-    const item = workerItemsById.get(presence.item_id);
-    if (
-      !item ||
-      item.current_execution_ref === null ||
-      presence.execution_ref !== item.current_execution_ref
-    ) {
+  for (const item of workerItems) {
+    const evidence = resolveCurrentWorkerNonLiveEvidence(item, matchedPresence);
+    if (item.status === 'doing') {
+      if (evidence !== 'confirmed') {
+        return false;
+      }
+      confirmedTerminalCount += 1;
       continue;
     }
-    if (presence.availability === 'non_live' && !presence.live) {
+    if (evidence === 'confirmed') {
       confirmedTerminalCount += 1;
-      if (item.status === 'doing') {
-        terminalDoingIds.add(item.item_id);
-      }
-    } else {
-      return false;
-    }
-  }
-  for (const doingId of doingWorkerIds) {
-    if (!terminalDoingIds.has(doingId)) {
+    } else if (evidence === 'degraded') {
       return false;
     }
   }
@@ -2530,7 +2621,7 @@ export function resolveSidebarChatStatus(
     liveness.coworker.activity === 'idle';
   if (
     hasConfirmedIdleNativeSample &&
-    !hasDegradedCurrentWorkerPresence(liveness)
+    hasConfirmedNonLiveCurrentDoingWorkers(liveness)
   ) {
     return {
       kind: 'idle',

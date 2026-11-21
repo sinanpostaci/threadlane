@@ -5266,6 +5266,16 @@ test('resolveSidebarChatStatus distinguishes confirmed idle and explicit termina
     blocked_reason: 'Worker failed without requesting human input.',
     current_execution_ref: 'exec-failed-1',
   });
+  const nonLiveDoingWorkerPresence = makePresence({
+    item_id: doingWorkerItem.item_id,
+    execution_ref: 'exec-doing-1',
+    availability: 'non_live',
+    freshness: 'not_applicable',
+    live: false,
+    sampled_at_ms: 10_200,
+    sample_age_ms: null,
+    expires_at_ms: null,
+  });
   const nonLiveTerminalPresence = makePresence({
     item_id: blockedFailedWorkerItem.item_id,
     execution_ref: 'exec-failed-1',
@@ -5307,9 +5317,60 @@ test('resolveSidebarChatStatus distinguishes confirmed idle and explicit termina
     tone: 'neutral',
   });
 
-  // Real confirmed fresh idle native sample renders Idle with neutral tone.
-  const confirmedIdle = evaluateChatWorkLiveness(
+  // Partial observation: fresh idle Coworker with an unconfirmed Doing Worker
+  // (missing or omitted worker_presence) stays neutral Status unavailable
+  // without fabricating a live agent or Needs you.
+  const partialIdle = evaluateChatWorkLiveness(
     passiveSelection,
+    makeNativeSample(identity, 'idle'),
+    { nowMs: CHAT_WORK_NOW_MS },
+  );
+  assert.equal(partialIdle.isWorking, false);
+  assert.equal(partialIdle.workingAgentCount, 0);
+  assert.equal(partialIdle.waitingForHuman, false);
+  assert.deepEqual(resolveSidebarChatStatus(partialIdle), {
+    kind: 'unknown',
+    label: 'Status unavailable',
+    tone: 'neutral',
+  });
+
+  const omittedWorkerPresenceSelection = selectWorkspaceChatWork(
+    [
+      makeChatWork(identity, {
+        items: [doingWorkerItem],
+        worker_presence: [],
+        bounds: { items_omitted: 0, events_omitted: 0, presence_omitted: 1 },
+      }),
+    ],
+    identity,
+  );
+  const omittedWorkerIdle = evaluateChatWorkLiveness(
+    omittedWorkerPresenceSelection,
+    makeNativeSample(identity, 'idle'),
+    { nowMs: CHAT_WORK_NOW_MS },
+  );
+  assert.equal(omittedWorkerIdle.isWorking, false);
+  assert.equal(omittedWorkerIdle.workingAgentCount, 0);
+  assert.equal(omittedWorkerIdle.waitingForHuman, false);
+  assert.deepEqual(resolveSidebarChatStatus(omittedWorkerIdle), {
+    kind: 'unknown',
+    label: 'Status unavailable',
+    tone: 'neutral',
+  });
+
+  // Complete observation: fresh idle native sample renders Idle once there is
+  // no outstanding Doing Worker or every relevant Doing Worker is explicitly non_live.
+  const completeIdleSelection = selectWorkspaceChatWork(
+    [
+      makeChatWork(identity, {
+        items: [todoItem, doingWorkerItem, blockedFailedWorkerItem],
+        worker_presence: [nonLiveDoingWorkerPresence],
+      }),
+    ],
+    identity,
+  );
+  const confirmedIdle = evaluateChatWorkLiveness(
+    completeIdleSelection,
     makeNativeSample(identity, 'idle'),
     { nowMs: CHAT_WORK_NOW_MS },
   );
@@ -5319,9 +5380,32 @@ test('resolveSidebarChatStatus distinguishes confirmed idle and explicit termina
     tone: 'neutral',
   });
 
+  const idleNoOutstandingSelection = selectWorkspaceChatWork(
+    [
+      makeChatWork(identity, {
+        items: [todoItem, blockedFailedWorkerItem],
+      }),
+    ],
+    identity,
+  );
+  assert.deepEqual(
+    resolveSidebarChatStatus(
+      evaluateChatWorkLiveness(
+        idleNoOutstandingSelection,
+        makeNativeSample(identity, 'idle'),
+        { nowMs: CHAT_WORK_NOW_MS },
+      ),
+    ),
+    {
+      kind: 'idle',
+      label: 'Idle',
+      tone: 'neutral',
+    },
+  );
+
   // Fresh native sample with unknown activity is NOT confirmed idle.
   const unknownActivity = evaluateChatWorkLiveness(
-    passiveSelection,
+    completeIdleSelection,
     makeNativeSample(identity, 'unknown'),
     { nowMs: CHAT_WORK_NOW_MS },
   );
@@ -5386,7 +5470,7 @@ test('resolveSidebarChatStatus distinguishes confirmed idle and explicit termina
   assert.deepEqual(
     resolveSidebarChatStatus(
       evaluateChatWorkLiveness(
-        passiveSelection,
+        completeIdleSelection,
         makeNativeSample(identity, 'idle'),
         { nowMs: CHAT_WORK_NOW_MS, isStale: true },
       ),
@@ -5476,6 +5560,378 @@ test('resolveSidebarChatStatus distinguishes confirmed idle and explicit termina
     label: 'Working',
     tone: 'working',
   });
+});
+
+test('resolveSidebarChatStatus stays Status unavailable when one of two Doing Workers is missing its sample and keeps live precedence', () => {
+  const identity = makeIdentity('bnd_sidebar_two_workers', UUID_ALPHA);
+  const workerA = makeBacklogItem({
+    item_id: 'blg_two_worker_a',
+    binding_id: identity.binding_id,
+    kind: 'worker',
+    status: 'doing',
+    current_execution_ref: 'exec-two-a',
+  });
+  const workerB = makeBacklogItem({
+    item_id: 'blg_two_worker_b',
+    binding_id: identity.binding_id,
+    kind: 'worker',
+    status: 'doing',
+    current_execution_ref: 'exec-two-b',
+  });
+  const nonLiveA = makePresence({
+    item_id: workerA.item_id,
+    execution_ref: 'exec-two-a',
+    availability: 'non_live',
+    freshness: 'not_applicable',
+    live: false,
+    sampled_at_ms: 10_200,
+    sample_age_ms: null,
+    expires_at_ms: null,
+  });
+  const nonLiveB = makePresence({
+    item_id: workerB.item_id,
+    execution_ref: 'exec-two-b',
+    worker_id: 'worker-2',
+    run_id: 'run-2',
+    task_id: 'task-2',
+    availability: 'non_live',
+    freshness: 'not_applicable',
+    live: false,
+    sampled_at_ms: 10_200,
+    sample_age_ms: null,
+    expires_at_ms: null,
+  });
+
+  const missingSecondSelection = selectWorkspaceChatWork(
+    [
+      makeChatWork(identity, {
+        items: [workerA, workerB],
+        worker_presence: [nonLiveA],
+        bounds: { items_omitted: 0, events_omitted: 0, presence_omitted: 1 },
+      }),
+    ],
+    identity,
+  );
+  const missingSecondLiveness = evaluateChatWorkLiveness(
+    missingSecondSelection,
+    makeNativeSample(identity, 'idle'),
+    { nowMs: CHAT_WORK_NOW_MS },
+  );
+  assert.equal(missingSecondLiveness.workingAgentCount, 0);
+  assert.equal(missingSecondLiveness.isWorking, false);
+  assert.equal(missingSecondLiveness.waitingForHuman, false);
+  assert.deepEqual(resolveSidebarChatStatus(missingSecondLiveness), {
+    kind: 'unknown',
+    label: 'Status unavailable',
+    tone: 'neutral',
+  });
+
+  // Confirmed live work on Worker A still renders Working with count 1 when Worker B is omitted.
+  const oneLiveOneMissingSelection = selectWorkspaceChatWork(
+    [
+      makeChatWork(identity, {
+        items: [workerA, workerB],
+        worker_presence: [
+          makePresence({ item_id: workerA.item_id, execution_ref: 'exec-two-a' }),
+        ],
+        bounds: { items_omitted: 0, events_omitted: 0, presence_omitted: 1 },
+      }),
+    ],
+    identity,
+  );
+  const oneLiveOneMissingLiveness = evaluateChatWorkLiveness(
+    oneLiveOneMissingSelection,
+    makeNativeSample(identity, 'idle'),
+    { nowMs: CHAT_WORK_NOW_MS },
+  );
+  assert.equal(oneLiveOneMissingLiveness.workingAgentCount, 1);
+  assert.equal(oneLiveOneMissingLiveness.isWorking, true);
+  assert.deepEqual(resolveSidebarChatStatus(oneLiveOneMissingLiveness), {
+    kind: 'working',
+    label: 'Working',
+    tone: 'working',
+  });
+
+  // Once both relevant Doing Workers are explicitly non_live, fresh idle Coworker renders Idle.
+  const bothNonLiveSelection = selectWorkspaceChatWork(
+    [
+      makeChatWork(identity, {
+        items: [workerA, workerB],
+        worker_presence: [nonLiveA, nonLiveB],
+      }),
+    ],
+    identity,
+  );
+  assert.deepEqual(
+    resolveSidebarChatStatus(
+      evaluateChatWorkLiveness(
+        bothNonLiveSelection,
+        makeNativeSample(identity, 'idle'),
+        { nowMs: CHAT_WORK_NOW_MS },
+      ),
+    ),
+    {
+      kind: 'idle',
+      label: 'Idle',
+      tone: 'neutral',
+    },
+  );
+});
+
+test('resolveSidebarChatStatus rejects mismatched previous-attempt non_live evidence for Idle', () => {
+  const identity = makeIdentity('bnd_sidebar_prev_attempt', UUID_ALPHA);
+  const doingWorker = makeBacklogItem({
+    item_id: 'blg_attempt_worker',
+    binding_id: identity.binding_id,
+    kind: 'worker',
+    status: 'doing',
+    current_execution_ref: 'exec-attempt-2',
+  });
+  const currentExecution = makeExecution(identity.binding_id, {
+    item_id: doingWorker.item_id,
+    execution_ref: 'exec-attempt-2',
+    run_id: 'run-attempt-2',
+    worker_id: 'worker-attempt-2',
+  });
+
+  // Explicit non_live for an earlier execution_ref does not confirm the current execution.
+  const previousRefSelection = selectWorkspaceChatWork(
+    [
+      makeChatWork(identity, {
+        items: [doingWorker],
+        worker_executions: [currentExecution],
+        worker_presence: [
+          makePresence({
+            item_id: doingWorker.item_id,
+            execution_ref: 'exec-attempt-1',
+            run_id: 'run-attempt-1',
+            worker_id: 'worker-attempt-1',
+            availability: 'non_live',
+            freshness: 'not_applicable',
+            live: false,
+            sampled_at_ms: 10_200,
+            sample_age_ms: null,
+            expires_at_ms: null,
+          }),
+        ],
+      }),
+    ],
+    identity,
+  );
+  const previousRefLiveness = evaluateChatWorkLiveness(
+    previousRefSelection,
+    makeNativeSample(identity, 'idle'),
+    { nowMs: CHAT_WORK_NOW_MS },
+  );
+  assert.equal(previousRefLiveness.workingAgentCount, 0);
+  assert.equal(previousRefLiveness.isWorking, false);
+  assert.equal(previousRefLiveness.waitingForHuman, false);
+  assert.deepEqual(resolveSidebarChatStatus(previousRefLiveness), {
+    kind: 'unknown',
+    label: 'Status unavailable',
+    tone: 'neutral',
+  });
+
+  // Explicit non_live with the same execution_ref but mismatched attempt run_id also stays unavailable.
+  const wrongRunSelection = selectWorkspaceChatWork(
+    [
+      makeChatWork(identity, {
+        items: [doingWorker],
+        worker_executions: [currentExecution],
+        worker_presence: [
+          makePresence({
+            item_id: doingWorker.item_id,
+            execution_ref: 'exec-attempt-2',
+            run_id: 'run-attempt-1',
+            worker_id: 'worker-attempt-2',
+            availability: 'non_live',
+            freshness: 'not_applicable',
+            live: false,
+            sampled_at_ms: 10_200,
+            sample_age_ms: null,
+            expires_at_ms: null,
+          }),
+        ],
+      }),
+    ],
+    identity,
+  );
+  assert.deepEqual(
+    resolveSidebarChatStatus(
+      evaluateChatWorkLiveness(
+        wrongRunSelection,
+        makeNativeSample(identity, 'idle'),
+        { nowMs: CHAT_WORK_NOW_MS },
+      ),
+    ),
+    {
+      kind: 'unknown',
+      label: 'Status unavailable',
+      tone: 'neutral',
+    },
+  );
+
+  // Matching current attempt non_live confirms Idle.
+  const matchingAttemptSelection = selectWorkspaceChatWork(
+    [
+      makeChatWork(identity, {
+        items: [doingWorker],
+        worker_executions: [currentExecution],
+        worker_presence: [
+          makePresence({
+            item_id: doingWorker.item_id,
+            execution_ref: 'exec-attempt-2',
+            run_id: 'run-attempt-2',
+            worker_id: 'worker-attempt-2',
+            availability: 'non_live',
+            freshness: 'not_applicable',
+            live: false,
+            sampled_at_ms: 10_200,
+            sample_age_ms: null,
+            expires_at_ms: null,
+          }),
+        ],
+      }),
+    ],
+    identity,
+  );
+  assert.deepEqual(
+    resolveSidebarChatStatus(
+      evaluateChatWorkLiveness(
+        matchingAttemptSelection,
+        makeNativeSample(identity, 'idle'),
+        { nowMs: CHAT_WORK_NOW_MS },
+      ),
+    ),
+    {
+      kind: 'idle',
+      label: 'Idle',
+      tone: 'neutral',
+    },
+  );
+});
+
+test('resolveSidebarChatStatus renders Idle when Coworker is fresh idle with no outstanding execution or reconciled non_live Workers', () => {
+  const identity = makeIdentity('bnd_sidebar_confirmed_idle', UUID_ALPHA);
+
+  // Just idle Coworker with no chat_work recorded yet renders Idle.
+  const coworkerOnlySelection = selectWorkspaceChatWork([], identity);
+  assert.deepEqual(
+    resolveSidebarChatStatus(
+      evaluateChatWorkLiveness(
+        coworkerOnlySelection,
+        makeNativeSample(identity, 'idle'),
+        { nowMs: CHAT_WORK_NOW_MS },
+      ),
+    ),
+    {
+      kind: 'idle',
+      label: 'Idle',
+      tone: 'neutral',
+    },
+  );
+
+  // Idle Coworker with no attached current execution renders Idle.
+  const noOutstandingSelection = selectWorkspaceChatWork(
+    [
+      makeChatWork(identity, {
+        items: [
+          makeBacklogItem({
+            item_id: 'blg_coworker_doing',
+            binding_id: identity.binding_id,
+            kind: 'coworker',
+            status: 'doing',
+          }),
+          makeBacklogItem({
+            item_id: 'blg_worker_unattached',
+            binding_id: identity.binding_id,
+            kind: 'worker',
+            status: 'doing',
+            current_execution_ref: null,
+          }),
+          makeBacklogItem({
+            item_id: 'blg_worker_done',
+            binding_id: identity.binding_id,
+            kind: 'worker',
+            status: 'done',
+            current_execution_ref: 'exec-done-1',
+          }),
+        ],
+      }),
+    ],
+    identity,
+  );
+  assert.deepEqual(
+    resolveSidebarChatStatus(
+      evaluateChatWorkLiveness(
+        noOutstandingSelection,
+        makeNativeSample(identity, 'idle'),
+        { nowMs: CHAT_WORK_NOW_MS },
+      ),
+    ),
+    {
+      kind: 'idle',
+      label: 'Idle',
+      tone: 'neutral',
+    },
+  );
+
+  // Reconciled newer explicit non_live superseding an older live sample confirms Idle
+  // even though deduplication increments bounds.presenceOmitted.
+  const reconciledSelection = selectWorkspaceChatWork(
+    [
+      makeChatWork(identity, {
+        items: [
+          makeBacklogItem({
+            item_id: 'blg_worker_reconciled',
+            binding_id: identity.binding_id,
+            kind: 'worker',
+            status: 'doing',
+            current_execution_ref: 'exec-reconciled-1',
+          }),
+        ],
+        worker_presence: [
+          makePresence({
+            item_id: 'blg_worker_reconciled',
+            execution_ref: 'exec-reconciled-1',
+            sequence: 4,
+            availability: 'live',
+            freshness: 'fresh',
+            live: true,
+            sampled_at_ms: 10_000,
+            expires_at_ms: 15_000,
+          }),
+          makePresence({
+            item_id: 'blg_worker_reconciled',
+            execution_ref: 'exec-reconciled-1',
+            sequence: 5,
+            availability: 'non_live',
+            freshness: 'not_applicable',
+            live: false,
+            sampled_at_ms: 10_200,
+            sample_age_ms: null,
+            expires_at_ms: null,
+          }),
+        ],
+      }),
+    ],
+    identity,
+  );
+  assert.equal(reconciledSelection.bounds.presenceOmitted, 1);
+  assert.deepEqual(
+    resolveSidebarChatStatus(
+      evaluateChatWorkLiveness(
+        reconciledSelection,
+        makeNativeSample(identity, 'idle'),
+        { nowMs: CHAT_WORK_NOW_MS },
+      ),
+    ),
+    {
+      kind: 'idle',
+      label: 'Idle',
+      tone: 'neutral',
+    },
+  );
 });
 
 test('sidebar navigation counters separate working agents from waiting chats with singular and plural labels', () => {
