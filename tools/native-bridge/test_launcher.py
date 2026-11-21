@@ -435,7 +435,7 @@ class LauncherPrototypeTest(unittest.TestCase):
                 self.assertEqual(len(spawns), 1)
 
     def test_prefixed_native_shape_roundtrip_and_argv_preservation(self) -> None:
-        """Verify native prefixed shape (-c <opaque1> -c <opaque2> app-server --analytics-default-enabled) preserves argv and bridges WS."""
+        """Bridge the desktop argv, including repeated MCP launch directories."""
         opaque_1 = 'synthetic_opaque_1="alpha:1=true"'
         opaque_2 = 'synthetic_opaque_2={nested=["app-server","--stdio"],count=2}'
         native_argv = [
@@ -445,6 +445,9 @@ class LauncherPrototypeTest(unittest.TestCase):
             opaque_2,
             "app-server",
             "--analytics-default-enabled",
+            "--plugin-mcp-launch-cwd", "demo-plugin", "demo-server", "/tmp/Project A",
+            "--mcp-launch-cwd", "demo", "/tmp/Project A", "/tmp/Çalışma",
+            "--mcp-launch-cwd", "other", "/tmp/Project B", "/tmp/Project B",
         ]
         server_notif = (
             '{"jsonrpc":"2.0","method":"codex/event",'
@@ -491,16 +494,7 @@ class LauncherPrototypeTest(unittest.TestCase):
             self.assertEqual(len(spawns), 1)
             self.assertEqual(
                 spawns[0]["argv"],
-                [
-                    "-c",
-                    opaque_1,
-                    "-c",
-                    opaque_2,
-                    "app-server",
-                    "--analytics-default-enabled",
-                    "--listen",
-                    f"unix://{socket_path}",
-                ],
+                [*native_argv, "--listen", f"unix://{socket_path}"],
             )
             handshakes = [e for e in events if e.get("event") == "handshake"]
             self.assertEqual(len(handshakes), 1)
@@ -515,6 +509,30 @@ class LauncherPrototypeTest(unittest.TestCase):
             for stream in (proc.stdin, proc.stdout, proc.stderr):
                 if stream is not None and not stream.closed:
                     stream.close()
+
+    def test_mcp_launch_cwd_groups(self) -> None:
+        for flag in ("--mcp-launch-cwd", "--plugin-mcp-launch-cwd"):
+            group = [flag, "server", "origin", "/tmp/project"]
+            with self.subTest(flag=flag):
+                self.assertEqual(
+                    launcher.plan_backend_argv(["app-server", *group, "--stdio"], "s.sock"),
+                    ["app-server", *group, "--listen", "unix://s.sock"],
+                )
+            cases = [
+                [*group, "app-server"],
+                ["app-server", *group, "extra"],
+                ["app-server", *group, "--listen=unix:///tmp/other"],
+                ["app-server", flag + "=server", "origin", "/tmp/project"],
+            ]
+            for consumed in range(3):
+                cases.append(["app-server", *group[:1 + consumed]])
+                for invalid in ("", "--stdio", "--listen", "--help"):
+                    operands = group.copy()
+                    operands[1 + consumed] = invalid
+                    cases.append(["app-server", *operands])
+            for args in cases:
+                with self.subTest(args=args):
+                    self.assertIsNone(launcher.plan_backend_argv(args, "s.sock"))
 
     def test_plan_backend_argv_and_negative_passthrough_cases(self) -> None:
         """Verify pure argv planner whitelist/order preservation and negative passthrough cases."""
@@ -579,6 +597,8 @@ class LauncherPrototypeTest(unittest.TestCase):
             ["--disable"],
             ["app-server", "-c"],
             ["app-server", "--config="],
+            ["app-server", "--mcp-launch-cwd", "server", "/tmp/project"],
+            ["app-server", "--plugin-mcp-launch-cwd", "plugin", "server", "--stdio"],
             ["app-server", "--listen"],
             ["--unknown-global", "app-server"],
             ["-c", "k=v", "app-server", "--unknown-flag"],

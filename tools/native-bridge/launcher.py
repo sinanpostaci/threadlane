@@ -83,7 +83,8 @@ def plan_backend_argv(
     `--config=VALUE`, `--enable VALUE`, `--disable VALUE`, `--strict-config`)
     before `app-server`, and whitelisted `app-server` suffix flags
     (`--analytics-default-enabled`, `--strict-config`, the same `-c`/`--config`/
-    `--config=..`/`--enable`/`--disable` forms, and at most one explicit stdio
+    `--config=..`/`--enable`/`--disable` forms, repeatable three-operand
+    `--mcp-launch-cwd` and `--plugin-mcp-launch-cwd`, and at most one explicit stdio
     listener `--stdio`, `--listen stdio://`, or `--listen=stdio://`).
 
     Preserves all opaque tokens and flags in order, strips any explicit stdio
@@ -132,6 +133,14 @@ def plan_backend_argv(
         if token in SUFFIX_BOOL_FLAGS:
             planned.append(token)
             i += 1
+            continue
+        if token in ("--mcp-launch-cwd", "--plugin-mcp-launch-cwd"):
+            operands = args[i + 1 : i + 4]
+            if len(operands) != 3 or any(not value or value.startswith("-") for value in operands):
+                return None
+            planned.append(token)
+            planned.extend(operands)
+            i += 4
             continue
         if token in OPAQUE_PAIR_FLAGS:
             if i + 1 >= n:
