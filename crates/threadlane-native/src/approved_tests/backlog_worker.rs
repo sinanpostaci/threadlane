@@ -1836,6 +1836,15 @@ async fn ordinary_notice_real_pages_duplicate_and_done_are_guarded() {
     );
     let store = crate::ordinary_review::ReviewStore::open(&f.fixture.state_dir).unwrap();
     let stored_read = store.read(&read_id).unwrap();
+    assert_eq!(ready["semantic_review"]["untrusted_data"], true);
+    assert_eq!(
+        ready["semantic_review"]["acceptance_condition"],
+        stored_read.context.acceptance_condition
+    );
+    assert_eq!(
+        ready["semantic_review"]["delivery_description"],
+        stored_read.context.delivery_description
+    );
     let expected_checkout = stored_read.physical.root.clone();
     assert_ready_projection(
         &ready,
