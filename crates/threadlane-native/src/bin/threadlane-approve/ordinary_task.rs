@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use threadlane::SupervisorClient;
 use threadlane_authority::validation::{
     validate_canonical_thread_uuid, validate_executable_worker_instruction, validate_identifier,
@@ -19,22 +19,25 @@ use threadlane_authority::validation::{
 };
 use threadlane_authority::{
     resolve_and_validate_worker_executable, OperatorApprovalIntent, OperatorApprovalIntentV2,
-    AUTHORITY_REQUEST_V2_SCHEMA_VERSION,
+    OperatorApprovalPreview, OperatorApprovalRequestV2, AUTHORITY_REQUEST_V2_SCHEMA_VERSION,
 };
 use threadlane_native::open_workflow_stores;
 use threadlane_workers::ExecutionBudgets;
 use threadlane_workflow::{
     deterministic_plan_id, preview_draft_compilation, Difficulty, PlanError, PlanRevision,
-    PlanStatus, PlanSummary, PlanTask, PublishedPlanView, RegistryError, SavePlanDraft,
-    ScopedWorkflow, WorkflowError, WorkflowRole,
+    PlanStatus, PlanSummary, PlanTask, PublishedPlanView, RegistryError, RegistrySnapshot,
+    SavePlanDraft, ScopedWorkflow, WorkflowError, WorkflowRole,
 };
 
 use super::{
     enforce_fixed_scope_on_request, load_stdin_json, optional_record_request,
     prepare_operator_preview, prepare_operator_preview_v2, verify_live_binding,
     write_private_preview_file, write_stdout_json, CliError, ExplicitBudgets, FixedApprovalScope,
-    PrivatePreviewReceipt, RecoveryContext, ValidatedStoreDirs,
+    RecoveryContext, ValidatedStoreDirs,
 };
+
+#[path = "ordinary_task/shadow.rs"]
+mod shadow;
 
 const SAVE_DRAFT_OUTCOME_UNKNOWN: &str = "workflow draft outcome is uncertain after an I/O, serialization, or response error; reconcile the original plan before retrying";
 const PUBLISH_OUTCOME_UNKNOWN: &str = "workflow publication outcome is uncertain after an I/O, serialization, or response error; reconcile the original plan before retrying";
@@ -58,8 +61,9 @@ struct PrepareTaskRequest {
     budgets: ExecutionBudgets,
 }
 
-/// Strict stdin request accepted by `prepare-task-exact`, requiring all five explicit budgets and
-/// supporting opt-in exact-file `task.required_changed_paths`.
+/// Strict stdin request accepted by `prepare-task-exact`, requiring all five explicit budgets,
+/// supporting opt-in exact-file `task.required_changed_paths`, and supporting optional top-level
+/// `forecast` complexity/summary input for bounded before-dispatch shadow advice.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PrepareTaskExactRequest {
@@ -73,10 +77,18 @@ struct PrepareTaskExactRequest {
     summary: String,
     task: PrepareTaskExactTask,
     budgets: ExplicitBudgets,
+    #[serde(default)]
+    forecast: Option<shadow::ForecastInput>,
 }
 
 impl PrepareTaskExactRequest {
-    fn into_parts(self) -> (PrepareTaskRequest, Option<Vec<String>>) {
+    fn into_parts(
+        self,
+    ) -> (
+        PrepareTaskRequest,
+        Option<Vec<String>>,
+        Option<shadow::ForecastInput>,
+    ) {
         let PrepareTaskExactTask {
             id,
             title,
@@ -109,8 +121,23 @@ impl PrepareTaskExactRequest {
                 budgets: self.budgets.into(),
             },
             required_changed_paths,
+            self.forecast,
         )
     }
+}
+
+/// Bounded stdout receipt returned by `prepare-task` and `prepare-task-exact`.
+///
+/// Legacy requests that omit `forecast` serialize the exact unchanged `{preview_path, preview}`
+/// (plus typed v2 `record_request` when `required_changed_paths` is set) wire shape.
+#[derive(Debug, Serialize)]
+struct PrepareTaskPreviewReceipt {
+    preview_path: PathBuf,
+    preview: OperatorApprovalPreview,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    record_request: Option<OperatorApprovalRequestV2>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    forecast: Option<shadow::ShadowForecastReceipt>,
 }
 
 /// Strict single-task object accepted before conversion to the canonical [`PlanTask`].
@@ -197,15 +224,21 @@ pub(super) async fn run_prepare_task(
     fixed_scope: &FixedApprovalScope,
     exact_budgets: bool,
 ) -> Result<(), CliError> {
-    let (request, required_changed_paths): (PrepareTaskRequest, Option<Vec<String>>) =
-        if exact_budgets {
-            let explicit: PrepareTaskExactRequest = load_stdin_json()?;
-            explicit.into_parts()
-        } else {
-            (load_stdin_json()?, None)
-        };
+    let (request, required_changed_paths, raw_forecast): (
+        PrepareTaskRequest,
+        Option<Vec<String>>,
+        Option<shadow::ForecastInput>,
+    ) = if exact_budgets {
+        let explicit: PrepareTaskExactRequest = load_stdin_json()?;
+        explicit.into_parts()
+    } else {
+        (load_stdin_json()?, None, None)
+    };
     let task = PlanTask::from(request.task.clone());
     let scope = prevalidate_request(dirs, fixed_scope, &request, &task)?;
+    let forecast = raw_forecast
+        .map(|input| shadow::ValidatedForecast::validate(input, &scope.canonical_repo))
+        .transpose()?;
 
     verify_live_binding_at(dirs, &scope.binding_id, &scope.thread_uuid).await?;
 
@@ -259,6 +292,7 @@ pub(super) async fn run_prepare_task(
         &workflow,
         &validated_task_paths,
         validated_required_paths.as_deref(),
+        forecast.as_ref(),
         &saved,
         &mut recovery,
     )
@@ -278,13 +312,14 @@ async fn finish_prepare_task(
     workflow: &ScopedWorkflow,
     validated_task_paths: &[String],
     validated_required_paths: Option<&[String]>,
+    forecast: Option<&shadow::ValidatedForecast>,
     saved: &PlanSummary,
     recovery: &mut Option<RecoveryContext>,
 ) -> Result<(), CliError> {
     verify_persisted_draft(workflow, saved, request, task)?;
 
     verify_live_binding_at(dirs, &scope.binding_id, &scope.thread_uuid).await?;
-    ensure_current_registry_revision(workflow, request.profile_revision)?;
+    let registry_snapshot = ensure_current_registry_revision(workflow, request.profile_revision)?;
 
     let published = workflow
         .publish(&saved.plan_id, saved.revision)
@@ -339,10 +374,25 @@ async fn finish_prepare_task(
 
     let record_request = optional_record_request(&preview)?;
     let (preview_path, directory) = write_private_preview_file(&preview)?;
-    let receipt = PrivatePreviewReceipt {
+    let forecast_receipt = forecast.map(|validated| {
+        shadow::run_before_dispatch_forecast(&shadow::BeforeDispatchForecastContext {
+            registry_dir: &dirs.registry_dir,
+            plans_dir: &dirs.plans_dir,
+            canonical_repo: &scope.canonical_repo,
+            registry_snapshot: &registry_snapshot,
+            profile_id: &request.profile_id,
+            profile_revision: request.profile_revision,
+            task_id: &task.id,
+            baseline_difficulty: task.difficulty,
+            preview: &preview,
+            forecast: validated,
+        })
+    });
+    let receipt = PrepareTaskPreviewReceipt {
         preview_path,
         preview,
         record_request,
+        forecast: forecast_receipt,
     };
 
     // The receipt is serialized before stdout so an oversized or failed response leaves no
@@ -652,6 +702,7 @@ fn validate_preview(
     if approved_task.task_id != task.id
         || approved_task.instruction != task.instruction
         || approved_task.role != WorkflowRole::Coder
+        || approved_task.difficulty != task.difficulty
         || !approved_task.depends_on.is_empty()
         || approved_task.allowed_write_paths.as_slice() != validated_task_paths
         || approved_task.required_changed_paths.as_deref() != validated_required_paths
@@ -661,11 +712,12 @@ fn validate_preview(
     Ok(())
 }
 
-/// Rechecks the live registry revision immediately before publication.
+/// Rechecks the live registry revision immediately before publication and returns the validated
+/// snapshot for downstream read-only inspection.
 fn ensure_current_registry_revision(
     workflow: &ScopedWorkflow,
     expected_revision: u64,
-) -> Result<(), CliError> {
+) -> Result<RegistrySnapshot, CliError> {
     let snapshot = workflow
         .registry()
         .snapshot()
@@ -673,7 +725,7 @@ fn ensure_current_registry_revision(
     if snapshot.revision != expected_revision {
         return Err(stale_registry_error());
     }
-    Ok(())
+    Ok(snapshot)
 }
 
 /// Rejects a repository path that matches or overlaps any private store directory.

@@ -9,14 +9,16 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::os::unix::fs::{symlink, PermissionsExt};
+use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use threadlane::{Supervisor, SupervisorClient, SupervisorConfig, SupervisorHandle};
 use threadlane_authority::{
@@ -30,9 +32,9 @@ use threadlane_workers::{
     WorkerProvider, DEFAULT_GIT_COMMAND_TIMEOUT_MS,
 };
 use threadlane_workflow::{
-    compile_plan_revision, Difficulty, ModelChoice, ModelDefinition, PlanChange, PlanStatus,
-    PlanTask, RegistryChange, RoleAssignment, ToolAdapter, ToolDefinition, WorkflowProfile,
-    WorkflowRole,
+    compile_plan_revision, DecisionAdvisor, DecisionAdvisorMode, Difficulty, ModelChoice,
+    ModelDefinition, PlanChange, PlanStatus, PlanTask, RegistryChange, RoleAssignment, ToolAdapter,
+    ToolDefinition, WorkflowProfile, WorkflowRole,
 };
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
@@ -4288,6 +4290,1622 @@ async fn prepare_and_prepare_private_expose_record_request_only_for_some_r_and_r
         Some(vec!["src/extra.rs".to_string()])
     );
     fx.assert_no_worker_invocation();
+
+    fx.shutdown().await;
+}
+
+struct StagedApproveBinaries {
+    approve_exe: PathBuf,
+    context_exe: PathBuf,
+    advice_exe: PathBuf,
+}
+
+fn copy_executable_atomic(src: &Path, dst: &Path) {
+    let parent = dst.parent().expect("staged executable parent");
+    let tmp = parent.join(format!(
+        ".{}.tmp.{}",
+        dst.file_name().unwrap().to_string_lossy(),
+        uuid::Uuid::new_v4().simple()
+    ));
+    fs::copy(src, &tmp).expect("copy executable to temp path");
+    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755))
+        .expect("chmod copied executable 0755");
+    fs::rename(&tmp, dst).expect("atomically place staged executable");
+}
+
+fn write_executable_script_atomic(dst: &Path, script: &str) {
+    let parent = dst.parent().expect("script parent");
+    fs::create_dir_all(parent).expect("create script parent dir");
+    let tmp = parent.join(format!(
+        ".{}.tmp.{}",
+        dst.file_name().unwrap().to_string_lossy(),
+        uuid::Uuid::new_v4().simple()
+    ));
+    fs::write(&tmp, script).expect("write executable script");
+    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755))
+        .expect("chmod executable script 0755");
+    fs::rename(&tmp, dst).expect("atomically place executable script");
+}
+
+fn stage_approve_binaries(root: &Path) -> StagedApproveBinaries {
+    let pkg_dir = root.join("pkg");
+    let bin_dir = pkg_dir.join("bin");
+    fs::create_dir_all(&bin_dir).expect("create staged pkg/bin directory");
+    fs::set_permissions(&pkg_dir, fs::Permissions::from_mode(0o700))
+        .expect("chmod staged pkg directory 0700");
+    fs::set_permissions(&bin_dir, fs::Permissions::from_mode(0o700))
+        .expect("chmod staged pkg/bin directory 0700");
+
+    let approve_exe = bin_dir.join("threadlane-approve");
+    let context_exe = bin_dir.join("threadlane-context");
+    let advice_exe = bin_dir.join("threadlane-advice");
+    copy_executable_atomic(
+        Path::new(env!("CARGO_BIN_EXE_threadlane-approve")),
+        &approve_exe,
+    );
+    copy_executable_atomic(
+        Path::new(env!("CARGO_BIN_EXE_threadlane-context")),
+        &context_exe,
+    );
+    StagedApproveBinaries {
+        approve_exe,
+        context_exe,
+        advice_exe,
+    }
+}
+
+fn staged_command(exe: &Path) -> Command {
+    let mut command = Command::new(exe);
+    command
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null");
+    command
+}
+
+fn sha256_hex_bytes(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(64);
+    for byte in digest {
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    out
+}
+
+fn write_fake_advice_script(
+    advice_exe: &Path,
+    log_dir: &Path,
+    response_json: &str,
+    hold_flag: Option<&Path>,
+) {
+    let calls_dir = log_dir.join("calls");
+    fs::create_dir_all(&calls_dir).expect("create fake advice calls dir");
+    fs::set_permissions(&calls_dir, fs::Permissions::from_mode(0o700))
+        .expect("chmod fake advice calls dir 0700");
+
+    let hold_block = match hold_flag {
+        Some(flag) => format!(
+            "n=0\nwhile [ ! -f '{}' ] && [ \"$n\" -lt 8 ]; do\n  sleep 1\n  n=$((n + 1))\ndone\n",
+            flag.display()
+        ),
+        None => String::new(),
+    };
+    let escaped_response = response_json.replace('\'', "'\\''");
+    let script = format!(
+        "#!/bin/sh\n\
+set -eu\n\
+calls_dir='{calls}'\n\
+i=1\n\
+while ! mkdir \"$calls_dir/call-$i\" 2>/dev/null; do\n\
+  i=$((i + 1))\n\
+done\n\
+call_dir=\"$calls_dir/call-$i\"\n\
+req_path=''\n\
+expect_req=0\n\
+for arg in \"$@\"; do\n\
+  printf '%s\\n' \"$arg\" >> \"$call_dir/argv.txt\"\n\
+  if [ \"$expect_req\" -eq 1 ]; then\n\
+    req_path=\"$arg\"\n\
+    expect_req=0\n\
+  elif [ \"$arg\" = '--request' ]; then\n\
+    expect_req=1\n\
+  fi\n\
+done\n\
+if [ -n \"$req_path\" ] && [ -f \"$req_path\" ]; then\n\
+  cp \"$req_path\" \"$call_dir/request.json\"\n\
+fi\n\
+{hold_block}\
+printf '%s\\n' '{escaped_response}'\n",
+        calls = calls_dir.display(),
+    );
+    write_executable_script_atomic(advice_exe, &script);
+}
+
+fn fake_advice_call_dirs(log_dir: &Path) -> Vec<PathBuf> {
+    let calls_dir = log_dir.join("calls");
+    if !calls_dir.exists() {
+        return Vec::new();
+    }
+    directory_entries(&calls_dir)
+}
+
+async fn wait_for_non_empty_file(path: &Path, timeout: Duration) -> String {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(content) = fs::read_to_string(path)
+            .ok()
+            .filter(|text| !text.trim().is_empty())
+        {
+            return content;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for non-empty file {}",
+            path.display()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+fn configure_profile_shadow_advisor(
+    fx: &mut ApprovalFixture,
+    tool_id: &str,
+    adapter: ToolAdapter,
+    tool_enabled: bool,
+    model_id: &str,
+    model_arg: &str,
+    configure_advisor: bool,
+) {
+    let s1 = fx
+        .registry
+        .apply(
+            fx.registry_revision,
+            RegistryChange::UpsertTool {
+                tool: ToolDefinition {
+                    id: tool_id.to_string(),
+                    label: format!("Shadow fixture tool {tool_id}"),
+                    adapter,
+                    executable_path: None,
+                    enabled: tool_enabled,
+                },
+            },
+        )
+        .expect("upsert shadow advisor tool");
+    let s2 = fx
+        .registry
+        .apply(
+            s1.revision,
+            RegistryChange::UpsertModel {
+                model: ModelDefinition {
+                    id: model_id.to_string(),
+                    tool_id: tool_id.to_string(),
+                    label: model_arg.to_string(),
+                    model_arg: model_arg.to_string(),
+                    efforts: Vec::new(),
+                    allow_no_effort: true,
+                },
+            },
+        )
+        .expect("upsert shadow advisor model");
+    let s3 = fx
+        .registry
+        .apply(
+            s2.revision,
+            RegistryChange::UpsertProfile {
+                profile: WorkflowProfile {
+                    id: PROFILE_ID.to_string(),
+                    name: "Approval CLI shadow fixture profile".to_string(),
+                    assignments: vec![
+                        RoleAssignment {
+                            role: WorkflowRole::Coder,
+                            difficulty: Some(Difficulty::Easy),
+                            choice: ModelChoice {
+                                model_id: "model-deepseek-flash".to_string(),
+                                effort: Some("max".to_string()),
+                            },
+                        },
+                        RoleAssignment {
+                            role: WorkflowRole::Coder,
+                            difficulty: Some(Difficulty::Hard),
+                            choice: ModelChoice {
+                                model_id: "model-deepseek-flash".to_string(),
+                                effort: Some("max".to_string()),
+                            },
+                        },
+                    ],
+                    decision_advisor: configure_advisor.then(|| DecisionAdvisor {
+                        model_id: model_id.to_string(),
+                        mode: DecisionAdvisorMode::Shadow,
+                    }),
+                },
+            },
+        )
+        .expect("upsert profile with shadow advisor");
+    fx.registry_revision = s3.revision;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prepare_task_exact_forecast_bounds_and_legacy_rejection_before_mutation() {
+    let mut fx = ApprovalFixture::start().await;
+    let temp_dir = fx.private_preview_temp_dir();
+    let before = total_plan_revision_count(&fx);
+    let forecasts_root = fx.plans_dir.join("ordinary-forecasts");
+
+    // 1. Legacy `prepare-task` (non-exact) must reject `forecast` strictly before mutation.
+    let mut legacy_with_forecast = prepare_task_request(&fx, "legacy-rejects-forecast-1");
+    legacy_with_forecast["forecast"] = serde_json::json!({
+        "component_count": 2,
+        "coupled": false,
+        "uncertain": false,
+        "summary": "Should be rejected on legacy prepare-task"
+    });
+    let legacy_out = fx
+        .run_cli_with_stdin(
+            &prepare_task_args(&fx),
+            &prepare_task_bytes(&legacy_with_forecast),
+            Some(&temp_dir),
+        )
+        .await;
+    assert_eq!(
+        expect_failure(&legacy_out, "legacy prepare-task rejects forecast").code,
+        "invalid_input"
+    );
+    assert_eq!(total_plan_revision_count(&fx), before);
+    assert!(directory_entries(&temp_dir).is_empty());
+    assert!(!forecasts_root.exists());
+
+    // 2. Omitted `forecast` on `prepare-task-exact` keeps exact unchanged 2-key legacy behavior.
+    let exact_args = prepare_task_exact_args(&fx);
+    let omitted_req =
+        prepare_task_exact_request(&fx, "exact-forecast-omitted-1", vec!["src/lib.rs"], None);
+    let omitted_out = fx
+        .run_cli_with_stdin(
+            &exact_args,
+            &prepare_task_bytes(&omitted_req),
+            Some(&temp_dir),
+        )
+        .await;
+    let omitted_receipt: PrivatePreviewReceipt =
+        parse_success(&omitted_out, "prepare-task-exact without forecast");
+    let omitted_raw: Value =
+        serde_json::from_slice(&omitted_out.stdout).expect("omitted receipt JSON");
+    let omitted_obj = omitted_raw.as_object().expect("omitted receipt object");
+    assert_eq!(omitted_obj.len(), 2);
+    assert!(omitted_obj.get("forecast").is_none());
+    assert!(omitted_obj.get("record_request").is_none());
+    assert!(
+        !forecasts_root.exists(),
+        "omitted forecast must not create ordinary-forecasts directory"
+    );
+    let preview_file_text =
+        fs::read_to_string(&omitted_receipt.preview_path).expect("read omitted preview.json");
+    assert!(!preview_file_text.contains("forecast"));
+
+    // 3. Invalid `forecast` values fail upfront before any plan mutation, preview, or secret echo.
+    let after_omitted = total_plan_revision_count(&fx);
+    let before_previews = directory_entries(&temp_dir).len();
+    let oversize_ascii = format!(
+        "{SECRET_SENTINEL}{}",
+        "a".repeat(513 - SECRET_SENTINEL.len())
+    );
+    let oversize_utf8 = "é".repeat(257);
+    assert_eq!(oversize_utf8.len(), 514);
+    let newline_secret = format!("line1 {SECRET_SENTINEL}\nline2");
+    let nul_secret = format!("bad {SECRET_SENTINEL}\0nul");
+    let esc_secret = format!("bad {SECRET_SENTINEL}\x1besc");
+    let repo_in_summary = format!("Refactor inside {}", fx.repo.display());
+
+    let invalid_forecasts: Vec<(&str, Value)> = vec![
+        (
+            "component_count zero",
+            serde_json::json!({"component_count": 0, "coupled": false, "uncertain": false, "summary": "Valid text"}),
+        ),
+        (
+            "component_count 33",
+            serde_json::json!({"component_count": 33, "coupled": false, "uncertain": false, "summary": "Valid text"}),
+        ),
+        (
+            "component_count negative",
+            serde_json::json!({"component_count": -1, "coupled": false, "uncertain": false, "summary": "Valid text"}),
+        ),
+        (
+            "missing uncertain field",
+            serde_json::json!({"component_count": 1, "coupled": false, "summary": "Valid text"}),
+        ),
+        (
+            "unknown field inside forecast",
+            serde_json::json!({"component_count": 1, "coupled": false, "uncertain": false, "summary": "Valid text", "extra": true}),
+        ),
+        (
+            "empty summary",
+            serde_json::json!({"component_count": 1, "coupled": false, "uncertain": false, "summary": ""}),
+        ),
+        (
+            "whitespace-only summary",
+            serde_json::json!({"component_count": 1, "coupled": false, "uncertain": false, "summary": "   "}),
+        ),
+        (
+            "513 ASCII bytes summary",
+            serde_json::json!({"component_count": 1, "coupled": false, "uncertain": false, "summary": oversize_ascii}),
+        ),
+        (
+            "514 UTF-8 bytes summary",
+            serde_json::json!({"component_count": 1, "coupled": false, "uncertain": false, "summary": oversize_utf8}),
+        ),
+        (
+            "newline control char",
+            serde_json::json!({"component_count": 1, "coupled": false, "uncertain": false, "summary": newline_secret}),
+        ),
+        (
+            "nul control char",
+            serde_json::json!({"component_count": 1, "coupled": false, "uncertain": false, "summary": nul_secret}),
+        ),
+        (
+            "escape control char",
+            serde_json::json!({"component_count": 1, "coupled": false, "uncertain": false, "summary": esc_secret}),
+        ),
+        (
+            "local repository path in summary",
+            serde_json::json!({"component_count": 1, "coupled": false, "uncertain": false, "summary": repo_in_summary}),
+        ),
+    ];
+
+    for (idx, (label, bad_forecast)) in invalid_forecasts.into_iter().enumerate() {
+        let mut req = prepare_task_exact_request(
+            &fx,
+            &format!("exact-forecast-invalid-{idx}"),
+            vec!["src/lib.rs"],
+            None,
+        );
+        req["forecast"] = bad_forecast;
+        let out = fx
+            .run_cli_with_stdin(&exact_args, &prepare_task_bytes(&req), Some(&temp_dir))
+            .await;
+        assert_eq!(
+            expect_failure(&out, label).code,
+            "invalid_input",
+            "unexpected error code for {label}"
+        );
+        assert_no_secret_echo(&out, label);
+    }
+
+    assert_eq!(
+        total_plan_revision_count(&fx),
+        after_omitted,
+        "invalid forecast must fail before saving any plan draft"
+    );
+    assert_eq!(
+        directory_entries(&temp_dir).len(),
+        before_previews,
+        "invalid forecast must not create preview files"
+    );
+    assert!(
+        !forecasts_root.exists(),
+        "invalid forecast must not create ordinary-forecasts directory"
+    );
+
+    // 4. Exact 512 UTF-8 byte multi-byte boundary succeeds as a simple skipped forecast.
+    let exact_512 = "é".repeat(256);
+    assert_eq!(exact_512.len(), 512);
+    let mut boundary_req =
+        prepare_task_exact_request(&fx, "exact-forecast-boundary-512", vec!["src/lib.rs"], None);
+    boundary_req["forecast"] = serde_json::json!({
+        "component_count": 1,
+        "coupled": false,
+        "uncertain": false,
+        "summary": exact_512
+    });
+    let boundary_out = fx
+        .run_cli_with_stdin(
+            &exact_args,
+            &prepare_task_bytes(&boundary_req),
+            Some(&temp_dir),
+        )
+        .await;
+    let boundary_raw: Value = parse_success(&boundary_out, "exact 512-byte UTF-8 forecast");
+    assert_eq!(boundary_raw["forecast"]["status"], "skipped");
+    assert_eq!(boundary_raw["forecast"]["triggered"], false);
+    assert_eq!(
+        boundary_raw["forecast"]["summary_sha256"],
+        sha256_hex_bytes(exact_512.as_bytes())
+    );
+    let record_path = PathBuf::from(
+        boundary_raw["forecast"]["record_path"]
+            .as_str()
+            .expect("boundary record_path"),
+    );
+    assert_mode(&forecasts_root, 0o700, "ordinary-forecasts root");
+    assert_mode(
+        record_path.parent().expect("subject dir"),
+        0o700,
+        "subject forecast dir",
+    );
+    assert_mode(&record_path, 0o600, "forecast record.json");
+    let record_text = fs::read_to_string(&record_path).expect("read boundary record.json");
+    assert!(
+        !record_text.contains(&exact_512),
+        "record.json must never store raw forecast summary"
+    );
+    fx.assert_no_approval_artifacts();
+
+    fx.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prepare_task_exact_forecast_trigger_simple_skip_and_privacy_minimization() {
+    let mut fx = ApprovalFixture::start().await;
+    let temp_dir = fx.private_preview_temp_dir();
+    let staged = stage_approve_binaries(&fx.root);
+    let advice_log = fx.root.join("fake-advice-log");
+    let fake_advice_output = serde_json::json!({
+        "schema_version": 1,
+        "advisory_only": true,
+        "recommended_difficulty": "medium",
+        "baseline_difficulty": "hard",
+        "agrees_with_baseline": false,
+        "provider": "jev_api",
+        "model_arg": "jev-latest"
+    })
+    .to_string();
+    write_fake_advice_script(&staged.advice_exe, &advice_log, &fake_advice_output, None);
+
+    configure_profile_shadow_advisor(
+        &mut fx,
+        "jev-api",
+        ToolAdapter::JevApi,
+        true,
+        "jev-api:jev-latest",
+        "jev-latest",
+        true,
+    );
+
+    let exact_args = prepare_task_exact_args(&fx);
+    let forecasts_root = fx.plans_dir.join("ordinary-forecasts");
+
+    // 1. Capture baseline subject_digest WITHOUT forecast on a `hard` task carrying a secret in
+    // instruction/summary so we prove adding `forecast` never modifies the authority digest.
+    let mut base_req =
+        prepare_task_exact_request(&fx, "shadow-trigger-uncertain", vec!["src/lib.rs"], None);
+    base_req["summary"] = serde_json::json!(format!("Internal plan summary {SECRET_SENTINEL}"));
+    base_req["task"]["title"] = serde_json::json!(format!("Private title {SECRET_SENTINEL}"));
+    base_req["task"]["instruction"] = serde_json::json!(format!(
+        "Sensitive implementation instruction touching src/lib.rs with {SECRET_SENTINEL}."
+    ));
+    base_req["task"]["difficulty"] = serde_json::json!("hard");
+
+    let no_forecast_out = run_command_with_stdin(
+        staged_command(&staged.approve_exe),
+        &exact_args,
+        &prepare_task_bytes(&base_req),
+        Some(&temp_dir),
+    )
+    .await;
+    let no_forecast_receipt: PrivatePreviewReceipt = parse_success(
+        &no_forecast_out,
+        "baseline prepare-task-exact without forecast",
+    );
+    let baseline_subject = no_forecast_receipt.preview.subject_digest.clone();
+    assert!(fake_advice_call_dirs(&advice_log).is_empty());
+
+    // 2. Simple task (`component_count=1, coupled=false, uncertain=false`) records `skipped` and
+    // never invokes `threadlane-advice` or creates `advice-cache`.
+    let mut simple_req =
+        prepare_task_exact_request(&fx, "shadow-simple-skip", vec!["src/lib.rs"], None);
+    simple_req["task"]["difficulty"] = serde_json::json!("hard");
+    simple_req["task"]["instruction"] =
+        serde_json::json!(format!("Private simple instruction {SECRET_SENTINEL}."));
+    let simple_summary = "Isolated single-module tweak with clear contract";
+    simple_req["forecast"] = serde_json::json!({
+        "component_count": 1,
+        "coupled": false,
+        "uncertain": false,
+        "summary": simple_summary
+    });
+    let simple_out = run_command_with_stdin(
+        staged_command(&staged.approve_exe),
+        &exact_args,
+        &prepare_task_bytes(&simple_req),
+        Some(&temp_dir),
+    )
+    .await;
+    let simple_raw: Value = parse_success(&simple_out, "simple forecast skipped");
+    assert_eq!(simple_raw["forecast"]["advisory_only"], true);
+    assert_eq!(simple_raw["forecast"]["status"], "skipped");
+    assert_eq!(simple_raw["forecast"]["reason"], "simple_task");
+    assert_eq!(simple_raw["forecast"]["triggered"], false);
+    assert_eq!(simple_raw["forecast"]["reused"], false);
+    assert_eq!(simple_raw["forecast"]["launched"], false);
+    assert_eq!(simple_raw["forecast"]["baseline_difficulty"], "hard");
+    assert!(simple_raw["forecast"].get("advice_path").is_none());
+    let simple_subject = simple_raw["preview"]["subject_digest"]
+        .as_str()
+        .expect("simple subject_digest");
+    let simple_subject_dir = forecasts_root.join(simple_subject);
+    let simple_record_path = simple_subject_dir.join("record.json");
+    assert_mode(&forecasts_root, 0o700, "ordinary-forecasts root");
+    assert_mode(&simple_subject_dir, 0o700, "simple subject dir");
+    assert_mode(&simple_record_path, 0o600, "simple record.json");
+    assert_mode(
+        &simple_subject_dir.join("claim.json"),
+        0o600,
+        "simple claim.json",
+    );
+    assert!(!simple_subject_dir.join("request.json").exists());
+    assert!(!simple_subject_dir.join("advice.json").exists());
+    assert!(!fx.plans_dir.join("advice-cache").exists());
+    assert!(fake_advice_call_dirs(&advice_log).is_empty());
+
+    let simple_record_text = fs::read_to_string(&simple_record_path).expect("read simple record");
+    assert!(!simple_record_text.contains(simple_summary));
+    assert!(!simple_record_text.contains(SECRET_SENTINEL));
+    let simple_record: Value = serde_json::from_str(&simple_record_text).expect("parse record");
+    assert_eq!(simple_record["binding_id"], fx.binding_id);
+    assert_eq!(simple_record["thread_uuid"], THREAD_UUID);
+    assert_eq!(
+        simple_record["plan_id"],
+        simple_raw["preview"]["request"]["plan_id"]
+    );
+    assert_eq!(simple_record["plan_revision"], 1);
+    assert_eq!(simple_record["task_id"], "task-fast");
+    assert_eq!(simple_record["profile_id"], PROFILE_ID);
+    assert_eq!(simple_record["profile_revision"], fx.registry_revision);
+    assert_eq!(simple_record["base_commit"], fx.base_commit);
+    assert_eq!(simple_record["subject_digest"], simple_subject);
+    assert_eq!(simple_record["baseline_difficulty"], "hard");
+    assert_eq!(
+        simple_record["complexity"],
+        serde_json::json!({"component_count": 1, "coupled": false, "uncertain": false})
+    );
+    assert_eq!(
+        simple_record["summary_sha256"],
+        sha256_hex_bytes(simple_summary.as_bytes())
+    );
+    assert_eq!(simple_record["triggered"], false);
+    assert_eq!(simple_record["status"], "skipped");
+
+    // 3. All three trigger conditions (`uncertain`, `coupled`, `component_count > 1`) launch the
+    // canonical sibling `threadlane-advice` with minimized payload and exact CLI contract.
+    let trigger_cases = [
+        (
+            "shadow-trigger-uncertain",
+            1u32,
+            false,
+            true,
+            "Ambiguous protocol edge case needing classification",
+            true,
+        ),
+        (
+            "shadow-trigger-coupled",
+            1u32,
+            true,
+            false,
+            "Tightly coupled state machine transition change",
+            false,
+        ),
+        (
+            "shadow-trigger-components",
+            3u32,
+            false,
+            false,
+            "Coordinate updates across three subsystem layers",
+            false,
+        ),
+    ];
+
+    for (
+        idx,
+        (cmd_key, component_count, coupled, uncertain, shareable_summary, matches_baseline),
+    ) in trigger_cases.into_iter().enumerate()
+    {
+        let mut req = prepare_task_exact_request(&fx, cmd_key, vec!["src/lib.rs"], None);
+        req["summary"] = serde_json::json!(format!("Internal plan summary {SECRET_SENTINEL}"));
+        req["task"]["title"] = serde_json::json!(format!("Private title {SECRET_SENTINEL}"));
+        req["task"]["instruction"] = serde_json::json!(format!(
+            "Sensitive implementation instruction touching src/lib.rs with {SECRET_SENTINEL}."
+        ));
+        req["task"]["difficulty"] = serde_json::json!("hard");
+        req["forecast"] = serde_json::json!({
+            "component_count": component_count,
+            "coupled": coupled,
+            "uncertain": uncertain,
+            "summary": shareable_summary
+        });
+
+        let out = run_command_with_stdin(
+            staged_command(&staged.approve_exe),
+            &exact_args,
+            &prepare_task_bytes(&req),
+            Some(&temp_dir),
+        )
+        .await;
+        let raw: Value = parse_success(&out, cmd_key);
+        let subject_digest = raw["preview"]["subject_digest"]
+            .as_str()
+            .expect("triggered subject_digest");
+        if matches_baseline {
+            assert_eq!(
+                subject_digest, baseline_subject,
+                "adding forecast must never alter preview subject_digest"
+            );
+        }
+        assert_eq!(raw["forecast"]["advisory_only"], true);
+        assert_eq!(raw["forecast"]["status"], "launched");
+        assert_eq!(raw["forecast"]["reason"], "shadow_classify_launched");
+        assert_eq!(raw["forecast"]["triggered"], true);
+        assert_eq!(raw["forecast"]["reused"], false);
+        assert_eq!(raw["forecast"]["launched"], true);
+        assert_eq!(raw["forecast"]["baseline_difficulty"], "hard");
+        assert_eq!(raw["forecast"]["advisor"]["tool_id"], "jev-api");
+        assert_eq!(raw["forecast"]["advisor"]["model_id"], "jev-api:jev-latest");
+        assert_eq!(raw["forecast"]["advisor"]["adapter"], "jev_api");
+
+        let subject_dir = forecasts_root.join(subject_digest);
+        let record_path = subject_dir.join("record.json");
+        let request_path = subject_dir.join("request.json");
+        let advice_path = subject_dir.join("advice.json");
+        assert_mode(&subject_dir, 0o700, "triggered subject dir");
+        assert_mode(&record_path, 0o600, "triggered record.json");
+        assert_mode(&request_path, 0o600, "triggered request.json");
+        assert_mode(&advice_path, 0o600, "triggered advice.json");
+
+        let advice_text = wait_for_non_empty_file(&advice_path, Duration::from_secs(5)).await;
+        let advice_val: Value = serde_json::from_str(&advice_text).expect("parse advice.json");
+        assert_eq!(advice_val["recommended_difficulty"], "medium");
+
+        let record_text = fs::read_to_string(&record_path).expect("read triggered record.json");
+        assert!(
+            !record_text.contains(shareable_summary),
+            "record.json must store only summary_sha256, never raw summary"
+        );
+        assert!(!record_text.contains(SECRET_SENTINEL));
+        let record_val: Value = serde_json::from_str(&record_text).expect("parse record.json");
+        assert_eq!(
+            record_val["summary_sha256"],
+            sha256_hex_bytes(shareable_summary.as_bytes())
+        );
+        assert_eq!(record_val["baseline_difficulty"], "hard");
+        assert_eq!(record_val["complexity"]["component_count"], component_count);
+        assert_eq!(record_val["complexity"]["coupled"], coupled);
+        assert_eq!(record_val["complexity"]["uncertain"], uncertain);
+
+        let calls = fake_advice_call_dirs(&advice_log);
+        assert_eq!(
+            calls.len(),
+            idx + 1,
+            "expected one advice call per triggered task"
+        );
+        let call_dir = &calls[idx];
+        let argv_text = fs::read_to_string(call_dir.join("argv.txt")).expect("read advice argv");
+        let argv: Vec<&str> = argv_text.lines().collect();
+        let expected_cache_dir = fx.plans_dir.join("advice-cache");
+        assert_eq!(
+            argv,
+            vec![
+                "--registry-dir",
+                fx.registry_dir.to_str().unwrap(),
+                "--cache-dir",
+                expected_cache_dir.to_str().unwrap(),
+                "--project-root",
+                fx.repo.to_str().unwrap(),
+                "--context-id",
+                THREAD_UUID,
+                "--profile-id",
+                PROFILE_ID,
+                "classify",
+                "--request",
+                request_path.to_str().unwrap(),
+            ],
+            "threadlane-advice must be invoked with exact canonical flags and no --refresh"
+        );
+        assert!(!argv.contains(&"--refresh"));
+
+        let captured_request_text =
+            fs::read_to_string(call_dir.join("request.json")).expect("read captured request.json");
+        let captured_request: Value =
+            serde_json::from_str(&captured_request_text).expect("parse captured request.json");
+        assert_eq!(captured_request["schema_version"], 1);
+        assert_eq!(
+            captured_request["expected_registry_revision"],
+            fx.registry_revision
+        );
+        assert_eq!(captured_request["tool_id"], "jev-api");
+        assert_eq!(captured_request["model_id"], "jev-api:jev-latest");
+        assert_eq!(captured_request["task_id"], "task-fast");
+        assert_eq!(captured_request["task_revision"], 1);
+        assert!(
+            captured_request.get("baseline_difficulty").is_none(),
+            "outgoing shadow advice request must omit baseline_difficulty: {captured_request_text}"
+        );
+        assert!(
+            !captured_request_text.contains("hard"),
+            "outgoing shadow advice request must never leak Coworker baseline difficulty: {captured_request_text}"
+        );
+
+        let model_summary = captured_request["task_summary"]
+            .as_str()
+            .expect("task_summary string");
+        assert!(model_summary.contains(shareable_summary));
+        assert!(model_summary.contains(&format!(
+            "component_count={component_count}, coupled={coupled}, uncertain={uncertain}"
+        )));
+        assert!(
+            model_summary.contains("dependencies")
+                && model_summary.contains("uncertainty")
+                && model_summary
+                    .contains("component or file count alone does not determine difficulty"),
+            "model task_summary must include stable difficulty rubric: {model_summary}"
+        );
+        for forbidden in [
+            SECRET_SENTINEL,
+            "Sensitive implementation instruction",
+            "Internal plan summary",
+            "Private title",
+            "src/lib.rs",
+            fx.repo.to_str().unwrap(),
+            subject_digest,
+            raw["preview"]["request"]["plan_id"].as_str().unwrap(),
+            "hard",
+        ] {
+            assert!(
+                !model_summary.contains(forbidden),
+                "model task_summary must never include forbidden token `{forbidden}`: {model_summary}"
+            );
+        }
+    }
+
+    assert_eq!(fake_advice_call_dirs(&advice_log).len(), 3);
+    fx.assert_no_approval_artifacts();
+
+    fx.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prepare_task_exact_forecast_single_owner_concurrency_replay_and_post_crash_no_retry() {
+    let mut fx = ApprovalFixture::start().await;
+    let temp_dir = fx.private_preview_temp_dir();
+    let staged = stage_approve_binaries(&fx.root);
+    let advice_log = fx.root.join("single-owner-advice-log");
+    let fake_advice_output = serde_json::json!({
+        "schema_version": 1,
+        "advisory_only": true,
+        "recommended_difficulty": "hard",
+        "baseline_difficulty": "easy",
+        "agrees_with_baseline": false,
+        "provider": "openai_decisions_api",
+        "model_arg": "gpt-6-luna"
+    })
+    .to_string();
+    write_fake_advice_script(&staged.advice_exe, &advice_log, &fake_advice_output, None);
+
+    configure_profile_shadow_advisor(
+        &mut fx,
+        "openai-decisions",
+        ToolAdapter::OpenaiDecisionsApi,
+        true,
+        "openai-decisions:gpt-6-luna",
+        "gpt-6-luna",
+        true,
+    );
+
+    let exact_args = prepare_task_exact_args(&fx);
+    let forecasts_root = fx.plans_dir.join("ordinary-forecasts");
+
+    // 1. Sequential replay must never overwrite `record.json` or double-launch `threadlane-advice`.
+    let first_summary = "First owner forecast summary";
+    let mut replay_req =
+        prepare_task_exact_request(&fx, "shadow-replay-1", vec!["src/lib.rs"], None);
+    replay_req["forecast"] = serde_json::json!({
+        "component_count": 2,
+        "coupled": false,
+        "uncertain": true,
+        "summary": first_summary
+    });
+    let first_out = run_command_with_stdin(
+        staged_command(&staged.approve_exe),
+        &exact_args,
+        &prepare_task_bytes(&replay_req),
+        Some(&temp_dir),
+    )
+    .await;
+    let first_raw: Value = parse_success(&first_out, "first forecast launch");
+    assert_eq!(first_raw["forecast"]["status"], "launched");
+    assert_eq!(first_raw["forecast"]["launched"], true);
+    assert_eq!(first_raw["forecast"]["reused"], false);
+    assert_eq!(
+        first_raw["forecast"]["advisor"]["tool_id"],
+        "openai-decisions"
+    );
+    assert_eq!(
+        first_raw["forecast"]["advisor"]["adapter"],
+        "openai_decisions_api"
+    );
+
+    let replay_subject = first_raw["preview"]["subject_digest"]
+        .as_str()
+        .expect("replay subject_digest")
+        .to_string();
+    let replay_record_path = forecasts_root.join(&replay_subject).join("record.json");
+    let replay_advice_path = forecasts_root.join(&replay_subject).join("advice.json");
+    let _ = wait_for_non_empty_file(&replay_advice_path, Duration::from_secs(5)).await;
+    let orig_bytes = fs::read(&replay_record_path).expect("read original record.json");
+    let orig_meta = fs::symlink_metadata(&replay_record_path).expect("stat original record.json");
+
+    let mut second_req = replay_req.clone();
+    second_req["forecast"] = serde_json::json!({
+        "component_count": 5,
+        "coupled": true,
+        "uncertain": false,
+        "summary": "Different replay summary must not overwrite original"
+    });
+    let second_out = run_command_with_stdin(
+        staged_command(&staged.approve_exe),
+        &exact_args,
+        &prepare_task_bytes(&second_req),
+        Some(&temp_dir),
+    )
+    .await;
+    let second_raw: Value = parse_success(&second_out, "sequential forecast replay");
+    assert_eq!(second_raw["preview"]["subject_digest"], replay_subject);
+    assert_eq!(second_raw["forecast"]["status"], "launched");
+    assert_eq!(second_raw["forecast"]["reused"], true);
+    assert_eq!(second_raw["forecast"]["launched"], false);
+    assert_eq!(
+        second_raw["forecast"]["summary_sha256"],
+        sha256_hex_bytes(first_summary.as_bytes())
+    );
+    let after_bytes = fs::read(&replay_record_path).expect("read record.json after replay");
+    let after_meta =
+        fs::symlink_metadata(&replay_record_path).expect("stat record.json after replay");
+    assert_eq!(
+        after_bytes, orig_bytes,
+        "record.json must never be overwritten"
+    );
+    assert_eq!(after_meta.ino(), orig_meta.ino());
+    assert_eq!(after_meta.dev(), orig_meta.dev());
+    assert_eq!(
+        fake_advice_call_dirs(&advice_log).len(),
+        1,
+        "sequential replay must not double-launch threadlane-advice"
+    );
+
+    // 2. Concurrent processes racing on the same preview subject must launch at most once.
+    let concurrent_base =
+        prepare_task_exact_request(&fx, "shadow-concurrent-1", vec!["src/lib.rs"], None);
+    let pre_out = run_command_with_stdin(
+        staged_command(&staged.approve_exe),
+        &exact_args,
+        &prepare_task_bytes(&concurrent_base),
+        Some(&temp_dir),
+    )
+    .await;
+    let pre_receipt: PrivatePreviewReceipt =
+        parse_success(&pre_out, "pre-publish plan for concurrency race");
+    let concurrent_subject = pre_receipt.preview.subject_digest.clone();
+    assert!(!forecasts_root.join(&concurrent_subject).exists());
+
+    let mut concurrent_req = concurrent_base;
+    concurrent_req["forecast"] = serde_json::json!({
+        "component_count": 4,
+        "coupled": true,
+        "uncertain": true,
+        "summary": "Concurrent single-owner claim race test"
+    });
+    let concurrent_bytes = prepare_task_bytes(&concurrent_req);
+    let (o1, o2, o3, o4) = tokio::join!(
+        run_command_with_stdin(
+            staged_command(&staged.approve_exe),
+            &exact_args,
+            &concurrent_bytes,
+            Some(&temp_dir),
+        ),
+        run_command_with_stdin(
+            staged_command(&staged.approve_exe),
+            &exact_args,
+            &concurrent_bytes,
+            Some(&temp_dir),
+        ),
+        run_command_with_stdin(
+            staged_command(&staged.approve_exe),
+            &exact_args,
+            &concurrent_bytes,
+            Some(&temp_dir),
+        ),
+        run_command_with_stdin(
+            staged_command(&staged.approve_exe),
+            &exact_args,
+            &concurrent_bytes,
+            Some(&temp_dir),
+        ),
+    );
+    let mut launched_count = 0usize;
+    let mut reused_count = 0usize;
+    for (idx, out) in [o1, o2, o3, o4].into_iter().enumerate() {
+        let raw: Value = parse_success(&out, &format!("concurrent forecast process {idx}"));
+        assert_eq!(raw["preview"]["subject_digest"], concurrent_subject);
+        if raw["forecast"]["launched"] == true {
+            launched_count += 1;
+            assert_eq!(raw["forecast"]["reused"], false);
+            assert_eq!(raw["forecast"]["status"], "launched");
+        } else {
+            reused_count += 1;
+            assert_eq!(raw["forecast"]["reused"], true);
+            let status = raw["forecast"]["status"]
+                .as_str()
+                .expect("reused forecast status");
+            assert!(
+                matches!(status, "launched" | "unknown"),
+                "concurrent loser must report existing launched record or unknown claim_exists, got {status}"
+            );
+        }
+    }
+    assert_eq!(
+        launched_count, 1,
+        "exactly one concurrent process may launch"
+    );
+    assert_eq!(reused_count, 3);
+    let _ = wait_for_non_empty_file(
+        &forecasts_root.join(&concurrent_subject).join("advice.json"),
+        Duration::from_secs(5),
+    )
+    .await;
+    assert_eq!(
+        fake_advice_call_dirs(&advice_log).len(),
+        2,
+        "4 concurrent processes must produce exactly 1 new advice launch"
+    );
+
+    // 3. Simulated post-crash state (claim.json exists without record.json) reports `unknown`
+    // (`claim_exists`) and NEVER self-retries or blocks the valid preview.
+    let crash_base = prepare_task_exact_request(&fx, "shadow-crash-1", vec!["src/lib.rs"], None);
+    let crash_pre_out = run_command_with_stdin(
+        staged_command(&staged.approve_exe),
+        &exact_args,
+        &prepare_task_bytes(&crash_base),
+        Some(&temp_dir),
+    )
+    .await;
+    let crash_pre_receipt: PrivatePreviewReceipt =
+        parse_success(&crash_pre_out, "pre-publish plan for post-crash test");
+    let crash_subject = crash_pre_receipt.preview.subject_digest.clone();
+    let crash_subject_dir = forecasts_root.join(&crash_subject);
+    fs::create_dir_all(&crash_subject_dir).expect("create simulated crash subject dir");
+    fs::set_permissions(&crash_subject_dir, fs::Permissions::from_mode(0o700))
+        .expect("chmod simulated crash subject dir 0700");
+    write_private_bytes(
+        &crash_subject_dir.join("claim.json"),
+        format!(
+            "{{\"schema_version\":1,\"subject_digest\":\"{crash_subject}\",\"pid\":999999,\"claimed_at_ms\":1}}\n"
+        )
+        .as_bytes(),
+    );
+
+    let mut crash_req = crash_base;
+    crash_req["forecast"] = serde_json::json!({
+        "component_count": 3,
+        "coupled": false,
+        "uncertain": true,
+        "summary": "Post-crash retry must never double launch"
+    });
+    let crash_out = run_command_with_stdin(
+        staged_command(&staged.approve_exe),
+        &exact_args,
+        &prepare_task_bytes(&crash_req),
+        Some(&temp_dir),
+    )
+    .await;
+    let crash_raw: Value = parse_success(&crash_out, "post-crash forecast replay");
+    assert_eq!(crash_raw["preview"]["subject_digest"], crash_subject);
+    assert_eq!(crash_raw["forecast"]["status"], "unknown");
+    assert_eq!(crash_raw["forecast"]["reason"], "claim_exists");
+    assert_eq!(crash_raw["forecast"]["reused"], true);
+    assert_eq!(crash_raw["forecast"]["launched"], false);
+    assert!(!crash_subject_dir.join("record.json").exists());
+    assert_eq!(
+        fake_advice_call_dirs(&advice_log).len(),
+        2,
+        "post-crash state must never self-retry threadlane-advice"
+    );
+    fx.assert_no_approval_artifacts();
+
+    fx.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prepare_task_exact_forecast_nonblocking_advisory_failures_and_ordinary_callback_compatibility(
+) {
+    let mut fx = ApprovalFixture::start().await;
+    let temp_dir = fx.private_preview_temp_dir();
+    let staged = stage_approve_binaries(&fx.root);
+    let advice_log = fx.root.join("nonblocking-advice-log");
+    let release_flag = fx.root.join("release-slow-advice");
+    let slow_advice_json = serde_json::json!({
+        "schema_version": 1,
+        "advisory_only": true,
+        "recommended_difficulty": "hard",
+        "baseline_difficulty": "easy",
+        "agrees_with_baseline": false
+    })
+    .to_string();
+    write_fake_advice_script(
+        &staged.advice_exe,
+        &advice_log,
+        &slow_advice_json,
+        Some(&release_flag),
+    );
+
+    configure_profile_shadow_advisor(
+        &mut fx,
+        "jev-api",
+        ToolAdapter::JevApi,
+        true,
+        "jev-api:jev-latest",
+        "jev-latest",
+        true,
+    );
+
+    // 1. Routed through staged `threadlane-context` with both `required_changed_paths` (v2) and a
+    // slow detached `threadlane-advice`: caller must return immediately (no inherited pipe keeping
+    // stdout/stderr open), and ordinary `record --preview` / `record --request` callbacks must work.
+    let context_path = write_prepare_task_context(&fx, "shadow-nonblocking-context.json");
+    let context_args = vec![
+        "--context".to_string(),
+        context_path.display().to_string(),
+        "approve".to_string(),
+        "prepare-task-exact".to_string(),
+    ];
+    let mut nonblocking_req = prepare_task_exact_request(
+        &fx,
+        "shadow-nonblocking-r-1",
+        vec!["src/lib.rs", "src/extra.rs"],
+        Some(vec!["src/lib.rs"]),
+    );
+    nonblocking_req["forecast"] = serde_json::json!({
+        "component_count": 2,
+        "coupled": true,
+        "uncertain": false,
+        "summary": "Nonblocking shadow launch with exact required changed paths"
+    });
+
+    let started = Instant::now();
+    let nb_out = run_command_with_stdin(
+        staged_command(&staged.context_exe),
+        &context_args,
+        &prepare_task_bytes(&nonblocking_req),
+        Some(&temp_dir),
+    )
+    .await;
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "prepare-task-exact must return immediately without waiting for slow threadlane-advice (took {elapsed:?})"
+    );
+    let nb_raw: Value = parse_success(&nb_out, "nonblocking prepare-task-exact via context");
+    let nb_obj = nb_raw.as_object().expect("receipt object");
+    assert_eq!(nb_obj.len(), 4);
+    assert_eq!(nb_raw["forecast"]["status"], "launched");
+    assert_eq!(nb_raw["forecast"]["launched"], true);
+    let nb_receipt: PrivatePreviewReceipt = parse_success(
+        &nb_out,
+        "PrivatePreviewReceipt compatibility with forecast field",
+    );
+    let nb_subject = nb_receipt.preview.subject_digest.clone();
+    let preview_file_val: Value =
+        serde_json::from_slice(&fs::read(&nb_receipt.preview_path).expect("read preview.json"))
+            .expect("parse preview.json");
+    assert!(preview_file_val.get("forecast").is_none());
+    assert!(preview_file_val.get("record_request").is_none());
+
+    // Release slow child and confirm asynchronous completion into `advice.json`.
+    fs::write(&release_flag, b"go\n").expect("release slow fake advice");
+    let nb_advice_path = PathBuf::from(
+        nb_raw["forecast"]["advice_path"]
+            .as_str()
+            .expect("advice_path present"),
+    );
+    let nb_advice_text = wait_for_non_empty_file(&nb_advice_path, Duration::from_secs(5)).await;
+    let nb_advice_val: Value =
+        serde_json::from_str(&nb_advice_text).expect("parse async advice.json");
+    assert_eq!(nb_advice_val["recommended_difficulty"], "hard");
+
+    // Ordinary callbacks: `record --preview` and `record --request` (v2 `record_request`) succeed
+    // with the unmodified `subject_digest`.
+    let summary_preview: ApprovalSummary = parse_success(
+        &fx.run_record_preview(&nb_receipt.preview_path, &nb_subject, THREAD_UUID, true)
+            .await,
+        "record --preview on forecast-enabled prepare-task-exact",
+    );
+    assert_eq!(summary_preview.subject_digest, nb_subject);
+    let req_v2_path = fx.write_request("shadow-nb-record-req-v2.json", &nb_raw["record_request"]);
+    let summary_req: ApprovalSummary = parse_success(
+        &fx.run_record(&req_v2_path, &nb_subject, THREAD_UUID, true)
+            .await,
+        "record --request with stdout record_request on forecast-enabled prepare-task-exact",
+    );
+    assert_eq!(summary_req, summary_preview);
+    assert_eq!(fx.approval_count(), 1);
+    assert_eq!(
+        fx.persisted_record().tasks[0].required_changed_paths,
+        Some(vec!["src/lib.rs".to_string()])
+    );
+
+    // Non-R ordinary task with `forecast` keeps the v1 `preview.request` callback path working.
+    let exact_args = prepare_task_exact_args(&fx);
+    let mut non_r_req =
+        prepare_task_exact_request(&fx, "shadow-callback-v1-compat", vec!["src/lib.rs"], None);
+    non_r_req["forecast"] = serde_json::json!({
+        "component_count": 1,
+        "coupled": false,
+        "uncertain": false,
+        "summary": "Simple non-R task verifying legacy callback compatibility"
+    });
+    let non_r_out = run_command_with_stdin(
+        staged_command(&staged.approve_exe),
+        &exact_args,
+        &prepare_task_bytes(&non_r_req),
+        Some(&temp_dir),
+    )
+    .await;
+    let non_r_raw: Value = parse_success(&non_r_out, "non-R prepare-task-exact with forecast");
+    assert_eq!(
+        non_r_raw.as_object().expect("non-R receipt object").len(),
+        3
+    );
+    assert!(non_r_raw.get("record_request").is_none());
+    assert_eq!(non_r_raw["forecast"]["status"], "skipped");
+    let non_r_receipt: PrivatePreviewReceipt =
+        parse_success(&non_r_out, "non-R PrivatePreviewReceipt with forecast");
+    let non_r_subject = non_r_receipt.preview.subject_digest.clone();
+    let v1_req_path =
+        fx.write_request("shadow-v1-preview-req.json", &non_r_receipt.preview.request);
+    let v1_summary_req: ApprovalSummary = parse_success(
+        &fx.run_record(&v1_req_path, &non_r_subject, THREAD_UUID, true)
+            .await,
+        "record --request with v1 preview.request on forecast-enabled prepare-task-exact",
+    );
+    let v1_summary_preview: ApprovalSummary = parse_success(
+        &fx.run_record_preview(
+            &non_r_receipt.preview_path,
+            &non_r_subject,
+            THREAD_UUID,
+            true,
+        )
+        .await,
+        "record --preview replays v1 forecast-enabled approval idempotently",
+    );
+    assert_eq!(v1_summary_preview, v1_summary_req);
+    assert_eq!(fx.approval_count(), 2);
+
+    // 2. Advisory failures MUST NOT block valid preview, and never fall back or search PATH.
+    let calls_before_failures = fake_advice_call_dirs(&advice_log).len();
+
+    // (a) Profile without configured shadow advisor -> `unavailable` (`advisor_not_configured`).
+    configure_profile_shadow_advisor(
+        &mut fx,
+        "jev-api",
+        ToolAdapter::JevApi,
+        true,
+        "jev-api:jev-latest",
+        "jev-latest",
+        false,
+    );
+    let mut unconf_req =
+        prepare_task_exact_request(&fx, "shadow-fail-unconfigured", vec!["src/lib.rs"], None);
+    unconf_req["forecast"] = serde_json::json!({
+        "component_count": 2,
+        "coupled": false,
+        "uncertain": false,
+        "summary": "Unconfigured advisor must not block preview"
+    });
+    let unconf_out = run_command_with_stdin(
+        staged_command(&staged.approve_exe),
+        &exact_args,
+        &prepare_task_bytes(&unconf_req),
+        Some(&temp_dir),
+    )
+    .await;
+    let unconf_raw: Value =
+        parse_success(&unconf_out, "unconfigured advisor still returns preview");
+    assert_eq!(unconf_raw["forecast"]["status"], "unavailable");
+    assert_eq!(unconf_raw["forecast"]["reason"], "advisor_not_configured");
+    assert_eq!(unconf_raw["forecast"]["launched"], false);
+
+    // (b) Unsupported provider model_arg on profile's selected advisor -> `unavailable`
+    // (`advisor_invalid_model`), never falling back even though an enabled valid `jev-api` tool
+    // exists in the same registry snapshot.
+    configure_profile_shadow_advisor(
+        &mut fx,
+        "openai-decisions",
+        ToolAdapter::OpenaiDecisionsApi,
+        true,
+        "openai-decisions:gpt-5-nano",
+        "gpt-5-nano",
+        true,
+    );
+    let mut bad_model_req =
+        prepare_task_exact_request(&fx, "shadow-fail-bad-model", vec!["src/lib.rs"], None);
+    bad_model_req["forecast"] = serde_json::json!({
+        "component_count": 2,
+        "coupled": true,
+        "uncertain": false,
+        "summary": "Unsupported advisor model must not fall back to another tool"
+    });
+    let bad_model_out = run_command_with_stdin(
+        staged_command(&staged.approve_exe),
+        &exact_args,
+        &prepare_task_bytes(&bad_model_req),
+        Some(&temp_dir),
+    )
+    .await;
+    let bad_model_raw: Value = parse_success(
+        &bad_model_out,
+        "unsupported advisor model still returns preview",
+    );
+    assert_eq!(bad_model_raw["forecast"]["status"], "unavailable");
+    assert_eq!(bad_model_raw["forecast"]["reason"], "advisor_invalid_model");
+    assert_eq!(bad_model_raw["forecast"]["launched"], false);
+
+    // Re-enable valid Jev advisor for sibling binary and directory security failure checks.
+    configure_profile_shadow_advisor(
+        &mut fx,
+        "jev-api",
+        ToolAdapter::JevApi,
+        true,
+        "jev-api:jev-latest",
+        "jev-latest",
+        true,
+    );
+
+    // (c) Missing sibling `threadlane-advice` + hostile PATH decoy prepended before PATH ->
+    // `advice_binary_unavailable`, decoy never executed.
+    fs::remove_file(&staged.advice_exe).expect("remove sibling threadlane-advice");
+    let hostile_bin = fx.root.join("hostile-path-bin");
+    let hostile_marker = fx.root.join("hostile-decoy-invoked");
+    write_executable_script_atomic(
+        &hostile_bin.join("threadlane-advice"),
+        &format!(
+            "#!/bin/sh\nprintf 'decoy\\n' > '{}'\nexit 0\n",
+            hostile_marker.display()
+        ),
+    );
+    let mut missing_bin_req =
+        prepare_task_exact_request(&fx, "shadow-fail-missing-bin", vec!["src/lib.rs"], None);
+    missing_bin_req["forecast"] = serde_json::json!({
+        "component_count": 2,
+        "coupled": false,
+        "uncertain": true,
+        "summary": "Missing sibling advice binary must never search PATH"
+    });
+    let mut hostile_path = std::ffi::OsString::from(hostile_bin.as_os_str());
+    if let Some(existing_path) = std::env::var_os("PATH") {
+        hostile_path.push(":");
+        hostile_path.push(existing_path);
+    }
+    let mut missing_bin_cmd = staged_command(&staged.approve_exe);
+    missing_bin_cmd.env("PATH", &hostile_path);
+    let missing_bin_out = run_command_with_stdin(
+        missing_bin_cmd,
+        &exact_args,
+        &prepare_task_bytes(&missing_bin_req),
+        Some(&temp_dir),
+    )
+    .await;
+    let missing_bin_raw: Value = parse_success(
+        &missing_bin_out,
+        "missing sibling advice binary still returns preview",
+    );
+    assert_eq!(missing_bin_raw["forecast"]["status"], "unavailable");
+    assert_eq!(
+        missing_bin_raw["forecast"]["reason"],
+        "advice_binary_unavailable"
+    );
+    assert!(!hostile_marker.exists(), "PATH decoy must never be invoked");
+
+    // (d) Symlink sibling `threadlane-advice` -> `advice_binary_unsafe`, symlink target uninvoked.
+    symlink(hostile_bin.join("threadlane-advice"), &staged.advice_exe)
+        .expect("symlink sibling threadlane-advice");
+    let mut symlink_bin_req =
+        prepare_task_exact_request(&fx, "shadow-fail-symlink-bin", vec!["src/lib.rs"], None);
+    symlink_bin_req["forecast"] = serde_json::json!({
+        "component_count": 2,
+        "coupled": false,
+        "uncertain": true,
+        "summary": "Symlink sibling advice binary must be rejected"
+    });
+    let symlink_bin_out = run_command_with_stdin(
+        staged_command(&staged.approve_exe),
+        &exact_args,
+        &prepare_task_bytes(&symlink_bin_req),
+        Some(&temp_dir),
+    )
+    .await;
+    let symlink_bin_raw: Value = parse_success(
+        &symlink_bin_out,
+        "symlink sibling advice binary still returns preview",
+    );
+    assert_eq!(symlink_bin_raw["forecast"]["status"], "unavailable");
+    assert_eq!(
+        symlink_bin_raw["forecast"]["reason"],
+        "advice_binary_unsafe"
+    );
+    assert!(
+        !hostile_marker.exists(),
+        "symlink sibling target must never be invoked"
+    );
+
+    // (e) Insecure `0755` `ordinary-forecasts` directory -> `unknown`, never silently chmodded.
+    let forecasts_root = fx.plans_dir.join("ordinary-forecasts");
+    fs::set_permissions(&forecasts_root, fs::Permissions::from_mode(0o755))
+        .expect("chmod ordinary-forecasts 0755");
+    let mut bad_mode_req =
+        prepare_task_exact_request(&fx, "shadow-fail-dir-mode", vec!["src/lib.rs"], None);
+    bad_mode_req["forecast"] = serde_json::json!({
+        "component_count": 2,
+        "coupled": false,
+        "uncertain": false,
+        "summary": "Insecure forecast dir must fail closed without blocking preview"
+    });
+    let bad_mode_out = run_command_with_stdin(
+        staged_command(&staged.approve_exe),
+        &exact_args,
+        &prepare_task_bytes(&bad_mode_req),
+        Some(&temp_dir),
+    )
+    .await;
+    let bad_mode_raw: Value = parse_success(
+        &bad_mode_out,
+        "insecure ordinary-forecasts dir still returns preview",
+    );
+    assert_eq!(bad_mode_raw["forecast"]["status"], "unknown");
+    assert_eq!(bad_mode_raw["forecast"]["reason"], "forecasts_dir_invalid");
+    assert_mode(&forecasts_root, 0o755, "ordinary-forecasts mode preserved");
+
+    // (f) Symlink `ordinary-forecasts` directory -> `unknown`, target untouched.
+    fs::remove_dir_all(&forecasts_root).expect("remove ordinary-forecasts dir");
+    let outside_dir = fx.root.join("outside-forecasts-target");
+    fs::create_dir_all(&outside_dir).expect("create outside symlink target");
+    fs::set_permissions(&outside_dir, fs::Permissions::from_mode(0o700))
+        .expect("chmod outside target 0700");
+    symlink(&outside_dir, &forecasts_root).expect("symlink ordinary-forecasts");
+    let mut symlink_dir_req =
+        prepare_task_exact_request(&fx, "shadow-fail-dir-symlink", vec!["src/lib.rs"], None);
+    symlink_dir_req["forecast"] = serde_json::json!({
+        "component_count": 2,
+        "coupled": false,
+        "uncertain": false,
+        "summary": "Symlink forecast dir must fail closed without blocking preview"
+    });
+    let symlink_dir_out = run_command_with_stdin(
+        staged_command(&staged.approve_exe),
+        &exact_args,
+        &prepare_task_bytes(&symlink_dir_req),
+        Some(&temp_dir),
+    )
+    .await;
+    let symlink_dir_raw: Value = parse_success(
+        &symlink_dir_out,
+        "symlink ordinary-forecasts still returns preview",
+    );
+    assert_eq!(symlink_dir_raw["forecast"]["status"], "unknown");
+    assert_eq!(
+        symlink_dir_raw["forecast"]["reason"],
+        "forecasts_dir_invalid"
+    );
+    assert!(
+        directory_entries(&outside_dir).is_empty(),
+        "symlink ordinary-forecasts target must remain untouched"
+    );
+
+    assert_eq!(
+        fake_advice_call_dirs(&advice_log).len(),
+        calls_before_failures
+    );
+    fx.assert_no_worker_invocation();
+
+    fx.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prepare_task_exact_forecast_rubric_distinction_and_unbounded_history_preservation() {
+    let mut fx = ApprovalFixture::start().await;
+    let temp_dir = fx.private_preview_temp_dir();
+    let staged = stage_approve_binaries(&fx.root);
+    let advice_log = fx.root.join("rubric-history-advice-log");
+    let fake_advice_output = serde_json::json!({
+        "schema_version": 1,
+        "advisory_only": true,
+        "recommended_difficulty": "medium",
+        "baseline_difficulty": null,
+        "agrees_with_baseline": null,
+        "provider": "jev_api",
+        "model_arg": "jev-latest"
+    })
+    .to_string();
+    write_fake_advice_script(&staged.advice_exe, &advice_log, &fake_advice_output, None);
+
+    configure_profile_shadow_advisor(
+        &mut fx,
+        "jev-api",
+        ToolAdapter::JevApi,
+        true,
+        "jev-api:jev-latest",
+        "jev-latest",
+        true,
+    );
+
+    let exact_args = prepare_task_exact_args(&fx);
+    let forecasts_root = fx.plans_dir.join("ordinary-forecasts");
+
+    // 1. Seed 260 historical subject directories (exceeding the removed 256 cap) so we prove
+    // old records never permanently disable new forecasts and are never deleted.
+    fs::create_dir_all(&forecasts_root).expect("create ordinary-forecasts root");
+    fs::set_permissions(&forecasts_root, fs::Permissions::from_mode(0o700))
+        .expect("chmod ordinary-forecasts root 0700");
+    let historical_count = 260usize;
+    let mut historical_sentinels = Vec::with_capacity(historical_count);
+    for idx in 0..historical_count {
+        let dir = forecasts_root.join(format!("{idx:064x}"));
+        fs::create_dir(&dir).expect("create historical forecast subject dir");
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
+            .expect("chmod historical forecast subject dir 0700");
+        let record_path = dir.join("record.json");
+        let sentinel = format!("{{\"historical_index\":{idx}}}\n");
+        write_private_bytes(&record_path, sentinel.as_bytes());
+        historical_sentinels.push((dir, record_path, sentinel));
+    }
+
+    // 2. Two requests with identical shareable summary and equal component_count (3), differing
+    // only in coupling/uncertainty, must both launch past 256 historical directories and yield
+    // distinct normalized `task_summary` inputs and `request_summary_sha256` hashes while
+    // omitting `baseline_difficulty` on the wire and preserving it in local `record.json`.
+    let shared_summary = "Update three collaborating modules under one interface";
+    let mut decoupled_req =
+        prepare_task_exact_request(&fx, "shadow-rubric-decoupled", vec!["src/lib.rs"], None);
+    decoupled_req["task"]["difficulty"] = serde_json::json!("hard");
+    decoupled_req["forecast"] = serde_json::json!({
+        "component_count": 3,
+        "coupled": false,
+        "uncertain": false,
+        "summary": shared_summary
+    });
+
+    let mut coupled_uncertain_req = prepare_task_exact_request(
+        &fx,
+        "shadow-rubric-coupled-uncertain",
+        vec!["src/lib.rs"],
+        None,
+    );
+    coupled_uncertain_req["task"]["difficulty"] = serde_json::json!("hard");
+    coupled_uncertain_req["forecast"] = serde_json::json!({
+        "component_count": 3,
+        "coupled": true,
+        "uncertain": true,
+        "summary": shared_summary
+    });
+
+    let out_a = run_command_with_stdin(
+        staged_command(&staged.approve_exe),
+        &exact_args,
+        &prepare_task_bytes(&decoupled_req),
+        Some(&temp_dir),
+    )
+    .await;
+    let raw_a: Value = parse_success(&out_a, "decoupled forecast past 256 dirs");
+    assert_eq!(raw_a["forecast"]["status"], "launched");
+    assert_eq!(raw_a["forecast"]["launched"], true);
+    assert_eq!(raw_a["forecast"]["reused"], false);
+    assert_eq!(raw_a["forecast"]["baseline_difficulty"], "hard");
+    let subject_a = raw_a["preview"]["subject_digest"]
+        .as_str()
+        .expect("subject_a digest");
+    let dir_a = forecasts_root.join(subject_a);
+    let _ = wait_for_non_empty_file(&dir_a.join("advice.json"), Duration::from_secs(5)).await;
+
+    let out_b = run_command_with_stdin(
+        staged_command(&staged.approve_exe),
+        &exact_args,
+        &prepare_task_bytes(&coupled_uncertain_req),
+        Some(&temp_dir),
+    )
+    .await;
+    let raw_b: Value = parse_success(&out_b, "coupled/uncertain forecast past 256 dirs");
+    assert_eq!(raw_b["forecast"]["status"], "launched");
+    assert_eq!(raw_b["forecast"]["launched"], true);
+    assert_eq!(raw_b["forecast"]["reused"], false);
+    assert_eq!(raw_b["forecast"]["baseline_difficulty"], "hard");
+    let subject_b = raw_b["preview"]["subject_digest"]
+        .as_str()
+        .expect("subject_b digest");
+    let dir_b = forecasts_root.join(subject_b);
+    let _ = wait_for_non_empty_file(&dir_b.join("advice.json"), Duration::from_secs(5)).await;
+
+    assert_mode(&dir_a, 0o700, "new subject_a dir");
+    assert_mode(&dir_a.join("record.json"), 0o600, "new subject_a record");
+    assert_mode(&dir_a.join("request.json"), 0o600, "new subject_a request");
+    assert_mode(&dir_b, 0o700, "new subject_b dir");
+    assert_mode(&dir_b.join("record.json"), 0o600, "new subject_b record");
+    assert_mode(&dir_b.join("request.json"), 0o600, "new subject_b request");
+
+    let req_a_text =
+        fs::read_to_string(dir_a.join("request.json")).expect("read decoupled request.json");
+    let req_b_text =
+        fs::read_to_string(dir_b.join("request.json")).expect("read coupled request.json");
+    let req_a: Value = serde_json::from_str(&req_a_text).expect("parse req_a");
+    let req_b: Value = serde_json::from_str(&req_b_text).expect("parse req_b");
+    assert!(req_a.get("baseline_difficulty").is_none());
+    assert!(req_b.get("baseline_difficulty").is_none());
+
+    let normalize = |raw: &str| {
+        raw.replace("\r\n", "\n")
+            .replace('\r', "\n")
+            .trim()
+            .to_string()
+    };
+    let summary_a = normalize(req_a["task_summary"].as_str().expect("req_a task_summary"));
+    let summary_b = normalize(req_b["task_summary"].as_str().expect("req_b task_summary"));
+    assert_ne!(
+        summary_a, summary_b,
+        "equal component_count with differing coupling/uncertainty must yield distinct normalized input"
+    );
+    assert!(summary_a.contains("component_count=3, coupled=false, uncertain=false"));
+    assert!(summary_b.contains("component_count=3, coupled=true, uncertain=true"));
+    for summary in [&summary_a, &summary_b] {
+        assert!(summary.contains(shared_summary));
+        assert!(summary.contains("dependencies"));
+        assert!(summary.contains("uncertainty"));
+        assert!(summary.contains("component or file count alone does not determine difficulty"));
+    }
+
+    let rec_a_text = fs::read_to_string(dir_a.join("record.json")).expect("read rec_a");
+    let rec_b_text = fs::read_to_string(dir_b.join("record.json")).expect("read rec_b");
+    let rec_a: Value = serde_json::from_str(&rec_a_text).expect("parse rec_a");
+    let rec_b: Value = serde_json::from_str(&rec_b_text).expect("parse rec_b");
+    assert_eq!(rec_a["baseline_difficulty"], "hard");
+    assert_eq!(rec_b["baseline_difficulty"], "hard");
+    assert_eq!(rec_a["summary_sha256"], rec_b["summary_sha256"]);
+    assert_ne!(
+        rec_a["request_summary_sha256"], rec_b["request_summary_sha256"],
+        "distinct normalized model inputs must produce distinct request_summary_sha256"
+    );
+    assert_eq!(
+        rec_a["request_summary_sha256"],
+        sha256_hex_bytes(summary_a.as_bytes())
+    );
+    assert_eq!(
+        rec_b["request_summary_sha256"],
+        sha256_hex_bytes(summary_b.as_bytes())
+    );
+
+    // 3. Replay of `subject_a` remains idempotent (no second launch, no overwrite) and all 260
+    // historical directories remain untouched.
+    let replay_out = run_command_with_stdin(
+        staged_command(&staged.approve_exe),
+        &exact_args,
+        &prepare_task_bytes(&decoupled_req),
+        Some(&temp_dir),
+    )
+    .await;
+    let replay_raw: Value = parse_success(&replay_out, "idempotent replay past 256 dirs");
+    assert_eq!(replay_raw["preview"]["subject_digest"], subject_a);
+    assert_eq!(replay_raw["forecast"]["status"], "launched");
+    assert_eq!(replay_raw["forecast"]["reused"], true);
+    assert_eq!(replay_raw["forecast"]["launched"], false);
+    assert_eq!(fake_advice_call_dirs(&advice_log).len(), 2);
+
+    assert_eq!(
+        directory_entries(&forecasts_root).len(),
+        historical_count + 2
+    );
+    for (dir, record_path, sentinel) in historical_sentinels {
+        assert!(dir.is_dir(), "historical forecast dir must not be deleted");
+        assert_eq!(
+            fs::read_to_string(record_path).expect("read preserved historical record.json"),
+            sentinel
+        );
+    }
+    fx.assert_no_approval_artifacts();
 
     fx.shutdown().await;
 }

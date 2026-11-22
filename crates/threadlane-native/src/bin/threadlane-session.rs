@@ -29,6 +29,10 @@ use threadlane_native::{
     MAX_APPROVED_ACTIVITY_LIMIT, MAX_APPROVED_CANCEL_REASON_LEN, MAX_APPROVED_EVENT_BATCH_LIMIT,
 };
 
+/// Bounded read-only forecast comparison report for one scoped Worker backlog item.
+#[path = "threadlane-session/forecast_report.rs"]
+mod forecast_report;
+
 #[derive(Debug, Parser)]
 #[command(
     name = "threadlane-session",
@@ -277,6 +281,13 @@ enum SessionCommand {
         #[arg(long = "request", value_name = "ABS")]
         request: PathBuf,
     },
+    /// Inspect a bounded read-only forecast comparison report for one scoped Worker backlog item.
+    #[command(name = "forecast-report")]
+    ForecastReport {
+        /// Durable Worker backlog item identifier (`blg_<uuid>`).
+        #[arg(long = "item-id", value_name = "ID")]
+        item_id: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -371,6 +382,20 @@ async fn run(cli: Cli) -> Result<(), OperatorCliError> {
     let sessions_dir = canonical_dirs[4].clone();
 
     verify_binding(&state_dir, &globals.binding, &globals.thread).await?;
+
+    if let SessionCommand::ForecastReport { item_id } = &cli.command {
+        let report =
+            forecast_report::build_forecast_report(forecast_report::ForecastReportScope {
+                state_dir: &state_dir,
+                plans_dir: &plans_dir,
+                authority_dir: &authority_dir,
+                sessions_dir: &sessions_dir,
+                binding_id: &globals.binding,
+                thread_uuid: &globals.thread,
+                item_id,
+            })?;
+        return write_result(&globals.binding, &report, false);
+    }
 
     let Some((registry, plans)) = open_workflow_stores(Some(&registry_dir), Some(&plans_dir))
         .map_err(|err| map_native_error(&err))?
@@ -468,6 +493,9 @@ async fn run(cli: Cli) -> Result<(), OperatorCliError> {
             false,
         ),
         SessionCommand::ResolveChange { .. } => ("session.resolve-change", None, None, true),
+        SessionCommand::ForecastReport { .. } => {
+            unreachable!("forecast-report is handled read-only before opening mutable stores")
+        }
     };
 
     let parent_req = read_env_parent_request_id();
@@ -1026,6 +1054,9 @@ async fn run(cli: Cli) -> Result<(), OperatorCliError> {
                 ));
             }
             write_result(&globals.binding, &record, true)
+        }
+        SessionCommand::ForecastReport { .. } => {
+            unreachable!("forecast-report is handled read-only before opening mutable stores")
         }
         }
     }.await;
@@ -2296,6 +2327,7 @@ mod tests {
             vec!["threadlane-session", "record-change", "--help"],
             vec!["threadlane-session", "list-changes", "--help"],
             vec!["threadlane-session", "resolve-change", "--help"],
+            vec!["threadlane-session", "forecast-report", "--help"],
         ] {
             let err = Cli::try_parse_from(&help_args)
                 .expect_err("help invocation should return clap DisplayHelp");
@@ -2556,5 +2588,41 @@ mod tests {
         );
         assert_eq!(blocked.code, "blocked_by_conversation_change");
         assert!(blocked.message.contains("unresolved conversational change"));
+    }
+
+    #[test]
+    fn cli_parses_forecast_report_and_rejects_missing_item_id() {
+        let parsed = Cli::try_parse_from([
+            "threadlane-session",
+            "--state-dir",
+            "/tmp/state",
+            "--registry-dir",
+            "/tmp/registry",
+            "--plans-dir",
+            "/tmp/plans",
+            "--authority-dir",
+            "/tmp/authority",
+            "--sessions-dir",
+            "/tmp/sessions",
+            "--binding",
+            BINDING_A,
+            "--thread",
+            THREAD_A,
+            "forecast-report",
+            "--item-id",
+            "blg_0196ed00-0000-7000-8000-000000000001",
+        ])
+        .expect("parse forecast-report");
+        match parsed.command {
+            SessionCommand::ForecastReport { item_id } => {
+                assert_eq!(item_id, "blg_0196ed00-0000-7000-8000-000000000001");
+            }
+            other => panic!("expected ForecastReport, got {other:?}"),
+        }
+
+        assert!(
+            Cli::try_parse_from(["threadlane-session", "forecast-report"]).is_err(),
+            "forecast-report without --item-id must fail clap parsing"
+        );
     }
 }
