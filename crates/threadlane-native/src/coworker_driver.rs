@@ -2771,10 +2771,7 @@ impl CoworkerCodeDriver {
         let Some(ref lease) = runtime_state.lease else {
             return Ok(true);
         };
-        if !lease.active || now_ms.saturating_add(LEASE_RENEWAL_MARGIN_MS) >= lease.expires_at_ms {
-            return Ok(true);
-        }
-        Ok(false)
+        Ok(!lease.active || now_ms.saturating_add(LEASE_RENEWAL_MARGIN_MS) >= lease.expires_at_ms)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -5623,13 +5620,9 @@ fn owner_has_active_work(
     match mode {
         CoworkerDriverExecutionMode::FullAutomaticPipeline => {
             if let Some(pipe) = pipeline_report {
-                if pipe.status == CoworkerPipelineStatus::Running
+                pipe.status == CoworkerPipelineStatus::Running
                     || !pipe.in_flight_stages.is_empty()
                     || pipe.draining_in_flight_after_stop
-                {
-                    return true;
-                }
-                false
             } else {
                 step_report.is_some_and(report_has_active_work)
             }
@@ -6938,17 +6931,12 @@ fn live_owned_running_initial_coder_effect_matches(
                 | TaskExecutionStatus::Queued
         )
     };
-    if obs.command_key != expected_command_key
-        || !valid_obs_stage
-        || !valid_host_status
-        || obs.run_id.as_deref() != Some(receipt.run_id.as_str())
-        || obs.worker_id.as_deref() != Some(receipt.worker_id.as_str())
-        || (attempt.task_worktree_id.is_some() && obs.task_worktree_id != attempt.task_worktree_id)
-    {
-        return false;
-    }
-
-    true
+    obs.command_key == expected_command_key
+        && valid_obs_stage
+        && valid_host_status
+        && obs.run_id.as_deref() == Some(receipt.run_id.as_str())
+        && obs.worker_id.as_deref() == Some(receipt.worker_id.as_str())
+        && (attempt.task_worktree_id.is_none() || obs.task_worktree_id == attempt.task_worktree_id)
 }
 
 #[allow(clippy::too_many_arguments)]

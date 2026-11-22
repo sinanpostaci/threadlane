@@ -3644,7 +3644,7 @@ pub(crate) fn is_task_coder_execution_active(
     if has_active_coder_outbox {
         return true;
     }
-    let has_active_coder_effect = runtime_state.pending_effects.values().any(|eff| {
+    runtime_state.pending_effects.values().any(|eff| {
         eff.kind == PendingControllerEffectKind::CoderDispatch
             && eff.task_id.as_deref() == Some(task.task_id.as_str())
             && matches!(
@@ -3652,11 +3652,7 @@ pub(crate) fn is_task_coder_execution_active(
                 PendingControllerEffectStatus::ReservedBeforeEffect
                     | PendingControllerEffectStatus::EffectUnknown
             )
-    });
-    if has_active_coder_effect {
-        return true;
-    }
-    false
+    })
 }
 
 pub(crate) fn count_active_coder_executions(

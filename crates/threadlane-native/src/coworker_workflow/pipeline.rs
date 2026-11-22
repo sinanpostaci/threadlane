@@ -2509,10 +2509,7 @@ fn can_advance_to_job_completion(
                 format!("failed to read ConversationChangeStore: {err}"),
             )
         })?;
-    if change_summary.approval_superseded || !change_summary.blocking_changes.is_empty() {
-        return Ok(false);
-    }
-    Ok(true)
+    Ok(!change_summary.approval_superseded && change_summary.blocking_changes.is_empty())
 }
 
 fn collect_integrated_predecessor_selections(
