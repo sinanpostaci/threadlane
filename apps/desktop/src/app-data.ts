@@ -8,6 +8,9 @@ import {
   type WorkspaceProductionProjection,
   type WorkspaceSelectedChatLabelHint,
 } from './app-model.ts';
+import {
+  reconcileRefreshChatWorkPresenceEntries,
+} from './message-scroll.ts';
 import type {
   ObservationJob,
   ObservationRequest,
@@ -444,6 +447,44 @@ function reconcileRefreshNativeSamples(
   return normalizeWorkspaceSnapshot({
     ...incoming,
     native_samples: reconciledSamples,
+  });
+}
+
+/**
+ * Guards against regressed per-chat Worker presence samples on newer overall
+ * refreshes for the exact same chat, item, execution, and trustworthy
+ * host/invocation/claim epoch while preserving original observation expiry.
+ */
+function reconcileRefreshChatWorkWorkerPresence(
+  current: WorkspaceSnapshot | null,
+  incoming: WorkspaceSnapshot,
+): WorkspaceSnapshot {
+  if (
+    current === null ||
+    current.chat_work.length === 0 ||
+    incoming.chat_work.length === 0
+  ) {
+    return incoming;
+  }
+
+  const unavailableSourceIds = new Set<string>();
+  for (const source of incoming.observation.sources) {
+    if (source.availability !== 'available') {
+      unavailableSourceIds.add(source.id);
+    }
+  }
+
+  const reconciled = reconcileRefreshChatWorkPresenceEntries(
+    current.chat_work,
+    incoming.chat_work,
+    unavailableSourceIds,
+  );
+  if (!reconciled.replaced) {
+    return incoming;
+  }
+  return normalizeWorkspaceSnapshot({
+    ...incoming,
+    chat_work: reconciled.chatWork,
   });
 }
 
@@ -1218,7 +1259,14 @@ export class DesktopAppCoordinator {
         ticket.mode === 'refresh'
           ? reconcileRefreshNativeSamples(currentSnapshot, fetchedSnapshot)
           : fetchedSnapshot;
-      const nextSnapshot = reconcileSnapshotSourceHealth(sampleReconciled);
+      const presenceReconciled =
+        ticket.mode === 'refresh'
+          ? reconcileRefreshChatWorkWorkerPresence(
+              currentSnapshot,
+              sampleReconciled,
+            )
+          : sampleReconciled;
+      const nextSnapshot = reconcileSnapshotSourceHealth(presenceReconciled);
 
       const { firstVisibleKey, allKnownKeys, labelsByKey } =
         this.resolveFirstVisibleChatKey(

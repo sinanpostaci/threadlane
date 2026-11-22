@@ -18,12 +18,15 @@ use threadlane_workers::{
 use threadlane_workflow::{Difficulty, ToolAdapter, WorkflowRole};
 
 use crate::coworker_workflow::{
-    deterministic_prefixed_id, sha256_hex, validate_bounded_text,
-    validate_non_native_worker_choice, validate_unique_id_list, verify_grant_registry_dependencies,
-    verify_recovery_command_context, ArchitectAdviceRecord, ArchitectConsultationRequestOutcome,
+    compute_architect_question_digest, compute_orchestrator_context_digest,
+    deterministic_prefixed_id, is_valid_orchestrator_round_key, sha256_hex, validate_bounded_text,
+    validate_eligible_architect_advice_for_target, validate_non_native_worker_choice,
+    validate_unique_id_list, verify_grant_registry_dependencies, verify_recovery_command_context,
+    ArchitectAdviceEligibilityRequest, ArchitectAdviceRecord, ArchitectConsultationRequestOutcome,
     ArchitectDecisionStatus, CanonicalProjectBaseRef, CoworkerBindingLedger, CoworkerJobLockState,
     CoworkerJobOwnershipGuard, CoworkerJobOwnershipKey, CoworkerJobOwnershipStore,
     CoworkerOwnershipSummary, CoworkerPlanningService, CoworkerWorkflowStore,
+    EligibleArchitectAdviceTarget, HistoricalReservationOwnershipCache,
     HumanClarificationRequestOutcome, OrchestrateWorkBriefPlanRequest,
     PersistedPlanningCallArtifact, PlanningAdviceGrant, PlanningArtifactOutcomeKind,
     PlanningGrantStatus, PlanningReservationStatus, PlanningResultRef, PriorArchitectAdviceContext,
@@ -1318,7 +1321,8 @@ impl PlanningCommandStore {
                     };
                 }
 
-                let validated = match self.validate_new_command_against_stores(request, now_ms) {
+                let validated =
+                    match self.validate_new_command_against_stores(request, ledger, now_ms) {
                     Ok(v) => v,
                     Err(err) => {
                         return if abandoned_mutated {
@@ -1483,7 +1487,7 @@ impl PlanningCommandStore {
                     ledger.commands[cmd_idx].payload.clone(),
                 );
                 let current_ctx =
-                    match self.validate_new_command_against_stores(&claim_req, now_ms) {
+                    match self.validate_new_command_against_stores(&claim_req, ledger, now_ms) {
                         Ok(ctx) => ctx,
                         Err(err) => {
                             return if abandoned_mutated {
@@ -2110,6 +2114,7 @@ impl PlanningCommandStore {
     fn validate_new_command_against_stores(
         &self,
         request: &EnqueuePlanningCommandRequest,
+        command_ledger: &PlanningCommandBindingLedger,
         now_ms: u64,
     ) -> Result<ValidatedEnqueueContext, NativeError> {
         let wf_ledger = self
@@ -2309,72 +2314,45 @@ impl PlanningCommandStore {
                 let call_base = job.work_brief.project_base.clone();
                 verify_call_base_against_grant(&grant.project_base, &call_base)?;
 
+                let mut ownership_cache = HistoricalReservationOwnershipCache::new(
+                    self.workflow_store.plans_dir(),
+                    &self.registry_dir,
+                    Some(command_ledger),
+                );
                 let mut attached_advice = Vec::with_capacity(req.architect_advice_ids.len());
                 for advice_id in &req.architect_advice_ids {
-                    let adv = wf_ledger
-                        .architect_advice
-                        .iter()
-                        .find(|a| &a.advice_id == advice_id)
-                        .ok_or_else(|| {
-                            NativeError::new(
-                                NativeErrorCode::ValidationFailed,
-                                format!(
-                                    "referenced architect_advice_id `{advice_id}` was not found in binding ledger"
-                                ),
-                            )
-                        })?;
-                    adv.validate()?;
-                    if adv.context_dependencies.project_base != call_base
-                        || adv.context_dependencies.work_brief_digest != job.work_brief_digest
-                        || !constant_time_str_eq(
-                            &adv.context_dependencies.policy_digest,
-                            &grant.policy_digest,
-                        )
-                    {
-                        return Err(NativeError::new(
-                            NativeErrorCode::ValidationFailed,
-                            format!(
-                                "referenced ArchitectAdviceRecord `{advice_id}` is stale relative to job or grant"
-                            ),
-                        ));
-                    }
-                    verify_dependency_blobs_at_base(
-                        &call_base,
-                        &adv.context_dependencies.dependency_file_blobs,
+                    let adv = validate_eligible_architect_advice_for_target(
+                        &ArchitectAdviceEligibilityRequest {
+                            binding_id: &request.binding_id,
+                            thread_uuid: &request.thread_uuid,
+                            ledger: &wf_ledger,
+                            grant,
+                            artifacts_dir: self.artifacts_dir.as_deref(),
+                            target: EligibleArchitectAdviceTarget::RecordedJob {
+                                job,
+                                in_call_consulted_advice_ids: &[],
+                            },
+                            advice_id,
+                        },
+                        &mut ownership_cache,
                     )?;
-                    attached_advice.push((
-                        adv.advice_id.as_str(),
-                        adv.context_digest.as_str(),
-                        adv.decision_digest.as_str(),
-                    ));
+                    attached_advice.push(adv.clone());
                 }
 
-                let seed = (
-                    "threadlane-native:coworker-orchestrator-context:v1",
+                let context_digest = compute_orchestrator_context_digest(
                     &request.binding_id,
                     &request.thread_uuid,
-                    &grant.grant_id,
-                    &grant.profile_id,
-                    grant.registry_revision,
-                    &grant.policy_digest,
-                    &job.job_id,
-                    &job.work_brief_digest,
-                    &job.work_brief.project_base,
+                    grant,
+                    job,
                     req.plan_id.as_deref(),
                     req.expected_plan_revision,
                     &selected_choice,
                     &attached_advice,
-                );
-                let ctx_bytes = serde_json::to_vec(&seed).map_err(|_| {
-                    NativeError::new(
-                        NativeErrorCode::ProtocolError,
-                        "failed to serialize Orchestrator planning context for digest",
-                    )
-                })?;
+                )?;
                 Ok(ValidatedEnqueueContext {
                     selected_choice,
                     call_project_base: call_base,
-                    context_digest: sha256_hex(&ctx_bytes),
+                    context_digest,
                 })
             }
         }
@@ -3009,45 +2987,6 @@ impl PlanningCommandStore {
     }
 }
 
-fn compute_architect_question_digest(
-    question_summary: &str,
-    prior_advice: &[PriorArchitectAdviceContext],
-) -> Result<String, NativeError> {
-    if prior_advice.is_empty() {
-        return Ok(sha256_hex(question_summary.trim().as_bytes()));
-    }
-    let seed = (
-        "threadlane-native:coworker-architect-question:v1",
-        question_summary.trim(),
-        prior_advice,
-    );
-    let bytes = serde_json::to_vec(&seed).map_err(|_| {
-        NativeError::new(
-            NativeErrorCode::ProtocolError,
-            "failed to serialize Architect question and prior_advice_context for digest calculation",
-        )
-    })?;
-    Ok(sha256_hex(&bytes))
-}
-
-fn is_valid_orchestrator_round_key(
-    candidate_key: &str,
-    root_service_key: &str,
-    max_architect_rounds: u32,
-) -> bool {
-    if candidate_key == root_service_key {
-        return true;
-    }
-    let bounded_rounds = max_architect_rounds.min(MAX_ORCHESTRATOR_ARCHITECT_ROUNDS);
-    for round in 1..=bounded_rounds {
-        let expected = format!("{root_service_key}_orch_r{round}");
-        if candidate_key == expected {
-            return true;
-        }
-    }
-    false
-}
-
 fn ensure_ledger_thread(
     ledger: &mut PlanningCommandBindingLedger,
     thread_uuid: &str,
@@ -3422,6 +3361,60 @@ fn validate_existing_private_store_dir(dir: &Path, label: &str) -> Result<PathBu
         }
     }
     Ok(clean)
+}
+
+/// Pure read-only read of `binding_id`'s [`PlanningCommandBindingLedger`] when
+/// `planning_commands_dir(plans_dir)` and its per-binding ledger file exist.
+///
+/// Never creates directories, state files, or lockfiles. Returns `Ok(None)` when the commands
+/// directory or binding ledger file is absent (for example in direct-service workflows that never
+/// wrote a gateway command). Fails closed on symlinks, insecure permissions, corrupt JSON, invalid
+/// command digests, or thread scope mismatch.
+pub(crate) fn read_planning_command_ledger_readonly_if_present(
+    plans_dir: &Path,
+    binding_id: &str,
+    thread_uuid: &str,
+) -> Result<Option<PlanningCommandBindingLedger>, NativeError> {
+    ensure_platform_supported()?;
+    validate_bounded_identifier(binding_id, "binding_id", MAX_COWORKER_ID_LEN)?;
+    validate_canonical_thread_uuid("thread_uuid", thread_uuid).map_err(|_| {
+        NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            "thread_uuid must be a canonical lowercase hyphenated non-nil UUID",
+        )
+    })?;
+    let commands_dir = crate::planning_driver::planning_commands_dir(plans_dir);
+    let clean_commands_dir =
+        match validate_existing_private_store_dir(&commands_dir, "planning_commands_dir") {
+            Ok(dir) => dir,
+            Err(err) if err.code == NativeErrorCode::NotConfigured => return Ok(None),
+            Err(err) => return Err(err),
+        };
+    let path = clean_commands_dir.join(ledger_filename_for_binding(binding_id));
+    let Some(bytes) = read_private_file_bounded(
+        &path,
+        MAX_PLANNING_COMMAND_LEDGER_BYTES,
+        "planning_command_ledger",
+    )?
+    else {
+        return Ok(None);
+    };
+    let ledger: PlanningCommandBindingLedger = serde_json::from_slice(&bytes).map_err(|_| {
+        NativeError::new(
+            NativeErrorCode::ProtocolError,
+            "persisted planning command ledger JSON is corrupt or invalid",
+        )
+    })?;
+    ledger.validate(binding_id)?;
+    if let Some(ref pinned) = ledger.thread_uuid {
+        if pinned != thread_uuid {
+            return Err(NativeError::new(
+                NativeErrorCode::SecurityViolation,
+                "thread_uuid does not match the thread pinned to this binding's command ledger",
+            ));
+        }
+    }
+    Ok(Some(ledger))
 }
 
 fn binding_command_tag(binding_id: &str) -> String {

@@ -400,9 +400,10 @@ while [ ! -f '{}' ] && [ "$i" -lt 200 ]; do
     sleep 0.05
     i=$((i + 1))
 done
+MODE_FILE='{}'
 MODE="architect"
-if [ -f '{}' ]; then
-    MODE=$(cat '{}' | tr -d '[:space:]')
+if [ -f "$MODE_FILE" ]; then
+    MODE=$(cat "$MODE_FILE" | tr -d '[:space:]')
 fi
 printf '{{"event":"init","init":{{"session_id":"agy-gw-sess-1","model":"gemini-4-argon-high"}}}}\n'
 case "$MODE" in
@@ -410,15 +411,29 @@ case "$MODE" in
         RESPONSE_JSON='{{\"outcome\":\"requires_human_clarification\",\"schema_version\":1,\"summary\":\"Need human decision before planning\",\"questions\":[\"Should we support multiple commands per batch?\"],\"referenced_files\":[\"src/lib.rs\"]}}'
         ;;
     orch_ask_then_plan)
-        printf 'orch_ask_step_arch\n' > '{}'
+        printf 'orch_ask_step_arch\n' > "$MODE_FILE"
         RESPONSE_JSON='{{\"outcome\":\"requires_architect_advice\",\"schema_version\":1,\"summary\":\"Need Architect contract check before finalizing plan\",\"questions\":[{{\"question_id\":\"q_arch_1\",\"question_summary\":\"Confirm boundary contract for src/lib.rs\",\"dependency_files\":[\"src/lib.rs\"],\"interfaces\":[\"iface_gateway\"]}}]}}'
         ;;
     orch_ask_step_arch)
-        printf 'orch_plan\n' > '{}'
+        printf 'orch_plan\n' > "$MODE_FILE"
+        RESPONSE_JSON='{{\"schema_version\":1,\"decision_summary\":\"Keep strict planning command boundary\",\"rationale\":\"Verify completed command result against stored advice, reservation, and private artifact.\",\"recommended_write_paths\":[\"src/lib.rs\"],\"interface_contracts\":{{\"iface_gateway\":\"Stable contract v1\"}},\"open_questions\":[]}}'
+        ;;
+    orch_ask_then_clarify)
+        printf 'orch_ask_step_clarify\n' > "$MODE_FILE"
+        RESPONSE_JSON='{{\"outcome\":\"requires_architect_advice\",\"schema_version\":1,\"summary\":\"Need Advisor contract check before requesting clarification\",\"questions\":[{{\"question_id\":\"q_arch_1\",\"question_summary\":\"Confirm boundary contract for src/lib.rs\",\"dependency_files\":[\"src/lib.rs\"],\"interfaces\":[\"iface_gateway\"]}}]}}'
+        ;;
+    orch_ask_step_clarify)
+        printf 'orch_clarify\n' > "$MODE_FILE"
         RESPONSE_JSON='{{\"schema_version\":1,\"decision_summary\":\"Keep strict planning command boundary\",\"rationale\":\"Verify completed command result against stored advice, reservation, and private artifact.\",\"recommended_write_paths\":[\"src/lib.rs\"],\"interface_contracts\":{{\"iface_gateway\":\"Stable contract v1\"}},\"open_questions\":[]}}'
         ;;
     orch_plan)
         RESPONSE_JSON='{{\"outcome\":\"plan\",\"schema_version\":1,\"summary\":\"Implement gateway slice\",\"tasks\":[{{\"task_id\":\"task_gateway_core\",\"title\":\"Implement planning gateway\",\"description\":\"Wire MCP tools to sibling threadlane-flow.\",\"role\":\"coder\",\"difficulty\":\"hard\",\"depends_on\":[],\"allowed_write_paths\":[\"src/lib.rs\"],\"owned_interfaces\":[\"iface_gateway\"],\"consumed_interfaces\":[]}}],\"check_suggestions\":[{{\"check_id\":\"cargo_test_gateway\",\"command_summary\":\"cargo test -p threadlane-native --test coworker_planning_gateway\",\"required\":true}}],\"unconfirmed_proposal_notes\":[\"Proposal stays unconfirmed\"],\"resolved_open_questions\":[],\"deferred_proposals\":[]}}'
+        ;;
+    orch_plan_v2_same_iface)
+        RESPONSE_JSON='{{\"outcome\":\"plan\",\"schema_version\":1,\"summary\":\"Implement gateway slice revision 2\",\"tasks\":[{{\"task_id\":\"task_gateway_core\",\"title\":\"Implement planning gateway revision 2\",\"description\":\"Refine MCP tool wiring to sibling threadlane-flow without altering interface contract.\",\"role\":\"coder\",\"difficulty\":\"hard\",\"depends_on\":[],\"allowed_write_paths\":[\"src/lib.rs\"],\"owned_interfaces\":[\"iface_gateway\"],\"consumed_interfaces\":[]}}],\"check_suggestions\":[{{\"check_id\":\"cargo_test_gateway\",\"command_summary\":\"cargo test -p threadlane-native --test coworker_planning_gateway\",\"required\":true}}],\"unconfirmed_proposal_notes\":[\"Proposal stays unconfirmed\"],\"resolved_open_questions\":[],\"deferred_proposals\":[]}}'
+        ;;
+    orch_plan_v2_changed_iface)
+        RESPONSE_JSON='{{\"outcome\":\"plan\",\"schema_version\":1,\"summary\":\"Implement gateway slice with changed interface contract\",\"tasks\":[{{\"task_id\":\"task_gateway_core\",\"title\":\"Implement planning gateway v2 contract\",\"description\":\"Change owned interface contract to iface_gateway_v2.\",\"role\":\"coder\",\"difficulty\":\"hard\",\"depends_on\":[],\"allowed_write_paths\":[\"src/lib.rs\"],\"owned_interfaces\":[\"iface_gateway_v2\"],\"consumed_interfaces\":[]}}],\"check_suggestions\":[{{\"check_id\":\"cargo_test_gateway\",\"command_summary\":\"cargo test -p threadlane-native --test coworker_planning_gateway\",\"required\":true}}],\"unconfirmed_proposal_notes\":[\"Proposal stays unconfirmed\"],\"resolved_open_questions\":[],\"deferred_proposals\":[]}}'
         ;;
     *)
         RESPONSE_JSON='{{\"schema_version\":1,\"decision_summary\":\"Keep strict planning command boundary\",\"rationale\":\"Verify completed command result against stored advice, reservation, and private artifact.\",\"recommended_write_paths\":[\"src/lib.rs\"],\"interface_contracts\":{{\"iface_gateway\":\"Stable contract v1\"}},\"open_questions\":[]}}'
@@ -431,9 +446,6 @@ exit 0
         counter_path.display(),
         started_path.display(),
         release_path.display(),
-        mode_path.display(),
-        mode_path.display(),
-        mode_path.display(),
         mode_path.display(),
     );
     fs::write(script_path, script).expect("write fake worker");
@@ -3595,6 +3607,5070 @@ async fn consult_mixed_policy_explicit_role_rules_route_each_target_precisely() 
     );
     assert!(!architect_replay.launched);
     assert_eq!(provider_invocation_count(&fixture.worker_marker), 2);
+
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn direct_same_content_amendment_carries_verified_advisor_decision_explicit_and_implicit_through_publish_and_get_without_extra_reservation(
+) {
+    use threadlane_native::{open_workflow_stores, ScopedWorkflow};
+
+    let mut fixture = GatewayFixture::start().await;
+    let mcp = fixture.enrolled_mcp();
+    let now_ms = current_wall_clock_ms().expect("wall clock");
+    let wf_store =
+        CoworkerWorkflowStore::new(&fixture.plans_dir).expect("open CoworkerWorkflowStore");
+    let grant_id = wf_store
+        .create_planning_grant(&CreatePlanningGrantRequest {
+            binding_id: fixture.binding_id.clone(),
+            thread_uuid: THREAD_UUID.to_string(),
+            request_key: "req-grant-amend-advisor-carry".to_string(),
+            expected_ledger_revision: None,
+            project_base: fixture.project_base.clone(),
+            profile_id: PROFILE_ID.to_string(),
+            registry_revision: 3,
+            policy: advisor_policy(),
+            capabilities: PlanningReadOnlyCapabilities::strict_read_only(),
+            budget: PlanningCallBudget {
+                max_total_calls: 8,
+                max_orchestrator_calls: 4,
+                max_architect_calls: 4,
+                max_timeout_ms_per_call: 60_000,
+                max_output_bytes_per_call: 65_536,
+            },
+            created_at_ms: now_ms.saturating_sub(5_000),
+            expires_at_ms: now_ms + 3_600_000,
+            operator_attested: true,
+        })
+        .expect("create advisor planning grant")
+        .grant_id;
+
+    let summary = "Coordinate direct amendment with verified Advisor decision";
+    let confirmed_requirements = vec![
+        "Preserve verified Advisor provenance across direct amendments",
+        "Compile single-task plan for src/lib.rs",
+    ];
+    let proposed_additions = vec!["Optional summary export"];
+    let assumptions = vec!["Repository stays clean at HEAD"];
+    let open_questions = vec!["Should the boundary keep one contract interface?"];
+
+    // 1. Prepare initial job (`job_parent`).
+    let job_parent: PrepareWorkResponse = invoke_mcp_ok(
+        &mcp,
+        "prepare_work",
+        json!({
+            "grant_id": grant_id,
+            "request_key": "req-prep-parent-advisor-carry",
+            "summary": summary,
+            "confirmed_requirements": confirmed_requirements,
+            "proposed_additions": proposed_additions,
+            "assumptions": assumptions,
+            "open_questions": open_questions
+        }),
+    )
+    .await;
+    assert_eq!(job_parent.job_revision, 1);
+    assert_eq!(job_parent.kind, WorkBriefKind::NewJob);
+
+    // 2. Run real `consult_advisor` on `job_parent` via local fake provider.
+    let consult_submit: PlanningCommandSubmissionResponse = invoke_mcp_ok(
+        &mcp,
+        "consult_advisor",
+        json!({
+            "grant_id": grant_id,
+            "job_id": job_parent.job_id,
+            "request_key": "req-consult-parent-advisor-carry",
+            "question": "Should the direct amendment preserve strict command boundary?",
+            "dependency_files": ["src/lib.rs"],
+            "difficulty": "hard"
+        }),
+    )
+    .await;
+    assert_eq!(consult_submit.role, WorkflowRole::Advisor);
+    let consult_detail = wait_for_command_completion(&mcp, &consult_submit.command_id).await;
+    assert_eq!(
+        consult_detail.status,
+        PlanningCommandStatus::Completed,
+        "consult_detail did not complete cleanly: {}",
+        format_command_detail_context(&consult_detail)
+    );
+    let advice_id = match consult_detail.result_ref.as_ref() {
+        Some(PlanningCommandResultRef::ArchitectAdvice {
+            advice_id,
+            artifact_verified,
+            ..
+        }) => {
+            assert!(*artifact_verified);
+            advice_id.clone()
+        }
+        other => panic!("expected ArchitectAdvice result_ref, got {other:?}"),
+    };
+    assert_eq!(provider_invocation_count(&fixture.worker_marker), 1);
+
+    let orig_ledger = wf_store
+        .read_binding_ledger(&fixture.binding_id)
+        .expect("read ledger after consult");
+    let orig_advice = orig_ledger
+        .architect_advice
+        .iter()
+        .find(|a| a.advice_id == advice_id)
+        .expect("stored original Advisor record")
+        .clone();
+    assert_eq!(
+        orig_advice.context_dependencies.work_brief_digest,
+        job_parent.work_brief_digest
+    );
+    assert_eq!(orig_advice.status, ArchitectDecisionStatus::Proposed);
+
+    // 3. Create direct same-content amendment accepting `advice_id` (`amend_explicit`).
+    let amend_explicit_args = json!({
+        "grant_id": grant_id,
+        "request_key": "req-prep-amend-explicit",
+        "summary": summary,
+        "confirmed_requirements": confirmed_requirements,
+        "proposed_additions": proposed_additions,
+        "assumptions": assumptions,
+        "open_questions": open_questions,
+        "accepted_architect_decisions": [advice_id],
+        "amendment": {
+            "target_job_id": job_parent.job_id,
+            "target_job_revision": job_parent.job_revision,
+            "amendment_reason": "Incorporate verified Advisor decision into brief"
+        }
+    });
+    let amend_explicit: PrepareWorkResponse =
+        invoke_mcp_ok(&mcp, "prepare_work", amend_explicit_args.clone()).await;
+    assert_eq!(
+        amend_explicit.supersedes_job_id.as_deref(),
+        Some(job_parent.job_id.as_str())
+    );
+    assert_ne!(
+        amend_explicit.work_brief_digest,
+        job_parent.work_brief_digest
+    );
+    assert_eq!(
+        amend_explicit.work_brief.accepted_architect_decisions,
+        vec![advice_id.clone()]
+    );
+
+    // Idempotent retry of `prepare_work` returns the exact same amendment job.
+    let amend_explicit_retry: PrepareWorkResponse =
+        invoke_mcp_ok(&mcp, "prepare_work", amend_explicit_args).await;
+    assert_eq!(amend_explicit_retry.job_id, amend_explicit.job_id);
+    assert_eq!(
+        amend_explicit_retry.work_brief_digest,
+        amend_explicit.work_brief_digest
+    );
+
+    // 4. `request_technical_plan` with EXPLICIT `architect_advice_ids: [advice_id]` -> publish -> get.
+    fs::write(&fixture.mode_path, b"orch_plan\n").expect("set fake worker mode orch_plan");
+    let explicit_plan_args = json!({
+        "grant_id": grant_id,
+        "job_id": amend_explicit.job_id,
+        "request_key": "req-tech-plan-amend-explicit",
+        "architect_advice_ids": [advice_id],
+        "max_architect_rounds": 0,
+        "difficulty": "hard"
+    });
+    let explicit_submit: PlanningCommandSubmissionResponse =
+        invoke_mcp_ok(&mcp, "request_technical_plan", explicit_plan_args.clone()).await;
+    let explicit_detail = wait_for_command_completion(&mcp, &explicit_submit.command_id).await;
+    assert_eq!(
+        explicit_detail.status,
+        PlanningCommandStatus::Completed,
+        "explicit_detail did not complete cleanly: {}",
+        format_command_detail_context(&explicit_detail)
+    );
+    let explicit_pr = match explicit_detail.result_ref.as_ref() {
+        Some(PlanningCommandResultRef::OrchestratorPlan {
+            job_id,
+            planning_result,
+            artifact_verified,
+        }) => {
+            assert_eq!(job_id, &amend_explicit.job_id);
+            assert!(*artifact_verified);
+            planning_result.as_ref().clone()
+        }
+        other => panic!("expected OrchestratorPlan result_ref, got {other:?}"),
+    };
+    assert_eq!(
+        explicit_pr.work_brief_digest,
+        amend_explicit.work_brief_digest
+    );
+    assert_ne!(explicit_pr.work_brief_digest, job_parent.work_brief_digest);
+    assert_eq!(explicit_pr.architect_advice_ids, vec![advice_id.clone()]);
+    assert_eq!(explicit_pr.plan_status, PlanStatus::Published);
+    assert_eq!(explicit_pr.plan_revision, 1);
+
+    let (reg_arc, plans_arc) =
+        open_workflow_stores(Some(&fixture.registry_dir), Some(&fixture.plans_dir))
+            .expect("open workflow stores")
+            .expect("workflow stores configured");
+    let scoped = ScopedWorkflow::new(reg_arc, plans_arc, fixture.binding_id.clone())
+        .expect("ScopedWorkflow");
+    let explicit_published = scoped
+        .get_plan(&explicit_pr.plan_id, Some(1), None, None)
+        .expect("get published plan for explicit amendment");
+    assert_eq!(explicit_published.header.status, PlanStatus::Published);
+    assert_eq!(explicit_published.header.revision, 1);
+    assert_eq!(
+        explicit_published.header.plan_digest.as_deref(),
+        Some(explicit_pr.plan_digest.as_str())
+    );
+    assert_eq!(explicit_published.tasks.len(), 1);
+
+    // Original Advisor record in the ledger must remain completely unmodified.
+    let ledger_after_explicit = wf_store
+        .read_binding_ledger(&fixture.binding_id)
+        .expect("read ledger after explicit publish");
+    let stored_adv_after_explicit = ledger_after_explicit
+        .architect_advice
+        .iter()
+        .find(|a| a.advice_id == advice_id)
+        .expect("original Advisor record retained");
+    assert_eq!(stored_adv_after_explicit, &orig_advice);
+    let grant_after_explicit = ledger_after_explicit
+        .planning_grants
+        .iter()
+        .find(|g| g.grant_id == grant_id)
+        .expect("grant after explicit publish");
+    assert_eq!(grant_after_explicit.reservations.len(), 2);
+    assert_eq!(grant_after_explicit.usage.reserved_total_calls, 2);
+    assert_eq!(grant_after_explicit.usage.reserved_architect_calls, 1);
+    assert_eq!(grant_after_explicit.usage.reserved_orchestrator_calls, 1);
+    assert_eq!(provider_invocation_count(&fixture.worker_marker), 2);
+
+    // Re-reads (`planning_command`, `coworker_status`, `get_plan`) and idempotent replay (both
+    // explicit and omitted `architect_advice_ids` with the same `request_key`) must NEVER create
+    // a second reservation or invoke the provider again.
+    for _ in 0..3 {
+        let reread_detail: PlanningCommandDetailResponse = invoke_mcp_ok(
+            &mcp,
+            "planning_command",
+            json!({ "command_id": explicit_submit.command_id }),
+        )
+        .await;
+        assert_eq!(reread_detail.status, PlanningCommandStatus::Completed);
+        assert_eq!(
+            reread_detail
+                .orchestrator_plan_summary
+                .as_ref()
+                .expect("explicit plan summary")
+                .plan_id,
+            explicit_pr.plan_id
+        );
+
+        let reread_status: CoworkerStatusResponse =
+            invoke_mcp_ok(&mcp, "coworker_status", json!({})).await;
+        assert!(reread_status
+            .jobs
+            .iter()
+            .any(|j| j.job_id == amend_explicit.job_id && j.planning_result.is_some()));
+
+        let reread_plan = scoped
+            .get_plan(&explicit_pr.plan_id, None, None, None)
+            .expect("re-read published plan");
+        assert_eq!(reread_plan.header.revision, 1);
+    }
+    let replay_explicit: PlanningCommandSubmissionResponse =
+        invoke_mcp_ok(&mcp, "request_technical_plan", explicit_plan_args).await;
+    assert_eq!(replay_explicit.command_id, explicit_submit.command_id);
+    assert_eq!(
+        replay_explicit.submission_status,
+        PlanningCommandStartStatus::AlreadyCompleted
+    );
+    assert!(!replay_explicit.launched);
+
+    let replay_implicit_same_key: PlanningCommandSubmissionResponse = invoke_mcp_ok(
+        &mcp,
+        "request_technical_plan",
+        json!({
+            "grant_id": grant_id,
+            "job_id": amend_explicit.job_id,
+            "request_key": "req-tech-plan-amend-explicit",
+            "max_architect_rounds": 0,
+            "difficulty": "hard"
+        }),
+    )
+    .await;
+    assert_eq!(
+        replay_implicit_same_key.command_id,
+        explicit_submit.command_id
+    );
+    assert_eq!(
+        replay_implicit_same_key.submission_status,
+        PlanningCommandStartStatus::AlreadyCompleted
+    );
+    assert!(!replay_implicit_same_key.launched);
+
+    let grant_after_rereads = wf_store
+        .read_binding_ledger(&fixture.binding_id)
+        .expect("read ledger after rereads")
+        .planning_grants
+        .into_iter()
+        .find(|g| g.grant_id == grant_id)
+        .expect("grant after rereads");
+    assert_eq!(grant_after_rereads.reservations.len(), 2);
+    assert_eq!(grant_after_rereads.usage.reserved_total_calls, 2);
+    assert_eq!(provider_invocation_count(&fixture.worker_marker), 2);
+
+    // 5. Create a second direct same-content amendment (`amend_implicit`, targeting `job_parent`
+    //    at its updated revision 2) and call `request_technical_plan` OMITTING
+    //    `architect_advice_ids` so it resolves implicitly from `work_brief.accepted_architect_decisions`.
+    let amend_implicit: PrepareWorkResponse = invoke_mcp_ok(
+        &mcp,
+        "prepare_work",
+        json!({
+            "grant_id": grant_id,
+            "request_key": "req-prep-amend-implicit",
+            "summary": summary,
+            "confirmed_requirements": confirmed_requirements,
+            "proposed_additions": proposed_additions,
+            "assumptions": assumptions,
+            "open_questions": open_questions,
+            "accepted_architect_decisions": [advice_id],
+            "amendment": {
+                "target_job_id": job_parent.job_id,
+                "target_job_revision": 2,
+                "amendment_reason": "Incorporate verified Advisor decision for implicit plan flow"
+            }
+        }),
+    )
+    .await;
+    assert_eq!(
+        amend_implicit.supersedes_job_id.as_deref(),
+        Some(job_parent.job_id.as_str())
+    );
+    assert_ne!(
+        amend_implicit.work_brief_digest,
+        job_parent.work_brief_digest
+    );
+    assert_ne!(
+        amend_implicit.work_brief_digest,
+        amend_explicit.work_brief_digest
+    );
+
+    let implicit_plan_args = json!({
+        "grant_id": grant_id,
+        "job_id": amend_implicit.job_id,
+        "request_key": "req-tech-plan-amend-implicit",
+        "max_architect_rounds": 0,
+        "difficulty": "hard"
+    });
+    let implicit_submit: PlanningCommandSubmissionResponse =
+        invoke_mcp_ok(&mcp, "request_technical_plan", implicit_plan_args.clone()).await;
+    let implicit_detail = wait_for_command_completion(&mcp, &implicit_submit.command_id).await;
+    assert_eq!(
+        implicit_detail.status,
+        PlanningCommandStatus::Completed,
+        "implicit_detail did not complete cleanly: {}",
+        format_command_detail_context(&implicit_detail)
+    );
+    let implicit_pr = match implicit_detail.result_ref.as_ref() {
+        Some(PlanningCommandResultRef::OrchestratorPlan {
+            job_id,
+            planning_result,
+            artifact_verified,
+        }) => {
+            assert_eq!(job_id, &amend_implicit.job_id);
+            assert!(*artifact_verified);
+            planning_result.as_ref().clone()
+        }
+        other => panic!("expected OrchestratorPlan result_ref, got {other:?}"),
+    };
+    assert_eq!(
+        implicit_pr.work_brief_digest,
+        amend_implicit.work_brief_digest
+    );
+    assert_eq!(implicit_pr.architect_advice_ids, vec![advice_id.clone()]);
+    assert_eq!(implicit_pr.plan_status, PlanStatus::Published);
+    assert_ne!(implicit_pr.plan_id, explicit_pr.plan_id);
+
+    let implicit_published = scoped
+        .get_plan(&implicit_pr.plan_id, Some(1), None, None)
+        .expect("get published plan for implicit amendment");
+    assert_eq!(implicit_published.header.status, PlanStatus::Published);
+    assert_eq!(
+        implicit_published.header.plan_digest.as_deref(),
+        Some(implicit_pr.plan_digest.as_str())
+    );
+
+    // Re-read & replay on the implicit command must not add a reservation.
+    let replay_implicit: PlanningCommandSubmissionResponse =
+        invoke_mcp_ok(&mcp, "request_technical_plan", implicit_plan_args).await;
+    assert_eq!(replay_implicit.command_id, implicit_submit.command_id);
+    assert_eq!(
+        replay_implicit.submission_status,
+        PlanningCommandStartStatus::AlreadyCompleted
+    );
+    assert!(!replay_implicit.launched);
+    let _: PlanningCommandDetailResponse = invoke_mcp_ok(
+        &mcp,
+        "planning_command",
+        json!({ "command_id": implicit_submit.command_id }),
+    )
+    .await;
+    let _: CoworkerStatusResponse = invoke_mcp_ok(&mcp, "coworker_status", json!({})).await;
+
+    let ledger_after_implicit = wf_store
+        .read_binding_ledger(&fixture.binding_id)
+        .expect("read ledger after implicit publish");
+    assert_eq!(
+        ledger_after_implicit
+            .architect_advice
+            .iter()
+            .find(|a| a.advice_id == advice_id)
+            .expect("original Advisor record unchanged after implicit publish"),
+        &orig_advice
+    );
+    let grant_after_implicit = ledger_after_implicit
+        .planning_grants
+        .iter()
+        .find(|g| g.grant_id == grant_id)
+        .expect("grant after implicit publish");
+    assert_eq!(grant_after_implicit.reservations.len(), 3);
+    assert_eq!(grant_after_implicit.usage.reserved_total_calls, 3);
+    assert_eq!(grant_after_implicit.usage.reserved_architect_calls, 1);
+    assert_eq!(grant_after_implicit.usage.reserved_orchestrator_calls, 2);
+    assert_eq!(provider_invocation_count(&fixture.worker_marker), 3);
+
+    // 6. Fresh exact-digest path remains preserved (`consult_advisor` directly on `job_fresh` ->
+    //    `request_technical_plan` directly on `job_fresh`).
+    fs::write(&fixture.mode_path, b"architect\n").expect("set fake worker mode architect");
+    let job_fresh: PrepareWorkResponse = invoke_mcp_ok(
+        &mcp,
+        "prepare_work",
+        json!({
+            "grant_id": grant_id,
+            "request_key": "req-prep-fresh-exact-digest",
+            "summary": "Fresh exact-digest Advisor consultation and planning",
+            "confirmed_requirements": ["Preserve exact-digest path for unamended jobs"]
+        }),
+    )
+    .await;
+    let fresh_consult: PlanningCommandSubmissionResponse = invoke_mcp_ok(
+        &mcp,
+        "consult_advisor",
+        json!({
+            "grant_id": grant_id,
+            "job_id": job_fresh.job_id,
+            "request_key": "req-consult-fresh-exact-digest",
+            "question": "Verify fresh exact-digest consultation boundary?",
+            "dependency_files": ["src/lib.rs"],
+            "difficulty": "hard"
+        }),
+    )
+    .await;
+    let fresh_consult_detail = wait_for_command_completion(&mcp, &fresh_consult.command_id).await;
+    assert_eq!(
+        fresh_consult_detail.status,
+        PlanningCommandStatus::Completed
+    );
+    let fresh_advice_id = match fresh_consult_detail.result_ref.as_ref() {
+        Some(PlanningCommandResultRef::ArchitectAdvice { advice_id, .. }) => advice_id.clone(),
+        other => panic!("expected fresh ArchitectAdvice result_ref, got {other:?}"),
+    };
+    fs::write(&fixture.mode_path, b"orch_plan\n").expect("set fake worker mode orch_plan");
+    let fresh_plan: PlanningCommandSubmissionResponse = invoke_mcp_ok(
+        &mcp,
+        "request_technical_plan",
+        json!({
+            "grant_id": grant_id,
+            "job_id": job_fresh.job_id,
+            "request_key": "req-tech-plan-fresh-exact-digest",
+            "architect_advice_ids": [fresh_advice_id],
+            "max_architect_rounds": 0,
+            "difficulty": "hard"
+        }),
+    )
+    .await;
+    let fresh_plan_detail = wait_for_command_completion(&mcp, &fresh_plan.command_id).await;
+    assert_eq!(fresh_plan_detail.status, PlanningCommandStatus::Completed);
+    let fresh_pr = match fresh_plan_detail.result_ref.as_ref() {
+        Some(PlanningCommandResultRef::OrchestratorPlan {
+            planning_result, ..
+        }) => planning_result.as_ref().clone(),
+        other => panic!("expected fresh OrchestratorPlan result_ref, got {other:?}"),
+    };
+    assert_eq!(fresh_pr.work_brief_digest, job_fresh.work_brief_digest);
+    assert_eq!(fresh_pr.architect_advice_ids, vec![fresh_advice_id]);
+    assert_eq!(provider_invocation_count(&fixture.worker_marker), 5);
+
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn direct_amendment_advice_eligibility_preserves_rejections_across_prepare_enqueue_and_execution(
+) {
+    use threadlane_native::coworker_workflow::{
+        CoworkerLedgerMutationOutcome, CreateCoworkerJobRequest, OrchestrateWorkBriefPlanRequest,
+    };
+    use threadlane_native::{open_workflow_stores, RequestTechnicalPlanParams, ScopedWorkflow};
+
+    let mut fixture = GatewayFixture::start().await;
+    let mcp = fixture.enrolled_mcp();
+    let now_ms = current_wall_clock_ms().expect("wall clock");
+    let wf_store =
+        CoworkerWorkflowStore::new(&fixture.plans_dir).expect("open CoworkerWorkflowStore");
+
+    let grant_id = wf_store
+        .create_planning_grant(&CreatePlanningGrantRequest {
+            binding_id: fixture.binding_id.clone(),
+            thread_uuid: THREAD_UUID.to_string(),
+            request_key: "req-grant-neg-primary".to_string(),
+            expected_ledger_revision: None,
+            project_base: fixture.project_base.clone(),
+            profile_id: PROFILE_ID.to_string(),
+            registry_revision: 3,
+            policy: advisor_policy(),
+            capabilities: PlanningReadOnlyCapabilities::strict_read_only(),
+            budget: PlanningCallBudget {
+                max_total_calls: 12,
+                max_orchestrator_calls: 6,
+                max_architect_calls: 6,
+                max_timeout_ms_per_call: 60_000,
+                max_output_bytes_per_call: 65_536,
+            },
+            created_at_ms: now_ms.saturating_sub(5_000),
+            expires_at_ms: now_ms + 3_600_000,
+            operator_attested: true,
+        })
+        .expect("create primary advisor grant")
+        .grant_id;
+
+    let mut alt_policy = advisor_policy();
+    alt_policy.policy_id = "policy-gateway-advisor-alt".to_string();
+    let other_policy_grant_id = wf_store
+        .create_planning_grant(&CreatePlanningGrantRequest {
+            binding_id: fixture.binding_id.clone(),
+            thread_uuid: THREAD_UUID.to_string(),
+            request_key: "req-grant-neg-other-policy".to_string(),
+            expected_ledger_revision: None,
+            project_base: fixture.project_base.clone(),
+            profile_id: PROFILE_ID.to_string(),
+            registry_revision: 3,
+            policy: alt_policy,
+            capabilities: PlanningReadOnlyCapabilities::strict_read_only(),
+            budget: PlanningCallBudget {
+                max_total_calls: 6,
+                max_orchestrator_calls: 4,
+                max_architect_calls: 2,
+                max_timeout_ms_per_call: 60_000,
+                max_output_bytes_per_call: 65_536,
+            },
+            created_at_ms: now_ms.saturating_sub(5_000),
+            expires_at_ms: now_ms + 3_600_000,
+            operator_attested: true,
+        })
+        .expect("create other-policy advisor grant")
+        .grant_id;
+
+    let summary = "Validate strict direct amendment Advisor eligibility";
+    let reqs = vec![
+        "First ordered requirement for src/lib.rs",
+        "Second ordered requirement for strict provenance",
+    ];
+    let proposals = vec!["Optional telemetry summary"];
+    let assumptions = vec!["Local checkout stays clean"];
+    let questions = vec!["Keep single interface boundary?"];
+
+    let job_parent: PrepareWorkResponse = invoke_mcp_ok(
+        &mcp,
+        "prepare_work",
+        json!({
+            "grant_id": grant_id,
+            "request_key": "req-neg-prep-parent",
+            "summary": summary,
+            "confirmed_requirements": reqs,
+            "proposed_additions": proposals,
+            "assumptions": assumptions,
+            "open_questions": questions
+        }),
+    )
+    .await;
+    let job_foreign: PrepareWorkResponse = invoke_mcp_ok(
+        &mcp,
+        "prepare_work",
+        json!({
+            "grant_id": grant_id,
+            "request_key": "req-neg-prep-foreign",
+            "summary": "Separate unrelated job for foreign decision testing",
+            "confirmed_requirements": ["Produce an Advisor decision bound only to foreign job"]
+        }),
+    )
+    .await;
+
+    // Produce three genuine artifact-backed Advisor records:
+    // - `adv_accepted`: bound to `job_parent`, accepted into `job_valid_amend`
+    // - `adv_unaccepted_parent`: bound to `job_parent`, NOT accepted into `job_valid_amend`
+    // - `adv_foreign`: bound to `job_foreign`
+    let consult_and_get_advice = |job_id: String, req_key: &'static str, question: &'static str| {
+        let mcp = &mcp;
+        let grant_id = grant_id.clone();
+        async move {
+            let submit: PlanningCommandSubmissionResponse = invoke_mcp_ok(
+                mcp,
+                "consult_advisor",
+                json!({
+                    "grant_id": grant_id,
+                    "job_id": job_id,
+                    "request_key": req_key,
+                    "question": question,
+                    "dependency_files": ["src/lib.rs"],
+                    "difficulty": "hard"
+                }),
+            )
+            .await;
+            let detail = wait_for_command_completion(mcp, &submit.command_id).await;
+            assert_eq!(detail.status, PlanningCommandStatus::Completed);
+            match detail.result_ref.as_ref() {
+                Some(PlanningCommandResultRef::ArchitectAdvice {
+                    advice_id,
+                    report_artifact_id,
+                    ..
+                }) => (advice_id.clone(), report_artifact_id.clone()),
+                other => panic!("expected ArchitectAdvice result_ref, got {other:?}"),
+            }
+        }
+    };
+
+    let (adv_accepted, adv_accepted_artifact_id) = consult_and_get_advice(
+        job_parent.job_id.clone(),
+        "req-neg-consult-accepted",
+        "Primary Advisor decision for parent job",
+    )
+    .await;
+    let (adv_unaccepted_parent, _) = consult_and_get_advice(
+        job_parent.job_id.clone(),
+        "req-neg-consult-unaccepted",
+        "Secondary Advisor decision for parent job that will not be accepted",
+    )
+    .await;
+    let (adv_foreign, _) = consult_and_get_advice(
+        job_foreign.job_id.clone(),
+        "req-neg-consult-foreign",
+        "Foreign Advisor decision bound to unrelated job",
+    )
+    .await;
+
+    // Also create a job whose plan & interface contracts change AFTER its Advisor consult.
+    let job_iface_drift: PrepareWorkResponse = invoke_mcp_ok(
+        &mcp,
+        "prepare_work",
+        json!({
+            "grant_id": grant_id,
+            "request_key": "req-neg-prep-iface-drift",
+            "summary": "Verify interface and plan contract drift invalidates prior Advisor decision",
+            "confirmed_requirements": ["Detect interface contract changes after consultation"]
+        }),
+    )
+    .await;
+    let (adv_pre_plan, _) = consult_and_get_advice(
+        job_iface_drift.job_id.clone(),
+        "req-neg-consult-pre-plan",
+        "Pre-plan Advisor decision before interface ownership exists",
+    )
+    .await;
+    fs::write(&fixture.mode_path, b"orch_plan\n").expect("set fake worker mode orch_plan");
+    let pre_plan_pub: PlanningCommandSubmissionResponse = invoke_mcp_ok(
+        &mcp,
+        "request_technical_plan",
+        json!({
+            "grant_id": grant_id,
+            "job_id": job_iface_drift.job_id,
+            "request_key": "req-neg-pub-iface-drift",
+            "max_architect_rounds": 0,
+            "difficulty": "hard"
+        }),
+    )
+    .await;
+    let pre_plan_pub_detail = wait_for_command_completion(&mcp, &pre_plan_pub.command_id).await;
+    assert_eq!(pre_plan_pub_detail.status, PlanningCommandStatus::Completed);
+    let iface_drift_plan_id = pre_plan_pub_detail
+        .orchestrator_plan_summary
+        .as_ref()
+        .expect("iface_drift plan summary")
+        .plan_id
+        .clone();
+
+    let calls_baseline = provider_invocation_count(&fixture.worker_marker);
+    assert_eq!(calls_baseline, 5);
+    let reservations_baseline = wf_store
+        .read_binding_ledger(&fixture.binding_id)
+        .expect("ledger baseline")
+        .planning_grants
+        .into_iter()
+        .find(|g| g.grant_id == grant_id)
+        .expect("grant baseline")
+        .reservations
+        .len();
+    assert_eq!(reservations_baseline, 5);
+
+    // 1. `prepare_work` rejects every invalid semantic change, reordering, foreign decision,
+    //    non-amendment, revision mismatch, changed policy, declared amended_interfaces, and
+    //    post-consult interface/plan drift.
+    let prepare_negatives = [
+        (
+            "modified confirmed_requirements",
+            json!({
+                "grant_id": grant_id,
+                "request_key": "req-neg-prep-mod-req",
+                "summary": summary,
+                "confirmed_requirements": [
+                    "First ordered requirement for src/lib.rs",
+                    "MODIFIED requirement text"
+                ],
+                "proposed_additions": proposals,
+                "assumptions": assumptions,
+                "open_questions": questions,
+                "accepted_architect_decisions": [adv_accepted],
+                "amendment": {
+                    "target_job_id": job_parent.job_id,
+                    "target_job_revision": 1,
+                    "amendment_reason": "Modified requirement must fail"
+                }
+            }),
+        ),
+        (
+            "reordered confirmed_requirements",
+            json!({
+                "grant_id": grant_id,
+                "request_key": "req-neg-prep-reordered-req",
+                "summary": summary,
+                "confirmed_requirements": [
+                    "Second ordered requirement for strict provenance",
+                    "First ordered requirement for src/lib.rs"
+                ],
+                "proposed_additions": proposals,
+                "assumptions": assumptions,
+                "open_questions": questions,
+                "accepted_architect_decisions": [adv_accepted],
+                "amendment": {
+                    "target_job_id": job_parent.job_id,
+                    "target_job_revision": 1,
+                    "amendment_reason": "Reordered requirements must fail"
+                }
+            }),
+        ),
+        (
+            "modified summary",
+            json!({
+                "grant_id": grant_id,
+                "request_key": "req-neg-prep-mod-summary",
+                "summary": "Different summary text",
+                "confirmed_requirements": reqs,
+                "proposed_additions": proposals,
+                "assumptions": assumptions,
+                "open_questions": questions,
+                "accepted_architect_decisions": [adv_accepted],
+                "amendment": {
+                    "target_job_id": job_parent.job_id,
+                    "target_job_revision": 1,
+                    "amendment_reason": "Modified summary must fail"
+                }
+            }),
+        ),
+        (
+            "modified proposed_additions",
+            json!({
+                "grant_id": grant_id,
+                "request_key": "req-neg-prep-mod-proposal",
+                "summary": summary,
+                "confirmed_requirements": reqs,
+                "proposed_additions": ["Different proposal"],
+                "assumptions": assumptions,
+                "open_questions": questions,
+                "accepted_architect_decisions": [adv_accepted],
+                "amendment": {
+                    "target_job_id": job_parent.job_id,
+                    "target_job_revision": 1,
+                    "amendment_reason": "Modified proposed_additions must fail"
+                }
+            }),
+        ),
+        (
+            "modified assumptions",
+            json!({
+                "grant_id": grant_id,
+                "request_key": "req-neg-prep-mod-assumption",
+                "summary": summary,
+                "confirmed_requirements": reqs,
+                "proposed_additions": proposals,
+                "assumptions": ["Different assumption"],
+                "open_questions": questions,
+                "accepted_architect_decisions": [adv_accepted],
+                "amendment": {
+                    "target_job_id": job_parent.job_id,
+                    "target_job_revision": 1,
+                    "amendment_reason": "Modified assumptions must fail"
+                }
+            }),
+        ),
+        (
+            "modified open_questions",
+            json!({
+                "grant_id": grant_id,
+                "request_key": "req-neg-prep-mod-question",
+                "summary": summary,
+                "confirmed_requirements": reqs,
+                "proposed_additions": proposals,
+                "assumptions": assumptions,
+                "open_questions": ["Different open question?"],
+                "accepted_architect_decisions": [adv_accepted],
+                "amendment": {
+                    "target_job_id": job_parent.job_id,
+                    "target_job_revision": 1,
+                    "amendment_reason": "Modified open_questions must fail"
+                }
+            }),
+        ),
+        (
+            "foreign decision on direct amendment",
+            json!({
+                "grant_id": grant_id,
+                "request_key": "req-neg-prep-foreign-decision",
+                "summary": summary,
+                "confirmed_requirements": reqs,
+                "proposed_additions": proposals,
+                "assumptions": assumptions,
+                "open_questions": questions,
+                "accepted_architect_decisions": [adv_foreign],
+                "amendment": {
+                    "target_job_id": job_parent.job_id,
+                    "target_job_revision": 1,
+                    "amendment_reason": "Foreign decision must fail"
+                }
+            }),
+        ),
+        (
+            "non-amendment NewJob accepting parent decision",
+            json!({
+                "grant_id": grant_id,
+                "request_key": "req-neg-prep-new-job-decision",
+                "summary": summary,
+                "confirmed_requirements": reqs,
+                "proposed_additions": proposals,
+                "assumptions": assumptions,
+                "open_questions": questions,
+                "accepted_architect_decisions": [adv_accepted]
+            }),
+        ),
+        (
+            "revision mismatch on target_job_revision",
+            json!({
+                "grant_id": grant_id,
+                "request_key": "req-neg-prep-wrong-rev",
+                "summary": summary,
+                "confirmed_requirements": reqs,
+                "proposed_additions": proposals,
+                "assumptions": assumptions,
+                "open_questions": questions,
+                "accepted_architect_decisions": [adv_accepted],
+                "amendment": {
+                    "target_job_id": job_parent.job_id,
+                    "target_job_revision": 99,
+                    "amendment_reason": "Stale target_job_revision must fail"
+                }
+            }),
+        ),
+        (
+            "changed policy grant",
+            json!({
+                "grant_id": other_policy_grant_id,
+                "request_key": "req-neg-prep-other-policy",
+                "summary": summary,
+                "confirmed_requirements": reqs,
+                "proposed_additions": proposals,
+                "assumptions": assumptions,
+                "open_questions": questions,
+                "accepted_architect_decisions": [adv_accepted],
+                "amendment": {
+                    "target_job_id": job_parent.job_id,
+                    "target_job_revision": 1,
+                    "amendment_reason": "Different policy_digest must fail"
+                }
+            }),
+        ),
+        (
+            "declared amended_interfaces",
+            json!({
+                "grant_id": grant_id,
+                "request_key": "req-neg-prep-amended-iface",
+                "summary": summary,
+                "confirmed_requirements": reqs,
+                "proposed_additions": proposals,
+                "assumptions": assumptions,
+                "open_questions": questions,
+                "accepted_architect_decisions": [adv_accepted],
+                "amendment": {
+                    "target_job_id": job_parent.job_id,
+                    "target_job_revision": 1,
+                    "amendment_reason": "Declared interface amendment must fail",
+                    "amended_interfaces": ["iface_gateway"]
+                }
+            }),
+        ),
+        (
+            "parent plan and interface contracts changed after consult",
+            json!({
+                "grant_id": grant_id,
+                "request_key": "req-neg-prep-parent-iface-drift",
+                "summary": "Verify interface and plan contract drift invalidates prior Advisor decision",
+                "confirmed_requirements": ["Detect interface contract changes after consultation"],
+                "accepted_architect_decisions": [adv_pre_plan],
+                "amendment": {
+                    "target_job_id": job_iface_drift.job_id,
+                    "target_job_revision": 2,
+                    "amendment_reason": "Parent published plan and interface ownership after consult"
+                }
+            }),
+        ),
+    ];
+    for (label, args) in prepare_negatives {
+        let code = invoke_mcp_err_code(&mcp, "prepare_work", args).await;
+        assert_eq!(
+            code, "validation_failed",
+            "prepare_work must reject `{label}`, got `{code}`"
+        );
+    }
+
+    // Also verify fresh exact-digest `request_technical_plan` rejects `adv_pre_plan` after
+    // `job_iface_drift` acquired interface ownership in `iface_drift_plan_id`.
+    assert_eq!(
+        invoke_mcp_err_code(
+            &mcp,
+            "request_technical_plan",
+            json!({
+                "grant_id": grant_id,
+                "job_id": job_iface_drift.job_id,
+                "request_key": "req-neg-plan-fresh-iface-drift",
+                "plan_id": iface_drift_plan_id,
+                "expected_plan_revision": 1,
+                "architect_advice_ids": [adv_pre_plan],
+                "max_architect_rounds": 0,
+                "difficulty": "hard"
+            })
+        )
+        .await,
+        "validation_failed"
+    );
+
+    // 2. Create one legitimate direct amendment `job_valid_amend` accepting ONLY `[adv_accepted]`.
+    let job_valid_amend: PrepareWorkResponse = invoke_mcp_ok(
+        &mcp,
+        "prepare_work",
+        json!({
+            "grant_id": grant_id,
+            "request_key": "req-neg-prep-valid-direct-amend",
+            "summary": summary,
+            "confirmed_requirements": reqs,
+            "proposed_additions": proposals,
+            "assumptions": assumptions,
+            "open_questions": questions,
+            "accepted_architect_decisions": [adv_accepted],
+            "amendment": {
+                "target_job_id": job_parent.job_id,
+                "target_job_revision": 1,
+                "amendment_reason": "Valid direct amendment for negative boundary checks"
+            }
+        }),
+    )
+    .await;
+
+    // 2-hop (grandparent) amendment trying to carry `adv_accepted` across `job_valid_amend` must fail.
+    assert_eq!(
+        invoke_mcp_err_code(
+            &mcp,
+            "prepare_work",
+            json!({
+                "grant_id": grant_id,
+                "request_key": "req-neg-prep-grandparent-hop",
+                "summary": summary,
+                "confirmed_requirements": reqs,
+                "proposed_additions": proposals,
+                "assumptions": assumptions,
+                "open_questions": questions,
+                "accepted_architect_decisions": [adv_accepted],
+                "amendment": {
+                    "target_job_id": job_valid_amend.job_id,
+                    "target_job_revision": 1,
+                    "amendment_reason": "Two-hop grandparent carry-forward must fail"
+                }
+            })
+        )
+        .await,
+        "validation_failed"
+    );
+
+    // Open direct `CoworkerPlanningService` + `ScopedWorkflow` to verify the execution layer
+    // enforces the exact same rule as `prepare_work` and `request_technical_plan` enqueue.
+    let (reg_arc, plans_arc) =
+        open_workflow_stores(Some(&fixture.registry_dir), Some(&fixture.plans_dir))
+            .expect("open workflow stores")
+            .expect("workflow stores configured");
+    let scoped = ScopedWorkflow::new(reg_arc, plans_arc, fixture.binding_id.clone())
+        .expect("ScopedWorkflow");
+    let planning_service = CoworkerPlanningService::new(
+        wf_store.clone(),
+        &fixture.registry_dir,
+        planning_artifacts_dir(&fixture.plans_dir),
+    )
+    .expect("open CoworkerPlanningService");
+
+    let run_direct_exec_err = |g_id: &str, j_id: &str, r_key: &str, advice_ids: Vec<String>| {
+        let service = &planning_service;
+        let scoped = &scoped;
+        let binding_id = fixture.binding_id.clone();
+        let req = OrchestrateWorkBriefPlanRequest {
+            binding_id,
+            thread_uuid: THREAD_UUID.to_string(),
+            grant_id: g_id.to_string(),
+            job_id: j_id.to_string(),
+            request_key: r_key.to_string(),
+            expected_ledger_revision: None,
+            difficulty: Some(Difficulty::Hard),
+            plan_id: None,
+            expected_plan_revision: 0,
+            architect_advice_ids: advice_ids,
+            max_architect_rounds: 0,
+            architect_difficulty: None,
+            current_time_ms: current_wall_clock_ms().expect("wall clock"),
+        };
+        async move {
+            service
+                .orchestrate_brief_to_plan(scoped, &req)
+                .await
+                .expect_err("direct Orchestrator execution must reject ineligible advice")
+        }
+    };
+
+    // 3. Unaccepted parent decision (`adv_unaccepted_parent`), foreign decision (`adv_foreign`),
+    //    and changed policy grant (`other_policy_grant_id`) are all rejected before enqueue and
+    //    before execution on `job_valid_amend`.
+    for (label, g_id, advice_ids) in [
+        (
+            "unaccepted parent decision",
+            grant_id.as_str(),
+            vec![adv_unaccepted_parent.clone()],
+        ),
+        (
+            "foreign job decision",
+            grant_id.as_str(),
+            vec![adv_foreign.clone()],
+        ),
+        (
+            "changed policy grant (explicit)",
+            other_policy_grant_id.as_str(),
+            vec![adv_accepted.clone()],
+        ),
+    ] {
+        assert_eq!(
+            invoke_mcp_err_code(
+                &mcp,
+                "request_technical_plan",
+                json!({
+                    "grant_id": g_id,
+                    "job_id": job_valid_amend.job_id,
+                    "request_key": format!("req-neg-plan-{}", label.replace(' ', "-")),
+                    "architect_advice_ids": advice_ids,
+                    "max_architect_rounds": 0,
+                    "difficulty": "hard"
+                })
+            )
+            .await,
+            "validation_failed",
+            "request_technical_plan must reject `{label}`"
+        );
+        let exec_err = run_direct_exec_err(
+            g_id,
+            &job_valid_amend.job_id,
+            &format!("exec-neg-{}", label.replace(' ', "-")),
+            advice_ids,
+        )
+        .await;
+        assert_eq!(exec_err.error_code(), NativeErrorCode::ValidationFailed);
+    }
+    // Changed policy grant with IMPLICIT (omitted `architect_advice_ids`) must also fail closed.
+    assert_eq!(
+        invoke_mcp_err_code(
+            &mcp,
+            "request_technical_plan",
+            json!({
+                "grant_id": other_policy_grant_id,
+                "job_id": job_valid_amend.job_id,
+                "request_key": "req-neg-plan-other-policy-implicit",
+                "max_architect_rounds": 0,
+                "difficulty": "hard"
+            })
+        )
+        .await,
+        "validation_failed"
+    );
+
+    // 4. Bypass `prepare_work` by storing malformed/ineligible direct-amendment jobs directly in
+    //    `CoworkerWorkflowStore` and prove BOTH enqueue (`request_technical_plan`, explicit +
+    //    implicit) AND execution (`orchestrate_brief_to_plan`) enforce the exact same rule:
+    //    (a) modified confirmed_requirements, (b) declared amended_interfaces,
+    //    (c) missing Advisor record ID, (d) mismatched documented parent amendment hold revision.
+    let parent_record = wf_store
+        .read_binding_ledger(&fixture.binding_id)
+        .expect("read ledger for direct store negatives")
+        .jobs
+        .into_iter()
+        .find(|j| j.job_id == job_parent.job_id)
+        .expect("parent job record");
+
+    let mut mod_req_brief = parent_record.work_brief.clone();
+    mod_req_brief.brief_id = "brf_neg_store_mod_req".to_string();
+    mod_req_brief.kind = WorkBriefKind::Amendment {
+        target_job_id: job_parent.job_id.clone(),
+        target_job_revision: parent_record.job_revision,
+        amendment_reason: "Direct store modified requirement".to_string(),
+    };
+    mod_req_brief.confirmed_requirements[1] =
+        "Altered requirement bypassing prepare_work".to_string();
+    mod_req_brief.accepted_architect_decisions = vec![adv_accepted.clone()];
+    let job_store_mod_req = wf_store
+        .create_or_amend_job(&CreateCoworkerJobRequest {
+            binding_id: fixture.binding_id.clone(),
+            thread_uuid: THREAD_UUID.to_string(),
+            request_key: "req-neg-store-mod-req".to_string(),
+            expected_ledger_revision: None,
+            work_brief: mod_req_brief,
+            amended_target_task_ids: Vec::new(),
+            amended_write_paths: Vec::new(),
+            amended_interfaces: Vec::new(),
+        })
+        .expect("store modified-requirement amendment job");
+
+    let mut iface_brief = parent_record.work_brief.clone();
+    iface_brief.brief_id = "brf_neg_store_iface".to_string();
+    iface_brief.kind = WorkBriefKind::Amendment {
+        target_job_id: job_parent.job_id.clone(),
+        target_job_revision: parent_record.job_revision + 1,
+        amendment_reason: "Direct store interface amendment".to_string(),
+    };
+    iface_brief.accepted_architect_decisions = vec![adv_accepted.clone()];
+    let job_store_iface = wf_store
+        .create_or_amend_job(&CreateCoworkerJobRequest {
+            binding_id: fixture.binding_id.clone(),
+            thread_uuid: THREAD_UUID.to_string(),
+            request_key: "req-neg-store-iface".to_string(),
+            expected_ledger_revision: None,
+            work_brief: iface_brief,
+            amended_target_task_ids: Vec::new(),
+            amended_write_paths: Vec::new(),
+            amended_interfaces: vec!["iface_gateway".to_string()],
+        })
+        .expect("store amended-interface amendment job");
+
+    let mut missing_src_brief = parent_record.work_brief.clone();
+    missing_src_brief.brief_id = "brf_neg_store_missing_src".to_string();
+    missing_src_brief.kind = WorkBriefKind::Amendment {
+        target_job_id: job_parent.job_id.clone(),
+        target_job_revision: parent_record.job_revision + 2,
+        amendment_reason: "Direct store missing source advice".to_string(),
+    };
+    let missing_advice_id = "adv_00000000000000000000000000000000".to_string();
+    missing_src_brief.accepted_architect_decisions = vec![missing_advice_id.clone()];
+    let job_store_missing_src = wf_store
+        .create_or_amend_job(&CreateCoworkerJobRequest {
+            binding_id: fixture.binding_id.clone(),
+            thread_uuid: THREAD_UUID.to_string(),
+            request_key: "req-neg-store-missing-src".to_string(),
+            expected_ledger_revision: None,
+            work_brief: missing_src_brief,
+            amended_target_task_ids: Vec::new(),
+            amended_write_paths: Vec::new(),
+            amended_interfaces: Vec::new(),
+        })
+        .expect("store missing-source amendment job");
+
+    let mut hold_mismatch_brief = parent_record.work_brief.clone();
+    hold_mismatch_brief.brief_id = "brf_neg_store_hold_mismatch".to_string();
+    hold_mismatch_brief.kind = WorkBriefKind::Amendment {
+        target_job_id: job_parent.job_id.clone(),
+        target_job_revision: parent_record.job_revision + 3,
+        amendment_reason: "Direct store hold revision mismatch".to_string(),
+    };
+    hold_mismatch_brief.accepted_architect_decisions = vec![adv_accepted.clone()];
+    let job_store_hold_mismatch = wf_store
+        .create_or_amend_job(&CreateCoworkerJobRequest {
+            binding_id: fixture.binding_id.clone(),
+            thread_uuid: THREAD_UUID.to_string(),
+            request_key: "req-neg-store-hold-mismatch".to_string(),
+            expected_ledger_revision: None,
+            work_brief: hold_mismatch_brief,
+            amended_target_task_ids: Vec::new(),
+            amended_write_paths: Vec::new(),
+            amended_interfaces: Vec::new(),
+        })
+        .expect("store hold-mismatch amendment job");
+    wf_store
+        .transact_binding_ledger(&fixture.binding_id, None, |ledger| {
+            let parent_mut = ledger
+                .jobs
+                .iter_mut()
+                .find(|j| j.job_id == job_parent.job_id)
+                .expect("parent job for hold mismatch");
+            let hold = parent_mut
+                .holds
+                .iter_mut()
+                .find(|h| h.request_key == "amend_req-neg-store-hold-mismatch")
+                .expect("documented amendment hold");
+            hold.request_key = "amend_other_unrelated_key".to_string();
+            Ok(CoworkerLedgerMutationOutcome::Mutated(()))
+        })
+        .expect("break documented parent amendment hold linkage");
+
+    for (label, target_job_id, adv_id) in [
+        (
+            "store modified requirement",
+            &job_store_mod_req.job_id,
+            &adv_accepted,
+        ),
+        (
+            "store declared amended_interfaces",
+            &job_store_iface.job_id,
+            &adv_accepted,
+        ),
+        (
+            "store missing Advisor record",
+            &job_store_missing_src.job_id,
+            &missing_advice_id,
+        ),
+        (
+            "store missing parent hold proof",
+            &job_store_hold_mismatch.job_id,
+            &adv_accepted,
+        ),
+    ] {
+        // Explicit `architect_advice_ids` fails closed before enqueue.
+        assert_eq!(
+            invoke_mcp_err_code(
+                &mcp,
+                "request_technical_plan",
+                json!({
+                    "grant_id": grant_id,
+                    "job_id": target_job_id,
+                    "request_key": format!("req-neg-exp-{}", label.replace(' ', "-")),
+                    "architect_advice_ids": [adv_id],
+                    "max_architect_rounds": 0,
+                    "difficulty": "hard"
+                })
+            )
+            .await,
+            "validation_failed",
+            "explicit request_technical_plan must reject `{label}`"
+        );
+        // Implicit (omitted `architect_advice_ids`) ALSO fails closed before enqueue.
+        assert_eq!(
+            invoke_mcp_err_code(
+                &mcp,
+                "request_technical_plan",
+                json!({
+                    "grant_id": grant_id,
+                    "job_id": target_job_id,
+                    "request_key": format!("req-neg-imp-{}", label.replace(' ', "-")),
+                    "max_architect_rounds": 0,
+                    "difficulty": "hard"
+                })
+            )
+            .await,
+            "validation_failed",
+            "implicit request_technical_plan must reject `{label}`"
+        );
+        // Direct execution layer ALSO fails closed.
+        let exec_err = run_direct_exec_err(
+            &grant_id,
+            target_job_id,
+            &format!("exec-store-{}", label.replace(' ', "-")),
+            vec![adv_id.clone()],
+        )
+        .await;
+        assert_eq!(
+            exec_err.error_code(),
+            NativeErrorCode::ValidationFailed,
+            "direct execution must reject `{label}`"
+        );
+    }
+
+    // 5. Missing persisted artifact evidence fails closed across prepare_work, enqueue (explicit +
+    //    implicit), and execution.
+    let artifact_path =
+        planning_artifacts_dir(&fixture.plans_dir).join(format!("{adv_accepted_artifact_id}.json"));
+    let saved_artifact = fs::read(&artifact_path).expect("read original Advisor artifact");
+    fs::remove_file(&artifact_path).expect("temporarily remove Advisor artifact");
+
+    let current_parent_rev = wf_store
+        .read_binding_ledger(&fixture.binding_id)
+        .expect("read ledger for parent rev")
+        .jobs
+        .into_iter()
+        .find(|j| j.job_id == job_parent.job_id)
+        .expect("parent job")
+        .job_revision;
+    assert_eq!(
+        invoke_mcp_err_code(
+            &mcp,
+            "prepare_work",
+            json!({
+                "grant_id": grant_id,
+                "request_key": "req-neg-prep-missing-artifact",
+                "summary": summary,
+                "confirmed_requirements": reqs,
+                "proposed_additions": proposals,
+                "assumptions": assumptions,
+                "open_questions": questions,
+                "accepted_architect_decisions": [adv_accepted],
+                "amendment": {
+                    "target_job_id": job_parent.job_id,
+                    "target_job_revision": current_parent_rev,
+                    "amendment_reason": "Missing artifact must fail"
+                }
+            })
+        )
+        .await,
+        "validation_failed"
+    );
+    assert_eq!(
+        invoke_mcp_err_code(
+            &mcp,
+            "request_technical_plan",
+            json!({
+                "grant_id": grant_id,
+                "job_id": job_valid_amend.job_id,
+                "request_key": "req-neg-plan-missing-artifact-exp",
+                "architect_advice_ids": [adv_accepted],
+                "max_architect_rounds": 0,
+                "difficulty": "hard"
+            })
+        )
+        .await,
+        "validation_failed"
+    );
+    assert_eq!(
+        invoke_mcp_err_code(
+            &mcp,
+            "request_technical_plan",
+            json!({
+                "grant_id": grant_id,
+                "job_id": job_valid_amend.job_id,
+                "request_key": "req-neg-plan-missing-artifact-imp",
+                "max_architect_rounds": 0,
+                "difficulty": "hard"
+            })
+        )
+        .await,
+        "validation_failed"
+    );
+    assert_eq!(
+        run_direct_exec_err(
+            &grant_id,
+            &job_valid_amend.job_id,
+            "exec-neg-missing-artifact",
+            vec![adv_accepted.clone()],
+        )
+        .await
+        .error_code(),
+        NativeErrorCode::ValidationFailed
+    );
+    fs::write(&artifact_path, saved_artifact).expect("restore Advisor artifact");
+    fs::set_permissions(&artifact_path, fs::Permissions::from_mode(0o600))
+        .expect("restore 0600 permissions on Advisor artifact");
+
+    // 6. Rejected and Superseded Advisor decisions fail closed across prepare_work, enqueue
+    //    (explicit + implicit), and execution.
+    for (status_label, status) in [
+        ("rejected", ArchitectDecisionStatus::Rejected),
+        ("superseded", ArchitectDecisionStatus::Superseded),
+    ] {
+        wf_store
+            .transact_binding_ledger(&fixture.binding_id, None, |ledger| {
+                ledger
+                    .architect_advice
+                    .iter_mut()
+                    .find(|a| a.advice_id == adv_accepted)
+                    .expect("adv_accepted")
+                    .status = status;
+                Ok(CoworkerLedgerMutationOutcome::Mutated(()))
+            })
+            .expect("update Advisor decision status");
+
+        assert_eq!(
+            invoke_mcp_err_code(
+                &mcp,
+                "prepare_work",
+                json!({
+                    "grant_id": grant_id,
+                    "request_key": format!("req-neg-prep-{status_label}"),
+                    "summary": summary,
+                    "confirmed_requirements": reqs,
+                    "proposed_additions": proposals,
+                    "assumptions": assumptions,
+                    "open_questions": questions,
+                    "accepted_architect_decisions": [adv_accepted],
+                    "amendment": {
+                        "target_job_id": job_parent.job_id,
+                        "target_job_revision": current_parent_rev,
+                        "amendment_reason": "Inactive Advisor decision must fail"
+                    }
+                })
+            )
+            .await,
+            "validation_failed"
+        );
+        assert_eq!(
+            invoke_mcp_err_code(
+                &mcp,
+                "request_technical_plan",
+                json!({
+                    "grant_id": grant_id,
+                    "job_id": job_valid_amend.job_id,
+                    "request_key": format!("req-neg-plan-{status_label}-exp"),
+                    "architect_advice_ids": [adv_accepted],
+                    "max_architect_rounds": 0,
+                    "difficulty": "hard"
+                })
+            )
+            .await,
+            "validation_failed"
+        );
+        assert_eq!(
+            invoke_mcp_err_code(
+                &mcp,
+                "request_technical_plan",
+                json!({
+                    "grant_id": grant_id,
+                    "job_id": job_valid_amend.job_id,
+                    "request_key": format!("req-neg-plan-{status_label}-imp"),
+                    "max_architect_rounds": 0,
+                    "difficulty": "hard"
+                })
+            )
+            .await,
+            "validation_failed"
+        );
+        assert_eq!(
+            run_direct_exec_err(
+                &grant_id,
+                &job_valid_amend.job_id,
+                &format!("exec-neg-{status_label}"),
+                vec![adv_accepted.clone()],
+            )
+            .await
+            .error_code(),
+            NativeErrorCode::ValidationFailed
+        );
+    }
+    wf_store
+        .transact_binding_ledger(&fixture.binding_id, None, |ledger| {
+            ledger
+                .architect_advice
+                .iter_mut()
+                .find(|a| a.advice_id == adv_accepted)
+                .expect("adv_accepted")
+                .status = ArchitectDecisionStatus::Proposed;
+            Ok(CoworkerLedgerMutationOutcome::Mutated(()))
+        })
+        .expect("restore Advisor decision status to Proposed");
+
+    // 7. Cross-thread scope fails closed without touching provider or reservations.
+    let other_thread_gw = CoworkerPlanningGateway::new(
+        &fixture.state_dir,
+        &fixture.registry_dir,
+        &fixture.plans_dir,
+        &fixture.authority_dir,
+        &fixture.sessions_dir,
+        &fixture.binding_id,
+        "0196ed00-0000-7000-8000-0000000000c4",
+    )
+    .expect("create other-thread gateway")
+    .with_sibling_anchor_exe(PathBuf::from(env!("CARGO_BIN_EXE_threadlane-flow")));
+    let other_thread_err = other_thread_gw
+        .request_technical_plan(&RequestTechnicalPlanParams {
+            grant_id: grant_id.clone(),
+            job_id: job_valid_amend.job_id.clone(),
+            request_key: "req-neg-other-thread".to_string(),
+            difficulty: Some(Difficulty::Hard),
+            plan_id: None,
+            expected_plan_revision: None,
+            architect_advice_ids: vec![adv_accepted.clone()],
+            max_architect_rounds: Some(0),
+            architect_difficulty: None,
+            expected_ledger_revision: None,
+        })
+        .await
+        .expect_err("other thread must fail closed");
+    assert!(matches!(
+        other_thread_err.error_code(),
+        NativeErrorCode::ValidationFailed | NativeErrorCode::SecurityViolation
+    ));
+
+    // 8. Changed base commit / tree / dependency blob invalidates carrying `adv_accepted` across
+    //    `prepare_work`, `request_technical_plan`, and execution.
+    fs::write(
+        fixture.repo_dir.join("src/lib.rs"),
+        "pub fn gateway_seed() -> u32 { 99 }\n",
+    )
+    .expect("modify src/lib.rs for base/blob drift");
+    for args in [
+        &["add", "src/lib.rs"][..],
+        &[
+            "commit",
+            "-m",
+            "advance base and change src/lib.rs blob",
+            "--quiet",
+        ][..],
+    ] {
+        run_sanitized_git(&fixture.repo_dir, args, DEFAULT_GIT_COMMAND_TIMEOUT_MS)
+            .expect("commit base/blob drift");
+    }
+    assert_eq!(
+        invoke_mcp_err_code(
+            &mcp,
+            "prepare_work",
+            json!({
+                "grant_id": grant_id,
+                "request_key": "req-neg-prep-changed-base-blob",
+                "summary": summary,
+                "confirmed_requirements": reqs,
+                "proposed_additions": proposals,
+                "assumptions": assumptions,
+                "open_questions": questions,
+                "accepted_architect_decisions": [adv_accepted],
+                "amendment": {
+                    "target_job_id": job_parent.job_id,
+                    "target_job_revision": current_parent_rev,
+                    "amendment_reason": "Changed base/tree/blob must fail"
+                }
+            })
+        )
+        .await,
+        "validation_failed"
+    );
+    assert_eq!(
+        invoke_mcp_err_code(
+            &mcp,
+            "request_technical_plan",
+            json!({
+                "grant_id": grant_id,
+                "job_id": job_valid_amend.job_id,
+                "request_key": "req-neg-plan-changed-base-blob",
+                "architect_advice_ids": [adv_accepted],
+                "max_architect_rounds": 0,
+                "difficulty": "hard"
+            })
+        )
+        .await,
+        "validation_failed"
+    );
+    assert_eq!(
+        run_direct_exec_err(
+            &grant_id,
+            &job_valid_amend.job_id,
+            "exec-neg-changed-base-blob",
+            vec![adv_accepted],
+        )
+        .await
+        .error_code(),
+        NativeErrorCode::ValidationFailed
+    );
+
+    // Every single negative check above must have zero provider calls and zero extra reservations.
+    assert_eq!(
+        provider_invocation_count(&fixture.worker_marker),
+        calls_baseline
+    );
+    let final_grant = wf_store
+        .read_binding_ledger(&fixture.binding_id)
+        .expect("final ledger")
+        .planning_grants
+        .into_iter()
+        .find(|g| g.grant_id == grant_id)
+        .expect("final primary grant");
+    assert_eq!(final_grant.reservations.len(), reservations_baseline);
+
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn auto_consultation_question_interface_hashes_allow_same_contract_plan_revisions_and_reject_spoofed_or_drifted_contracts(
+) {
+    use threadlane_native::coworker_workflow::{sha256_hex, OrchestrateWorkBriefPlanRequest};
+    use threadlane_native::{open_workflow_stores, ScopedWorkflow};
+
+    let mut fixture = GatewayFixture::start().await;
+    let mcp = fixture.enrolled_mcp();
+    let now_ms = current_wall_clock_ms().expect("wall clock");
+    let wf_store =
+        CoworkerWorkflowStore::new(&fixture.plans_dir).expect("open CoworkerWorkflowStore");
+
+    let grant = wf_store
+        .create_planning_grant(&CreatePlanningGrantRequest {
+            binding_id: fixture.binding_id.clone(),
+            thread_uuid: THREAD_UUID.to_string(),
+            request_key: "req-grant-auto-iface-revisions".to_string(),
+            expected_ledger_revision: None,
+            project_base: fixture.project_base.clone(),
+            profile_id: PROFILE_ID.to_string(),
+            registry_revision: 3,
+            policy: advisor_policy(),
+            capabilities: PlanningReadOnlyCapabilities::strict_read_only(),
+            budget: PlanningCallBudget {
+                max_total_calls: 24,
+                max_orchestrator_calls: 14,
+                max_architect_calls: 10,
+                max_timeout_ms_per_call: 60_000,
+                max_output_bytes_per_call: 65_536,
+            },
+            created_at_ms: now_ms.saturating_sub(5_000),
+            expires_at_ms: now_ms + 3_600_000,
+            operator_attested: true,
+        })
+        .expect("create advisor grant");
+    let grant_id = grant.grant_id.clone();
+
+    let (reg_arc, plans_arc) =
+        open_workflow_stores(Some(&fixture.registry_dir), Some(&fixture.plans_dir))
+            .expect("open workflow stores")
+            .expect("workflow stores configured");
+    let scoped = ScopedWorkflow::new(reg_arc, plans_arc, fixture.binding_id.clone())
+        .expect("ScopedWorkflow");
+    let planning_service = CoworkerPlanningService::new(
+        wf_store.clone(),
+        &fixture.registry_dir,
+        planning_artifacts_dir(&fixture.plans_dir),
+    )
+    .expect("open CoworkerPlanningService");
+
+    // 1. Built-in automatic Orchestrator -> Advisor consultation with `q.interfaces = ["iface_gateway"]`
+    //    publishes plan revision 1 and links `adv_auto` whose `interface_ownership_digests` stores
+    //    `sha256_hex(b"iface_gateway")` rather than planned-task ownership digests.
+    let job_auto: PrepareWorkResponse = invoke_mcp_ok(
+        &mcp,
+        "prepare_work",
+        json!({
+            "grant_id": grant_id,
+            "request_key": "req-auto-prep-job",
+            "summary": "Verify built-in auto-consultation advice across legitimate plan revisions",
+            "confirmed_requirements": ["Keep iface_gateway contract stable in src/lib.rs"]
+        }),
+    )
+    .await;
+
+    fs::write(&fixture.mode_path, b"orch_ask_then_plan\n").expect("set mode orch_ask_then_plan");
+    let rev1_submit: PlanningCommandSubmissionResponse = invoke_mcp_ok(
+        &mcp,
+        "request_technical_plan",
+        json!({
+            "grant_id": grant_id,
+            "job_id": job_auto.job_id,
+            "request_key": "req-auto-plan-rev1",
+            "max_architect_rounds": 1,
+            "difficulty": "hard"
+        }),
+    )
+    .await;
+    let rev1_detail = wait_for_command_completion(&mcp, &rev1_submit.command_id).await;
+    assert_eq!(
+        rev1_detail.status,
+        PlanningCommandStatus::Completed,
+        "auto-consultation plan rev1 failed: {}",
+        format_command_detail_context(&rev1_detail)
+    );
+    let rev1_pr = match rev1_detail.result_ref.as_ref() {
+        Some(PlanningCommandResultRef::OrchestratorPlan {
+            job_id,
+            planning_result,
+            artifact_verified,
+        }) => {
+            assert_eq!(job_id, &job_auto.job_id);
+            assert!(*artifact_verified);
+            planning_result.as_ref().clone()
+        }
+        other => panic!("expected OrchestratorPlan result_ref for rev1, got {other:?}"),
+    };
+    assert_eq!(rev1_pr.plan_revision, 1);
+    assert_eq!(rev1_pr.architect_advice_ids.len(), 1);
+    let adv_auto_id = rev1_pr.architect_advice_ids[0].clone();
+    assert_eq!(provider_invocation_count(&fixture.worker_marker), 3);
+
+    let ledger_after_rev1 = wf_store
+        .read_binding_ledger(&fixture.binding_id)
+        .expect("read ledger after rev1");
+    let adv_auto = ledger_after_rev1
+        .architect_advice
+        .iter()
+        .find(|a| a.advice_id == adv_auto_id)
+        .expect("adv_auto recorded in binding ledger");
+    let mut expected_label_digests = BTreeMap::new();
+    expected_label_digests.insert("iface_gateway".to_string(), sha256_hex(b"iface_gateway"));
+    assert_eq!(
+        adv_auto.context_dependencies.interface_ownership_digests,
+        expected_label_digests
+    );
+    assert_eq!(adv_auto.context_dependencies.plan_digest, None);
+
+    // 2. Subsequent legitimate plan revision (`plan@1` -> `plan@2`) under the same decision,
+    //    brief, base, policy, and unchanged interface ownership contract MUST SUCCEED.
+    fs::write(&fixture.mode_path, b"orch_plan_v2_same_iface\n")
+        .expect("set mode orch_plan_v2_same_iface");
+    let rev2_args = json!({
+        "grant_id": grant_id,
+        "job_id": job_auto.job_id,
+        "request_key": "req-auto-plan-rev2",
+        "plan_id": rev1_pr.plan_id,
+        "expected_plan_revision": 1,
+        "architect_advice_ids": [adv_auto_id],
+        "max_architect_rounds": 0,
+        "difficulty": "hard"
+    });
+    let rev2_submit: PlanningCommandSubmissionResponse =
+        invoke_mcp_ok(&mcp, "request_technical_plan", rev2_args.clone()).await;
+    let rev2_detail = wait_for_command_completion(&mcp, &rev2_submit.command_id).await;
+    assert_eq!(
+        rev2_detail.status,
+        PlanningCommandStatus::Completed,
+        "subsequent legitimate plan rev2 with adv_auto failed: {}",
+        format_command_detail_context(&rev2_detail)
+    );
+    let rev2_pr = match rev2_detail.result_ref.as_ref() {
+        Some(PlanningCommandResultRef::OrchestratorPlan {
+            job_id,
+            planning_result,
+            artifact_verified,
+        }) => {
+            assert_eq!(job_id, &job_auto.job_id);
+            assert!(*artifact_verified);
+            planning_result.as_ref().clone()
+        }
+        other => panic!("expected OrchestratorPlan result_ref for rev2, got {other:?}"),
+    };
+    assert_eq!(rev2_pr.plan_id, rev1_pr.plan_id);
+    assert_eq!(rev2_pr.plan_revision, 2);
+    assert_ne!(rev2_pr.plan_digest, rev1_pr.plan_digest);
+    assert_eq!(rev2_pr.architect_advice_ids, vec![adv_auto_id.clone()]);
+    assert_eq!(provider_invocation_count(&fixture.worker_marker), 4);
+
+    // Verify historical command status marks rev1 Superseded/non-executable and rev2 Published,
+    // and idempotent replay performs zero additional provider calls.
+    let rev1_history: PlanningCommandDetailResponse = invoke_mcp_ok(
+        &mcp,
+        "planning_command",
+        json!({ "command_id": rev1_submit.command_id }),
+    )
+    .await;
+    assert_eq!(rev1_history.status, PlanningCommandStatus::Completed);
+    assert_eq!(
+        rev1_history.current_plan_status,
+        Some(PlanStatus::Superseded)
+    );
+    assert_eq!(rev1_history.executable, Some(false));
+    assert_eq!(rev2_detail.current_plan_status, Some(PlanStatus::Published));
+    assert_eq!(rev2_detail.executable, None);
+
+    let rev2_replay: PlanningCommandSubmissionResponse =
+        invoke_mcp_ok(&mcp, "request_technical_plan", rev2_args).await;
+    assert_eq!(rev2_replay.command_id, rev2_submit.command_id);
+    assert_eq!(
+        rev2_replay.submission_status,
+        PlanningCommandStartStatus::AlreadyCompleted
+    );
+    assert!(!rev2_replay.launched);
+    assert_eq!(provider_invocation_count(&fixture.worker_marker), 4);
+
+    let published_rev2 = scoped
+        .get_plan(&rev2_pr.plan_id, Some(2), None, None)
+        .expect("get published plan rev2");
+    assert_eq!(published_rev2.header.status, PlanStatus::Published);
+    assert_eq!(
+        published_rev2.header.plan_digest.as_deref(),
+        Some(rev2_pr.plan_digest.as_str())
+    );
+
+    // 3. Wrong-job reuse of `adv_auto_id` MUST fail closed across prepare_work, enqueue, and
+    //    direct service execution without invoking the provider.
+    let job_other: PrepareWorkResponse = invoke_mcp_ok(
+        &mcp,
+        "prepare_work",
+        json!({
+            "grant_id": grant_id,
+            "request_key": "req-auto-prep-wrong-job",
+            "summary": "Unrelated job must not reuse job_auto's auto-consultation advice",
+            "confirmed_requirements": ["Reject cross-job auto-consultation advice reuse"]
+        }),
+    )
+    .await;
+    assert_eq!(
+        invoke_mcp_err_code(
+            &mcp,
+            "request_technical_plan",
+            json!({
+                "grant_id": grant_id,
+                "job_id": job_other.job_id,
+                "request_key": "req-auto-wrong-job-plan",
+                "architect_advice_ids": [adv_auto_id],
+                "max_architect_rounds": 0,
+                "difficulty": "hard"
+            })
+        )
+        .await,
+        "validation_failed"
+    );
+    let wrong_job_exec_err = planning_service
+        .orchestrate_brief_to_plan(
+            &scoped,
+            &OrchestrateWorkBriefPlanRequest {
+                binding_id: fixture.binding_id.clone(),
+                thread_uuid: THREAD_UUID.to_string(),
+                grant_id: grant_id.clone(),
+                job_id: job_other.job_id.clone(),
+                request_key: "exec-auto-wrong-job".to_string(),
+                expected_ledger_revision: None,
+                difficulty: Some(Difficulty::Hard),
+                plan_id: None,
+                expected_plan_revision: 0,
+                architect_advice_ids: vec![adv_auto_id.clone()],
+                max_architect_rounds: 0,
+                architect_difficulty: None,
+                current_time_ms: current_wall_clock_ms().expect("wall clock"),
+            },
+        )
+        .await
+        .expect_err("direct execution must reject wrong-job auto-consultation advice");
+    assert_eq!(
+        wrong_job_exec_err.error_code(),
+        NativeErrorCode::ValidationFailed
+    );
+    assert_eq!(
+        invoke_mcp_err_code(
+            &mcp,
+            "prepare_work",
+            json!({
+                "grant_id": grant_id,
+                "request_key": "req-auto-wrong-new-job",
+                "summary": "NewJob accepting foreign auto-consultation advice must fail",
+                "confirmed_requirements": ["Must fail closed"],
+                "accepted_architect_decisions": [adv_auto_id]
+            })
+        )
+        .await,
+        "validation_failed"
+    );
+
+    // 4. Spoofed label-hash advice (same `sha256_hex(b"iface_gateway")` digest shape, including
+    //    a syntactically forged `_arch_r1_1` key without verified asking Orchestrator
+    //    `RequiresArchitectAdvice` provenance) MUST fail closed across enqueue, direct execution,
+    //    and direct amendment carry-forward.
+    fs::write(&fixture.mode_path, b"architect\n").expect("set mode architect for spoofed advice");
+    let dep_blobs = CoworkerPlanningService::compute_dependency_file_blobs(
+        &fixture.project_base,
+        &["src/lib.rs".to_string()],
+    )
+    .expect("compute src/lib.rs blob");
+
+    let spoof_plain = planning_service
+        .obtain_advisor_advice(&RunArchitectAdviceRequest {
+            binding_id: fixture.binding_id.clone(),
+            thread_uuid: THREAD_UUID.to_string(),
+            grant_id: grant_id.clone(),
+            request_key: "req-spoof-label-hash".to_string(),
+            expected_ledger_revision: None,
+            difficulty: Some(Difficulty::Hard),
+            context_dependencies: ArchitectContextDependencies {
+                project_base: fixture.project_base.clone(),
+                work_brief_digest: job_auto.work_brief_digest.clone(),
+                plan_digest: None,
+                policy_digest: grant.policy_digest.clone(),
+                dependency_file_blobs: dep_blobs.clone(),
+                interface_ownership_digests: expected_label_digests.clone(),
+                accepted_predecessor_trees: BTreeMap::new(),
+            },
+            question_summary: "Spoofed plain label hash without Orchestrator question".to_string(),
+            prior_advice_context: Vec::new(),
+            accept_into_brief: false,
+            current_time_ms: current_wall_clock_ms().expect("wall clock"),
+        })
+        .await
+        .expect("record plain spoofed Advisor advice");
+
+    let spoof_forged_key = planning_service
+        .obtain_advisor_advice(&RunArchitectAdviceRequest {
+            binding_id: fixture.binding_id.clone(),
+            thread_uuid: THREAD_UUID.to_string(),
+            grant_id: grant_id.clone(),
+            request_key: "forged_orch_root_arch_r1_1".to_string(),
+            expected_ledger_revision: None,
+            difficulty: Some(Difficulty::Hard),
+            context_dependencies: ArchitectContextDependencies {
+                project_base: fixture.project_base.clone(),
+                work_brief_digest: job_other.work_brief_digest.clone(),
+                plan_digest: None,
+                policy_digest: grant.policy_digest.clone(),
+                dependency_file_blobs: dep_blobs,
+                interface_ownership_digests: expected_label_digests,
+                accepted_predecessor_trees: BTreeMap::new(),
+            },
+            question_summary: "Spoofed _arch_r1_1 key without Orchestrator reservation".to_string(),
+            prior_advice_context: Vec::new(),
+            accept_into_brief: false,
+            current_time_ms: current_wall_clock_ms().expect("wall clock"),
+        })
+        .await
+        .expect("record forged-key spoofed Advisor advice");
+    assert_eq!(provider_invocation_count(&fixture.worker_marker), 6);
+
+    // Spoofed plain advice on planned `job_auto` fails at enqueue and execution.
+    assert_eq!(
+        invoke_mcp_err_code(
+            &mcp,
+            "request_technical_plan",
+            json!({
+                "grant_id": grant_id,
+                "job_id": job_auto.job_id,
+                "request_key": "req-reject-spoof-plain",
+                "plan_id": rev2_pr.plan_id,
+                "expected_plan_revision": 2,
+                "architect_advice_ids": [spoof_plain.record.advice_id],
+                "max_architect_rounds": 0,
+                "difficulty": "hard"
+            })
+        )
+        .await,
+        "validation_failed"
+    );
+    let spoof_plain_exec_err = planning_service
+        .orchestrate_brief_to_plan(
+            &scoped,
+            &OrchestrateWorkBriefPlanRequest {
+                binding_id: fixture.binding_id.clone(),
+                thread_uuid: THREAD_UUID.to_string(),
+                grant_id: grant_id.clone(),
+                job_id: job_auto.job_id.clone(),
+                request_key: "exec-reject-spoof-plain".to_string(),
+                expected_ledger_revision: None,
+                difficulty: Some(Difficulty::Hard),
+                plan_id: Some(rev2_pr.plan_id.clone()),
+                expected_plan_revision: 2,
+                architect_advice_ids: vec![spoof_plain.record.advice_id.clone()],
+                max_architect_rounds: 0,
+                architect_difficulty: None,
+                current_time_ms: current_wall_clock_ms().expect("wall clock"),
+            },
+        )
+        .await
+        .expect_err("direct execution must reject spoofed plain label-hash advice");
+    assert_eq!(
+        spoof_plain_exec_err.error_code(),
+        NativeErrorCode::ValidationFailed
+    );
+
+    // Spoofed `_arch_r1_1` advice on unplanned `job_other` fails at enqueue, execution, and amendment.
+    assert_eq!(
+        invoke_mcp_err_code(
+            &mcp,
+            "request_technical_plan",
+            json!({
+                "grant_id": grant_id,
+                "job_id": job_other.job_id,
+                "request_key": "req-reject-spoof-forged-key",
+                "architect_advice_ids": [spoof_forged_key.record.advice_id],
+                "max_architect_rounds": 0,
+                "difficulty": "hard"
+            })
+        )
+        .await,
+        "validation_failed"
+    );
+    let spoof_forged_exec_err = planning_service
+        .orchestrate_brief_to_plan(
+            &scoped,
+            &OrchestrateWorkBriefPlanRequest {
+                binding_id: fixture.binding_id.clone(),
+                thread_uuid: THREAD_UUID.to_string(),
+                grant_id: grant_id.clone(),
+                job_id: job_other.job_id.clone(),
+                request_key: "exec-reject-spoof-forged-key".to_string(),
+                expected_ledger_revision: None,
+                difficulty: Some(Difficulty::Hard),
+                plan_id: None,
+                expected_plan_revision: 0,
+                architect_advice_ids: vec![spoof_forged_key.record.advice_id.clone()],
+                max_architect_rounds: 0,
+                architect_difficulty: None,
+                current_time_ms: current_wall_clock_ms().expect("wall clock"),
+            },
+        )
+        .await
+        .expect_err("direct execution must reject forged-key label-hash advice");
+    assert_eq!(
+        spoof_forged_exec_err.error_code(),
+        NativeErrorCode::ValidationFailed
+    );
+    assert_eq!(
+        invoke_mcp_err_code(
+            &mcp,
+            "prepare_work",
+            json!({
+                "grant_id": grant_id,
+                "request_key": "req-reject-spoof-forged-amend",
+                "summary": "Unrelated job must not reuse job_auto's auto-consultation advice",
+                "confirmed_requirements": ["Reject cross-job auto-consultation advice reuse"],
+                "accepted_architect_decisions": [spoof_forged_key.record.advice_id],
+                "amendment": {
+                    "target_job_id": job_other.job_id,
+                    "target_job_revision": 1,
+                    "amendment_reason": "Spoofed label hash must not carry forward"
+                }
+            })
+        )
+        .await,
+        "validation_failed"
+    );
+    assert_eq!(provider_invocation_count(&fixture.worker_marker), 6);
+
+    // 5. When a plan revision changes task interface contracts (`iface_gateway` -> `iface_gateway_v2`),
+    //    any subsequent plan revision attaching `adv_auto_id` MUST fail closed.
+    fs::write(&fixture.mode_path, b"orch_plan_v2_changed_iface\n")
+        .expect("set mode orch_plan_v2_changed_iface");
+    let rev3_submit: PlanningCommandSubmissionResponse = invoke_mcp_ok(
+        &mcp,
+        "request_technical_plan",
+        json!({
+            "grant_id": grant_id,
+            "job_id": job_auto.job_id,
+            "request_key": "req-auto-plan-rev3-drift-iface",
+            "plan_id": rev2_pr.plan_id,
+            "expected_plan_revision": 2,
+            "architect_advice_ids": [adv_auto_id],
+            "max_architect_rounds": 0,
+            "difficulty": "hard"
+        }),
+    )
+    .await;
+    let rev3_detail = wait_for_command_completion(&mcp, &rev3_submit.command_id).await;
+    assert_eq!(
+        rev3_detail.status,
+        PlanningCommandStatus::Completed,
+        "rev3 publishing changed interface contract failed: {}",
+        format_command_detail_context(&rev3_detail)
+    );
+    assert_eq!(provider_invocation_count(&fixture.worker_marker), 7);
+
+    // Now `job_auto` has drifted from baseline `plan@1` (`iface_gateway`) to `iface_gateway_v2`:
+    // rev4 attaching `adv_auto_id` MUST fail closed at both enqueue and direct execution.
+    assert_eq!(
+        invoke_mcp_err_code(
+            &mcp,
+            "request_technical_plan",
+            json!({
+                "grant_id": grant_id,
+                "job_id": job_auto.job_id,
+                "request_key": "req-auto-plan-rev4-after-drift",
+                "plan_id": rev2_pr.plan_id,
+                "expected_plan_revision": 3,
+                "architect_advice_ids": [adv_auto_id],
+                "max_architect_rounds": 0,
+                "difficulty": "hard"
+            })
+        )
+        .await,
+        "validation_failed"
+    );
+    let drifted_exec_err = planning_service
+        .orchestrate_brief_to_plan(
+            &scoped,
+            &OrchestrateWorkBriefPlanRequest {
+                binding_id: fixture.binding_id.clone(),
+                thread_uuid: THREAD_UUID.to_string(),
+                grant_id: grant_id.clone(),
+                job_id: job_auto.job_id.clone(),
+                request_key: "exec-auto-plan-rev4-after-drift".to_string(),
+                expected_ledger_revision: None,
+                difficulty: Some(Difficulty::Hard),
+                plan_id: Some(rev2_pr.plan_id.clone()),
+                expected_plan_revision: 3,
+                architect_advice_ids: vec![adv_auto_id.clone()],
+                max_architect_rounds: 0,
+                architect_difficulty: None,
+                current_time_ms: current_wall_clock_ms().expect("wall clock"),
+            },
+        )
+        .await
+        .expect_err("direct execution must reject auto-consultation advice after contract drift");
+    assert_eq!(
+        drifted_exec_err.error_code(),
+        NativeErrorCode::ValidationFailed
+    );
+    assert_eq!(provider_invocation_count(&fixture.worker_marker), 7);
+
+    // 6. Auto-consultation followed by `RequiresHumanClarification` allows verified direct
+    //    same-content amendment carry-forward and same-contract plan revisions on the amended job,
+    //    while still rejecting contract drift on subsequent revisions.
+    let clarify_summary = "Auto-consultation before clarification carried into direct amendment";
+    let clarify_reqs = vec!["Preserve iface_gateway boundary across amendment planning"];
+    let job_clarify_parent: PrepareWorkResponse = invoke_mcp_ok(
+        &mcp,
+        "prepare_work",
+        json!({
+            "grant_id": grant_id,
+            "request_key": "req-clarify-parent-prep",
+            "summary": clarify_summary,
+            "confirmed_requirements": clarify_reqs
+        }),
+    )
+    .await;
+
+    fs::write(&fixture.mode_path, b"orch_ask_then_clarify\n")
+        .expect("set mode orch_ask_then_clarify");
+    let clarify_submit: PlanningCommandSubmissionResponse = invoke_mcp_ok(
+        &mcp,
+        "request_technical_plan",
+        json!({
+            "grant_id": grant_id,
+            "job_id": job_clarify_parent.job_id,
+            "request_key": "req-clarify-parent-plan",
+            "max_architect_rounds": 1,
+            "difficulty": "hard"
+        }),
+    )
+    .await;
+    let clarify_detail = wait_for_command_completion(&mcp, &clarify_submit.command_id).await;
+    assert_eq!(clarify_detail.status, PlanningCommandStatus::Completed);
+    assert!(matches!(
+        clarify_detail.result_ref,
+        Some(PlanningCommandResultRef::OrchestratorRequiresHumanClarification { .. })
+    ));
+    assert_eq!(provider_invocation_count(&fixture.worker_marker), 10);
+
+    let adv_clarify_auto_id = wf_store
+        .read_binding_ledger(&fixture.binding_id)
+        .expect("read ledger for adv_clarify_auto")
+        .architect_advice
+        .into_iter()
+        .find(|a| a.context_dependencies.work_brief_digest == job_clarify_parent.work_brief_digest)
+        .expect("auto-consultation advice recorded for clarify parent")
+        .advice_id;
+
+    let job_clarify_amend: PrepareWorkResponse = invoke_mcp_ok(
+        &mcp,
+        "prepare_work",
+        json!({
+            "grant_id": grant_id,
+            "request_key": "req-clarify-direct-amend",
+            "summary": clarify_summary,
+            "confirmed_requirements": clarify_reqs,
+            "accepted_architect_decisions": [adv_clarify_auto_id],
+            "amendment": {
+                "target_job_id": job_clarify_parent.job_id,
+                "target_job_revision": 1,
+                "amendment_reason": "Accept verified auto-consultation decision on same semantic brief"
+            }
+        }),
+    )
+    .await;
+
+    // First plan on the amended job (implicit advice resolution from `accepted_architect_decisions`).
+    fs::write(&fixture.mode_path, b"orch_plan\n").expect("set mode orch_plan for amend rev1");
+    let amend_rev1_submit: PlanningCommandSubmissionResponse = invoke_mcp_ok(
+        &mcp,
+        "request_technical_plan",
+        json!({
+            "grant_id": grant_id,
+            "job_id": job_clarify_amend.job_id,
+            "request_key": "req-clarify-amend-plan-rev1",
+            "max_architect_rounds": 0,
+            "difficulty": "hard"
+        }),
+    )
+    .await;
+    let amend_rev1_detail = wait_for_command_completion(&mcp, &amend_rev1_submit.command_id).await;
+    assert_eq!(amend_rev1_detail.status, PlanningCommandStatus::Completed);
+    let amend_rev1_pr = match amend_rev1_detail.result_ref.as_ref() {
+        Some(PlanningCommandResultRef::OrchestratorPlan {
+            planning_result, ..
+        }) => planning_result.as_ref().clone(),
+        other => panic!("expected OrchestratorPlan for amend rev1, got {other:?}"),
+    };
+    assert_eq!(
+        amend_rev1_pr.architect_advice_ids,
+        vec![adv_clarify_auto_id.clone()]
+    );
+
+    // Second plan revision on the amended job with unchanged interface contract succeeds.
+    fs::write(&fixture.mode_path, b"orch_plan_v2_same_iface\n")
+        .expect("set mode orch_plan_v2_same_iface for amend rev2");
+    let amend_rev2_submit: PlanningCommandSubmissionResponse = invoke_mcp_ok(
+        &mcp,
+        "request_technical_plan",
+        json!({
+            "grant_id": grant_id,
+            "job_id": job_clarify_amend.job_id,
+            "request_key": "req-clarify-amend-plan-rev2",
+            "plan_id": amend_rev1_pr.plan_id,
+            "expected_plan_revision": 1,
+            "max_architect_rounds": 0,
+            "difficulty": "hard"
+        }),
+    )
+    .await;
+    let amend_rev2_detail = wait_for_command_completion(&mcp, &amend_rev2_submit.command_id).await;
+    assert_eq!(amend_rev2_detail.status, PlanningCommandStatus::Completed);
+
+    // Third plan revision changes the interface contract (`iface_gateway` -> `iface_gateway_v2`).
+    fs::write(&fixture.mode_path, b"orch_plan_v2_changed_iface\n")
+        .expect("set mode orch_plan_v2_changed_iface for amend rev3");
+    let amend_rev3_submit: PlanningCommandSubmissionResponse = invoke_mcp_ok(
+        &mcp,
+        "request_technical_plan",
+        json!({
+            "grant_id": grant_id,
+            "job_id": job_clarify_amend.job_id,
+            "request_key": "req-clarify-amend-plan-rev3-drift",
+            "plan_id": amend_rev1_pr.plan_id,
+            "expected_plan_revision": 2,
+            "max_architect_rounds": 0,
+            "difficulty": "hard"
+        }),
+    )
+    .await;
+    let amend_rev3_detail = wait_for_command_completion(&mcp, &amend_rev3_submit.command_id).await;
+    assert_eq!(amend_rev3_detail.status, PlanningCommandStatus::Completed);
+    let calls_before_amend_drift_reject = provider_invocation_count(&fixture.worker_marker);
+    assert_eq!(calls_before_amend_drift_reject, 13);
+
+    // Fourth plan revision on the amended job MUST fail closed (explicit, implicit, and direct).
+    assert_eq!(
+        invoke_mcp_err_code(
+            &mcp,
+            "request_technical_plan",
+            json!({
+                "grant_id": grant_id,
+                "job_id": job_clarify_amend.job_id,
+                "request_key": "req-clarify-amend-plan-rev4-exp",
+                "plan_id": amend_rev1_pr.plan_id,
+                "expected_plan_revision": 3,
+                "architect_advice_ids": [adv_clarify_auto_id],
+                "max_architect_rounds": 0,
+                "difficulty": "hard"
+            })
+        )
+        .await,
+        "validation_failed"
+    );
+    assert_eq!(
+        invoke_mcp_err_code(
+            &mcp,
+            "request_technical_plan",
+            json!({
+                "grant_id": grant_id,
+                "job_id": job_clarify_amend.job_id,
+                "request_key": "req-clarify-amend-plan-rev4-imp",
+                "plan_id": amend_rev1_pr.plan_id,
+                "expected_plan_revision": 3,
+                "max_architect_rounds": 0,
+                "difficulty": "hard"
+            })
+        )
+        .await,
+        "validation_failed"
+    );
+    let amend_drifted_exec_err = planning_service
+        .orchestrate_brief_to_plan(
+            &scoped,
+            &OrchestrateWorkBriefPlanRequest {
+                binding_id: fixture.binding_id.clone(),
+                thread_uuid: THREAD_UUID.to_string(),
+                grant_id: grant_id.clone(),
+                job_id: job_clarify_amend.job_id.clone(),
+                request_key: "exec-clarify-amend-plan-rev4".to_string(),
+                expected_ledger_revision: None,
+                difficulty: Some(Difficulty::Hard),
+                plan_id: Some(amend_rev1_pr.plan_id.clone()),
+                expected_plan_revision: 3,
+                architect_advice_ids: vec![adv_clarify_auto_id],
+                max_architect_rounds: 0,
+                architect_difficulty: None,
+                current_time_ms: current_wall_clock_ms().expect("wall clock"),
+            },
+        )
+        .await
+        .expect_err("direct execution must reject amended job advice after contract drift");
+    assert_eq!(
+        amend_drifted_exec_err.error_code(),
+        NativeErrorCode::ValidationFailed
+    );
+    assert_eq!(
+        provider_invocation_count(&fixture.worker_marker),
+        calls_before_amend_drift_reject
+    );
+
+    fixture.shutdown().await;
+}
+
+fn find_single_prefixed_json(dir: &Path, prefix: &str) -> PathBuf {
+    let mut matches: Vec<PathBuf> = fs::read_dir(dir)
+        .expect("read store directory")
+        .filter_map(|entry| {
+            let path = entry.expect("dir entry").path();
+            let name = path.file_name()?.to_str()?;
+            if name.starts_with(prefix) && name.ends_with(".json") {
+                Some(path)
+            } else {
+                None
+            }
+        })
+        .collect();
+    matches.sort();
+    assert_eq!(
+        matches.len(),
+        1,
+        "expected exactly one `{prefix}*.json` in {}, got {matches:?}",
+        dir.display()
+    );
+    matches.remove(0)
+}
+
+fn write_private_file_0600(path: &Path, bytes: &[u8]) {
+    fs::write(path, bytes).expect("write private test file");
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).expect("chmod private file 0600");
+}
+
+fn grant_reservation_count(
+    wf_store: &CoworkerWorkflowStore,
+    binding_id: &str,
+    grant_id: &str,
+) -> usize {
+    wf_store
+        .read_binding_ledger(binding_id)
+        .expect("read workflow binding ledger")
+        .planning_grants
+        .into_iter()
+        .find(|g| g.grant_id == grant_id)
+        .expect("target grant in binding ledger")
+        .reservations
+        .len()
+}
+
+#[tokio::test]
+async fn foreign_direct_service_two_revisions_reversed_advice_missing_first_artifact_preserves_target_revision_and_own_evidence_guards(
+) {
+    use threadlane_native::coworker_workflow::{
+        deterministic_prefixed_id, OrchestrateWorkBriefPlanRequest,
+    };
+    use threadlane_native::{open_workflow_stores, ScopedWorkflow};
+
+    let mut fixture = GatewayFixture::start().await;
+    let mcp = fixture.enrolled_mcp();
+    let now_ms = current_wall_clock_ms().expect("wall clock");
+    let wf_store =
+        CoworkerWorkflowStore::new(&fixture.plans_dir).expect("open CoworkerWorkflowStore");
+
+    let grant = wf_store
+        .create_planning_grant(&CreatePlanningGrantRequest {
+            binding_id: fixture.binding_id.clone(),
+            thread_uuid: THREAD_UUID.to_string(),
+            request_key: "req-grant-hist-iso-1".to_string(),
+            expected_ledger_revision: None,
+            project_base: fixture.project_base.clone(),
+            profile_id: PROFILE_ID.to_string(),
+            registry_revision: 3,
+            policy: advisor_policy(),
+            capabilities: PlanningReadOnlyCapabilities::strict_read_only(),
+            budget: PlanningCallBudget {
+                max_total_calls: 30,
+                max_orchestrator_calls: 20,
+                max_architect_calls: 10,
+                max_timeout_ms_per_call: 60_000,
+                max_output_bytes_per_call: 65_536,
+            },
+            created_at_ms: now_ms.saturating_sub(5_000),
+            expires_at_ms: now_ms + 3_600_000,
+            operator_attested: true,
+        })
+        .expect("create advisor grant");
+    let grant_id = grant.grant_id.clone();
+
+    let (reg_arc, plans_arc) =
+        open_workflow_stores(Some(&fixture.registry_dir), Some(&fixture.plans_dir))
+            .expect("open workflow stores")
+            .expect("workflow stores configured");
+    let scoped = ScopedWorkflow::new(reg_arc, plans_arc, fixture.binding_id.clone())
+        .expect("ScopedWorkflow");
+    let artifacts_dir = planning_artifacts_dir(&fixture.plans_dir);
+    let planning_service =
+        CoworkerPlanningService::new(wf_store.clone(), &fixture.registry_dir, &artifacts_dir)
+            .expect("open CoworkerPlanningService");
+
+    // 1. Unrelated job U consults Advisor decisions A and B, accepts them in reversed order [B, A],
+    //    and publishes two plans via the DIRECT planning service (writing no gateway command):
+    //    first with [B, A], then revision 2 with none ([]), superseding rev 1.
+    let u_summary = "Unrelated job U direct-service planning history";
+    let u_reqs = vec!["Publish two direct-service revisions for unrelated job U"];
+    let job_u_parent: PrepareWorkResponse = invoke_mcp_ok(
+        &mcp,
+        "prepare_work",
+        json!({
+            "grant_id": grant_id,
+            "request_key": "req-prep-u-parent",
+            "summary": u_summary,
+            "confirmed_requirements": u_reqs
+        }),
+    )
+    .await;
+
+    fs::write(&fixture.mode_path, b"architect\n").expect("set mode architect");
+    let consult_a_submit: PlanningCommandSubmissionResponse = invoke_mcp_ok(
+        &mcp,
+        "consult_advisor",
+        json!({
+            "grant_id": grant_id,
+            "job_id": job_u_parent.job_id,
+            "request_key": "req-u-advisor-a",
+            "question": "Advisor decision A for unrelated job U",
+            "dependency_files": ["src/lib.rs"],
+            "difficulty": "hard"
+        }),
+    )
+    .await;
+    let consult_a_detail = wait_for_command_completion(&mcp, &consult_a_submit.command_id).await;
+    let adv_a = match consult_a_detail.result_ref.as_ref() {
+        Some(PlanningCommandResultRef::ArchitectAdvice { advice_id, .. }) => advice_id.clone(),
+        other => panic!("expected ArchitectAdvice for A, got {other:?}"),
+    };
+
+    let consult_b_submit: PlanningCommandSubmissionResponse = invoke_mcp_ok(
+        &mcp,
+        "consult_advisor",
+        json!({
+            "grant_id": grant_id,
+            "job_id": job_u_parent.job_id,
+            "request_key": "req-u-advisor-b",
+            "question": "Advisor decision B for unrelated job U",
+            "dependency_files": ["src/lib.rs"],
+            "difficulty": "hard"
+        }),
+    )
+    .await;
+    let consult_b_detail = wait_for_command_completion(&mcp, &consult_b_submit.command_id).await;
+    let adv_b = match consult_b_detail.result_ref.as_ref() {
+        Some(PlanningCommandResultRef::ArchitectAdvice { advice_id, .. }) => advice_id.clone(),
+        other => panic!("expected ArchitectAdvice for B, got {other:?}"),
+    };
+
+    let job_u: PrepareWorkResponse = invoke_mcp_ok(
+        &mcp,
+        "prepare_work",
+        json!({
+            "grant_id": grant_id,
+            "request_key": "req-prep-u-reversed-decisions",
+            "summary": u_summary,
+            "confirmed_requirements": u_reqs,
+            "accepted_architect_decisions": [adv_b, adv_a],
+            "amendment": {
+                "target_job_id": job_u_parent.job_id,
+                "target_job_revision": 1,
+                "amendment_reason": "Accept Advisor decisions [B, A] in reversed order"
+            }
+        }),
+    )
+    .await;
+
+    fs::write(&fixture.mode_path, b"orch_plan\n").expect("set mode orch_plan for U rev1");
+    let u_rev1_outcome = planning_service
+        .orchestrate_brief_to_plan(
+            &scoped,
+            &OrchestrateWorkBriefPlanRequest {
+                binding_id: fixture.binding_id.clone(),
+                thread_uuid: THREAD_UUID.to_string(),
+                grant_id: grant_id.clone(),
+                job_id: job_u.job_id.clone(),
+                request_key: "direct-u-plan-rev1".to_string(),
+                expected_ledger_revision: None,
+                difficulty: Some(Difficulty::Hard),
+                plan_id: None,
+                expected_plan_revision: 0,
+                architect_advice_ids: vec![adv_b.clone(), adv_a.clone()],
+                max_architect_rounds: 0,
+                architect_difficulty: None,
+                current_time_ms: current_wall_clock_ms().expect("wall clock"),
+            },
+        )
+        .await
+        .expect("direct service U rev1");
+    let u_rev1_pr = u_rev1_outcome
+        .planning_result
+        .clone()
+        .expect("U rev1 planning_result");
+    assert_eq!(
+        u_rev1_pr.architect_advice_ids,
+        vec![adv_b.clone(), adv_a.clone()]
+    );
+
+    fs::write(&fixture.mode_path, b"orch_plan_v2_same_iface\n")
+        .expect("set mode orch_plan_v2_same_iface for U rev2");
+    let u_rev2_outcome = planning_service
+        .orchestrate_brief_to_plan(
+            &scoped,
+            &OrchestrateWorkBriefPlanRequest {
+                binding_id: fixture.binding_id.clone(),
+                thread_uuid: THREAD_UUID.to_string(),
+                grant_id: grant_id.clone(),
+                job_id: job_u.job_id.clone(),
+                request_key: "direct-u-plan-rev2".to_string(),
+                expected_ledger_revision: None,
+                difficulty: Some(Difficulty::Hard),
+                plan_id: Some(u_rev1_pr.plan_id.clone()),
+                expected_plan_revision: 1,
+                architect_advice_ids: Vec::new(),
+                max_architect_rounds: 0,
+                architect_difficulty: None,
+                current_time_ms: current_wall_clock_ms().expect("wall clock"),
+            },
+        )
+        .await
+        .expect("direct service U rev2");
+    let u_rev2_pr = u_rev2_outcome
+        .planning_result
+        .clone()
+        .expect("U rev2 planning_result");
+    assert!(u_rev2_pr.architect_advice_ids.is_empty());
+    assert_eq!(u_rev2_pr.plan_id, u_rev1_pr.plan_id);
+    assert_eq!(u_rev2_pr.plan_revision, 2);
+
+    // Also cover an unrelated direct-service job U2 that publishes rev 1 with an explicit `plan_id`
+    // and then publishes a distinct second plan (overwriting U2.planning_result with a new plan_id).
+    let job_u2: PrepareWorkResponse = invoke_mcp_ok(
+        &mcp,
+        "prepare_work",
+        json!({
+            "grant_id": grant_id,
+            "request_key": "req-prep-u2-explicit-plan",
+            "summary": "Unrelated job U2 with explicit plan_id first revision",
+            "confirmed_requirements": ["Verify explicit plan_id receipt isolation"]
+        }),
+    )
+    .await;
+    fs::write(&fixture.mode_path, b"orch_plan\n").expect("set mode orch_plan for U2 rev1");
+    let u2_rev1_outcome = planning_service
+        .orchestrate_brief_to_plan(
+            &scoped,
+            &OrchestrateWorkBriefPlanRequest {
+                binding_id: fixture.binding_id.clone(),
+                thread_uuid: THREAD_UUID.to_string(),
+                grant_id: grant_id.clone(),
+                job_id: job_u2.job_id.clone(),
+                request_key: "direct-u2-explicit-plan-rev1".to_string(),
+                expected_ledger_revision: None,
+                difficulty: Some(Difficulty::Hard),
+                plan_id: Some("plan_u2_explicit_custom".to_string()),
+                expected_plan_revision: 0,
+                architect_advice_ids: Vec::new(),
+                max_architect_rounds: 0,
+                architect_difficulty: None,
+                current_time_ms: current_wall_clock_ms().expect("wall clock"),
+            },
+        )
+        .await
+        .expect("direct service U2 explicit rev1");
+    let u2_rev1_pr = u2_rev1_outcome
+        .planning_result
+        .clone()
+        .expect("U2 rev1 planning_result");
+    assert_eq!(u2_rev1_pr.plan_id, "plan_u2_explicit_custom");
+
+    fs::write(&fixture.mode_path, b"orch_plan_v2_same_iface\n")
+        .expect("set mode orch_plan_v2_same_iface for U2 rev2");
+    let u2_rev2_outcome = planning_service
+        .orchestrate_brief_to_plan(
+            &scoped,
+            &OrchestrateWorkBriefPlanRequest {
+                binding_id: fixture.binding_id.clone(),
+                thread_uuid: THREAD_UUID.to_string(),
+                grant_id: grant_id.clone(),
+                job_id: job_u2.job_id.clone(),
+                request_key: "direct-u2-second-plan".to_string(),
+                expected_ledger_revision: None,
+                difficulty: Some(Difficulty::Hard),
+                plan_id: None,
+                expected_plan_revision: 0,
+                architect_advice_ids: Vec::new(),
+                max_architect_rounds: 0,
+                architect_difficulty: None,
+                current_time_ms: current_wall_clock_ms().expect("wall clock"),
+            },
+        )
+        .await
+        .expect("direct service U2 second plan");
+    let u2_rev2_pr = u2_rev2_outcome
+        .planning_result
+        .clone()
+        .expect("U2 rev2 planning_result");
+    assert_ne!(u2_rev2_pr.plan_id, u2_rev1_pr.plan_id);
+
+    // 2. Distinct job J on the same binding, base, and policy has its own complete evidence and
+    //    earlier accepted direct-parent Advisor handoff, and publishes J rev 1.
+    let j_summary = "Target job J with direct-parent Advisor handoff";
+    let j_reqs = vec!["Preserve target job J evidence and baseline guards"];
+    let job_j_parent: PrepareWorkResponse = invoke_mcp_ok(
+        &mcp,
+        "prepare_work",
+        json!({
+            "grant_id": grant_id,
+            "request_key": "req-prep-j-parent",
+            "summary": j_summary,
+            "confirmed_requirements": j_reqs
+        }),
+    )
+    .await;
+
+    fs::write(&fixture.mode_path, b"architect\n").expect("set mode architect for J");
+    let consult_j_submit: PlanningCommandSubmissionResponse = invoke_mcp_ok(
+        &mcp,
+        "consult_advisor",
+        json!({
+            "grant_id": grant_id,
+            "job_id": job_j_parent.job_id,
+            "request_key": "req-j-advisor",
+            "question": "Confirm boundary contract for target job J",
+            "dependency_files": ["src/lib.rs"],
+            "difficulty": "hard"
+        }),
+    )
+    .await;
+    let consult_j_detail = wait_for_command_completion(&mcp, &consult_j_submit.command_id).await;
+    let adv_j = match consult_j_detail.result_ref.as_ref() {
+        Some(PlanningCommandResultRef::ArchitectAdvice { advice_id, .. }) => advice_id.clone(),
+        other => panic!("expected ArchitectAdvice for J, got {other:?}"),
+    };
+
+    let prep_j_args = json!({
+        "grant_id": grant_id,
+        "request_key": "req-prep-j-direct-amend",
+        "summary": j_summary,
+        "confirmed_requirements": j_reqs,
+        "accepted_architect_decisions": [adv_j],
+        "amendment": {
+            "target_job_id": job_j_parent.job_id,
+            "target_job_revision": 1,
+            "amendment_reason": "Carry verified Advisor decision into target job J"
+        }
+    });
+    let job_j: PrepareWorkResponse = invoke_mcp_ok(&mcp, "prepare_work", prep_j_args.clone()).await;
+
+    fs::write(&fixture.mode_path, b"orch_plan\n").expect("set mode orch_plan for J rev1");
+    let j_rev1_submit: PlanningCommandSubmissionResponse = invoke_mcp_ok(
+        &mcp,
+        "request_technical_plan",
+        json!({
+            "grant_id": grant_id,
+            "job_id": job_j.job_id,
+            "request_key": "req-j-plan-rev1",
+            "max_architect_rounds": 0,
+            "difficulty": "hard"
+        }),
+    )
+    .await;
+    let j_rev1_detail = wait_for_command_completion(&mcp, &j_rev1_submit.command_id).await;
+    assert_eq!(
+        j_rev1_detail.status,
+        PlanningCommandStatus::Completed,
+        "J rev1 failed: {}",
+        format_command_detail_context(&j_rev1_detail)
+    );
+    let j_rev1_pr = match j_rev1_detail.result_ref.as_ref() {
+        Some(PlanningCommandResultRef::OrchestratorPlan {
+            planning_result, ..
+        }) => planning_result.as_ref().clone(),
+        other => panic!("expected OrchestratorPlan for J rev1, got {other:?}"),
+    };
+    assert_eq!(j_rev1_pr.architect_advice_ids, vec![adv_j.clone()]);
+
+    // 3. Remove BOTH foreign direct-service first artifacts (`U` rev 1 and `U2` explicit rev 1).
+    let u_rev1_artifact_path = artifacts_dir.join(format!("{}.json", u_rev1_pr.report_artifact_id));
+    let u2_rev1_artifact_path =
+        artifacts_dir.join(format!("{}.json", u2_rev1_pr.report_artifact_id));
+    fs::remove_file(&u_rev1_artifact_path).expect("delete U rev1 verified artifact");
+    fs::remove_file(&u2_rev1_artifact_path).expect("delete U2 explicit rev1 verified artifact");
+    assert!(!u_rev1_artifact_path.exists());
+    assert!(!u2_rev1_artifact_path.exists());
+
+    // Confirm the read-only workflow API resolves both implicit superseded and explicit plan_id receipts.
+    let readonly_receipts = ScopedWorkflow::read_save_draft_receipts_readonly_at(
+        &fixture.registry_dir,
+        &fixture.plans_dir,
+        &fixture.binding_id,
+    )
+    .expect("read readonly save_draft receipts");
+    let u_rev1_save_key = deterministic_prefixed_id(
+        "threadlane-native:coworker-plan-draft:v1",
+        "cmd",
+        &[
+            &fixture.binding_id,
+            &job_u.job_id,
+            &u_rev1_pr.reservation_id,
+            &u_rev1_pr.output_digest,
+        ],
+    );
+    let u_rev1_verified = readonly_receipts
+        .verify_completed_save_draft(&u_rev1_save_key)
+        .expect("verify U rev1 save_draft receipt")
+        .expect("U rev1 save_draft receipt present");
+    assert_eq!(u_rev1_verified.explicit_plan_id, None);
+    assert_eq!(u_rev1_verified.plan_id, u_rev1_pr.plan_id);
+    assert_eq!(u_rev1_verified.revision, 1);
+    assert_eq!(u_rev1_verified.status, PlanStatus::Superseded);
+    assert_eq!(u_rev1_verified.plan_digest, u_rev1_pr.plan_digest);
+
+    let u2_rev1_save_key = deterministic_prefixed_id(
+        "threadlane-native:coworker-plan-draft:v1",
+        "cmd",
+        &[
+            &fixture.binding_id,
+            &job_u2.job_id,
+            &u2_rev1_pr.reservation_id,
+            &u2_rev1_pr.output_digest,
+        ],
+    );
+    let u2_rev1_verified = readonly_receipts
+        .verify_completed_save_draft(&u2_rev1_save_key)
+        .expect("verify U2 explicit rev1 save_draft receipt")
+        .expect("U2 explicit rev1 save_draft receipt present");
+    assert_eq!(
+        u2_rev1_verified.explicit_plan_id.as_deref(),
+        Some("plan_u2_explicit_custom")
+    );
+    assert_eq!(u2_rev1_verified.plan_id, "plan_u2_explicit_custom");
+    assert_eq!(u2_rev1_verified.revision, 1);
+    assert_eq!(u2_rev1_verified.status, PlanStatus::Published);
+    assert_eq!(u2_rev1_verified.plan_digest, u2_rev1_pr.plan_digest);
+
+    // 4. While U's and U2's first artifacts remain missing, J's prepare_work replay, explicit-advice
+    //    gateway revision, exact original replay, implicit-advice gateway revision, and direct-service
+    //    revision all succeed cleanly.
+    let prep_j_replay: PrepareWorkResponse =
+        invoke_mcp_ok(&mcp, "prepare_work", prep_j_args.clone()).await;
+    assert_eq!(prep_j_replay.job_id, job_j.job_id);
+
+    fs::write(&fixture.mode_path, b"orch_plan_v2_same_iface\n")
+        .expect("set mode orch_plan_v2_same_iface for J rev2");
+    let j_rev2_args = json!({
+        "grant_id": grant_id,
+        "job_id": job_j.job_id,
+        "request_key": "req-j-plan-rev2-explicit",
+        "plan_id": j_rev1_pr.plan_id,
+        "expected_plan_revision": 1,
+        "architect_advice_ids": [adv_j],
+        "max_architect_rounds": 0,
+        "difficulty": "hard"
+    });
+    let j_rev2_submit: PlanningCommandSubmissionResponse =
+        invoke_mcp_ok(&mcp, "request_technical_plan", j_rev2_args.clone()).await;
+    let j_rev2_detail = wait_for_command_completion(&mcp, &j_rev2_submit.command_id).await;
+    assert_eq!(
+        j_rev2_detail.status,
+        PlanningCommandStatus::Completed,
+        "J rev2 explicit failed with missing foreign artifacts: {}",
+        format_command_detail_context(&j_rev2_detail)
+    );
+    let calls_after_j_rev2 = provider_invocation_count(&fixture.worker_marker);
+
+    // Valid original replay returns AlreadyCompleted with zero extra provider calls.
+    let j_rev2_replay: PlanningCommandSubmissionResponse =
+        invoke_mcp_ok(&mcp, "request_technical_plan", j_rev2_args).await;
+    assert_eq!(j_rev2_replay.command_id, j_rev2_submit.command_id);
+    assert_eq!(j_rev2_replay.status, PlanningCommandStatus::Completed);
+    assert_eq!(
+        j_rev2_replay.submission_status,
+        PlanningCommandStartStatus::AlreadyCompleted
+    );
+    assert!(!j_rev2_replay.launched);
+    assert_eq!(
+        provider_invocation_count(&fixture.worker_marker),
+        calls_after_j_rev2
+    );
+
+    // Implicit advice reuse (omitted `architect_advice_ids`) on J rev 3.
+    let j_rev3_submit: PlanningCommandSubmissionResponse = invoke_mcp_ok(
+        &mcp,
+        "request_technical_plan",
+        json!({
+            "grant_id": grant_id,
+            "job_id": job_j.job_id,
+            "request_key": "req-j-plan-rev3-implicit",
+            "plan_id": j_rev1_pr.plan_id,
+            "expected_plan_revision": 2,
+            "max_architect_rounds": 0,
+            "difficulty": "hard"
+        }),
+    )
+    .await;
+    let j_rev3_detail = wait_for_command_completion(&mcp, &j_rev3_submit.command_id).await;
+    assert_eq!(
+        j_rev3_detail.status,
+        PlanningCommandStatus::Completed,
+        "J rev3 implicit failed: {}",
+        format_command_detail_context(&j_rev3_detail)
+    );
+
+    // Direct-service revision on J rev 4 also succeeds while U's first artifacts remain missing.
+    let j_rev4_outcome = planning_service
+        .orchestrate_brief_to_plan(
+            &scoped,
+            &OrchestrateWorkBriefPlanRequest {
+                binding_id: fixture.binding_id.clone(),
+                thread_uuid: THREAD_UUID.to_string(),
+                grant_id: grant_id.clone(),
+                job_id: job_j.job_id.clone(),
+                request_key: "direct-j-plan-rev4".to_string(),
+                expected_ledger_revision: None,
+                difficulty: Some(Difficulty::Hard),
+                plan_id: Some(j_rev1_pr.plan_id.clone()),
+                expected_plan_revision: 3,
+                architect_advice_ids: vec![adv_j.clone()],
+                max_architect_rounds: 0,
+                architect_difficulty: None,
+                current_time_ms: current_wall_clock_ms().expect("wall clock"),
+            },
+        )
+        .await
+        .expect("direct service J rev4 succeeds with missing foreign artifacts");
+    assert_eq!(
+        j_rev4_outcome
+            .planning_result
+            .as_ref()
+            .expect("J rev4 planning_result")
+            .plan_revision,
+        4
+    );
+
+    // Also verify a distinct non-amendment exact-digest job `J_exact` (whose earlier pre-plan
+    // Advisor advice was consulted directly on `J_exact` before rev 1) can revise cleanly while
+    // `U` and `U2`'s first artifacts remain missing.
+    let job_j_exact: PrepareWorkResponse = invoke_mcp_ok(
+        &mcp,
+        "prepare_work",
+        json!({
+            "grant_id": grant_id,
+            "request_key": "req-prep-j-exact",
+            "summary": "Target job J_exact with exact-digest pre-plan Advisor advice",
+            "confirmed_requirements": ["Verify exact-digest pre-plan advice baseline isolation"]
+        }),
+    )
+    .await;
+    fs::write(&fixture.mode_path, b"architect\n").expect("set mode architect for J_exact");
+    let adv_j_exact_submit: PlanningCommandSubmissionResponse = invoke_mcp_ok(
+        &mcp,
+        "consult_advisor",
+        json!({
+            "grant_id": grant_id,
+            "job_id": job_j_exact.job_id,
+            "request_key": "req-j-exact-advisor",
+            "question": "Pre-plan contract advice for exact-digest job J_exact",
+            "dependency_files": ["src/lib.rs"],
+            "difficulty": "hard"
+        }),
+    )
+    .await;
+    let adv_j_exact_detail =
+        wait_for_command_completion(&mcp, &adv_j_exact_submit.command_id).await;
+    let adv_j_exact = match adv_j_exact_detail.result_ref.as_ref() {
+        Some(PlanningCommandResultRef::ArchitectAdvice { advice_id, .. }) => advice_id.clone(),
+        other => panic!("expected ArchitectAdvice for J_exact, got {other:?}"),
+    };
+    fs::write(&fixture.mode_path, b"orch_plan\n").expect("set mode orch_plan for J_exact rev1");
+    let j_exact_rev1_submit: PlanningCommandSubmissionResponse = invoke_mcp_ok(
+        &mcp,
+        "request_technical_plan",
+        json!({
+            "grant_id": grant_id,
+            "job_id": job_j_exact.job_id,
+            "request_key": "req-j-exact-plan-rev1",
+            "architect_advice_ids": [adv_j_exact],
+            "max_architect_rounds": 0,
+            "difficulty": "hard"
+        }),
+    )
+    .await;
+    let j_exact_rev1_detail =
+        wait_for_command_completion(&mcp, &j_exact_rev1_submit.command_id).await;
+    let j_exact_rev1_pr = match j_exact_rev1_detail.result_ref.as_ref() {
+        Some(PlanningCommandResultRef::OrchestratorPlan {
+            planning_result, ..
+        }) => planning_result.as_ref().clone(),
+        other => panic!("expected OrchestratorPlan for J_exact rev1, got {other:?}"),
+    };
+    fs::write(&fixture.mode_path, b"orch_plan_v2_same_iface\n")
+        .expect("set mode orch_plan_v2_same_iface for J_exact rev2");
+    let j_exact_rev2_submit: PlanningCommandSubmissionResponse = invoke_mcp_ok(
+        &mcp,
+        "request_technical_plan",
+        json!({
+            "grant_id": grant_id,
+            "job_id": job_j_exact.job_id,
+            "request_key": "req-j-exact-plan-rev2",
+            "plan_id": j_exact_rev1_pr.plan_id,
+            "expected_plan_revision": 1,
+            "architect_advice_ids": [adv_j_exact],
+            "max_architect_rounds": 0,
+            "difficulty": "hard"
+        }),
+    )
+    .await;
+    let j_exact_rev2_detail =
+        wait_for_command_completion(&mcp, &j_exact_rev2_submit.command_id).await;
+    assert_eq!(
+        j_exact_rev2_detail.status,
+        PlanningCommandStatus::Completed,
+        "J_exact rev2 failed with missing foreign artifacts: {}",
+        format_command_detail_context(&j_exact_rev2_detail)
+    );
+
+    // 5. Removing J's OWN historical rev 1 baseline artifact MUST fail closed before any provider
+    //    effects even though J's latest rev 4 planning_result artifact is intact.
+    let j_rev1_artifact_path = artifacts_dir.join(format!("{}.json", j_rev1_pr.report_artifact_id));
+    let saved_j_rev1_artifact = fs::read(&j_rev1_artifact_path).expect("read J rev1 artifact");
+    fs::remove_file(&j_rev1_artifact_path).expect("delete J rev1 own baseline artifact");
+    let calls_before_own_missing = provider_invocation_count(&fixture.worker_marker);
+    let reservations_before_own_missing =
+        grant_reservation_count(&wf_store, &fixture.binding_id, &grant_id);
+
+    assert_eq!(
+        invoke_mcp_err_code(
+            &mcp,
+            "request_technical_plan",
+            json!({
+                "grant_id": grant_id,
+                "job_id": job_j.job_id,
+                "request_key": "req-j-plan-rev5-own-missing-exp",
+                "plan_id": j_rev1_pr.plan_id,
+                "expected_plan_revision": 4,
+                "architect_advice_ids": [adv_j],
+                "max_architect_rounds": 0,
+                "difficulty": "hard"
+            })
+        )
+        .await,
+        "validation_failed"
+    );
+    assert_eq!(
+        invoke_mcp_err_code(
+            &mcp,
+            "request_technical_plan",
+            json!({
+                "grant_id": grant_id,
+                "job_id": job_j.job_id,
+                "request_key": "req-j-plan-rev5-own-missing-imp",
+                "plan_id": j_rev1_pr.plan_id,
+                "expected_plan_revision": 4,
+                "max_architect_rounds": 0,
+                "difficulty": "hard"
+            })
+        )
+        .await,
+        "validation_failed"
+    );
+    assert_eq!(
+        invoke_mcp_err_code(&mcp, "prepare_work", prep_j_args.clone()).await,
+        "validation_failed"
+    );
+    let direct_own_missing_err = planning_service
+        .orchestrate_brief_to_plan(
+            &scoped,
+            &OrchestrateWorkBriefPlanRequest {
+                binding_id: fixture.binding_id.clone(),
+                thread_uuid: THREAD_UUID.to_string(),
+                grant_id: grant_id.clone(),
+                job_id: job_j.job_id.clone(),
+                request_key: "direct-j-plan-rev5-own-missing".to_string(),
+                expected_ledger_revision: None,
+                difficulty: Some(Difficulty::Hard),
+                plan_id: Some(j_rev1_pr.plan_id.clone()),
+                expected_plan_revision: 4,
+                architect_advice_ids: vec![adv_j.clone()],
+                max_architect_rounds: 0,
+                architect_difficulty: None,
+                current_time_ms: current_wall_clock_ms().expect("wall clock"),
+            },
+        )
+        .await
+        .expect_err("direct service must reject missing own historical baseline artifact");
+    assert_eq!(
+        direct_own_missing_err.error_code(),
+        NativeErrorCode::ValidationFailed
+    );
+    assert_eq!(
+        provider_invocation_count(&fixture.worker_marker),
+        calls_before_own_missing
+    );
+    assert_eq!(
+        grant_reservation_count(&wf_store, &fixture.binding_id, &grant_id),
+        reservations_before_own_missing
+    );
+
+    // Restoring ONLY J's own artifact (leaving U's and U2's foreign artifacts missing) makes
+    // J's revision pass again.
+    write_private_file_0600(&j_rev1_artifact_path, &saved_j_rev1_artifact);
+    let j_rev5_submit: PlanningCommandSubmissionResponse = invoke_mcp_ok(
+        &mcp,
+        "request_technical_plan",
+        json!({
+            "grant_id": grant_id,
+            "job_id": job_j.job_id,
+            "request_key": "req-j-plan-rev5-restored-own",
+            "plan_id": j_rev1_pr.plan_id,
+            "expected_plan_revision": 4,
+            "architect_advice_ids": [adv_j],
+            "max_architect_rounds": 0,
+            "difficulty": "hard"
+        }),
+    )
+    .await;
+    let j_rev5_detail = wait_for_command_completion(&mcp, &j_rev5_submit.command_id).await;
+    assert_eq!(
+        j_rev5_detail.status,
+        PlanningCommandStatus::Completed,
+        "J rev5 failed after restoring own artifact: {}",
+        format_command_detail_context(&j_rev5_detail)
+    );
+
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn normal_gateway_vs_direct_service_unproven_artifacts_and_invalid_receipts_fail_closed_before_provider_effects(
+) {
+    use threadlane_native::coworker_workflow::{
+        OrchestrateWorkBriefPlanRequest, OrchestratorPlanningDecision,
+    };
+    use threadlane_native::{open_workflow_stores, ScopedWorkflow};
+
+    let mut fixture = GatewayFixture::start().await;
+    let mcp = fixture.enrolled_mcp();
+    let now_ms = current_wall_clock_ms().expect("wall clock");
+    let wf_store =
+        CoworkerWorkflowStore::new(&fixture.plans_dir).expect("open CoworkerWorkflowStore");
+
+    let grant = wf_store
+        .create_planning_grant(&CreatePlanningGrantRequest {
+            binding_id: fixture.binding_id.clone(),
+            thread_uuid: THREAD_UUID.to_string(),
+            request_key: "req-grant-hist-iso-2".to_string(),
+            expected_ledger_revision: None,
+            project_base: fixture.project_base.clone(),
+            profile_id: PROFILE_ID.to_string(),
+            registry_revision: 3,
+            policy: advisor_policy(),
+            capabilities: PlanningReadOnlyCapabilities::strict_read_only(),
+            budget: PlanningCallBudget {
+                max_total_calls: 30,
+                max_orchestrator_calls: 20,
+                max_architect_calls: 10,
+                max_timeout_ms_per_call: 60_000,
+                max_output_bytes_per_call: 65_536,
+            },
+            created_at_ms: now_ms.saturating_sub(5_000),
+            expires_at_ms: now_ms + 3_600_000,
+            operator_attested: true,
+        })
+        .expect("create advisor grant");
+    let grant_id = grant.grant_id.clone();
+
+    let (reg_arc, plans_arc) =
+        open_workflow_stores(Some(&fixture.registry_dir), Some(&fixture.plans_dir))
+            .expect("open workflow stores")
+            .expect("workflow stores configured");
+    let scoped = ScopedWorkflow::new(reg_arc, plans_arc, fixture.binding_id.clone())
+        .expect("ScopedWorkflow");
+    let artifacts_dir = planning_artifacts_dir(&fixture.plans_dir);
+    let planning_service =
+        CoworkerPlanningService::new(wf_store.clone(), &fixture.registry_dir, &artifacts_dir)
+            .expect("open CoworkerPlanningService");
+
+    // 1. Normal gateway route for unrelated job U_gw: a non-plan clarification outcome (owned ONLY
+    //    via PlanningCommandRecord, no save_draft receipt) plus two published plan revisions.
+    let job_u_gw: PrepareWorkResponse = invoke_mcp_ok(
+        &mcp,
+        "prepare_work",
+        json!({
+            "grant_id": grant_id,
+            "request_key": "req-prep-u-gw",
+            "summary": "Unrelated job U_gw using normal MCP gateway commands",
+            "confirmed_requirements": ["Exercise normal gateway ownership isolation"]
+        }),
+    )
+    .await;
+
+    fs::write(&fixture.mode_path, b"orch_clarify\n").expect("set mode orch_clarify for U_gw");
+    let u_gw_clarify_submit: PlanningCommandSubmissionResponse = invoke_mcp_ok(
+        &mcp,
+        "request_technical_plan",
+        json!({
+            "grant_id": grant_id,
+            "job_id": job_u_gw.job_id,
+            "request_key": "req-u-gw-clarify",
+            "max_architect_rounds": 0,
+            "difficulty": "hard"
+        }),
+    )
+    .await;
+    let u_gw_clarify_detail =
+        wait_for_command_completion(&mcp, &u_gw_clarify_submit.command_id).await;
+    let u_gw_clarify_art_id = match u_gw_clarify_detail.result_ref.as_ref() {
+        Some(PlanningCommandResultRef::OrchestratorRequiresHumanClarification {
+            report_artifact_id,
+            ..
+        }) => report_artifact_id.clone(),
+        other => panic!("expected OrchestratorRequiresHumanClarification, got {other:?}"),
+    };
+
+    fs::write(&fixture.mode_path, b"orch_plan\n").expect("set mode orch_plan for U_gw rev1");
+    let u_gw_rev1_submit: PlanningCommandSubmissionResponse = invoke_mcp_ok(
+        &mcp,
+        "request_technical_plan",
+        json!({
+            "grant_id": grant_id,
+            "job_id": job_u_gw.job_id,
+            "request_key": "req-u-gw-plan-rev1",
+            "max_architect_rounds": 0,
+            "difficulty": "hard"
+        }),
+    )
+    .await;
+    let u_gw_rev1_detail = wait_for_command_completion(&mcp, &u_gw_rev1_submit.command_id).await;
+    let u_gw_rev1_pr = match u_gw_rev1_detail.result_ref.as_ref() {
+        Some(PlanningCommandResultRef::OrchestratorPlan {
+            planning_result, ..
+        }) => planning_result.as_ref().clone(),
+        other => panic!("expected OrchestratorPlan for U_gw rev1, got {other:?}"),
+    };
+
+    fs::write(&fixture.mode_path, b"orch_plan_v2_same_iface\n")
+        .expect("set mode orch_plan_v2_same_iface for U_gw rev2");
+    let u_gw_rev2_submit: PlanningCommandSubmissionResponse = invoke_mcp_ok(
+        &mcp,
+        "request_technical_plan",
+        json!({
+            "grant_id": grant_id,
+            "job_id": job_u_gw.job_id,
+            "request_key": "req-u-gw-plan-rev2",
+            "plan_id": u_gw_rev1_pr.plan_id,
+            "expected_plan_revision": 1,
+            "max_architect_rounds": 0,
+            "difficulty": "hard"
+        }),
+    )
+    .await;
+    let u_gw_rev2_detail = wait_for_command_completion(&mcp, &u_gw_rev2_submit.command_id).await;
+    assert_eq!(u_gw_rev2_detail.status, PlanningCommandStatus::Completed);
+
+    // 2. Direct-service non-plan clarification reservation (NO gateway command, NO save_draft receipt):
+    //    unproven artifact must stay usable while intact, and MUST refuse if deleted.
+    let job_u_unproven: PrepareWorkResponse = invoke_mcp_ok(
+        &mcp,
+        "prepare_work",
+        json!({
+            "grant_id": grant_id,
+            "request_key": "req-prep-u-direct-clarify",
+            "summary": "Unrelated job with direct-service non-plan reservation",
+            "confirmed_requirements": ["Verify unproven artifacts are never silently skipped"]
+        }),
+    )
+    .await;
+    fs::write(&fixture.mode_path, b"orch_clarify\n").expect("set mode orch_clarify for U_unproven");
+    let u_unproven_outcome = planning_service
+        .orchestrate_brief_to_plan(
+            &scoped,
+            &OrchestrateWorkBriefPlanRequest {
+                binding_id: fixture.binding_id.clone(),
+                thread_uuid: THREAD_UUID.to_string(),
+                grant_id: grant_id.clone(),
+                job_id: job_u_unproven.job_id.clone(),
+                request_key: "direct-u-unproven-clarify".to_string(),
+                expected_ledger_revision: None,
+                difficulty: Some(Difficulty::Hard),
+                plan_id: None,
+                expected_plan_revision: 0,
+                architect_advice_ids: Vec::new(),
+                max_architect_rounds: 0,
+                architect_difficulty: None,
+                current_time_ms: current_wall_clock_ms().expect("wall clock"),
+            },
+        )
+        .await
+        .expect("direct service clarify");
+    assert!(matches!(
+        u_unproven_outcome.decision,
+        OrchestratorPlanningDecision::RequiresHumanClarification(_)
+    ));
+    let u_unproven_art_id = u_unproven_outcome
+        .reservation
+        .report_artifact_id
+        .clone()
+        .expect("unproven artifact id");
+    let u_unproven_art_path = artifacts_dir.join(format!("{u_unproven_art_id}.json"));
+
+    // 3. Direct-service two-revision unrelated job U_direct (for invalid-receipt tamper checks).
+    let job_u_direct: PrepareWorkResponse = invoke_mcp_ok(
+        &mcp,
+        "prepare_work",
+        json!({
+            "grant_id": grant_id,
+            "request_key": "req-prep-u-direct-plans",
+            "summary": "Unrelated job U_direct publishing two direct-service plans",
+            "confirmed_requirements": ["Test invalid save_draft receipts without provider calls"]
+        }),
+    )
+    .await;
+    fs::write(&fixture.mode_path, b"orch_plan\n").expect("set mode orch_plan for U_direct rev1");
+    let u_direct_rev1_pr = planning_service
+        .orchestrate_brief_to_plan(
+            &scoped,
+            &OrchestrateWorkBriefPlanRequest {
+                binding_id: fixture.binding_id.clone(),
+                thread_uuid: THREAD_UUID.to_string(),
+                grant_id: grant_id.clone(),
+                job_id: job_u_direct.job_id.clone(),
+                request_key: "direct-u-plans-rev1".to_string(),
+                expected_ledger_revision: None,
+                difficulty: Some(Difficulty::Hard),
+                plan_id: None,
+                expected_plan_revision: 0,
+                architect_advice_ids: Vec::new(),
+                max_architect_rounds: 0,
+                architect_difficulty: None,
+                current_time_ms: current_wall_clock_ms().expect("wall clock"),
+            },
+        )
+        .await
+        .expect("U_direct rev1")
+        .planning_result
+        .expect("U_direct rev1 planning_result");
+
+    fs::write(&fixture.mode_path, b"orch_plan_v2_same_iface\n")
+        .expect("set mode orch_plan_v2_same_iface for U_direct rev2");
+    let u_direct_rev2_pr = planning_service
+        .orchestrate_brief_to_plan(
+            &scoped,
+            &OrchestrateWorkBriefPlanRequest {
+                binding_id: fixture.binding_id.clone(),
+                thread_uuid: THREAD_UUID.to_string(),
+                grant_id: grant_id.clone(),
+                job_id: job_u_direct.job_id.clone(),
+                request_key: "direct-u-plans-rev2".to_string(),
+                expected_ledger_revision: None,
+                difficulty: Some(Difficulty::Hard),
+                plan_id: Some(u_direct_rev1_pr.plan_id.clone()),
+                expected_plan_revision: 1,
+                architect_advice_ids: Vec::new(),
+                max_architect_rounds: 0,
+                architect_difficulty: None,
+                current_time_ms: current_wall_clock_ms().expect("wall clock"),
+            },
+        )
+        .await
+        .expect("U_direct rev2")
+        .planning_result
+        .expect("U_direct rev2 planning_result");
+    assert_eq!(u_direct_rev2_pr.plan_revision, 2);
+
+    // 4. Target job J with earlier accepted Advisor advice and published rev 1 plan.
+    let job_j_parent: PrepareWorkResponse = invoke_mcp_ok(
+        &mcp,
+        "prepare_work",
+        json!({
+            "grant_id": grant_id,
+            "request_key": "req-prep-j2-parent",
+            "summary": "Target job J2 for gateway vs direct and invalid-receipt guards",
+            "confirmed_requirements": ["Reject unproven missing artifacts and invalid receipts"]
+        }),
+    )
+    .await;
+    fs::write(&fixture.mode_path, b"architect\n").expect("set mode architect for J2");
+    let adv_j_submit: PlanningCommandSubmissionResponse = invoke_mcp_ok(
+        &mcp,
+        "consult_advisor",
+        json!({
+            "grant_id": grant_id,
+            "job_id": job_j_parent.job_id,
+            "request_key": "req-j2-advisor",
+            "question": "Advisor guidance for target job J2",
+            "dependency_files": ["src/lib.rs"],
+            "difficulty": "hard"
+        }),
+    )
+    .await;
+    let adv_j_detail = wait_for_command_completion(&mcp, &adv_j_submit.command_id).await;
+    let adv_j = match adv_j_detail.result_ref.as_ref() {
+        Some(PlanningCommandResultRef::ArchitectAdvice { advice_id, .. }) => advice_id.clone(),
+        other => panic!("expected ArchitectAdvice for J2, got {other:?}"),
+    };
+    let prep_j_args = json!({
+        "grant_id": grant_id,
+        "request_key": "req-prep-j2-amend",
+        "summary": "Target job J2 for gateway vs direct and invalid-receipt guards",
+        "confirmed_requirements": ["Reject unproven missing artifacts and invalid receipts"],
+        "accepted_architect_decisions": [adv_j],
+        "amendment": {
+            "target_job_id": job_j_parent.job_id,
+            "target_job_revision": 1,
+            "amendment_reason": "Attach verified Advisor decision to target job J2"
+        }
+    });
+    let job_j: PrepareWorkResponse = invoke_mcp_ok(&mcp, "prepare_work", prep_j_args.clone()).await;
+
+    fs::write(&fixture.mode_path, b"orch_plan\n").expect("set mode orch_plan for J2 rev1");
+    let j_rev1_submit: PlanningCommandSubmissionResponse = invoke_mcp_ok(
+        &mcp,
+        "request_technical_plan",
+        json!({
+            "grant_id": grant_id,
+            "job_id": job_j.job_id,
+            "request_key": "req-j2-plan-rev1",
+            "max_architect_rounds": 0,
+            "difficulty": "hard"
+        }),
+    )
+    .await;
+    let j_rev1_detail = wait_for_command_completion(&mcp, &j_rev1_submit.command_id).await;
+    let j_rev1_pr = match j_rev1_detail.result_ref.as_ref() {
+        Some(PlanningCommandResultRef::OrchestratorPlan {
+            planning_result, ..
+        }) => planning_result.as_ref().clone(),
+        other => panic!("expected OrchestratorPlan for J2 rev1, got {other:?}"),
+    };
+
+    // 5. Delete U_gw's clarify + rev 1 artifacts AND U_direct's rev 1 artifact, while keeping
+    //    U_unproven's intact artifact on disk. J rev 2 MUST succeed (proving normal gateway plan,
+    //    normal gateway non-plan, direct-service plan, and intact earlier unproven record all work).
+    fs::remove_file(artifacts_dir.join(format!("{u_gw_clarify_art_id}.json")))
+        .expect("delete U_gw clarify artifact");
+    fs::remove_file(artifacts_dir.join(format!("{}.json", u_gw_rev1_pr.report_artifact_id)))
+        .expect("delete U_gw rev1 artifact");
+    fs::remove_file(artifacts_dir.join(format!("{}.json", u_direct_rev1_pr.report_artifact_id)))
+        .expect("delete U_direct rev1 artifact");
+
+    fs::write(&fixture.mode_path, b"orch_plan_v2_same_iface\n")
+        .expect("set mode orch_plan_v2_same_iface for J2 rev2");
+    let j_rev2_args = json!({
+        "grant_id": grant_id,
+        "job_id": job_j.job_id,
+        "request_key": "req-j2-plan-rev2",
+        "plan_id": j_rev1_pr.plan_id,
+        "expected_plan_revision": 1,
+        "architect_advice_ids": [adv_j],
+        "max_architect_rounds": 0,
+        "difficulty": "hard"
+    });
+    let j_rev2_submit: PlanningCommandSubmissionResponse =
+        invoke_mcp_ok(&mcp, "request_technical_plan", j_rev2_args.clone()).await;
+    let j_rev2_detail = wait_for_command_completion(&mcp, &j_rev2_submit.command_id).await;
+    assert_eq!(
+        j_rev2_detail.status,
+        PlanningCommandStatus::Completed,
+        "J2 rev2 failed while intact unproven artifact and missing proven foreign artifacts exist: {}",
+        format_command_detail_context(&j_rev2_detail)
+    );
+
+    let calls_baseline = provider_invocation_count(&fixture.worker_marker);
+    let reservations_baseline = grant_reservation_count(&wf_store, &fixture.binding_id, &grant_id);
+
+    // 6. Deleting the UNPROVEN direct-service clarify artifact MUST refuse before provider effects.
+    let saved_unproven_art = fs::read(&u_unproven_art_path).expect("read unproven artifact");
+    fs::remove_file(&u_unproven_art_path).expect("delete unproven artifact");
+    assert_eq!(
+        invoke_mcp_err_code(
+            &mcp,
+            "request_technical_plan",
+            json!({
+                "grant_id": grant_id,
+                "job_id": job_j.job_id,
+                "request_key": "req-j2-rev3-unproven-missing",
+                "plan_id": j_rev1_pr.plan_id,
+                "expected_plan_revision": 2,
+                "architect_advice_ids": [adv_j],
+                "max_architect_rounds": 0,
+                "difficulty": "hard"
+            })
+        )
+        .await,
+        "validation_failed"
+    );
+    let unproven_direct_err = planning_service
+        .orchestrate_brief_to_plan(
+            &scoped,
+            &OrchestrateWorkBriefPlanRequest {
+                binding_id: fixture.binding_id.clone(),
+                thread_uuid: THREAD_UUID.to_string(),
+                grant_id: grant_id.clone(),
+                job_id: job_j.job_id.clone(),
+                request_key: "direct-j2-rev3-unproven-missing".to_string(),
+                expected_ledger_revision: None,
+                difficulty: Some(Difficulty::Hard),
+                plan_id: Some(j_rev1_pr.plan_id.clone()),
+                expected_plan_revision: 2,
+                architect_advice_ids: vec![adv_j.clone()],
+                max_architect_rounds: 0,
+                architect_difficulty: None,
+                current_time_ms: current_wall_clock_ms().expect("wall clock"),
+            },
+        )
+        .await
+        .expect_err("direct service must never skip unproven missing artifact");
+    assert_eq!(
+        unproven_direct_err.error_code(),
+        NativeErrorCode::ValidationFailed
+    );
+    assert_eq!(
+        provider_invocation_count(&fixture.worker_marker),
+        calls_baseline
+    );
+    assert_eq!(
+        grant_reservation_count(&wf_store, &fixture.binding_id, &grant_id),
+        reservations_baseline
+    );
+    write_private_file_0600(&u_unproven_art_path, &saved_unproven_art);
+
+    // 7. Invalid, tampered, corrupt, or conflicting receipts MUST refuse before any provider action.
+    let journal_path = find_single_prefixed_json(&fixture.plans_dir, "workflow-commands-");
+    let plans_path = fixture.plans_dir.join("plans.json");
+    let cmd_ledger_path = find_single_prefixed_json(
+        &planning_commands_dir(&fixture.plans_dir),
+        "planning-commands-",
+    );
+    let original_journal = fs::read(&journal_path).expect("read original workflow journal");
+    let original_plans = fs::read(&plans_path).expect("read original plans.json");
+    let original_cmd_ledger = fs::read(&cmd_ledger_path).expect("read original command ledger");
+
+    let assert_refused_without_provider_effect =
+        |label: &str, expected_mcp_code: &str, expected_native_code: NativeErrorCode| {
+            let mcp = &mcp;
+            let planning_service = &planning_service;
+            let scoped = &scoped;
+            let wf_store = &wf_store;
+            let worker_marker = &fixture.worker_marker;
+            let binding_id = fixture.binding_id.clone();
+            let grant_id = grant_id.clone();
+            let job_id = job_j.job_id.clone();
+            let plan_id = j_rev1_pr.plan_id.clone();
+            let adv_j = adv_j.clone();
+            let label = label.to_string();
+            let expected_mcp_code = expected_mcp_code.to_string();
+            async move {
+                assert_eq!(
+                    invoke_mcp_err_code(
+                        mcp,
+                        "request_technical_plan",
+                        json!({
+                            "grant_id": grant_id,
+                            "job_id": job_id,
+                            "request_key": format!("req-j2-invalid-{label}"),
+                            "plan_id": plan_id,
+                            "expected_plan_revision": 2,
+                            "architect_advice_ids": [adv_j],
+                            "max_architect_rounds": 0,
+                            "difficulty": "hard"
+                        })
+                    )
+                    .await,
+                    expected_mcp_code,
+                    "MCP request_technical_plan must refuse invalid receipt case `{label}`"
+                );
+                let direct_err = planning_service
+                    .orchestrate_brief_to_plan(
+                        scoped,
+                        &OrchestrateWorkBriefPlanRequest {
+                            binding_id: binding_id.clone(),
+                            thread_uuid: THREAD_UUID.to_string(),
+                            grant_id: grant_id.clone(),
+                            job_id,
+                            request_key: format!("direct-j2-invalid-{label}"),
+                            expected_ledger_revision: None,
+                            difficulty: Some(Difficulty::Hard),
+                            plan_id: Some(plan_id),
+                            expected_plan_revision: 2,
+                            architect_advice_ids: vec![adv_j],
+                            max_architect_rounds: 0,
+                            architect_difficulty: None,
+                            current_time_ms: current_wall_clock_ms().expect("wall clock"),
+                        },
+                    )
+                    .await
+                    .expect_err("direct service must refuse invalid receipt case");
+                assert_eq!(
+                    direct_err.error_code(),
+                    expected_native_code,
+                    "direct service error code mismatch for `{label}`"
+                );
+                assert_eq!(
+                    provider_invocation_count(worker_marker),
+                    calls_baseline,
+                    "invalid receipt `{label}` must not invoke provider"
+                );
+                assert_eq!(
+                    grant_reservation_count(wf_store, &binding_id, &grant_id),
+                    reservations_baseline,
+                    "invalid receipt `{label}` must not create reservations"
+                );
+            }
+        };
+
+    // 7a. Tampered plan_digest on Superseded U_direct rev 1 journal entry.
+    {
+        let mut journal_json: Value =
+            serde_json::from_slice(&original_journal).expect("parse journal json");
+        let entry = journal_json["entries"]
+            .as_array_mut()
+            .expect("entries")
+            .iter_mut()
+            .find(|e| {
+                e["resolved_plan_id"] == u_direct_rev1_pr.plan_id && e["target_revision"] == 1
+            })
+            .expect("U_direct rev1 journal entry");
+        let forged = "0".repeat(64);
+        entry["plan_digest"] = json!(forged);
+        entry["state"]["plan_digest"] = json!(forged);
+        write_private_file_0600(
+            &journal_path,
+            &serde_json::to_vec_pretty(&journal_json).expect("serialize journal"),
+        );
+        assert_refused_without_provider_effect(
+            "tampered-digest",
+            "protocol_error",
+            NativeErrorCode::ProtocolError,
+        )
+        .await;
+        write_private_file_0600(&journal_path, &original_journal);
+    }
+
+    // 7b. Non-completed Pending and Failed states on U_direct rev 1 journal entry.
+    for (case_label, status_str) in [("pending-state", "pending"), ("failed-state", "failed")] {
+        let mut journal_json: Value =
+            serde_json::from_slice(&original_journal).expect("parse journal json");
+        let entry = journal_json["entries"]
+            .as_array_mut()
+            .expect("entries")
+            .iter_mut()
+            .find(|e| {
+                e["resolved_plan_id"] == u_direct_rev1_pr.plan_id && e["target_revision"] == 1
+            })
+            .expect("U_direct rev1 journal entry");
+        entry["state"] = json!({ "status": status_str });
+        write_private_file_0600(
+            &journal_path,
+            &serde_json::to_vec_pretty(&journal_json).expect("serialize journal"),
+        );
+        assert_refused_without_provider_effect(
+            case_label,
+            "validation_failed",
+            NativeErrorCode::ValidationFailed,
+        )
+        .await;
+        write_private_file_0600(&journal_path, &original_journal);
+    }
+
+    // 7c. Mismatched resolved_plan_id when explicit_plan_id is null.
+    {
+        let mut journal_json: Value =
+            serde_json::from_slice(&original_journal).expect("parse journal json");
+        let entry = journal_json["entries"]
+            .as_array_mut()
+            .expect("entries")
+            .iter_mut()
+            .find(|e| {
+                e["resolved_plan_id"] == u_direct_rev1_pr.plan_id && e["target_revision"] == 1
+            })
+            .expect("U_direct rev1 journal entry");
+        entry["resolved_plan_id"] = json!("plan_mismatched_resolved");
+        write_private_file_0600(
+            &journal_path,
+            &serde_json::to_vec_pretty(&journal_json).expect("serialize journal"),
+        );
+        assert_refused_without_provider_effect(
+            "mismatched-resolved-plan-id",
+            "protocol_error",
+            NativeErrorCode::ProtocolError,
+        )
+        .await;
+        write_private_file_0600(&journal_path, &original_journal);
+    }
+
+    // 7d. Missing PlanRevision in plans.json referenced by U_direct rev 1 completed journal entry.
+    {
+        let mut plans_json: Value =
+            serde_json::from_slice(&original_plans).expect("parse plans json");
+        plans_json["revisions"]
+            .as_array_mut()
+            .expect("revisions")
+            .retain(|r| r["plan_id"] != u_direct_rev1_pr.plan_id);
+        write_private_file_0600(
+            &plans_path,
+            &serde_json::to_vec_pretty(&plans_json).expect("serialize plans"),
+        );
+        assert_refused_without_provider_effect(
+            "missing-plan-revision",
+            "protocol_error",
+            NativeErrorCode::ProtocolError,
+        )
+        .await;
+        write_private_file_0600(&plans_path, &original_plans);
+    }
+
+    // 7e. Unpublished Draft status in plans.json for U_direct rev 1.
+    {
+        let mut plans_json: Value =
+            serde_json::from_slice(&original_plans).expect("parse plans json");
+        let rev = plans_json["revisions"]
+            .as_array_mut()
+            .expect("revisions")
+            .iter_mut()
+            .find(|r| r["plan_id"] == u_direct_rev1_pr.plan_id && r["revision"] == 1)
+            .expect("U_direct rev1 in plans.json");
+        rev["status"] = json!("draft");
+        write_private_file_0600(
+            &plans_path,
+            &serde_json::to_vec_pretty(&plans_json).expect("serialize plans"),
+        );
+        assert_refused_without_provider_effect(
+            "draft-plan-status",
+            "validation_failed",
+            NativeErrorCode::ValidationFailed,
+        )
+        .await;
+        write_private_file_0600(&plans_path, &original_plans);
+    }
+
+    // 7f. Conflicting gateway OrchestratorPlan command record missing its workflow save_draft receipt.
+    {
+        let mut journal_json: Value =
+            serde_json::from_slice(&original_journal).expect("parse journal json");
+        journal_json["entries"]
+            .as_array_mut()
+            .expect("entries")
+            .retain(|e| {
+                !(e["resolved_plan_id"] == u_gw_rev1_pr.plan_id && e["target_revision"] == 1)
+            });
+        write_private_file_0600(
+            &journal_path,
+            &serde_json::to_vec_pretty(&journal_json).expect("serialize journal"),
+        );
+        assert_refused_without_provider_effect(
+            "missing-gw-plan-draft-receipt",
+            "validation_failed",
+            NativeErrorCode::ValidationFailed,
+        )
+        .await;
+        write_private_file_0600(&journal_path, &original_journal);
+    }
+
+    // 7g. Corrupt workflow journal JSON fails closed without provider effects.
+    {
+        write_private_file_0600(&journal_path, b"{corrupt-workflow-journal");
+        assert_refused_without_provider_effect(
+            "corrupt-journal-json",
+            "protocol_error",
+            NativeErrorCode::ProtocolError,
+        )
+        .await;
+        write_private_file_0600(&journal_path, &original_journal);
+    }
+
+    // 7h. Corrupt planning command ledger JSON fails closed on direct service and prepare_work.
+    {
+        write_private_file_0600(&cmd_ledger_path, b"{corrupt-command-ledger");
+        assert_eq!(
+            invoke_mcp_err_code(&mcp, "prepare_work", prep_j_args.clone()).await,
+            "protocol_error"
+        );
+        let direct_corrupt_cmd_err = planning_service
+            .orchestrate_brief_to_plan(
+                &scoped,
+                &OrchestrateWorkBriefPlanRequest {
+                    binding_id: fixture.binding_id.clone(),
+                    thread_uuid: THREAD_UUID.to_string(),
+                    grant_id: grant_id.clone(),
+                    job_id: job_j.job_id.clone(),
+                    request_key: "direct-j2-corrupt-cmd-ledger".to_string(),
+                    expected_ledger_revision: None,
+                    difficulty: Some(Difficulty::Hard),
+                    plan_id: Some(j_rev1_pr.plan_id.clone()),
+                    expected_plan_revision: 2,
+                    architect_advice_ids: vec![adv_j.clone()],
+                    max_architect_rounds: 0,
+                    architect_difficulty: None,
+                    current_time_ms: current_wall_clock_ms().expect("wall clock"),
+                },
+            )
+            .await
+            .expect_err("direct service must fail closed on corrupt command ledger");
+        assert_eq!(
+            direct_corrupt_cmd_err.error_code(),
+            NativeErrorCode::ProtocolError
+        );
+        assert_eq!(
+            provider_invocation_count(&fixture.worker_marker),
+            calls_baseline
+        );
+        assert_eq!(
+            grant_reservation_count(&wf_store, &fixture.binding_id, &grant_id),
+            reservations_baseline
+        );
+        write_private_file_0600(&cmd_ledger_path, &original_cmd_ledger);
+    }
+
+    // 8. After restoring valid receipts, exact original replays of J2 rev 2 and prepare_work
+    //    succeed cleanly with zero extra provider calls or reservations.
+    let j_rev2_replay: PlanningCommandSubmissionResponse =
+        invoke_mcp_ok(&mcp, "request_technical_plan", j_rev2_args).await;
+    assert_eq!(j_rev2_replay.command_id, j_rev2_submit.command_id);
+    assert_eq!(j_rev2_replay.status, PlanningCommandStatus::Completed);
+    assert_eq!(
+        j_rev2_replay.submission_status,
+        PlanningCommandStartStatus::AlreadyCompleted
+    );
+    assert!(!j_rev2_replay.launched);
+    let prep_j_replay: PrepareWorkResponse = invoke_mcp_ok(&mcp, "prepare_work", prep_j_args).await;
+    assert_eq!(prep_j_replay.job_id, job_j.job_id);
+    assert_eq!(
+        provider_invocation_count(&fixture.worker_marker),
+        calls_baseline
+    );
+    assert_eq!(
+        grant_reservation_count(&wf_store, &fixture.binding_id, &grant_id),
+        reservations_baseline
+    );
+
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn direct_service_crash_between_save_draft_and_publish_for_unrelated_job_does_not_block_target_revision_and_fails_closed_on_contradictions(
+) {
+    use threadlane_native::coworker_workflow::OrchestrateWorkBriefPlanRequest;
+    use threadlane_native::{open_workflow_stores, ScopedWorkflow};
+    use threadlane_workflow::SavePlanDraft;
+
+    let mut fixture = GatewayFixture::start().await;
+    let mcp = fixture.enrolled_mcp();
+    let now_ms = current_wall_clock_ms().expect("wall clock");
+    let wf_store =
+        CoworkerWorkflowStore::new(&fixture.plans_dir).expect("open CoworkerWorkflowStore");
+
+    let grant = wf_store
+        .create_planning_grant(&CreatePlanningGrantRequest {
+            binding_id: fixture.binding_id.clone(),
+            thread_uuid: THREAD_UUID.to_string(),
+            request_key: "req-grant-draft-crash-1".to_string(),
+            expected_ledger_revision: None,
+            project_base: fixture.project_base.clone(),
+            profile_id: PROFILE_ID.to_string(),
+            registry_revision: 3,
+            policy: advisor_policy(),
+            capabilities: PlanningReadOnlyCapabilities::strict_read_only(),
+            budget: PlanningCallBudget {
+                max_total_calls: 30,
+                max_orchestrator_calls: 20,
+                max_architect_calls: 10,
+                max_timeout_ms_per_call: 60_000,
+                max_output_bytes_per_call: 65_536,
+            },
+            created_at_ms: now_ms.saturating_sub(5_000),
+            expires_at_ms: now_ms + 3_600_000,
+            operator_attested: true,
+        })
+        .expect("create advisor grant");
+    let grant_id = grant.grant_id.clone();
+
+    let (reg_arc, plans_arc) =
+        open_workflow_stores(Some(&fixture.registry_dir), Some(&fixture.plans_dir))
+            .expect("open workflow stores")
+            .expect("workflow stores configured");
+    let scoped = ScopedWorkflow::new(reg_arc, plans_arc, fixture.binding_id.clone())
+        .expect("ScopedWorkflow");
+    let artifacts_dir = planning_artifacts_dir(&fixture.plans_dir);
+    let planning_service =
+        CoworkerPlanningService::new(wf_store.clone(), &fixture.registry_dir, &artifacts_dir)
+            .expect("open CoworkerPlanningService");
+
+    let wf_ledger_path = wf_store
+        .ledger_path_for_binding(&fixture.binding_id)
+        .expect("workflow ledger path");
+    let plans_path = fixture.plans_dir.join("plans.json");
+
+    // Helper to roll back ONLY the post-`save_draft` effects (`publish` + `record_job_planning_result`)
+    // so disk state reproduces a real direct-service crash between completed `save_draft` and `publish`.
+    let simulate_crash_between_save_draft_and_publish =
+        |plan_id: &str,
+         plan_revision: u64,
+         pre_link_job: &threadlane_native::coworker_workflow::CoworkerJobRecord| {
+            let mut plans_json: Value =
+                serde_json::from_slice(&fs::read(&plans_path).expect("read plans.json"))
+                    .expect("parse plans.json");
+            let rev = plans_json["revisions"]
+                .as_array_mut()
+                .expect("plans revisions")
+                .iter_mut()
+                .find(|r| r["plan_id"] == plan_id && r["revision"] == plan_revision)
+                .expect("target plan revision in plans.json");
+            rev["status"] = json!("draft");
+            write_private_file_0600(
+                &plans_path,
+                &serde_json::to_vec_pretty(&plans_json).expect("serialize plans.json"),
+            );
+
+            let mut ledger_json: Value =
+                serde_json::from_slice(&fs::read(&wf_ledger_path).expect("read workflow ledger"))
+                    .expect("parse workflow ledger");
+            let job_slot = ledger_json["jobs"]
+                .as_array_mut()
+                .expect("ledger jobs")
+                .iter_mut()
+                .find(|j| j["job_id"] == pre_link_job.job_id)
+                .expect("target job in workflow ledger");
+            *job_slot = serde_json::to_value(pre_link_job).expect("serialize pre-link job");
+            write_private_file_0600(
+                &wf_ledger_path,
+                &serde_json::to_vec_pretty(&ledger_json).expect("serialize workflow ledger"),
+            );
+        };
+
+    // 1a. Unrelated job U_implicit: direct-service Orchestrator call with implicit `plan_id: None`
+    //     that completed `save_draft` and crashed before `publish` and `record_job_planning_result`.
+    let job_u_implicit: PrepareWorkResponse = invoke_mcp_ok(
+        &mcp,
+        "prepare_work",
+        json!({
+            "grant_id": grant_id,
+            "request_key": "req-prep-u-imp-crash",
+            "summary": "Unrelated job U_implicit crashing between save_draft and publish",
+            "confirmed_requirements": ["Produce unpublished implicit first draft for U_implicit"]
+        }),
+    )
+    .await;
+    let pre_u_implicit_job = wf_store
+        .read_binding_ledger(&fixture.binding_id)
+        .expect("read ledger before U_implicit plan")
+        .jobs
+        .into_iter()
+        .find(|j| j.job_id == job_u_implicit.job_id)
+        .expect("U_implicit pre-link job");
+    assert_eq!(pre_u_implicit_job.job_revision, 1);
+    assert_eq!(pre_u_implicit_job.phase, CoworkerJobPhase::Planning);
+    assert!(pre_u_implicit_job.planning_result.is_none());
+
+    fs::write(&fixture.mode_path, b"orch_plan\n").expect("set mode orch_plan for U_implicit");
+    let u_implicit_pr = planning_service
+        .orchestrate_brief_to_plan(
+            &scoped,
+            &OrchestrateWorkBriefPlanRequest {
+                binding_id: fixture.binding_id.clone(),
+                thread_uuid: THREAD_UUID.to_string(),
+                grant_id: grant_id.clone(),
+                job_id: job_u_implicit.job_id.clone(),
+                request_key: "direct-u-imp-crash-rev1".to_string(),
+                expected_ledger_revision: None,
+                difficulty: Some(Difficulty::Hard),
+                plan_id: None,
+                expected_plan_revision: 0,
+                architect_advice_ids: Vec::new(),
+                max_architect_rounds: 0,
+                architect_difficulty: None,
+                current_time_ms: current_wall_clock_ms().expect("wall clock"),
+            },
+        )
+        .await
+        .expect("U_implicit direct-service plan")
+        .planning_result
+        .expect("U_implicit planning_result");
+    simulate_crash_between_save_draft_and_publish(&u_implicit_pr.plan_id, 1, &pre_u_implicit_job);
+
+    // 1b. Unrelated job U_explicit: direct-service Orchestrator call with explicit `plan_id` AND
+    //     attached Advisor advice `adv_u` that completed `save_draft` and crashed before `publish`.
+    let job_u_explicit: PrepareWorkResponse = invoke_mcp_ok(
+        &mcp,
+        "prepare_work",
+        json!({
+            "grant_id": grant_id,
+            "request_key": "req-prep-u-exp-crash",
+            "summary": "Unrelated job U_explicit crashing between save_draft and publish",
+            "confirmed_requirements": ["Produce unpublished explicit first draft with advice"]
+        }),
+    )
+    .await;
+    fs::write(&fixture.mode_path, b"architect\n").expect("set mode architect for U_explicit");
+    let adv_u_submit: PlanningCommandSubmissionResponse = invoke_mcp_ok(
+        &mcp,
+        "consult_advisor",
+        json!({
+            "grant_id": grant_id,
+            "job_id": job_u_explicit.job_id,
+            "request_key": "req-u-exp-advisor",
+            "question": "Advisor guidance for U_explicit unpublished first draft",
+            "dependency_files": ["src/lib.rs"],
+            "difficulty": "hard"
+        }),
+    )
+    .await;
+    let adv_u_detail = wait_for_command_completion(&mcp, &adv_u_submit.command_id).await;
+    let adv_u = match adv_u_detail.result_ref.as_ref() {
+        Some(PlanningCommandResultRef::ArchitectAdvice { advice_id, .. }) => advice_id.clone(),
+        other => panic!("expected ArchitectAdvice for U_explicit, got {other:?}"),
+    };
+    let pre_u_explicit_job = wf_store
+        .read_binding_ledger(&fixture.binding_id)
+        .expect("read ledger before U_explicit plan")
+        .jobs
+        .into_iter()
+        .find(|j| j.job_id == job_u_explicit.job_id)
+        .expect("U_explicit pre-link job");
+
+    fs::write(&fixture.mode_path, b"orch_plan\n").expect("set mode orch_plan for U_explicit");
+    let u_explicit_pr = planning_service
+        .orchestrate_brief_to_plan(
+            &scoped,
+            &OrchestrateWorkBriefPlanRequest {
+                binding_id: fixture.binding_id.clone(),
+                thread_uuid: THREAD_UUID.to_string(),
+                grant_id: grant_id.clone(),
+                job_id: job_u_explicit.job_id.clone(),
+                request_key: "direct-u-exp-crash-rev1".to_string(),
+                expected_ledger_revision: None,
+                difficulty: Some(Difficulty::Hard),
+                plan_id: Some("plan_u_explicit_crash".to_string()),
+                expected_plan_revision: 0,
+                architect_advice_ids: vec![adv_u.clone()],
+                max_architect_rounds: 0,
+                architect_difficulty: None,
+                current_time_ms: current_wall_clock_ms().expect("wall clock"),
+            },
+        )
+        .await
+        .expect("U_explicit direct-service plan")
+        .planning_result
+        .expect("U_explicit planning_result");
+    assert_eq!(u_explicit_pr.plan_id, "plan_u_explicit_crash");
+    simulate_crash_between_save_draft_and_publish(&u_explicit_pr.plan_id, 1, &pre_u_explicit_job);
+
+    // Verify both crashed jobs' receipts are intact sole unpublished first drafts before running J.
+    let journal_path = find_single_prefixed_json(&fixture.plans_dir, "workflow-commands-");
+    let find_draft_command_key = |target_plan_id: &str| -> String {
+        let j_val: Value =
+            serde_json::from_slice(&fs::read(&journal_path).expect("read workflow journal"))
+                .expect("parse workflow journal");
+        j_val["entries"]
+            .as_array()
+            .expect("journal entries")
+            .iter()
+            .find(|e| e["resolved_plan_id"] == target_plan_id && e["target_revision"] == 1)
+            .expect("save_draft entry for plan_id")["command_key"]
+            .as_str()
+            .expect("command_key string")
+            .to_string()
+    };
+    let u_imp_cmd_key = find_draft_command_key(&u_implicit_pr.plan_id);
+    let u_exp_cmd_key = find_draft_command_key(&u_explicit_pr.plan_id);
+    let initial_receipts = ScopedWorkflow::read_save_draft_receipts_readonly_at(
+        &fixture.registry_dir,
+        &fixture.plans_dir,
+        &fixture.binding_id,
+    )
+    .expect("read readonly save_draft receipts");
+    let u_imp_receipt = initial_receipts
+        .verify_completed_save_draft(&u_imp_cmd_key)
+        .expect("verify U_implicit receipt")
+        .expect("U_implicit receipt present");
+    assert!(u_imp_receipt.is_sole_unpublished_first_draft());
+    assert_eq!(u_imp_receipt.explicit_plan_id, None);
+    let u_exp_receipt = initial_receipts
+        .verify_completed_save_draft(&u_exp_cmd_key)
+        .expect("verify U_explicit receipt")
+        .expect("U_explicit receipt present");
+    assert!(u_exp_receipt.is_sole_unpublished_first_draft());
+    assert_eq!(
+        u_exp_receipt.explicit_plan_id.as_deref(),
+        Some("plan_u_explicit_crash")
+    );
+
+    // 2. Create fully evidenced target job J (amendment with accepted advice `adv_j` + published
+    //    rev 1) and exact-digest target job J_exact (pre-plan advice `adv_j_exact` + published rev 1).
+    let job_j_parent: PrepareWorkResponse = invoke_mcp_ok(
+        &mcp,
+        "prepare_work",
+        json!({
+            "grant_id": grant_id,
+            "request_key": "req-prep-j-crash-parent",
+            "summary": "Target job J revising with advice alongside unrelated crashed U drafts",
+            "confirmed_requirements": ["Revise published plan cleanly without being blocked by U"]
+        }),
+    )
+    .await;
+    fs::write(&fixture.mode_path, b"architect\n").expect("set mode architect for J");
+    let adv_j_submit: PlanningCommandSubmissionResponse = invoke_mcp_ok(
+        &mcp,
+        "consult_advisor",
+        json!({
+            "grant_id": grant_id,
+            "job_id": job_j_parent.job_id,
+            "request_key": "req-j-crash-advisor",
+            "question": "Advisor guidance for target job J revision",
+            "dependency_files": ["src/lib.rs"],
+            "difficulty": "hard"
+        }),
+    )
+    .await;
+    let adv_j_detail = wait_for_command_completion(&mcp, &adv_j_submit.command_id).await;
+    let adv_j = match adv_j_detail.result_ref.as_ref() {
+        Some(PlanningCommandResultRef::ArchitectAdvice { advice_id, .. }) => advice_id.clone(),
+        other => panic!("expected ArchitectAdvice for J, got {other:?}"),
+    };
+    let prep_j_args = json!({
+        "grant_id": grant_id,
+        "request_key": "req-prep-j-crash-amend",
+        "summary": "Target job J revising with advice alongside unrelated crashed U drafts",
+        "confirmed_requirements": ["Revise published plan cleanly without being blocked by U"],
+        "accepted_architect_decisions": [adv_j],
+        "amendment": {
+            "target_job_id": job_j_parent.job_id,
+            "target_job_revision": 1,
+            "amendment_reason": "Attach verified Advisor decision to target job J"
+        }
+    });
+    let job_j: PrepareWorkResponse = invoke_mcp_ok(&mcp, "prepare_work", prep_j_args.clone()).await;
+
+    fs::write(&fixture.mode_path, b"orch_plan\n").expect("set mode orch_plan for J rev1");
+    let j_rev1_submit: PlanningCommandSubmissionResponse = invoke_mcp_ok(
+        &mcp,
+        "request_technical_plan",
+        json!({
+            "grant_id": grant_id,
+            "job_id": job_j.job_id,
+            "request_key": "req-j-crash-plan-rev1",
+            "max_architect_rounds": 0,
+            "difficulty": "hard"
+        }),
+    )
+    .await;
+    let j_rev1_detail = wait_for_command_completion(&mcp, &j_rev1_submit.command_id).await;
+    let j_rev1_pr = match j_rev1_detail.result_ref.as_ref() {
+        Some(PlanningCommandResultRef::OrchestratorPlan {
+            planning_result, ..
+        }) => planning_result.as_ref().clone(),
+        other => panic!("expected OrchestratorPlan for J rev1, got {other:?}"),
+    };
+
+    let job_j_exact: PrepareWorkResponse = invoke_mcp_ok(
+        &mcp,
+        "prepare_work",
+        json!({
+            "grant_id": grant_id,
+            "request_key": "req-prep-j-exact-crash",
+            "summary": "Exact-digest target job J_exact alongside crashed U drafts",
+            "confirmed_requirements": ["Verify exact-digest revision succeeds alongside crashed U"]
+        }),
+    )
+    .await;
+    fs::write(&fixture.mode_path, b"architect\n").expect("set mode architect for J_exact");
+    let adv_j_exact_submit: PlanningCommandSubmissionResponse = invoke_mcp_ok(
+        &mcp,
+        "consult_advisor",
+        json!({
+            "grant_id": grant_id,
+            "job_id": job_j_exact.job_id,
+            "request_key": "req-j-exact-crash-advisor",
+            "question": "Pre-plan contract advice for exact-digest job J_exact",
+            "dependency_files": ["src/lib.rs"],
+            "difficulty": "hard"
+        }),
+    )
+    .await;
+    let adv_j_exact_detail =
+        wait_for_command_completion(&mcp, &adv_j_exact_submit.command_id).await;
+    let adv_j_exact = match adv_j_exact_detail.result_ref.as_ref() {
+        Some(PlanningCommandResultRef::ArchitectAdvice { advice_id, .. }) => advice_id.clone(),
+        other => panic!("expected ArchitectAdvice for J_exact, got {other:?}"),
+    };
+    fs::write(&fixture.mode_path, b"orch_plan\n").expect("set mode orch_plan for J_exact rev1");
+    let j_exact_rev1_submit: PlanningCommandSubmissionResponse = invoke_mcp_ok(
+        &mcp,
+        "request_technical_plan",
+        json!({
+            "grant_id": grant_id,
+            "job_id": job_j_exact.job_id,
+            "request_key": "req-j-exact-crash-plan-rev1",
+            "architect_advice_ids": [adv_j_exact],
+            "max_architect_rounds": 0,
+            "difficulty": "hard"
+        }),
+    )
+    .await;
+    let j_exact_rev1_detail =
+        wait_for_command_completion(&mcp, &j_exact_rev1_submit.command_id).await;
+    let j_exact_rev1_pr = match j_exact_rev1_detail.result_ref.as_ref() {
+        Some(PlanningCommandResultRef::OrchestratorPlan {
+            planning_result, ..
+        }) => planning_result.as_ref().clone(),
+        other => panic!("expected OrchestratorPlan for J_exact rev1, got {other:?}"),
+    };
+
+    // 3. Revising J and J_exact MUST succeed via BOTH gateway MCP (explicit advice, implicit
+    //    advice, prepare_work replay) AND direct service while U_implicit and U_explicit remain
+    //    physically intact unpublished first drafts.
+    fs::write(&fixture.mode_path, b"orch_plan_v2_same_iface\n")
+        .expect("set mode orch_plan_v2_same_iface for revisions");
+
+    // 3a. Gateway MCP explicit advice revision (J rev 2).
+    let j_rev2_args = json!({
+        "grant_id": grant_id,
+        "job_id": job_j.job_id,
+        "request_key": "req-j-crash-plan-rev2-exp",
+        "plan_id": j_rev1_pr.plan_id,
+        "expected_plan_revision": 1,
+        "architect_advice_ids": [adv_j],
+        "max_architect_rounds": 0,
+        "difficulty": "hard"
+    });
+    let j_rev2_submit: PlanningCommandSubmissionResponse =
+        invoke_mcp_ok(&mcp, "request_technical_plan", j_rev2_args.clone()).await;
+    let j_rev2_detail = wait_for_command_completion(&mcp, &j_rev2_submit.command_id).await;
+    assert_eq!(
+        j_rev2_detail.status,
+        PlanningCommandStatus::Completed,
+        "J rev2 gateway explicit advice failed: {}",
+        format_command_detail_context(&j_rev2_detail)
+    );
+    assert!(!j_rev2_detail.pending_reconciliation);
+    let j_rev2_pr = match j_rev2_detail.result_ref.as_ref() {
+        Some(PlanningCommandResultRef::OrchestratorPlan {
+            job_id,
+            planning_result,
+            ..
+        }) => {
+            assert_eq!(job_id, &job_j.job_id);
+            planning_result.as_ref().clone()
+        }
+        other => panic!("expected OrchestratorPlan for J rev2, got {other:?}"),
+    };
+    assert_eq!(j_rev2_pr.plan_id, j_rev1_pr.plan_id);
+    assert_eq!(j_rev2_pr.plan_revision, 2);
+    assert_eq!(j_rev2_pr.plan_status, PlanStatus::Published);
+    assert_eq!(j_rev2_pr.architect_advice_ids, vec![adv_j.clone()]);
+
+    // 3b. Gateway MCP implicit advice revision (J rev 3).
+    let j_rev3_submit: PlanningCommandSubmissionResponse = invoke_mcp_ok(
+        &mcp,
+        "request_technical_plan",
+        json!({
+            "grant_id": grant_id,
+            "job_id": job_j.job_id,
+            "request_key": "req-j-crash-plan-rev3-imp",
+            "plan_id": j_rev1_pr.plan_id,
+            "expected_plan_revision": 2,
+            "max_architect_rounds": 0,
+            "difficulty": "hard"
+        }),
+    )
+    .await;
+    let j_rev3_detail = wait_for_command_completion(&mcp, &j_rev3_submit.command_id).await;
+    assert_eq!(
+        j_rev3_detail.status,
+        PlanningCommandStatus::Completed,
+        "J rev3 gateway implicit advice failed: {}",
+        format_command_detail_context(&j_rev3_detail)
+    );
+
+    // 3c. Direct service revision (J rev 4).
+    let j_rev4_req = OrchestrateWorkBriefPlanRequest {
+        binding_id: fixture.binding_id.clone(),
+        thread_uuid: THREAD_UUID.to_string(),
+        grant_id: grant_id.clone(),
+        job_id: job_j.job_id.clone(),
+        request_key: "direct-j-crash-plan-rev4".to_string(),
+        expected_ledger_revision: None,
+        difficulty: Some(Difficulty::Hard),
+        plan_id: Some(j_rev1_pr.plan_id.clone()),
+        expected_plan_revision: 3,
+        architect_advice_ids: vec![adv_j.clone()],
+        max_architect_rounds: 0,
+        architect_difficulty: None,
+        current_time_ms: current_wall_clock_ms().expect("wall clock"),
+    };
+    let j_rev4_outcome = planning_service
+        .orchestrate_brief_to_plan(&scoped, &j_rev4_req)
+        .await
+        .expect("direct service J rev4 succeeds alongside crashed U drafts");
+    let j_rev4_pr = j_rev4_outcome
+        .planning_result
+        .clone()
+        .expect("J rev4 planning_result");
+    assert_eq!(j_rev4_pr.plan_id, j_rev1_pr.plan_id);
+    assert_eq!(j_rev4_pr.plan_revision, 4);
+    assert_eq!(j_rev4_pr.plan_status, PlanStatus::Published);
+    assert_eq!(j_rev4_pr.architect_advice_ids, vec![adv_j.clone()]);
+
+    // 3d. Gateway MCP and direct service revisions for exact-digest job J_exact (rev 2 & rev 3).
+    let j_exact_rev2_submit: PlanningCommandSubmissionResponse = invoke_mcp_ok(
+        &mcp,
+        "request_technical_plan",
+        json!({
+            "grant_id": grant_id,
+            "job_id": job_j_exact.job_id,
+            "request_key": "req-j-exact-crash-plan-rev2",
+            "plan_id": j_exact_rev1_pr.plan_id,
+            "expected_plan_revision": 1,
+            "architect_advice_ids": [adv_j_exact],
+            "max_architect_rounds": 0,
+            "difficulty": "hard"
+        }),
+    )
+    .await;
+    let j_exact_rev2_detail =
+        wait_for_command_completion(&mcp, &j_exact_rev2_submit.command_id).await;
+    assert_eq!(
+        j_exact_rev2_detail.status,
+        PlanningCommandStatus::Completed,
+        "J_exact rev2 gateway failed: {}",
+        format_command_detail_context(&j_exact_rev2_detail)
+    );
+    let j_exact_rev3_outcome = planning_service
+        .orchestrate_brief_to_plan(
+            &scoped,
+            &OrchestrateWorkBriefPlanRequest {
+                binding_id: fixture.binding_id.clone(),
+                thread_uuid: THREAD_UUID.to_string(),
+                grant_id: grant_id.clone(),
+                job_id: job_j_exact.job_id.clone(),
+                request_key: "direct-j-exact-crash-plan-rev3".to_string(),
+                expected_ledger_revision: None,
+                difficulty: Some(Difficulty::Hard),
+                plan_id: Some(j_exact_rev1_pr.plan_id.clone()),
+                expected_plan_revision: 2,
+                architect_advice_ids: vec![adv_j_exact.clone()],
+                max_architect_rounds: 0,
+                architect_difficulty: None,
+                current_time_ms: current_wall_clock_ms().expect("wall clock"),
+            },
+        )
+        .await
+        .expect("direct service J_exact rev3 succeeds alongside crashed U drafts");
+    assert_eq!(
+        j_exact_rev3_outcome
+            .planning_result
+            .as_ref()
+            .expect("J_exact rev3 planning_result")
+            .plan_revision,
+        3
+    );
+
+    // 3e. Verify original shape/control: neither U_implicit nor U_explicit was auto-retried,
+    //     auto-published, or mutated, and J remains unapproved in AwaitingApproval at rev 4.
+    let ledger_after_revs = wf_store
+        .read_binding_ledger(&fixture.binding_id)
+        .expect("read workflow ledger after revisions");
+    for expected_u in [&pre_u_implicit_job, &pre_u_explicit_job] {
+        let actual_u = ledger_after_revs
+            .jobs
+            .iter()
+            .find(|j| j.job_id == expected_u.job_id)
+            .expect("crashed U job present");
+        assert_eq!(actual_u, expected_u, "crashed U job must never be mutated");
+    }
+    let actual_j = ledger_after_revs
+        .jobs
+        .iter()
+        .find(|j| j.job_id == job_j.job_id)
+        .expect("target job J present");
+    assert_eq!(actual_j.phase, CoworkerJobPhase::AwaitingApproval);
+    assert!(actual_j.approval_linkage.is_none());
+    assert!(actual_j.tasks.is_empty());
+    assert_eq!(
+        actual_j
+            .planning_result
+            .as_ref()
+            .expect("J planning_result")
+            .plan_revision,
+        4
+    );
+    let post_rev_receipts = ScopedWorkflow::read_save_draft_receipts_readonly_at(
+        &fixture.registry_dir,
+        &fixture.plans_dir,
+        &fixture.binding_id,
+    )
+    .expect("read readonly save_draft receipts after J revisions");
+    assert!(post_rev_receipts
+        .verify_completed_save_draft(&u_imp_cmd_key)
+        .expect("re-verify U_implicit draft")
+        .expect("U_implicit draft present")
+        .is_sole_unpublished_first_draft());
+    assert!(post_rev_receipts
+        .verify_completed_save_draft(&u_exp_cmd_key)
+        .expect("re-verify U_explicit draft")
+        .expect("U_explicit draft present")
+        .is_sole_unpublished_first_draft());
+
+    // 3f. Verify superseded J rev 2 history and stable current replays with ZERO additional
+    //     provider invocations or grant reservations.
+    let calls_baseline = provider_invocation_count(&fixture.worker_marker);
+    let reservations_baseline = grant_reservation_count(&wf_store, &fixture.binding_id, &grant_id);
+    let assert_superseded_j_rev2_history = || {
+        let mcp = &mcp;
+        let wf_store = &wf_store;
+        let worker_marker = &fixture.worker_marker;
+        let binding_id = fixture.binding_id.as_str();
+        let grant_id = grant_id.as_str();
+        let j_rev2_command_id = j_rev2_submit.command_id.as_str();
+        let j_rev2_plan_id = j_rev2_pr.plan_id.as_str();
+        let j_rev2_plan_digest = j_rev2_pr.plan_digest.as_str();
+        let j_rev2_args = j_rev2_args.clone();
+        async move {
+            let j_rev2_history: PlanningCommandDetailResponse = invoke_mcp_ok(
+                mcp,
+                "planning_command",
+                json!({ "command_id": j_rev2_command_id }),
+            )
+            .await;
+            assert_eq!(j_rev2_history.command_id, j_rev2_command_id);
+            assert_eq!(j_rev2_history.status, PlanningCommandStatus::Completed);
+            assert_eq!(
+                j_rev2_history.current_plan_status,
+                Some(PlanStatus::Superseded)
+            );
+            assert_eq!(j_rev2_history.executable, Some(false));
+            let j_rev2_summary = j_rev2_history
+                .orchestrator_plan_summary
+                .as_ref()
+                .expect("frozen J rev2 orchestrator_plan_summary");
+            assert_eq!(j_rev2_summary.plan_id, j_rev2_plan_id);
+            assert_eq!(j_rev2_summary.plan_revision, 2);
+            assert_eq!(j_rev2_summary.plan_digest, j_rev2_plan_digest);
+            assert_eq!(j_rev2_summary.plan_status, PlanStatus::Published);
+            assert_eq!(
+                invoke_mcp_err_code(mcp, "request_technical_plan", j_rev2_args).await,
+                "validation_failed"
+            );
+            assert_eq!(provider_invocation_count(worker_marker), calls_baseline);
+            assert_eq!(
+                grant_reservation_count(wf_store, binding_id, grant_id),
+                reservations_baseline
+            );
+        }
+    };
+    assert_superseded_j_rev2_history().await;
+    let prep_j_replay: PrepareWorkResponse =
+        invoke_mcp_ok(&mcp, "prepare_work", prep_j_args.clone()).await;
+    assert_eq!(prep_j_replay.job_id, job_j.job_id);
+    let j_rev4_direct_replay = planning_service
+        .orchestrate_brief_to_plan(&scoped, &j_rev4_req)
+        .await
+        .expect("direct service replay of J rev4");
+    assert_eq!(
+        j_rev4_direct_replay
+            .planning_result
+            .as_ref()
+            .expect("replayed J rev4 planning_result")
+            .plan_digest,
+        j_rev4_pr.plan_digest
+    );
+    assert_eq!(
+        j_rev4_direct_replay.reservation.reservation_id,
+        j_rev4_outcome.reservation.reservation_id
+    );
+    assert_eq!(
+        provider_invocation_count(&fixture.worker_marker),
+        calls_baseline
+    );
+    assert_eq!(
+        grant_reservation_count(&wf_store, &fixture.binding_id, &grant_id),
+        reservations_baseline
+    );
+
+    // 4. Negative fail-closed checks: missing/corrupt/contradictory U draft evidence, Draft
+    //    contradicting a published result, or missing/corrupt/contradictory target J evidence
+    //    MUST refuse on BOTH gateway MCP and direct service with zero extra provider effects.
+    let cmd_ledger_path = find_single_prefixed_json(
+        &planning_commands_dir(&fixture.plans_dir),
+        "planning-commands-",
+    );
+    let u_imp_art_path = artifacts_dir.join(format!("{}.json", u_implicit_pr.report_artifact_id));
+    let u_exp_art_path = artifacts_dir.join(format!("{}.json", u_explicit_pr.report_artifact_id));
+    let j_rev1_art_path = artifacts_dir.join(format!("{}.json", j_rev1_pr.report_artifact_id));
+
+    let original_journal = fs::read(&journal_path).expect("read original workflow journal");
+    let original_plans = fs::read(&plans_path).expect("read original plans.json");
+    let original_wf_ledger = fs::read(&wf_ledger_path).expect("read original workflow ledger");
+    let original_cmd_ledger = fs::read(&cmd_ledger_path).expect("read original command ledger");
+    let original_u_imp_art = fs::read(&u_imp_art_path).expect("read original U_implicit artifact");
+    let original_u_exp_art = fs::read(&u_exp_art_path).expect("read original U_explicit artifact");
+    let original_j_rev1_art = fs::read(&j_rev1_art_path).expect("read original J rev1 artifact");
+
+    let assert_refused_without_provider_effect =
+        |label: &str, expected_mcp_code: &str, expected_native_code: NativeErrorCode| {
+            let mcp = &mcp;
+            let planning_service = &planning_service;
+            let scoped = &scoped;
+            let wf_store = &wf_store;
+            let worker_marker = &fixture.worker_marker;
+            let binding_id = fixture.binding_id.clone();
+            let grant_id = grant_id.clone();
+            let job_id = job_j.job_id.clone();
+            let plan_id = j_rev1_pr.plan_id.clone();
+            let adv_j = adv_j.clone();
+            let label = label.to_string();
+            let expected_mcp_code = expected_mcp_code.to_string();
+            async move {
+                assert_eq!(
+                    invoke_mcp_err_code(
+                        mcp,
+                        "request_technical_plan",
+                        json!({
+                            "grant_id": grant_id,
+                            "job_id": job_id,
+                            "request_key": format!("req-j-crash-neg-{label}"),
+                            "plan_id": plan_id,
+                            "expected_plan_revision": 4,
+                            "architect_advice_ids": [adv_j],
+                            "max_architect_rounds": 0,
+                            "difficulty": "hard"
+                        })
+                    )
+                    .await,
+                    expected_mcp_code,
+                    "MCP request_technical_plan must refuse case `{label}`"
+                );
+                let direct_err = planning_service
+                    .orchestrate_brief_to_plan(
+                        scoped,
+                        &OrchestrateWorkBriefPlanRequest {
+                            binding_id: binding_id.clone(),
+                            thread_uuid: THREAD_UUID.to_string(),
+                            grant_id: grant_id.clone(),
+                            job_id,
+                            request_key: format!("direct-j-crash-neg-{label}"),
+                            expected_ledger_revision: None,
+                            difficulty: Some(Difficulty::Hard),
+                            plan_id: Some(plan_id),
+                            expected_plan_revision: 4,
+                            architect_advice_ids: vec![adv_j],
+                            max_architect_rounds: 0,
+                            architect_difficulty: None,
+                            current_time_ms: current_wall_clock_ms().expect("wall clock"),
+                        },
+                    )
+                    .await
+                    .expect_err("direct service must refuse negative case");
+                assert_eq!(
+                    direct_err.error_code(),
+                    expected_native_code,
+                    "direct service error code mismatch for `{label}`"
+                );
+                assert_eq!(
+                    provider_invocation_count(worker_marker),
+                    calls_baseline,
+                    "negative case `{label}` must not invoke provider"
+                );
+                assert_eq!(
+                    grant_reservation_count(wf_store, &binding_id, &grant_id),
+                    reservations_baseline,
+                    "negative case `{label}` must not create reservations"
+                );
+            }
+        };
+
+    // 4a. Missing artifact on unpublished-draft U_implicit MUST fail closed (never skipped).
+    fs::remove_file(&u_imp_art_path).expect("remove U_implicit artifact");
+    assert_refused_without_provider_effect(
+        "missing-u-draft-artifact",
+        "validation_failed",
+        NativeErrorCode::ValidationFailed,
+    )
+    .await;
+    write_private_file_0600(&u_imp_art_path, &original_u_imp_art);
+
+    // 4b. Corrupt artifact JSON on unpublished-draft U_implicit MUST fail closed.
+    write_private_file_0600(&u_imp_art_path, b"{corrupt-u-draft-artifact");
+    assert_refused_without_provider_effect(
+        "corrupt-u-draft-artifact",
+        "protocol_error",
+        NativeErrorCode::ProtocolError,
+    )
+    .await;
+    write_private_file_0600(&u_imp_art_path, &original_u_imp_art);
+
+    // 4c. Spoofed `explicit_plan_id` (`null` -> `resolved_plan_id`) on U_implicit's journal receipt
+    //     passes plan_id format checks and MUST be caught by context_digest verification.
+    {
+        let mut journal_json: Value =
+            serde_json::from_slice(&original_journal).expect("parse journal json");
+        let entry = journal_json["entries"]
+            .as_array_mut()
+            .expect("entries")
+            .iter_mut()
+            .find(|e| e["command_key"] == u_imp_cmd_key)
+            .expect("U_implicit journal entry");
+        entry["explicit_plan_id"] = json!(u_implicit_pr.plan_id);
+        write_private_file_0600(
+            &journal_path,
+            &serde_json::to_vec_pretty(&journal_json).expect("serialize spoofed explicit_plan_id"),
+        );
+        assert_refused_without_provider_effect(
+            "spoofed-u-explicit-plan-id",
+            "validation_failed",
+            NativeErrorCode::ValidationFailed,
+        )
+        .await;
+        write_private_file_0600(&journal_path, &original_journal);
+    }
+
+    // 4d. Removing attached `adv_u` from U_explicit's artifact `architect_advice_ids` passes
+    //     standalone artifact schema validation and MUST be caught by context_digest verification.
+    {
+        let mut art_json: Value =
+            serde_json::from_slice(&original_u_exp_art).expect("parse U_explicit artifact");
+        art_json["outcome"]["architect_advice_ids"] = json!([]);
+        write_private_file_0600(
+            &u_exp_art_path,
+            &serde_json::to_vec_pretty(&art_json).expect("serialize tampered U_explicit artifact"),
+        );
+        assert_refused_without_provider_effect(
+            "tampered-u-explicit-advice-ids",
+            "validation_failed",
+            NativeErrorCode::ValidationFailed,
+        )
+        .await;
+        write_private_file_0600(&u_exp_art_path, &original_u_exp_art);
+    }
+
+    // 4e. Internally consistent tampered draft summary in BOTH `plans.json` and `workflow-commands`
+    //     (recomputed valid `tasks_digest`, `payload_digest`, and `plan_digest`) contradicts
+    //     U_implicit's persisted Orchestrator artifact and MUST be refused.
+    {
+        let tmp_forge = TempDir::new().expect("create temp dir for forged draft");
+        let tmp_forge_root = fs::canonicalize(tmp_forge.path()).expect("canonicalize forge dir");
+        fs::set_permissions(&tmp_forge_root, fs::Permissions::from_mode(0o700))
+            .expect("chmod forge root 0700");
+        let tmp_plans_dir = tmp_forge_root.join("plans-forge");
+        create_private_dir(&tmp_plans_dir);
+        let (tmp_reg, tmp_plans) =
+            open_workflow_stores(Some(&fixture.registry_dir), Some(&tmp_plans_dir))
+                .expect("open temp workflow stores")
+                .expect("temp workflow stores configured");
+        let tmp_scoped = ScopedWorkflow::new(tmp_reg, tmp_plans, fixture.binding_id.clone())
+            .expect("temp ScopedWorkflow");
+        let forged_summary =
+            "Contradictory draft summary diverging from persisted Orchestrator artifact"
+                .to_string();
+        tmp_scoped
+            .save_draft(SavePlanDraft {
+                command_key: u_imp_receipt.command_key.clone(),
+                plan_id: None,
+                expected_revision: 0,
+                profile_id: u_imp_receipt.profile_id.clone(),
+                profile_revision: u_imp_receipt.profile_revision,
+                summary: forged_summary,
+                tasks: u_imp_receipt.tasks.clone(),
+            })
+            .expect("save internally consistent forged draft");
+
+        let forged_plans_val: Value = serde_json::from_slice(
+            &fs::read(tmp_plans_dir.join("plans.json")).expect("read forged plans.json"),
+        )
+        .expect("parse forged plans.json");
+        let forged_rev = forged_plans_val["revisions"]
+            .as_array()
+            .expect("forged revisions")
+            .iter()
+            .find(|r| r["plan_id"] == u_implicit_pr.plan_id && r["revision"] == 1)
+            .expect("forged rev 1")
+            .clone();
+
+        let forged_journal_path = find_single_prefixed_json(&tmp_plans_dir, "workflow-commands-");
+        let forged_journal_val: Value =
+            serde_json::from_slice(&fs::read(&forged_journal_path).expect("read forged journal"))
+                .expect("parse forged journal");
+        let forged_entry = forged_journal_val["entries"]
+            .as_array()
+            .expect("forged journal entries")
+            .iter()
+            .find(|e| e["command_key"] == u_imp_cmd_key)
+            .expect("forged journal entry")
+            .clone();
+
+        let mut patched_plans: Value =
+            serde_json::from_slice(&original_plans).expect("parse original plans");
+        let rev_slot = patched_plans["revisions"]
+            .as_array_mut()
+            .expect("revisions")
+            .iter_mut()
+            .find(|r| r["plan_id"] == u_implicit_pr.plan_id && r["revision"] == 1)
+            .expect("U_implicit rev 1 slot");
+        *rev_slot = forged_rev;
+        write_private_file_0600(
+            &plans_path,
+            &serde_json::to_vec_pretty(&patched_plans).expect("serialize patched plans"),
+        );
+
+        let mut patched_journal: Value =
+            serde_json::from_slice(&original_journal).expect("parse original journal");
+        let entry_slot = patched_journal["entries"]
+            .as_array_mut()
+            .expect("entries")
+            .iter_mut()
+            .find(|e| e["command_key"] == u_imp_cmd_key)
+            .expect("U_implicit journal slot");
+        *entry_slot = forged_entry;
+        write_private_file_0600(
+            &journal_path,
+            &serde_json::to_vec_pretty(&patched_journal).expect("serialize patched journal"),
+        );
+
+        assert_refused_without_provider_effect(
+            "artifact-vs-receipt-summary-contradiction",
+            "validation_failed",
+            NativeErrorCode::ValidationFailed,
+        )
+        .await;
+        write_private_file_0600(&plans_path, &original_plans);
+        write_private_file_0600(&journal_path, &original_journal);
+    }
+
+    // 4f. Tampered receipt fields on U_implicit's Draft journal entry (`tasks_digest`,
+    //     `payload_digest`, `plan_digest`, `created_at_ms`, and non-completed states).
+    for (case_label, field, value) in [
+        (
+            "u-draft-bad-tasks-digest",
+            "tasks_digest",
+            json!("1".repeat(64)),
+        ),
+        (
+            "u-draft-bad-payload-digest",
+            "payload_digest",
+            json!("2".repeat(64)),
+        ),
+    ] {
+        let mut journal_json: Value =
+            serde_json::from_slice(&original_journal).expect("parse journal");
+        let entry = journal_json["entries"]
+            .as_array_mut()
+            .expect("entries")
+            .iter_mut()
+            .find(|e| e["command_key"] == u_imp_cmd_key)
+            .expect("U_implicit entry");
+        entry[field] = value;
+        write_private_file_0600(
+            &journal_path,
+            &serde_json::to_vec_pretty(&journal_json).expect("serialize tampered journal"),
+        );
+        assert_refused_without_provider_effect(
+            case_label,
+            "protocol_error",
+            NativeErrorCode::ProtocolError,
+        )
+        .await;
+        write_private_file_0600(&journal_path, &original_journal);
+    }
+    {
+        let mut journal_json: Value =
+            serde_json::from_slice(&original_journal).expect("parse journal");
+        let entry = journal_json["entries"]
+            .as_array_mut()
+            .expect("entries")
+            .iter_mut()
+            .find(|e| e["command_key"] == u_imp_cmd_key)
+            .expect("U_implicit entry");
+        let ts = entry["state"]["created_at_ms"]
+            .as_i64()
+            .expect("created_at_ms");
+        entry["state"]["created_at_ms"] = json!(ts + 1);
+        write_private_file_0600(
+            &journal_path,
+            &serde_json::to_vec_pretty(&journal_json).expect("serialize tampered timestamp"),
+        );
+        assert_refused_without_provider_effect(
+            "u-draft-bad-created-at-ms",
+            "protocol_error",
+            NativeErrorCode::ProtocolError,
+        )
+        .await;
+        write_private_file_0600(&journal_path, &original_journal);
+    }
+    {
+        let mut journal_json: Value =
+            serde_json::from_slice(&original_journal).expect("parse journal");
+        let entry = journal_json["entries"]
+            .as_array_mut()
+            .expect("entries")
+            .iter_mut()
+            .find(|e| e["command_key"] == u_imp_cmd_key)
+            .expect("U_implicit entry");
+        let forged = "3".repeat(64);
+        entry["plan_digest"] = json!(forged);
+        entry["state"]["plan_digest"] = json!(forged);
+        write_private_file_0600(
+            &journal_path,
+            &serde_json::to_vec_pretty(&journal_json).expect("serialize tampered plan_digest"),
+        );
+        assert_refused_without_provider_effect(
+            "u-draft-bad-plan-digest",
+            "protocol_error",
+            NativeErrorCode::ProtocolError,
+        )
+        .await;
+        write_private_file_0600(&journal_path, &original_journal);
+    }
+    for (case_label, status_str) in [("u-draft-pending", "pending"), ("u-draft-failed", "failed")] {
+        let mut journal_json: Value =
+            serde_json::from_slice(&original_journal).expect("parse journal");
+        let entry = journal_json["entries"]
+            .as_array_mut()
+            .expect("entries")
+            .iter_mut()
+            .find(|e| e["command_key"] == u_imp_cmd_key)
+            .expect("U_implicit entry");
+        entry["state"] = json!({ "status": status_str });
+        write_private_file_0600(
+            &journal_path,
+            &serde_json::to_vec_pretty(&journal_json).expect("serialize non-completed state"),
+        );
+        assert_refused_without_provider_effect(
+            case_label,
+            "validation_failed",
+            NativeErrorCode::ValidationFailed,
+        )
+        .await;
+        write_private_file_0600(&journal_path, &original_journal);
+    }
+
+    // 4g. Draft contradicting a published result MUST always refuse.
+    // 4g-1: Owner job U_implicit has a linked `planning_result` while rev 1 in plans.json is Draft.
+    {
+        let mut ledger_json: Value =
+            serde_json::from_slice(&original_wf_ledger).expect("parse workflow ledger");
+        let u_slot = ledger_json["jobs"]
+            .as_array_mut()
+            .expect("jobs")
+            .iter_mut()
+            .find(|j| j["job_id"] == job_u_implicit.job_id)
+            .expect("U_implicit job slot");
+        u_slot["job_revision"] = json!(2);
+        u_slot["phase"] = serde_json::to_value(CoworkerJobPhase::AwaitingApproval)
+            .expect("serialize AwaitingApproval phase");
+        u_slot["planning_result"] =
+            serde_json::to_value(&u_implicit_pr).expect("serialize U_implicit planning_result");
+        write_private_file_0600(
+            &wf_ledger_path,
+            &serde_json::to_vec_pretty(&ledger_json).expect("serialize contradicting ledger"),
+        );
+        assert_refused_without_provider_effect(
+            "draft-contradicts-owner-planning-result",
+            "validation_failed",
+            NativeErrorCode::ValidationFailed,
+        )
+        .await;
+        write_private_file_0600(&wf_ledger_path, &original_wf_ledger);
+    }
+
+    // 4g-2: `plans.json` has rev 1 Draft alongside a rev 2 Published for the same `plan_id`
+    //       (even with rev 1 artifact still physically intact on disk).
+    {
+        let mut plans_json: Value =
+            serde_json::from_slice(&original_plans).expect("parse plans.json");
+        let mut rev2_clone = plans_json["revisions"]
+            .as_array()
+            .expect("revisions")
+            .iter()
+            .find(|r| r["plan_id"] == u_implicit_pr.plan_id && r["revision"] == 1)
+            .expect("U_implicit rev 1")
+            .clone();
+        rev2_clone["revision"] = json!(2);
+        rev2_clone["status"] = json!("published");
+        plans_json["revisions"]
+            .as_array_mut()
+            .expect("revisions")
+            .push(rev2_clone);
+        write_private_file_0600(
+            &plans_path,
+            &serde_json::to_vec_pretty(&plans_json).expect("serialize plans with rev2 published"),
+        );
+        assert_refused_without_provider_effect(
+            "draft-rev1-contradicts-published-rev2",
+            "validation_failed",
+            NativeErrorCode::ValidationFailed,
+        )
+        .await;
+        write_private_file_0600(&plans_path, &original_plans);
+    }
+
+    // 4g-3: A gateway `PlanningCommandRecord` claims `OrchestratorPlan` for U_implicit's `plan_id`
+    //       while rev 1 in plans.json is Draft.
+    {
+        let mut cmd_json: Value =
+            serde_json::from_slice(&original_cmd_ledger).expect("parse command ledger");
+        let target_cmd = cmd_json["commands"]
+            .as_array_mut()
+            .expect("commands")
+            .iter_mut()
+            .find(|c| c["command_id"] == j_exact_rev1_submit.command_id)
+            .expect("J_exact rev1 command record");
+        target_cmd["result_ref"]["planning_result"]["plan_id"] = json!(u_implicit_pr.plan_id);
+        write_private_file_0600(
+            &cmd_ledger_path,
+            &serde_json::to_vec_pretty(&cmd_json).expect("serialize contradicting command ledger"),
+        );
+        assert_refused_without_provider_effect(
+            "draft-contradicts-gateway-result-ref",
+            "validation_failed",
+            NativeErrorCode::ValidationFailed,
+        )
+        .await;
+        write_private_file_0600(&cmd_ledger_path, &original_cmd_ledger);
+    }
+
+    // 4h. Missing, corrupt, or contradictory TARGET J evidence MUST fail closed even while
+    //     intact crashed U drafts exist on disk.
+    // 4h-1: Missing J rev 1 baseline artifact.
+    fs::remove_file(&j_rev1_art_path).expect("remove J rev1 baseline artifact");
+    assert_eq!(
+        invoke_mcp_err_code(&mcp, "prepare_work", prep_j_args.clone()).await,
+        "validation_failed"
+    );
+    assert_eq!(
+        invoke_mcp_err_code(
+            &mcp,
+            "request_technical_plan",
+            json!({
+                "grant_id": grant_id,
+                "job_id": job_j.job_id,
+                "request_key": "req-j-crash-neg-missing-target-imp",
+                "plan_id": j_rev1_pr.plan_id,
+                "expected_plan_revision": 4,
+                "max_architect_rounds": 0,
+                "difficulty": "hard"
+            })
+        )
+        .await,
+        "validation_failed"
+    );
+    assert_refused_without_provider_effect(
+        "missing-target-j-baseline-artifact",
+        "validation_failed",
+        NativeErrorCode::ValidationFailed,
+    )
+    .await;
+    write_private_file_0600(&j_rev1_art_path, &original_j_rev1_art);
+
+    // 4h-2: Corrupt J rev 1 baseline artifact JSON.
+    write_private_file_0600(&j_rev1_art_path, b"{corrupt-target-j-artifact");
+    assert_refused_without_provider_effect(
+        "corrupt-target-j-baseline-artifact",
+        "protocol_error",
+        NativeErrorCode::ProtocolError,
+    )
+    .await;
+    write_private_file_0600(&j_rev1_art_path, &original_j_rev1_art);
+
+    // 4h-3: Contradictory `job_id` in J rev 1 baseline artifact.
+    {
+        let mut art_json: Value =
+            serde_json::from_slice(&original_j_rev1_art).expect("parse J rev1 artifact");
+        art_json["outcome"]["job_id"] = json!(job_u_implicit.job_id);
+        write_private_file_0600(
+            &j_rev1_art_path,
+            &serde_json::to_vec_pretty(&art_json).expect("serialize contradictory J rev1 artifact"),
+        );
+        assert_refused_without_provider_effect(
+            "contradictory-target-j-job-id",
+            "validation_failed",
+            NativeErrorCode::ValidationFailed,
+        )
+        .await;
+        write_private_file_0600(&j_rev1_art_path, &original_j_rev1_art);
+    }
+
+    // 5. After restoring valid state, superseded J rev 2 history and exact current replays still
+    //    succeed with zero extra provider calls.
+    assert_superseded_j_rev2_history().await;
+    let prep_j_replay_after: PrepareWorkResponse =
+        invoke_mcp_ok(&mcp, "prepare_work", prep_j_args).await;
+    assert_eq!(prep_j_replay_after.job_id, job_j.job_id);
+    let j_rev4_replay_after = planning_service
+        .orchestrate_brief_to_plan(&scoped, &j_rev4_req)
+        .await
+        .expect("direct service replay of J rev4 after restore");
+    assert_eq!(
+        j_rev4_replay_after
+            .planning_result
+            .as_ref()
+            .expect("J rev4 replay planning_result")
+            .plan_digest,
+        j_rev4_pr.plan_digest
+    );
+    assert_eq!(
+        provider_invocation_count(&fixture.worker_marker),
+        calls_baseline
+    );
+    assert_eq!(
+        grant_reservation_count(&wf_store, &fixture.binding_id, &grant_id),
+        reservations_baseline
+    );
+
+    // 6. A real direct-service crash on a SECOND revision (rev 1 Published + rev 2 Draft) is NOT
+    //    a sole unpublished first draft and MUST refuse on both gateway and direct service with
+    //    zero additional provider calls or reservations.
+    let job_u_rev2: PrepareWorkResponse = invoke_mcp_ok(
+        &mcp,
+        "prepare_work",
+        json!({
+            "grant_id": grant_id,
+            "request_key": "req-prep-u-rev2-draft-crash",
+            "summary": "Unrelated job U_rev2 crashing on second revision draft",
+            "confirmed_requirements": ["Verify unpublished rev 2 draft is never excused as first draft"]
+        }),
+    )
+    .await;
+    fs::write(&fixture.mode_path, b"orch_plan\n").expect("set mode orch_plan for U_rev2 rev1");
+    let u_rev2_r1_pr = planning_service
+        .orchestrate_brief_to_plan(
+            &scoped,
+            &OrchestrateWorkBriefPlanRequest {
+                binding_id: fixture.binding_id.clone(),
+                thread_uuid: THREAD_UUID.to_string(),
+                grant_id: grant_id.clone(),
+                job_id: job_u_rev2.job_id.clone(),
+                request_key: "direct-u-rev2-plan-r1".to_string(),
+                expected_ledger_revision: None,
+                difficulty: Some(Difficulty::Hard),
+                plan_id: None,
+                expected_plan_revision: 0,
+                architect_advice_ids: Vec::new(),
+                max_architect_rounds: 0,
+                architect_difficulty: None,
+                current_time_ms: current_wall_clock_ms().expect("wall clock"),
+            },
+        )
+        .await
+        .expect("U_rev2 rev1")
+        .planning_result
+        .expect("U_rev2 rev1 planning_result");
+    let post_u_rev2_r1_job = wf_store
+        .read_binding_ledger(&fixture.binding_id)
+        .expect("read ledger after U_rev2 rev1")
+        .jobs
+        .into_iter()
+        .find(|j| j.job_id == job_u_rev2.job_id)
+        .expect("U_rev2 post-rev1 job");
+    fs::write(&fixture.mode_path, b"orch_plan_v2_same_iface\n")
+        .expect("set mode orch_plan_v2_same_iface for U_rev2 rev2");
+    let u_rev2_r2_pr = planning_service
+        .orchestrate_brief_to_plan(
+            &scoped,
+            &OrchestrateWorkBriefPlanRequest {
+                binding_id: fixture.binding_id.clone(),
+                thread_uuid: THREAD_UUID.to_string(),
+                grant_id: grant_id.clone(),
+                job_id: job_u_rev2.job_id.clone(),
+                request_key: "direct-u-rev2-plan-r2".to_string(),
+                expected_ledger_revision: None,
+                difficulty: Some(Difficulty::Hard),
+                plan_id: Some(u_rev2_r1_pr.plan_id.clone()),
+                expected_plan_revision: 1,
+                architect_advice_ids: Vec::new(),
+                max_architect_rounds: 0,
+                architect_difficulty: None,
+                current_time_ms: current_wall_clock_ms().expect("wall clock"),
+            },
+        )
+        .await
+        .expect("U_rev2 rev2")
+        .planning_result
+        .expect("U_rev2 rev2 planning_result");
+    assert_eq!(u_rev2_r2_pr.plan_revision, 2);
+    // Roll back rev 2 to Draft and restore rev 1 to Published + job back to post-rev1 state.
+    {
+        let mut plans_json: Value =
+            serde_json::from_slice(&fs::read(&plans_path).expect("read plans.json"))
+                .expect("parse plans.json");
+        for rev in plans_json["revisions"].as_array_mut().expect("revisions") {
+            if rev["plan_id"] == u_rev2_r1_pr.plan_id && rev["revision"] == 1 {
+                rev["status"] = json!("published");
+            } else if rev["plan_id"] == u_rev2_r1_pr.plan_id && rev["revision"] == 2 {
+                rev["status"] = json!("draft");
+            }
+        }
+        write_private_file_0600(
+            &plans_path,
+            &serde_json::to_vec_pretty(&plans_json).expect("serialize plans.json"),
+        );
+        let mut ledger_json: Value =
+            serde_json::from_slice(&fs::read(&wf_ledger_path).expect("read workflow ledger"))
+                .expect("parse workflow ledger");
+        let job_slot = ledger_json["jobs"]
+            .as_array_mut()
+            .expect("jobs")
+            .iter_mut()
+            .find(|j| j["job_id"] == job_u_rev2.job_id)
+            .expect("U_rev2 job slot");
+        *job_slot = serde_json::to_value(&post_u_rev2_r1_job).expect("serialize post-rev1 job");
+        write_private_file_0600(
+            &wf_ledger_path,
+            &serde_json::to_vec_pretty(&ledger_json).expect("serialize workflow ledger"),
+        );
+    }
+
+    let calls_before_rev2_draft = provider_invocation_count(&fixture.worker_marker);
+    let reservations_before_rev2_draft =
+        grant_reservation_count(&wf_store, &fixture.binding_id, &grant_id);
+    assert_eq!(
+        invoke_mcp_err_code(
+            &mcp,
+            "request_technical_plan",
+            json!({
+                "grant_id": grant_id,
+                "job_id": job_j.job_id,
+                "request_key": "req-j-crash-neg-u-rev2-draft",
+                "plan_id": j_rev1_pr.plan_id,
+                "expected_plan_revision": 4,
+                "architect_advice_ids": [adv_j],
+                "max_architect_rounds": 0,
+                "difficulty": "hard"
+            })
+        )
+        .await,
+        "validation_failed"
+    );
+    let rev2_draft_direct_err = planning_service
+        .orchestrate_brief_to_plan(
+            &scoped,
+            &OrchestrateWorkBriefPlanRequest {
+                binding_id: fixture.binding_id.clone(),
+                thread_uuid: THREAD_UUID.to_string(),
+                grant_id: grant_id.clone(),
+                job_id: job_j.job_id.clone(),
+                request_key: "direct-j-crash-neg-u-rev2-draft".to_string(),
+                expected_ledger_revision: None,
+                difficulty: Some(Difficulty::Hard),
+                plan_id: Some(j_rev1_pr.plan_id.clone()),
+                expected_plan_revision: 4,
+                architect_advice_ids: vec![adv_j],
+                max_architect_rounds: 0,
+                architect_difficulty: None,
+                current_time_ms: current_wall_clock_ms().expect("wall clock"),
+            },
+        )
+        .await
+        .expect_err("direct service must reject unpublished rev 2 draft");
+    assert_eq!(
+        rev2_draft_direct_err.error_code(),
+        NativeErrorCode::ValidationFailed
+    );
+    assert_eq!(
+        provider_invocation_count(&fixture.worker_marker),
+        calls_before_rev2_draft
+    );
+    assert_eq!(
+        grant_reservation_count(&wf_store, &fixture.binding_id, &grant_id),
+        reservations_before_rev2_draft
+    );
 
     fixture.shutdown().await;
 }

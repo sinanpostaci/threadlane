@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+  CHAT_WORK_EXECUTION_BRIEF_GAP_MS,
   DEFAULT_BOTTOM_FOLLOW_THRESHOLD_PX,
   MAX_CHAT_WORK_EVENTS,
   MAX_CHAT_WORK_EXECUTIONS,
@@ -14,6 +15,7 @@ import {
   captureFirstVisibleMessageAnchor,
   compareWorkspaceMessageItems,
   computeAnchorScrollTop,
+  createChatWorkExecutionContinuityStore,
   createMessageScrollState,
   createMessageScrollStore,
   distanceFromBottomPx,
@@ -35,14 +37,17 @@ import {
   measureItemsFromContentOffsets,
   orderWorkspaceMessageItems,
   readWorkspaceChatWork,
+  reconcileRefreshChatWorkPresenceEntries,
   resolveChatWorkExecutionDurationLabel,
   resolveChatWorkExecutionFooterState,
+  resolveChatWorkExecutionFootersWithContinuity,
   resolveMessageScrollChatKey,
   resolveMessageViewportResize,
   resolveSidebarChatStatus,
   resolveVerifiedChatJobIds,
   selectWorkspaceChatWork,
   setChatScrollState,
+  shouldRetainPreviousChatWorkPresence,
   summarizeChatWorkLiveness,
   switchMessageScrollChat,
   syncChatWorkEventScroll,
@@ -3786,8 +3791,19 @@ test('worker footer shows Working only for exact fresh presence and removes the 
   const footer = buildChatWorkEventViews(selection)[0]!.workerExecution!;
   const freshFooter = resolveChatWorkExecutionFooterState(footer, CHAT_WORK_NOW_MS);
   assert.equal(freshFooter.statusKey, 'working');
-  assert.equal(freshFooter.statusLabel, 'Working');
+  assert.equal(freshFooter.statusLabel, 'Started');
+  assert.equal(freshFooter.tone, 'neutral');
+  assert.equal(
+    freshFooter.statusAriaLabel,
+    'Started, live evidence fresh (last confirmed 500ms ago)',
+  );
+  assert.equal(freshFooter.statusTitle, freshFooter.statusAriaLabel);
   assert.equal(freshFooter.durationLabel, 'Elapsed 1.5s');
+  assert.equal(
+    freshFooter.durationAriaLabel,
+    'Elapsed 1.5s, live evidence fresh (last confirmed 500ms ago)',
+  );
+  assert.equal(freshFooter.durationTitle, freshFooter.durationAriaLabel);
 
   const expiredAtMs = 10_000 + 5_000 + 1;
   const expired = evaluateChatWorkLiveness(selection, null, {
@@ -6172,4 +6188,1242 @@ test('sidebar navigation counters separate working agents from waiting chats wit
     formatSidebarWaitingCounter(twoWorkersSummary.waitingChatCount),
     null,
   );
+});
+
+test('refresh Worker presence reconciler retains only same-attempt same-origin newer samples without extending expiry', () => {
+  const alphaIdentity = makeIdentity('bnd_alpha_reconcile', UUID_ALPHA);
+  const betaIdentity = makeIdentity('bnd_beta_reconcile', UUID_BETA);
+  const baseLive = makePresence({
+    item_id: 'blg_alpha',
+    execution_ref: 'exec-1',
+    sequence: 12,
+    sampled_at_ms: 10_000,
+    sample_age_ms: 500,
+    max_sample_age_ms: 5_000,
+    expires_at_ms: 15_000,
+  });
+
+  // Same attempt and trustworthy origin/epoch: regressed sequence and older
+  // timestamp retain the newer sample verbatim.
+  assert.equal(
+    shouldRetainPreviousChatWorkPresence(
+      baseLive,
+      makePresence({
+        ...baseLive,
+        sequence: 11,
+        sampled_at_ms: 8_000,
+        expires_at_ms: 13_000,
+      }),
+    ),
+    true,
+  );
+  assert.equal(
+    shouldRetainPreviousChatWorkPresence(
+      baseLive,
+      makePresence({
+        ...baseLive,
+        sequence: 12,
+        sampled_at_ms: 9_500,
+        expires_at_ms: 14_500,
+      }),
+    ),
+    true,
+  );
+  assert.equal(
+    shouldRetainPreviousChatWorkPresence(
+      baseLive,
+      makePresence({
+        ...baseLive,
+        sequence: 12,
+        freshness: 'stale',
+        live: false,
+      }),
+    ),
+    true,
+  );
+
+  // Explicit non_live at equal or newer sequence wins immediately.
+  assert.equal(
+    shouldRetainPreviousChatWorkPresence(
+      baseLive,
+      makePresence({
+        ...baseLive,
+        sequence: 12,
+        availability: 'non_live',
+        freshness: 'not_applicable',
+        live: false,
+      }),
+    ),
+    false,
+  );
+  assert.equal(
+    shouldRetainPreviousChatWorkPresence(
+      baseLive,
+      makePresence({
+        ...baseLive,
+        sequence: 13,
+        availability: 'unavailable',
+        freshness: 'not_applicable',
+        live: false,
+        sampled_at_ms: 12_000,
+        expires_at_ms: null,
+      }),
+    ),
+    false,
+  );
+
+  // Restarted host, changed invocation/claim, missing origin, or foreign run
+  // must never retain previous presence.
+  for (const incoming of [
+    makePresence({ ...baseLive, host_instance_id: 'host-2', sequence: 1 }),
+    makePresence({ ...baseLive, invocation_id: 'invocation-2', sequence: 1 }),
+    makePresence({ ...baseLive, claim_id: 'claim-2', sequence: 1 }),
+    makePresence({ ...baseLive, host_instance_id: null, sequence: 1 }),
+    makePresence({ ...baseLive, invocation_id: null, sequence: 1 }),
+    makePresence({ ...baseLive, run_id: 'run-foreign', sequence: 1 }),
+    makePresence({ ...baseLive, worker_id: 'worker-foreign', sequence: 1 }),
+    makePresence({ ...baseLive, execution_ref: 'exec-foreign', sequence: 1 }),
+  ]) {
+    assert.equal(shouldRetainPreviousChatWorkPresence(baseLive, incoming), false);
+  }
+
+  // Entry-level reconciliation isolates chats, preserves original expiry, honors
+  // terminal executions, and never resurrects omitted presence.
+  const alphaItem = makeBacklogItem({
+    item_id: 'blg_alpha',
+    binding_id: alphaIdentity.binding_id,
+    kind: 'worker',
+    status: 'doing',
+    current_execution_ref: 'exec-1',
+  });
+  const betaItem = makeBacklogItem({
+    item_id: 'blg_alpha',
+    binding_id: betaIdentity.binding_id,
+    kind: 'worker',
+    status: 'doing',
+    current_execution_ref: 'exec-1',
+  });
+  const currentEntries = [
+    makeChatWork(alphaIdentity, {
+      items: [alphaItem],
+      worker_presence: [baseLive],
+      worker_executions: [makeExecution(alphaIdentity.binding_id)],
+    }),
+  ];
+  const regressedEntries = [
+    makeChatWork(alphaIdentity, {
+      items: [alphaItem],
+      worker_presence: [
+        makePresence({
+          ...baseLive,
+          sequence: 11,
+          sampled_at_ms: 8_000,
+          expires_at_ms: 13_000,
+        }),
+      ],
+      worker_executions: [makeExecution(alphaIdentity.binding_id)],
+    }),
+    makeChatWork(betaIdentity, {
+      items: [betaItem],
+      worker_presence: [
+        makePresence({
+          ...baseLive,
+          sequence: 11,
+          availability: 'unavailable',
+          freshness: 'not_applicable',
+          live: false,
+          sampled_at_ms: 8_000,
+          expires_at_ms: null,
+        }),
+      ],
+      worker_executions: [makeExecution(betaIdentity.binding_id)],
+    }),
+  ];
+
+  const reconciled = reconcileRefreshChatWorkPresenceEntries(
+    currentEntries,
+    regressedEntries,
+  );
+  assert.equal(reconciled.replaced, true);
+  assert.equal(reconciled.chatWork[0]!.worker_presence[0]!.sequence, 12);
+  assert.equal(reconciled.chatWork[0]!.worker_presence[0]!.expires_at_ms, 15_000);
+  assert.equal(reconciled.chatWork[1]!.worker_presence[0]!.availability, 'unavailable');
+
+  // Terminal execution immediately wins even if presence sequence regressed.
+  const terminalIncoming = [
+    makeChatWork(alphaIdentity, {
+      items: [alphaItem],
+      worker_presence: [
+        makePresence({
+          ...baseLive,
+          sequence: 11,
+          availability: 'unavailable',
+          freshness: 'not_applicable',
+          live: false,
+          sampled_at_ms: 8_000,
+          expires_at_ms: null,
+        }),
+      ],
+      worker_executions: [
+        makeExecution(alphaIdentity.binding_id, {
+          worker_status: 'completed',
+          outcome: 'success',
+          acceptance: 'pending_review',
+          finished_at_ms: 12_000,
+          duration_ms: 3_000,
+        }),
+      ],
+    }),
+  ];
+  const terminalReconciled = reconcileRefreshChatWorkPresenceEntries(
+    currentEntries,
+    terminalIncoming,
+  );
+  assert.equal(terminalReconciled.replaced, false);
+  assert.equal(
+    terminalReconciled.chatWork[0]!.worker_presence[0]!.availability,
+    'unavailable',
+  );
+
+  // Omitted presence on refresh is never resurrected.
+  const omittedIncoming = [
+    makeChatWork(alphaIdentity, {
+      items: [alphaItem],
+      worker_presence: [],
+      worker_executions: [makeExecution(alphaIdentity.binding_id)],
+    }),
+  ];
+  const omittedReconciled = reconcileRefreshChatWorkPresenceEntries(
+    currentEntries,
+    omittedIncoming,
+  );
+  assert.equal(omittedReconciled.replaced, false);
+  assert.deepEqual(omittedReconciled.chatWork[0]!.worker_presence, []);
+});
+
+test('worker dispatch footer holds durable Started with frozen last-confirmed elapsed across short repeated renewal gaps, expires genuinely, and preserves header/sidebar semantics', () => {
+  const identity = makeIdentity('bnd_alpha_brief_gap', UUID_ALPHA);
+  const chatKey = resolveMessageScrollChatKey(identity);
+  const buildViews = (
+    presenceRows: readonly ChatWorkPresence[],
+    executionOverrides: ChatWorkExecutionFixtureOverrides = {},
+    itemOverrides: Partial<ChatWorkItem> = {},
+  ) => {
+    const item = makeBacklogItem({
+      item_id: 'blg_gap',
+      binding_id: identity.binding_id,
+      kind: 'worker',
+      status: 'doing',
+      current_execution_ref: 'exec-gap-1',
+      ...itemOverrides,
+    });
+    const selection = selectWorkspaceChatWork(
+      [
+        makeChatWork(identity, {
+          items: [item],
+          events: [
+            makeBacklogEvent({
+              event_id: 'blg_gap:3',
+              sequence: 3,
+              item_id: 'blg_gap',
+              revision: 3,
+              action: 'worker_execution_attached',
+              status: 'doing',
+              execution_ref: 'exec-gap-1',
+              recorded_at_ms: 9_100,
+            }),
+          ],
+          worker_presence: [...presenceRows],
+          worker_executions: [
+            makeExecution(identity.binding_id, {
+              item_id: 'blg_gap',
+              execution_ref: 'exec-gap-1',
+              worker_status: 'running',
+              outcome: null,
+              started_at_ms: 9_000,
+              ...executionOverrides,
+            }),
+          ],
+        }),
+      ],
+      identity,
+    );
+    return {
+      selection,
+      events: buildChatWorkEventViews(selection),
+    };
+  };
+
+  // Unconfirmed dispatch never claims Started before live confirmation.
+  const unconfirmed = buildViews([]);
+  const unconfirmedFooter = resolveChatWorkExecutionFooterState(
+    unconfirmed.events[0]!.workerExecution!,
+    10_000,
+  );
+  assert.equal(unconfirmedFooter.statusKey, 'dispatched');
+  assert.equal(unconfirmedFooter.statusLabel, 'Dispatched');
+  assert.equal(unconfirmedFooter.duration, null);
+  assert.equal(unconfirmedFooter.durationLabel, null);
+  assert.equal(unconfirmedFooter.statusAriaLabel, undefined);
+  assert.equal(unconfirmedFooter.statusTitle, undefined);
+
+  // Sample 1: live from 10_000 until 15_000 (brief gap window ends at 20_000).
+  const liveSample1 = makePresence({
+    item_id: 'blg_gap',
+    execution_ref: 'exec-gap-1',
+    sequence: 10,
+    sampled_at_ms: 10_000,
+    sample_age_ms: 500,
+    max_sample_age_ms: 5_000,
+    expires_at_ms: 15_000,
+  });
+  const live1 = buildViews([liveSample1]);
+  const eventKey = live1.events[0]!.key;
+
+  let store = createChatWorkExecutionContinuityStore();
+  let step = resolveChatWorkExecutionFootersWithContinuity(
+    store,
+    live1.events,
+    14_000,
+    { activeChatKey: chatKey },
+  );
+  store = step.store;
+  const liveFooter1 = step.footersByEventKey.get(eventKey)!;
+  assert.equal(liveFooter1.statusKey, 'working');
+  assert.equal(liveFooter1.statusLabel, 'Started');
+  assert.equal(liveFooter1.tone, 'neutral');
+  assert.equal(
+    liveFooter1.statusAriaLabel,
+    'Started, live evidence fresh (last confirmed 4s ago)',
+  );
+  assert.equal(liveFooter1.statusTitle, liveFooter1.statusAriaLabel);
+  assert.equal(liveFooter1.duration?.kind, 'elapsed');
+  assert.equal(liveFooter1.durationLabel, 'Elapsed 5s');
+  assert.equal(
+    liveFooter1.durationAriaLabel,
+    'Elapsed 5s, live evidence fresh (last confirmed 4s ago)',
+  );
+  assert.equal(liveFooter1.durationTitle, liveFooter1.durationAriaLabel);
+
+  // Gap #1 at 15_500 (past original 15_000 expiry, inside 5_000ms brief gap):
+  // header and sidebar IMMEDIATELY drop Working, while footer keeps consistent
+  // neutral Started and frozen Elapsed 5s with accessible freshness/confirmation text.
+  const gap1Liveness = evaluateChatWorkLiveness(
+    live1.selection,
+    makeNativeSample(identity, 'idle'),
+    { nowMs: 15_500 },
+  );
+  assert.equal(gap1Liveness.isWorking, false);
+  assert.equal(gap1Liveness.waitingForHuman, false);
+  assert.deepEqual(gap1Liveness.agents, []);
+  assert.equal(resolveSidebarChatStatus(gap1Liveness).kind, 'unknown');
+  assert.equal(resolveSidebarChatStatus(gap1Liveness).label, 'Status unavailable');
+
+  step = resolveChatWorkExecutionFootersWithContinuity(
+    store,
+    live1.events,
+    15_500,
+    { activeChatKey: chatKey },
+  );
+  store = step.store;
+  const gap1Footer = step.footersByEventKey.get(eventKey)!;
+  assert.equal(gap1Footer.statusKey, 'started');
+  assert.equal(gap1Footer.statusLabel, 'Started');
+  assert.equal(
+    gap1Footer.statusAriaLabel,
+    'Started, last confirmed status (confirmed 5.5s ago)',
+  );
+  assert.equal(gap1Footer.statusTitle, gap1Footer.statusAriaLabel);
+  assert.equal(gap1Footer.tone, 'neutral');
+  assert.deepEqual(gap1Footer.duration, { kind: 'last_confirmed', elapsedMs: 5_000 });
+  assert.equal(gap1Footer.durationLabel, 'Elapsed 5s');
+  assert.equal(
+    gap1Footer.durationAriaLabel,
+    'Last confirmed elapsed 5s (confirmed 5.5s ago)',
+  );
+  assert.equal(gap1Footer.durationTitle, gap1Footer.durationAriaLabel);
+
+  // Delayed/stale and same-host unavailable probes during Gap #1 NEVER extend
+  // original expiry, NEVER grant live Working, and NEVER advance elapsed.
+  const staleDuringGap1 = buildViews([
+    makePresence({
+      ...liveSample1,
+      sequence: 10,
+      freshness: 'stale',
+      live: false,
+      sampled_at_ms: 10_000,
+      expires_at_ms: 15_000,
+    }),
+  ]);
+  step = resolveChatWorkExecutionFootersWithContinuity(
+    store,
+    staleDuringGap1.events,
+    17_500,
+    { activeChatKey: chatKey },
+  );
+  store = step.store;
+  const gap1StaleFooter = step.footersByEventKey.get(eventKey)!;
+  assert.equal(gap1StaleFooter.statusKey, 'started');
+  assert.equal(gap1StaleFooter.statusLabel, 'Started');
+  assert.equal(gap1StaleFooter.durationLabel, 'Elapsed 5s');
+  assert.equal(
+    gap1StaleFooter.statusAriaLabel,
+    'Started, last confirmed status (confirmed 7.5s ago)',
+  );
+
+  const sameHostUnavailable = buildViews([
+    makePresence({
+      ...liveSample1,
+      invocation_id: null,
+      claim_id: null,
+      sequence: null,
+      availability: 'unavailable',
+      freshness: 'not_applicable',
+      live: false,
+      sampled_at_ms: 18_000,
+      sample_age_ms: null,
+      expires_at_ms: null,
+    }),
+  ]);
+  step = resolveChatWorkExecutionFootersWithContinuity(
+    store,
+    sameHostUnavailable.events,
+    18_500,
+    { activeChatKey: chatKey },
+  );
+  store = step.store;
+  assert.equal(step.footersByEventKey.get(eventKey)!.statusKey, 'started');
+  assert.equal(step.footersByEventKey.get(eventKey)!.durationLabel, 'Elapsed 5s');
+
+  // Recovery #1: fresh sample arrives at 19_000 -> immediately restores live
+  // internal state while keeping visible Started / Elapsed consistent.
+  const liveSample2 = makePresence({
+    item_id: 'blg_gap',
+    execution_ref: 'exec-gap-1',
+    sequence: 11,
+    sampled_at_ms: 18_500,
+    sample_age_ms: 500,
+    max_sample_age_ms: 5_000,
+    expires_at_ms: 23_500,
+  });
+  const live2 = buildViews([liveSample2]);
+  step = resolveChatWorkExecutionFootersWithContinuity(
+    store,
+    live2.events,
+    19_000,
+    { activeChatKey: chatKey },
+  );
+  store = step.store;
+  assert.equal(step.footersByEventKey.get(eventKey)!.statusKey, 'working');
+  assert.equal(step.footersByEventKey.get(eventKey)!.statusLabel, 'Started');
+  assert.equal(step.footersByEventKey.get(eventKey)!.tone, 'neutral');
+  assert.equal(step.footersByEventKey.get(eventKey)!.durationLabel, 'Elapsed 10s');
+  assert.equal(
+    step.footersByEventKey.get(eventKey)!.statusTitle,
+    'Started, live evidence fresh (last confirmed 500ms ago)',
+  );
+
+  // Advance live tick to 23_000 (14s), then Gap #2 (brief omitted presence from
+  // a timed-out host probe) holds updated frozen elapsed (14s) until recovery.
+  step = resolveChatWorkExecutionFootersWithContinuity(
+    store,
+    live2.events,
+    23_000,
+    { activeChatKey: chatKey },
+  );
+  store = step.store;
+  assert.equal(step.footersByEventKey.get(eventKey)!.durationLabel, 'Elapsed 14s');
+
+  const omittedDuringGap2 = buildViews([]);
+  step = resolveChatWorkExecutionFootersWithContinuity(
+    store,
+    omittedDuringGap2.events,
+    24_500,
+    { activeChatKey: chatKey },
+  );
+  store = step.store;
+  const gap2Footer = step.footersByEventKey.get(eventKey)!;
+  assert.equal(gap2Footer.statusKey, 'started');
+  assert.equal(gap2Footer.statusLabel, 'Started');
+  assert.equal(gap2Footer.durationLabel, 'Elapsed 14s');
+  assert.equal(
+    gap2Footer.durationAriaLabel,
+    'Last confirmed elapsed 14s (confirmed 6s ago)',
+  );
+
+  // Recovery #2 with fresh seq 12 (expires at 30_000), then real expiration at
+  // 30_000 + CHAT_WORK_EXECUTION_BRIEF_GAP_MS (35_000) -> Status unavailable
+  // with duration removed.
+  const liveSample3 = makePresence({
+    item_id: 'blg_gap',
+    execution_ref: 'exec-gap-1',
+    sequence: 12,
+    sampled_at_ms: 25_000,
+    sample_age_ms: 500,
+    max_sample_age_ms: 5_000,
+    expires_at_ms: 30_000,
+  });
+  const live3 = buildViews([liveSample3]);
+  step = resolveChatWorkExecutionFootersWithContinuity(
+    store,
+    live3.events,
+    26_000,
+    { activeChatKey: chatKey },
+  );
+  store = step.store;
+  assert.equal(step.footersByEventKey.get(eventKey)!.statusKey, 'working');
+  assert.equal(step.footersByEventKey.get(eventKey)!.statusLabel, 'Started');
+  assert.equal(step.footersByEventKey.get(eventKey)!.durationLabel, 'Elapsed 17s');
+
+  const realExpiryMs = 30_000 + CHAT_WORK_EXECUTION_BRIEF_GAP_MS;
+  step = resolveChatWorkExecutionFootersWithContinuity(
+    store,
+    live3.events,
+    realExpiryMs,
+    { activeChatKey: chatKey },
+  );
+  store = step.store;
+  const expiredFooter = step.footersByEventKey.get(eventKey)!;
+  assert.equal(expiredFooter.statusKey, 'unavailable');
+  assert.equal(expiredFooter.statusLabel, 'Status unavailable');
+  assert.equal(expiredFooter.duration, null);
+  assert.equal(expiredFooter.durationLabel, null);
+  assert.equal(store.size, 1);
+  assert.equal(
+    store.get(live3.events[0]!.workerExecution!.attemptKey!)?.briefGapClosed,
+    true,
+  );
+  // Subsequent empty worker_presence after real expiry stays Status unavailable
+  // with no timer instead of reverting to Dispatched.
+  step = resolveChatWorkExecutionFootersWithContinuity(
+    store,
+    buildViews([]).events,
+    realExpiryMs + 1_000,
+    { activeChatKey: chatKey },
+  );
+  store = step.store;
+  const expiredEmptyFooter = step.footersByEventKey.get(eventKey)!;
+  assert.equal(expiredEmptyFooter.statusKey, 'unavailable');
+  assert.equal(expiredEmptyFooter.statusLabel, 'Status unavailable');
+  assert.equal(expiredEmptyFooter.duration, null);
+  assert.equal(expiredEmptyFooter.durationLabel, null);
+
+  // Three successive 4-second late renewals with a 3-second TTL keep the same
+  // visible neutral Started caption and Elapsed prefix without jumping backwards,
+  // while exposing freshness and last-confirmed age via accessible text/title.
+  let cadenceStore = createChatWorkExecutionContinuityStore();
+  let previousFrozenMs = -1;
+  for (let cycle = 0; cycle < 3; cycle += 1) {
+    const sampledAtMs = 50_000 + cycle * 4_000;
+    const expiresAtMs = sampledAtMs + 3_000;
+    const sample = makePresence({
+      item_id: 'blg_gap',
+      execution_ref: 'exec-gap-1',
+      sequence: 20 + cycle,
+      sampled_at_ms: sampledAtMs,
+      sample_age_ms: 0,
+      max_sample_age_ms: 3_000,
+      expires_at_ms: expiresAtMs,
+    });
+    const views = buildViews([sample], { started_at_ms: 45_000 });
+
+    const liveStart = resolveChatWorkExecutionFootersWithContinuity(
+      cadenceStore,
+      views.events,
+      sampledAtMs,
+      { activeChatKey: chatKey },
+    );
+    cadenceStore = liveStart.store;
+    const liveStartFooter = liveStart.footersByEventKey.get(eventKey)!;
+    assert.equal(liveStartFooter.statusKey, 'working');
+    assert.equal(liveStartFooter.statusLabel, 'Started');
+    assert.equal(liveStartFooter.tone, 'neutral');
+    assert.equal(liveStartFooter.duration?.kind, 'elapsed');
+    assert.equal(liveStartFooter.durationLabel, `Elapsed ${(sampledAtMs - 45_000) / 1_000}s`);
+    assert.equal(
+      liveStartFooter.statusTitle,
+      'Started, live evidence fresh (last confirmed just now)',
+    );
+    assert.equal(liveStartFooter.statusAriaLabel, liveStartFooter.statusTitle);
+    assert.ok(sampledAtMs - 45_000 > previousFrozenMs);
+
+    const liveTickMs = sampledAtMs + 2_000;
+    const expectedFrozenMs = liveTickMs - 45_000;
+    const liveTick = resolveChatWorkExecutionFootersWithContinuity(
+      cadenceStore,
+      views.events,
+      liveTickMs,
+      { activeChatKey: chatKey },
+    );
+    cadenceStore = liveTick.store;
+    assert.equal(
+      liveTick.footersByEventKey.get(eventKey)!.durationLabel,
+      `Elapsed ${expectedFrozenMs / 1_000}s`,
+    );
+
+    const gapTick = resolveChatWorkExecutionFootersWithContinuity(
+      cadenceStore,
+      views.events,
+      expiresAtMs + 500,
+      { activeChatKey: chatKey },
+    );
+    cadenceStore = gapTick.store;
+    const gapFooter = gapTick.footersByEventKey.get(eventKey)!;
+    assert.equal(gapFooter.statusKey, 'started');
+    assert.equal(gapFooter.statusLabel, 'Started');
+    assert.equal(gapFooter.tone, 'neutral');
+    assert.deepEqual(gapFooter.duration, {
+      kind: 'last_confirmed',
+      elapsedMs: expectedFrozenMs,
+    });
+    assert.equal(gapFooter.durationLabel, `Elapsed ${expectedFrozenMs / 1_000}s`);
+    assert.equal(
+      gapFooter.statusTitle,
+      'Started, last confirmed status (confirmed 3.5s ago)',
+    );
+    assert.equal(gapFooter.statusAriaLabel, gapFooter.statusTitle);
+    assert.equal(
+      gapFooter.durationTitle,
+      `Last confirmed elapsed ${expectedFrozenMs / 1_000}s (confirmed 3.5s ago)`,
+    );
+    assert.equal(gapFooter.durationAriaLabel, gapFooter.durationTitle);
+
+    // Later inside the same gap elapsed stays frozen while confirmation age advances.
+    const gapLater = resolveChatWorkExecutionFootersWithContinuity(
+      cadenceStore,
+      views.events,
+      expiresAtMs + 900,
+      { activeChatKey: chatKey },
+    );
+    cadenceStore = gapLater.store;
+    const gapLaterFooter = gapLater.footersByEventKey.get(eventKey)!;
+    assert.equal(gapLaterFooter.durationLabel, `Elapsed ${expectedFrozenMs / 1_000}s`);
+    assert.equal(
+      gapLaterFooter.statusTitle,
+      'Started, last confirmed status (confirmed 3.9s ago)',
+    );
+    previousFrozenMs = expectedFrozenMs;
+  }
+
+  const recoveredViews = buildViews(
+    [
+      makePresence({
+        item_id: 'blg_gap',
+        execution_ref: 'exec-gap-1',
+        sequence: 23,
+        sampled_at_ms: 62_000,
+        sample_age_ms: 0,
+        max_sample_age_ms: 3_000,
+        expires_at_ms: 65_000,
+      }),
+    ],
+    { started_at_ms: 45_000 },
+  );
+  const recovered = resolveChatWorkExecutionFootersWithContinuity(
+    cadenceStore,
+    recoveredViews.events,
+    62_000,
+    { activeChatKey: chatKey },
+  );
+  const recoveredFooter = recovered.footersByEventKey.get(eventKey)!;
+  assert.equal(recoveredFooter.statusKey, 'working');
+  assert.equal(recoveredFooter.statusLabel, 'Started');
+  assert.equal(recoveredFooter.duration?.kind, 'elapsed');
+  assert.equal(recoveredFooter.durationLabel, 'Elapsed 17s');
+});
+
+test('worker continuity immediately clears on explicit non_live, restarted host, foreign runs, other chats, and terminal failure/success', () => {
+  const alphaIdentity = makeIdentity('bnd_alpha_cont_iso', UUID_ALPHA);
+  const betaIdentity = makeIdentity('bnd_beta_cont_iso', UUID_BETA);
+  const alphaChatKey = resolveMessageScrollChatKey(alphaIdentity);
+  const betaChatKey = resolveMessageScrollChatKey(betaIdentity);
+
+  const buildChatViews = (
+    identity: WorkspaceChatIdentity,
+    presenceRows: readonly ChatWorkPresence[],
+    executionOverrides: ChatWorkExecutionFixtureOverrides = {},
+    itemOverrides: Partial<ChatWorkItem> = {},
+  ) => {
+    const item = makeBacklogItem({
+      item_id: 'blg_iso',
+      binding_id: identity.binding_id,
+      kind: 'worker',
+      status: 'doing',
+      current_execution_ref: 'exec-iso-1',
+      ...itemOverrides,
+    });
+    const selection = selectWorkspaceChatWork(
+      [
+        makeChatWork(identity, {
+          items: [item],
+          events: [
+            makeBacklogEvent({
+              event_id: 'blg_iso:3',
+              sequence: 3,
+              item_id: 'blg_iso',
+              revision: 3,
+              action: 'worker_execution_attached',
+              status: 'doing',
+              execution_ref: 'exec-iso-1',
+              recorded_at_ms: 9_100,
+            }),
+          ],
+          worker_presence: [...presenceRows],
+          worker_executions: [
+            makeExecution(identity.binding_id, {
+              item_id: 'blg_iso',
+              execution_ref: 'exec-iso-1',
+              worker_status: 'running',
+              outcome: null,
+              started_at_ms: 9_000,
+              ...executionOverrides,
+            }),
+          ],
+        }),
+      ],
+      identity,
+    );
+    return buildChatWorkEventViews(selection);
+  };
+
+  const livePresence = makePresence({
+    item_id: 'blg_iso',
+    execution_ref: 'exec-iso-1',
+    host_instance_id: 'host-1',
+    invocation_id: 'invocation-1',
+    claim_id: 'claim-1',
+    sequence: 8,
+    sampled_at_ms: 10_000,
+    max_sample_age_ms: 5_000,
+    expires_at_ms: 15_000,
+  });
+
+  const seedStore = () => {
+    const events = buildChatViews(alphaIdentity, [livePresence]);
+    const seeded = resolveChatWorkExecutionFootersWithContinuity(
+      createChatWorkExecutionContinuityStore(),
+      events,
+      14_000,
+      { activeChatKey: alphaChatKey },
+    );
+    assert.equal(seeded.footersByEventKey.get(events[0]!.key)!.statusKey, 'working');
+    return seeded.store;
+  };
+
+  // 1. Explicit non_live immediately clears Started -> Status unavailable.
+  {
+    const events = buildChatViews(alphaIdentity, [
+      makePresence({
+        ...livePresence,
+        sequence: 9,
+        availability: 'non_live',
+        freshness: 'not_applicable',
+        live: false,
+        sampled_at_ms: 15_200,
+        expires_at_ms: null,
+      }),
+    ]);
+    const next = resolveChatWorkExecutionFootersWithContinuity(
+      seedStore(),
+      events,
+      15_500,
+      { activeChatKey: alphaChatKey },
+    );
+    const footer = next.footersByEventKey.get(events[0]!.key)!;
+    assert.equal(footer.statusKey, 'unavailable');
+    assert.equal(footer.duration, null);
+  }
+
+  // 2. Restarted host, changed invocation/claim, missing host, or future sample
+  // immediately invalidates continuity.
+  for (const invalidPresence of [
+    makePresence({
+      ...livePresence,
+      host_instance_id: 'host-restarted-2',
+      availability: 'unavailable',
+      freshness: 'not_applicable',
+      live: false,
+      sampled_at_ms: 15_200,
+      expires_at_ms: null,
+    }),
+    makePresence({
+      ...livePresence,
+      invocation_id: 'invocation-restarted-2',
+      availability: 'unavailable',
+      freshness: 'not_applicable',
+      live: false,
+      sampled_at_ms: 15_200,
+      expires_at_ms: null,
+    }),
+    makePresence({
+      ...livePresence,
+      claim_id: 'claim-2',
+      availability: 'unavailable',
+      freshness: 'not_applicable',
+      live: false,
+      sampled_at_ms: 15_200,
+      expires_at_ms: null,
+    }),
+    makePresence({
+      ...livePresence,
+      host_instance_id: null,
+      availability: 'unavailable',
+      freshness: 'not_applicable',
+      live: false,
+      sampled_at_ms: 15_200,
+      expires_at_ms: null,
+    }),
+    makePresence({
+      ...livePresence,
+      sampled_at_ms: 16_000,
+      expires_at_ms: 21_000,
+    }),
+  ]) {
+    const events = buildChatViews(alphaIdentity, [invalidPresence]);
+    const next = resolveChatWorkExecutionFootersWithContinuity(
+      seedStore(),
+      events,
+      15_500,
+      { activeChatKey: alphaChatKey },
+    );
+    const footer = next.footersByEventKey.get(events[0]!.key)!;
+    assert.equal(footer.statusKey, 'unavailable');
+    assert.equal(footer.duration, null);
+  }
+
+  // 3. Foreign run (changed run_id/worker_id) never inherits Started or elapsed.
+  {
+    const foreignEvents = buildChatViews(
+      alphaIdentity,
+      [
+        makePresence({
+          ...livePresence,
+          run_id: 'run-foreign-2',
+          worker_id: 'worker-foreign-2',
+          freshness: 'stale',
+          live: false,
+        }),
+      ],
+      { run_id: 'run-foreign-2', worker_id: 'worker-foreign-2' },
+    );
+    const next = resolveChatWorkExecutionFootersWithContinuity(
+      seedStore(),
+      foreignEvents,
+      15_500,
+      { activeChatKey: alphaChatKey },
+    );
+    const footer = next.footersByEventKey.get(foreignEvents[0]!.key)!;
+    assert.equal(footer.statusKey, 'unavailable');
+    assert.equal(footer.duration, null);
+  }
+
+  // 4. Sibling chat with identical item_id/execution_ref/run_id never inherits
+  // continuity from Alpha.
+  {
+    const betaEvents = buildChatViews(betaIdentity, [
+      makePresence({ ...livePresence, freshness: 'stale', live: false }),
+    ]);
+    const next = resolveChatWorkExecutionFootersWithContinuity(
+      seedStore(),
+      betaEvents,
+      15_500,
+      { activeChatKey: betaChatKey },
+    );
+    const footer = next.footersByEventKey.get(betaEvents[0]!.key)!;
+    assert.equal(footer.statusKey, 'unavailable');
+    assert.equal(footer.duration, null);
+  }
+
+  // 5. Terminal failure and terminal success (Awaiting check / Completed)
+  // immediately win during a brief gap and evict continuity.
+  for (const terminalCase of [
+    {
+      execution: {
+        worker_status: 'failed',
+        outcome: 'failure' as const,
+        finished_at_ms: 15_400,
+        duration_ms: 6_400,
+      },
+      item: { status: 'blocked' as const, blocked_reason: 'Test failed.' },
+      expectedStatus: 'failed' as const,
+      expectedLabel: 'Failed',
+      expectedDuration: '6.4s',
+    },
+    {
+      execution: {
+        worker_status: 'completed',
+        outcome: 'success' as const,
+        acceptance: 'pending_review',
+        finished_at_ms: 15_400,
+        duration_ms: 6_400,
+      },
+      item: { status: 'doing' as const },
+      expectedStatus: 'checking' as const,
+      expectedLabel: 'Awaiting check',
+      expectedDuration: '6.4s',
+    },
+    {
+      execution: {
+        worker_status: 'completed',
+        outcome: 'success' as const,
+        acceptance: 'accepted',
+        finished_at_ms: 15_400,
+        duration_ms: 6_400,
+      },
+      item: { status: 'done' as const, completed_at_ms: 15_400 },
+      expectedStatus: 'completed' as const,
+      expectedLabel: 'Completed',
+      expectedDuration: '6.4s',
+    },
+  ]) {
+    const events = buildChatViews(
+      alphaIdentity,
+      [livePresence],
+      terminalCase.execution,
+      terminalCase.item,
+    );
+    const next = resolveChatWorkExecutionFootersWithContinuity(
+      seedStore(),
+      events,
+      15_500,
+      { activeChatKey: alphaChatKey },
+    );
+    const footer = next.footersByEventKey.get(events[0]!.key)!;
+    assert.equal(footer.statusKey, terminalCase.expectedStatus);
+    assert.equal(footer.statusLabel, terminalCase.expectedLabel);
+    assert.equal(footer.duration?.kind, 'final');
+    assert.equal(footer.durationLabel, terminalCase.expectedDuration);
+    assert.equal(next.store.size, 0);
+  }
+});
+
+test('previously confirmed running attempt returns unavailable with no timer after empty worker_presence passes its real deadline without affecting never-observed dispatches, grace bounds, terminal precedence, or attempt/host/chat isolation', () => {
+  const alphaIdentity = makeIdentity('bnd_alpha_empty_expiry', UUID_ALPHA);
+  const betaIdentity = makeIdentity('bnd_beta_empty_expiry', UUID_BETA);
+  const alphaChatKey = resolveMessageScrollChatKey(alphaIdentity);
+  const betaChatKey = resolveMessageScrollChatKey(betaIdentity);
+
+  const buildChatViews = (
+    identity: WorkspaceChatIdentity,
+    presenceRows: readonly ChatWorkPresence[],
+    executionOverrides: ChatWorkExecutionFixtureOverrides = {},
+    itemOverrides: Partial<ChatWorkItem> = {},
+  ) => {
+    const item = makeBacklogItem({
+      item_id: 'blg_empty_expiry',
+      binding_id: identity.binding_id,
+      kind: 'worker',
+      status: 'doing',
+      current_execution_ref: 'exec-empty-1',
+      ...itemOverrides,
+    });
+    const selection = selectWorkspaceChatWork(
+      [
+        makeChatWork(identity, {
+          items: [item],
+          events: [
+            makeBacklogEvent({
+              event_id: 'blg_empty_expiry:3',
+              sequence: 3,
+              item_id: 'blg_empty_expiry',
+              revision: 3,
+              action: 'worker_execution_attached',
+              status: 'doing',
+              execution_ref: 'exec-empty-1',
+              recorded_at_ms: 8_100,
+            }),
+          ],
+          worker_presence: [...presenceRows],
+          worker_executions: [
+            makeExecution(identity.binding_id, {
+              item_id: 'blg_empty_expiry',
+              execution_ref: 'exec-empty-1',
+              worker_status: 'running',
+              outcome: null,
+              started_at_ms: 8_000,
+              ...executionOverrides,
+            }),
+          ],
+        }),
+      ],
+      identity,
+    );
+    return buildChatWorkEventViews(selection);
+  };
+
+  // Never-observed dispatch with empty worker_presence stays Dispatched.
+  const emptyEvents = buildChatViews(alphaIdentity, []);
+  const eventKey = emptyEvents[0]!.key;
+  const attemptKey = emptyEvents[0]!.workerExecution!.attemptKey!;
+  const neverObserved = resolveChatWorkExecutionFootersWithContinuity(
+    createChatWorkExecutionContinuityStore(),
+    emptyEvents,
+    12_000,
+    { activeChatKey: alphaChatKey },
+  );
+  assert.equal(neverObserved.footersByEventKey.get(eventKey)!.statusKey, 'dispatched');
+  assert.equal(neverObserved.footersByEventKey.get(eventKey)!.statusLabel, 'Dispatched');
+  assert.equal(neverObserved.footersByEventKey.get(eventKey)!.duration, null);
+  assert.equal(neverObserved.footersByEventKey.get(eventKey)!.durationLabel, null);
+  assert.equal(neverObserved.store.size, 0);
+
+  // Confirm live running (sampled at 10_000, max_sample_age_ms 3_000, expires at 13_000 ->
+  // real deadline is 13_000 + min(5_000, 3_000) = 16_000).
+  const livePresence = makePresence({
+    item_id: 'blg_empty_expiry',
+    execution_ref: 'exec-empty-1',
+    host_instance_id: 'host-1',
+    invocation_id: 'invocation-1',
+    claim_id: 'claim-1',
+    sequence: 10,
+    sampled_at_ms: 10_000,
+    sample_age_ms: 0,
+    max_sample_age_ms: 3_000,
+    expires_at_ms: 13_000,
+  });
+  let step = resolveChatWorkExecutionFootersWithContinuity(
+    neverObserved.store,
+    buildChatViews(alphaIdentity, [livePresence]),
+    12_000,
+    { activeChatKey: alphaChatKey },
+  );
+  assert.equal(step.footersByEventKey.get(eventKey)!.statusKey, 'working');
+  assert.equal(step.footersByEventKey.get(eventKey)!.durationLabel, 'Elapsed 4s');
+  const activeEntry = step.store.get(attemptKey)!;
+  assert.ok(activeEntry);
+
+  // worker_presence becomes empty before real deadline -> holds Started with frozen elapsed;
+  // omitted and replayed stale samples never extend expiresAtMs or real deadline (16_000).
+  step = resolveChatWorkExecutionFootersWithContinuity(
+    step.store,
+    emptyEvents,
+    13_100,
+    { activeChatKey: alphaChatKey },
+  );
+  const openGapStore = step.store;
+  assert.equal(step.footersByEventKey.get(eventKey)!.statusKey, 'started');
+  assert.equal(step.footersByEventKey.get(eventKey)!.durationLabel, 'Elapsed 4s');
+  assert.equal(step.store.get(attemptKey)?.expiresAtMs, 13_000);
+
+  const replayedStaleEvents = buildChatViews(alphaIdentity, [
+    makePresence({
+      ...livePresence,
+      sequence: 10,
+      freshness: 'stale',
+      live: false,
+      sampled_at_ms: 14_000,
+      sample_age_ms: 4_000,
+      expires_at_ms: 17_000,
+    }),
+  ]);
+  step = resolveChatWorkExecutionFootersWithContinuity(
+    step.store,
+    replayedStaleEvents,
+    14_500,
+    { activeChatKey: alphaChatKey },
+  );
+  assert.equal(step.footersByEventKey.get(eventKey)!.statusKey, 'started');
+  assert.equal(step.footersByEventKey.get(eventKey)!.durationLabel, 'Elapsed 4s');
+  assert.equal(step.store.get(attemptKey)?.expiresAtMs, 13_000);
+
+  step = resolveChatWorkExecutionFootersWithContinuity(
+    step.store,
+    emptyEvents,
+    15_999,
+    { activeChatKey: alphaChatKey },
+  );
+  assert.equal(step.footersByEventKey.get(eventKey)!.statusKey, 'started');
+  assert.equal(step.footersByEventKey.get(eventKey)!.durationLabel, 'Elapsed 4s');
+
+  // Crossing the exact real deadline (16_000) with empty worker_presence returns
+  // Status unavailable with no timer (not Dispatched) and stays unavailable across later refreshes.
+  for (const afterDeadlineMs of [16_000, 17_000, 25_000]) {
+    step = resolveChatWorkExecutionFootersWithContinuity(
+      step.store,
+      emptyEvents,
+      afterDeadlineMs,
+      { activeChatKey: alphaChatKey },
+    );
+    const footer = step.footersByEventKey.get(eventKey)!;
+    assert.equal(footer.statusKey, 'unavailable');
+    assert.equal(footer.statusLabel, 'Status unavailable');
+    assert.equal(footer.duration, null);
+    assert.equal(footer.durationLabel, null);
+    assert.equal(footer.statusAriaLabel, undefined);
+    assert.equal(footer.statusTitle, undefined);
+    assert.equal(step.store.get(attemptKey)?.briefGapClosed, true);
+  }
+
+  // Once closed, clock jitter or replayed stale data never re-enters Started.
+  const closedStore = step.store;
+  const jitterBack = resolveChatWorkExecutionFootersWithContinuity(
+    closedStore,
+    emptyEvents,
+    15_500,
+    { activeChatKey: alphaChatKey },
+  );
+  assert.equal(jitterBack.footersByEventKey.get(eventKey)!.statusKey, 'unavailable');
+  assert.equal(jitterBack.footersByEventKey.get(eventKey)!.duration, null);
+
+  // Direct resolveChatWorkExecutionFooterState honors scoped matching continuity after expiry
+  // while keeping mismatched or absent continuity on empty presence as Dispatched.
+  const directExpired = resolveChatWorkExecutionFooterState(
+    emptyEvents[0]!.workerExecution!,
+    16_000,
+    activeEntry,
+  );
+  assert.equal(directExpired.statusKey, 'unavailable');
+  assert.equal(directExpired.duration, null);
+  assert.equal(
+    resolveChatWorkExecutionFooterState(emptyEvents[0]!.workerExecution!, 16_000, null)
+      .statusKey,
+    'dispatched',
+  );
+
+  // Isolation: another attempt on the same item/ref and a sibling chat with empty
+  // worker_presence never inherit Started or Status unavailable.
+  const foreignAttemptEmpty = buildChatViews(alphaIdentity, [], {
+    run_id: 'run-foreign-empty',
+    worker_id: 'worker-foreign-empty',
+  });
+  assert.equal(
+    resolveChatWorkExecutionFooterState(
+      foreignAttemptEmpty[0]!.workerExecution!,
+      16_000,
+      activeEntry,
+    ).statusKey,
+    'dispatched',
+  );
+  const foreignStep = resolveChatWorkExecutionFootersWithContinuity(
+    closedStore,
+    foreignAttemptEmpty,
+    16_500,
+    { activeChatKey: alphaChatKey },
+  );
+  assert.equal(
+    foreignStep.footersByEventKey.get(foreignAttemptEmpty[0]!.key)!.statusKey,
+    'dispatched',
+  );
+
+  const betaEmpty = buildChatViews(betaIdentity, []);
+  const betaAcrossAlphaExpiry = resolveChatWorkExecutionFootersWithContinuity(
+    openGapStore,
+    betaEmpty,
+    16_500,
+    { activeChatKey: betaChatKey },
+  );
+  assert.equal(
+    betaAcrossAlphaExpiry.footersByEventKey.get(betaEmpty[0]!.key)!.statusKey,
+    'dispatched',
+  );
+  assert.equal(betaAcrossAlphaExpiry.store.get(attemptKey)?.briefGapClosed, true);
+  // Switching back to Alpha after crossing expiry while viewing Beta keeps Alpha unavailable.
+  const alphaReturned = resolveChatWorkExecutionFootersWithContinuity(
+    betaAcrossAlphaExpiry.store,
+    emptyEvents,
+    17_000,
+    { activeChatKey: alphaChatKey },
+  );
+  assert.equal(
+    alphaReturned.footersByEventKey.get(eventKey)!.statusKey,
+    'unavailable',
+  );
+  assert.equal(alphaReturned.footersByEventKey.get(eventKey)!.duration, null);
+
+  // Host restart or explicit non_live inside the grace window closes brief-gap continuity so
+  // subsequent empty worker_presence still within the old grace window stays unavailable.
+  for (const invalidatingPresence of [
+    makePresence({
+      ...livePresence,
+      host_instance_id: 'host-restarted-2',
+      availability: 'unavailable',
+      freshness: 'not_applicable',
+      live: false,
+      sampled_at_ms: 13_400,
+      expires_at_ms: null,
+    }),
+    makePresence({
+      ...livePresence,
+      sequence: 11,
+      availability: 'non_live',
+      freshness: 'not_applicable',
+      live: false,
+      sampled_at_ms: 13_400,
+      expires_at_ms: null,
+    }),
+  ]) {
+    const seeded = resolveChatWorkExecutionFootersWithContinuity(
+      createChatWorkExecutionContinuityStore(),
+      buildChatViews(alphaIdentity, [livePresence]),
+      12_000,
+      { activeChatKey: alphaChatKey },
+    );
+    const invalidated = resolveChatWorkExecutionFootersWithContinuity(
+      seeded.store,
+      buildChatViews(alphaIdentity, [invalidatingPresence]),
+      13_500,
+      { activeChatKey: alphaChatKey },
+    );
+    assert.equal(invalidated.footersByEventKey.get(eventKey)!.statusKey, 'unavailable');
+    const emptyStillInOldWindow = resolveChatWorkExecutionFootersWithContinuity(
+      invalidated.store,
+      emptyEvents,
+      14_000,
+      { activeChatKey: alphaChatKey },
+    );
+    assert.equal(
+      emptyStillInOldWindow.footersByEventKey.get(eventKey)!.statusKey,
+      'unavailable',
+    );
+    assert.equal(emptyStillInOldWindow.footersByEventKey.get(eventKey)!.duration, null);
+  }
+
+  // Terminal precedence immediately wins over the closed empty-presence marker and evicts it.
+  const terminalEmpty = buildChatViews(
+    alphaIdentity,
+    [],
+    {
+      worker_status: 'completed',
+      outcome: 'success',
+      acceptance: 'accepted',
+      finished_at_ms: 16_200,
+      duration_ms: 8_200,
+    },
+    { status: 'done', completed_at_ms: 16_200 },
+  );
+  const terminalAfterExpiry = resolveChatWorkExecutionFootersWithContinuity(
+    closedStore,
+    terminalEmpty,
+    17_000,
+    { activeChatKey: alphaChatKey },
+  );
+  assert.equal(
+    terminalAfterExpiry.footersByEventKey.get(terminalEmpty[0]!.key)!.statusKey,
+    'completed',
+  );
+  assert.equal(
+    terminalAfterExpiry.footersByEventKey.get(terminalEmpty[0]!.key)!.durationLabel,
+    '8.2s',
+  );
+  assert.equal(terminalAfterExpiry.store.size, 0);
+
+  // Fresh live confirmation later recovers the same attempt from unavailable back to working.
+  const recoveredLive = resolveChatWorkExecutionFootersWithContinuity(
+    closedStore,
+    buildChatViews(alphaIdentity, [
+      makePresence({
+        ...livePresence,
+        sequence: 12,
+        sampled_at_ms: 18_000,
+        sample_age_ms: 0,
+        max_sample_age_ms: 3_000,
+        expires_at_ms: 21_000,
+      }),
+    ]),
+    19_000,
+    { activeChatKey: alphaChatKey },
+  );
+  assert.equal(recoveredLive.footersByEventKey.get(eventKey)!.statusKey, 'working');
+  assert.equal(recoveredLive.footersByEventKey.get(eventKey)!.durationLabel, 'Elapsed 11s');
+  assert.equal(recoveredLive.store.get(attemptKey)?.briefGapClosed, undefined);
 });

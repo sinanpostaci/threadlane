@@ -102,6 +102,9 @@ import {
   WRONG_SCOPE_QUARANTINE_SENTINEL,
 } from './fixtures/workspace.ts';
 import {
+  CHAT_WORK_EXECUTION_BRIEF_GAP_MS,
+} from '../src/message-scroll.ts';
+import {
   parseWorkspaceSnapshot,
   WORKSPACE_CHAT_ARCHIVE_STORAGE_KEY,
   WORKSPACE_SAMPLE_STALE_THRESHOLD_MS,
@@ -616,7 +619,10 @@ async function expectWorkerFooterStatus(
 }
 
 type WorkerFooterDurationExpectation =
-  | { readonly kind: 'final' | 'elapsed'; readonly text: RegExp }
+  | {
+      readonly kind: 'final' | 'elapsed' | 'last_confirmed';
+      readonly text: RegExp;
+    }
   | null;
 
 interface WorkerFooterExpectation {
@@ -3357,13 +3363,13 @@ test.describe('Compact Worker execution metadata footer', () => {
       MINIMAL_CHAT_ALPHA_LIVE_EXECUTION_REF,
     );
     // Exact current execution presence is the only proof that the durable
-    // dispatch metadata is Working.
+    // dispatch metadata is confirmed live (`working` internally, durable `Started` visibly).
     await expectWorkerFooterMetadata(liveFooter, {
       brand: 'gemini',
       model: /^Argon$/i,
       effort: /^High$/i,
       status: 'working',
-      label: 'Working',
+      label: 'Started',
       duration: {
         kind: 'elapsed',
         text: /^Elapsed\s+\d+(?:\.\d+)?s$/i,
@@ -3377,7 +3383,7 @@ test.describe('Compact Worker execution metadata footer', () => {
     // the original sample is still inside its freshness window. Advance the
     // browser clock only; no new snapshot or sample is injected.
     await page.clock.setFixedTime(FIXTURE_BASE_NOW_MS + 3_000);
-    await expectWorkerFooterStatus(liveFooter, 'working', 'Working');
+    await expectWorkerFooterStatus(liveFooter, 'working', 'Started');
     await expect(header.getByText(/^Working$/i).first()).toBeVisible();
     await expectLiveAgentWorking(workspace, 'Worker');
     await expectLiveAgentWorking(workspace, 'Coworker');
@@ -4418,8 +4424,8 @@ test.describe('Compact Worker execution metadata footer', () => {
     await expectNoHorizontalOverflow(page, '390px Worker metadata footer');
 
     // The exact current execution still has a fresh presence sample at the
-    // fixed fixture clock, so the compact footer renders Working with its live
-    // elapsed duration at the narrow width instead of a dispatch-only label.
+    // fixed fixture clock, so the compact footer renders confirmed live Started
+    // (`working` internally) with its elapsed duration at the narrow width.
     const liveFooter = await expectWorkerFooterAtLatestEvent(
       page,
       MINIMAL_CHAT_LIVE_PROGRESS_EVENT_TITLE,
@@ -4435,7 +4441,7 @@ test.describe('Compact Worker execution metadata footer', () => {
       model: /^Argon$/i,
       effort: /^High$/i,
       status: 'working',
-      label: 'Working',
+      label: 'Started',
       duration: {
         kind: 'elapsed',
         text: /^Elapsed\s+\d+(?:\.\d+)?s$/i,
@@ -4447,6 +4453,1101 @@ test.describe('Compact Worker execution metadata footer', () => {
     await acceptedFooter.scrollIntoViewIfNeeded();
     await expect(acceptedFooter).toBeVisible();
     await expectNoHorizontalOverflow(page, 'restored 1440px Worker metadata footer');
+  });
+
+  test('reconciles regressed Worker samples, keeps stable neutral Started and Elapsed across three late 4s/3s renewals in wide and narrow viewports, expires genuinely, and preserves header/sidebar semantics and accessibility', async ({
+    page,
+  }) => {
+    const controller = await installWorkerMetadata(page, {
+      width: 1440,
+      height: 900,
+    });
+    const workspace = workspaceSection(page);
+    const header = chatHeader(page, 'Workspace UI Contract');
+    const alphaSidebarRow = sidebar(page)
+      .locator('button.tl-chat-item')
+      .filter({ hasText: 'Workspace UI Contract' })
+      .first();
+
+    const baseSnapshot = await controller.getWorkspaceSnapshot();
+    expect(baseSnapshot).not.toBeNull();
+    let nativeSeq = 16;
+    const withFreshAlphaNativeAt = (
+      snapshot: WorkspaceSnapshot,
+      generatedAtMs: number,
+    ): WorkspaceSnapshot => {
+      nativeSeq += 1;
+      const advanced = advanceWorkspaceGeneratedAtFixture(snapshot, generatedAtMs);
+      return parseWorkspaceSnapshot({
+        ...advanced,
+        native_samples: advanced.native_samples.map((sample) =>
+          workspaceChatIdentitiesEqual(sample.chat_identity, CHAT_ALPHA_IDENTITY)
+            ? {
+                ...sample,
+                sequence: nativeSeq,
+                observed_at_ms: generatedAtMs - 500,
+                last_success_at_ms: generatedAtMs - 500,
+                activity: 'idle',
+              }
+            : sample,
+        ),
+      });
+    };
+
+    const pushAndRefresh = async (nextSnapshot: WorkspaceSnapshot): Promise<void> => {
+      await controller.setWorkspaceSnapshot(nextSnapshot);
+      const beforeCount = (await controller.getInvocations()).filter(
+        (call) => call.cmd === 'desktop_workspace_snapshot',
+      ).length;
+      await triggerWorkspaceRefresh(page);
+      await expect
+        .poll(async () =>
+          (await controller.getInvocations()).filter(
+            (call) => call.cmd === 'desktop_workspace_snapshot',
+          ).length,
+        )
+        .toBeGreaterThan(beforeCount);
+      await page.evaluate(
+        () =>
+          new Promise<void>((resolve) => {
+            requestAnimationFrame(() => {
+              requestAnimationFrame(() => resolve());
+            });
+          }),
+      );
+    };
+
+    const measureFooterPresentation = async (footer: Locator) =>
+      footer.evaluate((element) => {
+        const statusEl = element.querySelector('[data-worker-execution-status]');
+        const durationEl = element.querySelector('[data-worker-execution-duration]');
+        const footerRect = element.getBoundingClientRect();
+        const statusRect = statusEl?.getBoundingClientRect() ?? null;
+        const durationRect = durationEl?.getBoundingClientRect() ?? null;
+
+        const surfaceRoot = element.closest('.tl-cw-root') ?? document.body;
+        const probe = document.createElement('span');
+        probe.setAttribute('aria-hidden', 'true');
+        probe.style.position = 'fixed';
+        probe.style.visibility = 'hidden';
+        probe.style.pointerEvents = 'none';
+        probe.style.color = 'var(--cw-fg-secondary)';
+        surfaceRoot.appendChild(probe);
+        let neutralSecondaryColor = '';
+        let workingAccentColor = '';
+        try {
+          neutralSecondaryColor = getComputedStyle(probe).color;
+          probe.style.color = 'var(--cw-working)';
+          workingAccentColor = getComputedStyle(probe).color;
+        } finally {
+          probe.remove();
+        }
+
+        const parseRgb = (raw: string): [number, number, number] => {
+          const match = raw.match(/rgba?\(\s*([\d.]+)[,\s]+([\d.]+)[,\s]+([\d.]+)/i);
+          return match
+            ? [Number(match[1]), Number(match[2]), Number(match[3])]
+            : [0, 0, 0];
+        };
+        const lin = (c: number): number => {
+          const v = Math.max(0, Math.min(255, c)) / 255;
+          return v <= 0.04045 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4;
+        };
+        const lum = ([r, g, b]: [number, number, number]): number =>
+          0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b);
+
+        const statusColor = statusEl ? getComputedStyle(statusEl).color : '';
+        const durationColor = durationEl ? getComputedStyle(durationEl).color : '';
+        let statusContrast = 0;
+        if (statusEl) {
+          const fg = parseRgb(statusColor);
+          let bg: [number, number, number] = [24, 24, 28];
+          for (
+            let node: Element | null = statusEl;
+            node !== null;
+            node = node.parentElement
+          ) {
+            const rawBg = getComputedStyle(node).backgroundColor;
+            const alphaMatch = rawBg.match(
+              /rgba\(\s*[\d.]+[,\s]+[\d.]+[,\s]+[\d.]+[,\s/]+([\d.]+)\s*\)/i,
+            );
+            const alpha = alphaMatch
+              ? Number(alphaMatch[1])
+              : rawBg === 'transparent'
+                ? 0
+                : 1;
+            if (alpha >= 0.99) {
+              bg = parseRgb(rawBg);
+              break;
+            }
+          }
+          const l1 = Math.max(lum(fg), lum(bg));
+          const l2 = Math.min(lum(fg), lum(bg));
+          statusContrast = (l1 + 0.05) / (l2 + 0.05);
+        }
+
+        return {
+          eventKey:
+            element
+              .closest('[data-chat-event-key]')
+              ?.getAttribute('data-chat-event-key') ?? null,
+          statusKey: element.getAttribute('data-worker-status'),
+          statusText: (statusEl?.textContent ?? '').replace(/\s+/g, ' ').trim(),
+          statusAriaLabel: statusEl?.getAttribute('aria-label') ?? null,
+          statusTitle: statusEl?.getAttribute('title') ?? null,
+          statusColor,
+          neutralSecondaryColor,
+          workingAccentColor,
+          statusContrast,
+          durationKind:
+            durationEl?.getAttribute('data-worker-execution-duration') ?? null,
+          durationText: (durationEl?.textContent ?? '').replace(/\s+/g, ' ').trim(),
+          durationAriaLabel: durationEl?.getAttribute('aria-label') ?? null,
+          durationTitle: durationEl?.getAttribute('title') ?? null,
+          durationColor,
+          statusRelX: statusRect ? statusRect.left - footerRect.left : null,
+          statusRelY: statusRect ? statusRect.top - footerRect.top : null,
+          statusWidth: statusRect ? statusRect.width : null,
+          durationRelX: durationRect ? durationRect.left - footerRect.left : null,
+          durationRelY: durationRect ? durationRect.top - footerRect.top : null,
+          durationRightInset: durationRect
+            ? footerRect.right - durationRect.right
+            : null,
+          durationGapFromStatus:
+            statusRect && durationRect
+              ? durationRect.left - statusRect.right
+              : null,
+          overflows: element.scrollWidth > element.clientWidth + 1,
+        };
+      });
+
+    type FooterPresentation = Awaited<ReturnType<typeof measureFooterPresentation>>;
+    const assertStablePresentation = (
+      current: FooterPresentation,
+      baseline: FooterPresentation,
+      layout: 'wide' | 'narrow',
+      expected: {
+        statusKey: 'working' | 'started';
+        durationKind: 'elapsed' | 'last_confirmed';
+      },
+    ): void => {
+      expect(current.eventKey).not.toBeNull();
+      expect(current.eventKey).toBe(baseline.eventKey);
+      expect(current.statusKey).toBe(expected.statusKey);
+      expect(current.statusText).toBe('Started');
+      expect(current.durationKind).toBe(expected.durationKind);
+      expect(current.durationText).toMatch(/^Elapsed\s+\d+(?:\.\d+)?s$/i);
+      expect(current.durationText).not.toMatch(/last at/i);
+      expect(current.neutralSecondaryColor).not.toBe('');
+      expect(current.neutralSecondaryColor).not.toBe(current.workingAccentColor);
+      expect(current.statusColor).toBe(current.neutralSecondaryColor);
+      expect(current.statusColor).toBe(baseline.statusColor);
+      expect(current.durationColor).toBe(baseline.durationColor);
+      expect(current.statusContrast).toBeGreaterThanOrEqual(4.5);
+      expect(current.overflows).toBe(false);
+
+      expect(current.statusAriaLabel).not.toBeNull();
+      expect(current.statusTitle).toBe(current.statusAriaLabel);
+      expect(current.durationAriaLabel).not.toBeNull();
+      expect(current.durationTitle).toBe(current.durationAriaLabel);
+      if (expected.statusKey === 'working') {
+        expect(current.statusAriaLabel).toMatch(
+          /^Started, live evidence fresh \(last confirmed (?:just now|\d+(?:\.\d+)?(?:ms|s) ago)\)$/i,
+        );
+        expect(current.durationAriaLabel).toMatch(
+          /^Elapsed \d+(?:\.\d+)?s, live evidence fresh \(last confirmed (?:just now|\d+(?:\.\d+)?(?:ms|s) ago)\)$/i,
+        );
+      } else {
+        expect(current.statusAriaLabel).toMatch(
+          /^Started, last confirmed status \(confirmed \d+(?:\.\d+)?(?:ms|s) ago\)$/i,
+        );
+        expect(current.durationAriaLabel).toMatch(
+          /^Last confirmed elapsed \d+(?:\.\d+)?s \(confirmed \d+(?:\.\d+)?(?:ms|s) ago\)$/i,
+        );
+      }
+
+      expect(Math.abs(current.statusRelX! - baseline.statusRelX!)).toBeLessThanOrEqual(1);
+      expect(Math.abs(current.statusRelY! - baseline.statusRelY!)).toBeLessThanOrEqual(1);
+      expect(Math.abs(current.statusWidth! - baseline.statusWidth!)).toBeLessThanOrEqual(1);
+      expect(Math.abs(current.durationRelY! - baseline.durationRelY!)).toBeLessThanOrEqual(1);
+      if (layout === 'wide') {
+        expect(
+          Math.abs(current.durationRightInset! - baseline.durationRightInset!),
+        ).toBeLessThanOrEqual(1);
+      } else {
+        expect(Math.abs(current.durationRelX! - baseline.durationRelX!)).toBeLessThanOrEqual(1);
+        expect(
+          Math.abs(current.durationGapFromStatus! - baseline.durationGapFromStatus!),
+        ).toBeLessThanOrEqual(1);
+      }
+    };
+
+    const earlierLiveTitles = [
+      `Preparing Worker execution for ${MINIMAL_CHAT_DOING_TITLE}`,
+      `Worker execution attached for ${MINIMAL_CHAT_DOING_TITLE}`,
+    ];
+    const eventRow = await resolveStreamEventRow(
+      page,
+      MINIMAL_CHAT_LIVE_PROGRESS_EVENT_TITLE,
+    );
+    const initialEventId = await eventRow.getAttribute('data-chat-event-id');
+    const initialEventSequence = await eventRow.getAttribute(
+      'data-chat-event-sequence',
+    );
+    const initialEventKey = await eventRow.getAttribute('data-chat-event-key');
+    expect(initialEventId).not.toBeNull();
+    expect(initialEventSequence).not.toBeNull();
+    expect(initialEventKey).not.toBeNull();
+    await expectWorkerFooterAtLatestEvent(
+      page,
+      MINIMAL_CHAT_LIVE_PROGRESS_EVENT_TITLE,
+      earlierLiveTitles,
+      MINIMAL_CHAT_ALPHA_LIVE_EXECUTION_REF,
+    );
+    const keyedRow = workspace.locator(
+      `[data-chat-event-id="${initialEventId}"][data-chat-event-sequence="${initialEventSequence}"]`,
+    );
+    await expect(keyedRow).toHaveCount(1);
+    const keyedFooter = keyedRow.locator(
+      `[data-worker-execution-summary="${MINIMAL_CHAT_ALPHA_LIVE_EXECUTION_REF}"]`,
+    );
+    await expect(keyedFooter).toHaveCount(1);
+    await expect(keyedFooter).not.toHaveAttribute('role', 'status');
+    await expect(keyedFooter).not.toHaveAttribute('aria-live');
+
+    await expectWorkerFooterMetadata(keyedFooter, {
+      brand: 'gemini',
+      model: /^Argon$/i,
+      effort: /^High$/i,
+      status: 'working',
+      label: 'Started',
+      duration: { kind: 'elapsed', text: /^Elapsed\s+14s$/i },
+    });
+    await expect(header.getByText(/^Working$/i).first()).toBeVisible();
+    await expectLiveAgentWorking(workspace, 'Worker');
+    await expect(
+      alphaSidebarRow.locator('[data-sidebar-status="working"]'),
+    ).toHaveText('Working');
+
+    const wideBaseline = await measureFooterPresentation(keyedFooter);
+    expect(wideBaseline.eventKey).toBe(initialEventKey);
+    assertStablePresentation(wideBaseline, wideBaseline, 'wide', {
+      statusKey: 'working',
+      durationKind: 'elapsed',
+    });
+
+    // 1. A newer overall refresh carrying an older regressed Worker sample
+    // (seq 11, already expired at +1_500ms) must NOT replace still-valid seq 12
+    // (expires at +4_000ms). Row, header, and sidebar stay live without flicker.
+    const regressedSnapshot = updateChatWorkPresenceFixture(
+      withFreshAlphaNativeAt(baseSnapshot!, FIXTURE_BASE_NOW_MS + 1_500),
+      CHAT_ALPHA_IDENTITY,
+      [
+        createBacklogWorkerPresence({
+          itemId: MINIMAL_CHAT_ALPHA_DOING_ITEM_ID,
+          executionRef: MINIMAL_CHAT_ALPHA_LIVE_EXECUTION_REF,
+          sequence: 11,
+          sampledAtMs: FIXTURE_BASE_NOW_MS - 3_500,
+          sampleAgeMs: 5_000,
+          maxSampleAgeMs: 5_000,
+          expiresAtMs: FIXTURE_BASE_NOW_MS + 1_500,
+        }),
+      ],
+    );
+    await pushAndRefresh(regressedSnapshot);
+    await expectWorkerFooterMetadata(keyedFooter, {
+      brand: 'gemini',
+      model: /^Argon$/i,
+      effort: /^High$/i,
+      status: 'working',
+      label: 'Started',
+      duration: { kind: 'elapsed', text: /^Elapsed\s+16s$/i },
+    });
+    await expect(header.getByText(/^Working$/i).first()).toBeVisible();
+    await expectLiveAgentWorking(workspace, 'Worker');
+    await expect(
+      alphaSidebarRow.locator('[data-sidebar-status="working"]'),
+    ).toHaveText('Working');
+
+    // Advance within seq 12 (+3_000ms -> 17s), enter Gap #0 (+4_500ms), and verify
+    // delayed stale refresh and same-host unavailable probe never grant live
+    // Working or advance frozen elapsed.
+    await page.clock.setFixedTime(FIXTURE_BASE_NOW_MS + 3_000);
+    await expect
+      .poll(
+        async () =>
+          elapsedSecondsFromWorkerFooter(await keyedFooter.innerText()) ?? -1,
+        { timeout: 5_000 },
+      )
+      .toBeGreaterThanOrEqual(17);
+    await expectWorkerFooterStatus(keyedFooter, 'working', 'Started');
+
+    await page.clock.setFixedTime(FIXTURE_BASE_NOW_MS + 4_500);
+    await expect
+      .poll(async () => readWorkerFooterStatus(keyedFooter), { timeout: 5_000 })
+      .toBe('started');
+    const frozenElapsedGap0 = elapsedSecondsFromWorkerFooter(
+      await keyedFooter.innerText(),
+    );
+    expect(frozenElapsedGap0).not.toBeNull();
+    expect(frozenElapsedGap0!).toBeGreaterThanOrEqual(17);
+    expect(frozenElapsedGap0!).toBeLessThanOrEqual(18);
+    assertStablePresentation(
+      await measureFooterPresentation(keyedFooter),
+      wideBaseline,
+      'wide',
+      { statusKey: 'started', durationKind: 'last_confirmed' },
+    );
+    await expectNoLiveAgentWorking(workspace, 'Worker');
+    await expectNoVisibleWorking(workspace);
+    await expect(
+      alphaSidebarRow.locator('[data-sidebar-status="unknown"]'),
+    ).toHaveText('Status unavailable');
+    await expectNoNeedsYou(page);
+
+    const staleDuringGap0 = updateChatWorkPresenceFixture(
+      withFreshAlphaNativeAt(baseSnapshot!, FIXTURE_BASE_NOW_MS + 6_500),
+      CHAT_ALPHA_IDENTITY,
+      [
+        createBacklogWorkerPresence({
+          itemId: MINIMAL_CHAT_ALPHA_DOING_ITEM_ID,
+          executionRef: MINIMAL_CHAT_ALPHA_LIVE_EXECUTION_REF,
+          sequence: 12,
+          availability: 'live',
+          freshness: 'stale',
+          live: false,
+          sampledAtMs: FIXTURE_BASE_NOW_MS - 1_000,
+          sampleAgeMs: 7_500,
+          maxSampleAgeMs: 5_000,
+          expiresAtMs: FIXTURE_BASE_NOW_MS + 4_000,
+        }),
+      ],
+    );
+    await pushAndRefresh(staleDuringGap0);
+    expect(elapsedSecondsFromWorkerFooter(await keyedFooter.innerText())).toBe(
+      frozenElapsedGap0,
+    );
+    await expectNoVisibleWorking(workspace);
+
+    const sameHostUnavailableGap0 = updateChatWorkPresenceFixture(
+      withFreshAlphaNativeAt(baseSnapshot!, FIXTURE_BASE_NOW_MS + 7_500),
+      CHAT_ALPHA_IDENTITY,
+      [
+        createBacklogWorkerPresence({
+          itemId: MINIMAL_CHAT_ALPHA_DOING_ITEM_ID,
+          executionRef: MINIMAL_CHAT_ALPHA_LIVE_EXECUTION_REF,
+          hostInstanceId: 'host_alpha_01',
+          invocationId: null,
+          claimId: null,
+          sequence: null,
+          availability: 'unavailable',
+          freshness: 'not_applicable',
+          live: false,
+          sampledAtMs: FIXTURE_BASE_NOW_MS + 7_000,
+          sampleAgeMs: null,
+          maxSampleAgeMs: 5_000,
+          expiresAtMs: null,
+        }),
+      ],
+    );
+    await pushAndRefresh(sameHostUnavailableGap0);
+    await expectWorkerFooterStatus(keyedFooter, 'started', 'Started');
+    expect(elapsedSecondsFromWorkerFooter(await keyedFooter.innerText())).toBe(
+      frozenElapsedGap0,
+    );
+
+    // 2. Three successive late renewals (4-second renewals with a 3-second TTL)
+    // on the identical DOM record in wide (1440px) and narrow (390px) viewports.
+    const runThreeLateRenewalCycles = async (
+      layout: 'wide' | 'narrow',
+      startOffsetMs: number,
+      startSeq: number,
+      baseline: FooterPresentation,
+      firstCycleAlreadyLive: boolean,
+    ): Promise<number> => {
+      let lastFrozen = -1;
+      for (let cycle = 0; cycle < 3; cycle += 1) {
+        const cycleStartOffset = startOffsetMs + cycle * 4_000;
+        const cycleStartMs = FIXTURE_BASE_NOW_MS + cycleStartOffset;
+        const expiresAtMs = cycleStartMs + 3_000;
+        const seq = startSeq + cycle;
+
+        if (!(cycle === 0 && firstCycleAlreadyLive)) {
+          await pushAndRefresh(
+            updateChatWorkPresenceFixture(
+              withFreshAlphaNativeAt(baseSnapshot!, cycleStartMs),
+              CHAT_ALPHA_IDENTITY,
+              [
+                createBacklogWorkerPresence({
+                  itemId: MINIMAL_CHAT_ALPHA_DOING_ITEM_ID,
+                  executionRef: MINIMAL_CHAT_ALPHA_LIVE_EXECUTION_REF,
+                  sequence: seq,
+                  sampledAtMs: cycleStartMs,
+                  sampleAgeMs: 0,
+                  maxSampleAgeMs: 3_000,
+                  expiresAtMs,
+                }),
+              ],
+            ),
+          );
+        }
+
+        await expect(keyedFooter).toHaveCount(1);
+        const liveStartMetrics = await measureFooterPresentation(keyedFooter);
+        assertStablePresentation(liveStartMetrics, baseline, layout, {
+          statusKey: 'working',
+          durationKind: 'elapsed',
+        });
+        const liveStartElapsed = elapsedSecondsFromWorkerFooter(
+          liveStartMetrics.durationText,
+        );
+        expect(liveStartElapsed).not.toBeNull();
+        expect(liveStartElapsed!).toBeGreaterThan(lastFrozen);
+        await expect(header.getByText(/^Working$/i).first()).toBeVisible();
+        await expectLiveAgentWorking(workspace, 'Worker');
+        if (layout === 'wide') {
+          await expect(
+            alphaSidebarRow.locator('[data-sidebar-status="working"]'),
+          ).toHaveText('Working');
+        }
+
+        // Advance within the 3s TTL (+2_000ms) and record the exact live elapsed.
+        const liveTickMs = cycleStartMs + 2_000;
+        if (cycle === 0) {
+          await page.clock.setFixedTime(liveTickMs);
+          await expect
+            .poll(
+              async () =>
+                elapsedSecondsFromWorkerFooter(await keyedFooter.innerText()) ?? -1,
+              { timeout: 5_000 },
+            )
+            .toBeGreaterThanOrEqual(liveStartElapsed! + 2);
+        } else {
+          await pushAndRefresh(
+            updateChatWorkPresenceFixture(
+              withFreshAlphaNativeAt(baseSnapshot!, liveTickMs),
+              CHAT_ALPHA_IDENTITY,
+              [
+                createBacklogWorkerPresence({
+                  itemId: MINIMAL_CHAT_ALPHA_DOING_ITEM_ID,
+                  executionRef: MINIMAL_CHAT_ALPHA_LIVE_EXECUTION_REF,
+                  sequence: seq,
+                  sampledAtMs: cycleStartMs,
+                  sampleAgeMs: 2_000,
+                  maxSampleAgeMs: 3_000,
+                  expiresAtMs,
+                }),
+              ],
+            ),
+          );
+        }
+        const liveBeforeGap = elapsedSecondsFromWorkerFooter(
+          await keyedFooter.innerText(),
+        );
+        expect(liveBeforeGap).not.toBeNull();
+        expect(liveBeforeGap!).toBeGreaterThanOrEqual(liveStartElapsed! + 2);
+
+        // Cross the 3s TTL (+3_400ms): cycle 0 exercises pure wall-clock expiry,
+        // cycle 1 exercises an omitted host probe, cycle 2 exercises a stale refresh.
+        const gapMs = cycleStartMs + 3_400;
+        if (cycle === 0) {
+          await page.clock.setFixedTime(gapMs);
+          await expect
+            .poll(async () => readWorkerFooterStatus(keyedFooter), {
+              timeout: 5_000,
+            })
+            .toBe('started');
+        } else if (cycle === 1) {
+          await pushAndRefresh(
+            updateChatWorkPresenceFixture(
+              withFreshAlphaNativeAt(baseSnapshot!, gapMs),
+              CHAT_ALPHA_IDENTITY,
+              [],
+            ),
+          );
+        } else {
+          await pushAndRefresh(
+            updateChatWorkPresenceFixture(
+              withFreshAlphaNativeAt(baseSnapshot!, gapMs),
+              CHAT_ALPHA_IDENTITY,
+              [
+                createBacklogWorkerPresence({
+                  itemId: MINIMAL_CHAT_ALPHA_DOING_ITEM_ID,
+                  executionRef: MINIMAL_CHAT_ALPHA_LIVE_EXECUTION_REF,
+                  sequence: seq,
+                  availability: 'live',
+                  freshness: 'stale',
+                  live: false,
+                  sampledAtMs: cycleStartMs,
+                  sampleAgeMs: 3_400,
+                  maxSampleAgeMs: 3_000,
+                  expiresAtMs,
+                }),
+              ],
+            ),
+          );
+        }
+
+        await expect(keyedFooter).toHaveCount(1);
+        const gapMetrics = await measureFooterPresentation(keyedFooter);
+        assertStablePresentation(gapMetrics, baseline, layout, {
+          statusKey: 'started',
+          durationKind: 'last_confirmed',
+        });
+        const frozenElapsed = elapsedSecondsFromWorkerFooter(gapMetrics.durationText);
+        expect(frozenElapsed).toBe(liveBeforeGap);
+        await expectNoLiveAgentWorking(workspace, 'Worker');
+        await expectNoVisibleWorking(workspace);
+        await expectNoNeedsYou(page);
+        if (layout === 'wide') {
+          await expect(
+            alphaSidebarRow.locator('[data-sidebar-status="unknown"]'),
+          ).toHaveText('Status unavailable');
+        } else {
+          await expectNoHorizontalOverflow(page, `390px gap cycle ${cycle + 1}`);
+        }
+
+        // Advance later inside the same brief gap (+3_800ms): elapsed remains frozen.
+        await pushAndRefresh(
+          updateChatWorkPresenceFixture(
+            withFreshAlphaNativeAt(baseSnapshot!, cycleStartMs + 3_800),
+            CHAT_ALPHA_IDENTITY,
+            [
+              createBacklogWorkerPresence({
+                itemId: MINIMAL_CHAT_ALPHA_DOING_ITEM_ID,
+                executionRef: MINIMAL_CHAT_ALPHA_LIVE_EXECUTION_REF,
+                sequence: seq,
+                availability: 'live',
+                freshness: 'stale',
+                live: false,
+                sampledAtMs: cycleStartMs,
+                sampleAgeMs: 3_800,
+                maxSampleAgeMs: 3_000,
+                expiresAtMs,
+              }),
+            ],
+          ),
+        );
+        expect(elapsedSecondsFromWorkerFooter(await keyedFooter.innerText())).toBe(
+          frozenElapsed,
+        );
+        lastFrozen = frozenElapsed!;
+      }
+
+      // Live recovery at the 4th renewal (+12_000ms from startOffsetMs).
+      const recoveryMs = FIXTURE_BASE_NOW_MS + startOffsetMs + 12_000;
+      const recoveryExpiresAtMs = recoveryMs + 3_000;
+      await pushAndRefresh(
+        updateChatWorkPresenceFixture(
+          withFreshAlphaNativeAt(baseSnapshot!, recoveryMs),
+          CHAT_ALPHA_IDENTITY,
+          [
+            createBacklogWorkerPresence({
+              itemId: MINIMAL_CHAT_ALPHA_DOING_ITEM_ID,
+              executionRef: MINIMAL_CHAT_ALPHA_LIVE_EXECUTION_REF,
+              sequence: startSeq + 3,
+              sampledAtMs: recoveryMs,
+              sampleAgeMs: 0,
+              maxSampleAgeMs: 3_000,
+              expiresAtMs: recoveryExpiresAtMs,
+            }),
+          ],
+        ),
+      );
+      const recoveredMetrics = await measureFooterPresentation(keyedFooter);
+      assertStablePresentation(recoveredMetrics, baseline, layout, {
+        statusKey: 'working',
+        durationKind: 'elapsed',
+      });
+      const recoveredElapsed = elapsedSecondsFromWorkerFooter(
+        recoveredMetrics.durationText,
+      );
+      expect(recoveredElapsed).not.toBeNull();
+      expect(recoveredElapsed!).toBeGreaterThan(lastFrozen);
+      await expect(header.getByText(/^Working$/i).first()).toBeVisible();
+      await expectLiveAgentWorking(workspace, 'Worker');
+      return recoveryExpiresAtMs;
+    };
+
+    await runThreeLateRenewalCycles('wide', 8_000, 13, wideBaseline, false);
+
+    // 3. Narrow 390px: verify three successive late renewals on the exact same
+    // DOM record keep stable caption, elapsed prefix, neutral color, and fixed
+    // timer placement without horizontal overflow.
+    await page.setViewportSize({ width: 390, height: 740 });
+    await keyedFooter.scrollIntoViewIfNeeded();
+    await expect(keyedFooter).toBeVisible();
+    await expectNoHorizontalOverflow(page, '390px live Started Worker footer');
+    const narrowBaseline = await measureFooterPresentation(keyedFooter);
+    expect(narrowBaseline.eventKey).toBe(initialEventKey);
+    assertStablePresentation(narrowBaseline, narrowBaseline, 'narrow', {
+      statusKey: 'working',
+      durationKind: 'elapsed',
+    });
+    const lastExpiresAtMs = await runThreeLateRenewalCycles(
+      'narrow',
+      20_000,
+      16,
+      narrowBaseline,
+      true,
+    );
+
+    // 4. Real expiration past expires_at_ms + brief gap: after worker_presence
+    // becomes empty, genuine sustained loss becomes explicit Status unavailable
+    // with duration removed instead of reverting to Dispatched.
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await pushAndRefresh(
+      updateChatWorkPresenceFixture(
+        withFreshAlphaNativeAt(baseSnapshot!, lastExpiresAtMs + 100),
+        CHAT_ALPHA_IDENTITY,
+        [],
+      ),
+    );
+    await expectWorkerFooterStatus(keyedFooter, 'started', 'Started');
+    await page.clock.setFixedTime(
+      lastExpiresAtMs + CHAT_WORK_EXECUTION_BRIEF_GAP_MS + 500,
+    );
+    await expect
+      .poll(async () => readWorkerFooterStatus(keyedFooter), { timeout: 5_000 })
+      .toBe('unavailable');
+    await expectWorkerFooterMetadata(keyedFooter, {
+      brand: 'gemini',
+      model: /^Argon$/i,
+      effort: /^High$/i,
+      status: 'unavailable',
+      label: 'Status unavailable',
+      duration: null,
+    });
+    await pushAndRefresh(
+      updateChatWorkPresenceFixture(
+        withFreshAlphaNativeAt(
+          baseSnapshot!,
+          lastExpiresAtMs + CHAT_WORK_EXECUTION_BRIEF_GAP_MS + 1_500,
+        ),
+        CHAT_ALPHA_IDENTITY,
+        [],
+      ),
+    );
+    await expectWorkerFooterMetadata(keyedFooter, {
+      brand: 'gemini',
+      model: /^Argon$/i,
+      effort: /^High$/i,
+      status: 'unavailable',
+      label: 'Status unavailable',
+      duration: null,
+    });
+    await expectNoVisibleWorking(workspace);
+    await expectNoLiveAgentWorking(workspace, 'Worker');
+    await expectNoNeedsYou(page);
+  });
+
+  test('never carries continuity across restarted hosts or foreign runs, and lets terminal failure and success immediately win', async ({
+    page,
+  }) => {
+    const controller = await installWorkerMetadata(page, {
+      width: 1280,
+      height: 840,
+    });
+    const workspace = workspaceSection(page);
+    const baseSnapshot = await controller.getWorkspaceSnapshot();
+    expect(baseSnapshot).not.toBeNull();
+    const preparingExecution = getChatWorkWorkerExecutionsFixture(
+      baseSnapshot!,
+      CHAT_ALPHA_IDENTITY,
+    ).find(
+      (execution) =>
+        execution.execution_ref === MINIMAL_CHAT_ALPHA_PREPARING_EXECUTION_REF,
+    );
+    expect(preparingExecution).toBeDefined();
+    const preparingItemId = preparingExecution!.item_id;
+
+    let nativeSeq = 16;
+    const withFreshAlphaNativeAt = (
+      snapshot: WorkspaceSnapshot,
+      generatedAtMs: number,
+    ): WorkspaceSnapshot => {
+      nativeSeq += 1;
+      const advanced = advanceWorkspaceGeneratedAtFixture(snapshot, generatedAtMs);
+      return parseWorkspaceSnapshot({
+        ...advanced,
+        native_samples: advanced.native_samples.map((sample) =>
+          workspaceChatIdentitiesEqual(sample.chat_identity, CHAT_ALPHA_IDENTITY)
+            ? {
+                ...sample,
+                sequence: nativeSeq,
+                observed_at_ms: generatedAtMs - 500,
+                last_success_at_ms: generatedAtMs - 500,
+                activity: 'idle',
+              }
+            : sample,
+        ),
+      });
+    };
+
+    const pushAndRefresh = async (nextSnapshot: WorkspaceSnapshot): Promise<void> => {
+      await controller.setWorkspaceSnapshot(nextSnapshot);
+      const beforeCount = (await controller.getInvocations()).filter(
+        (call) => call.cmd === 'desktop_workspace_snapshot',
+      ).length;
+      await triggerWorkspaceRefresh(page);
+      await expect
+        .poll(async () =>
+          (await controller.getInvocations()).filter(
+            (call) => call.cmd === 'desktop_workspace_snapshot',
+          ).length,
+        )
+        .toBeGreaterThan(beforeCount);
+      await page.evaluate(
+        () =>
+          new Promise<void>((resolve) => {
+            requestAnimationFrame(() => {
+              requestAnimationFrame(() => resolve());
+            });
+          }),
+      );
+    };
+
+    const liveFooter = await expectWorkerFooterAtLatestEvent(
+      page,
+      MINIMAL_CHAT_LIVE_PROGRESS_EVENT_TITLE,
+      [
+        `Preparing Worker execution for ${MINIMAL_CHAT_DOING_TITLE}`,
+        `Worker execution attached for ${MINIMAL_CHAT_DOING_TITLE}`,
+      ],
+      MINIMAL_CHAT_ALPHA_LIVE_EXECUTION_REF,
+    );
+    await expectWorkerFooterStatus(liveFooter, 'working', 'Started');
+
+    // Enter brief gap at +4_500ms -> Started with frozen elapsed.
+    await page.clock.setFixedTime(FIXTURE_BASE_NOW_MS + 4_500);
+    await expect
+      .poll(async () => readWorkerFooterStatus(liveFooter), { timeout: 5_000 })
+      .toBe('started');
+    await expectWorkerFooterMetadata(liveFooter, {
+      brand: 'gemini',
+      model: /^Argon$/i,
+      effort: /^High$/i,
+      status: 'started',
+      label: 'Started',
+      duration: { kind: 'last_confirmed', text: /^Elapsed\s+14s$/i },
+    });
+
+    // 1. Restarted host (new host_instance_id / invocation_id) immediately clears
+    // Started instead of carrying prior host state.
+    const restartedHostSnapshot = updateChatWorkPresenceFixture(
+      withFreshAlphaNativeAt(baseSnapshot!, FIXTURE_BASE_NOW_MS + 5_000),
+      CHAT_ALPHA_IDENTITY,
+      [
+        createBacklogWorkerPresence({
+          itemId: MINIMAL_CHAT_ALPHA_DOING_ITEM_ID,
+          executionRef: MINIMAL_CHAT_ALPHA_LIVE_EXECUTION_REF,
+          hostInstanceId: 'host_alpha_restarted_02',
+          invocationId: 'inv_alpha_worker_02',
+          claimId: 'clm_alpha_worker_02',
+          sequence: 1,
+          availability: 'unavailable',
+          freshness: 'not_applicable',
+          live: false,
+          sampledAtMs: FIXTURE_BASE_NOW_MS + 4_800,
+          sampleAgeMs: null,
+          maxSampleAgeMs: 5_000,
+          expiresAtMs: null,
+        }),
+      ],
+    );
+    await pushAndRefresh(restartedHostSnapshot);
+    await expectWorkerFooterMetadata(liveFooter, {
+      brand: 'gemini',
+      model: /^Argon$/i,
+      effort: /^High$/i,
+      status: 'unavailable',
+      label: 'Status unavailable',
+      duration: null,
+    });
+
+    // 2. Re-seed live on host_alpha_restarted_02, enter brief gap, then switch
+    // to a foreign run (different run_id/worker_id) with stale presence: foreign
+    // run never inherits Started or frozen elapsed.
+    const restartedLiveSnapshot = updateChatWorkPresenceFixture(
+      withFreshAlphaNativeAt(baseSnapshot!, FIXTURE_BASE_NOW_MS + 6_000),
+      CHAT_ALPHA_IDENTITY,
+      [
+        createBacklogWorkerPresence({
+          itemId: MINIMAL_CHAT_ALPHA_DOING_ITEM_ID,
+          executionRef: MINIMAL_CHAT_ALPHA_LIVE_EXECUTION_REF,
+          hostInstanceId: 'host_alpha_restarted_02',
+          invocationId: 'inv_alpha_worker_02',
+          claimId: 'clm_alpha_worker_02',
+          sequence: 2,
+          sampledAtMs: FIXTURE_BASE_NOW_MS + 5_500,
+          sampleAgeMs: 500,
+          maxSampleAgeMs: 5_000,
+          expiresAtMs: FIXTURE_BASE_NOW_MS + 10_500,
+        }),
+      ],
+    );
+    await pushAndRefresh(restartedLiveSnapshot);
+    await expectWorkerFooterMetadata(liveFooter, {
+      brand: 'gemini',
+      model: /^Argon$/i,
+      effort: /^High$/i,
+      status: 'working',
+      label: 'Started',
+      duration: { kind: 'elapsed', text: /^Elapsed\s+20s$/i },
+    });
+
+    await page.clock.setFixedTime(FIXTURE_BASE_NOW_MS + 11_000);
+    await expect
+      .poll(async () => readWorkerFooterStatus(liveFooter), { timeout: 5_000 })
+      .toBe('started');
+
+    const foreignRunSnapshot = updateChatWorkPresenceFixture(
+      updateChatWorkWorkerExecutionFixture(
+        withFreshAlphaNativeAt(baseSnapshot!, FIXTURE_BASE_NOW_MS + 11_500),
+        CHAT_ALPHA_IDENTITY,
+        MINIMAL_CHAT_ALPHA_LIVE_EXECUTION_REF,
+        {
+          run_id: 'run_alpha_foreign_02',
+          worker_id: 'wrk_alpha_foreign_02',
+        },
+      ),
+      CHAT_ALPHA_IDENTITY,
+      [
+        createBacklogWorkerPresence({
+          itemId: MINIMAL_CHAT_ALPHA_DOING_ITEM_ID,
+          executionRef: MINIMAL_CHAT_ALPHA_LIVE_EXECUTION_REF,
+          runId: 'run_alpha_foreign_02',
+          workerId: 'wrk_alpha_foreign_02',
+          hostInstanceId: 'host_alpha_restarted_02',
+          invocationId: 'inv_alpha_worker_02',
+          claimId: 'clm_alpha_worker_02',
+          sequence: 2,
+          availability: 'live',
+          freshness: 'stale',
+          live: false,
+          sampledAtMs: FIXTURE_BASE_NOW_MS + 5_500,
+          sampleAgeMs: 6_000,
+          maxSampleAgeMs: 5_000,
+          expiresAtMs: FIXTURE_BASE_NOW_MS + 10_500,
+        }),
+      ],
+    );
+    await pushAndRefresh(foreignRunSnapshot);
+    await expectWorkerFooterMetadata(liveFooter, {
+      brand: 'gemini',
+      model: /^Argon$/i,
+      effort: /^High$/i,
+      status: 'unavailable',
+      label: 'Status unavailable',
+      duration: null,
+    });
+
+    // 3. Terminal FAILURE immediately wins during a brief gap.
+    const foreignLiveSnapshot = updateChatWorkPresenceFixture(
+      updateChatWorkWorkerExecutionFixture(
+        withFreshAlphaNativeAt(baseSnapshot!, FIXTURE_BASE_NOW_MS + 12_500),
+        CHAT_ALPHA_IDENTITY,
+        MINIMAL_CHAT_ALPHA_LIVE_EXECUTION_REF,
+        {
+          run_id: 'run_alpha_foreign_02',
+          worker_id: 'wrk_alpha_foreign_02',
+        },
+      ),
+      CHAT_ALPHA_IDENTITY,
+      [
+        createBacklogWorkerPresence({
+          itemId: MINIMAL_CHAT_ALPHA_DOING_ITEM_ID,
+          executionRef: MINIMAL_CHAT_ALPHA_LIVE_EXECUTION_REF,
+          runId: 'run_alpha_foreign_02',
+          workerId: 'wrk_alpha_foreign_02',
+          hostInstanceId: 'host_alpha_restarted_02',
+          invocationId: 'inv_alpha_worker_02',
+          claimId: 'clm_alpha_worker_02',
+          sequence: 3,
+          sampledAtMs: FIXTURE_BASE_NOW_MS + 12_000,
+          sampleAgeMs: 500,
+          maxSampleAgeMs: 5_000,
+          expiresAtMs: FIXTURE_BASE_NOW_MS + 17_000,
+        }),
+      ],
+    );
+    await pushAndRefresh(foreignLiveSnapshot);
+    await expectWorkerFooterStatus(liveFooter, 'working', 'Started');
+
+    await page.clock.setFixedTime(FIXTURE_BASE_NOW_MS + 17_500);
+    await expect
+      .poll(async () => readWorkerFooterStatus(liveFooter), { timeout: 5_000 })
+      .toBe('started');
+
+    const failedDuringGapBase = updateChatWorkWorkerExecutionFixture(
+      withFreshAlphaNativeAt(foreignLiveSnapshot, FIXTURE_BASE_NOW_MS + 17_800),
+      CHAT_ALPHA_IDENTITY,
+      MINIMAL_CHAT_ALPHA_LIVE_EXECUTION_REF,
+      {
+        worker_status: 'failed',
+        outcome: 'failure',
+        finished_at_ms: FIXTURE_BASE_NOW_MS + 17_800,
+        duration_ms: 31_800,
+      },
+    );
+    const failedWork = getChatWorkFixture(failedDuringGapBase, CHAT_ALPHA_IDENTITY);
+    const failedDuringGapSnapshot = updateChatWorkFixture(
+      failedDuringGapBase,
+      CHAT_ALPHA_IDENTITY,
+      {
+        items: failedWork.items.map((item) =>
+          item.item_id === MINIMAL_CHAT_ALPHA_DOING_ITEM_ID
+            ? {
+                ...item,
+                status: 'blocked',
+                blocked_reason: 'Worker failed during brief sampling gap.',
+              }
+            : item,
+        ),
+      },
+    );
+    await pushAndRefresh(failedDuringGapSnapshot);
+    await expectWorkerFooterMetadata(liveFooter, {
+      brand: 'gemini',
+      model: /^Argon$/i,
+      effort: /^High$/i,
+      status: 'failed',
+      label: 'Failed',
+      duration: { kind: 'final', text: /^32s$/i },
+    });
+    await expectNoNeedsYou(page);
+
+    // 4. Terminal SUCCESS (Awaiting check and guarded Completed) immediately
+    // wins during a brief gap on an independent Worker attempt.
+    const preparingLiveSnapshot = updateChatWorkPresenceFixture(
+      updateChatWorkWorkerExecutionFixture(
+        withFreshAlphaNativeAt(
+          failedDuringGapSnapshot,
+          FIXTURE_BASE_NOW_MS + 18_500,
+        ),
+        CHAT_ALPHA_IDENTITY,
+        MINIMAL_CHAT_ALPHA_PREPARING_EXECUTION_REF,
+        {
+          worker_status: 'running',
+          outcome: null,
+          acceptance: null,
+          started_at_ms: FIXTURE_BASE_NOW_MS + 10_000,
+        },
+      ),
+      CHAT_ALPHA_IDENTITY,
+      [
+        createBacklogWorkerPresence({
+          itemId: preparingItemId,
+          executionRef: MINIMAL_CHAT_ALPHA_PREPARING_EXECUTION_REF,
+          approvalId: preparingExecution!.approval_id,
+          taskId: preparingExecution!.task_id,
+          runId: preparingExecution!.run_id,
+          workerId: preparingExecution!.worker_id,
+          claimId: 'clm_alpha_preparing_01',
+          hostInstanceId: 'host_alpha_preparing_01',
+          invocationId: 'inv_alpha_preparing_01',
+          sequence: 5,
+          sampledAtMs: FIXTURE_BASE_NOW_MS + 18_000,
+          sampleAgeMs: 500,
+          maxSampleAgeMs: 5_000,
+          expiresAtMs: FIXTURE_BASE_NOW_MS + 23_000,
+        }),
+      ],
+    );
+    await pushAndRefresh(preparingLiveSnapshot);
+    const preparingFooter = await expectWorkerFooterAtLatestEvent(
+      page,
+      MINIMAL_CHAT_DISPATCH_EVENT_TITLE,
+      [`Preparing Worker execution for ${MINIMAL_CHAT_PREPARING_TITLE}`],
+      MINIMAL_CHAT_ALPHA_PREPARING_EXECUTION_REF,
+    );
+    await expectWorkerFooterMetadata(preparingFooter, {
+      brand: 'gemini',
+      model: /^Argon$/i,
+      effort: /^High$/i,
+      status: 'working',
+      label: 'Started',
+      duration: { kind: 'elapsed', text: /^Elapsed\s+8\.5s$/i },
+    });
+
+    await page.clock.setFixedTime(FIXTURE_BASE_NOW_MS + 23_500);
+    await expect
+      .poll(async () => readWorkerFooterStatus(preparingFooter), {
+        timeout: 5_000,
+      })
+      .toBe('started');
+    await expectWorkerFooterMetadata(preparingFooter, {
+      brand: 'gemini',
+      model: /^Argon$/i,
+      effort: /^High$/i,
+      status: 'started',
+      label: 'Started',
+      duration: { kind: 'last_confirmed', text: /^Elapsed\s+8\.5s$/i },
+    });
+
+    const awaitingCheckSnapshot = updateChatWorkWorkerExecutionFixture(
+      withFreshAlphaNativeAt(
+        preparingLiveSnapshot,
+        FIXTURE_BASE_NOW_MS + 24_200,
+      ),
+      CHAT_ALPHA_IDENTITY,
+      MINIMAL_CHAT_ALPHA_PREPARING_EXECUTION_REF,
+      {
+        worker_status: 'completed',
+        outcome: 'success',
+        acceptance: 'pending_review',
+        finished_at_ms: FIXTURE_BASE_NOW_MS + 24_000,
+        duration_ms: 14_000,
+      },
+    );
+    await pushAndRefresh(awaitingCheckSnapshot);
+    await expectWorkerFooterMetadata(preparingFooter, {
+      brand: 'gemini',
+      model: /^Argon$/i,
+      effort: /^High$/i,
+      status: 'checking',
+      label: 'Awaiting check',
+      duration: { kind: 'final', text: /^14s$/i },
+    });
+
+    const completedBase = updateChatWorkWorkerExecutionFixture(
+      withFreshAlphaNativeAt(
+        awaitingCheckSnapshot,
+        FIXTURE_BASE_NOW_MS + 24_600,
+      ),
+      CHAT_ALPHA_IDENTITY,
+      MINIMAL_CHAT_ALPHA_PREPARING_EXECUTION_REF,
+      {
+        acceptance: 'accepted',
+      },
+    );
+    const completedWork = getChatWorkFixture(completedBase, CHAT_ALPHA_IDENTITY);
+    const completedSnapshot = updateChatWorkFixture(
+      completedBase,
+      CHAT_ALPHA_IDENTITY,
+      {
+        items: completedWork.items.map((item) =>
+          item.item_id === preparingItemId
+            ? {
+                ...item,
+                status: 'done',
+                completed_at_ms: FIXTURE_BASE_NOW_MS + 24_500,
+              }
+            : item,
+        ),
+      },
+    );
+    await pushAndRefresh(completedSnapshot);
+    await expectWorkerFooterMetadata(preparingFooter, {
+      brand: 'gemini',
+      model: /^Argon$/i,
+      effort: /^High$/i,
+      status: 'completed',
+      label: 'Completed',
+      duration: { kind: 'final', text: /^14s$/i },
+    });
+    await expectNoVisibleWorking(workspace);
+    await expectNoNeedsYou(page);
   });
 
   test('reports the compiled Desktop build identity from the actual Vite build input in Settings', async ({

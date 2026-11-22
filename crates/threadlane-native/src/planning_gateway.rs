@@ -26,7 +26,7 @@
 //!   fixed global store/binding/thread flags and `coworker-planning start-command --command-id <ID>`,
 //!   awaiting only the short bounded CLI launch receipt.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -34,7 +34,6 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use threadlane_authority::validation::validate_canonical_thread_uuid;
 use threadlane_workflow::{
     ensure_mcp_response_budget, measure_mcp_response_bytes, Difficulty, PlanStatus, ScopedWorkflow,
@@ -47,19 +46,22 @@ use crate::coworker_grants::{
     list_planning_grant_summaries, PlanningGrantSummary, TrustedGrantScope,
 };
 use crate::coworker_workflow::{
-    deterministic_prefixed_id, validate_bounded_text, validate_non_native_worker_choice,
+    collect_job_accepted_predecessor_trees, collect_job_interface_ownership_digests_from_ledger,
+    deterministic_prefixed_id, validate_bounded_text,
+    validate_eligible_architect_advice_for_target, validate_non_native_worker_choice,
     validate_unique_id_list, validate_unique_text_list, verify_grant_registry_dependencies,
-    ArchitectAdviceRecord, ArchitectConsultationRequestOutcome, ArchitectContextDependencies,
-    ArchitectDecisionStatus, CanonicalProjectBaseRef, CoworkerBindingLedger, CoworkerJobPhase,
-    CoworkerJobRecord, CoworkerOwnershipSummary, CoworkerPlanningService, CoworkerTaskStage,
-    CoworkerWorkflowStore, CreateCoworkerJobRequest, HumanClarificationRequestOutcome,
-    OrchestrateWorkBriefPlanRequest, PersistedPlanningCallArtifact, PlanningAdviceGrant,
-    PlanningArtifactOutcomeKind, PlanningCallBudget, PlanningGrantStatus, PlanningGrantUsage,
-    PlanningReadOnlyCapabilities, PlanningResultRef, PriorArchitectAdviceContext,
-    RunArchitectAdviceRequest, StructuredArchitectAdviceOutput, StructuredOrchestratorOutput,
-    WorkBrief, WorkBriefKind, MAX_ARCHITECT_ADVICE_RECORDS_PER_BINDING, MAX_COWORKER_ID_LEN,
-    MAX_ORCHESTRATOR_ARCHITECT_ROUNDS, MAX_PLANNING_ARTIFACT_BYTES, MAX_TASKS_PER_JOB,
-    MAX_WORK_BRIEF_ITEMS,
+    ArchitectAdviceEligibilityRequest, ArchitectAdviceRecord, ArchitectConsultationRequestOutcome,
+    ArchitectContextDependencies, ArchitectDecisionStatus, CanonicalProjectBaseRef,
+    CoworkerBindingLedger, CoworkerJobPhase, CoworkerJobRecord, CoworkerOwnershipSummary,
+    CoworkerPlanningService, CoworkerWorkflowStore, CreateCoworkerJobRequest,
+    EligibleArchitectAdviceTarget, HistoricalReservationOwnershipCache,
+    HumanClarificationRequestOutcome, OrchestrateWorkBriefPlanRequest,
+    PersistedPlanningCallArtifact, PlanningAdviceGrant, PlanningArtifactOutcomeKind,
+    PlanningCallBudget, PlanningGrantStatus, PlanningGrantUsage, PlanningReadOnlyCapabilities,
+    PlanningResultRef, PriorArchitectAdviceContext, RunArchitectAdviceRequest,
+    StructuredArchitectAdviceOutput, StructuredOrchestratorOutput, WorkBrief, WorkBriefKind,
+    MAX_ARCHITECT_ADVICE_RECORDS_PER_BINDING, MAX_COWORKER_ID_LEN,
+    MAX_ORCHESTRATOR_ARCHITECT_ROUNDS, MAX_PLANNING_ARTIFACT_BYTES, MAX_WORK_BRIEF_ITEMS,
 };
 use crate::error::{NativeError, NativeErrorCode};
 use crate::fs_safety::{
@@ -178,17 +180,30 @@ pub struct PrepareWorkParams {
     pub grant_id: String,
     /// Idempotent caller request key (`1..=128` ASCII identifier characters).
     pub request_key: String,
-    /// Bounded summary of the work brief.
+    /// Bounded summary of the work brief. After reading the natural human request and any existing
+    /// plan, write or preserve this field in the active human conversation language (following any
+    /// explicit language preference), without unnecessarily translating technical data (file paths,
+    /// protocol keys, enum values, task IDs, symbols, code/comments) or original human expressions.
     pub summary: String,
-    /// Explicitly human-confirmed requirements (`>= 1` required; labels data only, not execution authorization).
+    /// Explicitly human-confirmed requirements (`>= 1` required; labels data only, not execution
+    /// authorization). After reading the natural human request and any existing plan, write or
+    /// preserve each item in the active human conversation language (following any explicit
+    /// language preference), without unnecessarily translating technical data (file paths,
+    /// protocol keys, enum values, task IDs, symbols, code/comments) or original human expressions.
     pub confirmed_requirements: Vec<String>,
-    /// Model-proposed scope or feature additions not yet confirmed by the human (kept distinct from `confirmed_requirements`).
+    /// Model-proposed scope or feature additions not yet confirmed by the human (kept distinct from
+    /// `confirmed_requirements`; write in the same active human conversation language or explicit
+    /// language preference while preserving technical data and original human expressions).
     #[serde(default)]
     pub proposed_additions: Vec<String>,
-    /// Explicit assumptions recorded in the work brief.
+    /// Explicit assumptions recorded in the work brief (write in the same active human conversation
+    /// language or explicit language preference while preserving technical data and original human
+    /// expressions).
     #[serde(default)]
     pub assumptions: Vec<String>,
-    /// Unresolved open questions requiring human clarification before execution approval.
+    /// Unresolved open questions requiring human clarification before execution approval (write in
+    /// the same active human conversation language or explicit language preference while preserving
+    /// technical data and original human expressions).
     #[serde(default)]
     pub open_questions: Vec<String>,
     /// Accepted [`ArchitectAdviceRecord::advice_id`]s incorporate into the brief.
@@ -2324,13 +2339,31 @@ impl CoworkerPlanningGateway {
         };
         work_brief.validate()?;
 
+        let eligibility_target = if let Some(ref existing_job) = existing_for_key {
+            if existing_job.work_brief != work_brief {
+                return Err(NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "job request_key was already used with a different WorkBrief",
+                ));
+            }
+            EligibleArchitectAdviceTarget::RecordedJob {
+                job: existing_job,
+                in_call_consulted_advice_ids: &[],
+            }
+        } else {
+            EligibleArchitectAdviceTarget::PrepareWorkNew {
+                work_brief: &work_brief,
+                amended_interfaces: &resolved_amendment.amended_interfaces,
+            }
+        };
         validate_accepted_architect_decisions(
             &wf_ledger,
             grant,
             &self.binding_id,
             &self.thread_uuid,
-            &work_brief,
-            existing_for_key.is_some(),
+            workflow_store.plans_dir(),
+            &self.registry_dir,
+            eligibility_target,
         )?;
 
         let create_req = CreateCoworkerJobRequest {
@@ -2669,18 +2702,31 @@ impl CoworkerPlanningGateway {
             self.lookup_existing_planning_command_readonly(&workflow_store, &params.request_key)?;
         let policy_new_consult_check =
             self.ensure_policy_explicitly_authorizes_new_consult(grant, role, params.difficulty);
+        let artifacts_dir = planning_artifacts_dir(workflow_store.plans_dir());
 
         match existing_cmd {
             None => {
                 policy_new_consult_check?;
                 ensure_grant_has_remaining_budget(grant)?;
-                let (enqueue_req, _) = self
-                    .construct_consult_enqueue_request(&wf_ledger, grant, params, role, now_ms)?;
+                let (enqueue_req, _) = self.construct_consult_enqueue_request(
+                    &wf_ledger,
+                    grant,
+                    &artifacts_dir,
+                    params,
+                    role,
+                    now_ms,
+                )?;
                 Ok(enqueue_req)
             }
             Some((command_store, existing)) => {
-                let (enqueue_req, context_digest) = self
-                    .construct_consult_enqueue_request(&wf_ledger, grant, params, role, now_ms)?;
+                let (enqueue_req, context_digest) = self.construct_consult_enqueue_request(
+                    &wf_ledger,
+                    grant,
+                    &artifacts_dir,
+                    params,
+                    role,
+                    now_ms,
+                )?;
                 validate_existing_consult_replay(
                     &command_store,
                     &existing,
@@ -2698,6 +2744,7 @@ impl CoworkerPlanningGateway {
         &self,
         wf_ledger: &CoworkerBindingLedger,
         grant: &PlanningAdviceGrant,
+        artifacts_dir: &Path,
         params: &ConsultArchitectParams,
         role: WorkflowRole,
         now_ms: u64,
@@ -2745,7 +2792,11 @@ impl CoworkerPlanningGateway {
                     .as_ref()
                     .map(|pr| pr.plan_digest.clone())
             });
-        let interface_ownership_digests = self.collect_job_interface_ownership_digests(job, grant);
+        let interface_ownership_digests = collect_job_interface_ownership_digests_from_ledger(
+            job,
+            wf_ledger,
+            Some(artifacts_dir),
+        )?;
         let accepted_predecessor_trees = collect_job_accepted_predecessor_trees(job);
 
         let context_dependencies = ArchitectContextDependencies {
@@ -2985,12 +3036,7 @@ impl CoworkerPlanningGateway {
             && !job.work_brief.accepted_architect_decisions.is_empty()
         {
             for decision_id in &job.work_brief.accepted_architect_decisions {
-                if wf_ledger
-                    .architect_advice
-                    .iter()
-                    .any(|a| &a.advice_id == decision_id)
-                    && !architect_advice_ids.contains(decision_id)
-                {
+                if !architect_advice_ids.contains(decision_id) {
                     architect_advice_ids.push(decision_id.clone());
                 }
             }
@@ -3207,76 +3253,6 @@ impl CoworkerPlanningGateway {
             native_notice,
             native_notice_error,
         })
-    }
-
-    fn collect_job_interface_ownership_digests(
-        &self,
-        job: &CoworkerJobRecord,
-        grant: &PlanningAdviceGrant,
-    ) -> BTreeMap<String, String> {
-        let mut digests = BTreeMap::new();
-        for task in &job.tasks {
-            for iface in &task.owned_interfaces {
-                if digests.len() >= MAX_WORK_BRIEF_ITEMS {
-                    break;
-                }
-                if validate_bounded_identifier(iface, "interface_id", MAX_COWORKER_ID_LEN).is_ok() {
-                    let seed = (
-                        "threadlane-native:job-task-interface-ownership:v1",
-                        &task.task_id,
-                        &task.task_digest,
-                        &task.write_paths,
-                        &task.owned_interfaces,
-                        &task.consumed_interfaces,
-                        iface,
-                    );
-                    if let Ok(bytes) = serde_json::to_vec(&seed) {
-                        digests.insert(iface.clone(), sha256_hex_bytes(&bytes));
-                    }
-                }
-            }
-        }
-        if digests.is_empty() {
-            if let Some(ref pr) = job.planning_result {
-                if let Ok(artifact) =
-                    self.read_verified_artifact_readonly(&pr.report_artifact_id, &grant.grant_id)
-                {
-                    if let PlanningArtifactOutcomeKind::OrchestratorOutput {
-                        structured_output: StructuredOrchestratorOutput::Plan { tasks, .. },
-                        ..
-                    } = artifact.outcome
-                    {
-                        for pt in &tasks {
-                            for iface in &pt.owned_interfaces {
-                                if digests.len() >= MAX_WORK_BRIEF_ITEMS {
-                                    break;
-                                }
-                                if validate_bounded_identifier(
-                                    iface,
-                                    "interface_id",
-                                    MAX_COWORKER_ID_LEN,
-                                )
-                                .is_ok()
-                                {
-                                    let seed = (
-                                        "threadlane-native:planned-task-interface-ownership:v1",
-                                        &pt.task_id,
-                                        &pt.allowed_write_paths,
-                                        &pt.owned_interfaces,
-                                        &pt.consumed_interfaces,
-                                        iface,
-                                    );
-                                    if let Ok(bytes) = serde_json::to_vec(&seed) {
-                                        digests.insert(iface.clone(), sha256_hex_bytes(&bytes));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        digests
     }
 
     fn read_verified_artifact_readonly(
@@ -4134,138 +4110,43 @@ fn validate_accepted_architect_decisions(
     grant: &PlanningAdviceGrant,
     binding_id: &str,
     thread_uuid: &str,
-    work_brief: &WorkBrief,
-    is_existing_request_retry: bool,
+    plans_dir: &Path,
+    registry_dir: &Path,
+    target: EligibleArchitectAdviceTarget<'_>,
 ) -> Result<(), NativeError> {
-    if work_brief.accepted_architect_decisions.is_empty() {
+    let accepted_decisions = match target {
+        EligibleArchitectAdviceTarget::PrepareWorkNew { work_brief, .. } => {
+            &work_brief.accepted_architect_decisions
+        }
+        EligibleArchitectAdviceTarget::RecordedJob { job, .. } => {
+            &job.work_brief.accepted_architect_decisions
+        }
+    };
+    if accepted_decisions.is_empty() {
         return Ok(());
     }
     validate_unique_id_list(
-        &work_brief.accepted_architect_decisions,
+        accepted_decisions,
         "accepted_architect_decisions",
         MAX_WORK_BRIEF_ITEMS,
     )?;
 
-    let current_brief_digest = work_brief.digest()?;
-    let mut brief_without_decisions = work_brief.clone();
-    brief_without_decisions.accepted_architect_decisions.clear();
-    let brief_without_decisions_digest = brief_without_decisions.digest()?;
-
-    let target_job = match work_brief.kind {
-        WorkBriefKind::NewJob => None,
-        WorkBriefKind::Amendment {
-            ref target_job_id,
-            target_job_revision,
-            ..
-        } => {
-            let found = wf_ledger
-                .jobs
-                .iter()
-                .find(|j| &j.job_id == target_job_id)
-                .ok_or_else(|| {
-                    NativeError::new(
-                        NativeErrorCode::ValidationFailed,
-                        "amendment target_job_id was not found in this binding ledger",
-                    )
-                })?;
-            if !is_existing_request_retry && found.job_revision != target_job_revision {
-                return Err(NativeError::new(
-                    NativeErrorCode::ValidationFailed,
-                    "amendment target_job_revision does not match current target job_revision",
-                ));
-            }
-            Some(found)
-        }
-    };
-
-    for id in &work_brief.accepted_architect_decisions {
-        let record = wf_ledger
-            .architect_advice
-            .iter()
-            .find(|a| &a.advice_id == id)
-            .ok_or_else(|| {
-                NativeError::new(
-                    NativeErrorCode::ValidationFailed,
-                    format!(
-                        "accepted_architect_decisions entry `{id}` was not found in binding `{binding_id}`"
-                    ),
-                )
-            })?;
-        record.validate()?;
-        if record.binding_id != binding_id
-            || record.thread_uuid != thread_uuid
-            || record.status == ArchitectDecisionStatus::Rejected
-            || record.context_dependencies.project_base.repository_path
-                != grant.project_base.repository_path
-        {
-            return Err(NativeError::new(
-                NativeErrorCode::ValidationFailed,
-                format!(
-                    "accepted_architect_decisions entry `{id}` is rejected or outside the current binding/repository scope"
-                ),
-            ));
-        }
-        if record.context_dependencies.project_base != work_brief.project_base {
-            return Err(NativeError::new(
-                NativeErrorCode::ValidationFailed,
-                format!(
-                    "accepted_architect_decisions entry `{id}` project_base does not match the current WorkBrief project_base"
-                ),
-            ));
-        }
-        if record.context_dependencies.policy_digest != grant.policy_digest {
-            return Err(NativeError::new(
-                NativeErrorCode::ValidationFailed,
-                format!(
-                    "accepted_architect_decisions entry `{id}` policy_digest does not match the standing grant policy_digest"
-                ),
-            ));
-        }
-        let dep_paths: Vec<String> = record
-            .context_dependencies
-            .dependency_file_blobs
-            .keys()
-            .cloned()
-            .collect();
-        let current_blobs = CoworkerPlanningService::compute_dependency_file_blobs(
-            &work_brief.project_base,
-            &dep_paths,
+    let artifacts_dir = planning_artifacts_dir(plans_dir);
+    let mut ownership_cache =
+        HistoricalReservationOwnershipCache::new(plans_dir, registry_dir, None);
+    for id in accepted_decisions {
+        let _ = validate_eligible_architect_advice_for_target(
+            &ArchitectAdviceEligibilityRequest {
+                binding_id,
+                thread_uuid,
+                ledger: wf_ledger,
+                grant,
+                artifacts_dir: Some(&artifacts_dir),
+                target,
+                advice_id: id,
+            },
+            &mut ownership_cache,
         )?;
-        if current_blobs != record.context_dependencies.dependency_file_blobs {
-            return Err(NativeError::new(
-                NativeErrorCode::ValidationFailed,
-                format!(
-                    "accepted_architect_decisions entry `{id}` dependency_file_blobs no longer match current WorkBrief project_base"
-                ),
-            ));
-        }
-
-        let brief_context_matches = match target_job {
-            Some(target) => {
-                record.context_dependencies.work_brief_digest == target.work_brief_digest
-                    || target
-                        .work_brief
-                        .accepted_architect_decisions
-                        .iter()
-                        .any(|accepted| accepted == id)
-                    || record.context_dependencies.work_brief_digest == current_brief_digest
-                    || record.context_dependencies.work_brief_digest
-                        == brief_without_decisions_digest
-            }
-            None => {
-                record.context_dependencies.work_brief_digest == current_brief_digest
-                    || record.context_dependencies.work_brief_digest
-                        == brief_without_decisions_digest
-            }
-        };
-        if !brief_context_matches {
-            return Err(NativeError::new(
-                NativeErrorCode::ValidationFailed,
-                format!(
-                    "accepted_architect_decisions entry `{id}` work_brief_digest does not match the current or amended WorkBrief context"
-                ),
-            ));
-        }
     }
     Ok(())
 }
@@ -4324,39 +4205,6 @@ fn resolve_prior_advice_records(
         });
     }
     Ok(resolved)
-}
-
-fn collect_job_accepted_predecessor_trees(job: &CoworkerJobRecord) -> BTreeMap<String, String> {
-    let mut trees = BTreeMap::new();
-    for task in &job.tasks {
-        for receipt in &task.accepted_predecessor_receipts {
-            if trees.len() < MAX_TASKS_PER_JOB {
-                trees.insert(receipt.task_id.clone(), receipt.tree_sha.clone());
-            }
-        }
-        if matches!(
-            task.stage,
-            CoworkerTaskStage::Accepted | CoworkerTaskStage::Integrated
-        ) {
-            if let Some(ref cand_id) = task.accepted_candidate_id {
-                if let Some(cand) = task.candidates.iter().find(|c| &c.candidate_id == cand_id) {
-                    if trees.len() < MAX_TASKS_PER_JOB {
-                        trees.insert(task.task_id.clone(), cand.tree_sha.clone());
-                    }
-                }
-            }
-        }
-    }
-    for cmb in &job.combined_candidates {
-        for receipt in &cmb.accepted_predecessor_receipts {
-            if trees.len() < MAX_TASKS_PER_JOB {
-                trees
-                    .entry(receipt.task_id.clone())
-                    .or_insert_with(|| receipt.tree_sha.clone());
-            }
-        }
-    }
-    trees
 }
 
 fn compute_default_max_architect_rounds(
@@ -4454,14 +4302,4 @@ fn can_resolve_headless_architect_for_grant(
     } else {
         tool_def.executable_path.is_some()
     }
-}
-
-fn sha256_hex_bytes(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    let mut out = String::with_capacity(64);
-    for b in digest {
-        use std::fmt::Write as _;
-        let _ = write!(&mut out, "{b:02x}");
-    }
-    out
 }

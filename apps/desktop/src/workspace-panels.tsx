@@ -55,6 +55,7 @@ import {
   buildChatActivityEventViews,
   buildChatWorkBacklogGroups,
   computeAnchorScrollTop,
+  createChatWorkExecutionContinuityStore,
   createMessageScrollStore,
   doesJobBelongToChat,
   doesMessageBelongToChat,
@@ -71,6 +72,7 @@ import {
   orderWorkspaceMessageItems,
   readWorkspaceChatWork,
   resolveChatWorkExecutionFooterState,
+  resolveChatWorkExecutionFootersWithContinuity,
   resolveMessageScrollChatKey,
   resolveMessageViewportResize,
   resolveVerifiedChatJobIds,
@@ -81,6 +83,7 @@ import {
   syncMessageScrollItems,
 } from './message-scroll.ts';
 import type {
+  ChatWorkExecutionContinuityStore,
   ChatWorkLiveness,
   MessageScrollMode,
   MessageScrollState,
@@ -3497,6 +3500,28 @@ export function WorkspaceChatWorkSurface({
     () => buildChatActivityEventViews(selection, chat, snapshot),
     [selection, chat, snapshot],
   );
+  const executionContinuityRef = useRef<ChatWorkExecutionContinuityStore>(
+    createChatWorkExecutionContinuityStore(),
+  );
+  const resolvedExecutionFooters = useMemo(
+    () =>
+      resolveChatWorkExecutionFootersWithContinuity(
+        snapshot === null
+          ? createChatWorkExecutionContinuityStore()
+          : executionContinuityRef.current,
+        eventViews,
+        referenceNowMs,
+        {
+          isStale,
+          refreshFailed: error !== null,
+          activeChatKey: selection.chatKey,
+        },
+      ),
+    [error, eventViews, isStale, referenceNowMs, selection.chatKey, snapshot],
+  );
+  useLayoutEffect(() => {
+    executionContinuityRef.current = resolvedExecutionFooters.store;
+  }, [resolvedExecutionFooters.store]);
   const backlogGroups = useMemo(
     () => buildChatWorkBacklogGroups(selection),
     [selection],
@@ -3912,7 +3937,8 @@ export function WorkspaceChatWorkSurface({
               const execution = event.workerExecution;
               const executionFooter =
                 execution !== null
-                  ? resolveChatWorkExecutionFooterState(execution, referenceNowMs)
+                  ? (resolvedExecutionFooters.footersByEventKey.get(event.key) ??
+                    resolveChatWorkExecutionFooterState(execution, referenceNowMs))
                   : null;
               return (
                 <li
@@ -3964,6 +3990,13 @@ export function WorkspaceChatWorkSurface({
                       <span
                         className="tl-cw-execution-status"
                         data-worker-execution-status={executionFooter.statusKey}
+                        aria-label={executionFooter.statusAriaLabel ?? undefined}
+                        title={executionFooter.statusTitle ?? undefined}
+                        style={
+                          executionFooter.statusKey === 'working'
+                            ? { color: 'var(--cw-fg-secondary)' }
+                            : undefined
+                        }
                       >
                         {executionFooter.statusLabel}
                       </span>
@@ -3972,6 +4005,8 @@ export function WorkspaceChatWorkSurface({
                         <span
                           className="tl-cw-execution-duration"
                           data-worker-execution-duration={executionFooter.duration.kind}
+                          aria-label={executionFooter.durationAriaLabel ?? undefined}
+                          title={executionFooter.durationTitle ?? undefined}
                         >
                           {executionFooter.durationLabel}
                         </span>

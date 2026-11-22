@@ -5124,3 +5124,894 @@ async fn orchestrator_prompt_and_publication_enforce_4096_utf8_byte_coder_instru
         "idempotent replay must not invoke provider again"
     );
 }
+
+#[test]
+fn prepare_work_schema_and_embedded_guide_preserve_brief_language_contract() {
+    use sha2::{Digest, Sha256};
+
+    let schema = schemars::schema_for!(threadlane_native::PrepareWorkParams);
+    let schema_json =
+        serde_json::to_value(&schema).expect("serialize PrepareWorkParams JSON schema");
+    let properties = schema_json["properties"]
+        .as_object()
+        .expect("PrepareWorkParams schema must expose properties");
+
+    for field in ["summary", "confirmed_requirements"] {
+        let raw_desc = properties[field]["description"]
+            .as_str()
+            .unwrap_or_else(|| panic!("PrepareWorkParams.{field} must have a schema description"));
+        let normalized = raw_desc.split_whitespace().collect::<Vec<_>>().join(" ");
+        for required in [
+            "natural human request",
+            "existing plan",
+            "active human conversation language",
+            "explicit language preference",
+            "without unnecessarily translating technical data",
+            "original human expressions",
+        ] {
+            assert!(
+                normalized.contains(required),
+                "PrepareWorkParams.{field} schema description missing `{required}`: {normalized}"
+            );
+        }
+    }
+
+    for field in ["proposed_additions", "assumptions", "open_questions"] {
+        let raw_desc = properties[field]["description"]
+            .as_str()
+            .unwrap_or_else(|| panic!("PrepareWorkParams.{field} must have a schema description"));
+        let normalized = raw_desc.split_whitespace().collect::<Vec<_>>().join(" ");
+        for required in [
+            "active human conversation language",
+            "explicit language preference",
+            "technical data",
+            "original human expressions",
+        ] {
+            assert!(
+                normalized.contains(required),
+                "PrepareWorkParams.{field} schema description missing `{required}`: {normalized}"
+            );
+        }
+    }
+
+    let guide = threadlane_native::OPERATING_GUIDE_MARKDOWN;
+    let version = threadlane_native::OPERATING_GUIDE_VERSION;
+    assert_eq!(version, "2026-11-19.v5");
+    assert_eq!(version, threadlane::OPERATING_GUIDE_VERSION);
+    assert_eq!(guide, threadlane::OPERATING_GUIDE_MARKDOWN);
+    assert!(guide.contains(version));
+    assert!(
+        guide.len() <= 16_384,
+        "embedded MCP operating guide must remain <= 16384 UTF-8 bytes, got {}",
+        guide.len()
+    );
+
+    let normalized_guide = guide.split_whitespace().collect::<Vec<_>>().join(" ");
+    for required in [
+        "active human conversation language",
+        "explicit language preference",
+        "human request and existing plan",
+        "prepare_work.summary",
+        "confirmed_requirements",
+        "without unnecessarily translating technical data",
+        "original human expressions",
+        "docs/code/comments/labels English by default",
+    ] {
+        assert!(
+            normalized_guide.contains(required),
+            "embedded MCP operating guide missing `{required}`"
+        );
+    }
+
+    // Operating guide version/digest and closure-template version/digest remain independent.
+    let template = threadlane::render_closure_template();
+    assert_eq!(template.version, threadlane::CLOSURE_TEMPLATE_VERSION);
+    assert_eq!(
+        template.source_sha256,
+        threadlane::closure_template_source_sha256()
+    );
+    let guide_sha256 = format!("{:x}", Sha256::digest(guide.as_bytes()));
+    assert_ne!(guide_sha256, template.source_sha256);
+    assert_ne!(version, template.version);
+}
+
+/// Pre-known task acceptance expectation inside a fixture-known 2-task Orchestrator DAG.
+struct KnownLanguageTaskSpec {
+    task_id: &'static str,
+    title: &'static str,
+    instruction: &'static str,
+    difficulty: Difficulty,
+    depends_on: &'static [&'static str],
+    allowed_write_paths: &'static [&'static str],
+}
+
+/// Pre-known field-by-field acceptance fixture for a 2-task Orchestrator DAG.
+///
+/// This test oracle measures persisted brief and published plan outputs strictly against
+/// pre-known fixture strings and exact technical byte tokens; it does not attempt or claim
+/// automatic natural-language recognition on arbitrary model output.
+struct KnownLanguageDagCase {
+    case_id: &'static str,
+    brief_summary: &'static str,
+    confirmed_requirements: [&'static str; 2],
+    plan_summary: &'static str,
+    tasks: [KnownLanguageTaskSpec; 2],
+    required_exact_tokens: &'static [&'static str],
+}
+
+fn contains_exact_bytes(haystack: &str, needle: &str) -> bool {
+    !needle.is_empty()
+        && haystack
+            .as_bytes()
+            .windows(needle.len())
+            .any(|window| window == needle.as_bytes())
+}
+
+/// Field-by-field acceptance oracle comparing persisted `WorkBrief` and normally read
+/// `PlanPage` (`summary`, two task `title`s, two task `instruction`s, DAG structure, and exact
+/// technical/quoted bytes) against a pre-known test fixture.
+fn verify_known_language_plan_acceptance(
+    brief: &WorkBrief,
+    fetched_plan: &threadlane_workflow::PlanPage,
+    expected: &KnownLanguageDagCase,
+) -> Result<(), Vec<String>> {
+    let mut mismatches = Vec::new();
+
+    if brief.summary != expected.brief_summary {
+        mismatches.push("brief.summary mismatch".to_string());
+    }
+    if brief
+        .confirmed_requirements
+        .iter()
+        .map(String::as_str)
+        .ne(expected.confirmed_requirements.iter().copied())
+    {
+        mismatches.push("brief.confirmed_requirements mismatch".to_string());
+    }
+    if fetched_plan.header.status != PlanStatus::Published {
+        mismatches.push("plan.status mismatch".to_string());
+    }
+    if fetched_plan.header.summary != expected.plan_summary {
+        mismatches.push("plan.summary mismatch".to_string());
+    }
+    if fetched_plan.tasks.len() != expected.tasks.len() {
+        mismatches.push("plan.tasks.len mismatch".to_string());
+    } else {
+        for (idx, (actual_task, expected_task)) in fetched_plan
+            .tasks
+            .iter()
+            .zip(expected.tasks.iter())
+            .enumerate()
+        {
+            if actual_task.id != expected_task.task_id {
+                mismatches.push(format!("tasks[{idx}].id mismatch"));
+            }
+            if actual_task.role != WorkflowRole::Coder {
+                mismatches.push(format!("tasks[{idx}].role mismatch"));
+            }
+            if actual_task.difficulty != expected_task.difficulty {
+                mismatches.push(format!("tasks[{idx}].difficulty mismatch"));
+            }
+            if actual_task
+                .depends_on
+                .iter()
+                .map(String::as_str)
+                .ne(expected_task.depends_on.iter().copied())
+            {
+                mismatches.push(format!("tasks[{idx}].depends_on mismatch"));
+            }
+            if actual_task
+                .allowed_write_paths
+                .iter()
+                .map(String::as_str)
+                .ne(expected_task.allowed_write_paths.iter().copied())
+            {
+                mismatches.push(format!("tasks[{idx}].allowed_write_paths mismatch"));
+            }
+            if actual_task.title != expected_task.title {
+                mismatches.push(format!("tasks[{idx}].title mismatch"));
+            }
+            if actual_task.instruction != expected_task.instruction {
+                mismatches.push(format!("tasks[{idx}].instruction mismatch"));
+            }
+        }
+    }
+
+    let brief_corpus = format!(
+        "{}\n{}",
+        brief.summary,
+        brief.confirmed_requirements.join("\n")
+    );
+    let plan_corpus = format!(
+        "{}\n{}",
+        fetched_plan.header.summary,
+        fetched_plan
+            .tasks
+            .iter()
+            .map(|task| format!("{}\n{}", task.title, task.instruction))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    for token in expected.required_exact_tokens {
+        if !contains_exact_bytes(&brief_corpus, token) {
+            mismatches.push(format!("brief missing exact byte token `{token}`"));
+        }
+        if !contains_exact_bytes(&plan_corpus, token) {
+            mismatches.push(format!("plan missing exact byte token `{token}`"));
+        }
+    }
+
+    if mismatches.is_empty() {
+        Ok(())
+    } else {
+        Err(mismatches)
+    }
+}
+
+fn build_two_task_language_plan_json(
+    plan_summary: &str,
+    task_parse_title: &str,
+    task_parse_description: &str,
+    task_export_title: &str,
+    task_export_description: &str,
+) -> String {
+    serde_json::to_string(&serde_json::json!({
+        "outcome": "plan",
+        "schema_version": 1,
+        "summary": plan_summary,
+        "tasks": [
+            {
+                "task_id": "task_parse",
+                "title": task_parse_title,
+                "description": task_parse_description,
+                "role": "coder",
+                "difficulty": "medium",
+                "depends_on": [],
+                "allowed_write_paths": ["src/parser.rs"],
+                "owned_interfaces": ["iface_parsed_frame"],
+                "consumed_interfaces": []
+            },
+            {
+                "task_id": "task_export",
+                "title": task_export_title,
+                "description": task_export_description,
+                "role": "coder",
+                "difficulty": "hard",
+                "depends_on": ["task_parse"],
+                "allowed_write_paths": ["src/exporter.rs"],
+                "owned_interfaces": ["iface_export_sink"],
+                "consumed_interfaces": ["iface_parsed_frame"]
+            }
+        ]
+    }))
+    .expect("serialize 2-task language plan JSON")
+}
+
+async fn run_prepare_publish_read_cycle(
+    case_tag: &str,
+    brief_summary: &str,
+    confirmed_requirements: &[&str],
+    plan_json: &str,
+) -> (WorkBrief, threadlane_workflow::PlanPage, serde_json::Value) {
+    let fx = OrchestratorTestFixture::new();
+    let now_ms = threadlane_native::current_wall_clock_ms()
+        .expect("wall clock")
+        .max(1_700_000_000_000);
+    let grant = fx.create_grant_with_budget(
+        &format!("grant_{case_tag}"),
+        PlanningCallBudget {
+            max_total_calls: 8,
+            max_orchestrator_calls: 4,
+            max_architect_calls: 4,
+            max_timeout_ms_per_call: 30_000,
+            max_output_bytes_per_call: 65_536,
+        },
+        now_ms + 3_600_000,
+    );
+
+    let state_dir = fx.root_dir.join("gateway-state");
+    let sessions_dir = fx.root_dir.join("gateway-sessions");
+    fs::create_dir_all(&state_dir).expect("create gateway state dir");
+    fs::create_dir_all(&sessions_dir).expect("create gateway sessions dir");
+    let gateway = threadlane_native::CoworkerPlanningGateway::new(
+        &state_dir,
+        &fx.registry_dir,
+        &fx.plans_dir,
+        &fx.authority_dir,
+        &sessions_dir,
+        BINDING_ID,
+        THREAD_UUID,
+    )
+    .expect("create CoworkerPlanningGateway");
+
+    let prepared = gateway
+        .prepare_work(&threadlane_native::PrepareWorkParams {
+            grant_id: grant.grant_id.clone(),
+            request_key: format!("prep_{case_tag}"),
+            summary: brief_summary.to_string(),
+            confirmed_requirements: confirmed_requirements
+                .iter()
+                .map(|item| (*item).to_string())
+                .collect(),
+            proposed_additions: Vec::new(),
+            assumptions: Vec::new(),
+            open_questions: Vec::new(),
+            accepted_architect_decisions: Vec::new(),
+            amendment: None,
+            target_job_id: None,
+            target_job_revision: None,
+            amendment_reason: None,
+            amended_target_task_ids: Vec::new(),
+            amended_write_paths: Vec::new(),
+            amended_interfaces: Vec::new(),
+            expected_ledger_revision: None,
+        })
+        .expect("prepare_work records brief");
+
+    let ledger = fx
+        .store
+        .read_binding_ledger(BINDING_ID)
+        .expect("read binding ledger after prepare_work");
+    let stored_job = ledger
+        .jobs
+        .iter()
+        .find(|job| job.job_id == prepared.job_id)
+        .expect("prepared job must exist in ledger")
+        .clone();
+    assert_eq!(stored_job.work_brief.summary, brief_summary);
+    assert!(stored_job
+        .work_brief
+        .confirmed_requirements
+        .iter()
+        .map(String::as_str)
+        .eq(confirmed_requirements.iter().copied()));
+
+    fx.write_custom_call_response(1, plan_json, false);
+    let mut req = OrchestratorTestFixture::plan_req(
+        &grant.grant_id,
+        &prepared.job_id,
+        &format!("orch_{case_tag}"),
+        0,
+    );
+    req.current_time_ms = now_ms + 1_000;
+
+    let outcome = fx
+        .service
+        .orchestrate_brief_to_plan(&fx.workflow, &req)
+        .await
+        .expect("orchestrate_brief_to_plan succeeds");
+    assert_eq!(fx.invocation_count(), 1);
+    assert_eq!(
+        outcome.reservation.status,
+        PlanningReservationStatus::Completed
+    );
+
+    let published = outcome
+        .require_published_plan()
+        .expect("expected published plan decision");
+    let fetched_plan = fx
+        .workflow
+        .get_plan(&published.published_plan.header.plan_id, None, None, None)
+        .expect("read published plan via ScopedWorkflow::get_plan");
+
+    let artifact_id = outcome
+        .reservation
+        .report_artifact_id
+        .as_deref()
+        .expect("reservation report_artifact_id");
+    let artifact = fx
+        .service
+        .read_planning_artifact(artifact_id)
+        .expect("read planning artifact");
+    match artifact.outcome {
+        PlanningArtifactOutcomeKind::OrchestratorOutput {
+            work_brief: Some(art_brief),
+            ..
+        } => assert_eq!(art_brief, stored_job.work_brief),
+        other => panic!("expected OrchestratorOutput with frozen work_brief, got {other:?}"),
+    }
+
+    let captured_prompt = fx.read_captured_prompt(1);
+    let (_, context_json) = captured_prompt
+        .split_once("Context:\n")
+        .expect("captured Orchestrator prompt must embed Context JSON");
+    let prompt_context: serde_json::Value =
+        serde_json::from_str(context_json.trim()).expect("parse captured Context JSON");
+    assert_eq!(
+        prompt_context["work_brief"]["summary"].as_str(),
+        Some(brief_summary)
+    );
+    for (idx, expected_req) in confirmed_requirements.iter().enumerate() {
+        assert_eq!(
+            prompt_context["work_brief"]["confirmed_requirements"][idx].as_str(),
+            Some(*expected_req)
+        );
+    }
+
+    (stored_job.work_brief, fetched_plan, prompt_context)
+}
+
+#[tokio::test]
+async fn orchestrator_publish_and_read_preserves_turkish_italian_and_english_plans_and_rejects_wrong_language_drift(
+) {
+    let tr_case = KnownLanguageDagCase {
+        case_id: "lang_tr",
+        brief_summary: "prepare_work.summary ve confirmed_requirements alanlarını koruyarak \"sıfır kopya başlık\" için src/parser.rs ve src/exporter.rs üzerinde iki aşamalı coder planı hazırla (durum: published).",
+        confirmed_requirements: [
+            "task_parse görevinde src/parser.rs içinde pub struct ParsedFrame tanımını koru ve // keep header layout stable yorumunu İngilizce tut.",
+            "task_export görevinde allowed_write_paths kapsamında src/exporter.rs içindeki export_batch() işlevini \"sıfır kopya başlık\" kuralıyla bağla.",
+        ],
+        plan_summary: "src/parser.rs ve src/exporter.rs üzerinde \"sıfır kopya başlık\" hedefi için prepare_work.summary ile uyumlu iki görevli coder planı (published).",
+        tasks: [
+            KnownLanguageTaskSpec {
+                task_id: "task_parse",
+                title: "src/parser.rs içinde ParsedFrame ayrıştırıcısını tamamla",
+                instruction: "task_parse kapsamında src/parser.rs dosyasındaki pub struct ParsedFrame yapısını \"sıfır kopya başlık\" gereksinimine göre doğrula; confirmed_requirements ve coder rolüne uy ve // keep header layout stable yorumunu İngilizce koru.",
+                difficulty: Difficulty::Medium,
+                depends_on: &[],
+                allowed_write_paths: &["src/parser.rs"],
+            },
+            KnownLanguageTaskSpec {
+                task_id: "task_export",
+                title: "src/exporter.rs içinde export_batch() aktarımını bağla",
+                instruction: "task_export kapsamında allowed_write_paths olarak yalnızca src/exporter.rs dosyasını düzenleyerek export_batch() işlevini ParsedFrame akışına bağla; \"sıfır kopya başlık\" ifadesini ve // keep header layout stable yorumunu koru.",
+                difficulty: Difficulty::Hard,
+                depends_on: &["task_parse"],
+                allowed_write_paths: &["src/exporter.rs"],
+            },
+        ],
+        required_exact_tokens: &[
+            "src/parser.rs",
+            "src/exporter.rs",
+            "prepare_work.summary",
+            "confirmed_requirements",
+            "allowed_write_paths",
+            "coder",
+            "published",
+            "task_parse",
+            "task_export",
+            "ParsedFrame",
+            "pub struct ParsedFrame",
+            "export_batch()",
+            "// keep header layout stable",
+            "\"sıfır kopya başlık\"",
+        ],
+    };
+
+    let it_case = KnownLanguageDagCase {
+        case_id: "lang_it",
+        brief_summary: "Prepara un piano coder in due fasi su src/parser.rs e src/exporter.rs per \"intestazione senza copia\" mantenendo prepare_work.summary e confirmed_requirements in italiano (stato: published).",
+        confirmed_requirements: [
+            "Nel task task_parse mantieni pub struct ParsedFrame in src/parser.rs e lascia in inglese il commento // keep header layout stable.",
+            "Nel task task_export collega export_batch() in src/exporter.rs entro allowed_write_paths rispettando la richiesta \"intestazione senza copia\".",
+        ],
+        plan_summary: "Piano coder in due attività su src/parser.rs e src/exporter.rs coerente con prepare_work.summary per \"intestazione senza copia\" (published).",
+        tasks: [
+            KnownLanguageTaskSpec {
+                task_id: "task_parse",
+                title: "Completa il parser ParsedFrame in src/parser.rs",
+                instruction: "Per task_parse verifica pub struct ParsedFrame in src/parser.rs secondo \"intestazione senza copia\"; rispetta confirmed_requirements e il ruolo coder mantenendo // keep header layout stable in inglese.",
+                difficulty: Difficulty::Medium,
+                depends_on: &[],
+                allowed_write_paths: &["src/parser.rs"],
+            },
+            KnownLanguageTaskSpec {
+                task_id: "task_export",
+                title: "Collega export_batch() in src/exporter.rs",
+                instruction: "Per task_export modifica solo src/exporter.rs in allowed_write_paths per collegare export_batch() a ParsedFrame; conserva la citazione \"intestazione senza copia\" e il commento // keep header layout stable.",
+                difficulty: Difficulty::Hard,
+                depends_on: &["task_parse"],
+                allowed_write_paths: &["src/exporter.rs"],
+            },
+        ],
+        required_exact_tokens: &[
+            "src/parser.rs",
+            "src/exporter.rs",
+            "prepare_work.summary",
+            "confirmed_requirements",
+            "allowed_write_paths",
+            "coder",
+            "published",
+            "task_parse",
+            "task_export",
+            "ParsedFrame",
+            "pub struct ParsedFrame",
+            "export_batch()",
+            "// keep header layout stable",
+            "\"intestazione senza copia\"",
+        ],
+    };
+
+    let en_case = KnownLanguageDagCase {
+        case_id: "lang_en",
+        brief_summary: "Prepare a two-stage coder plan across src/parser.rs and src/exporter.rs for \"zero-copy header\" while preserving prepare_work.summary and confirmed_requirements in English (status: published).",
+        confirmed_requirements: [
+            "In task_parse keep pub struct ParsedFrame in src/parser.rs and retain // keep header layout stable in English.",
+            "In task_export wire export_batch() in src/exporter.rs within allowed_write_paths for the \"zero-copy header\" requirement.",
+        ],
+        plan_summary: "Two-task coder plan across src/parser.rs and src/exporter.rs aligned with prepare_work.summary for \"zero-copy header\" (published).",
+        tasks: [
+            KnownLanguageTaskSpec {
+                task_id: "task_parse",
+                title: "Complete ParsedFrame parser in src/parser.rs",
+                instruction: "For task_parse validate pub struct ParsedFrame in src/parser.rs against \"zero-copy header\"; satisfy confirmed_requirements under role coder and keep // keep header layout stable in English.",
+                difficulty: Difficulty::Medium,
+                depends_on: &[],
+                allowed_write_paths: &["src/parser.rs"],
+            },
+            KnownLanguageTaskSpec {
+                task_id: "task_export",
+                title: "Wire export_batch() in src/exporter.rs",
+                instruction: "For task_export edit only src/exporter.rs in allowed_write_paths to wire export_batch() to ParsedFrame; preserve \"zero-copy header\" and // keep header layout stable.",
+                difficulty: Difficulty::Hard,
+                depends_on: &["task_parse"],
+                allowed_write_paths: &["src/exporter.rs"],
+            },
+        ],
+        required_exact_tokens: &[
+            "src/parser.rs",
+            "src/exporter.rs",
+            "prepare_work.summary",
+            "confirmed_requirements",
+            "allowed_write_paths",
+            "coder",
+            "published",
+            "task_parse",
+            "task_export",
+            "ParsedFrame",
+            "pub struct ParsedFrame",
+            "export_batch()",
+            "// keep header layout stable",
+            "\"zero-copy header\"",
+        ],
+    };
+
+    // 1. Positive end-to-end checks through prepare_work -> fake provider -> publish -> get_plan
+    //    for Turkish, Italian, and English requests, comparing summary, two titles, two persisted
+    //    instructions, DAG topology, and exact technical/quoted bytes field-by-field.
+    let mut captured_rules_baseline: Option<serde_json::Value> = None;
+    for case in [&tr_case, &it_case, &en_case] {
+        let plan_json = build_two_task_language_plan_json(
+            case.plan_summary,
+            case.tasks[0].title,
+            case.tasks[0].instruction,
+            case.tasks[1].title,
+            case.tasks[1].instruction,
+        );
+        let (brief, fetched_plan, prompt_ctx) = run_prepare_publish_read_cycle(
+            case.case_id,
+            case.brief_summary,
+            &case.confirmed_requirements,
+            &plan_json,
+        )
+        .await;
+
+        assert_eq!(
+            verify_known_language_plan_acceptance(&brief, &fetched_plan, case),
+            Ok(()),
+            "known acceptance oracle must pass for `{}`",
+            case.case_id
+        );
+
+        // Prompt rules must stay invariant across languages (no language detector or branch).
+        if let Some(ref baseline) = captured_rules_baseline {
+            assert_eq!(
+                baseline, &prompt_ctx["rules"],
+                "Orchestrator rules must not vary by language (`{}`)",
+                case.case_id
+            );
+        } else {
+            let rules_text =
+                serde_json::to_string(&prompt_ctx["rules"]).expect("serialize Orchestrator rules");
+            for required_rule_fragment in [
+                "same target language",
+                "published plan's `summary`",
+                "task `title`",
+                "task `description` (persisted as `instruction`)",
+                "clarification `questions`",
+                "Advisor-directed `question_summary`",
+                "code, comments, and documentation in English",
+            ] {
+                assert!(
+                    rules_text.contains(required_rule_fragment),
+                    "captured Orchestrator prompt rules missing `{required_rule_fragment}`"
+                );
+            }
+            captured_rules_baseline = Some(prompt_ctx["rules"].clone());
+        }
+    }
+
+    // 2. Negative check A: Anglicized brief with the exact same 2-task DAG and task IDs must fail
+    //    the Turkish acceptance oracle even when structural DAG/IDs match identically.
+    let tr_plan_json = build_two_task_language_plan_json(
+        tr_case.plan_summary,
+        tr_case.tasks[0].title,
+        tr_case.tasks[0].instruction,
+        tr_case.tasks[1].title,
+        tr_case.tasks[1].instruction,
+    );
+    let (anglicized_brief, anglicized_brief_plan, _) = run_prepare_publish_read_cycle(
+        "neg_tr_anglicized_brief",
+        en_case.brief_summary,
+        &en_case.confirmed_requirements,
+        &tr_plan_json,
+    )
+    .await;
+    assert_eq!(anglicized_brief_plan.tasks.len(), 2);
+    assert_eq!(anglicized_brief_plan.tasks[0].id, "task_parse");
+    assert_eq!(anglicized_brief_plan.tasks[1].id, "task_export");
+    assert_eq!(anglicized_brief_plan.tasks[1].depends_on, ["task_parse"]);
+    let anglicized_brief_err =
+        verify_known_language_plan_acceptance(&anglicized_brief, &anglicized_brief_plan, &tr_case)
+            .expect_err("Anglicized brief must fail Turkish acceptance oracle");
+    assert!(
+        anglicized_brief_err
+            .iter()
+            .any(|msg| msg == "brief.summary mismatch"),
+        "expected brief.summary mismatch, got {anglicized_brief_err:?}"
+    );
+    assert!(
+        anglicized_brief_err
+            .iter()
+            .any(|msg| msg == "brief.confirmed_requirements mismatch"),
+        "expected brief.confirmed_requirements mismatch, got {anglicized_brief_err:?}"
+    );
+    assert!(
+        anglicized_brief_err
+            .iter()
+            .any(|msg| msg == "brief missing exact byte token `\"sıfır kopya başlık\"`"),
+        "expected missing Turkish quoted expression token in brief, got {anglicized_brief_err:?}"
+    );
+
+    // 3. Negative check B: Single wrong-language task description (`tasks[1].instruction` in
+    //    English while brief, plan summary, both titles, tasks[0].instruction, DAG, task IDs, and
+    //    every technical/quoted byte token stay intact) must fail specifically on
+    //    `tasks[1].instruction mismatch` for both Turkish and Italian fixtures.
+    let tr_single_wrong_desc_json = build_two_task_language_plan_json(
+        tr_case.plan_summary,
+        tr_case.tasks[0].title,
+        tr_case.tasks[0].instruction,
+        tr_case.tasks[1].title,
+        "For task_export edit only src/exporter.rs in allowed_write_paths to wire export_batch() to ParsedFrame; preserve \"sıfır kopya başlık\" and // keep header layout stable.",
+    );
+    let (tr_brief_neg, tr_plan_single_wrong_desc, _) = run_prepare_publish_read_cycle(
+        "neg_tr_single_wrong_desc",
+        tr_case.brief_summary,
+        &tr_case.confirmed_requirements,
+        &tr_single_wrong_desc_json,
+    )
+    .await;
+    assert_eq!(tr_plan_single_wrong_desc.tasks[0].id, "task_parse");
+    assert_eq!(tr_plan_single_wrong_desc.tasks[1].id, "task_export");
+    assert_eq!(
+        tr_plan_single_wrong_desc.tasks[1].depends_on,
+        ["task_parse"]
+    );
+    let tr_single_err =
+        verify_known_language_plan_acceptance(&tr_brief_neg, &tr_plan_single_wrong_desc, &tr_case)
+            .expect_err(
+                "single wrong-language task description must fail Turkish acceptance oracle",
+            );
+    assert_eq!(tr_single_err, ["tasks[1].instruction mismatch"]);
+
+    let it_single_wrong_desc_json = build_two_task_language_plan_json(
+        it_case.plan_summary,
+        it_case.tasks[0].title,
+        it_case.tasks[0].instruction,
+        it_case.tasks[1].title,
+        "For task_export edit only src/exporter.rs in allowed_write_paths to wire export_batch() to ParsedFrame; preserve \"intestazione senza copia\" and // keep header layout stable.",
+    );
+    let (it_brief_neg, it_plan_single_wrong_desc, _) = run_prepare_publish_read_cycle(
+        "neg_it_single_wrong_desc",
+        it_case.brief_summary,
+        &it_case.confirmed_requirements,
+        &it_single_wrong_desc_json,
+    )
+    .await;
+    assert_eq!(it_plan_single_wrong_desc.tasks[0].id, "task_parse");
+    assert_eq!(it_plan_single_wrong_desc.tasks[1].id, "task_export");
+    assert_eq!(
+        it_plan_single_wrong_desc.tasks[1].depends_on,
+        ["task_parse"]
+    );
+    let it_single_err =
+        verify_known_language_plan_acceptance(&it_brief_neg, &it_plan_single_wrong_desc, &it_case)
+            .expect_err(
+                "single wrong-language task description must fail Italian acceptance oracle",
+            );
+    assert_eq!(it_single_err, ["tasks[1].instruction mismatch"]);
+
+    // 4. Verify non-plan Orchestrator outcomes (Advisor consultation round-trip in Turkish and
+    //    human clarification questions in Italian) preserve target language and technical bytes.
+    let fx_adv = OrchestratorTestFixture::new();
+    let grant_adv = fx_adv.create_default_grant("grant_lang_tr_advisor_roundtrip");
+    let job_adv = fx_adv
+        .store
+        .create_or_amend_job(&CreateCoworkerJobRequest {
+            binding_id: BINDING_ID.to_string(),
+            thread_uuid: THREAD_UUID.to_string(),
+            request_key: "job_lang_tr_advisor_roundtrip".to_string(),
+            expected_ledger_revision: None,
+            work_brief: WorkBrief {
+                brief_id: "brf_lang_tr_advisor_roundtrip".to_string(),
+                binding_id: BINDING_ID.to_string(),
+                thread_uuid: THREAD_UUID.to_string(),
+                project_base: fx_adv.project_base.clone(),
+                kind: WorkBriefKind::NewJob,
+                summary: tr_case.brief_summary.to_string(),
+                confirmed_requirements: tr_case
+                    .confirmed_requirements
+                    .iter()
+                    .map(|s| (*s).to_string())
+                    .collect(),
+                proposed_additions: Vec::new(),
+                assumptions: Vec::new(),
+                open_questions: Vec::new(),
+                accepted_architect_decisions: Vec::new(),
+            },
+            amended_target_task_ids: Vec::new(),
+            amended_write_paths: Vec::new(),
+            amended_interfaces: Vec::new(),
+        })
+        .expect("create Turkish Advisor round-trip job");
+
+    let tr_advisor_question = "src/parser.rs içindeki pub struct ParsedFrame yapısı \"sıfır kopya başlık\" ve // keep header layout stable kuralıyla uyumlu kalmalı mı?";
+    let tr_advisor_decision = "src/parser.rs içindeki pub struct ParsedFrame yapısını \"sıfır kopya başlık\" ve // keep header layout stable yorumuyla sabit tut.";
+    let adv_req_json = serde_json::to_string(&serde_json::json!({
+        "outcome": "requires_architect_advice",
+        "schema_version": 1,
+        "summary": "ParsedFrame sınırı için Advisor görüşü gerekiyor.",
+        "questions": [
+            {
+                "question_id": "q_tr_parsed_frame",
+                "question_summary": tr_advisor_question,
+                "dependency_files": ["src/parser.rs", "src/exporter.rs"],
+                "interfaces": ["iface_parsed_frame"]
+            }
+        ]
+    }))
+    .expect("serialize Turkish requires_architect_advice JSON");
+    let adv_reply_json = serde_json::to_string(&serde_json::json!({
+        "schema_version": 1,
+        "decision_summary": tr_advisor_decision,
+        "rationale": "src/exporter.rs içindeki export_batch() işlevi ParsedFrame sözleşmesine bağlı kalır.",
+        "recommended_write_paths": ["src/parser.rs", "src/exporter.rs"],
+        "interface_contracts": {
+            "iface_parsed_frame": "pub struct ParsedFrame { pub version: u8, pub payload_len: u16 }"
+        },
+        "open_questions": []
+    }))
+    .expect("serialize Turkish Advisor advice JSON");
+    fx_adv.write_custom_call_response(1, &adv_req_json, false);
+    fx_adv.write_custom_call_response(2, &adv_reply_json, false);
+    fx_adv.write_custom_call_response(3, &tr_plan_json, false);
+
+    let adv_outcome = fx_adv
+        .service
+        .orchestrate_brief_to_plan(
+            &fx_adv.workflow,
+            &OrchestratorTestFixture::plan_req(
+                &grant_adv.grant_id,
+                &job_adv.job_id,
+                "orch_lang_tr_advisor_roundtrip",
+                1,
+            ),
+        )
+        .await
+        .expect("Turkish Advisor round-trip succeeds");
+    assert_eq!(fx_adv.invocation_count(), 3);
+    let advisor_prompt = fx_adv.read_captured_prompt(2);
+    let (_, advisor_ctx_raw) = advisor_prompt
+        .split_once("Context:\n")
+        .expect("Advisor prompt embeds Context JSON");
+    let advisor_ctx: serde_json::Value =
+        serde_json::from_str(advisor_ctx_raw.trim()).expect("parse Advisor Context JSON");
+    assert_eq!(
+        advisor_ctx["question_summary"].as_str(),
+        Some(tr_advisor_question)
+    );
+    assert_eq!(
+        adv_outcome.consulted_architect_advice[0]
+            .record
+            .decision_summary,
+        tr_advisor_decision
+    );
+    let adv_published = adv_outcome
+        .require_published_plan()
+        .expect("published Turkish plan after Advisor round-trip");
+    let adv_fetched = fx_adv
+        .workflow
+        .get_plan(
+            &adv_published.published_plan.header.plan_id,
+            None,
+            None,
+            None,
+        )
+        .expect("read published plan after Advisor round-trip");
+    assert_eq!(
+        verify_known_language_plan_acceptance(&job_adv.work_brief, &adv_fetched, &tr_case),
+        Ok(())
+    );
+
+    let fx_clarify = OrchestratorTestFixture::new();
+    let grant_clarify = fx_clarify.create_default_grant("grant_lang_it_clarify");
+    let job_clarify = fx_clarify
+        .store
+        .create_or_amend_job(&CreateCoworkerJobRequest {
+            binding_id: BINDING_ID.to_string(),
+            thread_uuid: THREAD_UUID.to_string(),
+            request_key: "job_lang_it_clarify".to_string(),
+            expected_ledger_revision: None,
+            work_brief: WorkBrief {
+                brief_id: "brf_lang_it_clarify".to_string(),
+                binding_id: BINDING_ID.to_string(),
+                thread_uuid: THREAD_UUID.to_string(),
+                project_base: fx_clarify.project_base.clone(),
+                kind: WorkBriefKind::NewJob,
+                summary: it_case.brief_summary.to_string(),
+                confirmed_requirements: it_case
+                    .confirmed_requirements
+                    .iter()
+                    .map(|s| (*s).to_string())
+                    .collect(),
+                proposed_additions: Vec::new(),
+                assumptions: Vec::new(),
+                open_questions: Vec::new(),
+                accepted_architect_decisions: Vec::new(),
+            },
+            amended_target_task_ids: Vec::new(),
+            amended_write_paths: Vec::new(),
+            amended_interfaces: Vec::new(),
+        })
+        .expect("create Italian clarification job");
+
+    let it_clarify_summary =
+        "Serve chiarimento prima di pubblicare il piano per \"intestazione senza copia\".";
+    let it_clarify_question = "Per task_parse in src/parser.rs, pub struct ParsedFrame deve mantenere // keep header layout stable e confirmed_requirements invariati?";
+    let it_clarify_json = serde_json::to_string(&serde_json::json!({
+        "outcome": "requires_human_clarification",
+        "schema_version": 1,
+        "summary": it_clarify_summary,
+        "questions": [it_clarify_question],
+        "referenced_files": ["src/parser.rs"]
+    }))
+    .expect("serialize Italian clarification JSON");
+    fx_clarify.write_custom_call_response(1, &it_clarify_json, false);
+
+    let clarify_outcome = fx_clarify
+        .service
+        .orchestrate_brief_to_plan(
+            &fx_clarify.workflow,
+            &OrchestratorTestFixture::plan_req(
+                &grant_clarify.grant_id,
+                &job_clarify.job_id,
+                "orch_lang_it_clarify",
+                0,
+            ),
+        )
+        .await
+        .expect("Italian clarification outcome succeeds");
+    assert!(clarify_outcome.require_published_plan().is_err());
+    let clarify_artifact_id = clarify_outcome
+        .reservation
+        .report_artifact_id
+        .as_deref()
+        .expect("clarification artifact id");
+    let clarify_artifact = fx_clarify
+        .service
+        .read_planning_artifact(clarify_artifact_id)
+        .expect("read Italian clarification artifact");
+    match clarify_artifact.outcome {
+        PlanningArtifactOutcomeKind::OrchestratorOutput {
+            structured_output:
+                StructuredOrchestratorOutput::RequiresHumanClarification {
+                    summary, questions, ..
+                },
+            ..
+        } => {
+            assert_eq!(summary, it_clarify_summary);
+            assert_eq!(questions, [it_clarify_question]);
+        }
+        other => panic!("expected RequiresHumanClarification artifact, got {other:?}"),
+    }
+}

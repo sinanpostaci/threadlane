@@ -63,6 +63,15 @@ export const MAX_CHAT_WORK_PRESENCE = 32 as const;
 export const MAX_CHAT_WORK_EXECUTIONS = 32 as const;
 export const MAX_CHAT_WORK_EXECUTIONS_TOTAL = 128 as const;
 
+/**
+ * Maximum bounded brief-gap window after a confirmed live Worker sample's
+ * original `expires_at_ms` during which the single dispatch footer holds a
+ * durable `Started` state with a frozen last-confirmed elapsed value instead
+ * of flickering to `Status unavailable`. Always further capped by the sample's
+ * own `max_sample_age_ms` and never extended by delayed or stale samples.
+ */
+export const CHAT_WORK_EXECUTION_BRIEF_GAP_MS = 5_000 as const;
+
 export type ChatWorkItem = WorkspaceChatWork['items'][number];
 export type ChatWorkEvent = WorkspaceChatWork['events'][number];
 export type ChatWorkPresence = WorkspaceChatWork['worker_presence'][number];
@@ -781,6 +790,260 @@ function reconcileChatWorkPresence(
   return { presence: winners, omitted };
 }
 
+function hasTrustworthyChatWorkPresenceOrigin(
+  presence: ChatWorkPresence,
+): boolean {
+  return presence.host_instance_id !== null && presence.invocation_id !== null;
+}
+
+function sameTrustworthyChatWorkPresenceOrigin(
+  left: ChatWorkPresence,
+  right: ChatWorkPresence,
+): boolean {
+  return (
+    hasTrustworthyChatWorkPresenceOrigin(left) &&
+    hasTrustworthyChatWorkPresenceOrigin(right) &&
+    left.host_instance_id === right.host_instance_id &&
+    left.invocation_id === right.invocation_id &&
+    left.claim_id === right.claim_id
+  );
+}
+
+/**
+ * Decides whether a previously accepted Worker presence sample must be retained
+ * over an incoming refresh sample. Reconciliation is restricted to the exact
+ * same immutable attempt identity and the exact same trustworthy host,
+ * invocation, and claim epoch, and never renews or extends the retained
+ * sample's original timestamps or expiry.
+ */
+export function shouldRetainPreviousChatWorkPresence(
+  previous: ChatWorkPresence,
+  incoming: ChatWorkPresence,
+): boolean {
+  if (
+    chatWorkPresenceJoinKey(
+      previous.item_id,
+      previous.execution_ref,
+      previous.approval_id,
+      previous.task_id,
+      previous.run_id,
+      previous.worker_id,
+    ) !==
+    chatWorkPresenceJoinKey(
+      incoming.item_id,
+      incoming.execution_ref,
+      incoming.approval_id,
+      incoming.task_id,
+      incoming.run_id,
+      incoming.worker_id,
+    )
+  ) {
+    return false;
+  }
+  if (!sameTrustworthyChatWorkPresenceOrigin(previous, incoming)) {
+    return false;
+  }
+  if (previous.sequence !== null && incoming.sequence !== null) {
+    if (incoming.sequence < previous.sequence) {
+      return true;
+    }
+    if (incoming.sequence > previous.sequence) {
+      return false;
+    }
+    if (previous.sampled_at_ms !== null && incoming.sampled_at_ms !== null) {
+      if (incoming.sampled_at_ms < previous.sampled_at_ms) {
+        return true;
+      }
+      if (incoming.sampled_at_ms > previous.sampled_at_ms) {
+        return false;
+      }
+      return compareChatWorkPresenceWithinEpoch(previous, incoming) < 0;
+    }
+    return (
+      previous.availability === 'non_live' &&
+      incoming.availability !== 'non_live'
+    );
+  }
+  if (previous.sampled_at_ms !== null && incoming.sampled_at_ms !== null) {
+    return incoming.sampled_at_ms < previous.sampled_at_ms;
+  }
+  return false;
+}
+
+/**
+ * Guards per-chat Worker presence entries on background refreshes so a newer
+ * overall snapshot cannot overwrite a still-valid exact Worker sample with an
+ * older sample from the same trustworthy host/invocation/claim epoch.
+ *
+ * Omitted presence entries are never resurrected, terminal executions always
+ * win immediately, and foreign runs, restarted hosts, different epochs, and
+ * unavailable sources remain strictly isolated.
+ */
+export function reconcileRefreshChatWorkPresenceEntries(
+  currentChatWork: readonly WorkspaceChatWork[],
+  incomingChatWork: readonly WorkspaceChatWork[],
+  unavailableSourceIds: ReadonlySet<string> = new Set(),
+): { chatWork: WorkspaceChatWork[]; replaced: boolean } {
+  if (currentChatWork.length === 0 || incomingChatWork.length === 0) {
+    return { chatWork: Array.from(incomingChatWork), replaced: false };
+  }
+
+  const currentPresenceByChat = new Map<string, Map<string, ChatWorkPresence>>();
+  for (const entry of currentChatWork) {
+    if (entry.availability !== 'available') {
+      continue;
+    }
+    const chatKey = formatWorkspaceChatIdentityKey(entry.identity);
+    if (chatKey === null) {
+      continue;
+    }
+    const normalized: ChatWorkPresence[] = [];
+    for (const raw of entry.worker_presence) {
+      const clean = normalizeChatWorkPresence(raw);
+      if (clean !== null) {
+        normalized.push(clean);
+      }
+    }
+    if (normalized.length === 0) {
+      continue;
+    }
+    const byAttempt =
+      currentPresenceByChat.get(chatKey) ?? new Map<string, ChatWorkPresence>();
+    for (const presence of reconcileChatWorkPresence(normalized).presence) {
+      const attemptKey = chatWorkPresenceJoinKey(
+        presence.item_id,
+        presence.execution_ref,
+        presence.approval_id,
+        presence.task_id,
+        presence.run_id,
+        presence.worker_id,
+      );
+      const existing = byAttempt.get(attemptKey);
+      if (existing === undefined) {
+        byAttempt.set(attemptKey, presence);
+      } else {
+        const reconciled = reconcileChatWorkPresenceAttempt([existing, presence]);
+        if (reconciled !== null) {
+          byAttempt.set(attemptKey, reconciled.winner);
+        }
+      }
+    }
+    if (byAttempt.size > 0) {
+      currentPresenceByChat.set(chatKey, byAttempt);
+    }
+  }
+
+  if (currentPresenceByChat.size === 0) {
+    return { chatWork: Array.from(incomingChatWork), replaced: false };
+  }
+
+  let replaced = false;
+  const nextChatWork = incomingChatWork.map((incomingWork) => {
+    if (
+      incomingWork.availability !== 'available' ||
+      incomingWork.worker_presence.length === 0 ||
+      unavailableSourceIds.has(incomingWork.identity.source_id)
+    ) {
+      return incomingWork;
+    }
+    const chatKey = formatWorkspaceChatIdentityKey(incomingWork.identity);
+    if (chatKey === null) {
+      return incomingWork;
+    }
+    const prevByAttempt = currentPresenceByChat.get(chatKey);
+    if (prevByAttempt === undefined || prevByAttempt.size === 0) {
+      return incomingWork;
+    }
+
+    const incomingItemsById = new Map<string, ChatWorkItem>();
+    for (const item of reconcileChatWorkItems(incomingWork.items).items) {
+      if (item.binding_id === incomingWork.identity.binding_id) {
+        incomingItemsById.set(item.item_id, item);
+      }
+    }
+
+    const rawExecutions = incomingWork.worker_executions ?? [];
+    const attemptIndex = buildChatWorkExecutionAttemptIndex(rawExecutions);
+    const executionByJoinKey = new Map<string, ChatWorkExecution>();
+    for (const execution of rawExecutions) {
+      const joinKey = chatWorkExecutionJoinKey(
+        execution.item_id,
+        execution.execution_ref,
+      );
+      if (attemptIndex.conflictingExecutions.has(joinKey)) {
+        continue;
+      }
+      const existing = executionByJoinKey.get(joinKey);
+      if (
+        existing === undefined ||
+        executionRecordRank(execution) > executionRecordRank(existing)
+      ) {
+        executionByJoinKey.set(joinKey, execution);
+      }
+    }
+
+    let entryReplaced = false;
+    const nextPresence = incomingWork.worker_presence.map((rawPresence) => {
+      const incoming = normalizeChatWorkPresence(rawPresence);
+      if (incoming === null) {
+        return rawPresence;
+      }
+      const ownerItem = incomingItemsById.get(incoming.item_id);
+      if (
+        ownerItem === undefined ||
+        ownerItem.kind !== 'worker' ||
+        ownerItem.binding_id !== incomingWork.identity.binding_id ||
+        ownerItem.status !== 'doing' ||
+        ownerItem.current_execution_ref !== incoming.execution_ref
+      ) {
+        return rawPresence;
+      }
+      if (!doesChatWorkPresenceMatchExecutionAttempt(incoming, attemptIndex)) {
+        return rawPresence;
+      }
+      const joinKey = chatWorkExecutionJoinKey(
+        incoming.item_id,
+        incoming.execution_ref,
+      );
+      const execution = executionByJoinKey.get(joinKey);
+      if (execution !== undefined) {
+        const statusKey = resolveChatWorkExecutionStatus(execution, ownerItem);
+        if (isTerminalChatWorkExecution(statusKey)) {
+          return rawPresence;
+        }
+      }
+      const attemptKey = chatWorkPresenceJoinKey(
+        incoming.item_id,
+        incoming.execution_ref,
+        incoming.approval_id,
+        incoming.task_id,
+        incoming.run_id,
+        incoming.worker_id,
+      );
+      const previous = prevByAttempt.get(attemptKey);
+      if (
+        previous !== undefined &&
+        shouldRetainPreviousChatWorkPresence(previous, incoming)
+      ) {
+        entryReplaced = true;
+        replaced = true;
+        return previous;
+      }
+      return rawPresence;
+    });
+
+    if (!entryReplaced) {
+      return incomingWork;
+    }
+    return {
+      ...incomingWork,
+      worker_presence: nextPresence,
+    };
+  });
+
+  return { chatWork: nextChatWork, replaced };
+}
+
 export interface ChatWorkBoundsView {
   itemsOmitted: number;
   eventsOmitted: number;
@@ -1408,13 +1671,15 @@ export type ChatWorkExecutionStatusKey =
   | 'queued'
   | 'claimed'
   | 'dispatched'
+  | 'started'
   | 'working'
   | 'unavailable'
   | 'cancelling';
 
 export type ChatWorkExecutionDuration =
   | { readonly kind: 'final'; readonly durationMs: number }
-  | { readonly kind: 'elapsed'; readonly startedAtMs: number };
+  | { readonly kind: 'elapsed'; readonly startedAtMs: number }
+  | { readonly kind: 'last_confirmed'; readonly elapsedMs: number };
 
 /**
  * Compact, scope-verified execution metadata for one stream footer. Durable
@@ -1423,6 +1688,7 @@ export type ChatWorkExecutionDuration =
  */
 export interface ChatWorkExecutionSummaryView {
   key: string;
+  attemptKey?: string | null;
   executionRef: string;
   itemId: string;
   provider: string | null;
@@ -1453,7 +1719,8 @@ const EXECUTION_STATUS_PRESENTATION: Readonly<
   queued: { label: 'Queued', tone: 'neutral' },
   claimed: { label: 'Claimed', tone: 'neutral' },
   dispatched: { label: 'Dispatched', tone: 'neutral' },
-  working: { label: 'Working', tone: 'working' },
+  started: { label: 'Started', tone: 'neutral' },
+  working: { label: 'Started', tone: 'neutral' },
   unavailable: { label: 'Status unavailable', tone: 'neutral' },
   cancelling: { label: 'Cancelling', tone: 'attention' },
 };
@@ -1615,6 +1882,12 @@ function formatChatWorkExecutionDuration(
   if (duration.kind === 'final') {
     return formatDurationMs(duration.durationMs);
   }
+  if (duration.kind === 'last_confirmed') {
+    if (!Number.isFinite(duration.elapsedMs) || duration.elapsedMs < 0) {
+      return null;
+    }
+    return `Elapsed ${formatDurationMs(Math.trunc(duration.elapsedMs))}`;
+  }
   if (!Number.isFinite(nowMs)) {
     return null;
   }
@@ -1623,6 +1896,27 @@ function formatChatWorkExecutionDuration(
     return null;
   }
   return `Elapsed ${formatDurationMs(elapsedMs)}`;
+}
+
+function formatConfirmedAgeLabel(
+  confirmedAtMs: number | null,
+  nowMs: number,
+): string | null {
+  if (
+    confirmedAtMs === null ||
+    !Number.isFinite(confirmedAtMs) ||
+    !Number.isFinite(nowMs)
+  ) {
+    return null;
+  }
+  const ageMs = Math.trunc(nowMs) - Math.trunc(confirmedAtMs);
+  if (ageMs < 0) {
+    return null;
+  }
+  if (ageMs === 0) {
+    return 'just now';
+  }
+  return `${formatDurationMs(ageMs)} ago`;
 }
 
 /**
@@ -1639,38 +1933,269 @@ export function resolveChatWorkExecutionDurationLabel(
 export interface ChatWorkExecutionFooterState {
   statusKey: ChatWorkExecutionStatusKey;
   statusLabel: string;
+  statusAriaLabel?: string | null;
+  statusTitle?: string | null;
   tone: ChatWorkTone;
   duration: ChatWorkExecutionDuration | null;
   durationLabel: string | null;
+  durationAriaLabel?: string | null;
+  durationTitle?: string | null;
+}
+
+/**
+ * Bounded per-attempt continuity record anchored to the original confirmed live
+ * Worker presence observation. Never grants fresh liveness, never extends
+ * `expiresAtMs`, and never advances `lastConfirmedElapsedMs` during a gap.
+ * Once brief-gap continuity ends (`briefGapClosed: true`), the record remains
+ * solely as a scoped attempt-specific last-confirmed marker so empty
+ * `worker_presence` resolves to `Status unavailable` instead of reverting to
+ * `Dispatched`, without ever re-entering `Started`.
+ */
+export interface ChatWorkExecutionContinuityEntry {
+  readonly attemptKey: string;
+  readonly hostInstanceId: string | null;
+  readonly invocationId: string | null;
+  readonly claimId: string | null;
+  readonly sequence: number | null;
+  readonly sampledAtMs: number;
+  readonly maxSampleAgeMs: number;
+  readonly expiresAtMs: number;
+  readonly lastConfirmedAtMs: number;
+  readonly lastConfirmedElapsedMs: number | null;
+  readonly briefGapClosed?: boolean;
+}
+
+export type ChatWorkExecutionContinuityStore = ReadonlyMap<
+  string,
+  ChatWorkExecutionContinuityEntry
+>;
+
+export interface ChatWorkExecutionFooterResolutionOptions {
+  readonly isStale?: boolean;
+  readonly refreshFailed?: boolean;
+  readonly briefGapMs?: number;
+  readonly activeChatKey?: string | null;
+}
+
+export interface ReconciledChatWorkExecutionFooters {
+  readonly store: ChatWorkExecutionContinuityStore;
+  readonly footersByEventKey: ReadonlyMap<string, ChatWorkExecutionFooterState>;
+}
+
+export function createChatWorkExecutionContinuityStore(): ChatWorkExecutionContinuityStore {
+  return new Map();
+}
+
+function resolveChatWorkExecutionAttemptKey(
+  view: ChatWorkExecutionSummaryView,
+): string | null {
+  if (typeof view.attemptKey === 'string' && view.attemptKey.length > 0) {
+    return view.attemptKey;
+  }
+  const presence = view.presence ?? null;
+  if (presence === null) {
+    return null;
+  }
+  const separatorIndex = view.key.indexOf('\u0000');
+  const chatKey =
+    separatorIndex > 0 ? view.key.slice(0, separatorIndex) : 'unscoped';
+  return `${chatKey}\u0000${chatWorkPresenceJoinKey(
+    presence.item_id,
+    presence.execution_ref,
+    presence.approval_id,
+    presence.task_id,
+    presence.run_id,
+    presence.worker_id,
+  )}`;
+}
+
+function resolveBriefGapWindowMs(
+  maxSampleAgeMs: number,
+  options: ChatWorkExecutionFooterResolutionOptions,
+): number {
+  const configured =
+    typeof options.briefGapMs === 'number' &&
+    Number.isFinite(options.briefGapMs) &&
+    options.briefGapMs >= 0
+      ? Math.trunc(options.briefGapMs)
+      : CHAT_WORK_EXECUTION_BRIEF_GAP_MS;
+  const sampleBound =
+    Number.isFinite(maxSampleAgeMs) && maxSampleAgeMs > 0
+      ? Math.trunc(maxSampleAgeMs)
+      : 0;
+  return Math.min(configured, sampleBound);
+}
+
+function canHoldContinuityDuringBriefGap(
+  entry: ChatWorkExecutionContinuityEntry,
+  presence: ChatWorkPresence | null,
+  nowMs: number,
+  options: ChatWorkExecutionFooterResolutionOptions,
+): boolean {
+  if (
+    entry.briefGapClosed === true ||
+    entry.hostInstanceId === null ||
+    entry.invocationId === null
+  ) {
+    return false;
+  }
+  if (!Number.isFinite(nowMs)) {
+    return false;
+  }
+  const truncatedNowMs = Math.trunc(nowMs);
+  const briefGapMs = resolveBriefGapWindowMs(entry.maxSampleAgeMs, options);
+  if (briefGapMs <= 0) {
+    return false;
+  }
+  const gapDeadlineMs = entry.expiresAtMs + briefGapMs;
+  if (
+    !Number.isFinite(entry.sampledAtMs) ||
+    !Number.isFinite(entry.expiresAtMs) ||
+    !Number.isFinite(gapDeadlineMs) ||
+    truncatedNowMs < entry.sampledAtMs ||
+    truncatedNowMs >= gapDeadlineMs
+  ) {
+    return false;
+  }
+  if (presence === null) {
+    return true;
+  }
+  if (presence.availability === 'non_live') {
+    return false;
+  }
+  if (
+    presence.host_instance_id === null ||
+    presence.host_instance_id !== entry.hostInstanceId
+  ) {
+    return false;
+  }
+  if (presence.invocation_id !== null) {
+    if (presence.invocation_id !== entry.invocationId) {
+      return false;
+    }
+    if (presence.claim_id !== entry.claimId) {
+      return false;
+    }
+  } else {
+    // An unavailable host probe without a process snapshot still carries the
+    // running host_instance_id. Any non-unavailable record without invocation_id
+    // or with a conflicting claim_id fails closed.
+    if (presence.availability !== 'unavailable') {
+      return false;
+    }
+    if (presence.claim_id !== null && presence.claim_id !== entry.claimId) {
+      return false;
+    }
+  }
+  if (
+    presence.sampled_at_ms !== null &&
+    presence.sampled_at_ms > truncatedNowMs
+  ) {
+    return false;
+  }
+  return true;
+}
+
+function closeContinuityBriefGap(
+  entry: ChatWorkExecutionContinuityEntry,
+): ChatWorkExecutionContinuityEntry {
+  return entry.briefGapClosed === true
+    ? entry
+    : { ...entry, briefGapClosed: true };
+}
+
+function continuityEntriesEqual(
+  left: ChatWorkExecutionContinuityEntry | undefined,
+  right: ChatWorkExecutionContinuityEntry | undefined,
+): boolean {
+  if (left === right) {
+    return true;
+  }
+  if (left === undefined || right === undefined) {
+    return false;
+  }
+  return (
+    left.attemptKey === right.attemptKey &&
+    left.hostInstanceId === right.hostInstanceId &&
+    left.invocationId === right.invocationId &&
+    left.claimId === right.claimId &&
+    left.sequence === right.sequence &&
+    left.sampledAtMs === right.sampledAtMs &&
+    left.maxSampleAgeMs === right.maxSampleAgeMs &&
+    left.expiresAtMs === right.expiresAtMs &&
+    left.lastConfirmedAtMs === right.lastConfirmedAtMs &&
+    left.lastConfirmedElapsedMs === right.lastConfirmedElapsedMs &&
+    Boolean(left.briefGapClosed) === Boolean(right.briefGapClosed)
+  );
 }
 
 /**
  * Resolves the one footer at the current clock tick. Only the existing exact
- * current-execution presence validator may turn a dispatch receipt into
- * Working. A present but expired/stale/unavailable sample becomes Status
- * unavailable and removes the ticking timer; dispatch-only work stays
- * Dispatched. Running/Doing alone never proves liveness.
+ * current-execution presence validator may confirm live `working` state. Both
+ * fresh live evidence (`working`) and bounded brief-gap continuity (`started`)
+ * render the same neutral durable `Started` caption and `Elapsed` prefix so
+ * late renewals do not visibly flicker, while preserving internal live vs
+ * last-confirmed state and presenting evidence freshness and last-confirmed
+ * time via accessible text and title. In a brief gap, elapsed stays frozen at
+ * the last confirmed value without advancing or jumping backwards. Genuine
+ * expiration (including when `worker_presence` later becomes empty for a
+ * previously confirmed attempt), explicit `non_live`, restarted hosts, foreign
+ * runs, and unconfirmed stale/unavailable samples become `Status unavailable`
+ * with no timer; never-observed dispatch-only work stays `Dispatched`; terminal
+ * results immediately win.
  */
 export function resolveChatWorkExecutionFooterState(
   view: ChatWorkExecutionSummaryView,
   nowMs: number,
+  continuity?: ChatWorkExecutionContinuityEntry | null,
+  options: ChatWorkExecutionFooterResolutionOptions = {},
 ): ChatWorkExecutionFooterState {
   let statusKey = view.statusKey;
   const presence = view.presence ?? null;
+  const suppressed = Boolean(options.isStale || options.refreshFailed);
+  let heldLastConfirmedElapsedMs: number | null = null;
+  let confirmedAtMs: number | null = null;
+  const attemptKey = resolveChatWorkExecutionAttemptKey(view);
+
   if (!isTerminalChatWorkExecution(statusKey) && statusKey === 'dispatched') {
-    if (presence !== null) {
-      const itemStatus = view.itemStatus ?? null;
-      const item =
-        itemStatus !== null
-          ? {
-              status: itemStatus,
-              current_execution_ref: view.itemCurrentExecutionRef ?? null,
-            }
-          : null;
-      statusKey =
-        item !== null && isLiveChatWorkWorkerPresence(presence, item, nowMs)
-          ? 'working'
-          : 'unavailable';
+    const itemStatus = view.itemStatus ?? null;
+    const item =
+      itemStatus !== null
+        ? {
+            status: itemStatus,
+            current_execution_ref: view.itemCurrentExecutionRef ?? null,
+          }
+        : null;
+    const activeDispatch =
+      item !== null &&
+      item.status === 'doing' &&
+      item.current_execution_ref === view.executionRef;
+    const liveNow =
+      !suppressed &&
+      presence !== null &&
+      item !== null &&
+      isLiveChatWorkWorkerPresence(presence, item, nowMs);
+    const matchingContinuity =
+      continuity !== null &&
+      continuity !== undefined &&
+      attemptKey !== null &&
+      continuity.attemptKey === attemptKey
+        ? continuity
+        : null;
+
+    if (liveNow) {
+      statusKey = 'working';
+      confirmedAtMs = presence.sampled_at_ms;
+    } else if (
+      activeDispatch &&
+      matchingContinuity !== null &&
+      canHoldContinuityDuringBriefGap(matchingContinuity, presence, nowMs, options)
+    ) {
+      statusKey = 'started';
+      heldLastConfirmedElapsedMs = matchingContinuity.lastConfirmedElapsedMs;
+      confirmedAtMs = matchingContinuity.sampledAtMs;
+    } else if (presence !== null || matchingContinuity !== null) {
+      statusKey = 'unavailable';
     }
   }
 
@@ -1681,6 +2206,11 @@ export function resolveChatWorkExecutionFooterState(
       startedAtMs !== null && startedAtMs > 0
         ? { kind: 'elapsed', startedAtMs }
         : null;
+  } else if (statusKey === 'started') {
+    duration =
+      heldLastConfirmedElapsedMs !== null && heldLastConfirmedElapsedMs >= 0
+        ? { kind: 'last_confirmed', elapsedMs: heldLastConfirmedElapsedMs }
+        : null;
   } else if (isTerminalChatWorkExecution(view.statusKey)) {
     duration = view.duration;
   } else {
@@ -1690,12 +2220,203 @@ export function resolveChatWorkExecutionFooterState(
   }
 
   const presentation = EXECUTION_STATUS_PRESENTATION[statusKey];
+  const durationLabel = formatChatWorkExecutionDuration(duration, nowMs);
+  const confirmedAge = formatConfirmedAgeLabel(confirmedAtMs, nowMs);
+
+  let statusDetail: string | null = null;
+  if (statusKey === 'working') {
+    statusDetail =
+      confirmedAge !== null
+        ? `Started, live evidence fresh (last confirmed ${confirmedAge})`
+        : 'Started, live evidence fresh';
+  } else if (statusKey === 'started') {
+    statusDetail =
+      confirmedAge !== null
+        ? `Started, last confirmed status (confirmed ${confirmedAge})`
+        : 'Started, last confirmed status';
+  }
+
+  let durationDetail: string | null = null;
+  if (duration !== null && durationLabel !== null) {
+    if (duration.kind === 'elapsed') {
+      const elapsedValue = formatDurationMs(
+        Math.trunc(nowMs) - duration.startedAtMs,
+      );
+      durationDetail =
+        confirmedAge !== null
+          ? `Elapsed ${elapsedValue}, live evidence fresh (last confirmed ${confirmedAge})`
+          : `Elapsed ${elapsedValue}, live evidence fresh`;
+    } else if (duration.kind === 'last_confirmed') {
+      const elapsedValue = formatDurationMs(Math.trunc(duration.elapsedMs));
+      durationDetail =
+        confirmedAge !== null
+          ? `Last confirmed elapsed ${elapsedValue} (confirmed ${confirmedAge})`
+          : `Last confirmed elapsed ${elapsedValue}`;
+    }
+  }
+
   return {
     statusKey,
     statusLabel: presentation.label,
+    ...(statusDetail !== null
+      ? { statusAriaLabel: statusDetail, statusTitle: statusDetail }
+      : {}),
     tone: presentation.tone,
     duration,
-    durationLabel: formatChatWorkExecutionDuration(duration, nowMs),
+    durationLabel,
+    ...(durationDetail !== null
+      ? { durationAriaLabel: durationDetail, durationTitle: durationDetail }
+      : {}),
+  };
+}
+
+/**
+ * Pure per-render footer resolver that advances bounded continuity entries for
+ * confirmed live Worker attempts without adding timers or backend queries.
+ * Preserves original observation expiry verbatim across brief gaps, closes
+ * brief-gap eligibility immediately on explicit `non_live`, restarted hosts, or
+ * real expiration while retaining a scoped attempt-specific last-confirmed
+ * marker for non-terminal attempts so empty `worker_presence` stays
+ * `Status unavailable` instead of reverting to `Dispatched`, immediately evicts
+ * on terminal results, and never carries state across foreign runs or chats.
+ */
+export function resolveChatWorkExecutionFootersWithContinuity(
+  previousStore: ChatWorkExecutionContinuityStore,
+  events: readonly {
+    readonly key: string;
+    readonly workerExecution?: ChatWorkExecutionSummaryView | null;
+  }[],
+  nowMs: number,
+  options: ChatWorkExecutionFooterResolutionOptions = {},
+): ReconciledChatWorkExecutionFooters {
+  const truncatedNowMs = Number.isFinite(nowMs) ? Math.trunc(nowMs) : Number.NaN;
+  const activeChatKey = options.activeChatKey ?? null;
+  const activeChatPrefix =
+    activeChatKey !== null ? `${activeChatKey}\u0000` : null;
+
+  const nextStore = new Map<string, ChatWorkExecutionContinuityEntry>();
+  const footersByEventKey = new Map<string, ChatWorkExecutionFooterState>();
+  const seenAttemptKeys = new Set<string>();
+
+  for (const event of events) {
+    const view = event.workerExecution ?? null;
+    if (view === null) {
+      continue;
+    }
+    const attemptKey = resolveChatWorkExecutionAttemptKey(view);
+    if (attemptKey !== null) {
+      seenAttemptKeys.add(attemptKey);
+    }
+    const cached =
+      attemptKey !== null ? previousStore.get(attemptKey) : undefined;
+    const footerState = resolveChatWorkExecutionFooterState(
+      view,
+      nowMs,
+      cached ?? null,
+      options,
+    );
+    footersByEventKey.set(event.key, footerState);
+
+    if (attemptKey === null) {
+      continue;
+    }
+
+    if (footerState.statusKey === 'working') {
+      const presence = view.presence ?? null;
+      if (
+        presence !== null &&
+        presence.sampled_at_ms !== null &&
+        presence.expires_at_ms !== null &&
+        Number.isFinite(truncatedNowMs)
+      ) {
+        const confirmedAtMs = Math.min(truncatedNowMs, presence.expires_at_ms);
+        const startedAtMs = view.startedAtMs ?? null;
+        const confirmedElapsedMs =
+          startedAtMs !== null && startedAtMs > 0 && confirmedAtMs >= startedAtMs
+            ? confirmedAtMs - startedAtMs
+            : null;
+        const trustworthyOrigin = hasTrustworthyChatWorkPresenceOrigin(presence);
+        nextStore.set(attemptKey, {
+          attemptKey,
+          hostInstanceId: presence.host_instance_id,
+          invocationId: presence.invocation_id,
+          claimId: presence.claim_id,
+          sequence: presence.sequence,
+          sampledAtMs: presence.sampled_at_ms,
+          maxSampleAgeMs: presence.max_sample_age_ms,
+          expiresAtMs: presence.expires_at_ms,
+          lastConfirmedAtMs: confirmedAtMs,
+          lastConfirmedElapsedMs: confirmedElapsedMs,
+          ...(trustworthyOrigin ? {} : { briefGapClosed: true }),
+        });
+      }
+      continue;
+    }
+
+    if (footerState.statusKey === 'started' && cached !== undefined) {
+      // Preserve the original confirmed observation verbatim: never extend
+      // `expiresAtMs` or advance `lastConfirmedElapsedMs` during a brief gap.
+      nextStore.set(attemptKey, cached);
+      continue;
+    }
+
+    if (cached !== undefined && !isTerminalChatWorkExecution(view.statusKey)) {
+      // Brief-gap continuity is closed, but retain the scoped attempt-specific
+      // last-confirmed marker while the non-terminal attempt remains present so
+      // empty `worker_presence` stays `Status unavailable` instead of reverting
+      // to `Dispatched`.
+      nextStore.set(attemptKey, closeContinuityBriefGap(cached));
+    }
+  }
+
+  const deferredClosedEntries: Array<
+    readonly [string, ChatWorkExecutionContinuityEntry]
+  > = [];
+  for (const [attemptKey, entry] of previousStore) {
+    if (seenAttemptKeys.has(attemptKey)) {
+      continue;
+    }
+    if (activeChatPrefix !== null && attemptKey.startsWith(activeChatPrefix)) {
+      continue;
+    }
+    if (entry.briefGapClosed !== true && Number.isFinite(truncatedNowMs)) {
+      const briefGapMs = resolveBriefGapWindowMs(entry.maxSampleAgeMs, options);
+      const gapDeadlineMs = entry.expiresAtMs + briefGapMs;
+      if (
+        Number.isFinite(entry.sampledAtMs) &&
+        Number.isFinite(entry.expiresAtMs) &&
+        Number.isFinite(gapDeadlineMs) &&
+        truncatedNowMs >= entry.sampledAtMs &&
+        truncatedNowMs < gapDeadlineMs
+      ) {
+        if (nextStore.size < MAX_CHAT_WORK_EXECUTIONS_TOTAL) {
+          nextStore.set(attemptKey, entry);
+        }
+        continue;
+      }
+    }
+    deferredClosedEntries.push([attemptKey, closeContinuityBriefGap(entry)]);
+  }
+  for (const [attemptKey, closedEntry] of deferredClosedEntries) {
+    if (nextStore.size >= MAX_CHAT_WORK_EXECUTIONS_TOTAL) {
+      break;
+    }
+    nextStore.set(attemptKey, closedEntry);
+  }
+
+  let storeChanged = nextStore.size !== previousStore.size;
+  if (!storeChanged) {
+    for (const [attemptKey, entry] of nextStore) {
+      if (!continuityEntriesEqual(previousStore.get(attemptKey), entry)) {
+        storeChanged = true;
+        break;
+      }
+    }
+  }
+
+  return {
+    store: storeChanged ? nextStore : previousStore,
+    footersByEventKey,
   };
 }
 
@@ -1759,8 +2480,17 @@ export function buildChatWorkExecutionSummaries(
     if (conflictingJoinKeys.has(joinKey)) {
       continue;
     }
+    const presenceJoinKey = chatWorkPresenceJoinKey(
+      execution.item_id,
+      execution.execution_ref,
+      execution.approval_id,
+      execution.task_id,
+      execution.run_id,
+      execution.worker_id,
+    );
     summaries.push({
       key: `${chatKey}\u0000${joinKey}`,
+      attemptKey: `${chatKey}\u0000${presenceJoinKey}`,
       executionRef: execution.execution_ref,
       itemId: execution.item_id,
       provider: execution.provider,
@@ -1772,17 +2502,7 @@ export function buildChatWorkExecutionSummaries(
       tone: presentation.tone,
       duration: resolveChatWorkExecutionDuration(execution, statusKey),
       startedAtMs: execution.started_at_ms,
-      presence:
-        presenceByExecution.get(
-          chatWorkPresenceJoinKey(
-            execution.item_id,
-            execution.execution_ref,
-            execution.approval_id,
-            execution.task_id,
-            execution.run_id,
-            execution.worker_id,
-          ),
-        ) ?? null,
+      presence: presenceByExecution.get(presenceJoinKey) ?? null,
       itemStatus: item?.status ?? null,
       itemCurrentExecutionRef: item?.current_execution_ref ?? null,
     });

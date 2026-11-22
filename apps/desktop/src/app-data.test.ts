@@ -20,11 +20,16 @@ import {
   updateActiveDraft,
 } from './app-profile-state.ts';
 import type {
+  BacklogItem,
   ObservationJob,
   ObservationRequest,
   ObservationSnapshot,
   ObservationSnapshotRequest,
   ObservationSource,
+  WorkspaceBacklogEvent,
+  WorkspaceBacklogWorkerPresence,
+  WorkspaceChatWork,
+  WorkspaceWorkerExecution,
 } from './observation/types.ts';
 import {
   PROJECTS_ARCHIVE_STORAGE_KEY,
@@ -2590,6 +2595,701 @@ describe('app-data DesktopAppCoordinator', () => {
     assert.equal(
       coordinator.projectWorkspace().selectedChatUnavailable?.threadLabel,
       'Beta Chat',
+    );
+
+    coordinator.dispose();
+  });
+
+  it('reconciles regressed Worker presence on newer refreshes only for the exact chat, item, execution, and trustworthy origin/epoch without extending expiry', async () => {
+    const makeWorkerItem = (
+      bindingId: string,
+      overrides: Partial<BacklogItem> = {},
+    ): BacklogItem => ({
+      item_id: 'blg_worker_01',
+      binding_id: bindingId,
+      revision: 3,
+      title: 'Fix Worker presence flicker',
+      acceptance_condition: 'Single row stays stable across brief gaps.',
+      delivery_description: 'Frontend reconciliation and continuity.',
+      kind: 'worker',
+      status: 'doing',
+      blocked_reason: null,
+      current_execution_ref: 'exec_worker_01',
+      completion_note: null,
+      completion_evidence: null,
+      completed_at_ms: null,
+      created_at_ms: NOW_MS - 40_000,
+      updated_at_ms: NOW_MS - 15_000,
+      ...overrides,
+    });
+
+    const makeWorkerEvent = (
+      overrides: Partial<WorkspaceBacklogEvent> = {},
+    ): WorkspaceBacklogEvent => ({
+      event_id: 'blg_worker_01:3',
+      sequence: 3,
+      item_id: 'blg_worker_01',
+      revision: 3,
+      action: 'worker_execution_attached',
+      recorded_at_ms: NOW_MS - 15_000,
+      title: 'Worker execution attached',
+      status: 'doing',
+      execution_ref: 'exec_worker_01',
+      outcome: null,
+      note: null,
+      ...overrides,
+    });
+
+    const makeWorkerExecution = (
+      overrides: Partial<WorkspaceWorkerExecution> = {},
+    ): WorkspaceWorkerExecution => ({
+      item_id: 'blg_worker_01',
+      execution_ref: 'exec_worker_01',
+      approval_id: 'apr_worker_01',
+      task_id: 'task_worker_01',
+      session_binding_id: 'sbx_runtime_01',
+      run_id: 'run_worker_01',
+      worker_id: 'wrk_worker_01',
+      provider: 'google',
+      requested_model: 'gemini-4-argon-high',
+      observed_model: 'gemini-4-argon-high',
+      requested_effort: 'high',
+      observed_effort: 'high',
+      worker_status: 'running',
+      started_at_ms: NOW_MS - 14_000,
+      finished_at_ms: null,
+      duration_ms: null,
+      outcome: null,
+      acceptance: null,
+      ...overrides,
+    });
+
+    const makeWorkerPresence = (
+      overrides: Partial<WorkspaceBacklogWorkerPresence> = {},
+    ): WorkspaceBacklogWorkerPresence => ({
+      item_id: 'blg_worker_01',
+      execution_ref: 'exec_worker_01',
+      approval_id: 'apr_worker_01',
+      task_id: 'task_worker_01',
+      run_id: 'run_worker_01',
+      worker_id: 'wrk_worker_01',
+      claim_id: 'claim_01',
+      host_instance_id: 'host_01',
+      invocation_id: 'inv_01',
+      sequence: 12,
+      availability: 'live',
+      freshness: 'fresh',
+      live: true,
+      sampled_at_ms: NOW_MS - 1_000,
+      sample_age_ms: 1_000,
+      max_sample_age_ms: 5_000,
+      expires_at_ms: NOW_MS + 4_000,
+      ...overrides,
+    });
+
+    const makeChatWorkSnapshot = (
+      generatedAtMs: number,
+      chatWork: WorkspaceChatWork[],
+      sources: ObservationSource[] = [makeSource()],
+    ): WorkspaceSnapshot =>
+      makeWorkspaceSnapshot({
+        generated_at_ms: generatedAtMs,
+        observation: makeLegacyObservationSnapshot({
+          generated_at_ms: generatedAtMs,
+          sources,
+          jobs: [],
+          requests: [],
+        }),
+        chats: [
+          makeChatSummary(IDENTITY_A, { thread_label: 'Chat A' }),
+          makeChatSummary(IDENTITY_B, { thread_label: 'Chat B' }),
+        ],
+        native_samples: [
+          makeNativeSample(IDENTITY_A, {
+            sequence: Math.max(1, Math.trunc((generatedAtMs - NOW_MS) / 500) + 1),
+            observed_at_ms: generatedAtMs - 500,
+            last_success_at_ms: generatedAtMs - 500,
+            activity: 'idle',
+          }),
+          makeNativeSample(IDENTITY_B, {
+            sequence: 1,
+            observed_at_ms: generatedAtMs - 500,
+            last_success_at_ms: generatedAtMs - 500,
+            activity: 'idle',
+          }),
+        ],
+        job_histories: [],
+        chat_work: chatWork,
+      });
+
+    const makeAlphaWork = (
+      overrides: Partial<WorkspaceChatWork> = {},
+    ): WorkspaceChatWork => ({
+      identity: IDENTITY_A,
+      availability: 'available',
+      items: [makeWorkerItem(IDENTITY_A.binding_id)],
+      events: [makeWorkerEvent()],
+      worker_presence: [makeWorkerPresence()],
+      worker_executions: [makeWorkerExecution()],
+      bounds: {
+        items_omitted: 0,
+        events_omitted: 0,
+        presence_omitted: 0,
+        executions_omitted: 0,
+      },
+      ...overrides,
+    });
+
+    const makeBetaWork = (
+      overrides: Partial<WorkspaceChatWork> = {},
+    ): WorkspaceChatWork => ({
+      identity: IDENTITY_B,
+      availability: 'available',
+      items: [makeWorkerItem(IDENTITY_B.binding_id)],
+      events: [makeWorkerEvent()],
+      worker_presence: [],
+      worker_executions: [
+        makeWorkerExecution({ session_binding_id: 'sbx_runtime_beta_01' }),
+      ],
+      bounds: {
+        items_omitted: 0,
+        events_omitted: 0,
+        presence_omitted: 0,
+        executions_omitted: 0,
+      },
+      ...overrides,
+    });
+
+    let currentNowMs = NOW_MS;
+    let snapshotToServe = makeChatWorkSnapshot(NOW_MS, [
+      makeAlphaWork(),
+      makeBetaWork(),
+    ]);
+
+    const coordinator = new DesktopAppCoordinator({
+      fetchWorkspaceSnapshot: async () => snapshotToServe,
+      now: () => currentNowMs,
+    });
+
+    await coordinator.initialize();
+    const initialAlphaPresence =
+      coordinator.getState().workspaceSnapshot?.chat_work[0]?.worker_presence[0];
+    assert.equal(initialAlphaPresence?.sequence, 12);
+    assert.equal(initialAlphaPresence?.expires_at_ms, NOW_MS + 4_000);
+
+    // 1. Newer overall snapshot carrying an older sequence for the exact same
+    // chat, item, execution, and host/invocation/claim keeps seq 12 verbatim
+    // without extending its original expires_at_ms or inflating presence_omitted.
+    currentNowMs = NOW_MS + 1_000;
+    snapshotToServe = makeChatWorkSnapshot(currentNowMs, [
+      makeAlphaWork({
+        worker_presence: [
+          makeWorkerPresence({
+            sequence: 11,
+            sampled_at_ms: NOW_MS - 3_000,
+            sample_age_ms: 4_000,
+            expires_at_ms: NOW_MS + 2_000,
+          }),
+        ],
+      }),
+      makeBetaWork({
+        worker_presence: [
+          makeWorkerPresence({
+            sequence: 1,
+            availability: 'unavailable',
+            freshness: 'not_applicable',
+            live: false,
+            sampled_at_ms: NOW_MS - 3_000,
+            sample_age_ms: null,
+            expires_at_ms: null,
+          }),
+        ],
+      }),
+    ]);
+    await coordinator.refreshWorkspace({ mode: 'refresh' });
+    const afterRegressedSeq = coordinator.getState().workspaceSnapshot!;
+    assert.equal(afterRegressedSeq.generated_at_ms, NOW_MS + 1_000);
+    const alphaAfterSeq = afterRegressedSeq.chat_work.find(
+      (entry) =>
+        formatWorkspaceChatIdentityKey(entry.identity) ===
+        formatWorkspaceChatIdentityKey(IDENTITY_A),
+    )!;
+    const betaAfterSeq = afterRegressedSeq.chat_work.find(
+      (entry) =>
+        formatWorkspaceChatIdentityKey(entry.identity) ===
+        formatWorkspaceChatIdentityKey(IDENTITY_B),
+    )!;
+    assert.equal(alphaAfterSeq.worker_presence.length, 1);
+    assert.equal(alphaAfterSeq.worker_presence[0]!.sequence, 12);
+    assert.equal(alphaAfterSeq.worker_presence[0]!.sampled_at_ms, NOW_MS - 1_000);
+    assert.equal(alphaAfterSeq.worker_presence[0]!.expires_at_ms, NOW_MS + 4_000);
+    assert.equal(alphaAfterSeq.bounds.presence_omitted, 0);
+    // Sibling chat with identical item/execution/host tokens remains isolated.
+    assert.equal(betaAfterSeq.worker_presence[0]!.availability, 'unavailable');
+    assert.equal(betaAfterSeq.worker_presence[0]!.sequence, 1);
+
+    // 2. Same sequence with regressed timestamp or stale degradation of the same
+    // sample also retains the fresher sample without changing its original expiry.
+    currentNowMs = NOW_MS + 1_500;
+    snapshotToServe = makeChatWorkSnapshot(currentNowMs, [
+      makeAlphaWork({
+        worker_presence: [
+          makeWorkerPresence({
+            sequence: 12,
+            availability: 'live',
+            freshness: 'stale',
+            live: false,
+            sampled_at_ms: NOW_MS - 1_000,
+            sample_age_ms: 2_500,
+            expires_at_ms: NOW_MS + 4_000,
+          }),
+        ],
+      }),
+      makeBetaWork(),
+    ]);
+    await coordinator.refreshWorkspace({ mode: 'refresh' });
+    const afterSameSeqStale =
+      coordinator.getState().workspaceSnapshot!.chat_work[0]!.worker_presence[0]!;
+    assert.equal(afterSameSeqStale.sequence, 12);
+    assert.equal(afterSameSeqStale.freshness, 'fresh');
+    assert.equal(afterSameSeqStale.live, true);
+    assert.equal(afterSameSeqStale.expires_at_ms, NOW_MS + 4_000);
+
+    // 3. Newer sequence unavailable sample is NOT suppressed by older live seq 12.
+    currentNowMs = NOW_MS + 2_000;
+    snapshotToServe = makeChatWorkSnapshot(currentNowMs, [
+      makeAlphaWork({
+        worker_presence: [
+          makeWorkerPresence({
+            sequence: 13,
+            availability: 'unavailable',
+            freshness: 'not_applicable',
+            live: false,
+            sampled_at_ms: NOW_MS + 1_800,
+            sample_age_ms: null,
+            expires_at_ms: null,
+          }),
+        ],
+      }),
+      makeBetaWork(),
+    ]);
+    await coordinator.refreshWorkspace({ mode: 'refresh' });
+    assert.equal(
+      coordinator.getState().workspaceSnapshot!.chat_work[0]!.worker_presence[0]!
+        .availability,
+      'unavailable',
+    );
+    assert.equal(
+      coordinator.getState().workspaceSnapshot!.chat_work[0]!.worker_presence[0]!
+        .sequence,
+      13,
+    );
+
+    // 4. Recovery to fresh seq 14, then explicit non_live at the same seq 14 wins
+    // immediately, and a subsequent regressed live seq 13 cannot resurrect Working.
+    currentNowMs = NOW_MS + 3_000;
+    snapshotToServe = makeChatWorkSnapshot(currentNowMs, [
+      makeAlphaWork({
+        worker_presence: [
+          makeWorkerPresence({
+            sequence: 14,
+            sampled_at_ms: NOW_MS + 2_500,
+            sample_age_ms: 500,
+            expires_at_ms: NOW_MS + 7_500,
+          }),
+        ],
+      }),
+      makeBetaWork(),
+    ]);
+    await coordinator.refreshWorkspace({ mode: 'refresh' });
+    assert.equal(
+      coordinator.getState().workspaceSnapshot!.chat_work[0]!.worker_presence[0]!.live,
+      true,
+    );
+
+    currentNowMs = NOW_MS + 3_500;
+    snapshotToServe = makeChatWorkSnapshot(currentNowMs, [
+      makeAlphaWork({
+        worker_presence: [
+          makeWorkerPresence({
+            sequence: 14,
+            availability: 'non_live',
+            freshness: 'not_applicable',
+            live: false,
+            sampled_at_ms: NOW_MS + 2_500,
+            sample_age_ms: null,
+            expires_at_ms: null,
+          }),
+        ],
+      }),
+      makeBetaWork(),
+    ]);
+    await coordinator.refreshWorkspace({ mode: 'refresh' });
+    assert.equal(
+      coordinator.getState().workspaceSnapshot!.chat_work[0]!.worker_presence[0]!
+        .availability,
+      'non_live',
+    );
+
+    currentNowMs = NOW_MS + 4_000;
+    snapshotToServe = makeChatWorkSnapshot(currentNowMs, [
+      makeAlphaWork({
+        worker_presence: [
+          makeWorkerPresence({
+            sequence: 13,
+            sampled_at_ms: NOW_MS + 2_000,
+            sample_age_ms: 2_000,
+            expires_at_ms: NOW_MS + 7_000,
+          }),
+        ],
+      }),
+      makeBetaWork(),
+    ]);
+    await coordinator.refreshWorkspace({ mode: 'refresh' });
+    assert.equal(
+      coordinator.getState().workspaceSnapshot!.chat_work[0]!.worker_presence[0]!
+        .availability,
+      'non_live',
+    );
+    assert.equal(
+      coordinator.getState().workspaceSnapshot!.chat_work[0]!.worker_presence[0]!
+        .sequence,
+      14,
+    );
+
+    // 5. Restarted host, new invocation/claim epoch, or untrustworthy null origin
+    // never carries previous epoch state forward.
+    currentNowMs = NOW_MS + 5_000;
+    snapshotToServe = makeChatWorkSnapshot(currentNowMs, [
+      makeAlphaWork({
+        worker_presence: [
+          makeWorkerPresence({
+            host_instance_id: 'host_02',
+            invocation_id: 'inv_02',
+            claim_id: 'claim_02',
+            sequence: 1,
+            sampled_at_ms: NOW_MS + 4_500,
+            sample_age_ms: 500,
+            expires_at_ms: NOW_MS + 9_500,
+          }),
+        ],
+      }),
+      makeBetaWork(),
+    ]);
+    await coordinator.refreshWorkspace({ mode: 'refresh' });
+    assert.equal(
+      coordinator.getState().workspaceSnapshot!.chat_work[0]!.worker_presence[0]!
+        .host_instance_id,
+      'host_02',
+    );
+    assert.equal(
+      coordinator.getState().workspaceSnapshot!.chat_work[0]!.worker_presence[0]!.live,
+      true,
+    );
+
+    currentNowMs = NOW_MS + 5_500;
+    snapshotToServe = makeChatWorkSnapshot(currentNowMs, [
+      makeAlphaWork({
+        worker_presence: [
+          makeWorkerPresence({
+            host_instance_id: 'host_03',
+            invocation_id: 'inv_03',
+            claim_id: 'claim_03',
+            sequence: 1,
+            availability: 'unavailable',
+            freshness: 'not_applicable',
+            live: false,
+            sampled_at_ms: NOW_MS + 4_000,
+            sample_age_ms: null,
+            expires_at_ms: null,
+          }),
+        ],
+      }),
+      makeBetaWork(),
+    ]);
+    await coordinator.refreshWorkspace({ mode: 'refresh' });
+    assert.equal(
+      coordinator.getState().workspaceSnapshot!.chat_work[0]!.worker_presence[0]!
+        .host_instance_id,
+      'host_03',
+    );
+    assert.equal(
+      coordinator.getState().workspaceSnapshot!.chat_work[0]!.worker_presence[0]!
+        .availability,
+      'unavailable',
+    );
+
+    // Untrustworthy null origin/epoch never retains previous live presence.
+    currentNowMs = NOW_MS + 5_700;
+    snapshotToServe = makeChatWorkSnapshot(currentNowMs, [
+      makeAlphaWork({
+        worker_presence: [
+          makeWorkerPresence({
+            host_instance_id: 'host_03',
+            invocation_id: 'inv_03',
+            claim_id: 'claim_03',
+            sequence: 4,
+            sampled_at_ms: NOW_MS + 5_400,
+            sample_age_ms: 300,
+            expires_at_ms: NOW_MS + 10_400,
+          }),
+        ],
+      }),
+      makeBetaWork(),
+    ]);
+    await coordinator.refreshWorkspace({ mode: 'refresh' });
+    assert.equal(
+      coordinator.getState().workspaceSnapshot!.chat_work[0]!.worker_presence[0]!.live,
+      true,
+    );
+
+    currentNowMs = NOW_MS + 5_850;
+    snapshotToServe = makeChatWorkSnapshot(currentNowMs, [
+      makeAlphaWork({
+        worker_presence: [
+          makeWorkerPresence({
+            host_instance_id: null,
+            invocation_id: null,
+            claim_id: null,
+            sequence: 1,
+            availability: 'unavailable',
+            freshness: 'not_applicable',
+            live: false,
+            sampled_at_ms: NOW_MS + 4_000,
+            sample_age_ms: null,
+            expires_at_ms: null,
+          }),
+        ],
+      }),
+      makeBetaWork(),
+    ]);
+    await coordinator.refreshWorkspace({ mode: 'refresh' });
+    assert.equal(
+      coordinator.getState().workspaceSnapshot!.chat_work[0]!.worker_presence[0]!
+        .host_instance_id,
+      null,
+    );
+    assert.equal(
+      coordinator.getState().workspaceSnapshot!.chat_work[0]!.worker_presence[0]!
+        .availability,
+      'unavailable',
+    );
+
+    // Re-seed live on host_03 seq 5, then test foreign run, omitted presence,
+    // terminal execution, and unavailable source.
+    currentNowMs = NOW_MS + 6_000;
+    snapshotToServe = makeChatWorkSnapshot(currentNowMs, [
+      makeAlphaWork({
+        worker_presence: [
+          makeWorkerPresence({
+            host_instance_id: 'host_03',
+            invocation_id: 'inv_03',
+            claim_id: 'claim_03',
+            sequence: 5,
+            sampled_at_ms: NOW_MS + 5_500,
+            sample_age_ms: 500,
+            expires_at_ms: NOW_MS + 10_500,
+          }),
+        ],
+      }),
+      makeBetaWork(),
+    ]);
+    await coordinator.refreshWorkspace({ mode: 'refresh' });
+    assert.equal(
+      coordinator.getState().workspaceSnapshot!.chat_work[0]!.worker_presence[0]!
+        .sequence,
+      5,
+    );
+
+    // Foreign run on same item/execution_ref never inherits host_03 seq 5.
+    currentNowMs = NOW_MS + 6_500;
+    snapshotToServe = makeChatWorkSnapshot(currentNowMs, [
+      makeAlphaWork({
+        worker_executions: [
+          makeWorkerExecution({ run_id: 'run_foreign_02', worker_id: 'wrk_foreign_02' }),
+        ],
+        worker_presence: [
+          makeWorkerPresence({
+            run_id: 'run_foreign_02',
+            worker_id: 'wrk_foreign_02',
+            host_instance_id: 'host_03',
+            invocation_id: 'inv_03',
+            claim_id: 'claim_03',
+            sequence: 1,
+            availability: 'unavailable',
+            freshness: 'not_applicable',
+            live: false,
+            sampled_at_ms: NOW_MS + 5_000,
+            sample_age_ms: null,
+            expires_at_ms: null,
+          }),
+        ],
+      }),
+      makeBetaWork(),
+    ]);
+    await coordinator.refreshWorkspace({ mode: 'refresh' });
+    assert.equal(
+      coordinator.getState().workspaceSnapshot!.chat_work[0]!.worker_presence[0]!.run_id,
+      'run_foreign_02',
+    );
+    assert.equal(
+      coordinator.getState().workspaceSnapshot!.chat_work[0]!.worker_presence[0]!
+        .availability,
+      'unavailable',
+    );
+
+    // Re-seed live on original attempt, then verify omitted presence is NOT resurrected.
+    currentNowMs = NOW_MS + 7_000;
+    snapshotToServe = makeChatWorkSnapshot(currentNowMs, [
+      makeAlphaWork({
+        worker_presence: [
+          makeWorkerPresence({
+            host_instance_id: 'host_03',
+            invocation_id: 'inv_03',
+            claim_id: 'claim_03',
+            sequence: 6,
+            sampled_at_ms: NOW_MS + 6_500,
+            sample_age_ms: 500,
+            expires_at_ms: NOW_MS + 11_500,
+          }),
+        ],
+      }),
+      makeBetaWork(),
+    ]);
+    await coordinator.refreshWorkspace({ mode: 'refresh' });
+    assert.equal(
+      coordinator.getState().workspaceSnapshot!.chat_work[0]!.worker_presence.length,
+      1,
+    );
+
+    currentNowMs = NOW_MS + 7_500;
+    snapshotToServe = makeChatWorkSnapshot(currentNowMs, [
+      makeAlphaWork({ worker_presence: [] }),
+      makeBetaWork(),
+    ]);
+    await coordinator.refreshWorkspace({ mode: 'refresh' });
+    assert.deepEqual(
+      coordinator.getState().workspaceSnapshot!.chat_work[0]!.worker_presence,
+      [],
+    );
+
+    // Re-seed live, then verify terminal execution immediately wins over retained live.
+    currentNowMs = NOW_MS + 8_000;
+    snapshotToServe = makeChatWorkSnapshot(currentNowMs, [
+      makeAlphaWork({
+        worker_presence: [
+          makeWorkerPresence({
+            host_instance_id: 'host_03',
+            invocation_id: 'inv_03',
+            claim_id: 'claim_03',
+            sequence: 7,
+            sampled_at_ms: NOW_MS + 7_500,
+            sample_age_ms: 500,
+            expires_at_ms: NOW_MS + 12_500,
+          }),
+        ],
+      }),
+      makeBetaWork(),
+    ]);
+    await coordinator.refreshWorkspace({ mode: 'refresh' });
+    assert.equal(
+      coordinator.getState().workspaceSnapshot!.chat_work[0]!.worker_presence[0]!.live,
+      true,
+    );
+
+    currentNowMs = NOW_MS + 8_500;
+    snapshotToServe = makeChatWorkSnapshot(currentNowMs, [
+      makeAlphaWork({
+        worker_executions: [
+          makeWorkerExecution({
+            worker_status: 'failed',
+            outcome: 'failure',
+            finished_at_ms: NOW_MS + 8_400,
+            duration_ms: 22_400,
+          }),
+        ],
+        worker_presence: [
+          makeWorkerPresence({
+            host_instance_id: 'host_03',
+            invocation_id: 'inv_03',
+            claim_id: 'claim_03',
+            sequence: 6,
+            availability: 'unavailable',
+            freshness: 'not_applicable',
+            live: false,
+            sampled_at_ms: NOW_MS + 7_000,
+            sample_age_ms: null,
+            expires_at_ms: null,
+          }),
+        ],
+      }),
+      makeBetaWork(),
+    ]);
+    await coordinator.refreshWorkspace({ mode: 'refresh' });
+    assert.equal(
+      coordinator.getState().workspaceSnapshot!.chat_work[0]!.worker_presence[0]!
+        .availability,
+      'unavailable',
+    );
+    assert.equal(
+      coordinator.getState().workspaceSnapshot!.chat_work[0]!.worker_executions?.[0]!
+        .worker_status,
+      'failed',
+    );
+
+    // Re-seed live, then verify unavailable source never retains prior live presence.
+    currentNowMs = NOW_MS + 9_000;
+    snapshotToServe = makeChatWorkSnapshot(currentNowMs, [
+      makeAlphaWork({
+        worker_presence: [
+          makeWorkerPresence({
+            host_instance_id: 'host_03',
+            invocation_id: 'inv_03',
+            claim_id: 'claim_03',
+            sequence: 8,
+            sampled_at_ms: NOW_MS + 8_500,
+            sample_age_ms: 500,
+            expires_at_ms: NOW_MS + 13_500,
+          }),
+        ],
+      }),
+      makeBetaWork(),
+    ]);
+    await coordinator.refreshWorkspace({ mode: 'refresh' });
+    assert.equal(
+      coordinator.getState().workspaceSnapshot!.chat_work[0]!.worker_presence[0]!.live,
+      true,
+    );
+
+    currentNowMs = NOW_MS + 9_500;
+    snapshotToServe = makeChatWorkSnapshot(
+      currentNowMs,
+      [
+        makeAlphaWork({
+          worker_presence: [
+            makeWorkerPresence({
+              host_instance_id: 'host_03',
+              invocation_id: 'inv_03',
+              claim_id: 'claim_03',
+              sequence: 7,
+              availability: 'unavailable',
+              freshness: 'not_applicable',
+              live: false,
+              sampled_at_ms: NOW_MS + 8_000,
+              sample_age_ms: null,
+              expires_at_ms: null,
+            }),
+          ],
+        }),
+        makeBetaWork(),
+      ],
+      [makeSource({ availability: 'unavailable', message: 'Source unreachable' })],
+    );
+    await coordinator.refreshWorkspace({ mode: 'refresh' });
+    assert.equal(
+      coordinator.getState().workspaceSnapshot!.chat_work[0]!.worker_presence[0]!
+        .availability,
+      'unavailable',
     );
 
     coordinator.dispose();
