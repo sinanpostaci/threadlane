@@ -206,6 +206,15 @@ pub struct ApprovedTaskRecord {
 }
 
 impl ApprovedTaskRecord {
+    /// Whether the complete frozen task selects one of the exact AGY no-effort models.
+    #[must_use]
+    pub fn is_antigravity_no_effort_worker(&self) -> bool {
+        self.provider == Some(WorkerProvider::Antigravity)
+            && self.effort.is_none()
+            && threadlane_workers::antigravity_models::antigravity_no_effort_model(&self.model_arg)
+            && self.is_frozen_headless_worker()
+    }
+
     /// Verify actual Codex launch pins against this frozen task and its execution worktree.
     /// Missing runtime telemetry remains missing; supplied telemetry must still match.
     pub fn matches_codex_task_launch_report(

@@ -24,6 +24,31 @@ use threadlane_workers::{
 };
 use tokio::sync::{mpsc, watch};
 
+#[tokio::test]
+async fn antigravity_no_effort_rejects_malformed_effort_without_inventing_telemetry() {
+    let env = TestEnv::new();
+    for (index, effort) in ["0", "\"\""].into_iter().enumerate() {
+        let executable = env.write_fake_executable(
+            &format!("fake-agy-invalid-{index}"),
+            &format!(
+                r#"
+printf '%s\n' '{{"event":"init","init":{{"model":"gemini-pro-orchestrator","effort":{effort}}}}}'
+printf '%s\n' '{{"event":"result","result":{{"status":"SUCCESS"}}}}'
+"#
+            ),
+        );
+        let mut spec = env.antigravity_spec(executable, "No-effort invalid telemetry");
+        spec.model = "gemini-pro-orchestrator".to_string();
+        spec.effort = None;
+        spec.allowed_models = BTreeSet::from([spec.model.clone()]);
+        let workdir = env.root_dir.join(format!("invalid-effort-{index}"));
+        fs::create_dir_all(&workdir).unwrap();
+        let report = run_worker(&spec, &workdir).await.unwrap();
+        assert_eq!(report.status, WorkerRunStatus::MalformedStream);
+        assert_eq!(report.effective_observed_effort(), None);
+    }
+}
+
 struct TestEnv {
     _temp_dir: TempDir,
     root_dir: PathBuf,

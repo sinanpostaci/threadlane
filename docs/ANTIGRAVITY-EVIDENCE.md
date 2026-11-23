@@ -17,13 +17,23 @@ remains a verification failure. Unknown model IDs still require their own
 explicit provider evidence. The generic stream parser and other providers do not
 enable the AGY catalog rule.
 
-The canonical worker target requires an explicit effort and rejects a known
-concrete variant paired with a different effort. Catalog imports already expose
-a matching singleton effort; the profile editor preserves the concrete model ID
-and saves that explicit effort. Existing empty-effort catalog records remain
-readable. Refresh their catalog metadata and reselect/resave the same effort, or
-perform an explicitly authorized, backed-up registry migration. Do not switch
-models or alter other role assignments during migration.
+The canonical worker target requires an explicit effort, except for the two exact
+AGY catalog IDs `gemini-pro-orchestrator-neon` and `gemini-pro-orchestrator`
+when their frozen approval requests no effort. For that route the launcher omits
+`--effort` and requires a matching structured AGY `init.model`. Missing or
+conflicting model evidence, a reported effort, and malformed non-null effort
+metadata fail the run. An absent or null effort remains unobserved; it does not
+attest a provider reasoning budget. The legacy runtime uses the string `default`
+as its absent-effort storage marker; the notice scope separately identifies this
+specific approved no-effort route. Previously frozen explicit effort pins retain
+their existing matching-evidence requirement.
+
+Known concrete variants still reject a different explicit effort. Catalog imports
+already expose a matching singleton effort; the profile editor preserves the
+concrete model ID and saves that explicit effort. Existing empty-effort catalog
+records remain readable. Refresh their catalog metadata and reselect/resave the
+same effort, or perform an explicitly authorized, backed-up registry migration.
+Do not switch models or alter other role assignments during migration.
 
 Completion, verified model/variant, scoped diff checks, review acceptance and
 integration remain separate gates. A provider `SUCCESS` result with

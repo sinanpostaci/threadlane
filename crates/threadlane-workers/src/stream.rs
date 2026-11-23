@@ -302,6 +302,7 @@ pub struct NdjsonStreamParser {
     saw_result_event: bool,
     observed_model: Option<String>,
     model_conflict: Option<String>,
+    saw_no_effort_model_init: bool,
     observed_effort: Option<String>,
     observed_effort_source: Option<EffortEvidenceSource>,
     effort_conflict: Option<String>,
@@ -344,6 +345,7 @@ impl NdjsonStreamParser {
             saw_result_event: false,
             observed_model: None,
             model_conflict: None,
+            saw_no_effort_model_init: false,
             observed_effort: None,
             observed_effort_source: None,
             effort_conflict: None,
@@ -537,6 +539,27 @@ impl NdjsonStreamParser {
         let mut tool_name = extract_tool_name(obj);
         let event_is_tool = is_tool_event(obj, event_type, subtype, tool_name.is_some());
 
+        if self.is_antigravity_no_effort_target()
+            && !event_is_tool
+            && has_invalid_no_effort_metadata(obj)
+        {
+            self.record_malformed(
+                line_number,
+                "invalid non-null effort metadata for a no-effort AGY target".to_string(),
+                "",
+            );
+        }
+
+        if self.is_antigravity_no_effort_target()
+            && !event_is_tool
+            && has_non_exact_no_effort_model(obj, &self.requested_model.base_model)
+            && self.model_conflict.is_none()
+        {
+            self.model_conflict = Some(
+                "provider model metadata differs from the exact no-effort AGY target".to_string(),
+            );
+        }
+
         let (event_model, mut event_effort, inline_model_conflict, inline_effort_conflict) =
             if event_is_tool {
                 (None, None, None, None)
@@ -546,6 +569,19 @@ impl NdjsonStreamParser {
         let mut event_effort_source = event_effort
             .as_ref()
             .map(|_| EffortEvidenceSource::DirectStreamMetadata);
+
+        if self.is_antigravity_no_effort_target()
+            && !event_is_tool
+            && is_structured_antigravity_init_event(obj, subtype)
+            && obj
+                .get("init")
+                .and_then(Value::as_object)
+                .and_then(|init| init.get("model"))
+                .and_then(Value::as_str)
+                == Some(self.requested_model.base_model.as_str())
+        {
+            self.saw_no_effort_model_init = true;
+        }
 
         if self.model_conflict.is_none() {
             self.model_conflict = inline_model_conflict;
@@ -1128,16 +1164,36 @@ impl NdjsonStreamParser {
             );
         }
 
-        let model_evidence = evaluate_model_evidence(
+        let mut model_evidence = evaluate_model_evidence(
             &self.requested_model,
             self.observed_model.as_deref(),
             self.model_conflict.as_deref(),
         );
-        let effort_evidence = evaluate_effort_evidence(
+        if self.is_antigravity_no_effort_target()
+            && !self.saw_no_effort_model_init
+            && matches!(model_evidence, FieldEvidence::VerifiedMatch { .. })
+        {
+            model_evidence = FieldEvidence::Missing {
+                requested: self.requested_model.base_model.clone(),
+            };
+        }
+        let mut effort_evidence = evaluate_effort_evidence(
             self.requested_model.effort.as_deref(),
             self.observed_effort.as_deref(),
             self.effort_conflict.as_deref(),
         );
+        if self.is_antigravity_no_effort_target() {
+            if let FieldEvidence::NotRequested {
+                observed: Some(observed),
+            } = effort_evidence
+            {
+                effort_evidence = FieldEvidence::Mismatch {
+                    requested: None,
+                    observed,
+                    detail: "provider reported an effort for a no-effort AGY target".to_string(),
+                };
+            }
+        }
         let effort_evidence_source = if self.effort_conflict.is_none() {
             self.observed_effort_source
         } else {
@@ -1169,6 +1225,15 @@ impl NdjsonStreamParser {
             retained_events: self.retained_events,
             dropped_events_count: self.dropped_events_count,
         }
+    }
+
+    fn is_antigravity_no_effort_target(&self) -> bool {
+        self.provider == Some(WorkerProvider::Antigravity)
+            && self.requested_model.effort.is_none()
+            && self.requested_model.cli_model_arg == self.requested_model.base_model
+            && crate::antigravity_models::antigravity_no_effort_model(
+                &self.requested_model.base_model,
+            )
     }
 }
 
@@ -1390,6 +1455,56 @@ fn is_structured_antigravity_init_event(obj: &Map<String, Value>, subtype: Optio
         return false;
     };
     !has_object_error_field(init_obj) && init_obj.get("is_error") != Some(&Value::Bool(true))
+}
+
+// Check only the structured metadata scopes used by the existing effort extractor. Null means
+// absent; an empty string or any other JSON type is not reliable no-effort evidence. Tool
+// events are excluded by the caller and no message or tool text is inspected.
+fn has_invalid_no_effort_metadata(obj: &Map<String, Value>) -> bool {
+    let nested_model = |key: &str| {
+        obj.get(key)
+            .and_then(Value::as_object)
+            .and_then(|scope| scope.get("model"))
+            .and_then(Value::as_object)
+    };
+    [
+        Some(obj),
+        obj.get("init").and_then(Value::as_object),
+        obj.get("result").and_then(Value::as_object),
+        obj.get("step_update").and_then(Value::as_object),
+        obj.get("part").and_then(Value::as_object),
+        obj.get("message").and_then(Value::as_object),
+        obj.get("metadata").and_then(Value::as_object),
+        obj.get("model").and_then(Value::as_object),
+        nested_model("part"),
+        nested_model("result"),
+        nested_model("init"),
+        nested_model("message"),
+    ]
+    .into_iter()
+    .flatten()
+    .flat_map(|scope| {
+        ["effort", "variant", "reasoning_effort", "thinking_effort"]
+            .into_iter()
+            .filter_map(|key| scope.get(key))
+    })
+    .any(|value| !value.is_null() && value.as_str().is_none_or(|s| s.trim().is_empty()))
+}
+
+fn has_non_exact_no_effort_model(obj: &Map<String, Value>, expected: &str) -> bool {
+    [
+        Some(obj),
+        obj.get("init").and_then(Value::as_object),
+        obj.get("result").and_then(Value::as_object),
+        obj.get("step_update").and_then(Value::as_object),
+        obj.get("part").and_then(Value::as_object),
+        obj.get("message").and_then(Value::as_object),
+        obj.get("metadata").and_then(Value::as_object),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(|scope| scope.get("model").and_then(Value::as_str))
+    .any(|model| model != expected)
 }
 
 fn extract_model_and_effort(

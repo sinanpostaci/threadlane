@@ -6813,6 +6813,183 @@ async fn worker_notice_refuses_attached_unknown_outcome_without_side_effects() {
 }
 
 #[tokio::test]
+async fn agy_no_effort_prepared_approval_to_guarded_done() {
+    for model_arg in ["gemini-pro-orchestrator-neon", "gemini-pro-orchestrator"] {
+        let fixture = setup_approved_mcp_fixture().await;
+        let script = r##"#!/bin/sh
+set -eu
+printf '1' > '@COUNT@'
+MODEL=''
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --model) MODEL="$2"; shift 2 ;;
+        --effort) exit 81 ;;
+        --mode|--output-format|--print-timeout|--settings|--print|--log-file) shift 2 ;;
+        *) exit 82 ;;
+    esac
+done
+printf '{"event":"init","init":{"session_id":"sess-agy","model":"%s"}}\n' "$MODEL"
+printf '// updated by fake-agy\npub fn alpha() -> u32 { 42 }\n' > src/lib.rs
+printf '{"event":"result","result":{"status":"SUCCESS"}}\n'
+"##
+        .replace("@COUNT@", fixture.agy_count_file.to_str().unwrap());
+        fs::write(&fixture.fake_agy_exe, script).unwrap();
+        fs::set_permissions(&fixture.fake_agy_exe, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let snapshot = fixture.registry.snapshot().unwrap();
+        let snapshot = fixture
+            .registry
+            .apply(
+                snapshot.revision,
+                RegistryChange::UpsertModel {
+                    model: ModelDefinition {
+                        id: "model-orchestrator".into(),
+                        tool_id: "tool-agy".into(),
+                        label: model_arg.into(),
+                        model_arg: model_arg.into(),
+                        efforts: vec![],
+                        allow_no_effort: true,
+                    },
+                },
+            )
+            .unwrap();
+        let mut profile = snapshot
+            .profiles
+            .iter()
+            .find(|p| p.id == "profile-main")
+            .unwrap()
+            .clone();
+        let assignment = profile
+            .assignments
+            .iter_mut()
+            .find(|a| a.role == WorkflowRole::Coder && a.difficulty == Some(Difficulty::Hard))
+            .unwrap();
+        assignment.choice.model_id = "model-orchestrator".into();
+        assignment.choice.effort = None;
+        let registry = fixture
+            .registry
+            .apply(snapshot.revision, RegistryChange::UpsertProfile { profile })
+            .unwrap();
+        let tasks = default_plan_tasks("Implement bounded no-effort fixture")
+            .into_iter()
+            .filter(|t| t.id == "task-root-agy")
+            .collect();
+        let draft = fixture
+            .plans
+            .change_at(
+                0,
+                PlanChange::SaveDraft {
+                    plan_id: "plan-no-effort".into(),
+                    binding_id: fixture.binding_a.clone(),
+                    profile_id: "profile-main".into(),
+                    profile_revision: registry.revision,
+                    summary: "No-effort AGY fixture".into(),
+                    tasks,
+                },
+                1_700_002_152_000,
+            )
+            .unwrap();
+        let published = fixture
+            .plans
+            .change(
+                draft.revision,
+                PlanChange::Publish {
+                    plan_id: "plan-no-effort".into(),
+                    revision: draft.revision,
+                },
+            )
+            .unwrap();
+        let preview = fixture
+            .authority
+            .prepare_for_operator(threadlane_authority::OperatorApprovalIntent {
+                binding_id: fixture.binding_a.clone(),
+                thread_uuid: THREAD_UUID_A.into(),
+                plan_id: "plan-no-effort".into(),
+                plan_revision: published.revision,
+                expected_registry_revision: registry.revision,
+                repository_path: fixture.repo_dir.clone(),
+                base_commit: fixture.base_commit.clone(),
+                approved_task_ids: vec!["task-root-agy".into()],
+                approved_write_paths: vec!["src/".into()],
+                max_parallel: 1,
+                budgets: ExecutionBudgets::default(),
+            })
+            .unwrap();
+        assert_eq!(preview.tasks.len(), 1);
+        assert_eq!(preview.tasks[0].base_model, model_arg);
+        assert_eq!(preview.tasks[0].effort, None);
+        assert!(preview.tasks[0].is_antigravity_no_effort_worker());
+        let digest = preview.subject_digest.clone();
+        let approval = fixture
+            .authority
+            .approve_confirmed_preview(preview, &digest)
+            .unwrap();
+        let stored = fixture
+            .authority
+            .get_for_operator(&approval.approval_id)
+            .unwrap();
+        assert_eq!(stored.subject_digest, digest);
+        assert_eq!(stored.tasks[0].effort, None);
+        assert_eq!(stored.tasks[0].base_model, model_arg);
+
+        let context = review_test_context(&fixture);
+        let host = start_fixture_host(&fixture, &approval.approval_id).await;
+        let mcp = live_mcp(&fixture);
+        enroll_server(&fixture, &mcp, &fixture.binding_a, THREAD_UUID_A).await;
+        mcp.set_review_test_connection(&fixture.binding_a, THREAD_UUID_A, context);
+        let (item_id, revision) =
+            create_worker_item(&mcp, "no-effort-item", "No-effort Worker").await;
+        mcp.invoke_tool_json("ordinary_review_scope", json!({
+            "approval_id": approval.approval_id, "task_id": "task-root-agy", "item_id": item_id, "source_files": []
+        }), None).await.expect("freeze review scope");
+        mcp.invoke_tool_json(
+            "backlog_worker_start",
+            json!({
+                "item_id": item_id, "expected_revision": revision, "command_key": "no-effort-start",
+                "approval_id": approval.approval_id, "task_id": "task-root-agy"
+            }),
+            None,
+        )
+        .await
+        .expect("start approved task once");
+        let terminal = wait_for_terminal_task(&mcp, &approval.approval_id, "task-root-agy").await;
+        assert_eq!(
+            terminal.status,
+            TaskExecutionStatus::ReadyForReview,
+            "terminal snapshot: {terminal:#?}"
+        );
+        let worker = terminal.worker.unwrap();
+        assert_eq!(worker.provider, "antigravity");
+        assert_eq!(worker.observed_model.as_deref(), Some(model_arg));
+        assert_eq!(worker.observed_effort, None);
+        assert_eq!(read_invocation_count(&fixture.agy_count_file), 1);
+        let notice = mcp
+            .invoke_tool_json(
+                "ordinary_review_notice",
+                json!({"approval_id": approval.approval_id}),
+                None,
+            )
+            .await
+            .expect("verify receipt, delivery and prepare review")
+            .structured_content
+            .unwrap()["data"]
+            .clone();
+        assert_eq!(notice["status"], "ready_for_semantic_review");
+        assert_eq!(notice["worker"]["observed_model"], model_arg);
+        assert_eq!(notice["worker"]["observed_effort"], Value::Null);
+        assert_eq!(notice["delivery"]["files"][0]["text"], REVIEW_DELIVERY);
+        let read_id = notice["read_id"].as_str().unwrap();
+        let done = mcp.invoke_tool_json("ordinary_review_complete", json!({
+            "read_id": read_id, "verdict": "accept", "reason": "Verified exact fixture source and delivery."
+        }), None).await.expect("guarded completion");
+        assert_eq!(done.structured_content.unwrap()["data"]["status"], "done");
+        assert_eq!(get_item(&mcp, &item_id).await.status, BacklogStatus::Done);
+        assert_eq!(read_invocation_count(&fixture.agy_count_file), 1);
+        host.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn worker_notice_normalizes_frozen_absent_effort_like_host() {
     let fixture = setup_approved_mcp_fixture().await;
     let registry = fixture.registry.snapshot().expect("registry snapshot");

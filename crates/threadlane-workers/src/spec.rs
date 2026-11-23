@@ -1170,15 +1170,13 @@ fn build_provider_argv_from_resolved(
 ) -> Result<Vec<String>, WorkerError> {
     match provider {
         WorkerProvider::Antigravity => {
-            let effort = resolved
-                .effort
-                .as_deref()
-                .expect("Antigravity effort is verified during model target resolution");
             let mut argv = Vec::with_capacity(if settings_json.is_some() { 14 } else { 12 });
             argv.push("--model".to_string());
             argv.push(resolved.cli_model_arg.clone());
-            argv.push("--effort".to_string());
-            argv.push(effort.to_string());
+            if let Some(effort) = resolved.effort.as_deref() {
+                argv.push("--effort".to_string());
+                argv.push(effort.to_string());
+            }
             argv.push("--mode".to_string());
             argv.push(antigravity_mode.to_string());
             argv.push("--output-format".to_string());
@@ -1537,8 +1535,8 @@ pub fn is_pinned_codex_task_files_argv(argv: &[String], resolved: &ResolvedModel
 /// and optional effort/variant.
 ///
 /// This is the canonical pure target resolver for worker execution. It performs no filesystem,
-/// process, provider, or network I/O and applies the same Antigravity/Codex explicit-effort and
-/// OpenCode inline-variant rules as [`WorkerSpec::resolve_model_target`].
+/// process, provider, or network I/O and applies the same provider-specific effort and OpenCode
+/// inline-variant rules as [`WorkerSpec::resolve_model_target`].
 pub fn resolve_model_target(
     provider: WorkerProvider,
     model: &str,
@@ -1547,6 +1545,13 @@ pub fn resolve_model_target(
     match provider {
         WorkerProvider::Antigravity => {
             validate_simple_identifier(model, "model")?;
+            if effort.is_none() && crate::antigravity_models::antigravity_no_effort_model(model) {
+                return Ok(ResolvedModelTarget {
+                    base_model: model.to_string(),
+                    effort: None,
+                    cli_model_arg: model.to_string(),
+                });
+            }
             let effort = effort.ok_or_else(|| {
                 WorkerError::InvalidSpec(
                     "provider `antigravity` requires an explicit `effort` identifier".to_string(),

@@ -457,6 +457,10 @@ fn verify_delivery_context<'a>(
                 "worker snapshot is missing matching observed effort evidence",
             ));
         }
+    } else if task.is_antigravity_no_effort_worker() && worker.observed_effort.is_some() {
+        return Err(invalid_delivery(
+            "worker reported an effort for the frozen no-effort AGY task",
+        ));
     }
 
     let outcome = worker
@@ -2111,6 +2115,51 @@ mod tests {
             .cancel_requested_before_completion = true;
         inspect_delivery_for_verified_task(&fixture.record, &cancel_raced, &fixture.work_area_root)
             .expect("natural success with retained cancellation request flag");
+    }
+
+    #[test]
+    fn frozen_no_effort_agy_delivery_requires_exact_identity_and_no_observed_effort() {
+        for model in ["gemini-pro-orchestrator-neon", "gemini-pro-orchestrator"] {
+            let mut fixture = DeliveryFixture::new();
+            let task = &mut fixture.record.tasks[0];
+            task.adapter = ToolAdapter::Antigravity;
+            task.provider = Some(WorkerProvider::Antigravity);
+            task.model_arg = model.into();
+            task.base_model = model.into();
+            task.cli_model_arg = Some(model.into());
+            task.effort = None;
+            task.standalone = Some(false);
+            fixture.snapshot.adapter = task.adapter;
+            fixture.snapshot.provider = task.provider;
+            let worker = fixture.snapshot.worker.as_mut().unwrap();
+            worker.provider = "antigravity".into();
+            worker.requested_model = model.into();
+            worker.requested_effort = "default".into();
+            worker.observed_model = Some(model.into());
+            worker.observed_effort = None;
+            fixture.apply_patch();
+            fixture.refresh_terminal_snapshot();
+            let delivery = fixture
+                .inspect()
+                .expect("frozen no-effort task is inspectable");
+            fixture
+                .recheck(&delivery)
+                .expect("immutable receipt remains valid");
+
+            assert_rejected_with_snapshot(&fixture, |snapshot| {
+                snapshot.worker.as_mut().unwrap().observed_effort = Some("default".into());
+            });
+            assert_rejected_with_snapshot(&fixture, |snapshot| {
+                snapshot.worker.as_mut().unwrap().requested_effort = "high".into();
+            });
+            assert_rejected_with_snapshot(&fixture, |snapshot| {
+                snapshot.worker.as_mut().unwrap().provider = "opencode_v2".into();
+            });
+            assert_rejected_with_snapshot(&fixture, |snapshot| {
+                snapshot.worker.as_mut().unwrap().observed_model =
+                    Some("gemini-pro-orchestrator-argon".into());
+            });
+        }
     }
 
     #[test]

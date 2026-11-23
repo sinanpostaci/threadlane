@@ -168,13 +168,20 @@ pub struct WorkerBacklogNoticeScope {
     pub base_commit: String,
     /// Frozen requested model.
     pub requested_model: String,
-    /// Frozen requested reasoning effort.
+    /// Runtime-compatible requested effort; `default` is the historical absent-effort marker.
     pub requested_effort: String,
+    /// The frozen AGY task explicitly has no effort; absent on pre-existing notice scopes.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub no_effort_approved: bool,
     /// Exact approved task write paths.
     pub write_paths: Vec<String>,
     /// Optional frozen subset of exact write paths that must change; `None` requires every write path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub required_changed_paths: Option<Vec<String>>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
 }
 
 /// Read-only durable recovery context; no field grants new execution authority.
@@ -728,6 +735,7 @@ impl WorkerBacklogService {
                 base_commit: record.base_commit.clone(),
                 requested_model: task.base_model.clone(),
                 requested_effort: effort,
+                no_effort_approved: task.is_antigravity_no_effort_worker(),
                 write_paths: task.allowed_write_paths.clone(),
                 required_changed_paths: task.required_changed_paths.clone(),
             },
@@ -3459,6 +3467,7 @@ mod tests {
             base_commit: "a".repeat(40),
             requested_model: "model-a".to_string(),
             requested_effort: "high".to_string(),
+            no_effort_approved: false,
             write_paths: vec!["src/lib.rs".to_string(), "src/extra.rs".to_string()],
             required_changed_paths: None,
         };

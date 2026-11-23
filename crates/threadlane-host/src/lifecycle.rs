@@ -144,6 +144,8 @@ pub(crate) fn verify_worker_model_evidence(
         load_verified_codex_task_report(record, session_dir, task, worker).is_ok()
     } else {
         worker.observed_model.as_deref() == Some(task.base_model.as_str())
+            && (!task.is_antigravity_no_effort_worker()
+                || (worker.requested_effort == "default" && worker.observed_effort.is_none()))
             && task
                 .effort
                 .as_deref()

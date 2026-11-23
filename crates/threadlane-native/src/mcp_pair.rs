@@ -5722,13 +5722,8 @@ impl PairedMcpServer {
             || context.execution.reserved_at_ms != refreshed.execution.reserved_at_ms
             || context.acceptance_condition != refreshed.acceptance_condition
             || context.delivery_description != refreshed.delivery_description
-            || context.scope.repository_path != refreshed.scope.repository_path
-            || context.scope.base_commit != refreshed.scope.base_commit
-            || context.scope.write_paths != refreshed.scope.write_paths
-            || context.scope.required_changed_paths != refreshed.scope.required_changed_paths
+            || context.scope != refreshed.scope
             || context.scope.required_changed_paths != scope.required_changed_paths
-            || context.scope.requested_model != refreshed.scope.requested_model
-            || context.scope.requested_effort != refreshed.scope.requested_effort
         {
             return Err(Self::format_scoped_error(
                 binding,

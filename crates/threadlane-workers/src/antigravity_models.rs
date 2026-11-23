@@ -23,6 +23,17 @@ pub const ANTIGRAVITY_CATALOG_CONTRACT_VERSION: &str = "agy-1.5.12-catalog-v1";
 /// Most recent Antigravity CLI version contributing verified catalog variants.
 pub const ANTIGRAVITY_OBSERVED_CLI_VERSION: &str = "1.5.12";
 
+/// Exact AGY catalog model IDs that may be selected without a reasoning effort.
+/// This list does not assert an inferred provider reasoning budget.
+pub const ANTIGRAVITY_NO_EFFORT_MODELS: &[&str] =
+    &["gemini-pro-orchestrator-neon", "gemini-pro-orchestrator"];
+
+/// Whether an exact AGY catalog model supports the separately approved no-effort route.
+#[must_use]
+pub fn antigravity_no_effort_model(model_id: &str) -> bool {
+    ANTIGRAVITY_NO_EFFORT_MODELS.contains(&model_id)
+}
+
 /// Exact model IDs and their catalog-reported effort, including historical variants.
 pub const ANTIGRAVITY_KNOWN_CATALOG_MODELS: &[(&str, &str)] = &[
     ("gemini-4-argon-low", "low"),

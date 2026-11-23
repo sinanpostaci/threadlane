@@ -807,12 +807,7 @@ pub(crate) fn view(read_id: &str, read: &ReviewRead) -> Result<Value, NativeErro
             "observed worker model is unavailable",
         )
     })?;
-    let observed_effort = worker.observed_effort.as_deref().ok_or_else(|| {
-        error(
-            NativeErrorCode::ValidationFailed,
-            "observed worker effort is unavailable",
-        )
-    })?;
+    let observed_effort = worker.observed_effort.as_deref();
     let task_checkout_path = worker.task_worktree_path.as_deref().ok_or_else(|| {
         error(
             NativeErrorCode::ValidationFailed,
@@ -1438,7 +1433,16 @@ pub(crate) fn valid_read(read: &ReviewRead) -> bool {
         && worker.requested_model == context.scope.requested_model
         && worker.requested_effort == context.scope.requested_effort
         && worker.observed_model.as_deref() == Some(context.scope.requested_model.as_str())
-        && worker.observed_effort.as_deref() == Some(context.scope.requested_effort.as_str())
+        && if context.scope.no_effort_approved {
+            worker.provider == "antigravity"
+                && threadlane_workers::antigravity_models::antigravity_no_effort_model(
+                    &context.scope.requested_model,
+                )
+                && context.scope.requested_effort == "default"
+                && worker.observed_effort.is_none()
+        } else {
+            worker.observed_effort.as_deref() == Some(context.scope.requested_effort.as_str())
+        }
         && worker.exit_code == Some(0)
         && worker.signal.is_none()
         && worker.timed_out == Some(false)
@@ -1895,6 +1899,71 @@ mod tests {
     }
 
     #[allow(clippy::too_many_lines)]
+    #[test]
+    fn no_effort_review_requires_frozen_marker_exact_provider_model_and_absent_telemetry() {
+        let mut read = review_read("deliver", "hello\n");
+        let model = "gemini-pro-orchestrator-neon";
+        read.context.scope.requested_model = model.into();
+        read.context.scope.requested_effort = "default".into();
+        read.context.scope.no_effort_approved = true;
+        let worker = read.result.worker_evidence.as_mut().unwrap();
+        worker.provider = "antigravity".into();
+        worker.requested_model = model.into();
+        worker.requested_effort = "default".into();
+        worker.observed_model = Some(model.into());
+        worker.observed_effort = None;
+        assert!(valid_read(&read));
+        assert_eq!(
+            view(&format!("rd_{}", "a".repeat(64)), &read).unwrap()["worker"]["observed_effort"],
+            Value::Null
+        );
+
+        let mut missing_marker = read.clone();
+        missing_marker.context.scope.no_effort_approved = false;
+        assert!(!valid_read(&missing_marker));
+        missing_marker
+            .result
+            .worker_evidence
+            .as_mut()
+            .unwrap()
+            .observed_effort = Some("default".into());
+        assert!(
+            valid_read(&missing_marker),
+            "a legacy explicit default pin still requires and accepts its matching observation"
+        );
+        let mut wrong_provider = read.clone();
+        wrong_provider
+            .result
+            .worker_evidence
+            .as_mut()
+            .unwrap()
+            .provider = "opencode_v2".into();
+        assert!(!valid_read(&wrong_provider));
+        let mut wrong_model = read.clone();
+        wrong_model.context.scope.requested_model = "gemini-pro-orchestrator-argon".into();
+        let worker = wrong_model.result.worker_evidence.as_mut().unwrap();
+        worker.requested_model = "gemini-pro-orchestrator-argon".into();
+        worker.observed_model = Some("gemini-pro-orchestrator-argon".into());
+        assert!(!valid_read(&wrong_model));
+        let mut explicit_effort = read.clone();
+        explicit_effort
+            .result
+            .worker_evidence
+            .as_mut()
+            .unwrap()
+            .observed_effort = Some("default".into());
+        assert!(!valid_read(&explicit_effort));
+        let mut wrong_pin = read;
+        wrong_pin.context.scope.requested_effort = "high".into();
+        wrong_pin
+            .result
+            .worker_evidence
+            .as_mut()
+            .unwrap()
+            .requested_effort = "high".into();
+        assert!(!valid_read(&wrong_pin));
+    }
+
     fn review_read(criteria_text: &str, delivery_text: &str) -> ReviewRead {
         let mut read_scope = scope();
         read_scope.source_files.clear();
@@ -1948,6 +2017,7 @@ mod tests {
                     base_commit: base.clone(),
                     requested_model: "model-a".into(),
                     requested_effort: "high".into(),
+                    no_effort_approved: false,
                     write_paths: vec!["src/lib.rs".into()],
                     required_changed_paths: None,
                 },

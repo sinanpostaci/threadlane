@@ -374,7 +374,6 @@ fn hydrogen_invented_siblings_orchestrators_and_near_matches_never_derive_effort
         "GEMINI-4-HYDROGEN-XHIGH",            // fully folded xhigh variant
         "xgemini-4-hydrogen-xhigh",           // prefixed near match
         "gemini-4-argon-xhigh",               // invented xhigh sibling on argon
-        "gemini-pro-orchestrator",            // unlabeled orchestrator ID in agy 1.5.9
         "gemini-pro-orchestrator-argon",      // unlabeled orchestrator ID in agy 1.5.9
         "gemini-pro-orchestrator-high",       // invented effort suffix on orchestrator
         "gemini-pro-orchestrator-argon-high", // invented effort suffix on orchestrator-argon
