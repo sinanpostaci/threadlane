@@ -4494,6 +4494,22 @@ fn configure_profile_shadow_advisor(
         .registry
         .apply(
             s2.revision,
+            RegistryChange::UpsertModel {
+                model: ModelDefinition {
+                    id: "model-deepseek-hard".to_string(),
+                    tool_id: "tool-opencode".to_string(),
+                    label: "DeepSeek v4.1 Pro".to_string(),
+                    model_arg: "opencode-go/deepseek-v4.1-pro".to_string(),
+                    efforts: vec!["max".to_string()],
+                    allow_no_effort: false,
+                },
+            },
+        )
+        .expect("upsert second worker model for routing variation");
+    let s4 = fx
+        .registry
+        .apply(
+            s3.revision,
             RegistryChange::UpsertProfile {
                 profile: WorkflowProfile {
                     id: PROFILE_ID.to_string(),
@@ -4511,7 +4527,7 @@ fn configure_profile_shadow_advisor(
                             role: WorkflowRole::Coder,
                             difficulty: Some(Difficulty::Hard),
                             choice: ModelChoice {
-                                model_id: "model-deepseek-flash".to_string(),
+                                model_id: "model-deepseek-hard".to_string(),
                                 effort: Some("max".to_string()),
                             },
                         },
@@ -4524,7 +4540,7 @@ fn configure_profile_shadow_advisor(
             },
         )
         .expect("upsert profile with shadow advisor");
-    fx.registry_revision = s3.revision;
+    fx.registry_revision = s4.revision;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -5907,5 +5923,528 @@ async fn prepare_task_exact_forecast_rubric_distinction_and_unbounded_history_pr
     }
     fx.assert_no_approval_artifacts();
 
+    fx.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prepare_task_exact_forecast_skips_fixed_worker_route_and_launches_on_real_variation() {
+    let mut fx = ApprovalFixture::start().await;
+    let temp_dir = fx.private_preview_temp_dir();
+    let staged = stage_approve_binaries(&fx.root);
+    let advice_log = fx.root.join("routing-gate-advice-log");
+    let fake_advice_output = serde_json::json!({
+        "schema_version": 1,
+        "advisory_only": true,
+        "recommended_difficulty": "hard",
+        "baseline_difficulty": null,
+        "agrees_with_baseline": null,
+        "provider": "jev_api",
+        "model_arg": "jev-latest"
+    })
+    .to_string();
+    write_fake_advice_script(&staged.advice_exe, &advice_log, &fake_advice_output, None);
+
+    let rev = fx
+        .registry
+        .apply(
+            fx.registry_revision,
+            RegistryChange::UpsertTool {
+                tool: ToolDefinition {
+                    id: "jev-api".to_string(),
+                    label: "Jev API".to_string(),
+                    adapter: ToolAdapter::JevApi,
+                    executable_path: None,
+                    enabled: true,
+                },
+            },
+        )
+        .expect("upsert jev-api")
+        .revision;
+    let rev = fx
+        .registry
+        .apply(
+            rev,
+            RegistryChange::UpsertTool {
+                tool: ToolDefinition {
+                    id: "openai-decisions".to_string(),
+                    label: "OpenAI Decisions".to_string(),
+                    adapter: ToolAdapter::OpenaiDecisionsApi,
+                    executable_path: None,
+                    enabled: true,
+                },
+            },
+        )
+        .expect("upsert openai-decisions")
+        .revision;
+    let rev = fx
+        .registry
+        .apply(
+            rev,
+            RegistryChange::UpsertTool {
+                tool: ToolDefinition {
+                    id: "tool-opencode-secondary".to_string(),
+                    label: "Secondary OpenCode".to_string(),
+                    adapter: ToolAdapter::OpencodeV2,
+                    executable_path: Some(fx.fake_worker.clone()),
+                    enabled: true,
+                },
+            },
+        )
+        .expect("upsert secondary opencode tool")
+        .revision;
+    let rev = fx
+        .registry
+        .apply(
+            rev,
+            RegistryChange::UpsertTool {
+                tool: ToolDefinition {
+                    id: "tool-opencode-disabled".to_string(),
+                    label: "Disabled OpenCode".to_string(),
+                    adapter: ToolAdapter::OpencodeV2,
+                    executable_path: Some(fx.fake_worker.clone()),
+                    enabled: false,
+                },
+            },
+        )
+        .expect("upsert disabled opencode tool")
+        .revision;
+    let mut rev = fx
+        .registry
+        .apply(
+            rev,
+            RegistryChange::UpsertModels {
+                models: vec![
+                    ModelDefinition {
+                        id: "jev-api:jev-latest".to_string(),
+                        tool_id: "jev-api".to_string(),
+                        label: "jev-latest".to_string(),
+                        model_arg: "jev-latest".to_string(),
+                        efforts: Vec::new(),
+                        allow_no_effort: true,
+                    },
+                    ModelDefinition {
+                        id: "openai-decisions:gpt-5-nano".to_string(),
+                        tool_id: "openai-decisions".to_string(),
+                        label: "gpt-5-nano".to_string(),
+                        model_arg: "gpt-5-nano".to_string(),
+                        efforts: Vec::new(),
+                        allow_no_effort: true,
+                    },
+                    ModelDefinition {
+                        id: "model-deepseek-flash-alias".to_string(),
+                        tool_id: "tool-opencode".to_string(),
+                        label: "DeepSeek Flash Alias".to_string(),
+                        model_arg: "opencode-go/deepseek-v4.1-flash".to_string(),
+                        efforts: vec!["max".to_string()],
+                        allow_no_effort: false,
+                    },
+                    ModelDefinition {
+                        id: "model-deepseek-effort".to_string(),
+                        tool_id: "tool-opencode".to_string(),
+                        label: "DeepSeek Effort Variants".to_string(),
+                        model_arg: "opencode-go/deepseek-v4.1-flash".to_string(),
+                        efforts: vec!["medium".to_string(), "high".to_string()],
+                        allow_no_effort: false,
+                    },
+                    ModelDefinition {
+                        id: "model-secondary-flash".to_string(),
+                        tool_id: "tool-opencode-secondary".to_string(),
+                        label: "Secondary DeepSeek Flash".to_string(),
+                        model_arg: "opencode-go/deepseek-v4.1-flash".to_string(),
+                        efforts: vec!["max".to_string()],
+                        allow_no_effort: false,
+                    },
+                    ModelDefinition {
+                        id: "model-disabled-pro".to_string(),
+                        tool_id: "tool-opencode-disabled".to_string(),
+                        label: "Disabled Pro".to_string(),
+                        model_arg: "opencode-go/deepseek-v4.1-pro".to_string(),
+                        efforts: vec!["max".to_string()],
+                        allow_no_effort: false,
+                    },
+                ],
+            },
+        )
+        .expect("upsert routing gate models")
+        .revision;
+    fx.registry_revision = rev;
+
+    let set_profile = |fx: &mut ApprovalFixture,
+                       rev: &mut u64,
+                       assignments: Vec<RoleAssignment>,
+                       advisor_model: Option<&str>| {
+        let next = fx
+            .registry
+            .apply(
+                *rev,
+                RegistryChange::UpsertProfile {
+                    profile: WorkflowProfile {
+                        id: PROFILE_ID.to_string(),
+                        name: "Routing gate fixture profile".to_string(),
+                        assignments,
+                        decision_advisor: advisor_model.map(|model_id| DecisionAdvisor {
+                            model_id: model_id.to_string(),
+                            mode: DecisionAdvisorMode::Shadow,
+                        }),
+                    },
+                },
+            )
+            .expect("update routing gate profile")
+            .revision;
+        *rev = next;
+        fx.registry_revision = next;
+    };
+
+    let exact_args = prepare_task_exact_args(&fx);
+    let forecasts_root = fx.plans_dir.join("ordinary-forecasts");
+
+    // 1. Default only (plus varying Reviewer/Advisor roles that must be ignored) skips as
+    // `fixed_worker_route` with truthful `triggered: true` and idempotent replay.
+    set_profile(
+        &mut fx,
+        &mut rev,
+        vec![
+            RoleAssignment {
+                role: WorkflowRole::Coder,
+                difficulty: None,
+                choice: ModelChoice {
+                    model_id: "model-deepseek-flash".to_string(),
+                    effort: Some("max".to_string()),
+                },
+            },
+            RoleAssignment {
+                role: WorkflowRole::Reviewer,
+                difficulty: Some(Difficulty::Easy),
+                choice: ModelChoice {
+                    model_id: "model-deepseek-flash".to_string(),
+                    effort: Some("max".to_string()),
+                },
+            },
+            RoleAssignment {
+                role: WorkflowRole::Reviewer,
+                difficulty: Some(Difficulty::Hard),
+                choice: ModelChoice {
+                    model_id: "model-secondary-flash".to_string(),
+                    effort: Some("max".to_string()),
+                },
+            },
+            RoleAssignment {
+                role: WorkflowRole::Advisor,
+                difficulty: Some(Difficulty::Extreme),
+                choice: ModelChoice {
+                    model_id: "model-deepseek-effort".to_string(),
+                    effort: Some("high".to_string()),
+                },
+            },
+        ],
+        Some("jev-api:jev-latest"),
+    );
+
+    let mut default_only_req =
+        prepare_task_exact_request(&fx, "route-gate-default-only", vec!["src/lib.rs"], None);
+    default_only_req["forecast"] = serde_json::json!({
+        "component_count": 2,
+        "coupled": true,
+        "uncertain": false,
+        "summary": "Coupled change on default-only Coder profile"
+    });
+    let default_only_out = run_command_with_stdin(
+        staged_command(&staged.approve_exe),
+        &exact_args,
+        &prepare_task_bytes(&default_only_req),
+        Some(&temp_dir),
+    )
+    .await;
+    let default_only_raw: Value = parse_success(&default_only_out, "default-only fixed route skip");
+    assert_eq!(default_only_raw["forecast"]["status"], "skipped");
+    assert_eq!(default_only_raw["forecast"]["reason"], "fixed_worker_route");
+    assert_eq!(default_only_raw["forecast"]["triggered"], true);
+    assert_eq!(default_only_raw["forecast"]["reused"], false);
+    assert_eq!(default_only_raw["forecast"]["launched"], false);
+    assert!(default_only_raw["forecast"].get("advice_path").is_none());
+
+    let default_subject = default_only_raw["preview"]["subject_digest"]
+        .as_str()
+        .expect("default-only subject_digest");
+    let default_dir = forecasts_root.join(default_subject);
+    let default_record_bytes =
+        fs::read(default_dir.join("record.json")).expect("read default-only record.json");
+    let default_record: Value =
+        serde_json::from_slice(&default_record_bytes).expect("parse default-only record.json");
+    assert_eq!(default_record["status"], "skipped");
+    assert_eq!(default_record["reason"], "fixed_worker_route");
+    assert_eq!(default_record["triggered"], true);
+    assert!(default_record.get("request_file").is_none());
+    assert!(default_record.get("advice_file").is_none());
+    assert!(!default_dir.join("request.json").exists());
+    assert!(!default_dir.join("advice.json").exists());
+    assert!(!fx.plans_dir.join("advice-cache").exists());
+    assert!(fake_advice_call_dirs(&advice_log).is_empty());
+
+    let replay_default_out = run_command_with_stdin(
+        staged_command(&staged.approve_exe),
+        &exact_args,
+        &prepare_task_bytes(&default_only_req),
+        Some(&temp_dir),
+    )
+    .await;
+    let replay_default_raw: Value =
+        parse_success(&replay_default_out, "replay of fixed_worker_route skip");
+    assert_eq!(replay_default_raw["forecast"]["status"], "skipped");
+    assert_eq!(
+        replay_default_raw["forecast"]["reason"],
+        "fixed_worker_route"
+    );
+    assert_eq!(replay_default_raw["forecast"]["triggered"], true);
+    assert_eq!(replay_default_raw["forecast"]["reused"], true);
+    assert_eq!(replay_default_raw["forecast"]["launched"], false);
+    assert_eq!(
+        fs::read(default_dir.join("record.json")).expect("reread default-only record.json"),
+        default_record_bytes
+    );
+
+    // 2. Identical tiers via distinct model_id aliases selecting the same (tool, model_arg, effort)
+    // must also skip as `fixed_worker_route`.
+    set_profile(
+        &mut fx,
+        &mut rev,
+        vec![
+            RoleAssignment {
+                role: WorkflowRole::Coder,
+                difficulty: Some(Difficulty::Easy),
+                choice: ModelChoice {
+                    model_id: "model-deepseek-flash".to_string(),
+                    effort: Some("max".to_string()),
+                },
+            },
+            RoleAssignment {
+                role: WorkflowRole::Coder,
+                difficulty: Some(Difficulty::Hard),
+                choice: ModelChoice {
+                    model_id: "model-deepseek-flash-alias".to_string(),
+                    effort: Some("max".to_string()),
+                },
+            },
+        ],
+        Some("jev-api:jev-latest"),
+    );
+    let mut alias_req =
+        prepare_task_exact_request(&fx, "route-gate-aliases", vec!["src/lib.rs"], None);
+    alias_req["forecast"] = serde_json::json!({
+        "component_count": 3,
+        "coupled": false,
+        "uncertain": true,
+        "summary": "Aliases pointing to identical target must skip"
+    });
+    let alias_raw: Value = parse_success(
+        &run_command_with_stdin(
+            staged_command(&staged.approve_exe),
+            &exact_args,
+            &prepare_task_bytes(&alias_req),
+            Some(&temp_dir),
+        )
+        .await,
+        "identical aliases skip",
+    );
+    assert_eq!(alias_raw["forecast"]["status"], "skipped");
+    assert_eq!(alias_raw["forecast"]["reason"], "fixed_worker_route");
+    assert_eq!(alias_raw["forecast"]["triggered"], true);
+    assert_eq!(alias_raw["forecast"]["launched"], false);
+
+    // 3. Exact single tier only (plus an unusable disabled second tier) skips as `fixed_worker_route`,
+    // while invalid exact advisor provider still fails selected advisor validation without fallback.
+    set_profile(
+        &mut fx,
+        &mut rev,
+        vec![
+            RoleAssignment {
+                role: WorkflowRole::Coder,
+                difficulty: Some(Difficulty::Easy),
+                choice: ModelChoice {
+                    model_id: "model-deepseek-flash".to_string(),
+                    effort: Some("max".to_string()),
+                },
+            },
+            RoleAssignment {
+                role: WorkflowRole::Coder,
+                difficulty: Some(Difficulty::Hard),
+                choice: ModelChoice {
+                    model_id: "model-disabled-pro".to_string(),
+                    effort: Some("max".to_string()),
+                },
+            },
+        ],
+        Some("jev-api:jev-latest"),
+    );
+    let mut exact_tier_req =
+        prepare_task_exact_request(&fx, "route-gate-exact-tier-only", vec!["src/lib.rs"], None);
+    exact_tier_req["forecast"] = serde_json::json!({
+        "component_count": 2,
+        "coupled": false,
+        "uncertain": false,
+        "summary": "Single usable exact tier with disabled second tier must skip"
+    });
+    let exact_tier_raw: Value = parse_success(
+        &run_command_with_stdin(
+            staged_command(&staged.approve_exe),
+            &exact_args,
+            &prepare_task_bytes(&exact_tier_req),
+            Some(&temp_dir),
+        )
+        .await,
+        "single usable tier skip",
+    );
+    assert_eq!(exact_tier_raw["forecast"]["status"], "skipped");
+    assert_eq!(exact_tier_raw["forecast"]["reason"], "fixed_worker_route");
+    assert_eq!(exact_tier_raw["forecast"]["triggered"], true);
+
+    set_profile(
+        &mut fx,
+        &mut rev,
+        vec![RoleAssignment {
+            role: WorkflowRole::Coder,
+            difficulty: Some(Difficulty::Easy),
+            choice: ModelChoice {
+                model_id: "model-deepseek-flash".to_string(),
+                effort: Some("max".to_string()),
+            },
+        }],
+        Some("openai-decisions:gpt-5-nano"),
+    );
+    let mut exact_provider_invalid_req = prepare_task_exact_request(
+        &fx,
+        "route-gate-exact-provider-invalid",
+        vec!["src/lib.rs"],
+        None,
+    );
+    exact_provider_invalid_req["forecast"] = serde_json::json!({
+        "component_count": 2,
+        "coupled": false,
+        "uncertain": false,
+        "summary": "Exact invalid advisor provider must not fall back to jev-api"
+    });
+    let exact_provider_invalid_raw: Value = parse_success(
+        &run_command_with_stdin(
+            staged_command(&staged.approve_exe),
+            &exact_args,
+            &prepare_task_bytes(&exact_provider_invalid_req),
+            Some(&temp_dir),
+        )
+        .await,
+        "exact invalid advisor provider preserves advisor validation",
+    );
+    assert_eq!(
+        exact_provider_invalid_raw["forecast"]["status"],
+        "unavailable"
+    );
+    assert_eq!(
+        exact_provider_invalid_raw["forecast"]["reason"],
+        "advisor_invalid_model"
+    );
+    assert!(fake_advice_call_dirs(&advice_log).is_empty());
+
+    // 4. Real routing variations must launch `threadlane-advice`:
+    // (a) Effort-only difference on the same tool and model_arg.
+    set_profile(
+        &mut fx,
+        &mut rev,
+        vec![
+            RoleAssignment {
+                role: WorkflowRole::Coder,
+                difficulty: Some(Difficulty::Easy),
+                choice: ModelChoice {
+                    model_id: "model-deepseek-effort".to_string(),
+                    effort: Some("medium".to_string()),
+                },
+            },
+            RoleAssignment {
+                role: WorkflowRole::Coder,
+                difficulty: Some(Difficulty::Hard),
+                choice: ModelChoice {
+                    model_id: "model-deepseek-effort".to_string(),
+                    effort: Some("high".to_string()),
+                },
+            },
+        ],
+        Some("jev-api:jev-latest"),
+    );
+    let mut effort_req =
+        prepare_task_exact_request(&fx, "route-gate-effort-diff", vec!["src/lib.rs"], None);
+    effort_req["forecast"] = serde_json::json!({
+        "component_count": 2,
+        "coupled": false,
+        "uncertain": true,
+        "summary": "Effort-only variation across difficulties must launch advice"
+    });
+    let effort_raw: Value = parse_success(
+        &run_command_with_stdin(
+            staged_command(&staged.approve_exe),
+            &exact_args,
+            &prepare_task_bytes(&effort_req),
+            Some(&temp_dir),
+        )
+        .await,
+        "effort-only routing variation launches advice",
+    );
+    assert_eq!(effort_raw["forecast"]["status"], "launched");
+    assert_eq!(effort_raw["forecast"]["launched"], true);
+    let _ = wait_for_non_empty_file(
+        Path::new(effort_raw["forecast"]["advice_path"].as_str().unwrap()),
+        Duration::from_secs(5),
+    )
+    .await;
+
+    // (b) Coder fallback default + one tier override differing in tool.
+    set_profile(
+        &mut fx,
+        &mut rev,
+        vec![
+            RoleAssignment {
+                role: WorkflowRole::Coder,
+                difficulty: None,
+                choice: ModelChoice {
+                    model_id: "model-deepseek-flash".to_string(),
+                    effort: Some("max".to_string()),
+                },
+            },
+            RoleAssignment {
+                role: WorkflowRole::Coder,
+                difficulty: Some(Difficulty::Extreme),
+                choice: ModelChoice {
+                    model_id: "model-secondary-flash".to_string(),
+                    effort: Some("max".to_string()),
+                },
+            },
+        ],
+        Some("jev-api:jev-latest"),
+    );
+    let mut tool_req =
+        prepare_task_exact_request(&fx, "route-gate-tool-diff", vec!["src/lib.rs"], None);
+    tool_req["forecast"] = serde_json::json!({
+        "component_count": 2,
+        "coupled": true,
+        "uncertain": false,
+        "summary": "Coder fallback plus different tool tier must launch advice"
+    });
+    let tool_raw: Value = parse_success(
+        &run_command_with_stdin(
+            staged_command(&staged.approve_exe),
+            &exact_args,
+            &prepare_task_bytes(&tool_req),
+            Some(&temp_dir),
+        )
+        .await,
+        "fallback plus tool variation launches advice",
+    );
+    assert_eq!(tool_raw["forecast"]["status"], "launched");
+    assert_eq!(tool_raw["forecast"]["launched"], true);
+    let _ = wait_for_non_empty_file(
+        Path::new(tool_raw["forecast"]["advice_path"].as_str().unwrap()),
+        Duration::from_secs(5),
+    )
+    .await;
+    assert_eq!(fake_advice_call_dirs(&advice_log).len(), 2);
+
+    fx.assert_no_approval_artifacts();
     fx.shutdown().await;
 }

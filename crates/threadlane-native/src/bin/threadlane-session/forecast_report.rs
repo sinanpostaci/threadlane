@@ -1421,8 +1421,11 @@ fn validate_forecast_record(
 
     match record.status {
         ShadowForecastStatus::Skipped => {
-            if record.triggered
-                || record.advisor.is_some()
+            let valid_skip = match record.reason.as_str() {
+                "fixed_worker_route" => record.triggered,
+                _ => !record.triggered && record.advisor.is_none(),
+            };
+            if !valid_skip
                 || record.request_summary_sha256.is_some()
                 || record.request_file.is_some()
                 || record.advice_file.is_some()
@@ -2739,8 +2742,6 @@ mod tests {
             uncertain: bool,
             status: &str,
         ) {
-            let task = &approval.tasks[0];
-            let triggered = uncertain || coupled || component_count > 1;
             let reason = match status {
                 "skipped" => "simple_task",
                 "launched" => "shadow_classify_launched",
@@ -2748,6 +2749,30 @@ mod tests {
                 "unknown" => "advice_spawn_failed",
                 other => other,
             };
+            self.write_forecast_record_with(
+                approval,
+                component_count,
+                coupled,
+                uncertain,
+                status,
+                reason,
+                matches!(status, "launched" | "unknown"),
+            );
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn write_forecast_record_with(
+            &self,
+            approval: &ApprovalRecord,
+            component_count: u8,
+            coupled: bool,
+            uncertain: bool,
+            status: &str,
+            reason: &str,
+            include_advisor: bool,
+        ) {
+            let task = &approval.tasks[0];
+            let triggered = uncertain || coupled || component_count > 1;
             let mut obj = json!({
                 "schema_version": 1,
                 "advisory_only": true,
@@ -2773,7 +2798,7 @@ mod tests {
                 "reason": reason,
                 "recorded_at_ms": 1_700_000_000_000u64
             });
-            if matches!(status, "launched" | "unknown") {
+            if include_advisor {
                 obj["advisor"] = json!({
                     "tool_id": "jev-api",
                     "model_id": "jev-api:jev-latest",
@@ -3331,6 +3356,86 @@ mod tests {
         assert_eq!(missing_report.execution.elapsed_worker_ms, None);
         assert!(!missing_report.execution.guarded_done);
         assert!(!missing_report.execution.guarded_acceptance_rejected);
+
+        // Triggered fixed_worker_route skip (with or without advisor metadata) must load cleanly.
+        for include_advisor in [true, false] {
+            fx.write_forecast_record_with(
+                &approval_unstarted,
+                2,
+                true,
+                false,
+                "skipped",
+                "fixed_worker_route",
+                include_advisor,
+            );
+            let fixed_skip_report =
+                build_forecast_report(fx.scope(&fx.binding_id, THREAD_A, &unstarted_item.item_id))
+                    .expect("fixed_worker_route skipped report must succeed");
+            assert_eq!(
+                fixed_skip_report.initial_coworker.record_status,
+                ForecastRecordStatus::Present
+            );
+            assert_eq!(
+                fixed_skip_report.initial_coworker.complexity,
+                Some(ForecastComplexity {
+                    component_count: 2,
+                    coupled: true,
+                    uncertain: false,
+                })
+            );
+            assert_eq!(
+                fixed_skip_report.provider_advice.status,
+                ProviderAdviceStatus::Skipped
+            );
+            assert_eq!(fixed_skip_report.agreement, ForecastAgreement::Unavailable);
+        }
+
+        // Contradictory skipped records must still fail closed.
+        fx.write_forecast_record_with(
+            &approval_unstarted,
+            2,
+            false,
+            false,
+            "skipped",
+            "simple_task",
+            false,
+        );
+        assert_eq!(
+            build_forecast_report(fx.scope(&fx.binding_id, THREAD_A, &unstarted_item.item_id))
+                .expect_err("simple_task skip with triggered=true must fail")
+                .code,
+            "invalid_forecast"
+        );
+        fx.write_forecast_record_with(
+            &approval_unstarted,
+            1,
+            false,
+            false,
+            "skipped",
+            "simple_task",
+            true,
+        );
+        assert_eq!(
+            build_forecast_report(fx.scope(&fx.binding_id, THREAD_A, &unstarted_item.item_id))
+                .expect_err("simple_task skip with advisor metadata must fail")
+                .code,
+            "invalid_forecast"
+        );
+        fx.write_forecast_record_with(
+            &approval_unstarted,
+            1,
+            false,
+            false,
+            "skipped",
+            "fixed_worker_route",
+            true,
+        );
+        assert_eq!(
+            build_forecast_report(fx.scope(&fx.binding_id, THREAD_A, &unstarted_item.item_id))
+                .expect_err("fixed_worker_route skip with triggered=false must fail")
+                .code,
+            "invalid_forecast"
+        );
 
         fx.write_forecast_record(&approval_unstarted, 2, false, false, "unavailable");
         let unavailable_report =

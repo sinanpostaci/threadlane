@@ -5,11 +5,13 @@
 //! storing only scope identity, baseline difficulty (`task.difficulty`), bounded complexity
 //! facts, and `summary_sha256` (never raw summary text).
 //!
-//! When triggered (`uncertain || coupled || component_count > 1`) and the selected profile
+//! When triggered (`uncertain || coupled || component_count > 1`), the selected profile
 //! has an enabled shadow decision advisor in the already-opened validated registry snapshot,
-//! acquires a durable exclusive claim before launching the canonical sibling `threadlane-advice`
-//! binary nonblocking with `--profile-id <ID> classify` and no `--refresh`. Advisory failures
-//! never block a valid preview, never modify the preview authority digest, and never retry.
+//! and at least two usable effective Worker targets across `Difficulty::ALL` differ in tool,
+//! `model_arg`, or effort, acquires a durable exclusive claim before launching the canonical
+//! sibling `threadlane-advice` binary nonblocking with `--profile-id <ID> classify` and no
+//! `--refresh`. Advisory failures never block a valid preview, never modify the preview
+//! authority digest, and never retry.
 
 use std::fmt;
 #[cfg(unix)]
@@ -29,7 +31,7 @@ use threadlane_authority::OperatorApprovalPreview;
 #[cfg(unix)]
 use threadlane_native::fs_safety::validate_absolute_no_symlink_components;
 #[cfg(unix)]
-use threadlane_workflow::DecisionAdvisorMode;
+use threadlane_workflow::{resolve_choice, DecisionAdvisorMode, WorkflowRole};
 use threadlane_workflow::{Difficulty, RegistrySnapshot, ToolAdapter};
 #[cfg(unix)]
 use uuid::Uuid;
@@ -208,7 +210,8 @@ pub(super) struct ForecastComplexity {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum ShadowForecastStatus {
-    /// Simple task (`component_count == 1 && !coupled && !uncertain`); advisor skipped.
+    /// Simple task (`component_count == 1 && !coupled && !uncertain`) or fixed Worker route
+    /// across `Difficulty::ALL`; advisor skipped.
     Skipped,
     /// Exclusive claim acquired and canonical sibling `threadlane-advice` spawned nonblocking.
     Launched,
@@ -438,6 +441,18 @@ fn run_before_dispatch_forecast_unix(
             );
         }
     };
+
+    if !profile_has_variable_worker_route(ctx.registry_snapshot, ctx.profile_id) {
+        return persist_non_launched_record(
+            ctx,
+            &subject_dir,
+            &record_path,
+            ShadowForecastStatus::Skipped,
+            "fixed_worker_route",
+            Some(advisor),
+            expected_uid,
+        );
+    }
 
     let advice_exe = match resolve_canonical_sibling_advice_executable() {
         Ok(exe) => exe,
@@ -672,6 +687,37 @@ fn resolve_profile_shadow_advisor(
         model_arg: model.model_arg.clone(),
         adapter: tool.adapter,
     })
+}
+
+#[cfg(unix)]
+fn profile_has_variable_worker_route(snapshot: &RegistrySnapshot, profile_id: &str) -> bool {
+    use threadlane_workers::{spec::resolve_model_target, WorkerProvider};
+
+    let mut targets = Difficulty::ALL.into_iter().filter_map(|difficulty| {
+        let choice =
+            resolve_choice(snapshot, profile_id, WorkflowRole::Coder, Some(difficulty)).ok()?;
+        let model = snapshot
+            .models
+            .iter()
+            .find(|model| model.id == choice.model_id)?;
+        let tool = snapshot
+            .tools
+            .iter()
+            .find(|tool| tool.enabled && tool.id == model.tool_id)?;
+        let provider = match tool.adapter {
+            ToolAdapter::Antigravity => WorkerProvider::Antigravity,
+            ToolAdapter::OpencodeV2 => WorkerProvider::OpenCodeV2,
+            ToolAdapter::CodexCli => WorkerProvider::CodexCli,
+            _ => return None,
+        };
+        let target =
+            resolve_model_target(provider, &model.model_arg, choice.effort.as_deref()).ok()?;
+        Some((&tool.id, target))
+    });
+    let Some(first) = targets.next() else {
+        return false;
+    };
+    targets.any(|target| target != first)
 }
 
 #[cfg(unix)]
@@ -1349,7 +1395,12 @@ mod tests {
     use std::os::unix::fs::{symlink, PermissionsExt};
 
     use tempfile::TempDir;
-    use threadlane_workflow::{DecisionAdvisor, ModelDefinition, ToolDefinition, WorkflowProfile};
+    use threadlane_authority::OperatorApprovalRequest;
+    use threadlane_workers::ExecutionBudgets;
+    use threadlane_workflow::{
+        DecisionAdvisor, ModelChoice, ModelDefinition, RoleAssignment, ToolDefinition,
+        WorkflowProfile,
+    };
 
     use super::*;
 
@@ -1776,6 +1827,419 @@ mod tests {
         assert_eq!(
             prepare_subject_dir(&symlink_dir, expected_uid),
             Err("subject_dir_invalid")
+        );
+    }
+
+    fn routing_snapshot(assignments: Vec<RoleAssignment>) -> RegistrySnapshot {
+        RegistrySnapshot {
+            schema_version: RegistrySnapshot::empty().schema_version,
+            revision: 7,
+            tools: vec![
+                ToolDefinition {
+                    id: "tool-oc".to_string(),
+                    label: "OpenCode".to_string(),
+                    adapter: ToolAdapter::OpencodeV2,
+                    executable_path: Some(PathBuf::from("/usr/bin/opencode")),
+                    enabled: true,
+                },
+                ToolDefinition {
+                    id: "tool-agy".to_string(),
+                    label: "Antigravity".to_string(),
+                    adapter: ToolAdapter::Antigravity,
+                    executable_path: Some(PathBuf::from("/usr/bin/agy")),
+                    enabled: true,
+                },
+                ToolDefinition {
+                    id: "tool-codex".to_string(),
+                    label: "Codex".to_string(),
+                    adapter: ToolAdapter::CodexCli,
+                    executable_path: Some(PathBuf::from("/usr/bin/codex")),
+                    enabled: true,
+                },
+                ToolDefinition {
+                    id: "tool-oc-disabled".to_string(),
+                    label: "Disabled OpenCode".to_string(),
+                    adapter: ToolAdapter::OpencodeV2,
+                    executable_path: Some(PathBuf::from("/usr/bin/opencode")),
+                    enabled: false,
+                },
+                ToolDefinition {
+                    id: "jev-api".to_string(),
+                    label: "Jev API".to_string(),
+                    adapter: ToolAdapter::JevApi,
+                    executable_path: None,
+                    enabled: true,
+                },
+                ToolDefinition {
+                    id: "git-cli".to_string(),
+                    label: "Git".to_string(),
+                    adapter: ToolAdapter::Git,
+                    executable_path: Some(PathBuf::from("/usr/bin/git")),
+                    enabled: true,
+                },
+            ],
+            models: vec![
+                ModelDefinition {
+                    id: "oc-flash".to_string(),
+                    tool_id: "tool-oc".to_string(),
+                    label: "Flash".to_string(),
+                    model_arg: "opencode-go/deepseek-v4.1-flash".to_string(),
+                    efforts: vec!["medium".to_string(), "max".to_string()],
+                    allow_no_effort: false,
+                },
+                ModelDefinition {
+                    id: "oc-flash-alias".to_string(),
+                    tool_id: "tool-oc".to_string(),
+                    label: "Flash Alias".to_string(),
+                    model_arg: "opencode-go/deepseek-v4.1-flash".to_string(),
+                    efforts: vec!["max".to_string()],
+                    allow_no_effort: false,
+                },
+                ModelDefinition {
+                    id: "oc-flash-inline-alias".to_string(),
+                    tool_id: "tool-oc".to_string(),
+                    label: "Flash Inline".to_string(),
+                    model_arg: "opencode-go/deepseek-v4.1-flash#max".to_string(),
+                    efforts: Vec::new(),
+                    allow_no_effort: true,
+                },
+                ModelDefinition {
+                    id: "oc-pro".to_string(),
+                    tool_id: "tool-oc".to_string(),
+                    label: "Pro".to_string(),
+                    model_arg: "opencode-go/deepseek-v4.1-pro".to_string(),
+                    efforts: vec!["max".to_string()],
+                    allow_no_effort: false,
+                },
+                ModelDefinition {
+                    id: "agy-argon".to_string(),
+                    tool_id: "tool-agy".to_string(),
+                    label: "Argon".to_string(),
+                    model_arg: "gemini-4-argon-high".to_string(),
+                    efforts: vec!["medium".to_string(), "high".to_string()],
+                    allow_no_effort: false,
+                },
+                ModelDefinition {
+                    id: "codex-worker".to_string(),
+                    tool_id: "tool-codex".to_string(),
+                    label: "Codex".to_string(),
+                    model_arg: "gpt-6-astra".to_string(),
+                    efforts: vec!["high".to_string()],
+                    allow_no_effort: false,
+                },
+                ModelDefinition {
+                    id: "oc-disabled-model".to_string(),
+                    tool_id: "tool-oc-disabled".to_string(),
+                    label: "Disabled".to_string(),
+                    model_arg: "opencode-go/deepseek-v4.1-pro".to_string(),
+                    efforts: vec!["max".to_string()],
+                    allow_no_effort: false,
+                },
+                ModelDefinition {
+                    id: "jev-api:jev-latest".to_string(),
+                    tool_id: "jev-api".to_string(),
+                    label: "Jev".to_string(),
+                    model_arg: "jev-latest".to_string(),
+                    efforts: Vec::new(),
+                    allow_no_effort: true,
+                },
+                ModelDefinition {
+                    id: "git-helper".to_string(),
+                    tool_id: "git-cli".to_string(),
+                    label: "Git".to_string(),
+                    model_arg: "git".to_string(),
+                    efforts: Vec::new(),
+                    allow_no_effort: true,
+                },
+            ],
+            profiles: vec![WorkflowProfile {
+                id: "p-test".to_string(),
+                name: "Test Profile".to_string(),
+                assignments,
+                decision_advisor: Some(DecisionAdvisor {
+                    model_id: "jev-api:jev-latest".to_string(),
+                    mode: DecisionAdvisorMode::Shadow,
+                }),
+            }],
+            default_profile_id: Some("p-test".to_string()),
+        }
+    }
+
+    fn coder_assignment(
+        difficulty: Option<Difficulty>,
+        model_id: &str,
+        effort: Option<&str>,
+    ) -> RoleAssignment {
+        RoleAssignment {
+            role: WorkflowRole::Coder,
+            difficulty,
+            choice: ModelChoice {
+                model_id: model_id.to_string(),
+                effort: effort.map(str::to_string),
+            },
+        }
+    }
+
+    #[test]
+    fn worker_routing_variation_handles_none_default_aliases_other_roles_and_effort_diffs() {
+        // 1. None: empty assignments, only non-Coder roles (even varying), or unusable Coder tools.
+        assert!(!profile_has_variable_worker_route(
+            &routing_snapshot(Vec::new()),
+            "p-test"
+        ));
+        assert!(!profile_has_variable_worker_route(
+            &routing_snapshot(vec![
+                RoleAssignment {
+                    role: WorkflowRole::Reviewer,
+                    difficulty: Some(Difficulty::Easy),
+                    choice: ModelChoice {
+                        model_id: "oc-flash".to_string(),
+                        effort: Some("max".to_string()),
+                    },
+                },
+                RoleAssignment {
+                    role: WorkflowRole::Reviewer,
+                    difficulty: Some(Difficulty::Hard),
+                    choice: ModelChoice {
+                        model_id: "agy-argon".to_string(),
+                        effort: Some("high".to_string()),
+                    },
+                },
+                RoleAssignment {
+                    role: WorkflowRole::Advisor,
+                    difficulty: Some(Difficulty::Easy),
+                    choice: ModelChoice {
+                        model_id: "oc-pro".to_string(),
+                        effort: Some("max".to_string()),
+                    },
+                },
+                RoleAssignment {
+                    role: WorkflowRole::Closure,
+                    difficulty: Some(Difficulty::Extreme),
+                    choice: ModelChoice {
+                        model_id: "git-helper".to_string(),
+                        effort: None,
+                    },
+                },
+            ]),
+            "p-test"
+        ));
+        assert!(!profile_has_variable_worker_route(
+            &routing_snapshot(vec![
+                coder_assignment(Some(Difficulty::Easy), "oc-disabled-model", Some("max")),
+                coder_assignment(Some(Difficulty::Hard), "jev-api:jev-latest", None),
+                coder_assignment(Some(Difficulty::Extreme), "git-helper", None),
+            ]),
+            "p-test"
+        ));
+
+        // 2. Default only: Coder default alone (even with varying non-Coder roles) must not trigger.
+        assert!(!profile_has_variable_worker_route(
+            &routing_snapshot(vec![
+                coder_assignment(None, "oc-flash", Some("max")),
+                RoleAssignment {
+                    role: WorkflowRole::Reviewer,
+                    difficulty: Some(Difficulty::Easy),
+                    choice: ModelChoice {
+                        model_id: "oc-flash".to_string(),
+                        effort: Some("max".to_string()),
+                    },
+                },
+                RoleAssignment {
+                    role: WorkflowRole::Reviewer,
+                    difficulty: Some(Difficulty::Hard),
+                    choice: ModelChoice {
+                        model_id: "agy-argon".to_string(),
+                        effort: Some("high".to_string()),
+                    },
+                },
+            ]),
+            "p-test"
+        ));
+
+        // 3. Single exact tier only (or one usable + one disabled/non-worker tier) must not trigger.
+        assert!(!profile_has_variable_worker_route(
+            &routing_snapshot(vec![coder_assignment(
+                Some(Difficulty::Easy),
+                "oc-flash",
+                Some("max")
+            )]),
+            "p-test"
+        ));
+        assert!(!profile_has_variable_worker_route(
+            &routing_snapshot(vec![
+                coder_assignment(Some(Difficulty::Easy), "oc-flash", Some("max")),
+                coder_assignment(Some(Difficulty::Hard), "oc-disabled-model", Some("max")),
+                coder_assignment(Some(Difficulty::Extreme), "jev-api:jev-latest", None),
+            ]),
+            "p-test"
+        ));
+
+        // 4. Identical tiers and aliases selecting identical execution targets must not trigger.
+        assert!(!profile_has_variable_worker_route(
+            &routing_snapshot(vec![
+                coder_assignment(Some(Difficulty::Easy), "oc-flash", Some("max")),
+                coder_assignment(Some(Difficulty::Medium), "oc-flash", Some("max")),
+                coder_assignment(Some(Difficulty::Hard), "oc-flash", Some("max")),
+                coder_assignment(Some(Difficulty::Extreme), "oc-flash", Some("max")),
+            ]),
+            "p-test"
+        ));
+        assert!(!profile_has_variable_worker_route(
+            &routing_snapshot(vec![
+                coder_assignment(Some(Difficulty::Easy), "oc-flash", Some("max")),
+                coder_assignment(Some(Difficulty::Medium), "oc-flash-alias", Some("max")),
+                coder_assignment(Some(Difficulty::Hard), "oc-flash-inline-alias", None),
+                coder_assignment(None, "oc-flash-alias", Some("max")),
+            ]),
+            "p-test"
+        ));
+
+        // 5. Real differences across Difficulty::ALL trigger: tool, model_arg, effort-only, and fallback+override.
+        assert!(profile_has_variable_worker_route(
+            &routing_snapshot(vec![
+                coder_assignment(Some(Difficulty::Easy), "oc-flash", Some("max")),
+                coder_assignment(Some(Difficulty::Hard), "agy-argon", Some("high")),
+            ]),
+            "p-test"
+        ));
+        assert!(profile_has_variable_worker_route(
+            &routing_snapshot(vec![
+                coder_assignment(Some(Difficulty::Easy), "oc-flash", Some("max")),
+                coder_assignment(Some(Difficulty::Hard), "oc-pro", Some("max")),
+            ]),
+            "p-test"
+        ));
+        // The High-only AGY variant cannot execute the Medium assignment.
+        assert!(!profile_has_variable_worker_route(
+            &routing_snapshot(vec![
+                coder_assignment(Some(Difficulty::Easy), "agy-argon", Some("medium")),
+                coder_assignment(Some(Difficulty::Hard), "agy-argon", Some("high")),
+            ]),
+            "p-test"
+        ));
+        assert!(profile_has_variable_worker_route(
+            &routing_snapshot(vec![
+                coder_assignment(None, "oc-flash", Some("medium")),
+                coder_assignment(Some(Difficulty::Extreme), "oc-flash", Some("max")),
+            ]),
+            "p-test"
+        ));
+        assert!(profile_has_variable_worker_route(
+            &routing_snapshot(vec![
+                coder_assignment(Some(Difficulty::Easy), "oc-flash", Some("max")),
+                coder_assignment(Some(Difficulty::Hard), "codex-worker", Some("high")),
+            ]),
+            "p-test"
+        ));
+    }
+
+    #[test]
+    fn fixed_worker_route_skips_with_truthful_triggered_and_preserves_advisor_validation() {
+        let tmp = TempDir::new().expect("tempdir");
+        let root = fs::canonicalize(tmp.path()).expect("canonicalize tempdir");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).expect("chmod root 0700");
+        let registry_dir = root.join("registry");
+        let plans_dir = root.join("plans");
+        let repo = root.join("repo");
+        fs::create_dir(&registry_dir).expect("mkdir registry");
+        fs::create_dir(&plans_dir).expect("mkdir plans");
+        fs::create_dir(&repo).expect("mkdir repo");
+        fs::set_permissions(&plans_dir, fs::Permissions::from_mode(0o700))
+            .expect("chmod plans 0700");
+
+        let subject_fixed = "a".repeat(64);
+        let subject_unconf = "b".repeat(64);
+        let preview_for = |subject: &str| OperatorApprovalPreview {
+            request: OperatorApprovalRequest {
+                binding_id: "bnd-1".to_string(),
+                thread_uuid: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+                plan_id: "plan_1".to_string(),
+                plan_revision: 1,
+                expected_registry_revision: 7,
+                expected_plan_digest: "c".repeat(64),
+                repository_path: repo.clone(),
+                base_commit: "d".repeat(40),
+                approved_task_ids: vec!["task-1".to_string()],
+                approved_write_paths: vec!["src/lib.rs".to_string()],
+                max_parallel: 1,
+                budgets: ExecutionBudgets::default(),
+            },
+            subject_digest: subject.to_string(),
+            tasks: Vec::new(),
+        };
+
+        let forecast = ValidatedForecast::validate(
+            sample_input(2, true, false, "Coupled two-component change"),
+            &repo,
+        )
+        .expect("valid triggered forecast");
+
+        // Even with no Coder assignments ("none"), selected advisor validation still runs first.
+        let mut no_advisor_snap = routing_snapshot(Vec::new());
+        no_advisor_snap.profiles[0].decision_advisor = None;
+        let preview_unconf = preview_for(&subject_unconf);
+        let unconf_receipt = run_before_dispatch_forecast(&BeforeDispatchForecastContext {
+            registry_dir: &registry_dir,
+            plans_dir: &plans_dir,
+            canonical_repo: &repo,
+            registry_snapshot: &no_advisor_snap,
+            profile_id: "p-test",
+            profile_revision: 7,
+            task_id: "task-1",
+            baseline_difficulty: Difficulty::Hard,
+            preview: &preview_unconf,
+            forecast: &forecast,
+        });
+        assert_eq!(unconf_receipt.status, ShadowForecastStatus::Unavailable);
+        assert_eq!(unconf_receipt.reason, "advisor_not_configured");
+        assert!(unconf_receipt.triggered);
+        assert!(!unconf_receipt.launched);
+
+        // With a valid exact advisor and fixed Coder route, skip before launching advice while
+        // preserving truthful `triggered: true` in both receipt and persisted record.json.
+        let fixed_snap = routing_snapshot(vec![coder_assignment(None, "oc-flash", Some("max"))]);
+        let preview_fixed = preview_for(&subject_fixed);
+        let ctx_fixed = BeforeDispatchForecastContext {
+            registry_dir: &registry_dir,
+            plans_dir: &plans_dir,
+            canonical_repo: &repo,
+            registry_snapshot: &fixed_snap,
+            profile_id: "p-test",
+            profile_revision: 7,
+            task_id: "task-1",
+            baseline_difficulty: Difficulty::Hard,
+            preview: &preview_fixed,
+            forecast: &forecast,
+        };
+        let first = run_before_dispatch_forecast(&ctx_fixed);
+        assert_eq!(first.status, ShadowForecastStatus::Skipped);
+        assert_eq!(first.reason, "fixed_worker_route");
+        assert!(first.triggered);
+        assert!(!first.reused);
+        assert!(!first.launched);
+        assert!(first.advice_path.is_none());
+        let record_path = first.record_path.clone().expect("record_path");
+        let record_bytes = fs::read(&record_path).expect("read persisted record.json");
+        let persisted: PersistedForecastRecord =
+            serde_json::from_slice(&record_bytes).expect("parse persisted record.json");
+        assert_eq!(persisted.status, ShadowForecastStatus::Skipped);
+        assert_eq!(persisted.reason, "fixed_worker_route");
+        assert!(persisted.triggered);
+        assert!(persisted.request_file.is_none());
+        assert!(persisted.advice_file.is_none());
+        assert!(!plans_dir.join(ADVICE_CACHE_DIR_NAME).exists());
+
+        // Replay must reuse the skipped record without overwriting or launching.
+        let replay = run_before_dispatch_forecast(&ctx_fixed);
+        assert_eq!(replay.status, ShadowForecastStatus::Skipped);
+        assert_eq!(replay.reason, "fixed_worker_route");
+        assert!(replay.triggered);
+        assert!(replay.reused);
+        assert!(!replay.launched);
+        assert_eq!(
+            fs::read(&record_path).expect("reread record.json"),
+            record_bytes
         );
     }
 }
