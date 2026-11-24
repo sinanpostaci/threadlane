@@ -2165,6 +2165,43 @@ test('keeps jobless Advisor completion on default source (project_path=null) in 
 });
 
 test.describe('Workspace liveness, attention, and committed completion', () => {
+
+  for (const width of [1040, 390]) {
+    test(`keeps two sidebar rows stable across isolated read failures and recovers after an outage at ${width}px`, async ({ page }) => {
+      const base = buildMinimalChatWorkspaceSnapshot();
+      const beta = base.chats.find((chat) => chat.thread_label === 'Release Verification Gate');
+      if (!beta?.identity) throw new Error('Expected Beta fixture identity');
+      const working = updateNativeActivityFixture(
+        updateNativeActivityFixture(base, CHAT_ALPHA_IDENTITY, 'working'), beta.identity, 'working',
+      );
+      const controller = await installMinimal(page, { width, height: 760 }, { workspaceSnapshot: working });
+      const navigation = width === 390 ? page.locator('#tl-navigation-drawer') : sidebar(page);
+      if (width === 390) {
+        await page.getByRole('button', { name: /open navigation drawer/i }).first().click();
+      }
+      const rows = navigation.locator('button.tl-chat-item').filter({
+        hasText: /Workspace UI Contract|Release Verification Gate/,
+      });
+      const labels = (text: string) => rows.getByText(text, { exact: true });
+      await expect(labels('Working')).toHaveCount(2);
+      const readCount = async () => (await controller.getInvocations())
+        .filter((call) => call.cmd === 'desktop_workspace_snapshot').length;
+      for (let cycle = 0; cycle < 3; cycle++) {
+        const before = await readCount();
+        await controller.failNextWorkspaceSnapshotRead();
+        await page.evaluate(() => window.dispatchEvent(new Event('focus')));
+        await expect.poll(readCount).toBeGreaterThanOrEqual(before + 2);
+        await expect(labels('Working')).toHaveCount(2);
+      }
+      await controller.failNextWorkspaceSnapshotRead();
+      await controller.failNextWorkspaceSnapshotRead();
+      await page.evaluate(() => window.dispatchEvent(new Event('focus')));
+      await expect(labels('Status unavailable')).toHaveCount(2);
+      await page.evaluate(() => window.dispatchEvent(new Event('focus')));
+      await expect(labels('Working')).toHaveCount(2);
+    });
+  }
+
   test('shows actual fresh Worker and Coworker Working in live agents, clears Worker on expiry and failed refresh, and keeps drawer rows committed', async ({
     page,
   }) => {
@@ -2214,8 +2251,7 @@ test.describe('Workspace liveness, attention, and committed completion', () => {
     // The Coworker remains working because its native sample is still fresh.
     await expectVisibleWorking(header);
 
-    // Reset to a fresh Worker sample at the fixture instant, then fail the next
-    // refresh: the failed read must clear Worker live rather than retain proof.
+    // Recover a single missed read, then fail both reads of the next refresh.
     await controller.setWorkspaceSnapshot(workingSnapshot);
     await triggerWorkspaceRefresh(page);
     await expectLiveAgentWorking(workspace, 'Worker');
@@ -2229,7 +2265,12 @@ test.describe('Workspace liveness, attention, and committed completion', () => {
         const calls = await controller.getInvocations();
         return calls.filter((call) => call.cmd === 'desktop_workspace_snapshot').length;
       })
-      .toBeGreaterThan(readsBeforeFailedRefresh);
+      .toBeGreaterThanOrEqual(readsBeforeFailedRefresh + 2);
+    await expectLiveAgentWorking(workspace, 'Worker');
+    await expectLiveAgentWorking(workspace, 'Coworker');
+    await controller.failNextWorkspaceSnapshotRead();
+    await controller.failNextWorkspaceSnapshotRead();
+    await triggerWorkspaceRefresh(page);
     await expectNoLiveAgentWorking(workspace, 'Worker');
 
     dialog = await openBacklog(page);

@@ -4363,7 +4363,7 @@ export async function installWorkspaceTauriFixture(
       let currentTrayPrefs: TrayPreferencesResponse = { ...seed.trayPrefs };
       const invocations: RecordedTauriInvocation[] = [];
       let stallNextWorkspaceRead = false;
-      let failNextWorkspaceRead = false;
+      let workspaceReadFailuresRemaining = 0;
       const stalledWorkspaceReadResolvers: Array<() => void> = [];
       let nextCallbackId = 1;
       let nextEventListenerId = 1;
@@ -4625,8 +4625,8 @@ export async function installWorkspaceTauriFixture(
 
           switch (cmd) {
             case 'desktop_workspace_snapshot': {
-              if (failNextWorkspaceRead) {
-                failNextWorkspaceRead = false;
+              if (workspaceReadFailuresRemaining > 0) {
+                workspaceReadFailuresRemaining--;
                 throw {
                   code: 'workspace_unavailable',
                   message: 'Injected workspace refresh failure for live-presence clearing.',
@@ -4757,7 +4757,7 @@ export async function installWorkspaceTauriFixture(
           stallNextWorkspaceRead = true;
         },
         failNextWorkspaceSnapshotRead: () => {
-          failNextWorkspaceRead = true;
+          workspaceReadFailuresRemaining++;
         },
         getStalledWorkspaceSnapshotCount: () => stalledWorkspaceReadResolvers.length,
         releaseStalledWorkspaceSnapshotReads: () => {

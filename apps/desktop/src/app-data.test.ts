@@ -462,6 +462,48 @@ function flushMicrotasks(): Promise<void> {
 }
 
 describe('app-data DesktopAppCoordinator', () => {
+  it('confirms a failed background read before degrading all chat rows', async () => {
+    const chats = [IDENTITY_A, IDENTITY_B];
+    const snapshot = makeWorkspaceSnapshot({
+      chats: chats.map((id) => makeChatSummary(id)),
+      native_samples: chats.map((id) => makeNativeSample(id)),
+    });
+    let reads = 0;
+    let failures = 0;
+    const visibleErrors: string[] = [];
+    const coordinator = new DesktopAppCoordinator({
+      now: () => NOW_MS,
+      fetchWorkspaceSnapshot: async () => {
+        reads++;
+        if (failures > 0) {
+          failures--;
+          throw new Error('Workspace snapshot read failed');
+        }
+        return snapshot;
+      },
+    }, (state) => {
+      if (state.observationError) visibleErrors.push(state.observationError);
+    });
+    await coordinator.refreshWorkspace({ mode: 'replace' });
+    assert.equal(coordinator.projectWorkspace().totalWorkingCoworkerCount, 2);
+    failures = 1;
+    await coordinator.pollTick();
+    assert.equal(coordinator.projectWorkspace().totalWorkingCoworkerCount, 2);
+    assert.deepEqual(visibleErrors, []);
+    assert.equal(reads, 3);
+
+    failures = 3;
+    await coordinator.pollTick();
+    assert.equal(reads, 5);
+    assert.equal(coordinator.projectWorkspace().totalWorkingCoworkerCount, 0);
+    assert.equal(coordinator.projectWorkspace().isStale, true);
+    await coordinator.pollTick();
+    assert.equal(reads, 6);
+    await coordinator.pollTick();
+    assert.equal(coordinator.projectWorkspace().totalWorkingCoworkerCount, 2);
+    assert.equal(coordinator.projectWorkspace().isStale, false);
+  });
+
   it('prefers fetchWorkspaceSnapshot, defaults to Messages + Active lifecycle, and keeps legacy observation compatibility non-fabricating', async () => {
     let workspaceCalls = 0;
     let legacyCalls = 0;

@@ -1206,9 +1206,26 @@ export class DesktopAppCoordinator {
 
   private async readBoundedWorkspaceSnapshot(
     request: ObservationSnapshotRequest,
+    ticket: ObservationTicket,
   ): Promise<WorkspaceSnapshot> {
     if (this.ports.fetchWorkspaceSnapshot) {
-      const raw = await this.ports.fetchWorkspaceSnapshot(request);
+      let raw: WorkspaceSnapshot;
+      try {
+        raw = await this.ports.fetchWorkspaceSnapshot(request);
+      } catch (error) {
+        // A missed read applies to the whole workspace. Confirm it once before
+        // discarding every chat's sample. The UI clock still ages those samples.
+        if (
+          ticket.mode !== 'refresh' ||
+          !this.state.visible ||
+          this.state.workspaceSnapshot === null ||
+          this.state.observationError !== null ||
+          !this.isObservationTicketCurrent(ticket)
+        ) {
+          throw error;
+        }
+        raw = await this.ports.fetchWorkspaceSnapshot(request);
+      }
       return parseWorkspaceSnapshot(raw);
     }
     if (this.ports.fetchObservationSnapshot) {
@@ -1239,7 +1256,7 @@ export class DesktopAppCoordinator {
         job_id: ticket.scope?.job_id ?? null,
         cursor: null,
         limit: DEFAULT_OBSERVATION_REQUEST_PAGE_LIMIT,
-      });
+      }, ticket);
 
       if (!this.isObservationTicketCurrent(ticket)) {
         return;

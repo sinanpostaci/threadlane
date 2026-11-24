@@ -2,6 +2,24 @@
 
 The paired guide is `2026-11-19.v5`; the packaged legacy template remains `2026-11-19.v2`. For supported small native reviews, select `ordinary_review_scope` with the actual approval, task, item and authorized source files before the single guarded start. It retains the original verified origin and optional clean source baseline without granting execution authority. On a real callback call `ordinary_review_notice({approval_id})` first on the connected paired route. It verifies that original origin, validates and acknowledges actual scoped pages, reconciles the original result and prepares bounded physical evidence. It never accepts semantics or completes work. Progress waits for a further actual callback; unknown, stale, missing, foreign or partial evidence stops without retry or fallback. At `ready_for_semantic_review` decide independently and use the guarded decision. The source baseline does not prove continuous unchanged state.
 
+For native review, retain the successful `ordinary_review_scope` response's
+`structuredContent.data` with the originating binding and backlog item. Keep a
+separate receipt for each parallel task. Use the original scope receipt for
+the matching notification, including after a reconnect and identity check:
+
+```js
+const { approval_id, task_id, item_id } = scopeReceipt;
+if (task_id !== expectedTask || item_id !== expectedItem || approval_id !== startApproval) {
+  throw new Error("Review scope and start receipt differ");
+}
+const ready = await tools.mcp__threadlane__ordinary_review_notice({ approval_id });
+```
+
+Here `startApproval` is the original approval field read from the recorded start
+or authority response. Pass receipt fields as data. A missing or ambiguous receipt
+requires reconciliation before review; a prefix, task title, or reconstructed
+digest cannot identify a delivery.
+
 For behavior tests, prepare the trusted test command before guarded start. Run its evidence reader in the actual client environment with representative inputs, including a mismatched hash. At the real notice retain the returned data once. Check the original binding, model, effort and attempt, then read `head_matches_base`, `base_commit`, `changed_paths` and `task_checkout_path` under `delivery`. The tracked test’s baseline evidence is under `source`. Use exact UTF-8 bytes and verify the declared path set, byte lengths, final newlines and SHA-256 values before running the trusted test on the copies in a fresh scratch directory. Pass data as data, never as shell instructions. When the client permits it, invoke the prepared check in the same tool call as the notice. Review the actual code and test result before sending the separate guarded verdict with the original read ID. Preflight cannot accept future output.
 
 For a behavior test, prepare the command and its pass condition before dispatch. On the first Ready, retain the original read. Present the two fields of `semantic_review` (the acceptance condition and delivery description) together with the actual `delivery.files` paths and text. Start the trusted scratch test against those exact, hash-verified bytes in that same notice invocation. A quick test can return with the first view. For a slow test, expose the review data promptly and let the existing check continue while reading the code. Show a compact pending or finished status. Reuse that invocation and its read ID. A known live session can remain pending. If its executor response is lost, mark the check unverified and reconcile the original session. A duplicate notice must neither rerun the test nor report an unobserved success. Keep the reviewed code available from the retained read. If a display limit clips code, review the missing portion from the retained read before deciding. After independently reviewing all requested behavior, only a finished, successful check for that read permits the separate guarded accept. Keep incomplete evidence pending and use the existing rejection and recovery paths where applicable.
