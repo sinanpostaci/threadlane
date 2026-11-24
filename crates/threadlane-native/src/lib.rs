@@ -61,6 +61,8 @@ pub mod coworker_notice;
 pub mod coworker_observation;
 /// Shared durable contracts and per-binding ledger store for the end-to-end Coworker workflow.
 pub mod coworker_workflow;
+/// Read-only Forecast A / shadow advice verification and compact decision badge projection.
+pub mod decision_badge;
 /// Shared conversation-change advancement guard for direct native task dispatch.
 pub mod dispatch_guard;
 /// Structured error codes and redacted error types.
@@ -199,6 +201,16 @@ pub use coworker_observation::{
     COWORKER_OBS_OP_INTEGRATION_JOB_AGGREGATION, COWORKER_OBS_OP_INTEGRATION_TASK,
     COWORKER_OBS_OP_PLANNING_ADVISOR, COWORKER_OBS_OP_PLANNING_ARCHITECT,
     COWORKER_OBS_OP_PLANNING_ORCHESTRATOR, COWORKER_OBS_OP_REVIEW_TASK,
+};
+pub use decision_badge::{
+    compute_shadow_advice_cache_key, compute_shadow_advice_prompt_digest,
+    project_verified_decision_badge_readonly, read_verified_forecast_artifacts, AdviceClassifyFile,
+    AdviceLoadState, AdvicePayload, DecisionBadgeLookupScope, ForecastArtifactError,
+    ForecastComplexity, ForecastRecordFile, ShadowAdvisorSelection, ShadowForecastStatus,
+    ADVICE_CACHE_SUBDIR, ADVICE_SHADOW_MODE, FORECAST_ADVICE_FILENAME, FORECAST_RECORD_FILENAME,
+    FORECAST_REQUEST_FILENAME, FORECAST_SCHEMA_VERSION, FORECAST_SUBDIR,
+    MAX_ADVICE_CACHE_RECORD_BYTES, MAX_COMPONENT_COUNT, MAX_FORECAST_FILE_BYTES,
+    MIN_COMPONENT_COUNT,
 };
 pub use dispatch_guard::{
     dispatch_approved_task_guarded, verify_no_blocking_conversation_changes,

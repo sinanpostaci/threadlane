@@ -13,8 +13,11 @@ import {
 } from './pages/activity-feed-model.ts';
 import {
   MAX_WORKSPACE_BACKLOG_PRESENCE_SAMPLE_AGE_MS,
+  MAX_WORKSPACE_CHAT_WORK_DECISION_BADGES_PER_CHAT,
+  MAX_WORKSPACE_CHAT_WORK_DECISION_BADGES_TOTAL,
   WORKSPACE_SAMPLE_STALE_THRESHOLD_MS,
   evaluateWorkspaceNativeSampleAt,
+  normalizeDecisionBadgeList,
   formatWorkspaceChatIdentityKey,
   isValidCanonicalProjectScope,
   isValidWorkspaceChatIdentity,
@@ -25,6 +28,7 @@ import type {
   WorkspaceChatIdentity,
   WorkspaceChatSummary,
   WorkspaceChatWork,
+  WorkspaceDecisionBadge,
   WorkspaceJobHistory,
   WorkspaceMessageItem,
   WorkspaceNativeSample,
@@ -62,6 +66,8 @@ export const MAX_CHAT_WORK_EVENTS = 500 as const;
 export const MAX_CHAT_WORK_PRESENCE = 32 as const;
 export const MAX_CHAT_WORK_EXECUTIONS = 32 as const;
 export const MAX_CHAT_WORK_EXECUTIONS_TOTAL = 128 as const;
+export const MAX_CHAT_WORK_DECISION_BADGES = MAX_WORKSPACE_CHAT_WORK_DECISION_BADGES_PER_CHAT;
+export const MAX_CHAT_WORK_DECISION_BADGES_TOTAL = MAX_WORKSPACE_CHAT_WORK_DECISION_BADGES_TOTAL;
 
 /**
  * Maximum bounded brief-gap window after a confirmed live Worker sample's
@@ -76,6 +82,7 @@ export type ChatWorkItem = WorkspaceChatWork['items'][number];
 export type ChatWorkEvent = WorkspaceChatWork['events'][number];
 export type ChatWorkPresence = WorkspaceChatWork['worker_presence'][number];
 export type ChatWorkExecution = WorkspaceWorkerExecution;
+export type ChatWorkDecisionBadge = WorkspaceDecisionBadge;
 export type ChatWorkStatus = ChatWorkItem['status'];
 export type ChatWorkKind = ChatWorkItem['kind'];
 export type ChatWorkEventOutcome = ChatWorkEvent['outcome'];
@@ -151,11 +158,13 @@ interface ChatWorkCandidateAggregate {
   events: unknown[];
   worker_presence: unknown[];
   worker_executions: unknown[];
+  decision_badges: unknown[];
   bounds: {
     items_omitted: number;
     events_omitted: number;
     presence_omitted: number;
     executions_omitted: number;
+    decision_badges_omitted: number;
   };
 }
 
@@ -185,11 +194,13 @@ function mergeChatWorkCandidatesByIdentity(value: unknown): ChatWorkCandidate[] 
         events: [],
         worker_presence: [],
         worker_executions: [],
+        decision_badges: [],
         bounds: {
           items_omitted: 0,
           events_omitted: 0,
           presence_omitted: 0,
           executions_omitted: 0,
+          decision_badges_omitted: 0,
         },
       };
       merged.set(key, aggregate);
@@ -204,10 +215,14 @@ function mergeChatWorkCandidatesByIdentity(value: unknown): ChatWorkCandidate[] 
     aggregate.bounds.executions_omitted += cleanNonNegativeInt(
       bounds.executions_omitted,
     );
+    aggregate.bounds.decision_badges_omitted += cleanNonNegativeInt(
+      bounds.decision_badges_omitted,
+    );
     aggregate.items.push(...rawChatWorkArray(candidate.items));
     aggregate.events.push(...rawChatWorkArray(candidate.events));
     aggregate.worker_presence.push(...rawChatWorkArray(candidate.worker_presence));
     aggregate.worker_executions.push(...rawChatWorkArray(candidate.worker_executions));
+    aggregate.decision_badges.push(...rawChatWorkArray(candidate.decision_badges));
   }
   return Array.from(merged.values()).map((aggregate) => ({
     identity: aggregate.identity,
@@ -216,11 +231,13 @@ function mergeChatWorkCandidatesByIdentity(value: unknown): ChatWorkCandidate[] 
     events: aggregate.events,
     worker_presence: aggregate.worker_presence,
     worker_executions: aggregate.worker_executions,
+    decision_badges: aggregate.decision_badges,
     bounds: {
       items_omitted: aggregate.bounds.items_omitted,
       events_omitted: aggregate.bounds.events_omitted,
       presence_omitted: aggregate.bounds.presence_omitted,
       executions_omitted: aggregate.bounds.executions_omitted,
+      decision_badges_omitted: aggregate.bounds.decision_badges_omitted,
     },
   }));
 }
@@ -1049,6 +1066,7 @@ export interface ChatWorkBoundsView {
   eventsOmitted: number;
   presenceOmitted: number;
   executionsOmitted: number;
+  decisionBadgesOmitted?: number;
 }
 
 export interface WorkspaceChatWorkSelection {
@@ -1059,6 +1077,7 @@ export interface WorkspaceChatWorkSelection {
   events: ChatWorkEvent[];
   presence: ChatWorkPresence[];
   executions: ChatWorkExecution[];
+  decisionBadges?: ChatWorkDecisionBadge[];
   bounds: ChatWorkBoundsView;
   notices: string[];
   unavailableReason: string | null;
@@ -1076,11 +1095,13 @@ function emptyChatWorkSelection(
     events: [],
     presence: [],
     executions: [],
+    decisionBadges: [],
     bounds: {
       itemsOmitted: 0,
       eventsOmitted: 0,
       presenceOmitted: 0,
       executionsOmitted: 0,
+      decisionBadgesOmitted: 0,
     },
     notices: reason !== null ? [reason] : [],
     unavailableReason: reason,
@@ -1434,9 +1455,15 @@ function buildChatWorkSelectionFromWork(
   const itemById = new Map<string, ChatWorkItem>(
     itemCap.items.map((item) => [item.item_id, item] as const),
   );
+  const itemOrderIndex = new Map<string, number>(
+    itemCap.items.map((item, idx) => [item.item_id, idx] as const),
+  );
 
   const rawExecutions: readonly unknown[] = Array.isArray(work.worker_executions)
     ? work.worker_executions
+    : [];
+  const rawDecisionBadges: readonly unknown[] = Array.isArray(work.decision_badges)
+    ? work.decision_badges
     : [];
 
   const rawEvents: readonly unknown[] = Array.isArray(work.events) ? work.events : [];
@@ -1464,6 +1491,12 @@ function buildChatWorkSelectionFromWork(
     identity,
     itemById,
     eventExecutionKeys,
+  );
+  const decisionBadgeResult = normalizeDecisionBadgeList(
+    rawDecisionBadges,
+    identity,
+    itemById,
+    itemOrderIndex,
   );
 
   const rawPresence: readonly unknown[] = Array.isArray(work.worker_presence)
@@ -1495,6 +1528,9 @@ function buildChatWorkSelectionFromWork(
     presenceCap.omitted;
   const executionsOmitted =
     cleanNonNegativeInt(rawBounds.executions_omitted) + executionResult.omitted;
+  const decisionBadgesOmitted =
+    cleanNonNegativeInt(rawBounds.decision_badges_omitted) +
+    decisionBadgeResult.omitted;
 
   const notices: string[] = [];
   if (availability === 'unavailable') {
@@ -1520,6 +1556,11 @@ function buildChatWorkSelectionFromWork(
       `${executionsOmitted} worker execution ${executionsOmitted === 1 ? 'record is' : 'records are'} outside this bounded window.`,
     );
   }
+  if (decisionBadgesOmitted > 0) {
+    notices.push(
+      `${decisionBadgesOmitted} decision advice ${decisionBadgesOmitted === 1 ? 'record is' : 'records are'} outside this bounded window.`,
+    );
+  }
 
   return {
     chatKey,
@@ -1529,11 +1570,13 @@ function buildChatWorkSelectionFromWork(
     events: eventCap.items,
     presence: presenceCap.items,
     executions: executionResult.executions,
+    decisionBadges: decisionBadgeResult.items,
     bounds: {
       itemsOmitted,
       eventsOmitted,
       presenceOmitted,
       executionsOmitted,
+      decisionBadgesOmitted,
     },
     notices,
     unavailableReason:
@@ -1580,6 +1623,7 @@ export interface ChatWorkEventView {
   note: string | null;
   tone: ChatWorkTone;
   workerExecution: ChatWorkExecutionSummaryView | null;
+  decisionBadge?: ChatWorkDecisionBadge | null;
 }
 
 type PlanningRole = 'advisor' | 'orchestrator';
@@ -2510,6 +2554,35 @@ export function buildChatWorkExecutionSummaries(
   return summaries;
 }
 
+function buildChatWorkDecisionBadgeMap(
+  selection: WorkspaceChatWorkSelection,
+): Map<string, ChatWorkDecisionBadge> {
+  const rawBadges = selection.decisionBadges ?? [];
+  if (rawBadges.length === 0 || selection.identity === null || selection.availability !== 'available') {
+    return new Map();
+  }
+  const itemById = new Map<string, ChatWorkItem>(
+    selection.items.map((item) => [item.item_id, item] as const),
+  );
+  const itemOrderIndex = new Map<string, number>(
+    selection.items.map((item, idx) => [item.item_id, idx] as const),
+  );
+  const { items: badges } = normalizeDecisionBadgeList(
+    rawBadges,
+    selection.identity,
+    itemById,
+    itemOrderIndex,
+  );
+  const byExecutionKey = new Map<string, ChatWorkDecisionBadge>();
+  for (const badge of badges) {
+    byExecutionKey.set(
+      chatWorkExecutionJoinKey(badge.item_id, badge.execution_ref),
+      badge,
+    );
+  }
+  return byExecutionKey;
+}
+
 /**
  * Builds the chronological stream oldest to newest. Only the actual
  * `worker_outcome_recorded` event may carry an outcome; a later durable result
@@ -2519,6 +2592,11 @@ export function buildChatWorkExecutionSummaries(
  * exact `item_id` + `execution_ref`, so refreshed snapshots and duplicate events
  * never duplicate footers, collapse another item's textual ref, or rewrite an
  * older event's action, time, or outcome.
+ *
+ * Likewise, a verified decision badge attaches only to the latest retained
+ * event for an item's current Worker execution (`item_id` + `current_execution_ref`),
+ * keeping position stable across `pending -> result` refreshes without
+ * duplicating onto earlier events or superseded executions.
  */
 export function buildChatWorkEventViews(
   selection: WorkspaceChatWorkSelection,
@@ -2543,6 +2621,7 @@ export function buildChatWorkEventViews(
       note: cleanOptionalString(event.note),
       tone: resolveChatWorkEventTone(event),
       workerExecution: null as ChatWorkExecutionSummaryView | null,
+      decisionBadge: null as ChatWorkDecisionBadge | null,
     };
   });
 
@@ -2562,6 +2641,12 @@ export function buildChatWorkEventViews(
     );
     if (latestIndex !== undefined) {
       views[latestIndex]!.workerExecution = summary;
+    }
+  }
+  for (const [joinKey, badge] of buildChatWorkDecisionBadgeMap(selection)) {
+    const latestIndex = latestEventByExecutionKey.get(joinKey);
+    if (latestIndex !== undefined) {
+      views[latestIndex]!.decisionBadge = badge;
     }
   }
   return views;
@@ -2674,6 +2759,7 @@ export interface ChatWorkBacklogItemView {
   completionEvidence: string | null;
   completedAtMs: number | null;
   updatedAtMs: number | null;
+  decisionBadge?: ChatWorkDecisionBadge | null;
 }
 
 export interface ChatWorkBacklogGroup {
@@ -2685,6 +2771,7 @@ export interface ChatWorkBacklogGroup {
 function buildChatWorkBacklogItemView(
   item: ChatWorkItem,
   chatKey: string | null,
+  decisionBadge: ChatWorkDecisionBadge | null,
 ): ChatWorkBacklogItemView {
   return {
     key: `${chatKey ?? 'unscoped'}\u0000${item.item_id}\u0000${item.revision}`,
@@ -2703,15 +2790,24 @@ function buildChatWorkBacklogItemView(
     completionEvidence: cleanOptionalString(item.completion_evidence),
     completedAtMs: cleanOptionalTimestamp(item.completed_at_ms),
     updatedAtMs: cleanOptionalTimestamp(item.updated_at_ms),
+    decisionBadge,
   };
 }
 
 export function buildChatWorkBacklogGroups(
   selection: WorkspaceChatWorkSelection,
 ): ChatWorkBacklogGroup[] {
-  const items = selection.items.map((item) =>
-    buildChatWorkBacklogItemView(item, selection.chatKey),
-  );
+  const badgeByExecutionKey = buildChatWorkDecisionBadgeMap(selection);
+  const items = selection.items.map((item) => {
+    const executionRef = cleanOptionalString(item.current_execution_ref);
+    const decisionBadge =
+      item.kind === 'worker' && executionRef !== null
+        ? (badgeByExecutionKey.get(
+            chatWorkExecutionJoinKey(item.item_id, executionRef),
+          ) ?? null)
+        : null;
+    return buildChatWorkBacklogItemView(item, selection.chatKey, decisionBadge);
+  });
   return BACKLOG_STATUS_ORDER.map((status) => ({
     status,
     label: BACKLOG_STATUS_LABELS[status],
@@ -2740,6 +2836,7 @@ export interface ChatWorkLiveness {
   events: ChatWorkEvent[];
   presence: ChatWorkPresence[];
   executions?: ChatWorkExecution[];
+  decisionBadges?: ChatWorkDecisionBadge[];
   bounds: ChatWorkBoundsView;
   notices: string[];
   coworker: {
@@ -3026,6 +3123,7 @@ export function evaluateChatWorkLiveness(
     events: selection.events,
     presence: selection.presence,
     executions: selection.executions,
+    decisionBadges: selection.decisionBadges ?? [],
     bounds: selection.bounds,
     notices: selection.notices,
     coworker: {

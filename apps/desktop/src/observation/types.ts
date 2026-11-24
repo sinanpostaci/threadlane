@@ -200,10 +200,12 @@ export const MAX_WORKSPACE_CHAT_WORK_ITEMS_PER_CHAT = 200 as const;
 export const MAX_WORKSPACE_CHAT_WORK_EVENTS_PER_CHAT = 500 as const;
 export const MAX_WORKSPACE_CHAT_WORK_PRESENCE_PER_CHAT = 32 as const;
 export const MAX_WORKSPACE_CHAT_WORK_EXECUTIONS_PER_CHAT = 32 as const;
+export const MAX_WORKSPACE_CHAT_WORK_DECISION_BADGES_PER_CHAT = 32 as const;
 export const MAX_WORKSPACE_CHAT_WORK_ITEMS_TOTAL = 1_000 as const;
 export const MAX_WORKSPACE_CHAT_WORK_EVENTS_TOTAL = 2_000 as const;
 export const MAX_WORKSPACE_CHAT_WORK_PRESENCE_TOTAL = 64 as const;
 export const MAX_WORKSPACE_CHAT_WORK_EXECUTIONS_TOTAL = 128 as const;
+export const MAX_WORKSPACE_CHAT_WORK_DECISION_BADGES_TOTAL = 128 as const;
 export const MAX_WORKSPACE_BACKLOG_PRESENCE_SAMPLE_AGE_MS = 5_000 as const;
 export const MAX_WORKSPACE_EXTERNAL_RESOLUTIONS_PER_JOB =
   MAX_WORKSPACE_RECORD_LINKS_PER_LIST;
@@ -723,12 +725,44 @@ export interface WorkspaceWorkerExecution {
   acceptance: WorkspaceWorkerExecutionAcceptance | null;
 }
 
+export type WorkspaceDecisionAdvisorProvider = 'jev' | 'openai';
+
+export type WorkspaceDecisionDifficulty = 'easy' | 'medium' | 'hard' | 'extreme';
+
+export type WorkspaceDecisionBadgeStatus = 'pending' | 'result' | 'failed';
+
+export type WorkspaceDecisionAdviceSource = 'fresh' | 'cached';
+
+/**
+ * Compact, scope-verified decision-advisor badge metadata projected read-only
+ * from a confirmed launched Forecast A record and matching advice artifact.
+ * Strictly distinct from `WorkspaceWorkerExecution` (the Worker model).
+ */
+export interface WorkspaceDecisionBadge {
+  item_id: string;
+  execution_ref: string;
+  approval_id: string;
+  task_id: string;
+  subject_digest: string;
+  provider: WorkspaceDecisionAdvisorProvider;
+  status: WorkspaceDecisionBadgeStatus;
+  recommended_difficulty?: WorkspaceDecisionDifficulty | null;
+  coworker_difficulty?: WorkspaceDecisionDifficulty | null;
+  advice_source?: WorkspaceDecisionAdviceSource | null;
+  advisor_model?: string | null;
+  cache_age_ms?: number | null;
+  failure_reason_code?: string | null;
+  agrees_with_coworker?: boolean | null;
+}
+
 export interface WorkspaceChatWorkBounds {
   items_omitted: number;
   events_omitted: number;
   presence_omitted: number;
   /** Present on newer payloads; older snapshots normalize it to `0`. */
   executions_omitted?: number;
+  /** Present on newer payloads; older snapshots normalize it to `0`. */
+  decision_badges_omitted?: number;
 }
 
 export interface WorkspaceChatWork {
@@ -739,6 +773,8 @@ export interface WorkspaceChatWork {
   worker_presence: WorkspaceBacklogWorkerPresence[];
   /** Additive bounded execution metadata; older payloads normalize to `[]`. */
   worker_executions?: WorkspaceWorkerExecution[];
+  /** Additive bounded decision-advisor badges; older payloads normalize to `[]`. */
+  decision_badges?: WorkspaceDecisionBadge[];
   bounds: WorkspaceChatWorkBounds;
 }
 

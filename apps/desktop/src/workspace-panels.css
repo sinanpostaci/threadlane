@@ -2021,3 +2021,34 @@ html[data-theme="light"] .tl-drawer-dialog {
   --tl-dot-success: #16a34a;
   --tl-dot-neutral: #71717a;
 }
+
+.tl-decision-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-inline-start: 6px;
+  padding: 1px 6px;
+  border: 1px solid var(--gray-a6);
+  border-radius: 1em;
+  background: var(--gray-a2);
+  color: inherit;
+  font: inherit;
+  font-size: 11px;
+  line-height: 1.5;
+  vertical-align: middle;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.tl-decision-badge:hover { background: var(--gray-a4); }
+.tl-decision-badge:focus-visible { outline: 2px solid var(--accent-8); }
+.tl-decision-badge[data-decision-status="pending"] { color: var(--gray-11); }
+.tl-decision-popover-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+.tl-decision-popover-list { margin: 8px 0 0; font-size: 12px; }
+.tl-decision-popover-row { justify-content: space-between; }
+.tl-decision-popover-row dt { color: var(--gray-11); }
+.tl-decision-popover-row dd { margin: 0; }

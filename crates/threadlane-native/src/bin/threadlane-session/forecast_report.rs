@@ -6,8 +6,8 @@
 //! running SQLite migrations, performing live provider/host calls, or echoing raw prompts.
 
 use std::fs::{self, Metadata, OpenOptions};
-use std::io::{self, Read};
-use std::path::{Component, Path, PathBuf};
+use std::io;
+use std::path::{Path, PathBuf};
 
 use rusqlite::{
     params, Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior,
@@ -28,22 +28,24 @@ use threadlane_host::{
     read_host_manifest_optional, read_session_task_ledger_recorded_history_readonly,
     verify_existing_private_dir, verify_existing_session_dir, RUNTIME_STATE_SUBDIR,
 };
+pub(crate) use threadlane_native::decision_badge::ForecastComplexity;
+use threadlane_native::decision_badge::{
+    map_nofollow_open_error as map_artifact_nofollow_open_error,
+    read_verified_forecast_artifacts as read_verified_forecast_artifacts_shared,
+    validate_existing_private_dir_meta as validate_existing_private_dir_meta_shared,
+    verify_same_file_identity as verify_same_file_identity_shared, AdviceLoadState,
+    ForecastArtifactError, ForecastRecordFile, ShadowForecastStatus,
+};
+#[cfg(test)]
+use threadlane_native::decision_badge::{
+    FORECAST_ADVICE_FILENAME, FORECAST_RECORD_FILENAME, FORECAST_SUBDIR,
+};
 use threadlane_native::fs_safety::constant_time_str_eq;
 use threadlane_native::operator_cli::OperatorCliError;
-use threadlane_workflow::{Difficulty, ToolAdapter};
+use threadlane_workflow::Difficulty;
 
-const FORECAST_SUBDIR: &str = "ordinary-forecasts";
-const FORECAST_RECORD_FILENAME: &str = "record.json";
-const FORECAST_REQUEST_FILENAME: &str = "request.json";
-const FORECAST_ADVICE_FILENAME: &str = "advice.json";
-const FORECAST_SCHEMA_VERSION: u32 = 1;
-const MIN_COMPONENT_COUNT: u8 = 1;
-const MAX_COMPONENT_COUNT: u8 = 32;
-const MAX_FORECAST_FILE_BYTES: usize = 65_536;
 const MAX_CORE_DB_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_ITEM_EXECUTIONS: usize = 256;
-const MAX_JS_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
-const ADVICE_SHADOW_MODE: &str = "shadow";
 
 /// Store paths and caller scope required to build a read-only [`ForecastReport`].
 #[derive(Debug, Clone, Copy)]
@@ -62,18 +64,6 @@ pub(crate) struct ForecastReportScope<'a> {
     pub thread_uuid: &'a str,
     /// Target durable Worker backlog item identifier.
     pub item_id: &'a str,
-}
-
-/// Complexity markers recorded in Forecast A (`record.json`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ForecastComplexity {
-    /// Estimated component count (`1..=32`).
-    pub component_count: u8,
-    /// Whether components are tightly coupled.
-    pub coupled: bool,
-    /// Whether the scope carries meaningful uncertainty.
-    pub uncertain: bool,
 }
 
 /// Presence state of the Forecast A `record.json` artifact for the subject digest.
@@ -261,107 +251,6 @@ pub(crate) struct ForecastReport {
     pub execution: ExecutionOutcomeSummary,
     /// Correction evidence separating acceptance rejections from retries (`unknown` across separate items).
     pub correction_evidence: CorrectionEvidence,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum ShadowForecastStatus {
-    Skipped,
-    Launched,
-    Unavailable,
-    Unknown,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ShadowAdvisorSelection {
-    tool_id: String,
-    model_id: String,
-    model_arg: String,
-    adapter: ToolAdapter,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ForecastRecordFile {
-    schema_version: u32,
-    advisory_only: bool,
-    mode: String,
-    binding_id: String,
-    thread_uuid: String,
-    plan_id: String,
-    plan_revision: u64,
-    task_id: String,
-    profile_id: String,
-    profile_revision: u64,
-    base_commit: String,
-    subject_digest: String,
-    baseline_difficulty: Difficulty,
-    complexity: ForecastComplexity,
-    summary_sha256: String,
-    triggered: bool,
-    status: ShadowForecastStatus,
-    reason: String,
-    #[serde(default)]
-    advisor: Option<ShadowAdvisorSelection>,
-    #[serde(default)]
-    request_summary_sha256: Option<String>,
-    #[serde(default)]
-    request_file: Option<String>,
-    #[serde(default)]
-    advice_file: Option<String>,
-    #[serde(default)]
-    pid_hint: Option<u32>,
-    recorded_at_ms: u64,
-}
-
-enum AdviceLoadState {
-    Absent,
-    Pending,
-    Unknown,
-    Loaded(Box<AdviceClassifyFile>),
-}
-
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct AdviceClassifyFile {
-    untrusted_data: bool,
-    advisory_only: bool,
-    mode: String,
-    source: String,
-    context_id: String,
-    task_id: String,
-    task_revision: u64,
-    registry_revision: u64,
-    #[serde(default)]
-    profile_id: Option<String>,
-    tool_id: String,
-    model_id: String,
-    requested_model: String,
-    summary_sha256: String,
-    cache_key: String,
-    advice: AdvicePayload,
-    #[serde(default)]
-    baseline_difficulty: Option<Difficulty>,
-    #[serde(default)]
-    agrees_with_baseline: Option<bool>,
-    provider_call_performed: bool,
-    #[serde(default)]
-    cache_age_ms: Option<u64>,
-    elapsed_ms: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct AdvicePayload {
-    provider: String,
-    model: String,
-    difficulty: Option<Difficulty>,
-    confidence: Option<f64>,
-    needs_review: bool,
-    reason_code: String,
-    input_tokens: Option<u64>,
-    output_tokens: Option<u64>,
 }
 
 struct ControlItemState {
@@ -1208,6 +1097,10 @@ fn compute_verified_elapsed_ms(
     }
 }
 
+fn map_forecast_artifact_error(err: ForecastArtifactError) -> OperatorCliError {
+    OperatorCliError::new(err.code, err.message)
+}
+
 fn read_verified_forecast_artifacts(
     plans_dir: &Path,
     binding_id: &str,
@@ -1215,439 +1108,14 @@ fn read_verified_forecast_artifacts(
     approval: &ApprovalRecord,
     approved_task: &ApprovedTaskRecord,
 ) -> Result<(Option<ForecastRecordFile>, AdviceLoadState), OperatorCliError> {
-    let plans_meta = validate_existing_private_dir_meta(plans_dir)?;
-    validate_sha256_hex("subject_digest", &approval.subject_digest).map_err(|_| {
-        OperatorCliError::new(
-            "corrupt_store",
-            "Approval subject_digest failed SHA-256 validation.",
-        )
-    })?;
-
-    let forecasts_root = plans_dir.join(FORECAST_SUBDIR);
-    let Some(forecasts_root_meta) =
-        validate_optional_private_child_dir(&forecasts_root, &plans_meta)?
-    else {
-        return Ok((None, AdviceLoadState::Absent));
-    };
-
-    let subject_dir = forecasts_root.join(&approval.subject_digest);
-    let Some(subject_dir_meta) =
-        validate_optional_private_child_dir(&subject_dir, &forecasts_root_meta)?
-    else {
-        return Ok((None, AdviceLoadState::Absent));
-    };
-
-    let record_bytes = read_private_file_optional(
-        &subject_dir.join(FORECAST_RECORD_FILENAME),
-        &subject_dir_meta,
-        MAX_FORECAST_FILE_BYTES,
-    )?;
-    let record = match record_bytes {
-        Some(bytes) => {
-            let parsed: ForecastRecordFile = serde_json::from_slice(&bytes).map_err(|_| {
-                OperatorCliError::new(
-                    "invalid_forecast",
-                    "Forecast A record.json failed strict JSON schema validation.",
-                )
-            })?;
-            validate_forecast_record(&parsed, binding_id, thread_uuid, approval, approved_task)?;
-            Some(parsed)
-        }
-        None => None,
-    };
-
-    let advice_bytes = read_private_file_optional(
-        &subject_dir.join(FORECAST_ADVICE_FILENAME),
-        &subject_dir_meta,
-        MAX_FORECAST_FILE_BYTES,
-    )?;
-    let advice_state = match (record.as_ref(), advice_bytes) {
-        (None, None) => AdviceLoadState::Absent,
-        (None, Some(_)) => {
-            return Err(OperatorCliError::new(
-                "invalid_advice",
-                "Provider advice.json cannot be verified without a matching launched Forecast A record.json.",
-            ));
-        }
-        (Some(rec), None) if rec.status == ShadowForecastStatus::Launched => {
-            AdviceLoadState::Pending
-        }
-        (Some(_), None) => AdviceLoadState::Absent,
-        (Some(rec), Some(_)) if rec.status != ShadowForecastStatus::Launched => {
-            return Err(OperatorCliError::new(
-                "invalid_advice",
-                "Provider advice.json is unexpected for a non-launched Forecast A record.json.",
-            ));
-        }
-        (Some(rec), Some(bytes)) => {
-            if bytes.iter().all(u8::is_ascii_whitespace) {
-                AdviceLoadState::Pending
-            } else {
-                match serde_json::from_slice::<AdviceClassifyFile>(&bytes) {
-                    Ok(parsed) => {
-                        validate_advice_file(&parsed, thread_uuid, approval, approved_task, rec)?;
-                        AdviceLoadState::Loaded(Box::new(parsed))
-                    }
-                    Err(err) if err.is_eof() => AdviceLoadState::Unknown,
-                    Err(_) => {
-                        return Err(OperatorCliError::new(
-                            "invalid_advice",
-                            "Provider advice.json failed strict JSON schema validation.",
-                        ));
-                    }
-                }
-            }
-        }
-    };
-
-    Ok((record, advice_state))
-}
-
-fn validate_shadow_advisor(advisor: &ShadowAdvisorSelection) -> Result<(), OperatorCliError> {
-    if !matches!(
-        advisor.adapter,
-        ToolAdapter::JevApi | ToolAdapter::OpenaiDecisionsApi
-    ) {
-        return Err(OperatorCliError::new(
-            "invalid_forecast",
-            "Forecast A record.json advisor adapter must be jev_api or openai_decisions_api.",
-        ));
-    }
-    if advisor.tool_id.trim().is_empty()
-        || advisor.tool_id.trim() != advisor.tool_id
-        || advisor.tool_id.chars().any(char::is_control)
-        || advisor.model_id.trim().is_empty()
-        || advisor.model_id.trim() != advisor.model_id
-        || advisor.model_id.chars().any(char::is_control)
-        || advisor.model_arg.trim().is_empty()
-        || advisor.model_arg.trim() != advisor.model_arg
-        || advisor.model_arg.chars().any(char::is_control)
-    {
-        return Err(OperatorCliError::new(
-            "invalid_forecast",
-            "Forecast A record.json advisor metadata is missing or invalid.",
-        ));
-    }
-    Ok(())
-}
-
-fn validate_forecast_record(
-    record: &ForecastRecordFile,
-    binding_id: &str,
-    thread_uuid: &str,
-    approval: &ApprovalRecord,
-    approved_task: &ApprovedTaskRecord,
-) -> Result<(), OperatorCliError> {
-    if record.schema_version != FORECAST_SCHEMA_VERSION {
-        return Err(OperatorCliError::new(
-            "invalid_forecast",
-            "Forecast A record.json has an unsupported schema_version.",
-        ));
-    }
-    if !record.advisory_only || record.mode != ADVICE_SHADOW_MODE {
-        return Err(OperatorCliError::new(
-            "invalid_forecast",
-            "Forecast A record.json failed advisory shadow mode invariants.",
-        ));
-    }
-    if record.binding_id != binding_id || record.thread_uuid != thread_uuid {
-        return Err(OperatorCliError::new(
-            "scope_mismatch",
-            "Forecast A record.json does not belong to the requested binding and thread scope.",
-        ));
-    }
-    if !constant_time_str_eq(&record.subject_digest, &approval.subject_digest) {
-        return Err(OperatorCliError::new(
-            "subject_mismatch",
-            "Forecast A record.json subject_digest does not match the approval.",
-        ));
-    }
-    if record.plan_id != approval.plan_id
-        || record.plan_revision != approval.plan_revision
-        || record.profile_id != approval.profile_id
-        || record.profile_revision != approval.registry_revision
-        || record.task_id != approved_task.task_id
-        || record.base_commit != approval.base_commit
-    {
-        return Err(OperatorCliError::new(
-            "scope_mismatch",
-            "Forecast A record.json plan, profile, task, or base_commit does not match the approval.",
-        ));
-    }
-    if record.baseline_difficulty != approved_task.difficulty {
-        return Err(OperatorCliError::new(
-            "scope_mismatch",
-            "Forecast A record.json baseline_difficulty does not match frozen task difficulty.",
-        ));
-    }
-    if !(MIN_COMPONENT_COUNT..=MAX_COMPONENT_COUNT).contains(&record.complexity.component_count) {
-        return Err(OperatorCliError::new(
-            "invalid_forecast",
-            "Forecast A record.json complexity.component_count must be between 1 and 32.",
-        ));
-    }
-    validate_sha256_hex("summary_sha256", &record.summary_sha256).map_err(|_| {
-        OperatorCliError::new(
-            "invalid_forecast",
-            "Forecast A record.json summary_sha256 is not a valid SHA-256 hex digest.",
-        )
-    })?;
-    if record.reason.trim().is_empty() || record.reason.chars().any(char::is_control) {
-        return Err(OperatorCliError::new(
-            "invalid_forecast",
-            "Forecast A record.json reason must be non-empty without control characters.",
-        ));
-    }
-    if record.recorded_at_ms > MAX_JS_SAFE_INTEGER {
-        return Err(OperatorCliError::new(
-            "invalid_forecast",
-            "Forecast A record.json recorded_at_ms exceeds safe integer bounds.",
-        ));
-    }
-
-    let expected_triggered = record.complexity.uncertain
-        || record.complexity.coupled
-        || record.complexity.component_count > 1;
-    if record.triggered != expected_triggered {
-        return Err(OperatorCliError::new(
-            "invalid_forecast",
-            "Forecast A record.json triggered flag contradicts complexity markers.",
-        ));
-    }
-
-    if let Some(advisor) = record.advisor.as_ref() {
-        validate_shadow_advisor(advisor)?;
-    }
-
-    match record.status {
-        ShadowForecastStatus::Skipped => {
-            let valid_skip = match record.reason.as_str() {
-                "fixed_worker_route" => record.triggered,
-                _ => !record.triggered && record.advisor.is_none(),
-            };
-            if !valid_skip
-                || record.request_summary_sha256.is_some()
-                || record.request_file.is_some()
-                || record.advice_file.is_some()
-                || record.pid_hint.is_some()
-            {
-                return Err(OperatorCliError::new(
-                    "invalid_forecast",
-                    "Forecast A record.json skipped status has incompatible trigger or launch fields.",
-                ));
-            }
-        }
-        ShadowForecastStatus::Unavailable | ShadowForecastStatus::Unknown => {
-            if !record.triggered
-                || record.request_summary_sha256.is_some()
-                || record.request_file.is_some()
-                || record.advice_file.is_some()
-                || record.pid_hint.is_some()
-            {
-                return Err(OperatorCliError::new(
-                    "invalid_forecast",
-                    "Forecast A record.json non-launched status has incompatible trigger or launch fields.",
-                ));
-            }
-        }
-        ShadowForecastStatus::Launched => {
-            if !record.triggered || record.advisor.is_none() {
-                return Err(OperatorCliError::new(
-                    "invalid_forecast",
-                    "Forecast A record.json launched status requires triggered=true and advisor metadata.",
-                ));
-            }
-            let Some(request_sha) = record.request_summary_sha256.as_deref() else {
-                return Err(OperatorCliError::new(
-                    "invalid_forecast",
-                    "Forecast A record.json launched status requires request_summary_sha256.",
-                ));
-            };
-            validate_sha256_hex("request_summary_sha256", request_sha).map_err(|_| {
-                OperatorCliError::new(
-                    "invalid_forecast",
-                    "Forecast A record.json request_summary_sha256 is not a valid SHA-256 hex digest.",
-                )
-            })?;
-            if record.request_file.as_deref() != Some(FORECAST_REQUEST_FILENAME)
-                || record.advice_file.as_deref() != Some(FORECAST_ADVICE_FILENAME)
-            {
-                return Err(OperatorCliError::new(
-                    "invalid_forecast",
-                    "Forecast A record.json launched status has invalid request_file or advice_file.",
-                ));
-            }
-            if record.pid_hint == Some(0) {
-                return Err(OperatorCliError::new(
-                    "invalid_forecast",
-                    "Forecast A record.json pid_hint must be non-zero when present.",
-                ));
-            }
-        }
-    }
-
-    Ok(())
-}
-
-fn validate_advice_file(
-    file: &AdviceClassifyFile,
-    thread_uuid: &str,
-    approval: &ApprovalRecord,
-    approved_task: &ApprovedTaskRecord,
-    forecast_record: &ForecastRecordFile,
-) -> Result<(), OperatorCliError> {
-    if !file.untrusted_data || !file.advisory_only || file.mode != ADVICE_SHADOW_MODE {
-        return Err(OperatorCliError::new(
-            "invalid_advice",
-            "Provider advice.json failed advisory shadow mode invariants.",
-        ));
-    }
-    if !matches!(file.source.as_str(), "provider" | "cache") {
-        return Err(OperatorCliError::new(
-            "invalid_advice",
-            "Provider advice.json carries an unrecognized source value.",
-        ));
-    }
-    let expected_provider_call = file.source == "provider";
-    if file.provider_call_performed != expected_provider_call {
-        return Err(OperatorCliError::new(
-            "invalid_advice",
-            "Provider advice.json source contradicts provider_call_performed.",
-        ));
-    }
-    if expected_provider_call && file.cache_age_ms.is_some() {
-        return Err(OperatorCliError::new(
-            "invalid_advice",
-            "Provider advice.json must not include cache_age_ms for live provider output.",
-        ));
-    }
-    if !expected_provider_call && file.cache_age_ms.is_none() {
-        return Err(OperatorCliError::new(
-            "invalid_advice",
-            "Provider advice.json cached output must include cache_age_ms.",
-        ));
-    }
-    if file.elapsed_ms > MAX_JS_SAFE_INTEGER
-        || file
-            .cache_age_ms
-            .is_some_and(|age| age > MAX_JS_SAFE_INTEGER)
-        || file
-            .advice
-            .input_tokens
-            .is_some_and(|tokens| tokens > MAX_JS_SAFE_INTEGER)
-        || file
-            .advice
-            .output_tokens
-            .is_some_and(|tokens| tokens > MAX_JS_SAFE_INTEGER)
-    {
-        return Err(OperatorCliError::new(
-            "invalid_advice",
-            "Provider advice.json numeric metadata exceeds safe integer bounds.",
-        ));
-    }
-    if file.advice.difficulty.is_none() && !file.advice.needs_review {
-        return Err(OperatorCliError::new(
-            "invalid_advice",
-            "Provider advice.json refusal without difficulty must mark needs_review.",
-        ));
-    }
-    if file.context_id != thread_uuid
-        || file.task_id != approved_task.task_id
-        || file.task_revision != approval.plan_revision
-        || file.registry_revision != approval.registry_revision
-        || file.profile_id.as_deref() != Some(approval.profile_id.as_str())
-    {
-        return Err(OperatorCliError::new(
-            "scope_mismatch",
-            "Provider advice.json scope does not match thread, task, revision, registry, or profile.",
-        ));
-    }
-    validate_sha256_hex("summary_sha256", &file.summary_sha256).map_err(|_| {
-        OperatorCliError::new(
-            "invalid_advice",
-            "Provider advice.json summary_sha256 is not a valid SHA-256 hex digest.",
-        )
-    })?;
-    validate_sha256_hex("cache_key", &file.cache_key).map_err(|_| {
-        OperatorCliError::new(
-            "invalid_advice",
-            "Provider advice.json cache_key is not a valid SHA-256 hex digest.",
-        )
-    })?;
-    let expected_request_summary_sha = forecast_record
-        .request_summary_sha256
-        .as_deref()
-        .ok_or_else(|| {
-            OperatorCliError::new(
-                "invalid_forecast",
-                "Forecast A record.json is missing request_summary_sha256 for launched advice.",
-            )
-        })?;
-    if !constant_time_str_eq(&file.summary_sha256, expected_request_summary_sha) {
-        return Err(OperatorCliError::new(
-            "scope_mismatch",
-            "Provider advice.json summary_sha256 does not match Forecast A request_summary_sha256.",
-        ));
-    }
-    let advisor = forecast_record.advisor.as_ref().ok_or_else(|| {
-        OperatorCliError::new(
-            "invalid_forecast",
-            "Forecast A record.json is missing chosen advisor metadata for launched advice.",
-        )
-    })?;
-    let expected_provider = match advisor.adapter {
-        ToolAdapter::JevApi => "jev",
-        ToolAdapter::OpenaiDecisionsApi => "openai",
-        _ => {
-            return Err(OperatorCliError::new(
-                "invalid_forecast",
-                "Forecast A record.json carries an unsupported advisor adapter.",
-            ));
-        }
-    };
-    if file.tool_id != advisor.tool_id
-        || file.model_id != advisor.model_id
-        || file.requested_model != advisor.model_arg
-        || file.advice.provider != expected_provider
-    {
-        return Err(OperatorCliError::new(
-            "scope_mismatch",
-            "Provider advice.json advisor tool, model, or provider does not match Forecast A.",
-        ));
-    }
-    if let Some(baseline) = file.baseline_difficulty {
-        if baseline != approved_task.difficulty {
-            return Err(OperatorCliError::new(
-                "scope_mismatch",
-                "Provider advice.json baseline_difficulty does not match frozen task difficulty.",
-            ));
-        }
-    }
-    if file.advice.model.trim().is_empty() || file.advice.reason_code.trim().is_empty() {
-        return Err(OperatorCliError::new(
-            "invalid_advice",
-            "Provider advice.json is missing required classifier metadata.",
-        ));
-    }
-    if let Some(confidence) = file.advice.confidence {
-        if !confidence.is_finite() || !(0.0..=1.0).contains(&confidence) {
-            return Err(OperatorCliError::new(
-                "invalid_advice",
-                "Provider advice.json confidence must be finite and within [0.0, 1.0].",
-            ));
-        }
-    }
-    let expected_agrees = match (file.baseline_difficulty, file.advice.difficulty) {
-        (Some(baseline), Some(provider_diff)) => Some(provider_diff == baseline),
-        _ => None,
-    };
-    if file.agrees_with_baseline != expected_agrees {
-        return Err(OperatorCliError::new(
-            "invalid_advice",
-            "Provider advice.json agrees_with_baseline contradicts difficulty fields.",
-        ));
-    }
-    Ok(())
+    read_verified_forecast_artifacts_shared(
+        plans_dir,
+        binding_id,
+        thread_uuid,
+        approval,
+        approved_task,
+    )
+    .map_err(map_forecast_artifact_error)
 }
 
 fn evaluate_provider_advice(
@@ -1858,114 +1326,7 @@ fn inspect_readonly_sqlite_sidecar(
 }
 
 fn validate_existing_private_dir_meta(dir: &Path) -> Result<Metadata, OperatorCliError> {
-    if !dir.is_absolute() {
-        return Err(OperatorCliError::new(
-            "security_violation",
-            "Private store directory path must be absolute.",
-        ));
-    }
-
-    let mut current = PathBuf::new();
-    for component in dir.components() {
-        match component {
-            Component::Prefix(prefix) => current.push(prefix.as_os_str()),
-            Component::RootDir => current.push(component.as_os_str()),
-            Component::CurDir | Component::ParentDir => {
-                return Err(OperatorCliError::new(
-                    "security_violation",
-                    "Private store directory path must not contain relative traversal components.",
-                ));
-            }
-            Component::Normal(part) => {
-                current.push(part);
-                let meta = fs::symlink_metadata(&current).map_err(|err| {
-                    if err.kind() == io::ErrorKind::NotFound {
-                        OperatorCliError::new("not_found", "Required store directory is missing.")
-                    } else {
-                        OperatorCliError::new(
-                            "io_error",
-                            "Failed to inspect private store directory metadata.",
-                        )
-                    }
-                })?;
-                if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
-                    return Err(OperatorCliError::new(
-                        "security_violation",
-                        "Private store directory path must not traverse symlinks.",
-                    ));
-                }
-            }
-        }
-    }
-
-    let meta = fs::symlink_metadata(dir).map_err(|_| {
-        OperatorCliError::new("io_error", "Failed to inspect private store directory.")
-    })?;
-    verify_private_dir_permissions(&meta, None)?;
-    Ok(meta)
-}
-
-fn validate_optional_private_child_dir(
-    child_dir: &Path,
-    parent_meta: &Metadata,
-) -> Result<Option<Metadata>, OperatorCliError> {
-    let meta = match fs::symlink_metadata(child_dir) {
-        Ok(meta) => meta,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(_) => {
-            return Err(OperatorCliError::new(
-                "io_error",
-                "Failed to inspect forecast directory metadata.",
-            ));
-        }
-    };
-    if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
-        return Err(OperatorCliError::new(
-            "security_violation",
-            "Forecast directory path must be a real non-symlink directory.",
-        ));
-    }
-    verify_private_dir_permissions(&meta, Some(parent_meta))?;
-    Ok(Some(meta))
-}
-
-fn verify_private_dir_permissions(
-    meta: &Metadata,
-    parent_meta: Option<&Metadata>,
-) -> Result<(), OperatorCliError> {
-    if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
-        return Err(OperatorCliError::new(
-            "security_violation",
-            "Directory path must be a real non-symlink directory.",
-        ));
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        if (meta.permissions().mode() & 0o077) != 0 {
-            return Err(OperatorCliError::new(
-                "security_violation",
-                "Directory permissions must not grant group or world access.",
-            ));
-        }
-        if let Some(parent) = parent_meta {
-            if meta.uid() != parent.uid() {
-                return Err(OperatorCliError::new(
-                    "security_violation",
-                    "Directory owner does not match parent private directory owner.",
-                ));
-            }
-        }
-        Ok(())
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = parent_meta;
-        Err(OperatorCliError::new(
-            "unsupported_platform",
-            "Trusted local forecast inspection requires Unix private permissions.",
-        ))
-    }
+    validate_existing_private_dir_meta_shared(dir).map_err(map_forecast_artifact_error)
 }
 
 fn validate_readonly_sqlite_file(
@@ -2043,130 +1404,12 @@ fn verify_readonly_sqlite_metadata(
     }
 }
 
-fn read_private_file_optional(
-    file_path: &Path,
-    parent_meta: &Metadata,
-    max_bytes: usize,
-) -> Result<Option<Vec<u8>>, OperatorCliError> {
-    let pre_meta = match fs::symlink_metadata(file_path) {
-        Ok(meta) => meta,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(_) => {
-            return Err(OperatorCliError::new(
-                "io_error",
-                "Failed to inspect private forecast file metadata.",
-            ));
-        }
-    };
-    verify_private_regular_file_metadata(&pre_meta, parent_meta, max_bytes)?;
-
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    }
-
-    let file = options.open(file_path).map_err(map_nofollow_open_error)?;
-    let post_meta = file.metadata().map_err(|_| {
-        OperatorCliError::new("io_error", "Failed to stat opened private forecast file.")
-    })?;
-    verify_private_regular_file_metadata(&post_meta, parent_meta, max_bytes)?;
-    verify_same_file_identity(&pre_meta, &post_meta)?;
-
-    let mut bytes = Vec::with_capacity(
-        usize::try_from(post_meta.len())
-            .unwrap_or(max_bytes)
-            .min(max_bytes),
-    );
-    file.take(max_bytes as u64 + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|_| {
-            OperatorCliError::new("io_error", "Failed to read private forecast file bytes.")
-        })?;
-    if bytes.len() > max_bytes {
-        return Err(OperatorCliError::new(
-            "output_overflow",
-            "Private forecast file exceeds maximum bounded size.",
-        ));
-    }
-
-    Ok(Some(bytes))
-}
-
-fn verify_private_regular_file_metadata(
-    meta: &Metadata,
-    parent_meta: &Metadata,
-    max_bytes: usize,
-) -> Result<(), OperatorCliError> {
-    if meta.file_type().is_symlink() || !meta.file_type().is_file() {
-        return Err(OperatorCliError::new(
-            "security_violation",
-            "Forecast or advice path must be a non-symlink regular file.",
-        ));
-    }
-    if meta.len() > max_bytes as u64 {
-        return Err(OperatorCliError::new(
-            "output_overflow",
-            "Private forecast file exceeds maximum bounded size.",
-        ));
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        if (meta.permissions().mode() & 0o077) != 0 {
-            return Err(OperatorCliError::new(
-                "security_violation",
-                "Private forecast file must not grant group or world permissions.",
-            ));
-        }
-        if meta.uid() != parent_meta.uid() {
-            return Err(OperatorCliError::new(
-                "security_violation",
-                "Private forecast file owner does not match parent directory owner.",
-            ));
-        }
-        Ok(())
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = parent_meta;
-        Err(OperatorCliError::new(
-            "unsupported_platform",
-            "Trusted local forecast inspection requires Unix private permissions.",
-        ))
-    }
-}
-
 fn verify_same_file_identity(pre: &Metadata, post: &Metadata) -> Result<(), OperatorCliError> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if pre.dev() != post.dev() || pre.ino() != post.ino() {
-            return Err(OperatorCliError::new(
-                "security_violation",
-                "File identity changed while opening private state file.",
-            ));
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (pre, post);
-    }
-    Ok(())
+    verify_same_file_identity_shared(pre, post).map_err(map_forecast_artifact_error)
 }
 
 fn map_nofollow_open_error(err: io::Error) -> OperatorCliError {
-    #[cfg(unix)]
-    if err.raw_os_error() == Some(libc::ELOOP) {
-        return OperatorCliError::new(
-            "security_violation",
-            "Refusing to follow symlink while reading private state.",
-        );
-    }
-    let _ = err;
-    OperatorCliError::new("io_error", "Failed to open private state file read-only.")
+    map_forecast_artifact_error(map_artifact_nofollow_open_error(err))
 }
 
 fn build_sqlite_readonly_immutable_uri(database_path: &Path) -> Result<String, OperatorCliError> {
@@ -2302,7 +1545,7 @@ mod tests {
     };
     use threadlane_workflow::{
         compile_plan_revision, ModelChoice, ModelDefinition, PlanChange, PlanTask, RegistryChange,
-        RoleAssignment, ToolDefinition, WorkflowProfile, WorkflowRole,
+        RoleAssignment, ToolAdapter, ToolDefinition, WorkflowProfile, WorkflowRole,
     };
 
     use super::*;

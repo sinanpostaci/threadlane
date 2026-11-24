@@ -18,12 +18,13 @@ use threadlane_core::observation::{
     WorkspaceAttentionState, WorkspaceAvailabilityState, WorkspaceBacklogPresenceAvailability,
     WorkspaceBacklogPresenceFreshness, WorkspaceBacklogWorkerPresence, WorkspaceCapabilityState,
     WorkspaceChatIdentity, WorkspaceChatSummary, WorkspaceChatWork, WorkspaceChatWorkAvailability,
-    WorkspaceConfiguredSelection, WorkspaceCoveredAttention, WorkspaceExternalResolutionScope,
-    WorkspaceJobHistory, WorkspaceJobSummary, WorkspaceMessageCandidateInput, WorkspaceMessageItem,
-    WorkspaceMessageScope, WorkspaceMessageSourceOrder, WorkspaceMessagesWindow,
-    WorkspaceNativeSample, WorkspaceRecordLinks, WorkspaceSampleReconcileDecision,
-    WorkspaceSamplingPolicy, WorkspaceSnapshot, WorkspaceSnapshotBounds, WorkspaceTaskHistory,
-    WorkspaceWorkerExecution, MAX_OBSERVATION_JOBS, MAX_WORKSPACE_CHAT_WORK_EXECUTIONS_TOTAL,
+    WorkspaceConfiguredSelection, WorkspaceCoveredAttention, WorkspaceDecisionBadge,
+    WorkspaceExternalResolutionScope, WorkspaceJobHistory, WorkspaceJobSummary,
+    WorkspaceMessageCandidateInput, WorkspaceMessageItem, WorkspaceMessageScope,
+    WorkspaceMessageSourceOrder, WorkspaceMessagesWindow, WorkspaceNativeSample,
+    WorkspaceRecordLinks, WorkspaceSampleReconcileDecision, WorkspaceSamplingPolicy,
+    WorkspaceSnapshot, WorkspaceSnapshotBounds, WorkspaceTaskHistory, WorkspaceWorkerExecution,
+    MAX_OBSERVATION_JOBS, MAX_WORKSPACE_CHAT_WORK_EXECUTIONS_TOTAL,
     MAX_WORKSPACE_CHAT_WORK_PRESENCE_TOTAL, MAX_WORKSPACE_NATIVE_SAMPLES_PER_SOURCE,
     WORKSPACE_SNAPSHOT_SCHEMA_VERSION,
 };
@@ -35,6 +36,9 @@ use threadlane_native::coworker_observation::{
     WorkspaceHistoryDiagnosticKind, WorkspaceHistoryStores,
 };
 use threadlane_native::coworker_workflow::{CoworkerBindingLedger, CoworkerJobRecord};
+use threadlane_native::decision_badge::{
+    project_verified_decision_badge_readonly, DecisionBadgeLookupScope,
+};
 use threadlane_native::native_chat_observation::read_workspace_native_samples_readonly;
 use threadlane_plans::{PlanRevision, PlanStore};
 use tokio::task::JoinSet;
@@ -948,7 +952,7 @@ fn project_single_source_workspace(
         let stats = chat_job_stats.remove(&chat_key).unwrap_or_default();
         let native_sample = samples_by_chat_key.get(&chat_key).copied();
 
-        let chat_work = if binding_thread_counts
+        let mut chat_work = if binding_thread_counts
             .get(&(identity.binding_id.clone(), identity.thread_uuid.clone()))
             .copied()
             .unwrap_or(0)
@@ -963,6 +967,18 @@ fn project_single_source_workspace(
             }
         };
         if chat_work.availability == WorkspaceChatWorkAvailability::Available {
+            let mut decision_badges = project_workspace_chat_decision_badges(
+                &identity,
+                &core_states,
+                &chat_work.items,
+                &spec.plans_dir,
+                &spec.authority_dir,
+            );
+            if !decision_badges.is_empty() {
+                chat_work.decision_badges.append(&mut decision_badges);
+                chat_work = chat_work.normalized();
+            }
+
             let presence_candidates =
                 workspace_chat_work_presence_candidates(&identity, &core_states, &chat_work.items);
             for candidate in presence_candidates.candidates {
@@ -1072,6 +1088,80 @@ fn project_single_source_workspace(
 
         all_chats.insert(chat_key, summary);
     }
+}
+
+/// Projects verified, read-only shadow decision advisor badges for retained Worker items in one
+/// canonical chat.
+///
+/// Only the item's exact `current_execution_ref` is inspected. Conflicting execution authority
+/// rows across core snapshots fail closed (no badge). Missing, skipped, disabled, unavailable,
+/// truncated, or cross-scope Forecast A / advice files emit no badge and never mutate disk state.
+fn project_workspace_chat_decision_badges(
+    identity: &WorkspaceChatIdentity,
+    core_states: &[ReadonlyCoreStateSnapshot],
+    items: &[threadlane_core::BacklogItem],
+    plans_dir: &Path,
+    authority_dir: &Path,
+) -> Vec<WorkspaceDecisionBadge> {
+    let matching_states: Vec<&ReadonlyCoreStateSnapshot> = core_states
+        .iter()
+        .filter(|state| {
+            state.bindings.iter().any(|binding| {
+                binding.binding_id == identity.binding_id
+                    && binding.thread_uuid == identity.thread_uuid
+            })
+        })
+        .collect();
+    if matching_states.is_empty() {
+        return Vec::new();
+    }
+
+    let mut badges = Vec::new();
+    for item in items {
+        if item.binding_id != identity.binding_id
+            || item.kind != threadlane_core::BacklogItemKind::Worker
+        {
+            continue;
+        }
+        let Some(execution_ref) = item.current_execution_ref.as_deref() else {
+            continue;
+        };
+
+        let mut matching_authorities: Vec<&threadlane_core::WorkerBacklogAuthority> = Vec::new();
+        for state in &matching_states {
+            for execution in &state.backlog_worker_executions {
+                if execution.binding_id == identity.binding_id
+                    && execution.item_id == item.item_id
+                    && execution.execution_ref == execution_ref
+                {
+                    matching_authorities.push(&execution.authority);
+                }
+            }
+        }
+        let Some(first_authority) = matching_authorities.first().copied() else {
+            continue;
+        };
+        if matching_authorities
+            .iter()
+            .any(|other| *other != first_authority)
+        {
+            continue;
+        }
+
+        if let Some(badge) = project_verified_decision_badge_readonly(DecisionBadgeLookupScope {
+            plans_dir,
+            authority_dir,
+            binding_id: &identity.binding_id,
+            thread_uuid: &identity.thread_uuid,
+            canonical_project_scope: &identity.canonical_project_scope,
+            item_id: &item.item_id,
+            execution_ref,
+            authority: first_authority,
+        }) {
+            badges.push(badge);
+        }
+    }
+    badges
 }
 
 #[derive(Debug, Default)]

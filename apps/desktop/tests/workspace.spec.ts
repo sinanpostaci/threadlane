@@ -46,6 +46,7 @@ import {
   MINIMAL_CHAT_ACCEPTED_COMPLETED_EVENT_TITLE,
   MINIMAL_CHAT_ACCEPTED_COMPLETION_NOTE,
   MINIMAL_CHAT_ACCEPTED_TITLE,
+  MINIMAL_CHAT_ALPHA_ACCEPTED_ITEM_ID,
   MINIMAL_CHAT_ALPHA_ACCEPTED_EXECUTION_REF,
   MINIMAL_CHAT_ALPHA_CANCELLED_EXECUTION_REF,
   MINIMAL_CHAT_ALPHA_CANCELLED_PREVIOUS_EXECUTION_REF,
@@ -5737,3 +5738,74 @@ test.describe('Legacy compatibility safety', () => {
     await expect(workspaceSection(page).getByText(/verified accepted/i)).toHaveCount(0);
   });
 });
+
+for (const width of [390, 1040]) {
+  test(`decision badges follow the correct task through concurrent responses at ${width}px`, async ({ page }) => {
+    const base = buildWorkerMetadataWorkspaceSnapshot();
+    const work = getChatWorkFixture(base, CHAT_ALPHA_IDENTITY);
+    const jev = MINIMAL_CHAT_ALPHA_DOING_ITEM_ID;
+    const openai = MINIMAL_CHAT_ALPHA_CHECKING_ITEM_ID;
+    const skipped = MINIMAL_CHAT_ALPHA_ACCEPTED_ITEM_ID;
+
+    function snapshot(stage: 'pending' | 'openai-ready' | 'both-ready') {
+      const badges = ([jev, openai] as const).map((id) => {
+        const execution = work.worker_executions!.find((record) => record.item_id === id)!;
+        const ready = id === jev ? stage === 'both-ready' : stage !== 'pending';
+        return {
+          item_id: id,
+          execution_ref: execution.execution_ref,
+          approval_id: execution.approval_id,
+          task_id: execution.task_id,
+          subject_digest: (id === jev ? 'a' : 'b').repeat(64),
+          provider: id === jev ? 'jev' as const : 'openai' as const,
+          status: ready ? 'result' as const : 'pending' as const,
+          coworker_difficulty: 'medium' as const,
+          recommended_difficulty: !ready ? null : id === jev ? 'hard' as const : 'easy' as const,
+          advice_source: !ready ? null : id === jev ? 'fresh' as const : 'cached' as const,
+          cache_age_ms: ready && id === openai ? 120 : null,
+        };
+      });
+      const items = work.items.map((item) => [jev, openai, skipped].includes(item.item_id)
+        ? { ...item, title: 'Shared task name' } : item);
+      return updateChatWorkFixture(base, CHAT_ALPHA_IDENTITY, {
+        items: stage === 'pending' ? items : items.reverse(),
+        decision_badges: stage === 'pending' ? badges : badges.reverse(),
+      });
+    }
+
+    const controller = await installMinimal(page, { width, height: 760 }, {workspaceSnapshot: snapshot('pending')});
+    for (const stage of ['pending', 'openai-ready', 'both-ready'] as const) {
+      if (stage !== 'pending') {
+        await controller.setWorkspaceSnapshot(snapshot(stage));
+        await triggerWorkspaceRefresh(page);
+      }
+      for (const placement of ['stream', 'drawer'] as const) {
+        if (placement === 'drawer') await openBacklog(page);
+        const badge = (id: string) => page.locator(
+          `[data-decision-placement="${placement}"][data-decision-item-id="${id}"]`,
+        );
+        await expect(badge(jev)).toHaveCount(1);
+        await expect(badge(jev)).toHaveText(stage === 'both-ready' ? 'Jev · Hard' : 'Jev · Pending');
+        await expect(badge(openai)).toHaveCount(1);
+        await expect(badge(openai)).toHaveText(stage === 'pending' ? 'OpenAI · Pending' : 'OpenAI · Easy');
+        await expect(badge(skipped)).toHaveCount(0);
+        if (placement === 'drawer') {
+          for (const id of [jev, openai]) {
+            await expect(page.locator(`[data-backlog-item-id="${id}"] summary`)).toContainText('Shared task name');
+            await expect(page.locator(`[data-backlog-item-id="${id}"] summary`)).toContainText(id === jev ? 'Jev' : 'OpenAI');
+          }
+          if (stage === 'both-ready') {
+            await badge(openai).focus();
+            await page.keyboard.press('Enter');
+            const details = page.locator('[data-decision-popover]');
+            await expect(details).toContainText('Cached');
+            await expect(details).toContainText('Medium');
+            await page.keyboard.press('Escape');
+            await expect(details).toHaveCount(0);
+          }
+          await closeBacklogWithEscape(page);
+        }
+      }
+    }
+  });
+}

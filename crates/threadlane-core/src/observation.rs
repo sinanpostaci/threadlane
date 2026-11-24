@@ -3870,6 +3870,14 @@ pub const MAX_WORKSPACE_CHAT_WORK_EXECUTIONS_PER_CHAT: usize = 32;
 /// [`WorkspaceSnapshot::chat_work`] (`128`).
 pub const MAX_WORKSPACE_CHAT_WORK_EXECUTIONS_TOTAL: usize = 128;
 
+/// Maximum shadow decision advisor badges retained per canonical chat in [`WorkspaceChatWork`]
+/// (`32`).
+pub const MAX_WORKSPACE_CHAT_WORK_DECISION_BADGES_PER_CHAT: usize = 32;
+
+/// Maximum shadow decision advisor badges retained across all chats in
+/// [`WorkspaceSnapshot::chat_work`] (`128`).
+pub const MAX_WORKSPACE_CHAT_WORK_DECISION_BADGES_TOTAL: usize = 128;
+
 /// Maximum Worker executions retained per binding while reading backlog evidence (`500`).
 pub const MAX_READONLY_BACKLOG_EXECUTIONS_PER_BINDING: usize = 500;
 
@@ -7531,6 +7539,311 @@ impl WorkspaceWorkerExecution {
     }
 }
 
+/// Verified shadow decision advisor provider projected on a [`WorkspaceDecisionBadge`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceDecisionAdvisorProvider {
+    /// Jev shadow decision advisor (`jev_api`).
+    Jev,
+    /// OpenAI Decisions shadow advisor (`openai_decisions_api`).
+    Openai,
+}
+
+impl WorkspaceDecisionAdvisorProvider {
+    /// Returns the wire representation for this provider (`"jev"` or `"openai"`).
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Jev => "jev",
+            Self::Openai => "openai",
+        }
+    }
+}
+
+/// Verified implementation difficulty grade projected on a [`WorkspaceDecisionBadge`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceDecisionDifficulty {
+    /// Small isolated behavior-preserving edit.
+    Easy,
+    /// Bounded multi-step change within known module boundaries.
+    Medium,
+    /// Substantial uncertainty, concurrency, or cross-module integration complexity.
+    Hard,
+    /// High-risk architectural, security-critical, or multi-system redesign.
+    Extreme,
+}
+
+impl WorkspaceDecisionDifficulty {
+    /// Returns the wire representation for this difficulty grade.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Easy => "easy",
+            Self::Medium => "medium",
+            Self::Hard => "hard",
+            Self::Extreme => "extreme",
+        }
+    }
+}
+
+/// Verified lifecycle state of a confirmed launched shadow decision consultation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceDecisionBadgeStatus {
+    /// Confirmed launched consultation awaiting a validated advisor response.
+    Pending,
+    /// Confirmed launched consultation with a validated difficulty recommendation.
+    Result,
+    /// Confirmed launched consultation that genuinely failed or returned an advisor refusal.
+    Failed,
+}
+
+impl WorkspaceDecisionBadgeStatus {
+    /// Returns the wire representation for this badge lifecycle status.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Result => "result",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// Verified provenance of a completed or refused shadow decision advice payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceDecisionAdviceSource {
+    /// Newly returned from a live provider call (`provider_call_performed == true`).
+    Fresh,
+    /// Served from a validated shadow advice cache hit (`provider_call_performed == false`).
+    Cached,
+}
+
+impl WorkspaceDecisionAdviceSource {
+    /// Returns the wire representation for this advice provenance (`"fresh"` or `"cached"`).
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Fresh => "fresh",
+            Self::Cached => "cached",
+        }
+    }
+}
+
+/// Compact, read-only shadow decision advisor badge projected for one current Worker backlog
+/// execution.
+///
+/// Emitted only when a scoped, verified Forecast A record proves a launched shadow consultation
+/// (`status == "launched"`). Skipped, missing, disabled, unavailable, tampered, or cross-scope
+/// consultations emit no badge. Never carries raw prompts, summaries, paths, or secrets.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceDecisionBadge {
+    /// Backlog item that owns this current execution.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub item_id: String,
+    /// Exact current guarded Worker execution reference (`wbe_<uuid>`).
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub execution_ref: String,
+    /// Frozen approval identifier matching the current execution authority.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub approval_id: String,
+    /// Frozen approved task identifier matching the current execution authority.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub task_id: String,
+    /// Frozen 64-character lowercase hex SHA-256 approval subject digest.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub subject_digest: String,
+    /// Verified shadow decision advisor provider selected at launch (`jev` or `openai`).
+    pub provider: WorkspaceDecisionAdvisorProvider,
+    /// Verified consultation lifecycle state (`pending`, `result`, or `failed`).
+    pub status: WorkspaceDecisionBadgeStatus,
+    /// Validated provider recommended difficulty when `status == result`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_null_default"
+    )]
+    pub recommended_difficulty: Option<WorkspaceDecisionDifficulty>,
+    /// Verified initial Coworker baseline difficulty from the frozen approved task, if known.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_null_default"
+    )]
+    pub coworker_difficulty: Option<WorkspaceDecisionDifficulty>,
+    /// Verified provenance of a completed or refused advisor response (`fresh` or `cached`).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_null_default"
+    )]
+    pub advice_source: Option<WorkspaceDecisionAdviceSource>,
+    /// Safe bounded advisor model identifier (explicitly distinct from the Worker model).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_null_default"
+    )]
+    pub advisor_model: Option<String>,
+    /// Verified cache age in milliseconds when `advice_source == Some(Cached)`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_null_default"
+    )]
+    pub cache_age_ms: Option<u64>,
+    /// Safe bounded machine reason code when `status == failed` (for example `refusal` or `timeout`).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_null_default"
+    )]
+    pub failure_reason_code: Option<String>,
+    /// Whether `recommended_difficulty` agrees with `coworker_difficulty` when both are known.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_null_default"
+    )]
+    pub agrees_with_coworker: Option<bool>,
+}
+
+const MAX_DECISION_BADGE_JS_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+const MAX_DECISION_REASON_CODE_BYTES: usize = 64;
+
+fn is_lowercase_sha256_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+fn sanitize_decision_reason_code(raw: Option<&str>) -> Option<String> {
+    let trimmed = raw?.trim();
+    if trimmed.is_empty()
+        || trimmed.len() > MAX_DECISION_REASON_CODE_BYTES
+        || !trimmed
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        return None;
+    }
+    Some(trimmed.to_ascii_lowercase())
+}
+
+impl WorkspaceDecisionBadge {
+    /// Returns a strictly validated, sanitized copy when every required identity and lifecycle
+    /// invariant holds; otherwise returns `None` (fail-closed).
+    pub fn normalized_safe(&self) -> Option<Self> {
+        let item_id = validate_correlation_id(&self.item_id)?;
+        let execution_ref = validate_correlation_id(&self.execution_ref)?;
+        let approval_id = validate_correlation_id(&self.approval_id)?;
+        let task_id = validate_correlation_id(&self.task_id)?;
+        if !is_lowercase_sha256_hex(&self.subject_digest) {
+            return None;
+        }
+
+        let advisor_model = sanitize_observation_selection_token(self.advisor_model.as_deref());
+
+        let (
+            recommended_difficulty,
+            advice_source,
+            cache_age_ms,
+            failure_reason_code,
+            agrees_with_coworker,
+        ) = match self.status {
+            WorkspaceDecisionBadgeStatus::Pending => {
+                if self.recommended_difficulty.is_some()
+                    || self.advice_source.is_some()
+                    || self.cache_age_ms.is_some()
+                    || self.failure_reason_code.is_some()
+                    || self.agrees_with_coworker.is_some()
+                {
+                    return None;
+                }
+                (None, None, None, None, None)
+            }
+            WorkspaceDecisionBadgeStatus::Result => {
+                let rec = self.recommended_difficulty?;
+                let src = self.advice_source?;
+                if self.failure_reason_code.is_some() {
+                    return None;
+                }
+                let cache_age = match src {
+                    WorkspaceDecisionAdviceSource::Fresh => {
+                        if self.cache_age_ms.is_some() {
+                            return None;
+                        }
+                        None
+                    }
+                    WorkspaceDecisionAdviceSource::Cached => {
+                        let age = self.cache_age_ms?;
+                        if age > MAX_DECISION_BADGE_JS_SAFE_INTEGER {
+                            return None;
+                        }
+                        Some(age)
+                    }
+                };
+                let agrees = match self.coworker_difficulty {
+                    Some(coworker) => {
+                        let expected = coworker == rec;
+                        if let Some(provided) = self.agrees_with_coworker {
+                            if provided != expected {
+                                return None;
+                            }
+                        }
+                        Some(expected)
+                    }
+                    None => {
+                        if self.agrees_with_coworker.is_some() {
+                            return None;
+                        }
+                        None
+                    }
+                };
+                (Some(rec), Some(src), cache_age, None, agrees)
+            }
+            WorkspaceDecisionBadgeStatus::Failed => {
+                if self.recommended_difficulty.is_some() || self.agrees_with_coworker.is_some() {
+                    return None;
+                }
+                let cache_age = match self.advice_source {
+                    Some(WorkspaceDecisionAdviceSource::Cached) => {
+                        let age = self.cache_age_ms?;
+                        if age > MAX_DECISION_BADGE_JS_SAFE_INTEGER {
+                            return None;
+                        }
+                        Some(age)
+                    }
+                    Some(WorkspaceDecisionAdviceSource::Fresh) | None => {
+                        if self.cache_age_ms.is_some() {
+                            return None;
+                        }
+                        None
+                    }
+                };
+                let reason = sanitize_decision_reason_code(self.failure_reason_code.as_deref());
+                (None, self.advice_source, cache_age, reason, None)
+            }
+        };
+
+        Some(Self {
+            item_id,
+            execution_ref,
+            approval_id,
+            task_id,
+            subject_digest: self.subject_digest.clone(),
+            provider: self.provider,
+            status: self.status,
+            recommended_difficulty,
+            coworker_difficulty: self.coworker_difficulty,
+            advice_source,
+            advisor_model,
+            cache_age_ms,
+            failure_reason_code,
+            agrees_with_coworker,
+        })
+    }
+}
+
 /// Per-chat truthful omission accounting for [`WorkspaceChatWork`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct WorkspaceChatWorkBounds {
@@ -7547,6 +7860,14 @@ pub struct WorkspaceChatWorkBounds {
     /// or all-chat bounds.
     #[serde(default, deserialize_with = "deserialize_null_default")]
     pub executions_omitted: usize,
+    /// Decision advisor badges omitted by validity, duplicate/conflicting identity, stale
+    /// execution, per-chat, or all-chat bounds.
+    #[serde(
+        default,
+        skip_serializing_if = "is_zero_usize",
+        deserialize_with = "deserialize_null_default"
+    )]
+    pub decision_badges_omitted: usize,
 }
 
 /// Bounded read-only backlog work for one canonical chat identity.
@@ -7573,6 +7894,14 @@ pub struct WorkspaceChatWork {
     /// of inventing an attempt.
     #[serde(default, deserialize_with = "deserialize_null_default")]
     pub worker_executions: Vec<WorkspaceWorkerExecution>,
+    /// Compact read-only shadow decision advisor badges scoped to current Worker executions,
+    /// bounded to `<= 32` per chat.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_null_default"
+    )]
+    pub decision_badges: Vec<WorkspaceDecisionBadge>,
     /// Truthful per-chat omission accounting.
     #[serde(default, deserialize_with = "deserialize_null_default")]
     pub bounds: WorkspaceChatWorkBounds,
@@ -7803,6 +8132,69 @@ impl WorkspaceChatWork {
             bounds.executions_omitted = bounds.executions_omitted.saturating_add(overflow);
         }
 
+        let item_order_by_id: BTreeMap<&str, usize> = items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| (item.item_id.as_str(), index))
+            .collect();
+        let mut badge_groups: BTreeMap<(String, String), Vec<WorkspaceDecisionBadge>> =
+            BTreeMap::new();
+        for raw_badge in &self.decision_badges {
+            let Some(badge) = raw_badge.normalized_safe() else {
+                bounds.decision_badges_omitted = bounds.decision_badges_omitted.saturating_add(1);
+                continue;
+            };
+            let Some(owner) = items.iter().find(|item| item.item_id == badge.item_id) else {
+                bounds.decision_badges_omitted = bounds.decision_badges_omitted.saturating_add(1);
+                continue;
+            };
+            if owner.kind != crate::backlog::BacklogItemKind::Worker
+                || owner.current_execution_ref.as_deref() != Some(badge.execution_ref.as_str())
+            {
+                bounds.decision_badges_omitted = bounds.decision_badges_omitted.saturating_add(1);
+                continue;
+            }
+            badge_groups
+                .entry((badge.item_id.clone(), badge.execution_ref.clone()))
+                .or_default()
+                .push(badge);
+        }
+
+        let mut decision_badges: Vec<WorkspaceDecisionBadge> =
+            Vec::with_capacity(badge_groups.len());
+        for group in badge_groups.into_values() {
+            let group_len = group.len();
+            if let Some(winner) = reconcile_decision_badge_group(group) {
+                bounds.decision_badges_omitted = bounds
+                    .decision_badges_omitted
+                    .saturating_add(group_len.saturating_sub(1));
+                decision_badges.push(winner);
+            } else {
+                bounds.decision_badges_omitted =
+                    bounds.decision_badges_omitted.saturating_add(group_len);
+            }
+        }
+        decision_badges.sort_by(|left, right| {
+            let left_order = item_order_by_id
+                .get(left.item_id.as_str())
+                .copied()
+                .unwrap_or(usize::MAX);
+            let right_order = item_order_by_id
+                .get(right.item_id.as_str())
+                .copied()
+                .unwrap_or(usize::MAX);
+            left_order
+                .cmp(&right_order)
+                .then_with(|| left.item_id.cmp(&right.item_id))
+                .then_with(|| left.execution_ref.cmp(&right.execution_ref))
+        });
+        if decision_badges.len() > MAX_WORKSPACE_CHAT_WORK_DECISION_BADGES_PER_CHAT {
+            let overflow = decision_badges.len() - MAX_WORKSPACE_CHAT_WORK_DECISION_BADGES_PER_CHAT;
+            decision_badges = decision_badges.split_off(overflow);
+            bounds.decision_badges_omitted =
+                bounds.decision_badges_omitted.saturating_add(overflow);
+        }
+
         Self {
             identity,
             availability: self.availability,
@@ -7810,6 +8202,7 @@ impl WorkspaceChatWork {
             events,
             worker_presence,
             worker_executions: retained_executions,
+            decision_badges,
             bounds,
         }
     }
@@ -7875,6 +8268,8 @@ impl WorkspaceChatWork {
             .extend(other.worker_presence.iter().cloned());
         self.worker_executions
             .extend(other.worker_executions.iter().cloned());
+        self.decision_badges
+            .extend(other.decision_badges.iter().cloned());
         self.bounds.items_omitted = self
             .bounds
             .items_omitted
@@ -7891,7 +8286,113 @@ impl WorkspaceChatWork {
             .bounds
             .executions_omitted
             .saturating_add(other.bounds.executions_omitted);
+        self.bounds.decision_badges_omitted = self
+            .bounds
+            .decision_badges_omitted
+            .saturating_add(other.bounds.decision_badges_omitted);
     }
+}
+
+fn decision_badge_status_rank(status: WorkspaceDecisionBadgeStatus) -> u8 {
+    match status {
+        WorkspaceDecisionBadgeStatus::Result => 2,
+        WorkspaceDecisionBadgeStatus::Failed => 1,
+        WorkspaceDecisionBadgeStatus::Pending => 0,
+    }
+}
+
+fn decision_badge_immutable_scope(
+    badge: &WorkspaceDecisionBadge,
+) -> (&str, &str, &str, WorkspaceDecisionAdvisorProvider) {
+    (
+        badge.approval_id.as_str(),
+        badge.task_id.as_str(),
+        badge.subject_digest.as_str(),
+        badge.provider,
+    )
+}
+
+fn compare_decision_badge_preference(
+    left: &WorkspaceDecisionBadge,
+    right: &WorkspaceDecisionBadge,
+) -> std::cmp::Ordering {
+    decision_badge_status_rank(right.status)
+        .cmp(&decision_badge_status_rank(left.status))
+        .then_with(|| {
+            left.recommended_difficulty
+                .cmp(&right.recommended_difficulty)
+        })
+        .then_with(|| left.advice_source.cmp(&right.advice_source))
+        .then_with(|| left.coworker_difficulty.cmp(&right.coworker_difficulty))
+        .then_with(|| {
+            compare_opt_str_some_first(
+                left.advisor_model.as_deref(),
+                right.advisor_model.as_deref(),
+            )
+        })
+        .then_with(|| compare_opt_u64_asc(left.cache_age_ms, right.cache_age_ms))
+        .then_with(|| {
+            compare_opt_str_some_first(
+                left.failure_reason_code.as_deref(),
+                right.failure_reason_code.as_deref(),
+            )
+        })
+}
+
+/// Reconciles duplicate observations of a single `(item_id, execution_ref)` decision badge.
+///
+/// Conflicting immutable scopes (`approval_id`, `task_id`, `subject_digest`, `provider`) or
+/// conflicting terminal outcomes (`Result` vs `Failed`, or two `Result` badges with different
+/// recommended difficulties/provenance) are quarantined (`None`) rather than picking arbitrarily.
+fn reconcile_decision_badge_group(
+    group: Vec<WorkspaceDecisionBadge>,
+) -> Option<WorkspaceDecisionBadge> {
+    let first = group.first()?;
+    let expected_scope = decision_badge_immutable_scope(first);
+    if group
+        .iter()
+        .any(|candidate| decision_badge_immutable_scope(candidate) != expected_scope)
+    {
+        return None;
+    }
+
+    let mut seen_result: Option<(
+        Option<WorkspaceDecisionDifficulty>,
+        Option<WorkspaceDecisionAdviceSource>,
+    )> = None;
+    let mut seen_failed = false;
+    for candidate in &group {
+        match candidate.status {
+            WorkspaceDecisionBadgeStatus::Result => {
+                let sig = (candidate.recommended_difficulty, candidate.advice_source);
+                if let Some(prev) = seen_result {
+                    if prev != sig {
+                        return None;
+                    }
+                } else {
+                    seen_result = Some(sig);
+                }
+            }
+            WorkspaceDecisionBadgeStatus::Failed => {
+                seen_failed = true;
+            }
+            WorkspaceDecisionBadgeStatus::Pending => {}
+        }
+    }
+    if seen_result.is_some() && seen_failed {
+        return None;
+    }
+
+    let mut best: Option<WorkspaceDecisionBadge> = None;
+    for candidate in group {
+        let replace = best.as_ref().is_none_or(|existing| {
+            compare_decision_badge_preference(&candidate, existing) == std::cmp::Ordering::Less
+        });
+        if replace {
+            best = Some(candidate);
+        }
+    }
+    best
 }
 
 /// Stable attempt identity used to deduplicate projected Worker executions.
@@ -8480,6 +8981,10 @@ impl WorkspaceSnapshot {
             .iter()
             .map(|work| work.worker_executions.len())
             .sum();
+        let mut total_decision_badges: usize = chat_work
+            .iter()
+            .map(|work| work.decision_badges.len())
+            .sum();
         if total_items > MAX_WORKSPACE_CHAT_WORK_ITEMS_TOTAL {
             for work in chat_work.iter_mut().rev() {
                 if total_items <= MAX_WORKSPACE_CHAT_WORK_ITEMS_TOTAL {
@@ -8516,6 +9021,18 @@ impl WorkspaceSnapshot {
                             .executions_omitted
                             .saturating_add(removed_executions);
                         total_executions = total_executions.saturating_sub(removed_executions);
+                    }
+                    let badges_before = work.decision_badges.len();
+                    work.decision_badges
+                        .retain(|badge| remaining_item_ids.contains(&badge.item_id));
+                    let removed_badges = badges_before.saturating_sub(work.decision_badges.len());
+                    if removed_badges > 0 {
+                        work.bounds.decision_badges_omitted = work
+                            .bounds
+                            .decision_badges_omitted
+                            .saturating_add(removed_badges);
+                        total_decision_badges =
+                            total_decision_badges.saturating_sub(removed_badges);
                     }
                 }
             }
@@ -8568,6 +9085,23 @@ impl WorkspaceSnapshot {
                     work.bounds.executions_omitted =
                         work.bounds.executions_omitted.saturating_add(remove);
                     total_executions -= remove;
+                }
+            }
+        }
+
+        if total_decision_badges > MAX_WORKSPACE_CHAT_WORK_DECISION_BADGES_TOTAL {
+            for work in chat_work.iter_mut().rev() {
+                if total_decision_badges <= MAX_WORKSPACE_CHAT_WORK_DECISION_BADGES_TOTAL {
+                    break;
+                }
+                let overflow =
+                    total_decision_badges - MAX_WORKSPACE_CHAT_WORK_DECISION_BADGES_TOTAL;
+                let remove = overflow.min(work.decision_badges.len());
+                if remove > 0 {
+                    work.decision_badges = work.decision_badges.split_off(remove);
+                    work.bounds.decision_badges_omitted =
+                        work.bounds.decision_badges_omitted.saturating_add(remove);
+                    total_decision_badges -= remove;
                 }
             }
         }
@@ -12274,5 +12808,356 @@ mod tests {
         assert_eq!(records[0].record_id, "obsrec_fix_seed");
         assert_eq!(records[1].record_id, "obsrec_fix_child_2");
         assert_eq!(records[2].record_id, "obsrec_fix_drop_child");
+    }
+
+    #[test]
+    fn workspace_decision_badge_normalization_enforces_scope_conflicts_caps_and_legacy_compat() {
+        let identity = WorkspaceChatIdentity::new(
+            "default",
+            "bnd_decision_norm",
+            "0196ed00-0000-7000-8000-0000000000d5",
+            "/home/dev/repos/decision-norm",
+        )
+        .expect("identity");
+
+        // Legacy JSON without `decision_badges` / `decision_badges_omitted` deserializes cleanly,
+        // and re-serializing an empty badge list omits both new fields for wire compatibility.
+        let legacy_json = serde_json::json!({
+            "identity": identity,
+            "availability": "available",
+            "items": [],
+            "events": [],
+            "worker_presence": [],
+            "worker_executions": [],
+            "bounds": {
+                "items_omitted": 0,
+                "events_omitted": 0,
+                "presence_omitted": 0,
+                "executions_omitted": 0
+            }
+        });
+        let legacy: WorkspaceChatWork =
+            serde_json::from_value(legacy_json).expect("legacy WorkspaceChatWork must deserialize");
+        assert!(legacy.decision_badges.is_empty());
+        assert_eq!(legacy.bounds.decision_badges_omitted, 0);
+        let reserialized = serde_json::to_value(&legacy).expect("serialize legacy work");
+        assert!(reserialized.get("decision_badges").is_none());
+        assert!(reserialized["bounds"]
+            .get("decision_badges_omitted")
+            .is_none());
+
+        let make_item = |item_id: &str,
+                         title: &str,
+                         kind: crate::backlog::BacklogItemKind,
+                         exec_ref: Option<&str>,
+                         created_at_ms: i64| crate::backlog::BacklogItem {
+            item_id: item_id.to_string(),
+            binding_id: identity.binding_id.clone(),
+            revision: 2,
+            title: title.to_string(),
+            acceptance_condition: "Verified".to_string(),
+            delivery_description: "Delivered".to_string(),
+            kind,
+            status: crate::backlog::BacklogStatus::Doing,
+            blocked_reason: None,
+            current_execution_ref: exec_ref.map(str::to_string),
+            completion_note: None,
+            completion_evidence: None,
+            completed_at_ms: None,
+            created_at_ms,
+            updated_at_ms: created_at_ms + 1,
+        };
+
+        let digest_a = "a".repeat(64);
+        let digest_b = "b".repeat(64);
+        let digest_c = "c".repeat(64);
+
+        let work = WorkspaceChatWork {
+            identity: identity.clone(),
+            availability: WorkspaceChatWorkAvailability::Available,
+            items: vec![
+                make_item(
+                    "blg_same_title_1",
+                    "Identical task title",
+                    crate::backlog::BacklogItemKind::Worker,
+                    Some("wbe_exec_1"),
+                    1_000,
+                ),
+                make_item(
+                    "blg_same_title_2",
+                    "Identical task title",
+                    crate::backlog::BacklogItemKind::Worker,
+                    Some("wbe_exec_2"),
+                    1_100,
+                ),
+                make_item(
+                    "blg_conflict",
+                    "Conflicting badge item",
+                    crate::backlog::BacklogItemKind::Worker,
+                    Some("wbe_exec_conflict"),
+                    1_200,
+                ),
+                make_item(
+                    "blg_coworker",
+                    "Coworker item",
+                    crate::backlog::BacklogItemKind::Coworker,
+                    Some("wbe_coworker"),
+                    1_300,
+                ),
+            ],
+            decision_badges: vec![
+                // Item 1: duplicate pending + fresh result -> result wins cleanly.
+                WorkspaceDecisionBadge {
+                    item_id: "blg_same_title_1".to_string(),
+                    execution_ref: "wbe_exec_1".to_string(),
+                    approval_id: "apr_1".to_string(),
+                    task_id: "task_1".to_string(),
+                    subject_digest: digest_a.clone(),
+                    provider: WorkspaceDecisionAdvisorProvider::Jev,
+                    status: WorkspaceDecisionBadgeStatus::Pending,
+                    recommended_difficulty: None,
+                    coworker_difficulty: Some(WorkspaceDecisionDifficulty::Medium),
+                    advice_source: None,
+                    advisor_model: Some("jev-2.5".to_string()),
+                    cache_age_ms: None,
+                    failure_reason_code: None,
+                    agrees_with_coworker: None,
+                },
+                WorkspaceDecisionBadge {
+                    item_id: "blg_same_title_1".to_string(),
+                    execution_ref: "wbe_exec_1".to_string(),
+                    approval_id: "apr_1".to_string(),
+                    task_id: "task_1".to_string(),
+                    subject_digest: digest_a.clone(),
+                    provider: WorkspaceDecisionAdvisorProvider::Jev,
+                    status: WorkspaceDecisionBadgeStatus::Result,
+                    recommended_difficulty: Some(WorkspaceDecisionDifficulty::Hard),
+                    coworker_difficulty: Some(WorkspaceDecisionDifficulty::Medium),
+                    advice_source: Some(WorkspaceDecisionAdviceSource::Fresh),
+                    advisor_model: Some("jev-2.5-pro".to_string()),
+                    cache_age_ms: None,
+                    failure_reason_code: None,
+                    agrees_with_coworker: Some(false),
+                },
+                // Item 1 stale superseded execution -> must be dropped.
+                WorkspaceDecisionBadge {
+                    item_id: "blg_same_title_1".to_string(),
+                    execution_ref: "wbe_exec_old".to_string(),
+                    approval_id: "apr_old".to_string(),
+                    task_id: "task_old".to_string(),
+                    subject_digest: digest_a,
+                    provider: WorkspaceDecisionAdvisorProvider::Openai,
+                    status: WorkspaceDecisionBadgeStatus::Result,
+                    recommended_difficulty: Some(WorkspaceDecisionDifficulty::Easy),
+                    coworker_difficulty: Some(WorkspaceDecisionDifficulty::Medium),
+                    advice_source: Some(WorkspaceDecisionAdviceSource::Cached),
+                    advisor_model: Some("gpt-6-luna".to_string()),
+                    cache_age_ms: Some(12_000),
+                    failure_reason_code: None,
+                    agrees_with_coworker: Some(false),
+                },
+                // Item 2 (parallel identical title): OpenAI pending remains independent.
+                WorkspaceDecisionBadge {
+                    item_id: "blg_same_title_2".to_string(),
+                    execution_ref: "wbe_exec_2".to_string(),
+                    approval_id: "apr_2".to_string(),
+                    task_id: "task_2".to_string(),
+                    subject_digest: digest_b,
+                    provider: WorkspaceDecisionAdvisorProvider::Openai,
+                    status: WorkspaceDecisionBadgeStatus::Pending,
+                    recommended_difficulty: None,
+                    coworker_difficulty: Some(WorkspaceDecisionDifficulty::Extreme),
+                    advice_source: None,
+                    advisor_model: Some("gpt-6-luna".to_string()),
+                    cache_age_ms: None,
+                    failure_reason_code: None,
+                    agrees_with_coworker: None,
+                },
+                // Conflicting providers on the same execution -> quarantined.
+                WorkspaceDecisionBadge {
+                    item_id: "blg_conflict".to_string(),
+                    execution_ref: "wbe_exec_conflict".to_string(),
+                    approval_id: "apr_c".to_string(),
+                    task_id: "task_c".to_string(),
+                    subject_digest: digest_c.clone(),
+                    provider: WorkspaceDecisionAdvisorProvider::Jev,
+                    status: WorkspaceDecisionBadgeStatus::Pending,
+                    recommended_difficulty: None,
+                    coworker_difficulty: None,
+                    advice_source: None,
+                    advisor_model: None,
+                    cache_age_ms: None,
+                    failure_reason_code: None,
+                    agrees_with_coworker: None,
+                },
+                WorkspaceDecisionBadge {
+                    item_id: "blg_conflict".to_string(),
+                    execution_ref: "wbe_exec_conflict".to_string(),
+                    approval_id: "apr_c".to_string(),
+                    task_id: "task_c".to_string(),
+                    subject_digest: digest_c.clone(),
+                    provider: WorkspaceDecisionAdvisorProvider::Openai,
+                    status: WorkspaceDecisionBadgeStatus::Pending,
+                    recommended_difficulty: None,
+                    coworker_difficulty: None,
+                    advice_source: None,
+                    advisor_model: None,
+                    cache_age_ms: None,
+                    failure_reason_code: None,
+                    agrees_with_coworker: None,
+                },
+                // Coworker item -> rejected.
+                WorkspaceDecisionBadge {
+                    item_id: "blg_coworker".to_string(),
+                    execution_ref: "wbe_coworker".to_string(),
+                    approval_id: "apr_cw".to_string(),
+                    task_id: "task_cw".to_string(),
+                    subject_digest: digest_c,
+                    provider: WorkspaceDecisionAdvisorProvider::Jev,
+                    status: WorkspaceDecisionBadgeStatus::Pending,
+                    recommended_difficulty: None,
+                    coworker_difficulty: None,
+                    advice_source: None,
+                    advisor_model: None,
+                    cache_age_ms: None,
+                    failure_reason_code: None,
+                    agrees_with_coworker: None,
+                },
+                // Invalid digest -> rejected.
+                WorkspaceDecisionBadge {
+                    item_id: "blg_same_title_2".to_string(),
+                    execution_ref: "wbe_exec_2".to_string(),
+                    approval_id: "apr_2".to_string(),
+                    task_id: "task_2".to_string(),
+                    subject_digest: "not-a-sha256".to_string(),
+                    provider: WorkspaceDecisionAdvisorProvider::Openai,
+                    status: WorkspaceDecisionBadgeStatus::Pending,
+                    recommended_difficulty: None,
+                    coworker_difficulty: None,
+                    advice_source: None,
+                    advisor_model: None,
+                    cache_age_ms: None,
+                    failure_reason_code: None,
+                    agrees_with_coworker: None,
+                },
+            ],
+            ..WorkspaceChatWork::default()
+        };
+
+        let normalized = work.normalized();
+        assert_eq!(normalized.decision_badges.len(), 2);
+        assert_eq!(normalized.decision_badges[0].item_id, "blg_same_title_1");
+        assert_eq!(
+            normalized.decision_badges[0].provider,
+            WorkspaceDecisionAdvisorProvider::Jev
+        );
+        assert_eq!(
+            normalized.decision_badges[0].status,
+            WorkspaceDecisionBadgeStatus::Result
+        );
+        assert_eq!(
+            normalized.decision_badges[0].recommended_difficulty,
+            Some(WorkspaceDecisionDifficulty::Hard)
+        );
+        assert_eq!(normalized.decision_badges[1].item_id, "blg_same_title_2");
+        assert_eq!(
+            normalized.decision_badges[1].provider,
+            WorkspaceDecisionAdvisorProvider::Openai
+        );
+        assert_eq!(
+            normalized.decision_badges[1].status,
+            WorkspaceDecisionBadgeStatus::Pending
+        );
+        assert_eq!(normalized.bounds.decision_badges_omitted, 6);
+
+        // Per-chat cap (32) and global cap (128).
+        let mut chats = Vec::new();
+        for chat_idx in 0..5u32 {
+            let binding = format!("bnd_badge_cap_{chat_idx}");
+            let chat_id = WorkspaceChatIdentity::new(
+                "default",
+                &binding,
+                &format!("0196ed00-0000-7000-8000-00000001{chat_idx:04}"),
+                &format!("/home/dev/repos/badge-cap-{chat_idx}"),
+            )
+            .expect("cap identity");
+            let mut items = Vec::new();
+            let mut badges = Vec::new();
+            for item_idx in 0..36u32 {
+                let item_id = format!("blg_cap_{chat_idx}_{item_idx:02}");
+                let exec_ref = format!("wbe_cap_{chat_idx}_{item_idx:02}");
+                items.push(crate::backlog::BacklogItem {
+                    item_id: item_id.clone(),
+                    binding_id: binding.clone(),
+                    revision: 1,
+                    title: format!("Task {item_idx}"),
+                    acceptance_condition: "Pass".to_string(),
+                    delivery_description: "Deliver".to_string(),
+                    kind: crate::backlog::BacklogItemKind::Worker,
+                    status: crate::backlog::BacklogStatus::Doing,
+                    blocked_reason: None,
+                    current_execution_ref: Some(exec_ref.clone()),
+                    completion_note: None,
+                    completion_evidence: None,
+                    completed_at_ms: None,
+                    created_at_ms: i64::from(item_idx) + 1,
+                    updated_at_ms: i64::from(item_idx) + 1,
+                });
+                badges.push(WorkspaceDecisionBadge {
+                    item_id,
+                    execution_ref: exec_ref,
+                    approval_id: format!("apr_{chat_idx}_{item_idx:02}"),
+                    task_id: format!("task_{item_idx:02}"),
+                    subject_digest: format!("{item_idx:064x}"),
+                    provider: WorkspaceDecisionAdvisorProvider::Jev,
+                    status: WorkspaceDecisionBadgeStatus::Pending,
+                    recommended_difficulty: None,
+                    coworker_difficulty: Some(WorkspaceDecisionDifficulty::Medium),
+                    advice_source: None,
+                    advisor_model: None,
+                    cache_age_ms: None,
+                    failure_reason_code: None,
+                    agrees_with_coworker: None,
+                });
+            }
+            chats.push(WorkspaceChatWork {
+                identity: chat_id,
+                availability: WorkspaceChatWorkAvailability::Available,
+                items,
+                decision_badges: badges,
+                ..WorkspaceChatWork::default()
+            });
+        }
+        let snapshot = WorkspaceSnapshot {
+            schema_version: WORKSPACE_SNAPSHOT_SCHEMA_VERSION,
+            generated_at_ms: 0,
+            sampling_policy: WorkspaceSamplingPolicy::default(),
+            observation: default_empty_observation_snapshot(),
+            chats: Vec::new(),
+            native_samples: Vec::new(),
+            job_histories: Vec::new(),
+            messages: WorkspaceMessagesWindow::default(),
+            chat_work: chats,
+            bounds: WorkspaceSnapshotBounds::default(),
+        }
+        .normalized();
+        let total_retained: usize = snapshot
+            .chat_work
+            .iter()
+            .map(|entry| entry.decision_badges.len())
+            .sum();
+        let total_omitted: usize = snapshot
+            .chat_work
+            .iter()
+            .map(|entry| entry.bounds.decision_badges_omitted)
+            .sum();
+        assert_eq!(
+            total_retained,
+            MAX_WORKSPACE_CHAT_WORK_DECISION_BADGES_TOTAL
+        );
+        assert_eq!(
+            total_omitted,
+            5 * 36 - MAX_WORKSPACE_CHAT_WORK_DECISION_BADGES_TOTAL
+        );
     }
 }

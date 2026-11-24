@@ -7,6 +7,8 @@ import {
   MAX_WORKSPACE_ATTEMPTS_PER_TASK,
   MAX_WORKSPACE_CANDIDATES_PER_TASK,
   MAX_WORKSPACE_CANONICAL_PATH_BYTES,
+  MAX_WORKSPACE_CHAT_WORK_DECISION_BADGES_PER_CHAT,
+  MAX_WORKSPACE_CHAT_WORK_DECISION_BADGES_TOTAL,
   MAX_WORKSPACE_CHAT_WORK_EVENTS_PER_CHAT,
   MAX_WORKSPACE_CHAT_WORK_EVENTS_TOTAL,
   MAX_WORKSPACE_CHAT_WORK_EXECUTIONS_PER_CHAT,
@@ -68,6 +70,11 @@ import type {
   WorkspaceConfiguredSelection,
   WorkspaceConnectionState,
   WorkspaceCoveredAttention,
+  WorkspaceDecisionAdviceSource,
+  WorkspaceDecisionAdvisorProvider,
+  WorkspaceDecisionBadge,
+  WorkspaceDecisionBadgeStatus,
+  WorkspaceDecisionDifficulty,
   WorkspaceEvaluatedNativeSample,
   WorkspaceExternalResolution,
   WorkspaceExternalResolutionApplicability,
@@ -113,6 +120,8 @@ export {
   MAX_WORKSPACE_ATTEMPTS_PER_TASK,
   MAX_WORKSPACE_CANDIDATES_PER_TASK,
   MAX_WORKSPACE_CANONICAL_PATH_BYTES,
+  MAX_WORKSPACE_CHAT_WORK_DECISION_BADGES_PER_CHAT,
+  MAX_WORKSPACE_CHAT_WORK_DECISION_BADGES_TOTAL,
   MAX_WORKSPACE_CHAT_WORK_EVENTS_PER_CHAT,
   MAX_WORKSPACE_CHAT_WORK_EVENTS_TOTAL,
   MAX_WORKSPACE_CHAT_WORK_EXECUTIONS_PER_CHAT,
@@ -166,6 +175,11 @@ export type {
   WorkspaceConfiguredSelection,
   WorkspaceConnectionState,
   WorkspaceCoveredAttention,
+  WorkspaceDecisionAdviceSource,
+  WorkspaceDecisionAdvisorProvider,
+  WorkspaceDecisionBadge,
+  WorkspaceDecisionBadgeStatus,
+  WorkspaceDecisionDifficulty,
   WorkspaceEvaluatedNativeSample,
   WorkspaceExternalResolution,
   WorkspaceExternalResolutionApplicability,
@@ -3280,6 +3294,379 @@ function normalizeWorkerExecutionList(
   return { items: capped.items, omitted: omitted + capped.omitted };
 }
 
+const WORKSPACE_DECISION_ADVISOR_PROVIDERS: readonly WorkspaceDecisionAdvisorProvider[] = [
+  'jev',
+  'openai',
+] as const;
+const WORKSPACE_DECISION_DIFFICULTIES: readonly WorkspaceDecisionDifficulty[] = [
+  'easy',
+  'medium',
+  'hard',
+  'extreme',
+] as const;
+const WORKSPACE_DECISION_BADGE_STATUSES: readonly WorkspaceDecisionBadgeStatus[] = [
+  'pending',
+  'result',
+  'failed',
+] as const;
+const WORKSPACE_DECISION_ADVICE_SOURCES: readonly WorkspaceDecisionAdviceSource[] = [
+  'fresh',
+  'cached',
+] as const;
+const MAX_DECISION_REASON_CODE_BYTES = 64 as const;
+
+function parseDecisionAdvisorProvider(
+  raw: unknown,
+): WorkspaceDecisionAdvisorProvider | null {
+  return typeof raw === 'string' &&
+    (WORKSPACE_DECISION_ADVISOR_PROVIDERS as readonly string[]).includes(raw)
+    ? (raw as WorkspaceDecisionAdvisorProvider)
+    : null;
+}
+
+function parseDecisionDifficulty(raw: unknown): WorkspaceDecisionDifficulty | null {
+  return typeof raw === 'string' &&
+    (WORKSPACE_DECISION_DIFFICULTIES as readonly string[]).includes(raw)
+    ? (raw as WorkspaceDecisionDifficulty)
+    : null;
+}
+
+function parseOptionalDecisionDifficulty(
+  raw: unknown,
+): WorkspaceDecisionDifficulty | null | undefined {
+  if (raw === null || raw === undefined) {
+    return null;
+  }
+  const parsed = parseDecisionDifficulty(raw);
+  return parsed === null ? undefined : parsed;
+}
+
+function parseDecisionBadgeStatus(raw: unknown): WorkspaceDecisionBadgeStatus | null {
+  return typeof raw === 'string' &&
+    (WORKSPACE_DECISION_BADGE_STATUSES as readonly string[]).includes(raw)
+    ? (raw as WorkspaceDecisionBadgeStatus)
+    : null;
+}
+
+function parseOptionalDecisionAdviceSource(
+  raw: unknown,
+): WorkspaceDecisionAdviceSource | null | undefined {
+  if (raw === null || raw === undefined) {
+    return null;
+  }
+  return typeof raw === 'string' &&
+    (WORKSPACE_DECISION_ADVICE_SOURCES as readonly string[]).includes(raw)
+    ? (raw as WorkspaceDecisionAdviceSource)
+    : undefined;
+}
+
+function isLowercaseSha256Hex(raw: unknown): raw is string {
+  return typeof raw === 'string' && /^[0-9a-f]{64}$/.test(raw);
+}
+
+function sanitizeDecisionReasonCode(raw: unknown): string | null {
+  if (typeof raw !== 'string') {
+    return null;
+  }
+  const trimmed = raw.trim();
+  if (
+    trimmed.length === 0 ||
+    utf8ByteLength(trimmed) > MAX_DECISION_REASON_CODE_BYTES ||
+    !/^[A-Za-z0-9_-]+$/.test(trimmed) ||
+    containsSensitiveMarker(trimmed.toLowerCase())
+  ) {
+    return null;
+  }
+  return trimmed.toLowerCase();
+}
+
+function decisionBadgeJoinKey(itemId: string, executionRef: string): string {
+  return `${itemId}\u0000${executionRef}`;
+}
+
+function decisionBadgeImmutableScopeKey(badge: WorkspaceDecisionBadge): string {
+  return [
+    badge.item_id,
+    badge.execution_ref,
+    badge.approval_id,
+    badge.task_id,
+    badge.subject_digest,
+    badge.provider,
+  ].join('\u0000');
+}
+
+function decisionBadgeStatusRank(badge: WorkspaceDecisionBadge): number {
+  if (badge.status === 'result') {
+    return (
+      2_000 +
+      (badge.coworker_difficulty != null ? 4 : 0) +
+      (badge.advisor_model != null ? 2 : 0) +
+      (badge.agrees_with_coworker != null ? 1 : 0)
+    );
+  }
+  if (badge.status === 'failed') {
+    return (
+      1_000 +
+      (badge.failure_reason_code != null ? 8 : 0) +
+      (badge.advice_source != null ? 4 : 0) +
+      (badge.advisor_model != null ? 2 : 0) +
+      (badge.coworker_difficulty != null ? 1 : 0)
+    );
+  }
+  return (
+    (badge.coworker_difficulty != null ? 2 : 0) +
+    (badge.advisor_model != null ? 1 : 0)
+  );
+}
+
+function decisionBadgesConflict(
+  left: WorkspaceDecisionBadge,
+  right: WorkspaceDecisionBadge,
+): boolean {
+  if (decisionBadgeImmutableScopeKey(left) !== decisionBadgeImmutableScopeKey(right)) {
+    return true;
+  }
+  if (
+    left.coworker_difficulty != null &&
+    right.coworker_difficulty != null &&
+    left.coworker_difficulty !== right.coworker_difficulty
+  ) {
+    return true;
+  }
+  if (
+    (left.status === 'result' && right.status === 'failed') ||
+    (left.status === 'failed' && right.status === 'result')
+  ) {
+    return true;
+  }
+  if (
+    left.status === 'result' &&
+    right.status === 'result' &&
+    (left.recommended_difficulty !== right.recommended_difficulty ||
+      left.advice_source !== right.advice_source)
+  ) {
+    return true;
+  }
+  if (
+    left.status === 'failed' &&
+    right.status === 'failed' &&
+    left.advice_source != null &&
+    right.advice_source != null &&
+    left.advice_source !== right.advice_source
+  ) {
+    return true;
+  }
+  return false;
+}
+
+function normalizeDecisionBadgeRecord(
+  raw: unknown,
+  identity: WorkspaceChatIdentity,
+  itemById: ReadonlyMap<string, BacklogItem>,
+): WorkspaceDecisionBadge | null {
+  if (!isRecord(raw)) {
+    return null;
+  }
+  const itemId = validateCorrelationId(raw.item_id);
+  const executionRef = validateCorrelationId(raw.execution_ref);
+  const approvalId = validateCorrelationId(raw.approval_id);
+  const taskId = validateCorrelationId(raw.task_id);
+  if (
+    itemId === null ||
+    executionRef === null ||
+    approvalId === null ||
+    taskId === null ||
+    !isLowercaseSha256Hex(raw.subject_digest)
+  ) {
+    return null;
+  }
+  const provider = parseDecisionAdvisorProvider(raw.provider);
+  const status = parseDecisionBadgeStatus(raw.status);
+  const recommendedDifficulty = parseOptionalDecisionDifficulty(
+    raw.recommended_difficulty,
+  );
+  const coworkerDifficulty = parseOptionalDecisionDifficulty(
+    raw.coworker_difficulty,
+  );
+  const adviceSource = parseOptionalDecisionAdviceSource(raw.advice_source);
+  const cacheAgeMs = cleanStrictOptionalNonNegativeInt(raw.cache_age_ms);
+  const rawFailureCodePresent =
+    raw.failure_reason_code !== null && raw.failure_reason_code !== undefined;
+  const agreesWithCoworker =
+    raw.agrees_with_coworker === null || raw.agrees_with_coworker === undefined
+      ? null
+      : typeof raw.agrees_with_coworker === 'boolean'
+        ? raw.agrees_with_coworker
+        : undefined;
+
+  if (
+    provider === null ||
+    status === null ||
+    recommendedDifficulty === undefined ||
+    coworkerDifficulty === undefined ||
+    adviceSource === undefined ||
+    cacheAgeMs === undefined ||
+    agreesWithCoworker === undefined
+  ) {
+    return null;
+  }
+
+  const ownerItem = itemById.get(itemId);
+  if (
+    ownerItem === undefined ||
+    ownerItem.binding_id !== identity.binding_id ||
+    ownerItem.kind !== 'worker' ||
+    ownerItem.current_execution_ref !== executionRef
+  ) {
+    return null;
+  }
+
+  const advisorModel = sanitizeWorkspaceSelectionToken(raw.advisor_model);
+
+  let finalRecommended: WorkspaceDecisionDifficulty | null = null;
+  let finalSource: WorkspaceDecisionAdviceSource | null = null;
+  let finalCacheAgeMs: number | null = null;
+  let finalFailureReasonCode: string | null = null;
+  let finalAgrees: boolean | null = null;
+
+  if (status === 'pending') {
+    if (
+      recommendedDifficulty !== null ||
+      adviceSource !== null ||
+      cacheAgeMs !== null ||
+      rawFailureCodePresent ||
+      agreesWithCoworker !== null
+    ) {
+      return null;
+    }
+  } else if (status === 'result') {
+    if (
+      recommendedDifficulty === null ||
+      adviceSource === null ||
+      rawFailureCodePresent
+    ) {
+      return null;
+    }
+    if (adviceSource === 'fresh') {
+      if (cacheAgeMs !== null) {
+        return null;
+      }
+    } else if (cacheAgeMs === null) {
+      return null;
+    }
+    if (coworkerDifficulty !== null) {
+      const expected = coworkerDifficulty === recommendedDifficulty;
+      if (agreesWithCoworker !== null && agreesWithCoworker !== expected) {
+        return null;
+      }
+      finalAgrees = expected;
+    } else if (agreesWithCoworker !== null) {
+      return null;
+    }
+    finalRecommended = recommendedDifficulty;
+    finalSource = adviceSource;
+    finalCacheAgeMs = adviceSource === 'cached' ? cacheAgeMs : null;
+  } else {
+    if (recommendedDifficulty !== null || agreesWithCoworker !== null) {
+      return null;
+    }
+    if (rawFailureCodePresent && typeof raw.failure_reason_code !== 'string') {
+      return null;
+    }
+    if (adviceSource === 'cached') {
+      if (cacheAgeMs === null) {
+        return null;
+      }
+      finalCacheAgeMs = cacheAgeMs;
+    } else if (cacheAgeMs !== null) {
+      return null;
+    }
+    finalSource = adviceSource;
+    finalFailureReasonCode = sanitizeDecisionReasonCode(raw.failure_reason_code);
+  }
+
+  return {
+    item_id: itemId,
+    execution_ref: executionRef,
+    approval_id: approvalId,
+    task_id: taskId,
+    subject_digest: raw.subject_digest,
+    provider,
+    status,
+    recommended_difficulty: finalRecommended,
+    coworker_difficulty: coworkerDifficulty,
+    advice_source: finalSource,
+    advisor_model: advisorModel,
+    cache_age_ms: finalCacheAgeMs,
+    failure_reason_code: finalFailureReasonCode,
+    agrees_with_coworker: finalAgrees,
+  };
+}
+
+export function normalizeDecisionBadgeList(
+  raw: unknown,
+  identity: WorkspaceChatIdentity,
+  itemById: ReadonlyMap<string, BacklogItem>,
+  itemOrderIndex: ReadonlyMap<string, number>,
+): { items: WorkspaceDecisionBadge[]; omitted: number } {
+  if (!Array.isArray(raw)) {
+    return { items: [], omitted: 0 };
+  }
+  let omitted = 0;
+  interface BadgeGroup {
+    selected: WorkspaceDecisionBadge | null;
+    conflicted: boolean;
+  }
+  const groups = new Map<string, BadgeGroup>();
+  for (const entry of raw) {
+    const badge = normalizeDecisionBadgeRecord(entry, identity, itemById);
+    if (badge === null) {
+      omitted += 1;
+      continue;
+    }
+    const key = decisionBadgeJoinKey(badge.item_id, badge.execution_ref);
+    const group = groups.get(key);
+    if (group === undefined) {
+      groups.set(key, { selected: badge, conflicted: false });
+      continue;
+    }
+    if (group.conflicted) {
+      omitted += 1;
+      continue;
+    }
+    const existing = group.selected!;
+    if (decisionBadgesConflict(existing, badge)) {
+      omitted += 2;
+      group.conflicted = true;
+      group.selected = null;
+      continue;
+    }
+    omitted += 1;
+    if (decisionBadgeStatusRank(badge) > decisionBadgeStatusRank(existing)) {
+      group.selected = badge;
+    }
+  }
+  const ordered = Array.from(groups.values())
+    .filter(
+      (group): group is BadgeGroup & { selected: WorkspaceDecisionBadge } =>
+        !group.conflicted && group.selected !== null,
+    )
+    .map((group) => group.selected)
+    .sort((left, right) => {
+      const leftOrder = itemOrderIndex.get(left.item_id) ?? Number.MAX_SAFE_INTEGER;
+      const rightOrder = itemOrderIndex.get(right.item_id) ?? Number.MAX_SAFE_INTEGER;
+      if (leftOrder !== rightOrder) {
+        return leftOrder - rightOrder;
+      }
+      return (
+        compareStringsUtf8(left.item_id, right.item_id) ||
+        compareStringsUtf8(left.execution_ref, right.execution_ref)
+      );
+    });
+  const capped = capTail(ordered, MAX_WORKSPACE_CHAT_WORK_DECISION_BADGES_PER_CHAT);
+  return { items: capped.items, omitted: omitted + capped.omitted };
+}
+
 function normalizeWorkspaceChatWorkEntry(raw: unknown): WorkspaceChatWork | null {
   if (!isRecord(raw)) {
     return null;
@@ -3297,6 +3684,7 @@ function normalizeWorkspaceChatWorkEntry(raw: unknown): WorkspaceChatWork | null
     events_omitted: cleanNonNegativeInt(rawBounds.events_omitted, 0),
     presence_omitted: cleanNonNegativeInt(rawBounds.presence_omitted, 0),
     executions_omitted: cleanNonNegativeInt(rawBounds.executions_omitted, 0),
+    decision_badges_omitted: cleanNonNegativeInt(rawBounds.decision_badges_omitted, 0),
   };
 
   let itemsOmitted = 0;
@@ -3419,6 +3807,15 @@ function normalizeWorkspaceChatWorkEntry(raw: unknown): WorkspaceChatWork | null
     itemById,
     eventExecutionKeys,
   );
+  const itemOrderIndex = new Map<string, number>(
+    items.map((item, idx) => [item.item_id, idx] as const),
+  );
+  const decisionBadges = normalizeDecisionBadgeList(
+    raw.decision_badges,
+    identity,
+    itemById,
+    itemOrderIndex,
+  );
 
   return {
     identity,
@@ -3427,11 +3824,14 @@ function normalizeWorkspaceChatWorkEntry(raw: unknown): WorkspaceChatWork | null
     events,
     worker_presence: workerPresence,
     worker_executions: workerExecutions.items,
+    decision_badges: decisionBadges.items,
     bounds: {
       items_omitted: bounds.items_omitted + itemsOmitted,
       events_omitted: bounds.events_omitted + eventsOmitted,
       presence_omitted: bounds.presence_omitted + presenceOmitted,
       executions_omitted: (bounds.executions_omitted ?? 0) + workerExecutions.omitted,
+      decision_badges_omitted:
+        (bounds.decision_badges_omitted ?? 0) + decisionBadges.omitted,
     },
   };
 }
@@ -3656,11 +4056,13 @@ interface RawChatWorkAggregate {
   events: unknown[];
   worker_presence: unknown[];
   worker_executions: unknown[];
+  decision_badges: unknown[];
   bounds: {
     items_omitted: number;
     events_omitted: number;
     presence_omitted: number;
     executions_omitted: number;
+    decision_badges_omitted: number;
   };
 }
 
@@ -3699,11 +4101,13 @@ function normalizeWorkspaceChatWorkList(raw: unknown): WorkspaceChatWork[] {
           events: [],
           worker_presence: [],
           worker_executions: [],
+          decision_badges: [],
           bounds: {
             items_omitted: 0,
             events_omitted: 0,
             presence_omitted: 0,
             executions_omitted: 0,
+            decision_badges_omitted: 0,
           },
         };
         merged.set(key, aggregate);
@@ -3719,10 +4123,15 @@ function normalizeWorkspaceChatWorkList(raw: unknown): WorkspaceChatWork[] {
         rawBounds.executions_omitted,
         0,
       );
+      aggregate.bounds.decision_badges_omitted += cleanNonNegativeInt(
+        rawBounds.decision_badges_omitted,
+        0,
+      );
       aggregate.items.push(...rawChatWorkArray(entry.items));
       aggregate.events.push(...rawChatWorkArray(entry.events));
       aggregate.worker_presence.push(...rawChatWorkArray(entry.worker_presence));
       aggregate.worker_executions.push(...rawChatWorkArray(entry.worker_executions));
+      aggregate.decision_badges.push(...rawChatWorkArray(entry.decision_badges));
     }
   }
 
@@ -3740,6 +4149,7 @@ function normalizeWorkspaceChatWorkList(raw: unknown): WorkspaceChatWork[] {
       events: entry.events,
       worker_presence: entry.worker_presence,
       worker_executions: entry.worker_executions,
+      decision_badges: entry.decision_badges,
       bounds: entry.bounds,
     });
     if (normalized !== null) {
@@ -3752,6 +4162,10 @@ function normalizeWorkspaceChatWorkList(raw: unknown): WorkspaceChatWork[] {
   let totalPresence = chatWork.reduce((sum, work) => sum + work.worker_presence.length, 0);
   let totalExecutions = chatWork.reduce(
     (sum, work) => sum + (work.worker_executions?.length ?? 0),
+    0,
+  );
+  let totalDecisionBadges = chatWork.reduce(
+    (sum, work) => sum + (work.decision_badges?.length ?? 0),
     0,
   );
   if (totalItems > MAX_WORKSPACE_CHAT_WORK_ITEMS_TOTAL) {
@@ -3799,6 +4213,18 @@ function normalizeWorkspaceChatWorkList(raw: unknown): WorkspaceChatWork[] {
           work.bounds.executions_omitted =
             (work.bounds.executions_omitted ?? 0) + removedExecutions;
           totalExecutions -= removedExecutions;
+        }
+        const badgesBefore = work.decision_badges?.length ?? 0;
+        if (work.decision_badges !== undefined) {
+          work.decision_badges = work.decision_badges.filter((badge) =>
+            remainingItemIds.has(badge.item_id),
+          );
+        }
+        const removedBadges = badgesBefore - (work.decision_badges?.length ?? 0);
+        if (removedBadges > 0) {
+          work.bounds.decision_badges_omitted =
+            (work.bounds.decision_badges_omitted ?? 0) + removedBadges;
+          totalDecisionBadges -= removedBadges;
         }
       }
     }
@@ -3853,6 +4279,25 @@ function normalizeWorkspaceChatWorkList(raw: unknown): WorkspaceChatWork[] {
         work.bounds.executions_omitted =
           (work.bounds.executions_omitted ?? 0) + remove;
         totalExecutions -= remove;
+      }
+    }
+  }
+
+  if (totalDecisionBadges > MAX_WORKSPACE_CHAT_WORK_DECISION_BADGES_TOTAL) {
+    for (let index = chatWork.length - 1; index >= 0; index -= 1) {
+      if (totalDecisionBadges <= MAX_WORKSPACE_CHAT_WORK_DECISION_BADGES_TOTAL) {
+        break;
+      }
+      const work = chatWork[index]!;
+      const badges = work.decision_badges ?? [];
+      const overflow =
+        totalDecisionBadges - MAX_WORKSPACE_CHAT_WORK_DECISION_BADGES_TOTAL;
+      const remove = Math.min(overflow, badges.length);
+      if (remove > 0) {
+        work.decision_badges = badges.slice(remove);
+        work.bounds.decision_badges_omitted =
+          (work.bounds.decision_badges_omitted ?? 0) + remove;
+        totalDecisionBadges -= remove;
       }
     }
   }

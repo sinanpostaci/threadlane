@@ -1,4 +1,5 @@
 import './workspace-panels.css';
+import { DecisionBadge } from './decision-badge.tsx';
 
 // Workspace panels are retained for compatibility; the selected-chat surface
 // now renders the minimal chat-work stream and backlog drawer.
@@ -3959,6 +3960,7 @@ export function WorkspaceChatWorkSurface({
                   </div>
                   <p className="tl-cw-event-title">
                     {event.title.trim().length > 0 ? event.title : 'Untitled backlog item'}
+                    <DecisionBadge badge={event.decisionBadge} placement="stream" />
                   </p>
                   {note !== null ? <p className="tl-cw-event-note">{note}</p> : null}
                   {execution !== null && executionFooter !== null ? (
@@ -4105,7 +4107,10 @@ export function WorkspaceChatWorkSurface({
                       >
                         <summary className="tl-cw-backlog-summary">
                           <ChatWorkStatusDot tone={item.statusTone} />
-                          <span className="tl-cw-backlog-title">{item.title}</span>
+                          <span className="tl-cw-backlog-title">
+                            {item.title}
+                            <DecisionBadge badge={item.decisionBadge} placement="drawer" />
+                          </span>
                           <span className="tl-cw-backlog-kind">{item.kindLabel}</span>
                         </summary>
                         <div className="tl-cw-backlog-details">

@@ -26,11 +26,13 @@ mod unix_workspace_tests {
         WorkspaceBacklogPresenceFreshness, WorkspaceBacklogWorkerPresence,
         WorkspaceCapabilityState, WorkspaceChatIdentity, WorkspaceChatWork,
         WorkspaceChatWorkAvailability, WorkspaceChatWorkBounds, WorkspaceConfiguredSelection,
-        WorkspaceConnectionState, WorkspaceExternalResolutionApplicability,
-        WorkspaceExternalResolutionScope, WorkspaceFreshnessState, WorkspaceMessageSourceKind,
-        WorkspaceNativeCapabilities, WorkspaceNativeSample, WorkspaceSampleConnection,
-        WorkspaceSelectionEvidence, WorkspaceSnapshot, WorkspaceWorkerExecutionAcceptance,
-        WorkspaceWorkerExecutionStatus, WORKSPACE_SNAPSHOT_SCHEMA_VERSION,
+        WorkspaceConnectionState, WorkspaceDecisionAdviceSource, WorkspaceDecisionAdvisorProvider,
+        WorkspaceDecisionBadgeStatus, WorkspaceDecisionDifficulty,
+        WorkspaceExternalResolutionApplicability, WorkspaceExternalResolutionScope,
+        WorkspaceFreshnessState, WorkspaceMessageSourceKind, WorkspaceNativeCapabilities,
+        WorkspaceNativeSample, WorkspaceSampleConnection, WorkspaceSelectionEvidence,
+        WorkspaceSnapshot, WorkspaceWorkerExecutionAcceptance, WorkspaceWorkerExecutionStatus,
+        WORKSPACE_SNAPSHOT_SCHEMA_VERSION,
     };
     use threadlane_core::{
         Command, CommandOutput, Core, WorkerAcceptanceState, WorkerCompletionRecord,
@@ -53,6 +55,10 @@ mod unix_workspace_tests {
         PlanningReadOnlyCapabilities, PlanningReservationStatus, PlanningResultRef,
         ReviewVerdictOutcome, StructuredReviewVerdict, TaskCandidateRef, WorkBrief, WorkBriefKind,
         WorkflowHoldReason, WorkflowHoldRecord, COWORKER_WORKFLOW_SCHEMA_VERSION,
+    };
+    use threadlane_native::decision_badge::{
+        compute_shadow_advice_cache_key, compute_shadow_advice_prompt_digest, ADVICE_CACHE_SUBDIR,
+        FORECAST_ADVICE_FILENAME, FORECAST_RECORD_FILENAME, FORECAST_SUBDIR,
     };
     use threadlane_native::external_resolution::{
         ExternalResolutionConfirmation, ExternalResolutionEvidenceRef, ExternalResolutionScope,
@@ -7938,5 +7944,789 @@ mod unix_workspace_tests {
             "collector summary must remain bounded and contain only counts/status"
         );
         println!("{summary}");
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write_forecast_record_fixture(
+        plans_dir: &Path,
+        approval: &ApprovalRecord,
+        status: &str,
+        reason: &str,
+        triggered: bool,
+        advisor: Option<(&str, &str, &str, &str)>,
+        request_summary_sha: Option<&str>,
+    ) -> PathBuf {
+        let forecasts_root = plans_dir.join(FORECAST_SUBDIR);
+        if !forecasts_root.exists() {
+            make_private_dir(&forecasts_root);
+        }
+        let subject_dir = forecasts_root.join(&approval.subject_digest);
+        if !subject_dir.exists() {
+            make_private_dir(&subject_dir);
+        }
+        let task = &approval.tasks[0];
+        let mut obj = serde_json::json!({
+            "schema_version": 1,
+            "advisory_only": true,
+            "mode": "shadow",
+            "binding_id": approval.binding_id,
+            "thread_uuid": approval.thread_uuid,
+            "plan_id": approval.plan_id,
+            "plan_revision": approval.plan_revision,
+            "task_id": task.task_id,
+            "profile_id": approval.profile_id,
+            "profile_revision": approval.registry_revision,
+            "base_commit": approval.base_commit,
+            "subject_digest": approval.subject_digest,
+            "baseline_difficulty": task.difficulty,
+            "complexity": {
+                "component_count": if triggered { 3 } else { 1 },
+                "coupled": triggered,
+                "uncertain": false
+            },
+            "summary_sha256": "1".repeat(64),
+            "triggered": triggered,
+            "status": status,
+            "reason": reason,
+            "recorded_at_ms": 1_700_000_321_500u64
+        });
+        if let Some((adapter, tool_id, model_id, model_arg)) = advisor {
+            obj["advisor"] = serde_json::json!({
+                "tool_id": tool_id,
+                "model_id": model_id,
+                "model_arg": model_arg,
+                "adapter": adapter
+            });
+        }
+        if status == "launched" {
+            obj["request_summary_sha256"] = serde_json::json!(request_summary_sha.unwrap_or(""));
+            obj["request_file"] = serde_json::json!("request.json");
+            obj["advice_file"] = serde_json::json!("advice.json");
+            obj["pid_hint"] = serde_json::json!(4242u32);
+        }
+        let record_path = subject_dir.join(FORECAST_RECORD_FILENAME);
+        write_private_json(&record_path, &obj);
+        subject_dir
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write_advice_json_fixture(
+        subject_dir: &Path,
+        approval: &ApprovalRecord,
+        provider: &str,
+        tool_id: &str,
+        model_id: &str,
+        requested_model: &str,
+        echoed_model: &str,
+        request_summary_sha: &str,
+        source: &str,
+        cache_age_ms: Option<u64>,
+        difficulty: Option<&str>,
+        reason_code: &str,
+    ) {
+        let task = &approval.tasks[0];
+        let is_provider = source == "provider";
+        let obj = serde_json::json!({
+            "untrusted_data": true,
+            "advisory_only": true,
+            "mode": "shadow",
+            "source": source,
+            "context_id": approval.thread_uuid,
+            "task_id": task.task_id,
+            "task_revision": approval.plan_revision,
+            "registry_revision": approval.registry_revision,
+            "profile_id": approval.profile_id,
+            "tool_id": tool_id,
+            "model_id": model_id,
+            "requested_model": requested_model,
+            "summary_sha256": request_summary_sha,
+            "cache_key": "2".repeat(64),
+            "advice": {
+                "provider": provider,
+                "model": echoed_model,
+                "difficulty": difficulty,
+                "confidence": difficulty.map(|_| 0.9),
+                "needs_review": difficulty.is_none(),
+                "reason_code": reason_code,
+                "input_tokens": 120,
+                "output_tokens": 12
+            },
+            "baseline_difficulty": null,
+            "agrees_with_baseline": null,
+            "provider_call_performed": is_provider,
+            "cache_age_ms": cache_age_ms,
+            "elapsed_ms": if is_provider { 350 } else { 4 }
+        });
+        write_private_json(&subject_dir.join(FORECAST_ADVICE_FILENAME), &obj);
+    }
+
+    #[test]
+    fn workspace_snapshot_projects_scoped_jev_and_openai_decision_badges_transitions_and_stays_readonly(
+    ) {
+        let tree = TestTree::new("decision-badges-e2e");
+        let stores = TestStores::new(&tree, "stores");
+        let app_data = tree.dir("app-data");
+        let project = tree.dir("repo-decision-badges");
+        let thread_uuid = "0196ed00-0000-7000-8000-000000000d01";
+        let source_id = stores.canonical_source_id();
+
+        let mut core = Core::open(stores.state.join("state.db")).expect("open state db");
+        let binding = core
+            .create_binding(thread_uuid, "Decision Badge Chat")
+            .expect("create binding");
+
+        let make_worker_item = |core: &mut Core, key: &str, title: &str, ts: i64| {
+            core.create_backlog_item(
+                &binding.binding_id,
+                key,
+                threadlane_core::NewBacklogItem {
+                    title: title.to_string(),
+                    acceptance_condition: "Verified badge scope".to_string(),
+                    delivery_description: "Deliver decision badge projection".to_string(),
+                    kind: threadlane_core::BacklogItemKind::Worker,
+                },
+                ts,
+            )
+            .expect("create worker item")
+        };
+
+        let item_jev = make_worker_item(&mut core, "cmd-jev", "Refactor auth guard", 1_000);
+        let item_openai = make_worker_item(&mut core, "cmd-openai", "Refactor auth guard", 1_100);
+        let item_refused = make_worker_item(&mut core, "cmd-refused", "Audit schema split", 1_200);
+        let item_timeout = make_worker_item(&mut core, "cmd-timeout", "Audit cache key", 1_300);
+        let item_skipped = make_worker_item(&mut core, "cmd-skipped", "Rename helper", 1_400);
+        let item_missing = make_worker_item(&mut core, "cmd-missing", "Missing forecast", 1_500);
+        let item_unavail = make_worker_item(&mut core, "cmd-unavail", "Disabled advisor", 1_600);
+        let item_reserved =
+            make_worker_item(&mut core, "cmd-reserved", "Reserved before dispatch", 1_700);
+
+        let build_fixture = |plan_id: &str, task_id: &str| {
+            write_backlog_terminal_host_fixture(TerminalHostFixtureRequest {
+                stores: &stores,
+                binding_id: &binding.binding_id,
+                thread_uuid,
+                project: &project,
+                plan_id,
+                task_id,
+                outcome: LegacyWorkerOutcome::ReadyForReview,
+                observed_telemetry: true,
+            })
+        };
+        let fx_jev = build_fixture("plan_badge_jev", "task-badge-jev");
+        let fx_openai = build_fixture("plan_badge_openai", "task-badge-openai");
+        let fx_refused = build_fixture("plan_badge_refused", "task-badge-refused");
+        let fx_timeout = build_fixture("plan_badge_timeout", "task-badge-timeout");
+        let fx_skipped = build_fixture("plan_badge_skipped", "task-badge-skipped");
+        let fx_missing = build_fixture("plan_badge_missing", "task-badge-missing");
+        let fx_unavail = build_fixture("plan_badge_unavail", "task-badge-unavail");
+        let fx_reserved = build_fixture("plan_badge_reserved", "task-badge-reserved");
+        write_legacy_approvals_ledger(
+            &stores,
+            &[
+                fx_jev.approval.clone(),
+                fx_openai.approval.clone(),
+                fx_refused.approval.clone(),
+                fx_timeout.approval.clone(),
+                fx_skipped.approval.clone(),
+                fx_missing.approval.clone(),
+                fx_unavail.approval.clone(),
+                fx_reserved.approval.clone(),
+            ],
+        );
+
+        let seed_exec = |core: &mut Core,
+                         item_id: &str,
+                         fx: &BacklogTerminalHostFixture,
+                         prefix: &str,
+                         ts: i64| {
+            seed_backlog_worker_execution(
+                core,
+                BacklogWorkerExecutionSeed {
+                    binding_id: &binding.binding_id,
+                    item_id,
+                    fixture: fx,
+                    command_prefix: prefix,
+                    outcome: threadlane_core::WorkerBacklogOutcome::Success,
+                    result_digest: Some("a".repeat(64)),
+                    now_ms: ts,
+                },
+            )
+        };
+        let exec_jev = seed_exec(&mut core, &item_jev.item_id, &fx_jev, "exec-jev", 2_000);
+        let exec_openai = seed_exec(
+            &mut core,
+            &item_openai.item_id,
+            &fx_openai,
+            "exec-openai",
+            2_100,
+        );
+        let exec_refused = seed_exec(
+            &mut core,
+            &item_refused.item_id,
+            &fx_refused,
+            "exec-refused",
+            2_200,
+        );
+        let exec_timeout = seed_exec(
+            &mut core,
+            &item_timeout.item_id,
+            &fx_timeout,
+            "exec-timeout",
+            2_300,
+        );
+        let _exec_skipped = seed_exec(
+            &mut core,
+            &item_skipped.item_id,
+            &fx_skipped,
+            "exec-skipped",
+            2_400,
+        );
+        let _exec_missing = seed_exec(
+            &mut core,
+            &item_missing.item_id,
+            &fx_missing,
+            "exec-missing",
+            2_500,
+        );
+        let _exec_unavail = seed_exec(
+            &mut core,
+            &item_unavail.item_id,
+            &fx_unavail,
+            "exec-unavail",
+            2_600,
+        );
+
+        // Reserve-only item (no dispatch receipt yet) should still display confirmed launched badge.
+        let exec_reserved = core
+            .reserve_worker_backlog_execution_operator_attested(
+                &binding.binding_id,
+                "exec-reserved-only",
+                &item_reserved.item_id,
+                item_reserved.revision,
+                threadlane_core::WorkerBacklogAuthority {
+                    approval_id: fx_reserved.approval.approval_id.clone(),
+                    subject_digest: fx_reserved.approval.subject_digest.clone(),
+                    task_id: fx_reserved.task.task_id.clone(),
+                    task_digest: fx_reserved.task.task_digest.clone(),
+                },
+                2_700,
+            )
+            .expect("reserve un-dispatched item");
+        drop(core);
+
+        let req_sha_jev = "4".repeat(64);
+        let req_sha_openai = "5".repeat(64);
+        let req_sha_refused = "6".repeat(64);
+        let req_sha_timeout = "7".repeat(64);
+        let req_sha_reserved = "8".repeat(64);
+
+        let dir_jev = write_forecast_record_fixture(
+            &stores.plans,
+            &fx_jev.approval,
+            "launched",
+            "shadow_classify_launched",
+            true,
+            Some(("jev_api", "tool-jev", "model-jev", "jev-2.5")),
+            Some(&req_sha_jev),
+        );
+        fs::write(dir_jev.join(FORECAST_ADVICE_FILENAME), b"").expect("empty jev advice");
+        set_mode(&dir_jev.join(FORECAST_ADVICE_FILENAME), 0o600);
+
+        let dir_openai = write_forecast_record_fixture(
+            &stores.plans,
+            &fx_openai.approval,
+            "launched",
+            "shadow_classify_launched",
+            true,
+            Some((
+                "openai_decisions_api",
+                "tool-openai",
+                "model-openai",
+                "gpt-6-luna",
+            )),
+            Some(&req_sha_openai),
+        );
+        fs::write(dir_openai.join(FORECAST_ADVICE_FILENAME), b"").expect("empty openai advice");
+        set_mode(&dir_openai.join(FORECAST_ADVICE_FILENAME), 0o600);
+
+        let dir_refused = write_forecast_record_fixture(
+            &stores.plans,
+            &fx_refused.approval,
+            "launched",
+            "shadow_classify_launched",
+            true,
+            Some((
+                "openai_decisions_api",
+                "tool-openai",
+                "model-openai",
+                "gpt-6-luna",
+            )),
+            Some(&req_sha_refused),
+        );
+        write_advice_json_fixture(
+            &dir_refused,
+            &fx_refused.approval,
+            "openai",
+            "tool-openai",
+            "model-openai",
+            "gpt-6-luna",
+            "gpt-6-luna",
+            &req_sha_refused,
+            "provider",
+            None,
+            None,
+            "refusal",
+        );
+
+        let dir_timeout = write_forecast_record_fixture(
+            &stores.plans,
+            &fx_timeout.approval,
+            "launched",
+            "shadow_classify_launched",
+            true,
+            Some(("jev_api", "tool-jev", "model-jev", "jev-2.5")),
+            Some(&req_sha_timeout),
+        );
+        fs::write(dir_timeout.join(FORECAST_ADVICE_FILENAME), b"").expect("empty timeout advice");
+        set_mode(&dir_timeout.join(FORECAST_ADVICE_FILENAME), 0o600);
+        let cache_dir = stores.plans.join(ADVICE_CACHE_SUBDIR);
+        make_private_dir(&cache_dir);
+        let project_str = path_text(&project);
+        let timeout_prompt_digest =
+            compute_shadow_advice_prompt_digest(WorkspaceDecisionAdvisorProvider::Jev);
+        let timeout_cache_key = compute_shadow_advice_cache_key(
+            &project_str,
+            thread_uuid,
+            &fx_timeout.task.task_id,
+            fx_timeout.approval.plan_revision,
+            &req_sha_timeout,
+            fx_timeout.approval.registry_revision,
+            WorkspaceDecisionAdvisorProvider::Jev,
+            "tool-jev",
+            "model-jev",
+            "jev-2.5",
+            Some(fx_timeout.approval.profile_id.as_str()),
+        );
+        write_private_json(
+            &cache_dir.join(format!("{timeout_cache_key}.json")),
+            &serde_json::json!({
+                "schema_version": 1,
+                "prompt_digest": timeout_prompt_digest,
+                "cache_key": timeout_cache_key,
+                "project_root_sha256": sha256_hex(project_str.as_bytes()),
+                "context_id": thread_uuid,
+                "task_id": fx_timeout.task.task_id,
+                "task_revision": fx_timeout.approval.plan_revision,
+                "summary_sha256": req_sha_timeout,
+                "registry_revision": fx_timeout.approval.registry_revision,
+                "profile_id": fx_timeout.approval.profile_id,
+                "tool_id": "tool-jev",
+                "model_id": "model-jev",
+                "requested_model": "jev-2.5",
+                "state": {
+                    "status": "uncertain",
+                    "attempt_id": "att-1-1-1",
+                    "failed_at_ms": 1_700_000_321_900u64,
+                    "error_code": "timeout"
+                }
+            }),
+        );
+
+        let _dir_skipped = write_forecast_record_fixture(
+            &stores.plans,
+            &fx_skipped.approval,
+            "skipped",
+            "simple_task",
+            false,
+            None,
+            None,
+        );
+        let _dir_unavail = write_forecast_record_fixture(
+            &stores.plans,
+            &fx_unavail.approval,
+            "unavailable",
+            "advisor_not_configured",
+            true,
+            None,
+            None,
+        );
+        let dir_reserved = write_forecast_record_fixture(
+            &stores.plans,
+            &fx_reserved.approval,
+            "launched",
+            "shadow_classify_launched",
+            true,
+            Some(("jev_api", "tool-jev", "model-jev", "jev-2.5")),
+            Some(&req_sha_reserved),
+        );
+        fs::write(dir_reserved.join(FORECAST_ADVICE_FILENAME), b"").expect("empty reserved advice");
+        set_mode(&dir_reserved.join(FORECAST_ADVICE_FILENAME), 0o600);
+
+        let identity = write_verified_chat_sample(
+            &stores,
+            &source_id,
+            &binding.binding_id,
+            thread_uuid,
+            &project,
+            "epoch_decision_badges",
+        );
+
+        // Phase 1: Jev + OpenAI both Pending (plus refused, cache-timeout failed, reserved pending; skipped/missing/unavailable absent).
+        let before_read = snapshot_tree_fingerprints(tree.path());
+        let service = ObservationService::new(stores.config(&app_data));
+        let snap1 = service.workspace_snapshot(None).expect("snap1");
+        let snap1_repeat = service.workspace_snapshot(None).expect("snap1 repeat");
+        assert_eq!(
+            snapshot_tree_fingerprints(tree.path()),
+            before_read,
+            "decision badge reads must stay strictly read-only"
+        );
+
+        let work1 = snap1
+            .chat_work
+            .iter()
+            .find(|work| work.identity == identity)
+            .expect("chat work 1");
+        let work1_repeat = snap1_repeat
+            .chat_work
+            .iter()
+            .find(|work| work.identity == identity)
+            .expect("chat work 1 repeat");
+        assert_eq!(
+            work1.decision_badges, work1_repeat.decision_badges,
+            "repeated refresh must not duplicate or drift badges"
+        );
+        assert_eq!(work1.decision_badges.len(), 5);
+
+        fn badge_for<'a>(
+            work: &'a WorkspaceChatWork,
+            item_id: &str,
+        ) -> Option<&'a threadlane_core::observation::WorkspaceDecisionBadge> {
+            work.decision_badges
+                .iter()
+                .find(|badge| badge.item_id == item_id)
+        }
+        let b_jev = badge_for(work1, &item_jev.item_id).expect("jev pending badge");
+        assert_eq!(b_jev.execution_ref, exec_jev.execution_ref);
+        assert_eq!(b_jev.provider, WorkspaceDecisionAdvisorProvider::Jev);
+        assert_eq!(b_jev.status, WorkspaceDecisionBadgeStatus::Pending);
+        assert_eq!(
+            b_jev.coworker_difficulty,
+            Some(WorkspaceDecisionDifficulty::Medium)
+        );
+
+        let b_openai = badge_for(work1, &item_openai.item_id).expect("openai pending badge");
+        assert_eq!(b_openai.execution_ref, exec_openai.execution_ref);
+        assert_eq!(b_openai.provider, WorkspaceDecisionAdvisorProvider::Openai);
+        assert_eq!(b_openai.status, WorkspaceDecisionBadgeStatus::Pending);
+
+        let b_refused = badge_for(work1, &item_refused.item_id).expect("refused badge");
+        assert_eq!(b_refused.execution_ref, exec_refused.execution_ref);
+        assert_eq!(b_refused.status, WorkspaceDecisionBadgeStatus::Failed);
+        assert_eq!(
+            b_refused.advice_source,
+            Some(WorkspaceDecisionAdviceSource::Fresh)
+        );
+        assert_eq!(b_refused.failure_reason_code.as_deref(), Some("refusal"));
+
+        let b_timeout = badge_for(work1, &item_timeout.item_id).expect("timeout failed badge");
+        assert_eq!(b_timeout.execution_ref, exec_timeout.execution_ref);
+        assert_eq!(b_timeout.status, WorkspaceDecisionBadgeStatus::Failed);
+        assert_eq!(b_timeout.advice_source, None);
+        assert_eq!(b_timeout.failure_reason_code.as_deref(), Some("timeout"));
+
+        let b_reserved = badge_for(work1, &item_reserved.item_id).expect("reserved pending badge");
+        assert_eq!(b_reserved.execution_ref, exec_reserved.execution_ref);
+        assert_eq!(b_reserved.status, WorkspaceDecisionBadgeStatus::Pending);
+
+        assert!(badge_for(work1, &item_skipped.item_id).is_none());
+        assert!(badge_for(work1, &item_missing.item_id).is_none());
+        assert!(badge_for(work1, &item_unavail.item_id).is_none());
+
+        // Phase 2: Jev resolves to Fresh Hard while OpenAI with identical title stays Pending.
+        write_advice_json_fixture(
+            &dir_jev,
+            &fx_jev.approval,
+            "jev",
+            "tool-jev",
+            "model-jev",
+            "jev-2.5",
+            "jev-2.5-pro",
+            &req_sha_jev,
+            "provider",
+            None,
+            Some("hard"),
+            "classified",
+        );
+        let snap2 = service.workspace_snapshot(None).expect("snap2");
+        let work2 = snap2
+            .chat_work
+            .iter()
+            .find(|work| work.identity == identity)
+            .expect("chat work 2");
+        let b_jev2 = badge_for(work2, &item_jev.item_id).expect("jev result badge");
+        assert_eq!(b_jev2.status, WorkspaceDecisionBadgeStatus::Result);
+        assert_eq!(
+            b_jev2.recommended_difficulty,
+            Some(WorkspaceDecisionDifficulty::Hard)
+        );
+        assert_eq!(
+            b_jev2.advice_source,
+            Some(WorkspaceDecisionAdviceSource::Fresh)
+        );
+        assert_eq!(b_jev2.agrees_with_coworker, Some(false));
+        let b_openai2 = badge_for(work2, &item_openai.item_id).expect("openai still pending");
+        assert_eq!(b_openai2.status, WorkspaceDecisionBadgeStatus::Pending);
+
+        // Phase 3: OpenAI resolves to Cached Easy.
+        write_advice_json_fixture(
+            &dir_openai,
+            &fx_openai.approval,
+            "openai",
+            "tool-openai",
+            "model-openai",
+            "gpt-6-luna",
+            "gpt-6-luna-2026-08-01",
+            &req_sha_openai,
+            "cache",
+            Some(15_000),
+            Some("easy"),
+            "classified",
+        );
+        let snap3 = service.workspace_snapshot(None).expect("snap3");
+        let work3 = snap3
+            .chat_work
+            .iter()
+            .find(|work| work.identity == identity)
+            .expect("chat work 3");
+        let b_openai3 = badge_for(work3, &item_openai.item_id).expect("openai cached result");
+        assert_eq!(b_openai3.status, WorkspaceDecisionBadgeStatus::Result);
+        assert_eq!(
+            b_openai3.recommended_difficulty,
+            Some(WorkspaceDecisionDifficulty::Easy)
+        );
+        assert_eq!(
+            b_openai3.advice_source,
+            Some(WorkspaceDecisionAdviceSource::Cached)
+        );
+        assert_eq!(b_openai3.cache_age_ms, Some(15_000));
+
+        // Compact safe payload: never leaks raw task instructions or filesystem paths.
+        let serialized = serde_json::to_string(&work3.decision_badges).expect("serialize badges");
+        assert!(!serialized.contains(&project_str));
+        assert!(!serialized.contains("Do not leak"));
+    }
+
+    #[test]
+    fn workspace_snapshot_decision_badges_reject_stale_superseded_and_cross_scope_artifacts() {
+        let tree = TestTree::new("decision-badges-isolation");
+        let stores = TestStores::new(&tree, "stores");
+        let app_data = tree.dir("app-data");
+        let project_a = tree.dir("repo-iso-a");
+        let project_b = tree.dir("repo-iso-b");
+        let thread_a = "0196ed00-0000-7000-8000-000000000d11";
+        let thread_b = "0196ed00-0000-7000-8000-000000000d12";
+        let source_id = stores.canonical_source_id();
+
+        let mut core = Core::open(stores.state.join("state.db")).expect("open state db");
+        let binding_a = core
+            .create_binding(thread_a, "Chat A")
+            .expect("create binding A");
+        let binding_b = core
+            .create_binding(thread_b, "Chat B")
+            .expect("create binding B");
+
+        let superseded_item = core
+            .create_backlog_item(
+                &binding_a.binding_id,
+                "cmd-superseded",
+                threadlane_core::NewBacklogItem {
+                    title: "Superseded execution item".to_string(),
+                    acceptance_condition: "Current execution only".to_string(),
+                    delivery_description: "Never leak prior execution badge".to_string(),
+                    kind: threadlane_core::BacklogItemKind::Worker,
+                },
+                1_000,
+            )
+            .expect("create superseded item");
+        let cross_item = core
+            .create_backlog_item(
+                &binding_b.binding_id,
+                "cmd-cross-chat",
+                threadlane_core::NewBacklogItem {
+                    title: "Superseded execution item".to_string(),
+                    acceptance_condition: "Isolated chat scope".to_string(),
+                    delivery_description: "Never leak cross-chat badge".to_string(),
+                    kind: threadlane_core::BacklogItemKind::Worker,
+                },
+                1_100,
+            )
+            .expect("create cross-chat item");
+
+        let fx_old = write_backlog_terminal_host_fixture(TerminalHostFixtureRequest {
+            stores: &stores,
+            binding_id: &binding_a.binding_id,
+            thread_uuid: thread_a,
+            project: &project_a,
+            plan_id: "plan_old_exec",
+            task_id: "task-old-exec",
+            outcome: LegacyWorkerOutcome::Failed,
+            observed_telemetry: true,
+        });
+        let fx_new = write_backlog_terminal_host_fixture(TerminalHostFixtureRequest {
+            stores: &stores,
+            binding_id: &binding_a.binding_id,
+            thread_uuid: thread_a,
+            project: &project_a,
+            plan_id: "plan_new_exec",
+            task_id: "task-new-exec",
+            outcome: LegacyWorkerOutcome::ReadyForReview,
+            observed_telemetry: true,
+        });
+        let fx_cross = write_backlog_terminal_host_fixture(TerminalHostFixtureRequest {
+            stores: &stores,
+            binding_id: &binding_b.binding_id,
+            thread_uuid: thread_b,
+            project: &project_b,
+            plan_id: "plan_cross_chat",
+            task_id: "task-cross-chat",
+            outcome: LegacyWorkerOutcome::ReadyForReview,
+            observed_telemetry: true,
+        });
+        write_legacy_approvals_ledger(
+            &stores,
+            &[
+                fx_old.approval.clone(),
+                fx_new.approval.clone(),
+                fx_cross.approval.clone(),
+            ],
+        );
+
+        // Attempt 1 failed (had launched Jev result), Attempt 2 is current and skipped.
+        let _old_exec = seed_backlog_worker_execution(
+            &mut core,
+            BacklogWorkerExecutionSeed {
+                binding_id: &binding_a.binding_id,
+                item_id: &superseded_item.item_id,
+                fixture: &fx_old,
+                command_prefix: "old-exec",
+                outcome: threadlane_core::WorkerBacklogOutcome::Failure,
+                result_digest: Some("1".repeat(64)),
+                now_ms: 2_000,
+            },
+        );
+        let _new_exec = seed_backlog_worker_execution(
+            &mut core,
+            BacklogWorkerExecutionSeed {
+                binding_id: &binding_a.binding_id,
+                item_id: &superseded_item.item_id,
+                fixture: &fx_new,
+                command_prefix: "new-exec",
+                outcome: threadlane_core::WorkerBacklogOutcome::Success,
+                result_digest: Some("2".repeat(64)),
+                now_ms: 2_100,
+            },
+        );
+        let _cross_exec = seed_backlog_worker_execution(
+            &mut core,
+            BacklogWorkerExecutionSeed {
+                binding_id: &binding_b.binding_id,
+                item_id: &cross_item.item_id,
+                fixture: &fx_cross,
+                command_prefix: "cross-exec",
+                outcome: threadlane_core::WorkerBacklogOutcome::Success,
+                result_digest: Some("3".repeat(64)),
+                now_ms: 2_200,
+            },
+        );
+        drop(core);
+
+        let req_sha = "9".repeat(64);
+        let dir_old = write_forecast_record_fixture(
+            &stores.plans,
+            &fx_old.approval,
+            "launched",
+            "shadow_classify_launched",
+            true,
+            Some(("jev_api", "tool-jev", "model-jev", "jev-2.5")),
+            Some(&req_sha),
+        );
+        write_advice_json_fixture(
+            &dir_old,
+            &fx_old.approval,
+            "jev",
+            "tool-jev",
+            "model-jev",
+            "jev-2.5",
+            "jev-2.5",
+            &req_sha,
+            "provider",
+            None,
+            Some("hard"),
+            "classified",
+        );
+        let _dir_new = write_forecast_record_fixture(
+            &stores.plans,
+            &fx_new.approval,
+            "skipped",
+            "simple_task",
+            false,
+            None,
+            None,
+        );
+        // Tamper cross-chat forecast with world-readable mode -> must fail closed.
+        let dir_cross = write_forecast_record_fixture(
+            &stores.plans,
+            &fx_cross.approval,
+            "launched",
+            "shadow_classify_launched",
+            true,
+            Some((
+                "openai_decisions_api",
+                "tool-openai",
+                "model-openai",
+                "gpt-6-luna",
+            )),
+            Some(&req_sha),
+        );
+        set_mode(&dir_cross.join(FORECAST_RECORD_FILENAME), 0o644);
+
+        let id_a = write_verified_chat_sample(
+            &stores,
+            &source_id,
+            &binding_a.binding_id,
+            thread_a,
+            &project_a,
+            "epoch_iso_a",
+        );
+        let id_b = write_verified_chat_sample(
+            &stores,
+            &source_id,
+            &binding_b.binding_id,
+            thread_b,
+            &project_b,
+            "epoch_iso_b",
+        );
+
+        let service = ObservationService::new(stores.config(&app_data));
+        let snap = service.workspace_snapshot(None).expect("isolation snap");
+        let work_a = snap
+            .chat_work
+            .iter()
+            .find(|work| work.identity == id_a)
+            .expect("work A");
+        let work_b = snap
+            .chat_work
+            .iter()
+            .find(|work| work.identity == id_b)
+            .expect("work B");
+        assert!(
+            work_a.decision_badges.is_empty(),
+            "superseded attempt 1 forecast must not leak onto skipped attempt 2"
+        );
+        assert!(
+            work_b.decision_badges.is_empty(),
+            "world-readable forecast artifact must fail closed with no badge"
+        );
     }
 }
