@@ -424,3 +424,139 @@ test.describe('Advisor profile workflow', () => {
     await exerciseProfile(page, controller, true, advisorProfile, 'advisor');
   });
 });
+
+test.describe('Profile readiness and multi-role separation', () => {
+  test('separates single-Worker readiness from optional multi-role completeness and preserves draft and decision selection', async ({
+    page,
+  }) => {
+    const base = buildDefaultRegistryFixture();
+    const singleWorkerProfile: WorkflowProfile = {
+      id: 'profile-single-worker',
+      name: 'Single Worker Profile',
+      assignments: [
+        {
+          role: 'coder',
+          difficulty: null,
+          choice: { model_id: 'model-gpt-5-4', effort: 'high' },
+        },
+      ],
+      decision_advisor: { model_id: 'model-jev-1-14', mode: 'shadow' },
+    };
+    const noWorkerProfile: WorkflowProfile = {
+      id: 'profile-no-worker',
+      name: 'Orchestrator Only Profile',
+      assignments: [
+        {
+          role: 'orchestrator',
+          difficulty: null,
+          choice: { model_id: 'model-gpt-5-4', effort: 'xhigh' },
+        },
+      ],
+    };
+    const completeProfile: WorkflowProfile = {
+      id: 'profile-complete',
+      name: 'Complete Multi-Role Profile',
+      assignments: [
+        ...otherRoleDefaults(),
+        {
+          role: 'advisor',
+          difficulty: null,
+          choice: { model_id: 'model-argon-high', effort: 'high' },
+        },
+      ],
+    };
+
+    const registry: RegistrySnapshot = {
+      ...base,
+      tools: [
+        ...base.tools,
+        {
+          id: 'tool-jev',
+          label: 'Jev Decisions API',
+          adapter: 'jev_api',
+          executable_path: null,
+          enabled: true,
+        },
+      ],
+      models: [
+        ...base.models,
+        {
+          id: 'model-jev-1-14',
+          tool_id: 'tool-jev',
+          label: 'Jev 1.14.0',
+          model_arg: 'jev-1.14.0',
+          efforts: [],
+          allow_no_effort: true,
+        },
+      ],
+      profiles: [singleWorkerProfile, noWorkerProfile, completeProfile],
+      default_profile_id: singleWorkerProfile.id,
+    };
+
+    await installWorkspaceTauriFixture(page, {
+      workspaceSnapshot: buildMinimalChatWorkspaceSnapshot(),
+      registrySnapshot: registry,
+    });
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.goto('/');
+    await expect(page.locator('#app .tl-app-shell, #app .tl-app').first()).toBeVisible();
+    await selectChat(page, 'Workspace UI Contract');
+    await sidebar(page).getByRole('button', { name: 'Profiles', exact: true }).click();
+
+    const profiles = profileSection(page);
+    await expect(profiles).toBeVisible();
+
+    const singleRow = profileRow(page, singleWorkerProfile.name);
+    await expect(singleRow).toContainText('Single-Worker ready');
+    await expect(singleRow).toContainText('Multi-role optional (1/5)');
+    await expect(singleRow).not.toContainText('Needs repair');
+    await expect(singleRow).not.toContainText('Missing defaults');
+
+    const noWorkerRow = profileRow(page, noWorkerProfile.name);
+    await expect(noWorkerRow).toContainText('Worker not configured');
+    await expect(noWorkerRow).toContainText('Multi-role optional (1/5)');
+
+    const completeRow = profileRow(page, completeProfile.name);
+    await expect(completeRow).toContainText('Single-Worker ready');
+    await expect(completeRow).toContainText('Multi-role complete (5/5)');
+
+    // Keyboard select the single-Worker profile and verify separate readiness cards & advisor distinction
+    await singleRow.focus();
+    await page.keyboard.press('Enter');
+    const readiness = profiles.getByRole('region', { name: 'Profile readiness' });
+    await expect(readiness).toContainText('Ordinary single-Worker use');
+    await expect(readiness).toContainText('Single-Worker ready');
+    await expect(readiness).toContainText('does not verify live');
+    await expect(readiness).toContainText('Optional multi-role workflows');
+    await expect(readiness).toContainText('Multi-role optional (1/5)');
+
+    const decisionSection = profiles.getByRole('region', { name: 'Decision advisor' });
+    await expect(decisionSection).toContainText('Task-difficulty advice');
+    await expect(decisionSection).toContainText('Separate from the technical Advisor execution role');
+    await expect(
+      profiles.getByRole('combobox', { name: 'Decision advisor API model' })
+    ).toHaveText('Jev 1.14.0');
+
+    // Unsaved draft and decision selection stay unaltered when cancelling a switch
+    const nameInput = profiles.getByLabel('Profile name');
+    await nameInput.fill('Single Worker Unsaved Draft');
+    await noWorkerRow.click();
+    await expect(
+      profiles.getByRole('alertdialog', { name: 'Unsaved profile changes' })
+    ).toBeVisible();
+    await profiles.getByRole('button', { name: 'Stay here' }).click();
+    await expect(nameInput).toHaveValue('Single Worker Unsaved Draft');
+    await expect(
+      profiles.getByRole('combobox', { name: 'Decision advisor API model' })
+    ).toHaveText('Jev 1.14.0');
+    await expect(
+      profiles.getByRole('combobox', { name: 'Default model' })
+    ).toHaveText('GPT-5.4');
+
+    // Discard and inspect the no-Worker profile
+    await noWorkerRow.click();
+    await profiles.getByRole('button', { name: 'Discard changes' }).click();
+    await expect(readiness).toContainText('Worker not configured');
+    await expect(readiness).toContainText('Multi-role optional (1/5)');
+  });
+});

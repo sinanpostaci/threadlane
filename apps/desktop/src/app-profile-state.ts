@@ -62,7 +62,8 @@ export const ROLE_METADATA: readonly RoleMetadata[] = [
   {
     id: 'advisor',
     label: workflowRoleLabel('advisor'),
-    summary: 'Optional read-only structural consultation before plan lock.',
+    summary:
+      'Optional technical Advisor for multi-role plans (distinct from Jev/OpenAI task-difficulty advice).',
   },
   {
     id: 'coder',
@@ -109,6 +110,47 @@ export interface AssignmentIssue {
   message: string;
 }
 
+export type WorkerReadinessStatus =
+  | 'ready'
+  | 'partial_tiers'
+  | 'missing'
+  | 'disabled'
+  | 'invalid';
+
+export interface WorkerReadiness {
+  status: WorkerReadinessStatus;
+  usableForSingleWorker: boolean;
+  coversAllDifficulties: boolean;
+  defaultConfigured: boolean;
+  defaultValid: boolean;
+  validOverrideDifficulties: Difficulty[];
+  uncoveredDifficulties: Difficulty[];
+  issues: AssignmentIssue[];
+  summaryLabel: string;
+  detail: string;
+}
+
+export type MultiRoleCompletenessStatus =
+  | 'complete'
+  | 'partial'
+  | 'needs_repair';
+
+export interface MultiRoleCompleteness {
+  status: MultiRoleCompletenessStatus;
+  configuredDefaults: number;
+  totalRoles: number;
+  missingDefaultRoles: CanonicalExecutionWorkflowRole[];
+  otherRoleMissingDefaults: CanonicalExecutionWorkflowRole[];
+  issues: AssignmentIssue[];
+  summaryLabel: string;
+  detail: string;
+}
+
+export interface ProfileReadiness {
+  worker: WorkerReadiness;
+  multiRole: MultiRoleCompleteness;
+}
+
 export interface DraftAnalysis {
   errors: string[];
   issues: AssignmentIssue[];
@@ -118,6 +160,7 @@ export interface DraftAnalysis {
   assignmentCount: number;
   defaultCount: number;
   overrideCount: number;
+  readiness: ProfileReadiness;
 }
 
 export interface ProfileSummary {
@@ -127,6 +170,7 @@ export interface ProfileSummary {
   missingDefaults: CanonicalExecutionWorkflowRole[];
   issues: AssignmentIssue[];
   advisor: DecisionAdvisorValidation;
+  readiness: ProfileReadiness;
 }
 
 export interface ProfileDraft {
@@ -923,12 +967,192 @@ export function validateTableWithIndex(
   return issues;
 }
 
+function isChoiceDisabledTool(index: RegistryIndex, cell: Choice): boolean {
+  if (cell.pending_family) {
+    const family = index.familiesByKey.get(cell.pending_family);
+    const tool = family ? index.tools.get(family.tool_id) : undefined;
+    return Boolean(tool && !tool.enabled);
+  }
+  if (!cell.model_id) {
+    return false;
+  }
+  const model = index.models.get(cell.model_id);
+  const tool = model ? index.tools.get(model.tool_id) : undefined;
+  return Boolean(tool && !tool.enabled);
+}
+
+/**
+ * Evaluates ordinary single-Worker readiness separately from optional
+ * multi-role workflow completeness using the current registry index and table.
+ */
+export function evaluateProfileReadiness(
+  index: RegistryIndex,
+  table: AssignmentTable,
+  allIssues?: AssignmentIssue[]
+): ProfileReadiness {
+  const issues = allIssues ?? validateTableWithIndex(index, table);
+  const coderIssues = issues.filter((issue) => issue.role === 'coder');
+  const coderSlots = table.coder;
+  const defaultConfigured = hasDifficultyOverride(coderSlots.default);
+  const defaultValid = Boolean(
+    coderSlots.default.model_id &&
+      !coderSlots.default.pending_family &&
+      !coderIssues.some((issue) => issue.slot === 'default')
+  );
+  const validOverrideDifficulties = DIFFICULTIES.filter((diff) =>
+    Boolean(
+      coderSlots[diff].model_id &&
+        !coderSlots[diff].pending_family &&
+        !coderIssues.some((issue) => issue.slot === diff)
+    )
+  );
+  const uncoveredDifficulties = DIFFICULTIES.filter((diff) => {
+    if (validOverrideDifficulties.includes(diff)) {
+      return false;
+    }
+    return hasDifficultyOverride(coderSlots[diff]) || !defaultValid;
+  });
+
+  let worker: WorkerReadiness;
+  if (coderIssues.length > 0) {
+    const allDisabled = coderIssues.every((issue) =>
+      isChoiceDisabledTool(index, coderSlots[issue.slot])
+    );
+    const firstIssue = coderIssues[0]!;
+    worker = {
+      status: allDisabled ? 'disabled' : 'invalid',
+      usableForSingleWorker: false,
+      coversAllDifficulties: false,
+      defaultConfigured,
+      defaultValid,
+      validOverrideDifficulties,
+      uncoveredDifficulties,
+      issues: coderIssues,
+      summaryLabel: allDisabled ? 'Worker tool disabled' : 'Worker needs repair',
+      detail: `${workflowRoleLabel(firstIssue.role)} ${slotLabel(firstIssue.slot)}: ${firstIssue.message} Configuration alone does not verify live execution.`,
+    };
+  } else if (!defaultValid && validOverrideDifficulties.length === 0) {
+    worker = {
+      status: 'missing',
+      usableForSingleWorker: false,
+      coversAllDifficulties: false,
+      defaultConfigured,
+      defaultValid,
+      validOverrideDifficulties,
+      uncoveredDifficulties,
+      issues: [],
+      summaryLabel: 'Worker not configured',
+      detail:
+        'No Worker default or difficulty override is assigned. Assign an eligible Worker model for ordinary single-Worker tasks.',
+    };
+  } else if (!defaultValid && uncoveredDifficulties.length > 0) {
+    const validLabels = validOverrideDifficulties
+      .map((diff) => DIFFICULTY_LABELS[diff])
+      .join(', ');
+    const uncoveredLabels = uncoveredDifficulties
+      .map((diff) => DIFFICULTY_LABELS[diff])
+      .join(', ');
+    worker = {
+      status: 'partial_tiers',
+      usableForSingleWorker: true,
+      coversAllDifficulties: false,
+      defaultConfigured,
+      defaultValid,
+      validOverrideDifficulties,
+      uncoveredDifficulties,
+      issues: [],
+      summaryLabel: `Worker ready (${validLabels} only)`,
+      detail: `Valid Worker overrides cover ${validLabels}; no Worker default is set for ${uncoveredLabels}. Configuration only; does not verify live CLI login or execution.`,
+    };
+  } else {
+    const validLabels = validOverrideDifficulties
+      .map((diff) => DIFFICULTY_LABELS[diff])
+      .join(', ');
+    const detail = defaultValid
+      ? validOverrideDifficulties.length > 0
+        ? `Worker default and ${validOverrideDifficulties.length} difficulty ${
+            validOverrideDifficulties.length === 1 ? 'override' : 'overrides'
+          } (${validLabels}) are configured. Configuration only; does not verify live CLI login or execution.`
+        : 'Worker default is configured across all difficulty tiers. Configuration only; does not verify live CLI login or execution.'
+      : 'Valid Worker overrides cover all four difficulty tiers. Configuration only; does not verify live CLI login or execution.';
+    worker = {
+      status: 'ready',
+      usableForSingleWorker: true,
+      coversAllDifficulties: true,
+      defaultConfigured,
+      defaultValid,
+      validOverrideDifficulties,
+      uncoveredDifficulties,
+      issues: [],
+      summaryLabel: 'Single-Worker ready',
+      detail,
+    };
+  }
+
+  const nonCoderIssues = issues.filter((issue) => issue.role !== 'coder');
+  const missingDefaultRoles = PROFILE_EXECUTION_ROLES.filter(
+    (role) => !table[role].default.model_id
+  );
+  const otherRoleMissingDefaults = missingDefaultRoles.filter(
+    (role) => role !== 'coder'
+  );
+  const totalRoles = PROFILE_EXECUTION_ROLES.length;
+  const configuredDefaults = totalRoles - missingDefaultRoles.length;
+
+  let multiRole: MultiRoleCompleteness;
+  if (nonCoderIssues.length > 0) {
+    const firstIssue = nonCoderIssues[0]!;
+    multiRole = {
+      status: 'needs_repair',
+      configuredDefaults,
+      totalRoles,
+      missingDefaultRoles,
+      otherRoleMissingDefaults,
+      issues: nonCoderIssues,
+      summaryLabel: `Multi-role needs repair (${configuredDefaults}/${totalRoles})`,
+      detail: `Full-workflow assignment issue — ${workflowRoleLabel(firstIssue.role)} ${slotLabel(firstIssue.slot)}: ${firstIssue.message} Ordinary single-Worker tasks use only Worker.`,
+    };
+  } else if (missingDefaultRoles.length === 0) {
+    multiRole = {
+      status: 'complete',
+      configuredDefaults,
+      totalRoles,
+      missingDefaultRoles,
+      otherRoleMissingDefaults,
+      issues: [],
+      summaryLabel: `Multi-role complete (${configuredDefaults}/${totalRoles})`,
+      detail:
+        'All five execution role defaults are configured for full multi-role workflows. Configuration does not verify live execution.',
+    };
+  } else {
+    const missingNames = otherRoleMissingDefaults
+      .map((role) => workflowRoleLabel(role))
+      .join(', ');
+    multiRole = {
+      status: 'partial',
+      configuredDefaults,
+      totalRoles,
+      missingDefaultRoles,
+      otherRoleMissingDefaults,
+      issues: [],
+      summaryLabel: `Multi-role optional (${configuredDefaults}/${totalRoles})`,
+      detail:
+        otherRoleMissingDefaults.length > 0
+          ? `Other roles are optional for ordinary single-Worker tasks. Full multi-role workflows are missing defaults for ${missingNames}.`
+          : 'The other four multi-role defaults are configured; Worker default is unset (difficulty overrides only).',
+    };
+  }
+
+  return { worker, multiRole };
+}
+
 export function analyzeDraft(
   snapshot: RegistrySnapshot,
   draft: ProfileDraft
 ): DraftAnalysis {
   const index = buildRegistryIndex(snapshot);
   const issues = validateTableWithIndex(index, draft.assignments);
+  const readiness = evaluateProfileReadiness(index, draft.assignments, issues);
   const advisor = validateDecisionAdvisor(
     { tools: index.toolList, models: index.modelList },
     draft.decisionAdvisor
@@ -989,6 +1213,7 @@ export function analyzeDraft(
     assignmentCount,
     defaultCount: PROFILE_EXECUTION_ROLES.length - missingDefaults.length,
     overrideCount,
+    readiness,
   };
 }
 
@@ -998,6 +1223,8 @@ export function summarizeProfile(
 ): ProfileSummary {
   const index = buildRegistryIndex(snapshot);
   const table = tableFromProfile(profile);
+  const issues = validateTableWithIndex(index, table);
+  const readiness = evaluateProfileReadiness(index, table, issues);
   const missingDefaults = PROFILE_EXECUTION_ROLES.filter(
     (role) => !table[role].default.model_id
   );
@@ -1020,11 +1247,12 @@ export function summarizeProfile(
     defaultCount: PROFILE_EXECUTION_ROLES.length - missingDefaults.length,
     overrideCount,
     missingDefaults,
-    issues: validateTableWithIndex(index, table),
+    issues,
     advisor: validateDecisionAdvisor(
       { tools: snapshot.tools, models: snapshot.models },
       profile.decision_advisor
     ),
+    readiness,
   };
 }
 

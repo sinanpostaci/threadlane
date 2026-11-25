@@ -30,11 +30,12 @@ function probe(models: ModelDefinition[]): ToolProbe {
   };
 }
 
-test('Refresh tools replaces an open stale or failed catalog without changing saved profiles', async ({
+test('Refresh model catalog on expanded tool card recovers from error, loads 6.2 options, and keeps pending selections and saved models', async ({
   page,
 }) => {
   const registry = buildDefaultRegistryFixture();
   const olderModel = model('gpt-6.1-sol', 'GPT-6.1-Sol');
+  const vanishedModel = model('gpt-6.1-temp', 'GPT-6.1-Temp');
   const sol = model('gpt-6.2-sol', 'GPT-6.2-Sol');
   const astra = model('gpt-6.2-astra', 'GPT-6.2-Astra');
   const controller = await installWorkspaceTauriFixture(page, {
@@ -42,7 +43,7 @@ test('Refresh tools replaces an open stale or failed catalog without changing sa
     toolProbeReplies: {
       [codexTool]: [
         { error: { code: 'probe_failed', message: 'Codex model catalog command failed.' } },
-        probe([olderModel]),
+        probe([olderModel, vanishedModel]),
         probe([olderModel, sol, astra]),
       ],
     },
@@ -52,6 +53,16 @@ test('Refresh tools replaces an open stale or failed catalog without changing sa
   await sidebar(page).getByRole('button', { name: 'Tools', exact: true }).click();
 
   const tools = page.getByRole('region', { name: 'Tools', exact: true });
+  await expect(
+    page.getByRole('button', { name: 'Refresh saved registry', exact: true })
+  ).toBeVisible();
+  await expect(
+    tools.getByRole('button', { name: 'Refresh tool discovery', exact: true })
+  ).toBeVisible();
+  await expect(
+    tools.getByRole('button', { name: /^(?:Recheck|Check) installed tool versions$/ })
+  ).toBeVisible();
+
   const openCodex = tools.getByRole('button', { name: 'Choose models', exact: true }).first();
   await expect(openCodex).toBeVisible();
   const catalogCalls = async () =>
@@ -61,17 +72,41 @@ test('Refresh tools replaces an open stale or failed catalog without changing sa
   expect(await catalogCalls()).toEqual([]);
 
   await openCodex.click();
-  await expect(tools.getByRole('button', { name: 'Retry catalog' })).toBeVisible();
-  const refresh = tools.locator('[data-focus="discovery-refresh"]');
-  await refresh.click();
-  const checked = tools.getByRole('checkbox', { name: 'Select GPT-6.1-Sol for import' });
-  await expect(checked).toBeVisible();
-  await checked.check();
-  await refresh.click();
+  const picker = tools.getByRole('region', { name: 'Choose models for Codex CLI' });
+  await expect(picker).toBeVisible();
+  await expect(picker.getByText('Codex model catalog command failed.')).toBeVisible();
 
-  await expect(tools.getByRole('checkbox', { name: 'Select GPT-6.2-Sol for import' })).toBeVisible();
-  await expect(tools.getByRole('checkbox', { name: 'Select GPT-6.2-Astra for import' })).toBeVisible();
-  await expect(checked).toBeChecked();
+  // Single explicit Refresh model catalog action on the expanded card (no duplicate header refresh)
+  const refreshCatalog = picker.getByRole('button', { name: 'Refresh model catalog', exact: true });
+  await expect(refreshCatalog).toHaveCount(1);
+  await expect(tools.getByRole('button', { name: 'Refresh models', exact: true })).toHaveCount(0);
+
+  // Trigger Refresh model catalog via keyboard after error
+  await refreshCatalog.focus();
+  await page.keyboard.press('Enter');
+
+  const keptSelection = picker.getByRole('checkbox', { name: 'Select GPT-6.1-Sol for import' });
+  const droppedSelection = picker.getByRole('checkbox', { name: 'Select GPT-6.1-Temp for import' });
+  await expect(keptSelection).toBeVisible();
+  await expect(droppedSelection).toBeVisible();
+  await keptSelection.check();
+  await droppedSelection.check();
+  await expect(keptSelection).toBeChecked();
+  await expect(droppedSelection).toBeChecked();
+
+  // Single Refresh model catalog action remains available after success and works via keyboard
+  await expect(refreshCatalog).toHaveCount(1);
+  await refreshCatalog.focus();
+  await page.keyboard.press('Enter');
+
+  await expect(picker.getByRole('checkbox', { name: 'Select GPT-6.2-Sol for import' })).toBeVisible();
+  await expect(picker.getByRole('checkbox', { name: 'Select GPT-6.2-Astra for import' })).toBeVisible();
+  await expect(keptSelection).toBeChecked();
+  await expect(refreshCatalog).toBeFocused();
+  await expect(droppedSelection).toHaveCount(0);
+
+  // Saved models and profile overrides remain intact
+  await expect(page.getByRole('region', { name: 'Saved models', exact: true }).getByRole('heading', { name: 'GPT-5.4', exact: true })).toBeVisible();
   expect(await catalogCalls()).toEqual([codexTool, codexTool, codexTool]);
   expect(await controller.getRegistrySnapshot()).toEqual(registry);
 });

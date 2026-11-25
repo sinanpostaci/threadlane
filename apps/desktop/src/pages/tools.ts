@@ -133,6 +133,7 @@ interface ProbeState {
   loading: boolean;
   result: ToolProbe | null;
   error: SafeError | null;
+  requestId: number;
 }
 
 interface SecretState {
@@ -147,6 +148,7 @@ interface ApiState {
   loaded: boolean;
   models: ModelDefinition[];
   error: SafeError | null;
+  requestId: number;
   testModel: string;
   testLoading: boolean;
   advice: DecisionAdvice | null;
@@ -623,6 +625,7 @@ export class ToolsPage {
   private catalogProviders = new Map<string, CatalogProvider>();
   private openPickers = new Set<string>();
   private expanded = new Set<string>();
+  private pendingCatalogRefreshFocus = new Map<string, string>();
   private configuringDiscoveredId: string | null = null;
   private pendingSwitch: PendingToolSwitch | null = null;
   private deleteConfirm: { kind: 'tool' | 'model'; id: string } | null = null;
@@ -826,6 +829,7 @@ export class ToolsPage {
     this.catalogProviders.clear();
     this.openPickers.clear();
     this.expanded.clear();
+    this.pendingCatalogRefreshFocus.clear();
     this.configuringDiscoveredId = null;
     this.pendingSwitch = null;
     this.deleteConfirm = null;
@@ -1035,6 +1039,7 @@ export class ToolsPage {
 
   private closeModelPicker(toolId: string, clearSelection: boolean): void {
     this.openPickers.delete(toolId);
+    this.pendingCatalogRefreshFocus.delete(toolId);
     const probeKey = `probe:${toolId}`;
     const apiKey = `api:${toolId}`;
     if (clearSelection) {
@@ -1186,7 +1191,15 @@ export class ToolsPage {
               'primary'
             )
           : null,
-        this.button('Refresh', () => this.notifyOuter(), 'reload-registry')
+        (() => {
+          const reloadBtn = this.button(
+            'Refresh saved registry',
+            () => this.notifyOuter(),
+            'reload-registry'
+          );
+          reloadBtn.setAttribute('aria-label', 'Refresh saved registry');
+          return reloadBtn;
+        })()
       )
     );
   }
@@ -1328,15 +1341,9 @@ export class ToolsPage {
         : null;
 
     const refreshBtn = this.button(
-      this.discoveryLoading ? 'Refreshing…' : 'Refresh tools',
+      this.discoveryLoading ? 'Refreshing tool discovery…' : 'Refresh tool discovery',
       () => {
         this.onRefreshDiscovery?.();
-        this.onRecheckVersions?.();
-        for (const tool of snapshot.tools) {
-          if (tool.enabled && providerFor(tool.adapter) === null && this.openPickers.has(tool.id)) {
-            void this.probe(tool);
-          }
-        }
       },
       'discovery-refresh',
       undefined,
@@ -1344,7 +1351,7 @@ export class ToolsPage {
     );
     refreshBtn.dataset.action = 'refresh-tools';
     refreshBtn.dataset.focus = 'discovery-refresh';
-    refreshBtn.setAttribute('aria-label', 'Refresh tools');
+    refreshBtn.setAttribute('aria-label', 'Refresh tool discovery');
 
     const { tools: primaryTools, duplicates: duplicateGroups } = projectToolRegistrations(
       snapshot.tools,
@@ -1417,7 +1424,7 @@ export class ToolsPage {
             { className: 'aq-note aq-tools-empty' },
             this.discoveryLoading
               ? 'Checking local PATH for supported CLIs…'
-              : 'No tools are registered yet. Refresh tools to check local PATH or click Add custom or API tool.'
+              : 'No tools are registered yet. Refresh tool discovery to check local PATH or click Add custom or API tool.'
           )
         : h(
             'div',
@@ -2074,7 +2081,6 @@ export class ToolsPage {
     const changed = !sameTool(tool, draft);
     const provider = providerFor(tool.adapter);
     const probe = this.probes.get(tool.id);
-    const api = provider ? this.apiState(tool.id) : null;
     const using = snapshot.models.filter((model) => model.tool_id === tool.id);
     const usingModelCount = visibleModelCount(using, snapshot.tools);
     const usingCountText = `${usingModelCount} model${usingModelCount === 1 ? '' : 's'}`;
@@ -2114,16 +2120,20 @@ export class ToolsPage {
       provider === null
         ? this.pending.has(`probe:${tool.id}`)
         : this.pending.has(`catalog:api:${tool.id}`);
-    const hasLoadedCatalog =
-      provider === null ? Boolean(probe?.result) : Boolean(api?.loaded);
+    const pickerKey = provider === null ? `probe:${tool.id}` : `api:${tool.id}`;
+    const pickerId = `${this.pageId}-${token(pickerKey)}-picker`;
 
     const chooseModelsBtn = this.button(
-      probeBusy
-        ? 'Loading models…'
-        : pickerOpen && hasLoadedCatalog
-          ? 'Refresh models'
+      pickerOpen
+        ? 'Hide models'
+        : probeBusy
+          ? 'Loading models…'
           : 'Choose models',
       () => {
+        if (pickerOpen) {
+          this.closeModelPicker(tool.id, true);
+          return;
+        }
         this.openPickers.add(tool.id);
         if (provider === null) {
           void this.probe(tool);
@@ -2133,8 +2143,10 @@ export class ToolsPage {
       },
       provider === null ? `tool-${tool.id}-probe` : `api-${tool.id}-catalog`,
       using.length === 0 && !pickerOpen ? 'primary' : undefined,
-      probeBusy
+      !pickerOpen && probeBusy
     );
+    chooseModelsBtn.setAttribute('aria-expanded', String(pickerOpen));
+    chooseModelsBtn.setAttribute('aria-controls', pickerId);
     if (using.length === 0 && !pickerOpen) {
       chooseModelsBtn.classList.add('aq-tools-primary');
     }
@@ -2407,8 +2419,17 @@ export class ToolsPage {
     catalogModels: readonly ModelDefinition[] | null,
     onRefreshCatalog: () => void
   ): HTMLElement {
+    const pickerId = `${this.pageId}-${token(key)}-picker`;
+    const headingId = `${this.pageId}-${token(key)}-heading`;
     const closePicker = (): void => {
       this.closeModelPicker(tool.id, true);
+    };
+    const triggerCatalogRefresh = (focusAfterKey?: string): void => {
+      if (loading) return;
+      if (focusAfterKey) {
+        this.pendingCatalogRefreshFocus.set(tool.id, focusAfterKey);
+      }
+      onRefreshCatalog();
     };
 
     const head = h(
@@ -2417,7 +2438,7 @@ export class ToolsPage {
       h(
         'div',
         { className: 'aq-tools-create-heading' },
-        h('h5', undefined, `Choose models for ${tool.label}`),
+        h('h5', { id: headingId }, `Choose models for ${tool.label}`),
         h(
           'p',
           { className: 'aq-tools-hint' },
@@ -2430,7 +2451,13 @@ export class ToolsPage {
     if (loading) {
       return h(
         'div',
-        { className: 'aq-tools-probe' },
+        {
+          className: 'aq-tools-probe',
+          id: pickerId,
+          role: 'region',
+          'aria-labelledby': headingId,
+          'aria-busy': 'true',
+        },
         head,
         h(
           'p',
@@ -2440,6 +2467,13 @@ export class ToolsPage {
         h(
           'div',
           { className: 'aq-tools-actions aq-tools-form-actions' },
+          this.button(
+            'Refreshing model catalog…',
+            () => {},
+            `${key}-refresh`,
+            undefined,
+            true
+          ),
           this.button('Cancel', closePicker, `${key}-cancel`)
         )
       );
@@ -2448,13 +2482,23 @@ export class ToolsPage {
     if (error) {
       return h(
         'div',
-        { className: 'aq-tools-probe' },
+        {
+          className: 'aq-tools-probe',
+          id: pickerId,
+          role: 'region',
+          'aria-labelledby': headingId,
+        },
         head,
         this.errorBlock(error),
         h(
           'div',
           { className: 'aq-tools-actions aq-tools-form-actions' },
-          this.button('Retry catalog', onRefreshCatalog, `${key}-retry`, 'primary'),
+          this.button(
+            'Refresh model catalog',
+            () => triggerCatalogRefresh(`${key}-refresh`),
+            `${key}-refresh`,
+            'primary'
+          ),
           this.button('Cancel', closePicker, `${key}-cancel`)
         )
       );
@@ -2463,7 +2507,12 @@ export class ToolsPage {
     if (!catalogModels) {
       return h(
         'div',
-        { className: 'aq-tools-probe aq-tools-probe-empty' },
+        {
+          className: 'aq-tools-probe aq-tools-probe-empty',
+          id: pickerId,
+          role: 'region',
+          'aria-labelledby': headingId,
+        },
         head,
         h(
           'p',
@@ -2473,7 +2522,12 @@ export class ToolsPage {
         h(
           'div',
           { className: 'aq-tools-actions aq-tools-form-actions' },
-          this.button('Load catalog', onRefreshCatalog, `${key}-load`, 'primary'),
+          this.button(
+            'Load catalog',
+            () => triggerCatalogRefresh(`${key}-refresh`),
+            `${key}-load`,
+            'primary'
+          ),
           this.button('Cancel', closePicker, `${key}-cancel`)
         )
       );
@@ -2678,11 +2732,11 @@ export class ToolsPage {
       const actionNodes: HTMLElement[] = [
         importBtn,
         this.button(
-          'Refresh catalog',
-          onRefreshCatalog,
+          'Refresh model catalog',
+          () => triggerCatalogRefresh(`${key}-refresh`),
           `${key}-refresh`,
           undefined,
-          importing
+          loading || importing
         ),
       ];
       if (toolHasSavedModels && this.onOpenProfiles) {
@@ -2721,7 +2775,12 @@ export class ToolsPage {
 
     return h(
       'div',
-      { className: 'aq-tools-probe' },
+      {
+        className: 'aq-tools-probe',
+        id: pickerId,
+        role: 'region',
+        'aria-labelledby': headingId,
+      },
       head,
       providerSelect
         ? this.field('Model source', providerSelect,
@@ -3802,7 +3861,7 @@ export class ToolsPage {
   private probeState(toolId: string): ProbeState {
     let state = this.probes.get(toolId);
     if (!state) {
-      state = { loading: false, result: null, error: null };
+      state = { loading: false, result: null, error: null, requestId: 0 };
       this.probes.set(toolId, state);
     }
     return state;
@@ -3825,6 +3884,7 @@ export class ToolsPage {
         loaded: false,
         models: [],
         error: null,
+        requestId: 0,
         testModel: '',
         testLoading: false,
         advice: null,
@@ -4041,10 +4101,13 @@ export class ToolsPage {
           }
         }
         this.probes.delete(tool.id);
+        this.pending.delete(`probe:${tool.id}`);
+        this.pendingCatalogRefreshFocus.delete(tool.id);
         this.selections.delete(`probe:${tool.id}`);
         if (tool.adapter !== value.adapter) {
           this.secrets.delete(tool.id);
           this.apiStates.delete(tool.id);
+          this.pending.delete(`catalog:api:${tool.id}`);
           this.selections.delete(`api:${tool.id}`);
         }
         this.notice = { tone: 'success', text: `Saved tool "${value.label}".` };
@@ -4101,6 +4164,9 @@ export class ToolsPage {
         this.toolDrafts.delete(tool.id);
         this.expanded.delete(`tool:${tool.id}`);
         this.openPickers.delete(tool.id);
+        this.pending.delete(`probe:${tool.id}`);
+        this.pending.delete(`catalog:api:${tool.id}`);
+        this.pendingCatalogRefreshFocus.delete(tool.id);
         this.probes.delete(tool.id);
         this.secrets.delete(tool.id);
         this.apiStates.delete(tool.id);
@@ -4114,11 +4180,30 @@ export class ToolsPage {
     if (!deleted) this.deleteConfirm = null;
   }
 
+  private restoreCatalogRefreshFocus(toolId: string): void {
+    const focusKey = this.pendingCatalogRefreshFocus.get(toolId);
+    if (!focusKey) return;
+    this.pendingCatalogRefreshFocus.delete(toolId);
+    if (this.disposed || !this.openPickers.has(toolId) || !this.root) return;
+    const active = typeof document !== 'undefined' ? document.activeElement : null;
+    if (
+      active instanceof HTMLElement &&
+      active !== document.body &&
+      this.root.contains(active) &&
+      active.dataset.focusKey
+    ) {
+      return;
+    }
+    this.focusAndScroll(focusKey);
+  }
+
   private async probe(tool: ToolDefinition): Promise<void> {
     const key = `probe:${tool.id}`;
     if (this.disposed || this.pending.has(key)) return;
     this.openPickers.add(tool.id);
     const state = this.probeState(tool.id);
+    const requestId = state.requestId + 1;
+    state.requestId = requestId;
     state.loading = true;
     state.error = null;
     state.result = null;
@@ -4126,7 +4211,7 @@ export class ToolsPage {
     this.refresh();
     try {
       const result = await desktop_probe_tool({ toolId: tool.id });
-      if (!this.disposed && this.probes.get(tool.id) === state) {
+      if (!this.disposed && this.probes.get(tool.id) === state && state.requestId === requestId) {
         state.result = result;
         if (this.openPickers.has(tool.id)) {
           this.selection(key, result.models);
@@ -4135,14 +4220,15 @@ export class ToolsPage {
         }
       }
     } catch (err) {
-      if (!this.disposed) {
+      if (!this.disposed && this.probes.get(tool.id) === state && state.requestId === requestId) {
         state.error = safeError(err);
       }
     } finally {
-      if (!this.disposed) {
+      if (!this.disposed && this.probes.get(tool.id) === state && state.requestId === requestId) {
         state.loading = false;
         this.pending.delete(key);
         this.refresh();
+        this.restoreCatalogRefreshFocus(tool.id);
       }
     }
   }
@@ -4490,14 +4576,16 @@ export class ToolsPage {
 
   private async loadModels(tool: ToolDefinition, provider: Provider): Promise<void> {
     const key = `catalog:api:${tool.id}`;
+    const selectionKey = `api:${tool.id}`;
     if (this.disposed || this.pending.has(key)) return;
     this.openPickers.add(tool.id);
     const state = this.apiState(tool.id);
+    const requestId = state.requestId + 1;
+    state.requestId = requestId;
     state.loading = true;
     state.error = null;
     state.loaded = false;
     state.models = [];
-    this.selections.delete(`api:${tool.id}`);
     this.pending.add(key);
     this.refresh();
     try {
@@ -4505,24 +4593,25 @@ export class ToolsPage {
         toolId: tool.id,
         provider,
       });
-      if (!this.disposed) {
+      if (!this.disposed && this.apiStates.get(tool.id) === state && state.requestId === requestId) {
         state.models = models;
         state.loaded = true;
         if (this.openPickers.has(tool.id)) {
-          this.selections.set(`api:${tool.id}`, new Set());
+          this.selection(selectionKey, models);
         } else {
-          this.selections.delete(`api:${tool.id}`);
+          this.selections.delete(selectionKey);
         }
       }
     } catch (err) {
-      if (!this.disposed) {
+      if (!this.disposed && this.apiStates.get(tool.id) === state && state.requestId === requestId) {
         state.error = safeError(err);
       }
     } finally {
-      if (!this.disposed) {
+      if (!this.disposed && this.apiStates.get(tool.id) === state && state.requestId === requestId) {
         state.loading = false;
         this.pending.delete(key);
         this.refresh();
+        this.restoreCatalogRefreshFocus(tool.id);
       }
     }
   }

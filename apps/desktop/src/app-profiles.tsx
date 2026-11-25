@@ -28,6 +28,7 @@ import { ToolBrand } from './app-brand.tsx';
 import type { ProfilesPanelProps } from './app-contract.ts';
 import {
   acknowledgeActiveDraftOverwrite,
+  analyzeDraft,
   beginAsyncOperation,
   beginCloneProfile,
   beginCreateProfile,
@@ -45,6 +46,7 @@ import {
   discardActiveDraft,
   discardDraftAndSwitch,
   effectiveCellEffort,
+  evaluateProfileReadiness,
   getActiveDraft,
   getRoleMetadata,
   hasDifficultyOverride,
@@ -54,6 +56,8 @@ import {
   MAX_PROFILE_NAME_LENGTH,
   needsAcknowledgement,
   PROFILE_EXECUTION_ROLES,
+  profileFromDraft,
+  profileSignature,
   requestDeleteProfile,
   resolveFamilyForCell,
   resolveOperationError,
@@ -65,22 +69,19 @@ import {
   selectRoleModel,
   selectWorkflowRole,
   setCompactStep,
+  summarizeProfile,
   syncRegistrySnapshot,
+  tableFromProfile,
   toggleDifficultyAccordion,
   updateActiveDraft,
   type AssignmentTable,
   type Choice,
+  type MultiRoleCompletenessStatus,
   type ProfilesPanelState,
   type RegistryIndex,
   type Slot,
+  type WorkerReadinessStatus,
 } from './app-profile-state.ts';
-import {
-  analyzeDraft,
-  profileFromDraft,
-  profileSignature,
-  summarizeProfile,
-  tableFromProfile,
-} from './pages/profiles.ts';
 import {
   desktop_registry_apply,
   desktop_registry_snapshot,
@@ -183,6 +184,32 @@ function formatAdvisorSummary(validation: DecisionAdvisorValidation): string {
     return 'Needs repair';
   }
   return `${validation.tool.label} · ${validation.model.label}`;
+}
+
+type PillTone = 'working' | 'attention' | 'danger' | 'success' | undefined;
+
+function workerReadinessTone(status: WorkerReadinessStatus): PillTone {
+  switch (status) {
+    case 'ready':
+      return 'success';
+    case 'partial_tiers':
+    case 'missing':
+      return 'attention';
+    case 'disabled':
+    case 'invalid':
+      return 'danger';
+  }
+}
+
+function multiRoleTone(status: MultiRoleCompletenessStatus): PillTone {
+  switch (status) {
+    case 'complete':
+      return 'success';
+    case 'partial':
+      return undefined;
+    case 'needs_repair':
+      return 'danger';
+  }
 }
 
 function groupAdvisorChoices(
@@ -926,8 +953,9 @@ export function ProfilesPanel(props: ProfilesPanelProps) {
               No profiles saved yet
             </Text>
             <Text size="1" color="gray">
-              Create a profile to assign models and reasoning efforts across the
-              five execution roles.
+              Create a profile with an eligible Worker model for ordinary
+              single-Worker tasks, and optionally configure the remaining
+              multi-role defaults.
             </Text>
           </div>
         ) : (
@@ -979,10 +1007,20 @@ export function ProfilesPanel(props: ProfilesPanelProps) {
               const table = trackedDraft
                 ? trackedDraft.assignments
                 : tableFromProfile(profile);
+              const readiness = index
+                ? evaluateProfileReadiness(index, table)
+                : summary.readiness;
               const workerDefault = formatCellChoiceLabel(
                 index,
                 table.coder.default
               );
+              const workerOverrideSummary =
+                !table.coder.default.model_id &&
+                readiness.worker.validOverrideDifficulties.length > 0
+                  ? `Overrides (${readiness.worker.validOverrideDifficulties
+                      .map((diff) => DIFFICULTY_LABELS[diff])
+                      .join(', ')})`
+                  : workerDefault;
               const drifted = Boolean(
                 trackedDraft &&
                   trackedDraft.sourceSignature !== null &&
@@ -990,27 +1028,33 @@ export function ProfilesPanel(props: ProfilesPanelProps) {
               );
               const isSelected = state.selectedProfileId === profile.id;
               const isDefault = snapshot.default_profile_id === profile.id;
-              const hasIssues =
-                summary.issues.length > 0 ||
+              const hasRepairIssue =
+                readiness.worker.status === 'disabled' ||
+                readiness.worker.status === 'invalid' ||
+                readiness.multiRole.status === 'needs_repair' ||
                 summary.advisor.state === 'invalid';
               const displayName =
                 (trackedDraft?.name.trim() || profile.name) || 'Unnamed profile';
 
               const subtitleParts: string[] = [
-                `${workflowRoleLabel('coder')}: ${workerDefault}`,
+                `${workflowRoleLabel('coder')}: ${workerOverrideSummary}`,
               ];
-              if (summary.missingDefaults.length > 0) {
+              if (readiness.multiRole.status === 'complete') {
                 subtitleParts.push(
-                  `Missing defaults: ${summary.missingDefaults
-                    .map((role) => workflowRoleLabel(role))
-                    .join(', ')}`
+                  `Multi-role: ${readiness.multiRole.configuredDefaults}/${PROFILE_EXECUTION_ROLES.length} defaults`
+                );
+              } else if (readiness.multiRole.status === 'needs_repair') {
+                subtitleParts.push(
+                  `Multi-role: ${readiness.multiRole.configuredDefaults}/${PROFILE_EXECUTION_ROLES.length} defaults (needs repair)`
                 );
               } else {
-                subtitleParts.push('All 5 role defaults set');
+                subtitleParts.push(
+                  `Multi-role: ${readiness.multiRole.configuredDefaults}/${PROFILE_EXECUTION_ROLES.length} defaults (other roles optional)`
+                );
               }
               if (summary.advisor.state !== 'off') {
                 subtitleParts.push(
-                  `Advisor: ${formatAdvisorSummary(summary.advisor)}`
+                  `Decision advisor: ${formatAdvisorSummary(summary.advisor)}`
                 );
               }
 
@@ -1049,9 +1093,9 @@ export function ProfilesPanel(props: ProfilesPanelProps) {
                           Updated externally
                         </span>
                       ) : null}
-                      {hasIssues ? (
+                      {hasRepairIssue ? (
                         <span className="tl-profiles-pill" data-tone="danger">
-                          Needs attention
+                          Needs repair
                         </span>
                       ) : null}
                     </Flex>
@@ -1066,11 +1110,24 @@ export function ProfilesPanel(props: ProfilesPanelProps) {
                   </div>
 
                   <Flex align="center" gap="2" wrap="wrap">
-                    <span className="tl-profiles-pill">
-                      {summary.defaultCount}/{PROFILE_EXECUTION_ROLES.length}{' '}
-                      role defaults · {summary.overrideCount}{' '}
-                      {summary.overrideCount === 1 ? 'override' : 'overrides'}
+                    <span
+                      className="tl-profiles-pill"
+                      data-tone={workerReadinessTone(readiness.worker.status)}
+                    >
+                      {readiness.worker.summaryLabel}
                     </span>
+                    <span
+                      className="tl-profiles-pill"
+                      data-tone={multiRoleTone(readiness.multiRole.status)}
+                    >
+                      {readiness.multiRole.summaryLabel}
+                    </span>
+                    {summary.overrideCount > 0 ? (
+                      <span className="tl-profiles-pill">
+                        {summary.overrideCount}{' '}
+                        {summary.overrideCount === 1 ? 'override' : 'overrides'}
+                      </span>
+                    ) : null}
                     <ChevronRight size={16} aria-hidden="true" />
                   </Flex>
                 </button>
@@ -1386,6 +1443,46 @@ export function ProfilesPanel(props: ProfilesPanelProps) {
               }}
             />
           </div>
+
+          <div
+            className="tl-profiles-readiness-grid"
+            role="region"
+            aria-label="Profile readiness"
+          >
+            <div className="tl-profiles-readiness-card">
+              <div className="tl-profiles-readiness-head">
+                <Text size="1" weight="bold">
+                  Ordinary single-Worker use
+                </Text>
+                <span
+                  className="tl-profiles-pill"
+                  data-tone={workerReadinessTone(analysis.readiness.worker.status)}
+                >
+                  {analysis.readiness.worker.summaryLabel}
+                </span>
+              </div>
+              <Text size="1" color="gray">
+                {analysis.readiness.worker.detail}
+              </Text>
+            </div>
+
+            <div className="tl-profiles-readiness-card">
+              <div className="tl-profiles-readiness-head">
+                <Text size="1" weight="bold">
+                  Optional multi-role workflows
+                </Text>
+                <span
+                  className="tl-profiles-pill"
+                  data-tone={multiRoleTone(analysis.readiness.multiRole.status)}
+                >
+                  {analysis.readiness.multiRole.summaryLabel}
+                </span>
+              </div>
+              <Text size="1" color="gray">
+                {analysis.readiness.multiRole.detail}
+              </Text>
+            </div>
+          </div>
         </section>
 
         {renderModelSetupCallout(true)}
@@ -1458,7 +1555,11 @@ export function ProfilesPanel(props: ProfilesPanelProps) {
                           ? `${roleOverrides} ${
                               roleOverrides === 1 ? 'override' : 'overrides'
                             }`
-                          : 'Default only'}
+                          : !activeDraft.assignments[roleId].default.model_id
+                            ? roleId === 'coder'
+                              ? 'Unassigned'
+                              : 'Optional'
+                            : 'Default only'}
                       </span>
                     )}
                     <ChevronRight size={16} aria-hidden="true" />
@@ -1498,6 +1599,11 @@ export function ProfilesPanel(props: ProfilesPanelProps) {
               <Text size="2" weight="bold">
                 {selectedRoleMeta.label} defaults
               </Text>
+              <span className="tl-profiles-pill">
+                {selectedRole === 'coder'
+                  ? 'Used by single-Worker tasks'
+                  : 'Optional for ordinary tasks'}
+              </span>
             </Flex>
             <Text size="1" color="gray">
               {selectedRoleMeta.summary}
@@ -1831,10 +1937,14 @@ export function ProfilesPanel(props: ProfilesPanelProps) {
                 <Text size="2" weight="bold">
                   Decision advisor
                 </Text>
-                <span className="tl-profiles-pill">Optional · Shadow mode</span>
+                <span className="tl-profiles-pill">
+                  Optional · Task-difficulty advice · Shadow mode
+                </span>
               </Flex>
               <Text size="1" color="gray" as="div" style={{ marginTop: 2 }}>
-                Suggests task difficulty without changing plans or active tasks.
+                Optional Jev or OpenAI task-difficulty advice in shadow mode.
+                Separate from the technical Advisor execution role above; never
+                changes plans, role assignments, or active tasks.
               </Text>
             </div>
 

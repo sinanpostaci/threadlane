@@ -603,6 +603,13 @@
   border-top: 1px solid var(--aq-line);
 }
 
+.aq-tools-probe .aq-btn:focus-visible,
+.aq-tools-probe input:focus-visible,
+.aq-tools-probe select:focus-visible {
+  outline: 2px solid var(--aq-accent);
+  outline-offset: 1px;
+}
+
 .aq-tools-catalog {
   display: flex;
   flex-direction: column;

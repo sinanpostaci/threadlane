@@ -18,6 +18,7 @@ import {
   createProfilesPanelState,
   discardActiveDraft,
   discardDraftAndSwitch,
+  evaluateProfileReadiness,
   getActiveDraft,
   isDraftDirty,
   keepDraftAndSwitch,
@@ -29,6 +30,7 @@ import {
   resolveOperationError,
   resolveOperationSuccess,
   resolveReloadSuccess,
+  ROLE_METADATA,
   selectProfile,
   selectRoleEffort,
   selectRoleModel,
@@ -1152,5 +1154,173 @@ describe('app-profile-state transitions and invariants', () => {
       Object.hasOwn(profileFromDraft(clearedDraft), 'decision_advisor'),
       false
     );
+  });
+
+  it('evaluates ordinary single-Worker readiness separately from optional multi-role completeness', () => {
+    const singleWorkerProfile: WorkflowProfile = {
+      id: 'profile-single-worker',
+      name: 'Single Worker Only',
+      assignments: [
+        {
+          role: 'coder',
+          difficulty: null,
+          choice: { model_id: 'gpt-5.4', effort: 'high' },
+        },
+      ],
+      decision_advisor: { model_id: 'jev-1.14.0', mode: 'shadow' },
+    };
+
+    const partialTiersProfile: WorkflowProfile = {
+      id: 'profile-partial-tiers',
+      name: 'Worker Overrides Only',
+      assignments: [
+        {
+          role: 'orchestrator',
+          difficulty: null,
+          choice: { model_id: 'gpt-5.4', effort: 'xhigh' },
+        },
+        {
+          role: 'coder',
+          difficulty: 'easy',
+          choice: { model_id: 'deepseek-v4.1-flash', effort: 'max' },
+        },
+        {
+          role: 'coder',
+          difficulty: 'hard',
+          choice: { model_id: 'gemini-4-argon-high', effort: 'high' },
+        },
+      ],
+    };
+
+    const missingWorkerProfile: WorkflowProfile = {
+      id: 'profile-no-worker',
+      name: 'No Worker Configured',
+      assignments: [
+        {
+          role: 'orchestrator',
+          difficulty: null,
+          choice: { model_id: 'gpt-5.4', effort: 'high' },
+        },
+      ],
+    };
+
+    const incompatibleEffortProfile: WorkflowProfile = {
+      id: 'profile-bad-effort',
+      name: 'Incompatible Worker Effort',
+      assignments: [
+        {
+          role: 'coder',
+          difficulty: null,
+          choice: { model_id: 'deepseek-v4.1-flash', effort: 'low' },
+        },
+      ],
+    };
+
+    const completeProfile = makeProfile('profile-complete', 'Complete Multi-Role');
+
+    const snapshot = makeSnapshot([
+      singleWorkerProfile,
+      partialTiersProfile,
+      missingWorkerProfile,
+      incompatibleEffortProfile,
+      completeProfile,
+    ]);
+
+    // 1. Eligible single-Worker default is ready even when other 4 roles are unassigned
+    const singleSummary = summarizeProfile(snapshot, singleWorkerProfile);
+    assert.equal(singleSummary.readiness.worker.status, 'ready');
+    assert.equal(singleSummary.readiness.worker.usableForSingleWorker, true);
+    assert.equal(singleSummary.readiness.worker.coversAllDifficulties, true);
+    assert.match(singleSummary.readiness.worker.detail, /does not verify live/i);
+    assert.equal(singleSummary.readiness.multiRole.status, 'partial');
+    assert.equal(singleSummary.readiness.multiRole.configuredDefaults, 1);
+    assert.match(singleSummary.readiness.multiRole.detail, /optional/i);
+    const singleDraft = createEditDraftFromProfile(snapshot, singleWorkerProfile);
+    const singleAnalysis = analyzeDraft(snapshot, singleDraft);
+    assert.deepEqual(singleAnalysis.errors, []);
+    assert.deepEqual(singleDraft.decisionAdvisor, {
+      model_id: 'jev-1.14.0',
+      mode: 'shadow',
+    });
+
+    // 2. Valid difficulty overrides without a default cover only those tiers
+    const partialSummary = summarizeProfile(snapshot, partialTiersProfile);
+    assert.equal(partialSummary.readiness.worker.status, 'partial_tiers');
+    assert.equal(partialSummary.readiness.worker.usableForSingleWorker, true);
+    assert.equal(partialSummary.readiness.worker.coversAllDifficulties, false);
+    assert.deepEqual(partialSummary.readiness.worker.validOverrideDifficulties, [
+      'easy',
+      'hard',
+    ]);
+    assert.deepEqual(partialSummary.readiness.worker.uncoveredDifficulties, [
+      'medium',
+      'extreme',
+    ]);
+    assert.equal(partialSummary.readiness.multiRole.status, 'partial');
+    assert.equal(partialSummary.readiness.multiRole.configuredDefaults, 1);
+
+    // 3. Missing Worker reports missing independently of other roles
+    const missingSummary = summarizeProfile(snapshot, missingWorkerProfile);
+    assert.equal(missingSummary.readiness.worker.status, 'missing');
+    assert.equal(missingSummary.readiness.worker.usableForSingleWorker, false);
+    assert.equal(missingSummary.readiness.multiRole.status, 'partial');
+
+    // 4. Effort incompatibility on Worker reports invalid
+    const badEffortSummary = summarizeProfile(snapshot, incompatibleEffortProfile);
+    assert.equal(badEffortSummary.readiness.worker.status, 'invalid');
+    assert.equal(badEffortSummary.readiness.worker.usableForSingleWorker, false);
+    assert.match(badEffortSummary.readiness.worker.detail, /not supported/i);
+
+    // 5. Disabled Worker tool reports disabled
+    const disabledSnapshot: RegistrySnapshot = {
+      ...snapshot,
+      tools: snapshot.tools.map((tool) =>
+        tool.id === 'codex-main' ? { ...tool, enabled: false } : tool
+      ),
+    };
+    const disabledSummary = summarizeProfile(disabledSnapshot, singleWorkerProfile);
+    assert.equal(disabledSummary.readiness.worker.status, 'disabled');
+    assert.equal(disabledSummary.readiness.worker.usableForSingleWorker, false);
+    assert.match(disabledSummary.readiness.worker.detail, /disabled tool/i);
+
+    // 6. Complete 5/5 profile reports both single-Worker ready and multi-role complete
+    const completeSummary = summarizeProfile(snapshot, completeProfile);
+    assert.equal(completeSummary.readiness.worker.status, 'ready');
+    assert.equal(completeSummary.readiness.multiRole.status, 'complete');
+    assert.equal(completeSummary.readiness.multiRole.configuredDefaults, 5);
+
+    // 7. Ready Worker with invalid optional multi-role assignment keeps Worker ready
+    // while preserving the full-workflow warning on multi-role completeness
+    const mixedProfile: WorkflowProfile = {
+      id: 'profile-mixed',
+      name: 'Ready Worker With Broken Reviewer',
+      assignments: [
+        {
+          role: 'coder',
+          difficulty: null,
+          choice: { model_id: 'gpt-5.4', effort: 'high' },
+        },
+        {
+          role: 'reviewer',
+          difficulty: null,
+          choice: { model_id: 'retired-reviewer-model', effort: 'high' },
+        },
+      ],
+    };
+    const mixedReadiness = evaluateProfileReadiness(
+      buildRegistryIndex(snapshot),
+      tableFromProfile(mixedProfile)
+    );
+    assert.equal(mixedReadiness.worker.status, 'ready');
+    assert.equal(mixedReadiness.worker.usableForSingleWorker, true);
+    assert.equal(mixedReadiness.multiRole.status, 'needs_repair');
+    assert.equal(mixedReadiness.multiRole.issues.length, 1);
+    assert.match(mixedReadiness.multiRole.detail, /Reviewer/i);
+
+    // 8. Technical Advisor role copy distinguishes it from Jev/OpenAI task-difficulty advice
+    const advisorMeta = ROLE_METADATA.find((role) => role.id === 'advisor');
+    assert.ok(advisorMeta);
+    assert.equal(advisorMeta.label, 'Advisor');
+    assert.match(advisorMeta.summary, /Jev\/OpenAI task-difficulty advice/i);
   });
 });
