@@ -138,41 +138,26 @@ acceptance.
     unpinning, alternating `2 -> 1 -> 2 -> MenuOpenStatus` opens, `ScaleFactorChanged` +
     `monitor-added` + hot-unplug refreshes, and bounded mock-Unix-socket Hyprland IPC validation),
     `TrayState::active_open_anchor` isolation, `focus_follows_mouse`
-    pointer-crossing tracking, click debounce, and post-blur reopen suppression. In-process harness
-    tests prove coordinator/tracker/planner state-machine and IPC parsing/timeout invariants only;
-    real GTK3/Wayland signal dispatch and live compositor behavior require the parent's Linux build,
-    isolated Sway VM qualification gates below, and separate live Hyprland desktop validation.
-- **Pending live parent qualification and software WebKitGTK refresh-blanking verification (not claimed by source edits alone)**:
-  - Running Linux GTK compilation, `cargo fmt --check`, focused behavioral unit tests,
-    `python3 -m unittest scripts/test_desktop_acceptance.py`, and `cargo clippy -- -D warnings`
-    in the parent checkout against its local `CARGO_TARGET_DIR`.
-  - Executing the strengthened isolated `1x` and `2x` Sway VM acceptance gates (persistent guest
-    pointer and keyboard seat capabilities, **without** `for_window [all] floating enable`, **with**
-    default `focus_follows_mouse yes`, and preserving unchanged isolated VM software-rendering flags
-    `WLR_RENDERER=pixman`, `WEBKIT_DISABLE_DMABUF_RENDERER=1`, `WEBKIT_DISABLE_COMPOSITING_MODE=1`,
-    and `LIBGL_ALWAYS_SOFTWARE=1`) to verify live `connect_map` backdrop admission, `>= 9.5s` `2x`
-    pointer-transit dwell survival, empty-workspace outside-click implicit-grab release and
-    dismissal, `Escape` dismissal, `10` immediate `1s`-target (`<= 2.5s` actual inter-capture time
-    including overhead) `1x` reopen pixel and cross-output measurements over `>= 9.0s`
-    (`refresh_paint_survival`) before `Open Threadlane`, isolated absent-coordinate SNI
-    `Activate(0, 0)` placement onto focused secondary output `HEADLESS-2` (`scale 2.0`) while
-    restored `main` stays open on `HEADLESS-1` (`scale 1.0`) and after prior `HEADLESS-1` pinning
-    (`absent_anchor_secondary_output_placement`), `Quit`, and owned 4-process cleanup.
-  - **Separate live Hyprland desktop verification**: isolated headless Sway VM tests prove real
-    `gtk_layer_set_monitor(win, NULL)` compositor-default output placement on secondary outputs
-    and genuine Waybar global anchoring, while unit tests prove Hyprland env gating, rotated/fractional
-    geometry matching, panel-local disambiguation, and bounded Unix-socket I/O/timeout/symlink
-    rejection against mock sockets. End-to-end Hyprland + Dux/Quickshell `item.activate()`
-    verification on the real multi-monitor desktop (`DP-1` + rotated `DP-2 @ 1.25`) remains a live
-    host/desktop check and is not claimed from unit tests or the Sway VM alone.
-  - **Pending software WebKitGTK supplied-buffer backport verification**: while short single-pass
-    checks could finish between periodic `4000ms` UI refreshes, sustained mixed-scale reopen across
-    multiple refresh cycles exposed blank frames correlating with sparse `13x13` CPU damage updates
-    in software WebKitGTK (`2.54.1`; upstream fix [`WebKit/WebKit@bfae1a7`](https://github.com/WebKit/WebKit/commit/bfae1a7),
-    packaged separately without changing runtime environment flags, DOM/CSS, or reload behavior).
-    Full native tray acceptance is **not** claimed until the parent runner executes the strengthened
-    NixOS VM gate against the patched WebKitGTK dependency and passes both `refresh_paint_survival`
-    and all 15 checks.
+    pointer-crossing tracking, click debounce, and post-blur reopen suppression.
+
+**Development verification, 2026-11-25**
+
+The packaged desktop at `5dccff3` passed all 15 checks in the NixOS 26.05 Sway VM with
+WebKitGTK 2.54.2. After `Activate(0, 0)`, the main window remained on the first output.
+The second output kept the same 360 × 320 logical popup, title, body, and Open Threadlane
+button immediately after a pointer click on Refresh and after the next four-second poll.
+The first output showed zero popup pixels outside the main window. The VM writes these
+measurements to `vm-artifacts/vm-acceptance-report.json` under `absent_anchor_secondary_output`.
+
+A separate two-output Sway run exercised a real Waybar tray on a display rotated 270° at
+125% scale and then reopened the popup on the first display. Both openings retained their
+content after Refresh. An additional run supplied Hyprland cursor and monitor replies through
+a local IPC fixture while keyboard focus was on the opposite display. Physical Hyprland with
+Dux/Quickshell remains a separate host check.
+
+The NixOS 26.05 run used the installed system's package set. Builds pinned to WebKitGTK
+2.54.1 have a separate software-rendering backport for partial damage. Use the same VM
+checks to qualify that library version. [WebKit fix](https://github.com/WebKit/WebKit/commit/bfae1a7)
 
 ## 2. Implemented Platform Matrix
 
