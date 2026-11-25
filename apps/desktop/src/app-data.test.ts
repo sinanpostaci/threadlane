@@ -3,7 +3,9 @@ import { describe, it } from 'node:test';
 
 import type { CodexChatTarget } from './app-contract.ts';
 import {
+  CODEX_APP_UNAVAILABLE_ERROR_CODE,
   DesktopAppCoordinator,
+  isVerifiedNoRunningCodexInstanceError,
   mergeHealthyObservationSources,
   mergeScopedObservationJobs,
   mergeScopedObservationRequests,
@@ -3333,6 +3335,153 @@ describe('app-data DesktopAppCoordinator', () => {
         .availability,
       'unavailable',
     );
+
+    coordinator.dispose();
+  });
+
+  it('tracks exact Codex navigation error codes so only verified codex_app_unavailable enables Codex settings recovery', async () => {
+    const keyB = formatWorkspaceChatIdentityKey(IDENTITY_B)!;
+    let nextOpenError: unknown = null;
+    const coordinator = new DesktopAppCoordinator({
+      fetchWorkspaceSnapshot: async () =>
+        makeWorkspaceSnapshot({
+          chats: [
+            makeChatSummary(IDENTITY_A, { thread_label: 'Chat A' }),
+            makeChatSummary(IDENTITY_B, { thread_label: 'Chat B' }),
+          ],
+          native_samples: [
+            makeNativeSample(IDENTITY_A),
+            makeNativeSample(IDENTITY_B),
+          ],
+        }),
+      openCodexChat: async () => {
+        if (nextOpenError !== null) {
+          throw nextOpenError;
+        }
+      },
+      now: () => NOW_MS,
+    });
+
+    await coordinator.refreshWorkspace();
+
+    const exactNoInstanceMessage =
+      'No verified running Codex desktop instance is available for chat activation.';
+    nextOpenError = {
+      code: CODEX_APP_UNAVAILABLE_ERROR_CODE,
+      message: exactNoInstanceMessage,
+    };
+    const noInstanceOk = await coordinator.openCodexChat({
+      source_id: IDENTITY_A.source_id,
+      thread_uuid: IDENTITY_A.thread_uuid,
+      job_id: null,
+    });
+    assert.equal(noInstanceOk, false);
+    assert.equal(coordinator.getState().codexOpenError, exactNoInstanceMessage);
+    assert.equal(
+      coordinator.getState().codexOpenErrorCode,
+      CODEX_APP_UNAVAILABLE_ERROR_CODE,
+    );
+    assert.equal(
+      isVerifiedNoRunningCodexInstanceError(
+        coordinator.getState().codexOpenErrorCode,
+      ),
+      true,
+    );
+
+    coordinator.clearCodexOpenError();
+    assert.equal(coordinator.getState().codexOpenError, null);
+    assert.equal(coordinator.getState().codexOpenErrorCode, null);
+
+    const exactOtherMessage =
+      'Codex desktop activation returned an unverified window result.';
+    nextOpenError = {
+      code: 'codex_activation_unknown',
+      message: exactOtherMessage,
+    };
+    const otherOk = await coordinator.openCodexChat({
+      source_id: IDENTITY_A.source_id,
+      thread_uuid: IDENTITY_A.thread_uuid,
+      job_id: null,
+    });
+    assert.equal(otherOk, false);
+    assert.equal(coordinator.getState().codexOpenError, exactOtherMessage);
+    assert.equal(
+      coordinator.getState().codexOpenErrorCode,
+      'codex_activation_unknown',
+    );
+    assert.equal(
+      isVerifiedNoRunningCodexInstanceError(
+        coordinator.getState().codexOpenErrorCode,
+      ),
+      false,
+    );
+
+    coordinator.selectChat(keyB);
+    assert.equal(coordinator.getState().codexOpenError, null);
+    assert.equal(coordinator.getState().codexOpenErrorCode, null);
+    coordinator.dispose();
+  });
+
+  it('keeps same-name chats isolated on archive and restores exact identity and selection on reversible Undo', async () => {
+    const { storage } = createMemoryStorage();
+    const keyA = formatWorkspaceChatIdentityKey(IDENTITY_A)!;
+    const keyB = formatWorkspaceChatIdentityKey(IDENTITY_B)!;
+
+    const duplicateNameSnapshot = makeWorkspaceSnapshot({
+      chats: [
+        makeChatSummary(IDENTITY_A, {
+          thread_label: 'Same Name Chat',
+          updated_at_ms: NOW_MS - 1_000,
+        }),
+        makeChatSummary(IDENTITY_B, {
+          thread_label: 'Same Name Chat',
+          updated_at_ms: NOW_MS - 2_000,
+        }),
+      ],
+      native_samples: [
+        makeNativeSample(IDENTITY_A),
+        makeNativeSample(IDENTITY_B),
+      ],
+    });
+
+    const coordinator = new DesktopAppCoordinator({
+      fetchWorkspaceSnapshot: async () => duplicateNameSnapshot,
+      preferenceStorage: storage,
+      now: () => NOW_MS,
+    });
+
+    await coordinator.refreshWorkspace();
+    assert.equal(coordinator.getState().selectedChatKey, keyA);
+    assert.equal(coordinator.projectWorkspace().activeChatCount, 2);
+
+    // Archive first chat by exact 4-part identity: sibling with identical thread_label remains active.
+    assert.equal(coordinator.setChatArchived(IDENTITY_A, true), true);
+    assert.equal(coordinator.projectWorkspace().activeChatCount, 1);
+    assert.equal(coordinator.projectWorkspace().archivedChatCount, 1);
+    assert.equal(coordinator.getState().selectedChatKey, keyB);
+    assert.equal(
+      coordinator.projectWorkspace().activeProjects[0]?.chats[0]?.chatKey,
+      keyB,
+    );
+
+    // Reversible Undo restores exact IDENTITY_A and re-selects it when selectIfVisible is true.
+    assert.equal(
+      coordinator.setChatArchived(IDENTITY_A, false, { selectIfVisible: true }),
+      true,
+    );
+    assert.equal(coordinator.projectWorkspace().activeChatCount, 2);
+    assert.equal(coordinator.projectWorkspace().archivedChatCount, 0);
+    assert.equal(coordinator.getState().selectedChatKey, keyA);
+
+    // Archive IDENTITY_A again and simulate user keeping selection on IDENTITY_B before Undo.
+    assert.equal(coordinator.setChatArchived(IDENTITY_A, true), true);
+    coordinator.selectChat(keyB);
+    assert.equal(
+      coordinator.setChatArchived(IDENTITY_A, false, { selectIfVisible: false }),
+      true,
+    );
+    assert.equal(coordinator.projectWorkspace().activeChatCount, 2);
+    assert.equal(coordinator.getState().selectedChatKey, keyB);
 
     coordinator.dispose();
   });

@@ -27,6 +27,7 @@ import {
   filterMessagesForChat,
   filterObservationRequestsForActivity,
   formatSidebarLifecycleWaitingLabel,
+  formatSidebarLifecycleWorkingLabel,
   formatSidebarWaitingCounter,
   formatSidebarWorkingCounter,
   getActiveChatScrollState,
@@ -43,6 +44,7 @@ import {
   resolveChatWorkExecutionFootersWithContinuity,
   resolveMessageScrollChatKey,
   resolveMessageViewportResize,
+  resolveSidebarChatActor,
   resolveSidebarChatStatus,
   resolveVerifiedChatJobIds,
   selectWorkspaceChatWork,
@@ -2435,7 +2437,7 @@ test('chat_work backlog groups stay honest and bounded with truthful omitted cou
   assert.ok(selection.notices.some((notice) => notice.includes('worker presence records')));
 
   const groups = buildChatWorkBacklogGroups(selection);
-  assert.deepEqual(groups.map((group) => group.status), ['todo', 'doing', 'done', 'blocked']);
+  assert.deepEqual(groups.map((group) => group.status), ['doing', 'blocked', 'todo', 'done']);
   assert.ok(groups.every((group) => group.items.every((item) => item.status === group.status)));
   const blocked = groups.find((group) => group.status === 'blocked')!.items[0]!;
   assert.ok(blocked.blockedReason !== null);
@@ -7426,4 +7428,373 @@ test('previously confirmed running attempt returns unavailable with no timer aft
   assert.equal(recoveredLive.footersByEventKey.get(eventKey)!.statusKey, 'working');
   assert.equal(recoveredLive.footersByEventKey.get(eventKey)!.durationLabel, 'Elapsed 11s');
   assert.equal(recoveredLive.store.get(attemptKey)?.briefGapClosed, undefined);
+});
+
+test('resolveSidebarChatActor pairs active role with verified observed execution model and never substitutes configured or requested models', () => {
+  const identity = makeIdentity('bnd_sidebar_actor', UUID_ALPHA);
+  const workerItem = makeBacklogItem({
+    item_id: 'blg_actor_worker_1',
+    binding_id: identity.binding_id,
+    kind: 'worker',
+    status: 'doing',
+    current_execution_ref: 'exec-actor-1',
+  });
+  const secondWorkerItem = makeBacklogItem({
+    item_id: 'blg_actor_worker_2',
+    binding_id: identity.binding_id,
+    kind: 'worker',
+    status: 'doing',
+    current_execution_ref: 'exec-actor-2',
+  });
+  const workerPresence = makePresence({
+    item_id: workerItem.item_id,
+    execution_ref: 'exec-actor-1',
+    approval_id: 'apr-actor-1',
+    task_id: 'task-actor-1',
+    run_id: 'run-actor-1',
+    worker_id: 'worker-actor-1',
+    sampled_at_ms: CHAT_WORK_NOW_MS - 500,
+    max_sample_age_ms: 5_000,
+  });
+  const secondWorkerPresence = makePresence({
+    item_id: secondWorkerItem.item_id,
+    execution_ref: 'exec-actor-2',
+    approval_id: 'apr-actor-2',
+    task_id: 'task-actor-2',
+    run_id: 'run-actor-2',
+    worker_id: 'worker-actor-2',
+    sampled_at_ms: CHAT_WORK_NOW_MS - 500,
+    max_sample_age_ms: 5_000,
+  });
+  const idleCoworkerSample = makeNativeSample(identity, 'idle', CHAT_WORK_NOW_MS - 500);
+  const workingCoworkerSample = makeNativeSample(identity, 'working', CHAT_WORK_NOW_MS - 500);
+  const waitingCoworkerSample = makeNativeSample(
+    identity,
+    'waiting_for_input',
+    CHAT_WORK_NOW_MS - 500,
+  );
+
+  // 1. Worker-only live with verified observed_model shows Worker · Argon, never Coworker configured gpt-6-astra.
+  const observedWorkerSelection = selectWorkspaceChatWork(
+    [
+      makeChatWork(identity, {
+        items: [workerItem],
+        worker_presence: [workerPresence],
+        worker_executions: [
+          makeExecution(identity.binding_id, {
+            item_id: workerItem.item_id,
+            execution_ref: 'exec-actor-1',
+            approval_id: 'apr-actor-1',
+            task_id: 'task-actor-1',
+            run_id: 'run-actor-1',
+            worker_id: 'worker-actor-1',
+            provider: 'antigravity',
+            requested_model: 'gemini-4-neon-high',
+            observed_model: 'gemini-4-argon-high',
+          }),
+        ],
+      }),
+    ],
+    identity,
+  );
+  const observedWorkerLiveness = evaluateChatWorkLiveness(
+    observedWorkerSelection,
+    idleCoworkerSample,
+    { nowMs: CHAT_WORK_NOW_MS },
+  );
+  const observedWorkerActor = resolveSidebarChatActor(observedWorkerLiveness);
+  assert.deepEqual(observedWorkerActor, {
+    kind: 'single_agent',
+    role: 'worker',
+    roleLabel: 'Worker',
+    observedModel: 'Argon',
+    observedModelRaw: 'gemini-4-argon-high',
+    workingAgentCount: 1,
+    label: 'Worker · Argon',
+  });
+
+  // 2. Worker-only live with requested_model only (observed_model === null) shows role only.
+  const requestedOnlySelection = selectWorkspaceChatWork(
+    [
+      makeChatWork(identity, {
+        items: [workerItem],
+        worker_presence: [workerPresence],
+        worker_executions: [
+          makeExecution(identity.binding_id, {
+            item_id: workerItem.item_id,
+            execution_ref: 'exec-actor-1',
+            approval_id: 'apr-actor-1',
+            task_id: 'task-actor-1',
+            run_id: 'run-actor-1',
+            worker_id: 'worker-actor-1',
+            provider: 'antigravity',
+            requested_model: 'gemini-4-argon-high',
+            observed_model: null,
+          }),
+        ],
+      }),
+    ],
+    identity,
+  );
+  const requestedOnlyActor = resolveSidebarChatActor(
+    evaluateChatWorkLiveness(requestedOnlySelection, idleCoworkerSample, {
+      nowMs: CHAT_WORK_NOW_MS,
+    }),
+  );
+  assert.deepEqual(requestedOnlyActor, {
+    kind: 'single_agent',
+    role: 'worker',
+    roleLabel: 'Worker',
+    observedModel: null,
+    observedModelRaw: null,
+    workingAgentCount: 1,
+    label: 'Worker',
+  });
+
+  // 3a. An unrelated execution_ref's observed_model never attaches to a different live execution_ref.
+  const olderExecutionSelection = selectWorkspaceChatWork(
+    [
+      makeChatWork(identity, {
+        items: [workerItem],
+        worker_presence: [workerPresence],
+        worker_executions: [
+          makeExecution(identity.binding_id, {
+            item_id: workerItem.item_id,
+            execution_ref: 'exec-actor-older',
+            approval_id: 'apr-actor-older',
+            task_id: 'task-actor-older',
+            run_id: 'run-actor-older',
+            worker_id: 'worker-actor-older',
+            observed_model: 'gemini-4-argon-high',
+          }),
+        ],
+      }),
+    ],
+    identity,
+  );
+  const olderExecutionActor = resolveSidebarChatActor(
+    evaluateChatWorkLiveness(olderExecutionSelection, idleCoworkerSample, {
+      nowMs: CHAT_WORK_NOW_MS,
+    }),
+  );
+  assert.equal(olderExecutionActor?.label, 'Worker');
+  assert.equal(olderExecutionActor?.observedModel, null);
+
+  // 3b. Mismatched execution run_id for the same execution_ref fails closed (not working, no model).
+  const mismatchedExecutionSelection = selectWorkspaceChatWork(
+    [
+      makeChatWork(identity, {
+        items: [workerItem],
+        worker_presence: [workerPresence],
+        worker_executions: [
+          makeExecution(identity.binding_id, {
+            item_id: workerItem.item_id,
+            execution_ref: 'exec-actor-1',
+            approval_id: 'apr-actor-1',
+            task_id: 'task-actor-1',
+            run_id: 'run-other-attempt',
+            worker_id: 'worker-actor-1',
+            observed_model: 'gemini-4-argon-high',
+          }),
+        ],
+      }),
+    ],
+    identity,
+  );
+  const mismatchedLiveness = evaluateChatWorkLiveness(
+    mismatchedExecutionSelection,
+    idleCoworkerSample,
+    { nowMs: CHAT_WORK_NOW_MS },
+  );
+  assert.equal(mismatchedLiveness.isWorking, false);
+  assert.equal(resolveSidebarChatActor(mismatchedLiveness), null);
+
+  // 4. Coworker-only live never substitutes verified configured_selection (gpt-6-astra) as observed model.
+  const coworkerOnlyLiveness = evaluateChatWorkLiveness(
+    selectWorkspaceChatWork([makeChatWork(identity)], identity),
+    workingCoworkerSample,
+    { nowMs: CHAT_WORK_NOW_MS },
+  );
+  assert.deepEqual(resolveSidebarChatActor(coworkerOnlyLiveness), {
+    kind: 'single_agent',
+    role: 'coworker',
+    roleLabel: 'Coworker',
+    observedModel: null,
+    observedModelRaw: null,
+    workingAgentCount: 1,
+    label: 'Coworker',
+  });
+
+  // 5. Mixed live (Coworker + Worker) shows agent count instead of picking one model.
+  const mixedLiveness = evaluateChatWorkLiveness(
+    observedWorkerSelection,
+    workingCoworkerSample,
+    { nowMs: CHAT_WORK_NOW_MS },
+  );
+  assert.deepEqual(resolveSidebarChatActor(mixedLiveness), {
+    kind: 'multiple_agents',
+    role: null,
+    roleLabel: null,
+    observedModel: null,
+    observedModelRaw: null,
+    workingAgentCount: 2,
+    label: '2 agents',
+  });
+
+  // 6. Multiple live Workers show agent count.
+  const multiWorkerSelection = selectWorkspaceChatWork(
+    [
+      makeChatWork(identity, {
+        items: [workerItem, secondWorkerItem],
+        worker_presence: [workerPresence, secondWorkerPresence],
+        worker_executions: [
+          makeExecution(identity.binding_id, {
+            item_id: workerItem.item_id,
+            execution_ref: 'exec-actor-1',
+            approval_id: 'apr-actor-1',
+            task_id: 'task-actor-1',
+            run_id: 'run-actor-1',
+            worker_id: 'worker-actor-1',
+            observed_model: 'gemini-4-argon-high',
+          }),
+          makeExecution(identity.binding_id, {
+            item_id: secondWorkerItem.item_id,
+            execution_ref: 'exec-actor-2',
+            approval_id: 'apr-actor-2',
+            task_id: 'task-actor-2',
+            run_id: 'run-actor-2',
+            worker_id: 'worker-actor-2',
+            observed_model: 'deepseek-v4.1-flash',
+          }),
+        ],
+      }),
+    ],
+    identity,
+  );
+  assert.deepEqual(
+    resolveSidebarChatActor(
+      evaluateChatWorkLiveness(multiWorkerSelection, idleCoworkerSample, {
+        nowMs: CHAT_WORK_NOW_MS,
+      }),
+    ),
+    {
+      kind: 'multiple_agents',
+      role: null,
+      roleLabel: null,
+      observedModel: null,
+      observedModelRaw: null,
+      workingAgentCount: 2,
+      label: '2 agents',
+    },
+  );
+
+  // 7. Waiting, idle, terminal, unknown, and suppressed states never emit an active actor label.
+  const waitingWithWorker = evaluateChatWorkLiveness(
+    observedWorkerSelection,
+    waitingCoworkerSample,
+    { nowMs: CHAT_WORK_NOW_MS },
+  );
+  assert.equal(resolveSidebarChatStatus(waitingWithWorker).kind, 'waiting');
+  assert.equal(resolveSidebarChatActor(waitingWithWorker), null);
+
+  const idleLiveness = evaluateChatWorkLiveness(
+    selectWorkspaceChatWork([makeChatWork(identity)], identity),
+    idleCoworkerSample,
+    { nowMs: CHAT_WORK_NOW_MS },
+  );
+  assert.equal(resolveSidebarChatStatus(idleLiveness).kind, 'idle');
+  assert.equal(resolveSidebarChatActor(idleLiveness), null);
+
+  assert.equal(resolveSidebarChatActor(observedWorkerLiveness, { suppressed: true }), null);
+  assert.equal(resolveSidebarChatActor(null), null);
+});
+
+test('backlog groups surface Doing and Blocked before 100 Done items without deriving Needs you from Blocked', () => {
+  const identity = makeIdentity('bnd_backlog_100_done', UUID_ALPHA);
+  const doneItems = Array.from({ length: 100 }, (_, index) =>
+    makeBacklogItem({
+      item_id: `blg_done_${index + 1}`,
+      binding_id: identity.binding_id,
+      revision: 2,
+      title: `Completed item ${index + 1}`,
+      status: 'done',
+      completion_note: `Done note ${index + 1}`,
+      completion_evidence: `Verified ${index + 1}`,
+      completed_at_ms: 5_000 + index,
+      updated_at_ms: 5_000 + index,
+    }),
+  );
+  const blockedItem = makeBacklogItem({
+    item_id: 'blg_blocked_1',
+    binding_id: identity.binding_id,
+    revision: 3,
+    title: 'Blocked integration check',
+    status: 'blocked',
+    blocked_reason: 'Upstream acceptance fixture failed.',
+    updated_at_ms: 6_000,
+  });
+  const doingItem = makeBacklogItem({
+    item_id: 'blg_doing_1',
+    binding_id: identity.binding_id,
+    revision: 2,
+    title: 'Active implementation item',
+    status: 'doing',
+    updated_at_ms: 6_100,
+  });
+  const todoItem = makeBacklogItem({
+    item_id: 'blg_todo_1',
+    binding_id: identity.binding_id,
+    revision: 1,
+    title: 'Queued follow-up item',
+    status: 'todo',
+    updated_at_ms: 6_200,
+  });
+
+  const selection = selectWorkspaceChatWork(
+    [
+      makeChatWork(identity, {
+        items: [...doneItems, todoItem, blockedItem, doingItem],
+      }),
+    ],
+    identity,
+  );
+  const groups = buildChatWorkBacklogGroups(selection);
+  assert.deepEqual(
+    groups.map((group) => [group.status, group.items.length]),
+    [
+      ['doing', 1],
+      ['blocked', 1],
+      ['todo', 1],
+      ['done', 100],
+    ],
+  );
+  assert.equal(groups[0]!.items[0]!.itemId, 'blg_doing_1');
+  assert.equal(groups[1]!.items[0]!.itemId, 'blg_blocked_1');
+  assert.equal(groups[1]!.items[0]!.blockedReason, 'Upstream acceptance fixture failed.');
+
+  const liveness = evaluateChatWorkLiveness(
+    selection,
+    makeNativeSample(identity, 'idle', CHAT_WORK_NOW_MS - 500),
+    { nowMs: CHAT_WORK_NOW_MS },
+  );
+  assert.equal(liveness.waitingForHuman, false);
+  assert.equal(liveness.isWorking, false);
+  assert.equal(resolveSidebarChatStatus(liveness).kind, 'idle');
+});
+
+test('formatSidebarLifecycleWorkingLabel reports active and archived working agent counts', () => {
+  assert.equal(formatSidebarLifecycleWorkingLabel('archived', 0), null);
+  assert.equal(formatSidebarLifecycleWorkingLabel('archived', -1), null);
+  assert.equal(
+    formatSidebarLifecycleWorkingLabel('archived', 1),
+    '1 working agent in Archive',
+  );
+  assert.equal(
+    formatSidebarLifecycleWorkingLabel('archived', 3),
+    '3 working agents in Archive',
+  );
+  assert.equal(
+    formatSidebarLifecycleWorkingLabel('active', 1),
+    '1 working agent in Active',
+  );
 });

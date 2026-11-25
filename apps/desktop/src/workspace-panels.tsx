@@ -9,11 +9,14 @@ import {
   AlertCircle,
   Blocks,
   Bot,
+  ChevronDown,
+  ChevronRight,
   ExternalLink,
   FolderGit2,
   History,
   Loader2,
   RefreshCw,
+  Settings2,
   SquareTerminal,
   Terminal,
   X,
@@ -3374,9 +3377,18 @@ export interface WorkspaceChatWorkSurfaceProps {
   loading?: boolean;
   error?: string | null;
   isStale?: boolean;
+  workspaceStatus?: 'loading' | 'unavailable' | 'empty' | 'ready';
+  workspaceHealthyEmpty?: boolean;
+  workspaceUnavailableReason?: string | null;
+  workspaceLifecycle?: 'active' | 'archived';
+  activeChatCount?: number;
+  archivedChatCount?: number;
   onRefresh?: () => void;
   onOpenCodex?: (target: CodexChatTarget) => void;
   onOpenScopedCodex?: (target: WorkspaceScopedChatTarget) => void;
+  onOpenSettings?: () => void;
+  onOpenCodexSettings?: () => void;
+  onOpenArchive?: () => void;
   codexOpenInFlight?: boolean;
 }
 
@@ -3421,12 +3433,23 @@ export function WorkspaceChatWorkSurface({
   loading = false,
   error = null,
   isStale = false,
+  workspaceStatus,
+  workspaceHealthyEmpty = false,
+  workspaceUnavailableReason = null,
+  workspaceLifecycle = 'active',
+  activeChatCount,
+  archivedChatCount,
   onRefresh,
   onOpenCodex,
   onOpenScopedCodex,
+  onOpenSettings,
+  onOpenCodexSettings,
+  onOpenArchive,
   codexOpenInFlight = false,
 }: WorkspaceChatWorkSurfaceProps) {
   const [backlogOpen, setBacklogOpen] = useState(false);
+  const [doneExpanded, setDoneExpanded] = useState(false);
+  const donePanelId = useId();
   const streamRef = useRef<HTMLDivElement | null>(null);
   const listRef = useRef<HTMLOListElement | null>(null);
   const backlogTriggerRef = useRef<HTMLButtonElement | null>(null);
@@ -3571,6 +3594,7 @@ export function WorkspaceChatWorkSurface({
 
   useEffect(() => {
     setBacklogOpen(false);
+    setDoneExpanded(false);
   }, [chatKey]);
 
   // Record every self-issued scroll target for the current chat. A matching
@@ -3854,9 +3878,41 @@ export function WorkspaceChatWorkSurface({
       ) : (
         <header className="tl-cw-header">
           <div className="tl-cw-heading">
-            <h2 className="tl-cw-title">Workspace</h2>
+            <h2 className="tl-cw-title">
+              {loading || workspaceStatus === 'loading'
+                ? 'Workspace'
+                : workspaceStatus === 'unavailable' ||
+                    error !== null ||
+                    (workspaceStatus === 'empty' && !workspaceHealthyEmpty)
+                  ? 'Connection unavailable'
+                  : workspaceStatus === 'empty' && workspaceHealthyEmpty
+                    ? 'No Codex chats yet'
+                    : workspaceLifecycle === 'archived' && (archivedChatCount ?? 0) === 0
+                      ? 'Archive is empty'
+                      : workspaceLifecycle === 'active' &&
+                          (activeChatCount ?? 0) === 0 &&
+                          (archivedChatCount ?? 0) > 0
+                        ? 'No active chats'
+                        : 'Workspace'}
+            </h2>
             <div className="tl-cw-subtitle">
-              <span>Select a chat to view its activity stream.</span>
+              <span>
+                {loading || workspaceStatus === 'loading'
+                  ? 'Reading workspace snapshot…'
+                  : workspaceStatus === 'unavailable' ||
+                      error !== null ||
+                      (workspaceStatus === 'empty' && !workspaceHealthyEmpty)
+                    ? 'Workspace observation is not connected.'
+                    : workspaceStatus === 'empty' && workspaceHealthyEmpty
+                      ? 'Workspace observation is connected and ready.'
+                      : workspaceLifecycle === 'archived' && (archivedChatCount ?? 0) === 0
+                        ? 'Archived chats appear here.'
+                        : workspaceLifecycle === 'active' &&
+                            (activeChatCount ?? 0) === 0 &&
+                            (archivedChatCount ?? 0) > 0
+                          ? 'Archived chats remain available in Archive.'
+                          : 'Select a chat to view its activity stream.'}
+              </span>
             </div>
           </div>
         </header>
@@ -4021,25 +4077,132 @@ export function WorkspaceChatWorkSurface({
           </ol>
 
           {eventViews.length === 0 ? (
-            <div className="tl-cw-empty" role="status">
-              {loading ? (
-                <>
+            chat === null ? (
+              loading || workspaceStatus === 'loading' ? (
+                <div className="tl-cw-empty" role="status">
                   <Loader2 size={15} className="tl-spin" aria-hidden="true" />
-                  <span>Reading chat activity…</span>
-                </>
-              ) : error !== null ? (
-                <>
-                  <AlertCircle size={15} aria-hidden="true" />
-                  <span>Chat activity is unavailable until the next successful refresh.</span>
-                </>
-              ) : selection.availability === 'unavailable' ? (
-                <span>
-                  {selection.unavailableReason ?? 'Chat activity is unavailable.'}
-                </span>
+                  <span>Reading workspace snapshot…</span>
+                </div>
+              ) : workspaceStatus === 'unavailable' ||
+                error !== null ||
+                (workspaceStatus === 'empty' && !workspaceHealthyEmpty) ? (
+                <div
+                  className="tl-cw-empty tl-cw-empty--card"
+                  role="status"
+                  data-workspace-empty-kind="unavailable"
+                >
+                  <div className="tl-cw-empty-copy">
+                    <strong className="tl-cw-empty-title">
+                      <AlertCircle size={15} aria-hidden="true" />
+                      <span>Observation unavailable</span>
+                    </strong>
+                    <span>
+                      {workspaceUnavailableReason ??
+                        error ??
+                        'Workspace observation runtime is not connected or returned no snapshot.'}
+                    </span>
+                  </div>
+                  {onOpenSettings ? (
+                    <div className="tl-cw-empty-actions">
+                      {onRefresh ? (
+                        <button type="button" className="tl-cw-btn" onClick={onRefresh}>
+                          <RefreshCw size={13} aria-hidden="true" />
+                          <span>Retry</span>
+                        </button>
+                      ) : null}
+                      <button type="button" className="tl-cw-btn" onClick={onOpenSettings}>
+                        <Settings2 size={13} aria-hidden="true" />
+                        <span>Open Settings</span>
+                      </button>
+                    </div>
+                  ) : null}
+                </div>
+              ) : workspaceStatus === 'empty' && workspaceHealthyEmpty ? (
+                <div
+                  className="tl-cw-empty tl-cw-empty--card"
+                  role="status"
+                  data-workspace-empty-kind="healthy-empty"
+                >
+                  <div className="tl-cw-empty-copy">
+                    <strong className="tl-cw-empty-title">Open a Codex project chat</strong>
+                    <span>
+                      Threadlane is connected and ready. Open a project chat in Codex to start tracking work here.
+                    </span>
+                  </div>
+                  {onOpenCodexSettings ? (
+                    <div className="tl-cw-empty-actions">
+                      <button
+                        type="button"
+                        className="tl-cw-btn"
+                        onClick={onOpenCodexSettings}
+                      >
+                        <Settings2 size={13} aria-hidden="true" />
+                        <span>Codex integration in Settings</span>
+                      </button>
+                    </div>
+                  ) : null}
+                </div>
+              ) : workspaceLifecycle === 'active' &&
+                (activeChatCount ?? 0) === 0 &&
+                (archivedChatCount ?? 0) > 0 ? (
+                <div
+                  className="tl-cw-empty tl-cw-empty--card"
+                  role="status"
+                  data-workspace-empty-kind="active-empty"
+                >
+                  <div className="tl-cw-empty-copy">
+                    <strong className="tl-cw-empty-title">No active chats</strong>
+                    <span>
+                      All observed chats are currently in Archive. Restore any chat without losing Codex history.
+                    </span>
+                  </div>
+                  {onOpenArchive ? (
+                    <div className="tl-cw-empty-actions">
+                      <button type="button" className="tl-cw-btn" onClick={onOpenArchive}>
+                        <span>Open Archive</span>
+                      </button>
+                    </div>
+                  ) : null}
+                </div>
+              ) : workspaceLifecycle === 'archived' && (archivedChatCount ?? 0) === 0 ? (
+                <div
+                  className="tl-cw-empty tl-cw-empty--card"
+                  role="status"
+                  data-workspace-empty-kind="archive-empty"
+                >
+                  <div className="tl-cw-empty-copy">
+                    <strong className="tl-cw-empty-title">No archived chats</strong>
+                    <span>
+                      Archiving a chat is a reversible local view preference and never deletes Codex history.
+                    </span>
+                  </div>
+                </div>
               ) : (
-                <span>No activity is recorded for this chat yet.</span>
-              )}
-            </div>
+                <div className="tl-cw-empty" role="status">
+                  <span>Select a chat to view its activity stream.</span>
+                </div>
+              )
+            ) : (
+              <div className="tl-cw-empty" role="status">
+                {loading ? (
+                  <>
+                    <Loader2 size={15} className="tl-spin" aria-hidden="true" />
+                    <span>Reading chat activity…</span>
+                  </>
+                ) : error !== null ? (
+                  <>
+                    <AlertCircle size={15} aria-hidden="true" />
+                    <span>Chat activity is unavailable until the next successful refresh.</span>
+                  </>
+                ) : selection.availability === 'unavailable' ? (
+                  <span>
+                    {selection.unavailableReason ?? 'Chat activity is unavailable.'}
+                  </span>
+                ) : (
+                  <span>No activity is recorded for this chat yet.</span>
+                )}
+              </div>
+            )
           ) : null}
         </div>
 
@@ -4054,7 +4217,15 @@ export function WorkspaceChatWorkSurface({
         ) : null}
       </div>
 
-      <Dialog.Root open={backlogOpen} onOpenChange={setBacklogOpen}>
+      <Dialog.Root
+        open={backlogOpen}
+        onOpenChange={(open) => {
+          setBacklogOpen(open);
+          if (!open) {
+            setDoneExpanded(false);
+          }
+        }}
+      >
         <Dialog.Content
           className="tl-cw-drawer-dialog"
           aria-label="Backlog"
@@ -4075,93 +4246,168 @@ export function WorkspaceChatWorkSurface({
               variant="ghost"
               color="gray"
               aria-label="Close backlog drawer"
-              onClick={() => setBacklogOpen(false)}
+              onClick={() => {
+                setBacklogOpen(false);
+                setDoneExpanded(false);
+              }}
             >
               <X size={17} aria-hidden="true" />
             </IconButton>
           </header>
 
           <div className="tl-cw-drawer-body">
-            {backlogGroups.map((group) => (
-              <section
-                key={group.status}
-                className="tl-cw-backlog-section"
-                aria-label={`${group.label} backlog items`}
-              >
-                <header className="tl-cw-backlog-heading">
+            <div className="tl-cw-backlog-overview" aria-label="Backlog counts">
+              {backlogGroups.map((group) => (
+                <span
+                  key={group.status}
+                  className="tl-cw-backlog-overview-chip"
+                  data-backlog-count-status={group.status}
+                >
                   <ChatWorkStatusDot tone={backlogStatusTone(group.status)} />
-                  <h3>{BACKLOG_STATUS_LABELS[group.status]}</h3>
-                  <span className="tl-cw-backlog-count">{group.items.length}</span>
-                </header>
+                  <span>{BACKLOG_STATUS_LABELS[group.status]}</span>
+                  <span className="tl-cw-backlog-overview-num">{group.items.length}</span>
+                </span>
+              ))}
+            </div>
 
-                {group.items.length === 0 ? (
-                  <p className="tl-cw-backlog-empty">No {group.label.toLowerCase()} items.</p>
-                ) : (
-                  <div className="tl-cw-backlog-list">
-                    {group.items.map((item) => (
-                      <details
-                        key={item.key}
-                        className="tl-cw-backlog-item"
-                        data-backlog-item-id={item.itemId}
-                        data-status={item.status}
-                      >
-                        <summary className="tl-cw-backlog-summary">
-                          <ChatWorkStatusDot tone={item.statusTone} />
-                          <span className="tl-cw-backlog-title">
-                            {item.title}
-                            <DecisionBadge badge={item.decisionBadge} placement="drawer" />
-                          </span>
-                          <span className="tl-cw-backlog-kind">{item.kindLabel}</span>
-                        </summary>
-                        <div className="tl-cw-backlog-details">
-                          {item.status === 'blocked' ? (
-                            <p>
-                              <strong>Blocked reason</strong>
-                              <span>
-                                {item.blockedReason ??
-                                  'No blocked reason was recorded.'}
-                              </span>
-                            </p>
-                          ) : null}
-                          {item.acceptanceCondition !== null ? (
-                            <p>
-                              <strong>Acceptance</strong>
-                              <span>{item.acceptanceCondition}</span>
-                            </p>
-                          ) : null}
-                          {item.deliveryDescription !== null ? (
-                            <p>
-                              <strong>Delivery</strong>
-                              <span>{item.deliveryDescription}</span>
-                            </p>
-                          ) : null}
-                          {item.completionNote !== null ? (
-                            <p>
-                              <strong>Completion note</strong>
-                              <span>{item.completionNote}</span>
-                            </p>
-                          ) : null}
-                          {item.completionEvidence !== null ? (
-                            <p>
-                              <strong>Completion evidence</strong>
-                              <span>{item.completionEvidence}</span>
-                            </p>
-                          ) : null}
-                          {item.completedAtMs !== null ? (
-                            <p>
-                              <strong>Completed</strong>
-                              <span>
-                                {formatRelativeTimestamp(item.completedAtMs, referenceNowMs)}
-                              </span>
-                            </p>
-                          ) : null}
-                        </div>
-                      </details>
-                    ))}
+            {backlogGroups.map((group) => {
+              const isCollapsibleHistory = group.status === 'done';
+              const renderGroupItem = (
+                item: (typeof group.items)[number],
+              ) => (
+                <details
+                  key={item.key}
+                  className="tl-cw-backlog-item"
+                  data-backlog-item-id={item.itemId}
+                  data-status={item.status}
+                >
+                  <summary className="tl-cw-backlog-summary">
+                    <ChatWorkStatusDot tone={item.statusTone} />
+                    <span className="tl-cw-backlog-title">
+                      {item.title}
+                      <DecisionBadge badge={item.decisionBadge} placement="drawer" />
+                    </span>
+                    <span className="tl-cw-backlog-kind">{item.kindLabel}</span>
+                  </summary>
+                  <div className="tl-cw-backlog-details">
+                    {item.status === 'blocked' ? (
+                      <p>
+                        <strong>Blocked reason</strong>
+                        <span>
+                          {item.blockedReason ??
+                            'No blocked reason was recorded.'}
+                        </span>
+                      </p>
+                    ) : null}
+                    {item.acceptanceCondition !== null ? (
+                      <p>
+                        <strong>Acceptance</strong>
+                        <span>{item.acceptanceCondition}</span>
+                      </p>
+                    ) : null}
+                    {item.deliveryDescription !== null ? (
+                      <p>
+                        <strong>Delivery</strong>
+                        <span>{item.deliveryDescription}</span>
+                      </p>
+                    ) : null}
+                    {item.completionNote !== null ? (
+                      <p>
+                        <strong>Completion note</strong>
+                        <span>{item.completionNote}</span>
+                      </p>
+                    ) : null}
+                    {item.completionEvidence !== null ? (
+                      <p>
+                        <strong>Completion evidence</strong>
+                        <span>{item.completionEvidence}</span>
+                      </p>
+                    ) : null}
+                    {item.completedAtMs !== null ? (
+                      <p>
+                        <strong>Completed</strong>
+                        <span>
+                          {formatRelativeTimestamp(item.completedAtMs, referenceNowMs)}
+                        </span>
+                      </p>
+                    ) : null}
                   </div>
-                )}
-              </section>
-            ))}
+                </details>
+              );
+
+              if (isCollapsibleHistory) {
+                return (
+                  <section
+                    key={group.status}
+                    className="tl-cw-backlog-section tl-cw-backlog-section--history"
+                    aria-label={`${group.label} backlog items`}
+                    data-backlog-section={group.status}
+                    data-collapsed={doneExpanded ? 'false' : 'true'}
+                  >
+                    <header className="tl-cw-backlog-heading tl-cw-backlog-heading--collapsible">
+                      <h3 className="tl-cw-backlog-heading-title">
+                        <button
+                          type="button"
+                          className="tl-cw-backlog-toggle"
+                          aria-expanded={doneExpanded}
+                          aria-controls={donePanelId}
+                          data-backlog-toggle="done"
+                          onClick={() => setDoneExpanded((prev) => !prev)}
+                        >
+                          {doneExpanded ? (
+                            <ChevronDown size={14} aria-hidden="true" />
+                          ) : (
+                            <ChevronRight size={14} aria-hidden="true" />
+                          )}
+                          <ChatWorkStatusDot tone={backlogStatusTone(group.status)} />
+                          <span>{BACKLOG_STATUS_LABELS[group.status]}</span>
+                          <span className="tl-cw-backlog-count">{group.items.length}</span>
+                        </button>
+                      </h3>
+                    </header>
+
+                    <div
+                      id={donePanelId}
+                      className="tl-cw-backlog-list"
+                      hidden={!doneExpanded}
+                    >
+                      {doneExpanded ? (
+                        group.items.length === 0 ? (
+                          <p className="tl-cw-backlog-empty">
+                            No {group.label.toLowerCase()} items.
+                          </p>
+                        ) : (
+                          group.items.map(renderGroupItem)
+                        )
+                      ) : null}
+                    </div>
+                  </section>
+                );
+              }
+
+              return (
+                <section
+                  key={group.status}
+                  className="tl-cw-backlog-section"
+                  aria-label={`${group.label} backlog items`}
+                  data-backlog-section={group.status}
+                >
+                  <header className="tl-cw-backlog-heading">
+                    <ChatWorkStatusDot tone={backlogStatusTone(group.status)} />
+                    <h3>{BACKLOG_STATUS_LABELS[group.status]}</h3>
+                    <span className="tl-cw-backlog-count">{group.items.length}</span>
+                  </header>
+
+                  {group.items.length === 0 ? (
+                    <p className="tl-cw-backlog-empty">No {group.label.toLowerCase()} items.</p>
+                  ) : (
+                    <div className="tl-cw-backlog-list">
+                      {group.items.map(renderGroupItem)}
+                    </div>
+                  )}
+                </section>
+              );
+            })}
 
             {selection.notices.length > 0 ? (
               <div className="tl-cw-bounds" role="status">

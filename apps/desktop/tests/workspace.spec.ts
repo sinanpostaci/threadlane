@@ -10,6 +10,7 @@ import {
   appendChatWorkEventFixture,
   backlogButton,
   BETA_CHAT_ONLY_SENTINEL,
+  buildDefaultCodexSetupFixture,
   buildExternalResolutionWorkspaceSnapshot,
   buildFourPartScopeCollisionWorkspaceSnapshot,
   buildHistoricalFailureWorkspaceSnapshot,
@@ -25,6 +26,7 @@ import {
   chatHeader,
   closeBacklogWithEscape,
   createBacklogEvent,
+  createBacklogItem,
   createBacklogWorkerPresence,
   createWorkerExecution,
   EXTERNAL_RESOLUTION_FULL_SUMMARY,
@@ -102,10 +104,12 @@ import {
   workspaceSection,
   WRONG_SCOPE_QUARANTINE_SENTINEL,
 } from './fixtures/workspace.ts';
+import { CODEX_APP_UNAVAILABLE_ERROR_CODE } from '../src/app-data.ts';
 import {
   CHAT_WORK_EXECUTION_BRIEF_GAP_MS,
 } from '../src/message-scroll.ts';
 import {
+  formatWorkspaceChatIdentityKey,
   parseWorkspaceSnapshot,
   WORKSPACE_CHAT_ARCHIVE_STORAGE_KEY,
   WORKSPACE_SAMPLE_STALE_THRESHOLD_MS,
@@ -224,6 +228,15 @@ async function expectCommittedBacklogStatus(
   const row = resolveBacklogItemRow(group, title);
   await expect(row).toBeVisible();
   await expect(row).toHaveAttribute('data-status', status);
+}
+
+async function expandBacklogDoneSection(dialog: Locator): Promise<void> {
+  const toggle = dialog.locator('[data-backlog-toggle="done"]').first();
+  await expect(toggle).toBeVisible();
+  if ((await toggle.getAttribute('aria-expanded')) !== 'true') {
+    await toggle.click();
+  }
+  await expect(toggle).toHaveAttribute('aria-expanded', 'true');
 }
 
 async function expectNoInventedBacklogRowStatus(row: Locator): Promise<void> {
@@ -1381,6 +1394,11 @@ test.describe('Minimal chat stream, archive, scroll, and read-only backlog drawe
     await expect(dialog.getByText(WRONG_SCOPE_QUARANTINE_SENTINEL)).toHaveCount(0);
     await expect(dialog.getByText(MINIMAL_CHAT_LEGACY_MESSAGE_SENTINEL)).toHaveCount(0);
 
+    const doneToggle = dialog.locator('[data-backlog-toggle="done"]').first();
+    await expect(doneToggle).toHaveAttribute('aria-expanded', 'false');
+    await expect(dialog.getByText(MINIMAL_CHAT_DONE_TITLE, { exact: true })).toHaveCount(0);
+    await expandBacklogDoneSection(dialog);
+
     const expectedStates: Array<[string, CommittedBacklogStatus]> = [
       [MINIMAL_CHAT_TODO_TITLE, 'todo'],
       [MINIMAL_CHAT_COWORKER_DOING_TITLE, 'doing'],
@@ -1431,6 +1449,13 @@ test.describe('Minimal chat stream, archive, scroll, and read-only backlog drawe
     await page.setViewportSize({ width: 390, height: 740 });
     const narrowDialog = await openBacklog(page);
     await expect(
+      resolveBacklogItemRow(narrowDialog, MINIMAL_CHAT_BLOCKED_TITLE),
+    ).toBeVisible();
+    await expect(
+      narrowDialog.locator('[data-backlog-toggle="done"]').first(),
+    ).toHaveAttribute('aria-expanded', 'false');
+    await expandBacklogDoneSection(narrowDialog);
+    await expect(
       resolveBacklogItemRow(narrowDialog, MINIMAL_CHAT_DONE_TITLE),
     ).toBeVisible();
     const narrowBox = await narrowDialog.boundingBox();
@@ -1463,6 +1488,7 @@ test.describe('Minimal chat stream, archive, scroll, and read-only backlog drawe
     let trigger = backlogButton(page);
     let dialog = await openBacklog(page);
     await waitForFiniteAnimations(dialog);
+    await expandBacklogDoneSection(dialog);
     for (const title of drawerTitles) {
       await expectReadableDrawerTitle(dialog, title);
     }
@@ -1485,6 +1511,7 @@ test.describe('Minimal chat stream, archive, scroll, and read-only backlog drawe
     trigger = backlogButton(page);
     dialog = await openBacklog(page);
     await waitForFiniteAnimations(dialog);
+    await expandBacklogDoneSection(dialog);
     for (const title of drawerTitles) {
       await expectReadableDrawerTitle(dialog, title);
     }
@@ -2448,6 +2475,7 @@ test.describe('Workspace liveness, attention, and committed completion', () => {
     await expectNoLiveAgentWorking(workspaceSection(page), 'Coworker');
     const dialog = await openBacklog(page);
 
+    await expandBacklogDoneSection(dialog);
     await expectCommittedBacklogStatus(dialog, MINIMAL_CHAT_DONE_TITLE, 'done');
     await expectCommittedBacklogStatus(dialog, MINIMAL_CHAT_TODO_TITLE, 'todo');
     await expectCommittedBacklogStatus(
@@ -2567,6 +2595,7 @@ test.describe('Workspace liveness, attention, and committed completion', () => {
     expect(storedAlphaSample?.last_success_at_ms).toBe(baseAlphaSample!.last_success_at_ms);
 
     const dialog = await openBacklog(page);
+    await expandBacklogDoneSection(dialog);
     await expect(resolveBacklogItemRow(dialog, MINIMAL_CHAT_DONE_TITLE)).toBeVisible();
     await closeBacklogWithEscape(page);
   });
@@ -2698,6 +2727,7 @@ test.describe('Workspace liveness, attention, and committed completion', () => {
       ),
     ).toBeVisible();
 
+    await expandBacklogDoneSection(dialog);
     await expectCommittedBacklogStatus(dialog, MINIMAL_CHAT_DONE_TITLE, 'done');
     await closeBacklogWithEscape(page);
   });
@@ -3723,6 +3753,7 @@ test.describe('Compact Worker execution metadata footer', () => {
 
     const dialog = await openBacklog(page);
     await expectCommittedBacklogStatus(dialog, MINIMAL_CHAT_CHECKING_TITLE, 'doing');
+    await expandBacklogDoneSection(dialog);
     await expectCommittedBacklogStatus(dialog, MINIMAL_CHAT_ACCEPTED_TITLE, 'done');
     const acceptedDrawerItem = await resolveBacklogItemRow(
       dialog,
@@ -4293,6 +4324,7 @@ test.describe('Compact Worker execution metadata footer', () => {
     expect(reloadedStatus).toBe(beforeStatus);
 
     const dialog = await openBacklog(page);
+    await expandBacklogDoneSection(dialog);
     await expectCommittedBacklogStatus(dialog, MINIMAL_CHAT_ACCEPTED_TITLE, 'done');
     await closeBacklogWithEscape(page);
   });
@@ -4410,6 +4442,7 @@ test.describe('Compact Worker execution metadata footer', () => {
 
     const dialog = await openBacklog(page);
     await expectCommittedBacklogStatus(dialog, MINIMAL_CHAT_CHECKING_TITLE, 'blocked');
+    await expandBacklogDoneSection(dialog);
     await expectCommittedBacklogStatus(dialog, MINIMAL_CHAT_ACCEPTED_TITLE, 'done');
     await closeBacklogWithEscape(page);
   });
@@ -5677,6 +5710,7 @@ test.describe('Legacy compatibility safety', () => {
 
     const dialog = await openBacklog(page);
     await expect(dialog.getByText(MINIMAL_CHAT_MALFORMED_WORK_SENTINEL)).toHaveCount(0);
+    await expandBacklogDoneSection(dialog);
     await expect(resolveBacklogItemRow(dialog, MINIMAL_CHAT_DONE_TITLE)).toBeVisible();
     await closeBacklogWithEscape(page);
   });
@@ -5850,3 +5884,477 @@ for (const width of [390, 1040]) {
     }
   });
 }
+
+test.describe('UX-02/03/04/05 desktop ergonomics and honesty invariants', () => {
+  test('shows active role and verified observed execution model beside Working without substituting Coworker configuration or requested models', async ({
+    page,
+  }) => {
+    const base = buildWorkerMetadataWorkspaceSnapshot();
+    const controller = await installMinimal(page, { width: 1040, height: 760 }, {
+      workspaceSnapshot: base,
+    });
+    const sidebarEl = sidebar(page);
+    const alphaBtn = sidebarEl
+      .locator('button.tl-chat-item')
+      .filter({ hasText: 'Workspace UI Contract' })
+      .first();
+    const betaBtn = sidebarEl
+      .locator('button.tl-chat-item')
+      .filter({ hasText: 'Release Verification Gate' })
+      .first();
+
+    // 1. Live Worker with verified observed_model + idle Coworker configured as gpt-5.4:
+    // sidebar shows Worker · Argon, never GPT-5.4.
+    const alphaActor = alphaBtn.locator('.tl-chat-model-text');
+    await expect(alphaBtn.locator('[data-sidebar-status="working"]')).toHaveText('Working');
+    await expect(alphaActor).toHaveCount(1);
+    await expect(alphaActor).toHaveText('Worker · Argon');
+    await expect(alphaActor).toHaveAttribute('data-sidebar-actor', 'single_agent');
+    await expect(alphaActor).toHaveAttribute('data-sidebar-actor-role', 'worker');
+    await expect(alphaActor).toHaveAttribute('data-observed-model', 'gemini-4-argon-high');
+    await expect(alphaBtn).not.toContainText(/gpt-5\.4/i);
+    await expectLiveAgentWorking(workspaceSection(page), 'Worker');
+    await expect(betaBtn.locator('[data-sidebar-status="idle"]')).toHaveText('Idle');
+    await expect(betaBtn.locator('.tl-chat-model-text')).toHaveCount(0);
+
+    // 2. Worker with requested_model only (observed_model === null) shows role only.
+    const requestedOnlySnapshot = updateChatWorkWorkerExecutionFixture(
+      advanceWorkspaceGeneratedAtFixture(base, FIXTURE_BASE_NOW_MS + 1_000),
+      CHAT_ALPHA_IDENTITY,
+      MINIMAL_CHAT_ALPHA_LIVE_EXECUTION_REF,
+      {
+        requested_model: 'gemini-4-argon-high',
+        observed_model: null,
+      },
+    );
+    await controller.setWorkspaceSnapshot(requestedOnlySnapshot);
+    await triggerWorkspaceRefresh(page);
+    await expect(alphaActor).toHaveText('Worker');
+    await expect(alphaActor).not.toHaveAttribute('data-observed-model', /.+/);
+    await expect(alphaBtn).not.toContainText(/argon|gpt-5\.4/i);
+
+    // 3. Mixed Coworker + Worker live shows agent count.
+    const mixedSnapshot = updateNativeActivityFixture(
+      advanceWorkspaceGeneratedAtFixture(requestedOnlySnapshot, FIXTURE_BASE_NOW_MS + 2_000),
+      CHAT_ALPHA_IDENTITY,
+      'working',
+    );
+    await controller.setWorkspaceSnapshot(mixedSnapshot);
+    await triggerWorkspaceRefresh(page);
+    await expect(alphaActor).toHaveText('2 agents');
+    await expect(alphaActor).toHaveAttribute('data-sidebar-actor', 'multiple_agents');
+    await expectLiveAgentWorking(workspaceSection(page), 'Coworker');
+    await expectLiveAgentWorking(workspaceSection(page), 'Worker');
+
+    // 4. Coworker-only live shows role only (never substitutes configured gpt-5.4).
+    const coworkerOnlySnapshot = updateChatWorkPresenceFixture(
+      advanceWorkspaceGeneratedAtFixture(mixedSnapshot, FIXTURE_BASE_NOW_MS + 3_000),
+      CHAT_ALPHA_IDENTITY,
+      [],
+    );
+    await controller.setWorkspaceSnapshot(coworkerOnlySnapshot);
+    await triggerWorkspaceRefresh(page);
+    await expect(alphaActor).toHaveText('Coworker');
+    await expect(alphaActor).toHaveAttribute('data-sidebar-actor-role', 'coworker');
+    await expect(alphaBtn).not.toContainText(/gpt-5\.4/i);
+
+    // 5. Waiting chat stays honest with no active model badge.
+    const waitingBetaSnapshot = updateNativeActivityFixture(
+      advanceWorkspaceGeneratedAtFixture(coworkerOnlySnapshot, FIXTURE_BASE_NOW_MS + 4_000),
+      CHAT_BETA_SAME_PROJECT_IDENTITY,
+      'waiting_for_approval',
+    );
+    await controller.setWorkspaceSnapshot(waitingBetaSnapshot);
+    await triggerWorkspaceRefresh(page);
+    await expect(betaBtn.locator('[data-sidebar-status="waiting"]')).toHaveText(
+      'Waiting for you in Codex',
+    );
+    await expect(betaBtn.locator('.tl-chat-model-text')).toHaveCount(0);
+  });
+
+  test('surfaces Doing, Blocked, and counts ahead of 100 collapsed-by-default Done items without deriving Needs you from Blocked', async ({
+    page,
+  }) => {
+    const base = buildMinimalChatWorkspaceSnapshot();
+    const doneItems = Array.from({ length: 100 }, (_, index) =>
+      createBacklogItem({
+        identity: CHAT_ALPHA_IDENTITY,
+        itemId: `blg_done_${String(index + 1).padStart(3, '0')}`,
+        title: `Completed history slice #${index + 1}`,
+        revision: 2,
+        kind: 'worker',
+        status: 'done',
+        completionNote: `Verified slice #${index + 1}.`,
+        completionEvidence: `Evidence #${index + 1}.`,
+        completedAtMs: FIXTURE_BASE_NOW_MS - 120_000 + index * 500,
+        createdAtMs: FIXTURE_BASE_NOW_MS - 180_000 + index * 500,
+        updatedAtMs: FIXTURE_BASE_NOW_MS - 120_000 + index * 500,
+      }),
+    );
+    const doingItem = createBacklogItem({
+      identity: CHAT_ALPHA_IDENTITY,
+      itemId: 'blg_ux03_doing',
+      title: 'Active worker slice',
+      revision: 2,
+      kind: 'worker',
+      status: 'doing',
+    });
+    const blockedItem = createBacklogItem({
+      identity: CHAT_ALPHA_IDENTITY,
+      itemId: 'blg_ux03_blocked',
+      title: 'Critical blocked review item',
+      revision: 3,
+      kind: 'worker',
+      status: 'blocked',
+      blockedReason: 'Awaiting external schema fixture repair.',
+    });
+    const todoItem = createBacklogItem({
+      identity: CHAT_ALPHA_IDENTITY,
+      itemId: 'blg_ux03_todo',
+      title: 'Queued next slice',
+      revision: 1,
+      kind: 'coworker',
+      status: 'todo',
+    });
+
+    const hundredDoneSnapshot = updateChatWorkFixture(base, CHAT_ALPHA_IDENTITY, {
+      items: [...doneItems, todoItem, blockedItem, doingItem],
+      worker_presence: [],
+    });
+
+    await installMinimal(page, { width: 1040, height: 760 }, {
+      workspaceSnapshot: hundredDoneSnapshot,
+    });
+    await expectNoNeedsYou(page);
+
+    const trigger = backlogButton(page);
+    const dialog = await openBacklog(page);
+
+    // Overview counts and section order put Doing and Blocked ahead of 100 Done items.
+    await expect(dialog.locator('[data-backlog-count-status="doing"]')).toContainText('1');
+    await expect(dialog.locator('[data-backlog-count-status="blocked"]')).toContainText('1');
+    await expect(dialog.locator('[data-backlog-count-status="todo"]')).toContainText('1');
+    await expect(dialog.locator('[data-backlog-count-status="done"]')).toContainText('100');
+    const sectionOrder = await dialog
+      .locator('[data-backlog-section]')
+      .evaluateAll((nodes) => nodes.map((node) => node.getAttribute('data-backlog-section')));
+    expect(sectionOrder).toEqual(['doing', 'blocked', 'todo', 'done']);
+
+    // Done is collapsed by default; Blocked is immediately visible without scrolling past 100 Done items.
+    const doneToggle = dialog.locator('[data-backlog-toggle="done"]').first();
+    await expect(doneToggle).toHaveAttribute('aria-expanded', 'false');
+    await expect(dialog.locator('[data-backlog-section="done"]')).toHaveAttribute(
+      'data-collapsed',
+      'true',
+    );
+    await expect(dialog.locator('[data-status="done"]')).toHaveCount(0);
+
+    const blockedRow = resolveBacklogItemRow(dialog, 'Critical blocked review item');
+    await expect(blockedRow).toBeVisible();
+    await expect(blockedRow).toHaveAttribute('data-backlog-item-id', 'blg_ux03_blocked');
+    const [dialogBox, blockedBox] = await Promise.all([
+      dialog.boundingBox(),
+      blockedRow.boundingBox(),
+    ]);
+    expect(dialogBox).not.toBeNull();
+    expect(blockedBox).not.toBeNull();
+    expect(blockedBox!.y + blockedBox!.height).toBeLessThanOrEqual(
+      dialogBox!.y + dialogBox!.height,
+    );
+    await expectNoNeedsYou(page);
+
+    // Keyboard Enter toggles Done open and reveals all 100 Done items with preserved identity.
+    await doneToggle.focus();
+    await page.keyboard.press('Enter');
+    await expect(doneToggle).toHaveAttribute('aria-expanded', 'true');
+    await expect(dialog.locator('[data-status="done"]')).toHaveCount(100);
+    await expect(
+      dialog.locator('[data-backlog-item-id="blg_done_001"]'),
+    ).toContainText('Completed history slice #1');
+
+    // Keyboard Enter collapses Done again.
+    await page.keyboard.press('Enter');
+    await expect(doneToggle).toHaveAttribute('aria-expanded', 'false');
+    await expect(dialog.locator('[data-status="done"]')).toHaveCount(0);
+    await expectNoHorizontalOverflow(page, 'wide 100-done backlog drawer');
+
+    await closeBacklogWithEscape(page);
+    await expect(trigger).toBeFocused();
+
+    // Narrow 390px layout resets Done collapsed, keeps Blocked visible, and avoids overflow.
+    await page.setViewportSize({ width: 390, height: 740 });
+    const narrowDialog = await openBacklog(page);
+    await expect(
+      narrowDialog.locator('[data-backlog-toggle="done"]').first(),
+    ).toHaveAttribute('aria-expanded', 'false');
+    await expect(
+      resolveBacklogItemRow(narrowDialog, 'Critical blocked review item'),
+    ).toBeVisible();
+    await expectNoHorizontalOverflow(page, 'narrow 100-done backlog drawer');
+    await closeBacklogWithEscape(page);
+    await expect(backlogButton(page)).toBeFocused();
+  });
+
+  test('distinguishes healthy empty workspace from unavailable connection without auto-applying setup', async ({
+    page,
+  }) => {
+    const base = buildMinimalChatWorkspaceSnapshot();
+    const healthyEmptySnapshot = parseWorkspaceSnapshot({
+      ...base,
+      observation: {
+        ...base.observation,
+        jobs: [],
+        requests: [],
+      },
+      chats: [],
+      native_samples: [],
+      job_histories: [],
+      chat_work: [],
+      messages: {
+        ...base.messages,
+        items: [],
+      },
+    });
+
+    const controller = await installWorkspaceTauriFixture(page, {
+      workspaceSnapshot: healthyEmptySnapshot,
+    });
+    await page.setViewportSize({ width: 1040, height: 760 });
+    await page.goto('/');
+    await expect(page.locator('#app .tl-app-shell, #app .tl-app').first()).toBeVisible();
+
+    // 1. Healthy empty directs the user to open a Codex project chat (never unavailable copy).
+    const healthyCard = page.locator('[data-workspace-empty-kind="healthy-empty"]');
+    await expect(healthyCard).toBeVisible();
+    await expect(healthyCard).toContainText('Open a Codex project chat');
+    await expect(page.getByText('Chat identity is unavailable.')).toHaveCount(0);
+    await expect(page.locator('[data-workspace-empty-kind="unavailable"]')).toHaveCount(0);
+
+    await healthyCard
+      .getByRole('button', { name: 'Codex integration in Settings', exact: true })
+      .click();
+    await expect(page.locator('#tl-settings-codex-integration')).toBeVisible();
+
+    // Return to Projects and simulate genuine source unavailability.
+    await sidebar(page).getByRole('button', { name: 'Projects', exact: true }).click();
+    const unavailableSnapshot = parseWorkspaceSnapshot({
+      ...healthyEmptySnapshot,
+      generated_at_ms: healthyEmptySnapshot.generated_at_ms + 2_000,
+      observation: {
+        ...healthyEmptySnapshot.observation,
+        generated_at_ms: healthyEmptySnapshot.generated_at_ms + 2_000,
+        sources: healthyEmptySnapshot.observation.sources.map((src) => ({
+          ...src,
+          availability: 'unavailable',
+          message: 'Runtime store socket permission denied',
+        })),
+      },
+    });
+    await controller.setWorkspaceSnapshot(unavailableSnapshot);
+    await triggerWorkspaceRefresh(page);
+
+    await expect(page.locator('[data-workspace-empty-kind="healthy-empty"]')).toHaveCount(0);
+    await expect(page.locator('[data-workspace-empty-kind="unavailable"]')).toBeVisible();
+    await expect(
+      page.getByText(/Runtime store socket permission denied/).first(),
+    ).toBeVisible();
+
+    const applyCalls = (await controller.getInvocations()).filter(
+      (call) => call.cmd === 'desktop_codex_setup_apply',
+    );
+    expect(applyCalls).toHaveLength(0);
+  });
+
+  test('makes Codex integration directly reachable in Settings on setup failure or verified codex_app_unavailable without auto-applying setup', async ({
+    page,
+  }) => {
+    const exactSetupError = 'Codex config.toml contains an invalid MCP server block.';
+    const exactNoInstanceError =
+      'No verified running Codex desktop instance is available for chat activation.';
+    const exactOtherError = 'Codex window activation could not be verified.';
+
+    const failedCodexSetup = {
+      ...buildDefaultCodexSetupFixture(),
+      state: 'error' as const,
+      registered: false,
+      error_code: 'config_parse_error',
+      message: exactSetupError,
+    };
+
+    const controller = await installWorkspaceTauriFixture(page, {
+      workspaceSnapshot: buildMinimalChatWorkspaceSnapshot(),
+      codexSetup: failedCodexSetup,
+      openCodexChatError: {
+        code: CODEX_APP_UNAVAILABLE_ERROR_CODE,
+        message: exactNoInstanceError,
+      },
+    });
+    await page.setViewportSize({ width: 1040, height: 760 });
+    await page.goto('/');
+    await expect(page.locator('#app .tl-app-shell, #app .tl-app').first()).toBeVisible();
+    await selectChat(page, 'Workspace UI Contract');
+
+    // 1. Setup failure surfaces exact error and jumps directly to prioritized Codex integration in Settings.
+    const setupAlert = page.locator('[data-codex-setup-alert="true"]');
+    await expect(setupAlert).toBeVisible();
+    await expect(setupAlert).toContainText(exactSetupError);
+    await setupAlert.getByRole('button', { name: 'Open Codex settings', exact: true }).click();
+
+    const settingsSection = page.locator('section[aria-label="Settings"]').first();
+    await expect(settingsSection).toBeVisible();
+    const codexCard = settingsSection.locator('#tl-settings-codex-integration');
+    await expect(codexCard).toBeVisible();
+    await expect(codexCard).toHaveAttribute('data-codex-integration-priority', 'true');
+    const firstCardId = await settingsSection
+      .locator('.tl-settings-stack > .tl-settings-card')
+      .first()
+      .getAttribute('id');
+    expect(firstCardId).toBe('tl-settings-codex-integration');
+    await expect(codexCard).toContainText(exactSetupError);
+    await expect(
+      codexCard.getByRole('button', { name: 'Recheck', exact: true }),
+    ).toBeVisible();
+    await expect(
+      codexCard.getByRole('button', { name: 'Apply setup', exact: true }),
+    ).toBeVisible();
+
+    // Clear setup failure via Recheck so we can test navigation error recovery cleanly.
+    await controller.setCodexSetupReport(buildDefaultCodexSetupFixture());
+    await codexCard.getByRole('button', { name: 'Recheck', exact: true }).click();
+    await expect(codexCard).not.toContainText(exactSetupError);
+
+    await sidebar(page).getByRole('button', { name: 'Projects', exact: true }).click();
+    await selectChat(page, 'Workspace UI Contract');
+    await expect(page.locator('[data-codex-setup-alert="true"]')).toHaveCount(0);
+
+    // 2. Verified codex_app_unavailable navigation error preserves exact error and exposes Settings jump.
+    await chatHeader(page, 'Workspace UI Contract')
+      .getByRole('button', { name: /^open in codex$/i })
+      .click();
+    const navAlert = page.locator('.tl-workspace-alert-bar[role="alert"]').first();
+    await expect(navAlert).toBeVisible();
+    await expect(navAlert).toContainText(exactNoInstanceError);
+    await navAlert.getByRole('button', { name: 'Open Codex settings', exact: true }).click();
+
+    await expect(settingsSection).toBeVisible();
+    await expect(codexCard).toHaveAttribute('data-codex-integration-priority', 'true');
+    await expect(codexCard.locator('[data-codex-navigation-error="true"]')).toContainText(
+      exactNoInstanceError,
+    );
+
+    // 3. Non-codex_app_unavailable error preserves exact error without Settings recovery button.
+    await sidebar(page).getByRole('button', { name: 'Projects', exact: true }).click();
+    await selectChat(page, 'Workspace UI Contract');
+    await controller.setOpenCodexChatError({
+      code: 'codex_activation_unknown',
+      message: exactOtherError,
+    });
+    await chatHeader(page, 'Workspace UI Contract')
+      .getByRole('button', { name: /^open in codex$/i })
+      .click();
+    await expect(navAlert).toBeVisible();
+    await expect(navAlert).toContainText(exactOtherError);
+    await expect(
+      navAlert.getByRole('button', { name: 'Open Codex settings', exact: true }),
+    ).toHaveCount(0);
+
+    // Read-only invariant: setup was never automatically applied.
+    const applyCalls = (await controller.getInvocations()).filter(
+      (call) => call.cmd === 'desktop_codex_setup_apply',
+    );
+    expect(applyCalls).toHaveLength(0);
+  });
+
+  test('shows reversible Undo for duplicate-name chats by exact identity, preserves selection, and identifies working agents in Archive', async ({
+    page,
+  }) => {
+    const base = buildMinimalChatWorkspaceSnapshot();
+    const sharedTitle = 'Shared Sprint Thread';
+    const alphaKey = formatWorkspaceChatIdentityKey(CHAT_ALPHA_IDENTITY)!;
+    const betaKey = formatWorkspaceChatIdentityKey(CHAT_BETA_SAME_PROJECT_IDENTITY)!;
+    const duplicateNameSnapshot = parseWorkspaceSnapshot({
+      ...base,
+      chats: base.chats.map((chat) =>
+        workspaceChatIdentitiesEqual(chat.identity, CHAT_ALPHA_IDENTITY) ||
+        workspaceChatIdentitiesEqual(chat.identity, CHAT_BETA_SAME_PROJECT_IDENTITY)
+          ? { ...chat, thread_label: sharedTitle }
+          : chat,
+      ),
+    });
+
+    await installWorkspaceTauriFixture(page, {
+      workspaceSnapshot: duplicateNameSnapshot,
+    });
+    await page.setViewportSize({ width: 1040, height: 760 });
+    await page.goto('/');
+    await expect(page.locator('#app .tl-app-shell, #app .tl-app').first()).toBeVisible();
+
+    const sidebarEl = sidebar(page);
+    const alphaRow = sidebarEl.locator(`.tl-chat-item-row[data-chat-key="${alphaKey}"]`);
+    const betaRow = sidebarEl.locator(`.tl-chat-item-row[data-chat-key="${betaKey}"]`);
+    await expect(alphaRow).toHaveCount(1);
+    await expect(betaRow).toHaveCount(1);
+
+    // Select Alpha (live Worker) and explicitly archive it by exact row identity.
+    await alphaRow.locator('button.tl-chat-item').click();
+    await expect(alphaRow).toHaveAttribute('data-selected', 'true');
+    await alphaRow
+      .getByRole('button', { name: `Archive ${sharedTitle}`, exact: true })
+      .click();
+
+    // Only Alpha moved to Archive; same-named Beta stays active and untouched.
+    await expect(alphaRow).toHaveCount(0);
+    await expect(betaRow).toHaveCount(1);
+
+    // Reversible Undo banner identifies the exact archived chat.
+    const undoBanner = page.locator('[data-archive-undo="true"]');
+    await expect(undoBanner).toBeVisible();
+    await expect(undoBanner).toHaveAttribute('data-archive-undo-chat-key', alphaKey);
+    await expect(undoBanner).toContainText(`Archived ${sharedTitle}.`);
+
+    // Archived live Worker is visibly flagged both on Archive subnav and Active view banner.
+    const archiveWorkingDot = lifecycleFilterControl(page, 'archived').locator(
+      '[data-archived-working-indicator="true"]',
+    );
+    await expect(archiveWorkingDot).toHaveCount(1);
+    await expect(archiveWorkingDot).toHaveAttribute('data-tone', 'working');
+    await expect(archiveWorkingDot).toHaveAttribute(
+      'aria-label',
+      '1 working agent in Archive',
+    );
+    const archiveWorkingBanner = page.locator('[data-archived-working-banner="true"]');
+    await expect(archiveWorkingBanner).toBeVisible();
+    await expect(archiveWorkingBanner).toContainText(
+      '1 working agent is running in Archive',
+    );
+    await expectNoNeedsYou(page);
+
+    // Clicking Undo restores exact Alpha and restores selection on Alpha without losing Beta.
+    await undoBanner
+      .getByRole('button', { name: `Undo archiving ${sharedTitle}`, exact: true })
+      .click();
+    await expect(undoBanner).toHaveCount(0);
+    await expect(archiveWorkingBanner).toHaveCount(0);
+    await expect(archiveWorkingDot).toHaveCount(0);
+    await expect(alphaRow).toHaveCount(1);
+    await expect(betaRow).toHaveCount(1);
+    await expect(alphaRow).toHaveAttribute('data-selected', 'true');
+
+    // Archive Alpha again, manually select Beta, then Undo: Beta stays selected while Alpha returns.
+    await alphaRow
+      .getByRole('button', { name: `Archive ${sharedTitle}`, exact: true })
+      .click();
+    await expect(undoBanner).toBeVisible();
+    await betaRow.locator('button.tl-chat-item').click();
+    await expect(betaRow).toHaveAttribute('data-selected', 'true');
+
+    await undoBanner
+      .getByRole('button', { name: `Undo archiving ${sharedTitle}`, exact: true })
+      .click();
+    await expect(undoBanner).toHaveCount(0);
+    await expect(alphaRow).toHaveCount(1);
+    await expect(betaRow).toHaveCount(1);
+    await expect(betaRow).toHaveAttribute('data-selected', 'true');
+    await expect(alphaRow).toHaveAttribute('data-selected', 'false');
+  });
+});

@@ -1,5 +1,5 @@
 #[path = "tray_linux.rs"]
-mod tray_linux;
+pub(crate) mod tray_linux;
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -2021,6 +2021,7 @@ struct TrayRuntimeInner {
     last_popover_blur_hidden_at: Option<Instant>,
     last_tray_click_at: Option<Instant>,
     last_raw_anchor: Option<RawTrayAnchor>,
+    active_open_anchor: Option<RawTrayAnchor>,
     tray_icon: Option<TrayIcon>,
     _single_instance: Option<SingleInstanceGuard>,
 }
@@ -2076,6 +2077,7 @@ impl TrayState {
                 last_popover_blur_hidden_at: None,
                 last_tray_click_at: None,
                 last_raw_anchor: None,
+                active_open_anchor: None,
                 tray_icon,
                 _single_instance: single_instance,
             })),
@@ -2235,6 +2237,16 @@ impl TrayState {
         guard.last_raw_anchor
     }
 
+    pub fn set_active_open_anchor(&self, anchor: Option<RawTrayAnchor>) {
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        guard.active_open_anchor = anchor;
+    }
+
+    pub fn active_open_anchor(&self) -> Option<RawTrayAnchor> {
+        let guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        guard.active_open_anchor
+    }
+
     pub fn set_placement_notice(&self, notice: Option<String>) {
         let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         guard.placement_notice = notice.filter(|msg| !msg.trim().is_empty());
@@ -2357,6 +2369,9 @@ fn combine_status_messages(
 
 /// Restores, unminimizes, shows, and focuses the primary `main` window.
 pub fn show_and_focus_main_window(app: &AppHandle) {
+    if let Some(tray) = app.try_state::<TrayState>() {
+        tray.set_active_open_anchor(None);
+    }
     #[cfg(target_os = "linux")]
     {
         if !tray_linux::is_linux_gtk_main_thread() {
@@ -2396,6 +2411,9 @@ pub fn show_and_focus_main_window(app: &AppHandle) {
 /// Hides only the `tray` popover window (and releases any transient Linux Wayland outside-click
 /// surfaces fail-open) without affecting `main` or running workers.
 pub fn hide_popover_window(app: &AppHandle) {
+    if let Some(tray) = app.try_state::<TrayState>() {
+        tray.set_active_open_anchor(None);
+    }
     #[cfg(target_os = "linux")]
     {
         if !tray_linux::is_linux_gtk_main_thread() {
@@ -2449,6 +2467,7 @@ pub(crate) fn hide_popover_window_if_linux_epoch_current(
     }
     if tray_linux::is_linux_dismiss_epoch_unsuperseded_on_main_thread(generation, attempt_ticket) {
         if let Some(tray) = app.try_state::<TrayState>() {
+            tray.set_active_open_anchor(None);
             if !tray.is_explicit_quit_requested() {
                 ensure_main_reachable_if_tray_unavailable(app, &tray);
             }
@@ -2625,7 +2644,7 @@ pub fn handle_window_event(window: &Window, event: &WindowEvent) {
             WindowEvent::ScaleFactorChanged { .. } => {
                 if let Some(popover) = app.get_webview_window(TRAY_WINDOW_LABEL) {
                     let monitors = resolve_available_monitors(app);
-                    let raw_anchor = tray.last_raw_anchor();
+                    let raw_anchor = tray.active_open_anchor();
                     #[cfg(target_os = "linux")]
                     {
                         tray_linux::refresh_linux_popover_size_on_scale_change(
@@ -2669,7 +2688,7 @@ fn ensure_or_create_tray_popover_window(
         return Ok((existing, None));
     }
 
-    let popover = WebviewWindowBuilder::new(
+    let builder = WebviewWindowBuilder::new(
         app,
         TRAY_WINDOW_LABEL,
         WebviewUrl::App(TRAY_WINDOW_URL.into()),
@@ -2680,14 +2699,18 @@ fn ensure_or_create_tray_popover_window(
     .max_inner_size(TRAY_POPOVER_WIDTH, TRAY_POPOVER_HEIGHT)
     .resizable(false)
     .decorations(false)
-    .transparent(true)
+    // On GTK, clearing a transparent window can erase web content outside a partial repaint.
+    .transparent(!cfg!(target_os = "linux"))
     .always_on_top(true)
     .skip_taskbar(true)
     .visible(false)
     .focused(false)
-    .initialization_script(TRAY_ESCAPE_INIT_SCRIPT)
-    .build()
-    .map_err(|err| format!("Failed to create tray popover window: {err}"))?;
+    .initialization_script(TRAY_ESCAPE_INIT_SCRIPT);
+    #[cfg(target_os = "linux")]
+    let builder = builder.background_color(tauri::webview::Color(22, 22, 24, 255));
+    let popover = builder
+        .build()
+        .map_err(|err| format!("Failed to create tray popover window: {err}"))?;
 
     #[cfg(target_os = "linux")]
     let init_notice = tray_linux::initialize_linux_popover_window(app, &popover);
@@ -2760,6 +2783,7 @@ pub fn open_popover_window_with_source(
     }
 
     let raw_anchor = tray.anchor_for_activation(source);
+    tray.set_active_open_anchor(raw_anchor);
     let monitors = resolve_available_monitors(app);
 
     #[cfg(target_os = "linux")]
@@ -2769,6 +2793,7 @@ pub fn open_popover_window_with_source(
             &popover,
             &monitors,
             raw_anchor,
+            source,
             || tray.record_popover_opened(),
         );
         match tray.apply_linux_open_outcome(open_outcome) {
@@ -4074,5 +4099,56 @@ mod tests {
             current_err,
             LinuxOpenPublicationAction::RecoverMainOnCurrentFailure
         );
+    }
+
+    #[test]
+    fn active_open_anchor_is_scoped_to_current_open_without_leaking_previous_clicks() {
+        let tmp = TempDir::new().expect("tempdir");
+        let store = TrayPreferencesStore::new(tmp.path().join("app-data"));
+        let initial = store.load_or_default();
+        let state = TrayState::new(store, initial, true, None, None, None);
+
+        let click_anchor_mon1 = RawTrayAnchor {
+            click_position: Some(RawCoordinate2D::Logical {
+                x: 2480.0,
+                y: 1650.0,
+            }),
+            tray_rect: None,
+        };
+        let decision = state.evaluate_tray_click_toggle(TrayClickEvaluationInput {
+            button: MouseButton::Left,
+            button_state: MouseButtonState::Up,
+            is_linux: true,
+            popover_currently_visible: false,
+            raw_anchor: click_anchor_mon1,
+            now: Instant::now(),
+        });
+        assert_eq!(decision, TrayToggleDecision::OpenPopover);
+        assert_eq!(state.last_raw_anchor(), Some(click_anchor_mon1));
+        assert_eq!(state.active_open_anchor(), None);
+
+        // Opening from the click records the click's anchor for active refreshes.
+        let click_anchor = state.anchor_for_activation(PopoverActivationSource::TrayIconClick);
+        state.set_active_open_anchor(click_anchor);
+        assert_eq!(state.active_open_anchor(), Some(click_anchor_mon1));
+
+        // Closing clears `active_open_anchor` even while `last_raw_anchor` remains historical.
+        state.set_active_open_anchor(None);
+        assert_eq!(state.active_open_anchor(), None);
+        assert_eq!(state.last_raw_anchor(), Some(click_anchor_mon1));
+
+        // Subsequent `MenuOpenStatus` (no click point) must NOT inherit the earlier click anchor.
+        let menu_anchor = state.anchor_for_activation(PopoverActivationSource::MenuOpenStatus);
+        assert_eq!(menu_anchor, None);
+        state.set_active_open_anchor(menu_anchor);
+        assert_eq!(state.active_open_anchor(), None);
+
+        // Subsequent absent-coordinate `(0, 0)` click replaces `active_open_anchor` cleanly.
+        let absent_anchor = RawTrayAnchor {
+            click_position: Some(RawCoordinate2D::Physical { x: 0.0, y: 0.0 }),
+            tray_rect: None,
+        };
+        state.set_active_open_anchor(Some(absent_anchor));
+        assert_eq!(state.active_open_anchor(), Some(absent_anchor));
     }
 }

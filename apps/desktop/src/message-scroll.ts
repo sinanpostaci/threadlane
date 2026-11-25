@@ -93,7 +93,7 @@ export type ChatWorkTone =
   | 'success'
   | 'neutral';
 
-export const BACKLOG_STATUS_ORDER = ['todo', 'doing', 'done', 'blocked'] as const;
+export const BACKLOG_STATUS_ORDER = ['doing', 'blocked', 'todo', 'done'] as const;
 
 export const BACKLOG_STATUS_LABELS: Readonly<Record<ChatWorkStatus, string>> = {
   todo: 'Todo',
@@ -2826,6 +2826,8 @@ export interface ChatWorkAgentView {
   detail: string;
   itemId: string | null;
   working: boolean;
+  observedModel?: string | null;
+  observedModelRaw?: string | null;
 }
 
 export interface ChatWorkLiveness {
@@ -3012,6 +3014,32 @@ function collectLiveChatWorkWorkerAgents(
     itemsById.set(item.item_id, item);
   }
   const attemptIndex = buildChatWorkExecutionAttemptIndex(selection.executions);
+  const executionByAttemptKey = new Map<string, ChatWorkExecution>();
+  for (const execution of selection.executions) {
+    const executionItem = itemsById.get(execution.item_id);
+    const joinKey = chatWorkExecutionJoinKey(
+      execution.item_id,
+      execution.execution_ref,
+    );
+    if (
+      attemptIndex.conflictingExecutions.has(joinKey) ||
+      !executionItem ||
+      executionItem.binding_id !== expectedBindingId
+    ) {
+      continue;
+    }
+    const attemptKey = chatWorkPresenceJoinKey(
+      execution.item_id,
+      execution.execution_ref,
+      execution.approval_id,
+      execution.task_id,
+      execution.run_id,
+      execution.worker_id,
+    );
+    if (!executionByAttemptKey.has(attemptKey)) {
+      executionByAttemptKey.set(attemptKey, execution);
+    }
+  }
   const agents: ChatWorkAgentView[] = [];
   const seen = new Set<string>();
   for (const presence of normalizeReconciledChatWorkPresence(selection.presence)) {
@@ -3032,6 +3060,23 @@ function collectLiveChatWorkWorkerAgents(
       continue;
     }
     seen.add(key);
+    const presenceAttemptKey = chatWorkPresenceJoinKey(
+      presence.item_id,
+      presence.execution_ref,
+      presence.approval_id,
+      presence.task_id,
+      presence.run_id,
+      presence.worker_id,
+    );
+    const matchedExecution = executionByAttemptKey.get(presenceAttemptKey) ?? null;
+    // Only use a verified observed runtime execution model for this exact
+    // item/execution identity. Never substitute requested_model or config.
+    const observedModelRaw =
+      matchedExecution !== null
+        ? cleanOptionalString(matchedExecution.observed_model)
+        : null;
+    const observedModel =
+      observedModelRaw !== null ? formatFriendlyModel(observedModelRaw) : null;
     agents.push({
       key,
       role: 'worker',
@@ -3039,6 +3084,8 @@ function collectLiveChatWorkWorkerAgents(
       detail: item.title,
       itemId: item.item_id,
       working: true,
+      observedModel,
+      observedModelRaw,
     });
   }
   return agents;
@@ -3089,6 +3136,8 @@ export function evaluateChatWorkLiveness(
       detail: 'Working in Codex',
       itemId: null,
       working: true,
+      observedModel: null,
+      observedModelRaw: null,
     });
   }
   if (!suppressed) {
@@ -3476,6 +3525,61 @@ export function resolveSidebarChatStatus(
   };
 }
 
+export interface SidebarChatActorView {
+  kind: 'single_agent' | 'multiple_agents';
+  role: 'coworker' | 'worker' | null;
+  roleLabel: 'Coworker' | 'Worker' | null;
+  observedModel: string | null;
+  observedModelRaw: string | null;
+  workingAgentCount: number;
+  label: string;
+}
+
+/**
+ * Resolves the active actor and verified observed model shown beside `Working`
+ * in the sidebar. Never substitutes configured Coworker selection or a Worker's
+ * requested model for observed execution telemetry.
+ */
+export function resolveSidebarChatActor(
+  liveness: ChatWorkLiveness | null | undefined,
+  options: SidebarChatStatusOptions = {},
+): SidebarChatActorView | null {
+  const status = resolveSidebarChatStatus(liveness, options);
+  if (status.kind !== 'working' || liveness === null || liveness === undefined) {
+    return null;
+  }
+  const liveAgents = liveness.agents.filter((agent) => agent.working);
+  if (liveAgents.length === 0) {
+    return null;
+  }
+  if (liveAgents.length === 1) {
+    const agent = liveAgents[0]!;
+    const observedModelRaw = cleanOptionalString(agent.observedModelRaw ?? null);
+    const observedModel = cleanOptionalString(agent.observedModel ?? null);
+    return {
+      kind: 'single_agent',
+      role: agent.role,
+      roleLabel: agent.roleLabel,
+      observedModel,
+      observedModelRaw,
+      workingAgentCount: 1,
+      label:
+        observedModel !== null
+          ? `${agent.roleLabel} · ${observedModel}`
+          : agent.roleLabel,
+    };
+  }
+  return {
+    kind: 'multiple_agents',
+    role: null,
+    roleLabel: null,
+    observedModel: null,
+    observedModelRaw: null,
+    workingAgentCount: liveAgents.length,
+    label: `${liveAgents.length} agents`,
+  };
+}
+
 export interface SidebarNavCounterView {
   count: number;
   label: string;
@@ -3531,6 +3635,21 @@ export function formatSidebarLifecycleWaitingLabel(
   }
   const unit = count === 1 ? 'chat' : 'chats';
   return `${count} ${lifecycle} ${unit} waiting for you`;
+}
+
+export function formatSidebarLifecycleWorkingLabel(
+  lifecycle: 'active' | 'archived',
+  workingAgentCount: number,
+): string | null {
+  const count = Number.isFinite(workingAgentCount)
+    ? Math.max(0, Math.trunc(workingAgentCount))
+    : 0;
+  if (count <= 0) {
+    return null;
+  }
+  const unit = count === 1 ? 'working agent' : 'working agents';
+  const viewName = lifecycle === 'archived' ? 'Archive' : 'Active';
+  return `${count} ${unit} in ${viewName}`;
 }
 
 function compareStringsUtf8(left: string, right: string): number {

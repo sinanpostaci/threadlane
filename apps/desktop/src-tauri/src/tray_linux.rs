@@ -73,9 +73,14 @@ use super::{
 
 #[cfg(any(target_os = "linux", test))]
 use super::{
-    MonitorBoundsPx, PopoverPlacementOutcome, RawCoordinate2D, RawSize2D, RawTrayAnchor,
-    RawTrayRect, UnanchoredPlacementReason, TRAY_POPOVER_HEIGHT, TRAY_POPOVER_MIN_HEIGHT,
-    TRAY_POPOVER_MIN_WIDTH, TRAY_POPOVER_WIDTH,
+    MonitorBoundsPx, PopoverActivationSource, PopoverPlacementOutcome, RawCoordinate2D, RawSize2D,
+    RawTrayAnchor, RawTrayRect, UnanchoredPlacementReason, TRAY_POPOVER_HEIGHT,
+    TRAY_POPOVER_MIN_HEIGHT, TRAY_POPOVER_MIN_WIDTH, TRAY_POPOVER_WIDTH,
+};
+
+#[cfg(any(target_os = "linux", test))]
+use crate::tray_output_linux::{
+    resolve_wayland_activation_input, HyprlandClickSnapshot, LinuxMonitorIdentity,
 };
 
 /// Truthful diagnostic surfaced when running on a Wayland compositor (such as GNOME / Mutter) that
@@ -1808,6 +1813,99 @@ impl LinuxPopoverPlan {
     }
 }
 
+/// Fallback monitor policy applied on Linux when no trusted global tray anchor coordinates
+/// matched a monitor.
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinuxFallbackMonitorPolicy {
+    /// Leave Wayland `zwlr_layer_shell_v1` output unpinned (`monitor_index: None` / `NULL`
+    /// output) so the compositor selects the active output. `sizing_monitor_hint` only chooses
+    /// workarea/scale sizing metadata and never pins `layer_shell.monitor_index`.
+    CompositorDefault { sizing_monitor_hint: Option<usize> },
+    /// Pin to a specific GDK monitor index when that index matches a live monitor entry (e.g.
+    /// X11 fallback or a trustworthy activation-specific Wayland monitor hint). If the index no
+    /// longer exists in the live monitor list (e.g. after hot-unplug), degrades to unpinned
+    /// compositor output choice rather than pinning `monitors[0]`.
+    PinMonitor(usize),
+}
+
+/// Concrete GTK layer-shell monitor mutation derived from the previous pin state and the newly
+/// planned `monitor_index`.
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayerShellMonitorAction {
+    /// Keep existing unpinned (`NULL`) monitor state without calling `gtk_layer_set_monitor`.
+    NoChange,
+    /// Pin the layer surface to `gdk::Display::monitor(index)`.
+    PinMonitor(usize),
+    /// Clear a prior monitor pin back to `NULL` (`gtk_layer_set_monitor(win, NULL)`) so the
+    /// compositor regains output choice instead of retaining a stale previous-open pin.
+    ClearToCompositorDefault,
+}
+
+/// Pure transition function mapping `(previously_pinned, requested_monitor_index,
+/// requested_monitor_exists)` into `(action, next_pinned_state)`.
+#[cfg(any(target_os = "linux", test))]
+pub fn resolve_layer_shell_monitor_action(
+    previously_pinned: bool,
+    requested_monitor_index: Option<usize>,
+    requested_monitor_exists: bool,
+) -> (LayerShellMonitorAction, bool) {
+    match requested_monitor_index {
+        Some(mon_idx) if requested_monitor_exists => {
+            (LayerShellMonitorAction::PinMonitor(mon_idx), true)
+        }
+        _ if previously_pinned => (LayerShellMonitorAction::ClearToCompositorDefault, false),
+        _ => (LayerShellMonitorAction::NoChange, false),
+    }
+}
+
+/// Logical geometry fingerprint of the monitor targeted when a Linux popup opened, used to
+/// re-identify the same physical output across `ScaleFactorChanged` or `monitor-added`
+/// index shifts without remapping back to `main`'s monitor or `monitors[0]`.
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MonitorGeometryFingerprint {
+    pub geometry_x: i32,
+    pub geometry_y: i32,
+    pub geometry_width: i32,
+    pub geometry_height: i32,
+}
+
+#[cfg(any(target_os = "linux", test))]
+impl MonitorGeometryFingerprint {
+    pub fn from_monitor(monitor: &LinuxMonitorWorkarea) -> Self {
+        Self {
+            geometry_x: monitor.geometry_x,
+            geometry_y: monitor.geometry_y,
+            geometry_width: monitor.geometry_width,
+            geometry_height: monitor.geometry_height,
+        }
+    }
+}
+
+/// Generation-scoped placement target captured at Linux popup open so subsequent
+/// `ScaleFactorChanged` or `monitor-added` refreshes stay on the same output (or keep
+/// compositor-default `NULL` output) instead of falling back to `main` or index `0`.
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ActiveLinuxOpenTarget {
+    /// Opened from trusted global anchor coordinates.
+    GlobalAnchor {
+        raw_anchor: RawTrayAnchor,
+        monitor_index: Option<usize>,
+        monitor_geometry: MonitorGeometryFingerprint,
+    },
+    /// Opened without trusted global icon coordinates, pinned to a trustworthy
+    /// activation-specific monitor hint (or X11 monitor fallback).
+    ActivationHintedMonitor {
+        monitor_index: usize,
+        monitor_geometry: MonitorGeometryFingerprint,
+    },
+    /// Opened with `zwlr_layer_shell_v1` `NULL` output (compositor output choice).
+    CompositorDefault,
+}
+
 /// Decision returned when evaluating a deferred Wayland layer-shell focus-loss check.
 #[cfg(any(target_os = "linux", test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2943,11 +3041,7 @@ pub trait PopupPresentationTarget {
 
     fn apply_layer_shell_surface_props(&mut self, layer: WaylandShellLayer, exclusive_zone: i32);
 
-    fn apply_layer_shell_monitor(
-        &mut self,
-        placement_monitor_index: Option<usize>,
-        fallback_target_monitor_index: Option<usize>,
-    );
+    fn apply_layer_shell_monitor(&mut self, placement_monitor_index: Option<usize>);
 
     fn apply_layer_shell_anchors_and_margins(&mut self, placement: &WaylandLayerShellPlacement);
 
@@ -2977,7 +3071,6 @@ pub fn drive_present_layer_popup_with_checkpoints<B, T>(
     attempt_ticket: u64,
     logical_size: (i32, i32),
     layer_placement: Option<&WaylandLayerShellPlacement>,
-    fallback_target_monitor_index: Option<usize>,
     base_notice: Option<String>,
 ) -> Result<(), String>
 where
@@ -3006,7 +3099,7 @@ where
             return Ok(());
         }
 
-        target.apply_layer_shell_monitor(lp.monitor_index, fallback_target_monitor_index);
+        target.apply_layer_shell_monitor(lp.monitor_index);
         if !is_presentation_epoch_current(state_cell, backend, generation, attempt_ticket) {
             return Ok(());
         }
@@ -4567,18 +4660,34 @@ fn plan_wayland_outside_click_backdrops(
 }
 
 #[cfg(any(target_os = "linux", test))]
+fn resolve_raw_anchor_on_linux_monitors(
+    backend: LinuxDisplayBackend,
+    monitors: &[LinuxMonitorWorkarea],
+    spans: &[PhysicalSpan],
+    raw_anchor: Option<RawTrayAnchor>,
+) -> Option<(usize, LinuxMonitorWorkarea, GdkResolvedAnchor)> {
+    raw_anchor.and_then(|anchor| {
+        anchor
+            .tray_rect
+            .and_then(|rect| resolve_rect_on_linux_monitors(backend, monitors, spans, rect))
+            .or_else(|| {
+                anchor
+                    .click_position
+                    .and_then(|pt| resolve_point_on_linux_monitors(backend, monitors, spans, pt))
+            })
+    })
+}
+
+#[cfg(any(target_os = "linux", test))]
 fn select_unanchored_fallback_monitor(
     monitors: &[LinuxMonitorWorkarea],
     preferred_monitor_index: Option<usize>,
-) -> (usize, LinuxMonitorWorkarea) {
+) -> (usize, LinuxMonitorWorkarea, bool) {
     if let Some(pref_idx) = preferred_monitor_index {
-        if let Some((slice_idx, found)) = monitors
-            .iter()
-            .copied()
-            .enumerate()
-            .find(|(i, m)| m.monitor_index == Some(pref_idx) || *i == pref_idx)
-        {
-            return (slice_idx, found);
+        if let Some((slice_idx, found)) = monitors.iter().copied().enumerate().find(|(i, m)| {
+            m.monitor_index == Some(pref_idx) || (m.monitor_index.is_none() && *i == pref_idx)
+        }) {
+            return (slice_idx, found, true);
         }
     }
     if let Some((slice_idx, primary)) = monitors
@@ -4587,25 +4696,25 @@ fn select_unanchored_fallback_monitor(
         .enumerate()
         .find(|(_, m)| m.is_primary)
     {
-        return (slice_idx, primary);
+        return (slice_idx, primary, false);
     }
     monitors
         .first()
         .copied()
-        .map(|m| (0, m))
-        .unwrap_or_else(|| (0, LinuxMonitorWorkarea::default()))
+        .map(|m| (0, m, false))
+        .unwrap_or_else(|| (0, LinuxMonitorWorkarea::default(), false))
 }
 
 /// Pure planner for Linux tray popup monitor selection, compact 3-row sizing, Wayland
 /// `zwlr_layer_shell_v1` anchoring, X11 workarea clamping, and truthful capability/fallback
-/// reporting.
+/// reporting with an explicit [`LinuxFallbackMonitorPolicy`].
 #[cfg(any(target_os = "linux", test))]
-pub fn plan_linux_popover_placement(
+pub fn plan_linux_popover_placement_with_policy(
     backend: LinuxDisplayBackend,
     wayland_support: WaylandLayerShellSupport,
     monitors: &[LinuxMonitorWorkarea],
     raw_anchor: Option<RawTrayAnchor>,
-    preferred_fallback_monitor_index: Option<usize>,
+    fallback_policy: LinuxFallbackMonitorPolicy,
     desired_logical_size: (f64, f64),
 ) -> LinuxPopoverPlan {
     let default_monitor = LinuxMonitorWorkarea::default();
@@ -4615,28 +4724,26 @@ pub fn plan_linux_popover_placement(
         monitors
     };
     let spans = derive_physical_spans(effective_monitors);
+    let resolved =
+        resolve_raw_anchor_on_linux_monitors(backend, effective_monitors, &spans, raw_anchor);
 
-    let resolved = raw_anchor.and_then(|anchor| {
-        anchor
-            .tray_rect
-            .and_then(|rect| {
-                resolve_rect_on_linux_monitors(backend, effective_monitors, &spans, rect)
-            })
-            .or_else(|| {
-                anchor.click_position.and_then(|pt| {
-                    resolve_point_on_linux_monitors(backend, effective_monitors, &spans, pt)
-                })
-            })
-    });
-
-    let (target_slice_idx, target_monitor, gdk_anchor) = match resolved {
-        Some((idx, mon, anchor)) => (idx, mon, Some(anchor)),
+    let (target_slice_idx, target_monitor, gdk_anchor, fallback_monitor_pin) = match resolved {
+        Some((idx, mon, anchor)) => (idx, mon, Some(anchor), mon.monitor_index),
         None => {
-            let (idx, mon) = select_unanchored_fallback_monitor(
-                effective_monitors,
-                preferred_fallback_monitor_index,
-            );
-            (idx, mon, None)
+            let (lookup_idx, allow_pin) = match fallback_policy {
+                LinuxFallbackMonitorPolicy::PinMonitor(mon_idx) => (Some(mon_idx), true),
+                LinuxFallbackMonitorPolicy::CompositorDefault {
+                    sizing_monitor_hint,
+                } => (sizing_monitor_hint, false),
+            };
+            let (idx, mon, matched_preferred) =
+                select_unanchored_fallback_monitor(effective_monitors, lookup_idx);
+            let pin = if allow_pin && matched_preferred {
+                mon.monitor_index
+            } else {
+                None
+            };
+            (idx, mon, None, pin)
         }
     };
     let target_span = spans
@@ -4711,12 +4818,10 @@ pub fn plan_linux_popover_placement(
                             est_gdk_x,
                             est_gdk_y,
                         );
-                        // Only pin `monitor_index` on missing-coordinate fallback if the caller
-                        // supplied an explicit active-monitor hint; otherwise let the compositor
-                        // place the fallback corner on the user's currently active output rather
-                        // than guessing `monitors[0]`.
-                        let fallback_monitor_pin =
-                            preferred_fallback_monitor_index.and(target_monitor.monitor_index);
+                        // Only pin `monitor_index` on missing-coordinate fallback when
+                        // `fallback_policy` explicitly requested a live monitor entry; otherwise
+                        // leave `monitor_index: None` (`NULL` output) so the compositor selects
+                        // the active output rather than pinning `main` or `monitors[0]`.
                         let placement = WaylandLayerShellPlacement {
                             monitor_index: fallback_monitor_pin,
                             layer: shell_layer,
@@ -4912,11 +5017,362 @@ pub fn plan_linux_popover_placement(
     }
 }
 
+/// Pure planner for Linux tray popup monitor selection, compact 3-row sizing, Wayland
+/// `zwlr_layer_shell_v1` anchoring, X11 workarea clamping, and truthful capability/fallback
+/// reporting.
+#[cfg(test)]
+pub fn plan_linux_popover_placement(
+    backend: LinuxDisplayBackend,
+    wayland_support: WaylandLayerShellSupport,
+    monitors: &[LinuxMonitorWorkarea],
+    raw_anchor: Option<RawTrayAnchor>,
+    preferred_fallback_monitor_index: Option<usize>,
+    desired_logical_size: (f64, f64),
+) -> LinuxPopoverPlan {
+    let fallback_policy = match preferred_fallback_monitor_index {
+        Some(idx) => LinuxFallbackMonitorPolicy::PinMonitor(idx),
+        None => LinuxFallbackMonitorPolicy::CompositorDefault {
+            sizing_monitor_hint: None,
+        },
+    };
+    plan_linux_popover_placement_with_policy(
+        backend,
+        wayland_support,
+        monitors,
+        raw_anchor,
+        fallback_policy,
+        desired_logical_size,
+    )
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn derive_active_open_target(
+    plan: &LinuxPopoverPlan,
+    trusted_global_anchor: Option<RawTrayAnchor>,
+) -> ActiveLinuxOpenTarget {
+    let geometry = MonitorGeometryFingerprint::from_monitor(&plan.target_monitor);
+    if let Some(raw_anchor) = trusted_global_anchor {
+        if matches!(plan.outcome, PopoverPlacementOutcome::IconAnchored { .. }) {
+            return ActiveLinuxOpenTarget::GlobalAnchor {
+                raw_anchor,
+                monitor_index: plan.target_monitor.monitor_index,
+                monitor_geometry: geometry,
+            };
+        }
+    }
+    match plan.backend {
+        LinuxDisplayBackend::Wayland => match plan.layer_shell.and_then(|ls| ls.monitor_index) {
+            Some(monitor_index) => ActiveLinuxOpenTarget::ActivationHintedMonitor {
+                monitor_index,
+                monitor_geometry: geometry,
+            },
+            None => ActiveLinuxOpenTarget::CompositorDefault,
+        },
+        LinuxDisplayBackend::X11 => match plan.target_monitor.monitor_index {
+            Some(monitor_index) => ActiveLinuxOpenTarget::ActivationHintedMonitor {
+                monitor_index,
+                monitor_geometry: geometry,
+            },
+            None => ActiveLinuxOpenTarget::CompositorDefault,
+        },
+        LinuxDisplayBackend::Unknown => ActiveLinuxOpenTarget::CompositorDefault,
+    }
+}
+
+/// Plans a Linux tray popover open for a concrete activation source (`TrayIconClick` or
+/// `MenuOpenStatus`), returning both the placement plan and the generation-scoped
+/// [`ActiveLinuxOpenTarget`] for later scale/hotplug refreshes.
+///
+/// On Wayland, `x11_main_window_monitor_index` is strictly ignored so absent-coordinate or
+/// panel-local activations on a secondary monitor never pin `main`'s monitor or index `0`.
+#[cfg(any(target_os = "linux", test))]
+#[allow(clippy::too_many_arguments)]
+pub fn plan_linux_popover_open_for_activation(
+    backend: LinuxDisplayBackend,
+    wayland_support: WaylandLayerShellSupport,
+    monitors: &[LinuxMonitorWorkarea],
+    identities: &[LinuxMonitorIdentity],
+    raw_anchor: Option<RawTrayAnchor>,
+    source: PopoverActivationSource,
+    hyprland_snapshot: Option<&HyprlandClickSnapshot>,
+    x11_main_window_monitor_index: Option<usize>,
+    desired_logical_size: (f64, f64),
+) -> (LinuxPopoverPlan, ActiveLinuxOpenTarget) {
+    match backend {
+        LinuxDisplayBackend::Wayland => {
+            let spans = derive_physical_spans(monitors);
+            let matched_sni_slice_idx =
+                resolve_raw_anchor_on_linux_monitors(backend, monitors, &spans, raw_anchor)
+                    .map(|(slice_idx, _, _)| slice_idx);
+            let resolved_input = resolve_wayland_activation_input(
+                source,
+                monitors,
+                identities,
+                raw_anchor,
+                matched_sni_slice_idx,
+                hyprland_snapshot,
+            );
+            let plan = plan_linux_popover_placement_with_policy(
+                backend,
+                wayland_support,
+                monitors,
+                resolved_input.trusted_global_anchor,
+                resolved_input.fallback_policy,
+                desired_logical_size,
+            );
+            let active_target =
+                derive_active_open_target(&plan, resolved_input.trusted_global_anchor);
+            (plan, active_target)
+        }
+        LinuxDisplayBackend::X11 | LinuxDisplayBackend::Unknown => {
+            let fallback_policy = match x11_main_window_monitor_index {
+                Some(idx) => LinuxFallbackMonitorPolicy::PinMonitor(idx),
+                None => LinuxFallbackMonitorPolicy::CompositorDefault {
+                    sizing_monitor_hint: None,
+                },
+            };
+            let plan = plan_linux_popover_placement_with_policy(
+                backend,
+                wayland_support,
+                monitors,
+                raw_anchor,
+                fallback_policy,
+                desired_logical_size,
+            );
+            let active_target = derive_active_open_target(&plan, raw_anchor);
+            (plan, active_target)
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn reidentify_active_monitor(
+    monitors: &[LinuxMonitorWorkarea],
+    saved_geometry: MonitorGeometryFingerprint,
+    saved_monitor_index: Option<usize>,
+    popup_current_monitor_index: Option<usize>,
+) -> Option<usize> {
+    let pick_unique = |candidates: &[usize]| -> Option<usize> {
+        if candidates.len() == 1 {
+            return monitors[candidates[0]].monitor_index;
+        }
+        if candidates.len() > 1 {
+            if let Some(cur_idx) = popup_current_monitor_index {
+                if let Some(&slice_idx) = candidates
+                    .iter()
+                    .find(|&&i| monitors[i].monitor_index == Some(cur_idx))
+                {
+                    return monitors[slice_idx].monitor_index;
+                }
+            }
+            if let Some(saved_idx) = saved_monitor_index {
+                if let Some(&slice_idx) = candidates
+                    .iter()
+                    .find(|&&i| monitors[i].monitor_index == Some(saved_idx))
+                {
+                    return monitors[slice_idx].monitor_index;
+                }
+            }
+        }
+        None
+    };
+
+    // 1. Exact logical geometry match (survives `monitor-added` index shifts).
+    let exact: Vec<usize> = monitors
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| {
+            m.monitor_index.is_some()
+                && m.geometry_x == saved_geometry.geometry_x
+                && m.geometry_y == saved_geometry.geometry_y
+                && m.geometry_width == saved_geometry.geometry_width
+                && m.geometry_height == saved_geometry.geometry_height
+        })
+        .map(|(i, _)| i)
+        .collect();
+    if let Some(mon_idx) = pick_unique(&exact) {
+        return Some(mon_idx);
+    }
+
+    // 2. Origin match (survives `ScaleFactorChanged` logical dimension changes at the same origin).
+    let same_origin: Vec<usize> = monitors
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| {
+            m.monitor_index.is_some()
+                && m.geometry_x == saved_geometry.geometry_x
+                && m.geometry_y == saved_geometry.geometry_y
+        })
+        .map(|(i, _)| i)
+        .collect();
+    if let Some(mon_idx) = pick_unique(&same_origin) {
+        return Some(mon_idx);
+    }
+
+    // 3. Live mapped popup's current monitor (survives layout origin shifts while mapped).
+    if let Some(cur_idx) = popup_current_monitor_index {
+        if let Some(found) = monitors.iter().find(|m| m.monitor_index == Some(cur_idx)) {
+            return found.monitor_index;
+        }
+    }
+
+    // 4. Never fall back to `main`'s monitor or `monitors[0]`; degrade to compositor default.
+    None
+}
+
+/// Plans a Linux tray popover refresh (`ScaleFactorChanged` or `monitor-added`) while preserving
+/// the active open generation's output choice.
+///
+/// On Wayland, `x11_main_window_monitor_index` is strictly ignored so refreshing an unpinned or
+/// activation-hinted popup on a secondary output never remaps it back to `main`'s monitor or
+/// `monitors[0]`.
+#[cfg(any(target_os = "linux", test))]
+#[allow(clippy::too_many_arguments)]
+pub fn plan_linux_popover_refresh(
+    backend: LinuxDisplayBackend,
+    wayland_support: WaylandLayerShellSupport,
+    monitors: &[LinuxMonitorWorkarea],
+    active_target: Option<ActiveLinuxOpenTarget>,
+    popup_current_monitor_index: Option<usize>,
+    x11_main_window_monitor_index: Option<usize>,
+    fallback_raw_anchor: Option<RawTrayAnchor>,
+    desired_logical_size: (f64, f64),
+) -> LinuxPopoverPlan {
+    match backend {
+        LinuxDisplayBackend::Wayland => match active_target {
+            Some(ActiveLinuxOpenTarget::GlobalAnchor {
+                raw_anchor,
+                monitor_index,
+                monitor_geometry,
+            }) => {
+                let fallback_policy = match reidentify_active_monitor(
+                    monitors,
+                    monitor_geometry,
+                    monitor_index,
+                    popup_current_monitor_index,
+                ) {
+                    Some(mon_idx) => LinuxFallbackMonitorPolicy::PinMonitor(mon_idx),
+                    None => LinuxFallbackMonitorPolicy::CompositorDefault {
+                        sizing_monitor_hint: popup_current_monitor_index,
+                    },
+                };
+                plan_linux_popover_placement_with_policy(
+                    backend,
+                    wayland_support,
+                    monitors,
+                    Some(raw_anchor),
+                    fallback_policy,
+                    desired_logical_size,
+                )
+            }
+            Some(ActiveLinuxOpenTarget::ActivationHintedMonitor {
+                monitor_index,
+                monitor_geometry,
+            }) => {
+                let fallback_policy = match reidentify_active_monitor(
+                    monitors,
+                    monitor_geometry,
+                    Some(monitor_index),
+                    popup_current_monitor_index,
+                ) {
+                    Some(mon_idx) => LinuxFallbackMonitorPolicy::PinMonitor(mon_idx),
+                    None => LinuxFallbackMonitorPolicy::CompositorDefault {
+                        sizing_monitor_hint: None,
+                    },
+                };
+                plan_linux_popover_placement_with_policy(
+                    backend,
+                    wayland_support,
+                    monitors,
+                    None,
+                    fallback_policy,
+                    desired_logical_size,
+                )
+            }
+            Some(ActiveLinuxOpenTarget::CompositorDefault) | None => {
+                // Keep layer-shell output unpinned (`NULL`) while sizing against the popup's
+                // current monitor when mapped.
+                plan_linux_popover_placement_with_policy(
+                    backend,
+                    wayland_support,
+                    monitors,
+                    None,
+                    LinuxFallbackMonitorPolicy::CompositorDefault {
+                        sizing_monitor_hint: popup_current_monitor_index,
+                    },
+                    desired_logical_size,
+                )
+            }
+        },
+        LinuxDisplayBackend::X11 | LinuxDisplayBackend::Unknown => {
+            let (anchor, fallback_policy) = match active_target {
+                Some(ActiveLinuxOpenTarget::GlobalAnchor {
+                    raw_anchor,
+                    monitor_index,
+                    monitor_geometry,
+                }) => {
+                    let pin = reidentify_active_monitor(
+                        monitors,
+                        monitor_geometry,
+                        monitor_index,
+                        popup_current_monitor_index,
+                    )
+                    .or(x11_main_window_monitor_index);
+                    let policy = match pin {
+                        Some(idx) => LinuxFallbackMonitorPolicy::PinMonitor(idx),
+                        None => LinuxFallbackMonitorPolicy::CompositorDefault {
+                            sizing_monitor_hint: None,
+                        },
+                    };
+                    (Some(raw_anchor), policy)
+                }
+                Some(ActiveLinuxOpenTarget::ActivationHintedMonitor {
+                    monitor_index,
+                    monitor_geometry,
+                }) => {
+                    let pin = reidentify_active_monitor(
+                        monitors,
+                        monitor_geometry,
+                        Some(monitor_index),
+                        popup_current_monitor_index,
+                    )
+                    .or(x11_main_window_monitor_index);
+                    let policy = match pin {
+                        Some(idx) => LinuxFallbackMonitorPolicy::PinMonitor(idx),
+                        None => LinuxFallbackMonitorPolicy::CompositorDefault {
+                            sizing_monitor_hint: None,
+                        },
+                    };
+                    (None, policy)
+                }
+                Some(ActiveLinuxOpenTarget::CompositorDefault) | None => {
+                    let policy = match x11_main_window_monitor_index {
+                        Some(idx) => LinuxFallbackMonitorPolicy::PinMonitor(idx),
+                        None => LinuxFallbackMonitorPolicy::CompositorDefault {
+                            sizing_monitor_hint: None,
+                        },
+                    };
+                    (fallback_raw_anchor, policy)
+                }
+            };
+            plan_linux_popover_placement_with_policy(
+                backend,
+                wayland_support,
+                monitors,
+                anchor,
+                fallback_policy,
+                desired_logical_size,
+            )
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
 struct LinuxTrayRuntimeState {
     popover_signals_attached: bool,
     main_click_guard_attached: bool,
     layer_monitor_pinned: bool,
+    active_open_target: Option<(u64, ActiveLinuxOpenTarget)>,
     focus_tracker: WaylandLayerFocusTracker,
 }
 
@@ -4927,6 +5383,7 @@ impl LinuxTrayRuntimeState {
             popover_signals_attached: false,
             main_click_guard_attached: false,
             layer_monitor_pinned: false,
+            active_open_target: None,
             focus_tracker: WaylandLayerFocusTracker::new(),
         }
     }
@@ -6031,6 +6488,7 @@ pub(super) fn fence_linux_popover_dismiss_epoch_on_main_thread(
         return false;
     }
     tracker.abort_attempt_remap(generation, attempt_ticket);
+    guard.active_open_target = None;
     true
 }
 
@@ -6082,6 +6540,7 @@ pub fn release_linux_outside_click_backdrops(app: &AppHandle) {
         let mut guard = linux_runtime_state()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        guard.active_open_target = None;
         guard.focus_tracker.on_unmapped();
     }
     if gtk::is_initialized_main_thread() {
@@ -6124,6 +6583,7 @@ fn attach_linux_display_monitor_lifecycle_guard(app: &AppHandle, display: &gdk::
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             guard.layer_monitor_pinned = false;
+            guard.active_open_target = None;
             guard.focus_tracker.on_unmapped();
         }
         if let Some(popover) = app_for_removed.get_webview_window(TRAY_WINDOW_LABEL) {
@@ -6131,6 +6591,11 @@ fn attach_linux_display_monitor_lifecycle_guard(app: &AppHandle, display: &gdk::
                 hide_popover_window(&app_for_removed);
                 if let Some(tray) = app_for_removed.try_state::<TrayState>() {
                     ensure_main_reachable_if_tray_unavailable(&app_for_removed, &tray);
+                }
+            }
+            if let Ok(gtk_win) = popover.gtk_window() {
+                if gtk_win.is_layer_window() {
+                    clear_gtk_layer_shell_monitor(&gtk_win);
                 }
             }
         }
@@ -6152,7 +6617,7 @@ fn attach_linux_display_monitor_lifecycle_guard(app: &AppHandle, display: &gdk::
         }
         let raw_anchor = app_for_added
             .try_state::<TrayState>()
-            .and_then(|tray| tray.last_raw_anchor());
+            .and_then(|tray| tray.active_open_anchor());
         refresh_linux_popover_size_on_scale_change(&app_for_added, &popover, &[], raw_anchor);
     });
 }
@@ -6216,33 +6681,73 @@ fn apply_gtk_layer_shell_surface_props(
     gtk_win.set_exclusive_zone(exclusive_zone);
 }
 
+/// Clears any previously pinned `GdkMonitor` on a `zwlr_layer_shell_v1` surface by calling
+/// `gtk_layer_set_monitor(window, NULL)` so the Wayland compositor chooses the active output.
+///
+/// `gtk-layer-shell 0.8.2`'s safe `LayerShell::set_monitor(&gdk::Monitor)` binding takes a
+/// non-optional reference even though `libgtk-layer-shell`'s documented C API accepts `NULL`
+/// specifically to unpin the output and return placement choice to the compositor.
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+fn clear_gtk_layer_shell_monitor(gtk_win: &gtk::ApplicationWindow) {
+    use gtk::glib::translate::ToGlibPtr;
+    extern "C" {
+        fn gtk_layer_set_monitor(
+            window: *mut gtk::ffi::GtkWindow,
+            monitor: *mut gdk::ffi::GdkMonitor,
+        );
+    }
+    debug_assert!(gtk::is_initialized_main_thread());
+    if !gtk::is_initialized_main_thread() || !gtk_win.is_layer_window() {
+        return;
+    }
+    let window: &gtk::Window = gtk_win.upcast_ref();
+    // SAFETY:
+    // 1. Caller verified `gtk::is_initialized_main_thread()` and `gtk_win.is_layer_window()`,
+    //    guaranteeing GTK/GDK initialization, exclusive GTK main-thread access, and a valid
+    //    initialized `gtk-layer-shell` surface.
+    // 2. `window` is a live owned `gtk::Window` reference whose `to_glib_none().0` `Stash`
+    //    temporary lives for the full synchronous C call; `std::ptr::null_mut()` is explicitly
+    //    accepted by `libgtk-layer-shell`'s documented nullable `monitor` parameter to clear any
+    //    pinned output and delegate monitor choice to the Wayland compositor.
+    // 3. All `RefCell` borrows and `Mutex` guards are dropped prior to calling this helper, so
+    //    any synchronous `unmap`/`remap` GTK signals emitted by `gtk_layer_set_monitor` cannot
+    //    alias Rust borrows.
+    unsafe {
+        gtk_layer_set_monitor(window.to_glib_none().0, std::ptr::null_mut());
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn apply_gtk_layer_shell_monitor(
     gtk_win: &gtk::ApplicationWindow,
     display: &gdk::Display,
     placement_monitor_index: Option<usize>,
-    fallback_target_monitor_index: Option<usize>,
 ) {
-    if let Some(mon_idx) = placement_monitor_index {
-        if let Some(gdk_mon) = display.monitor(mon_idx as i32) {
-            linux_runtime_state()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .layer_monitor_pinned = true;
-            gtk_win.set_monitor(&gdk_mon);
-        }
-    } else {
-        let was_pinned = linux_runtime_state()
+    let resolved_gdk_mon =
+        placement_monitor_index.and_then(|mon_idx| display.monitor(mon_idx as i32));
+    let action = {
+        let mut guard = linux_runtime_state()
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .layer_monitor_pinned;
-        if was_pinned {
-            if let Some(mon_idx) = fallback_target_monitor_index {
-                if let Some(gdk_mon) = display.monitor(mon_idx as i32) {
-                    gtk_win.set_monitor(&gdk_mon);
-                }
+            .unwrap_or_else(|e| e.into_inner());
+        let (action, next_pinned) = resolve_layer_shell_monitor_action(
+            guard.layer_monitor_pinned,
+            placement_monitor_index,
+            resolved_gdk_mon.is_some(),
+        );
+        guard.layer_monitor_pinned = next_pinned;
+        action
+    };
+    match action {
+        LayerShellMonitorAction::PinMonitor(_) => {
+            if let Some(gdk_mon) = resolved_gdk_mon {
+                gtk_win.set_monitor(&gdk_mon);
             }
         }
+        LayerShellMonitorAction::ClearToCompositorDefault => {
+            clear_gtk_layer_shell_monitor(gtk_win);
+        }
+        LayerShellMonitorAction::NoChange => {}
     }
 }
 
@@ -6274,16 +6779,10 @@ fn apply_wayland_layer_shell_placement(
     gtk_win: &gtk::ApplicationWindow,
     display: &gdk::Display,
     placement: &WaylandLayerShellPlacement,
-    fallback_target_monitor_index: Option<usize>,
 ) {
     debug_assert!(placement.is_compact_non_exclusive());
     apply_gtk_layer_shell_surface_props(gtk_win, placement.layer, placement.exclusive_zone);
-    apply_gtk_layer_shell_monitor(
-        gtk_win,
-        display,
-        placement.monitor_index,
-        fallback_target_monitor_index,
-    );
+    apply_gtk_layer_shell_monitor(gtk_win, display, placement.monitor_index);
     apply_gtk_layer_shell_anchors_and_margins(gtk_win, placement);
 }
 
@@ -6320,17 +6819,8 @@ impl<FRecord: FnOnce()> PopupPresentationTarget for GtkPopupPresentationTarget<'
         apply_gtk_layer_shell_surface_props(self.gtk_win, layer, exclusive_zone);
     }
 
-    fn apply_layer_shell_monitor(
-        &mut self,
-        placement_monitor_index: Option<usize>,
-        fallback_target_monitor_index: Option<usize>,
-    ) {
-        apply_gtk_layer_shell_monitor(
-            self.gtk_win,
-            self.display,
-            placement_monitor_index,
-            fallback_target_monitor_index,
-        );
+    fn apply_layer_shell_monitor(&mut self, placement_monitor_index: Option<usize>) {
+        apply_gtk_layer_shell_monitor(self.gtk_win, self.display, placement_monitor_index);
     }
 
     fn apply_layer_shell_anchors_and_margins(&mut self, placement: &WaylandLayerShellPlacement) {
@@ -6400,18 +6890,19 @@ fn detect_window_layer_shell_support(gtk_win: &gtk::ApplicationWindow) -> Waylan
 }
 
 #[cfg(target_os = "linux")]
-fn collect_gdk_monitors(
+fn collect_gdk_monitors_with_identities(
     display: &gdk::Display,
     fallback_monitors: &[MonitorBoundsPx],
-) -> Vec<LinuxMonitorWorkarea> {
+) -> (Vec<LinuxMonitorWorkarea>, Vec<LinuxMonitorIdentity>) {
     let count = display.n_monitors();
-    let mut out = Vec::new();
+    let mut monitors = Vec::new();
+    let mut identities = Vec::new();
     for idx in 0..count {
         if let Some(mon) = display.monitor(idx) {
             let geom = mon.geometry();
             let work = mon.workarea();
             let gdk_scale = (mon.scale_factor().max(1)) as f64;
-            out.push(LinuxMonitorWorkarea {
+            monitors.push(LinuxMonitorWorkarea {
                 monitor_index: Some(idx as usize),
                 geometry_x: geom.x(),
                 geometry_y: geom.y(),
@@ -6424,18 +6915,50 @@ fn collect_gdk_monitors(
                 scale_factor: gdk_scale,
                 is_primary: mon.is_primary(),
             });
+            identities.push(LinuxMonitorIdentity {
+                manufacturer: mon.manufacturer().map(|s| s.to_string()),
+                model: mon.model().map(|s| s.to_string()),
+            });
         }
     }
-    if out.is_empty() {
+    if monitors.is_empty() {
         for (idx, bounds) in fallback_monitors.iter().copied().enumerate() {
-            out.push(LinuxMonitorWorkarea::from_monitor_bounds_px(
+            monitors.push(LinuxMonitorWorkarea::from_monitor_bounds_px(
                 bounds,
                 Some(idx),
                 idx == 0,
             ));
+            identities.push(LinuxMonitorIdentity::default());
         }
     }
-    out
+    (monitors, identities)
+}
+
+#[cfg(target_os = "linux")]
+fn collect_gdk_monitors(
+    display: &gdk::Display,
+    fallback_monitors: &[MonitorBoundsPx],
+) -> Vec<LinuxMonitorWorkarea> {
+    collect_gdk_monitors_with_identities(display, fallback_monitors).0
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_gtk_window_monitor_index(
+    gtk_win: &gtk::ApplicationWindow,
+    display: &gdk::Display,
+) -> Option<usize> {
+    if !gtk_win.is_mapped() {
+        return None;
+    }
+    let gdk_win = gtk_win.window()?;
+    let active_mon = display.monitor_at_window(&gdk_win)?;
+    let count = display.n_monitors();
+    for idx in 0..count {
+        if display.monitor(idx).as_ref() == Some(&active_mon) {
+            return Some(idx as usize);
+        }
+    }
+    None
 }
 
 #[cfg(target_os = "linux")]
@@ -6641,7 +7164,11 @@ fn attach_linux_popover_signal_handlers(app: &AppHandle, gtk_win: &gtk::Applicat
             let mut guard = linux_runtime_state()
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            guard.focus_tracker.on_transient_unmap_preserving_epoch()
+            let preserved = guard.focus_tracker.on_transient_unmap_preserving_epoch();
+            if preserved.is_none() {
+                guard.active_open_target = None;
+            }
+            preserved
         };
         if !gtk::is_initialized_main_thread() {
             return;
@@ -6657,6 +7184,7 @@ fn attach_linux_popover_signal_handlers(app: &AppHandle, gtk_win: &gtk::Applicat
             let mut guard = linux_runtime_state()
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
+            guard.active_open_target = None;
             guard.focus_tracker.on_unmapped();
         }
         release_outside_click_backdrops_on_main_thread();
@@ -6721,12 +7249,7 @@ pub fn initialize_linux_popover_window(app: &AppHandle, popover: &WebviewWindow)
                         },
                         estimated_gdk_bounds: (0, 12, width, height),
                     };
-                    apply_wayland_layer_shell_placement(
-                        &gtk_win,
-                        &display,
-                        &initial_placement,
-                        None,
-                    );
+                    apply_wayland_layer_shell_placement(&gtk_win, &display, &initial_placement);
                     if proto < 4 {
                         initial_notice = Some(WAYLAND_LEGACY_LAYER_PROTOCOL_NOTICE.to_string());
                     }
@@ -6750,6 +7273,56 @@ pub fn initialize_linux_popover_window(app: &AppHandle, popover: &WebviewWindow)
     initial_notice
 }
 
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn updated_active_target_after_refresh(
+    previous: Option<ActiveLinuxOpenTarget>,
+    plan: &LinuxPopoverPlan,
+) -> Option<ActiveLinuxOpenTarget> {
+    let geom = MonitorGeometryFingerprint::from_monitor(&plan.target_monitor);
+    match previous? {
+        ActiveLinuxOpenTarget::GlobalAnchor { raw_anchor, .. } => {
+            Some(ActiveLinuxOpenTarget::GlobalAnchor {
+                raw_anchor,
+                monitor_index: plan.target_monitor.monitor_index,
+                monitor_geometry: geom,
+            })
+        }
+        ActiveLinuxOpenTarget::ActivationHintedMonitor { .. } => {
+            let new_idx = match plan.backend {
+                LinuxDisplayBackend::Wayland => plan.layer_shell.and_then(|ls| ls.monitor_index),
+                LinuxDisplayBackend::X11 => plan.target_monitor.monitor_index,
+                LinuxDisplayBackend::Unknown => None,
+            };
+            Some(match new_idx {
+                Some(monitor_index) => ActiveLinuxOpenTarget::ActivationHintedMonitor {
+                    monitor_index,
+                    monitor_geometry: geom,
+                },
+                None => ActiveLinuxOpenTarget::CompositorDefault,
+            })
+        }
+        ActiveLinuxOpenTarget::CompositorDefault => Some(ActiveLinuxOpenTarget::CompositorDefault),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn record_active_open_target_if_current(
+    generation: u64,
+    attempt_ticket: u64,
+    target: ActiveLinuxOpenTarget,
+) {
+    let mut guard = linux_runtime_state()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let tracker = &guard.focus_tracker;
+    if tracker.current_generation() == generation
+        && !tracker.is_fenced_or_superseded(generation)
+        && !tracker.is_attempt_superseded(generation, attempt_ticket)
+    {
+        guard.active_open_target = Some((generation, target));
+    }
+}
+
 /// Recomputes compact 3-row sizing, configures Wayland `zwlr_layer_shell_v1` anchors/margins/monitor
 /// or X11 root coordinates for the target monitor's scale and workarea, presents the window, and
 /// returns a truthful [`LinuxOpenOutcome`].
@@ -6759,6 +7332,7 @@ pub fn open_and_present_linux_popover(
     popover: &WebviewWindow,
     fallback_monitors: &[MonitorBoundsPx],
     raw_anchor: Option<RawTrayAnchor>,
+    source: PopoverActivationSource,
     record_open_before_show: impl FnOnce(),
 ) -> Result<LinuxOpenOutcome, String> {
     if !gtk::is_initialized_main_thread() {
@@ -6783,14 +7357,30 @@ pub fn open_and_present_linux_popover(
         )
     };
 
-    let monitors = collect_gdk_monitors(&display, fallback_monitors);
-    let preferred_fallback_monitor_index = resolve_main_window_monitor_index(app, &display);
-    let plan = plan_linux_popover_placement(
+    let (monitors, identities) = collect_gdk_monitors_with_identities(&display, fallback_monitors);
+    let hyprland_snapshot = if backend == LinuxDisplayBackend::Wayland
+        && matches!(wayland_support, WaylandLayerShellSupport::Supported { .. })
+        && source == PopoverActivationSource::TrayIconClick
+        && monitors.len() > 1
+    {
+        crate::tray_output_linux::query_confirmed_hyprland_click_snapshot_from_env()
+    } else {
+        None
+    };
+    let x11_main_window_monitor_index = if backend == LinuxDisplayBackend::X11 {
+        resolve_main_window_monitor_index(app, &display)
+    } else {
+        None
+    };
+    let (plan, active_open_target) = plan_linux_popover_open_for_activation(
         backend,
         wayland_support,
         &monitors,
+        &identities,
         raw_anchor,
-        preferred_fallback_monitor_index,
+        source,
+        hyprland_snapshot.as_ref(),
+        x11_main_window_monitor_index,
         (TRAY_POPOVER_WIDTH, TRAY_POPOVER_HEIGHT),
     );
     let plan_valid = plan.validate_outside_click_plan();
@@ -6822,6 +7412,11 @@ pub fn open_and_present_linux_popover(
                 Instant::now,
                 WAYLAND_POPUP_PENDING_MAP_TIMEOUT,
                 |open_generation, attempt_ticket| {
+                    record_active_open_target_if_current(
+                        open_generation,
+                        attempt_ticket,
+                        active_open_target,
+                    );
                     drive_present_layer_popup_with_checkpoints(
                         cell,
                         &gtk_backend,
@@ -6831,7 +7426,6 @@ pub fn open_and_present_linux_popover(
                         attempt_ticket,
                         (gdk_w, gdk_h),
                         plan.layer_shell.as_ref(),
-                        plan.target_monitor.monitor_index,
                         base_notice.clone(),
                     )
                 },
@@ -6890,6 +7484,8 @@ pub fn open_and_present_linux_popover(
             }
         }));
     }
+
+    record_active_open_target_if_current(open_generation, attempt_ticket, active_open_target);
 
     let x11_gdk_position = (plan.backend == LinuxDisplayBackend::X11)
         .then_some(plan.gdk_position)
@@ -7073,15 +7669,39 @@ pub fn refresh_linux_popover_size_on_scale_change(
         )
     };
     let monitors = collect_gdk_monitors(&display, fallback_monitors);
-    let preferred_fallback = resolve_main_window_monitor_index(app, &display);
-    let plan = plan_linux_popover_placement(
+    let active_target = {
+        let guard = linux_runtime_state()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let current_gen = guard.focus_tracker.current_generation();
+        if guard.focus_tracker.has_live_or_pending_open()
+            && !guard.focus_tracker.is_fenced_or_superseded(current_gen)
+        {
+            guard
+                .active_open_target
+                .filter(|(gen, _)| *gen == current_gen)
+                .map(|(_, target)| target)
+        } else {
+            None
+        }
+    };
+    let popup_current_monitor_index = resolve_gtk_window_monitor_index(&gtk_win, &display);
+    let x11_main_window_monitor_index = if backend == LinuxDisplayBackend::X11 {
+        resolve_main_window_monitor_index(app, &display)
+    } else {
+        None
+    };
+    let plan = plan_linux_popover_refresh(
         backend,
         wayland_support,
         &monitors,
+        active_target,
+        popup_current_monitor_index,
+        x11_main_window_monitor_index,
         raw_anchor,
-        preferred_fallback,
         (TRAY_POPOVER_WIDTH, TRAY_POPOVER_HEIGHT),
     );
+    let refreshed_target = updated_active_target_after_refresh(active_target, &plan);
     let plan_valid = plan.validate_outside_click_plan();
     debug_assert!(plan_valid);
 
@@ -7111,6 +7731,13 @@ pub fn refresh_linux_popover_size_on_scale_change(
                 Instant::now,
                 WAYLAND_POPUP_PENDING_MAP_TIMEOUT,
                 |refresh_generation, attempt_ticket| {
+                    if let Some(updated_target) = refreshed_target {
+                        record_active_open_target_if_current(
+                            refresh_generation,
+                            attempt_ticket,
+                            updated_target,
+                        );
+                    }
                     drive_present_layer_popup_with_checkpoints(
                         cell,
                         &gtk_backend,
@@ -7120,7 +7747,6 @@ pub fn refresh_linux_popover_size_on_scale_change(
                         attempt_ticket,
                         (gdk_w, gdk_h),
                         plan.layer_shell.as_ref(),
-                        plan.target_monitor.monitor_index,
                         base_notice.clone(),
                     )
                 },
@@ -7158,6 +7784,9 @@ pub fn refresh_linux_popover_size_on_scale_change(
     else {
         return;
     };
+    if let Some(updated_target) = refreshed_target {
+        record_active_open_target_if_current(refresh_generation, attempt_ticket, updated_target);
+    }
     let x11_gdk_position = (plan.backend == LinuxDisplayBackend::X11)
         .then_some(plan.gdk_position)
         .flatten();
@@ -11227,7 +11856,7 @@ mod tests {
         WebviewSize(i32, i32),
         GtkHints(i32, i32, bool),
         LayerProps(WaylandShellLayer, i32),
-        Monitor(Option<usize>, Option<usize>),
+        Monitor(Option<usize>),
         AnchorsAndMargins {
             anchors: (bool, bool, bool, bool),
             margins: (i32, i32, i32, i32),
@@ -11247,7 +11876,7 @@ mod tests {
     struct RecordedPopupPresentation {
         webview_size: (i32, i32),
         gtk_hints: (i32, i32, bool),
-        monitor: (Option<usize>, Option<usize>),
+        monitor: Option<usize>,
         anchors: (bool, bool, bool, bool),
         margins: (i32, i32, i32, i32),
         keyboard_focus: RecordedKeyboardFocus,
@@ -11262,7 +11891,7 @@ mod tests {
             Self {
                 webview_size: (0, 0),
                 gtk_hints: (0, 0, false),
-                monitor: (None, None),
+                monitor: None,
                 anchors: (false, false, false, false),
                 margins: (0, 0, 0, 0),
                 keyboard_focus: RecordedKeyboardFocus::Unset,
@@ -11306,16 +11935,10 @@ mod tests {
             self.writes.push(write);
         }
 
-        fn apply_layer_shell_monitor(
-            &mut self,
-            placement_monitor_index: Option<usize>,
-            fallback_target_monitor_index: Option<usize>,
-        ) {
-            self.monitor = (placement_monitor_index, fallback_target_monitor_index);
-            self.writes.push(RecordedPresentationWrite::Monitor(
-                placement_monitor_index,
-                fallback_target_monitor_index,
-            ));
+        fn apply_layer_shell_monitor(&mut self, placement_monitor_index: Option<usize>) {
+            self.monitor = placement_monitor_index;
+            self.writes
+                .push(RecordedPresentationWrite::Monitor(placement_monitor_index));
             if let Some(hook) = self.on_set_monitor_hook.take() {
                 hook(self);
             }
@@ -11457,7 +12080,6 @@ mod tests {
                             inner_ticket,
                             (340, 296),
                             Some(&inner_placement),
-                            Some(1),
                             None,
                         )?;
                         target.keyboard_focus = RecordedKeyboardFocus::OnDemand;
@@ -11494,7 +12116,6 @@ mod tests {
                     ticket,
                     (360, 320),
                     Some(&outer_placement),
-                    Some(0),
                     Some("stale-open-notice".to_string()),
                 )
             },
@@ -11513,7 +12134,7 @@ mod tests {
             );
             assert_eq!(target.webview_size, (340, 296));
             assert_eq!(target.gtk_hints, (340, 296, true));
-            assert_eq!(target.monitor, (Some(1), Some(1)));
+            assert_eq!(target.monitor, Some(1));
             assert_eq!(target.anchors, (false, true, true, false));
             assert_eq!(target.margins, (0, 24, 28, 0));
             assert_eq!(target.keyboard_focus, RecordedKeyboardFocus::OnDemand);
@@ -11555,7 +12176,6 @@ mod tests {
                             inner_ticket,
                             (360, 320),
                             Some(&inner_placement),
-                            Some(1),
                             Some("new-gen-notice".to_string()),
                         )?;
                         set_tracker_window_flags(&inner_harness, true, true);
@@ -11591,7 +12211,6 @@ mod tests {
                     ticket,
                     (300, 240),
                     Some(&outer_placement),
-                    Some(0),
                     None,
                 )
             },
@@ -11609,7 +12228,7 @@ mod tests {
                 "outer Refresh must emit ZERO GTK writes after nested Open in set_monitor"
             );
             assert_eq!(target.webview_size, (360, 320));
-            assert_eq!(target.monitor, (Some(1), Some(1)));
+            assert_eq!(target.monitor, Some(1));
             assert_eq!(target.anchors, (false, true, true, false));
             assert_eq!(target.margins, (0, 24, 28, 0));
             assert_eq!(target.published_notice.as_deref(), Some("new-gen-notice"));
@@ -11661,7 +12280,6 @@ mod tests {
                     ticket,
                     (360, 320),
                     Some(&outer_placement),
-                    Some(0),
                     None,
                 )
             },
@@ -13617,5 +14235,533 @@ mod tests {
             classify_gdk_pointer_event(gdk::EventType::TripleButtonPress, 1),
             BackdropPointerEvent::NonInitialButtonEvent
         );
+    }
+
+    fn real_rotated_dp1_dp2_monitors(dp2_gdk_scale: f64) -> Vec<LinuxMonitorWorkarea> {
+        vec![
+            LinuxMonitorWorkarea {
+                monitor_index: Some(0),
+                geometry_x: 0,
+                geometry_y: 1632,
+                geometry_width: 2560,
+                geometry_height: 1440,
+                workarea_x: 0,
+                workarea_y: 1664,
+                workarea_width: 2560,
+                workarea_height: 1408,
+                scale_factor: 1.0,
+                is_primary: true,
+            },
+            LinuxMonitorWorkarea {
+                monitor_index: Some(1),
+                geometry_x: 2560,
+                geometry_y: 0,
+                geometry_width: 1728,
+                geometry_height: 3072,
+                workarea_x: 2560,
+                workarea_y: 32,
+                workarea_width: 1728,
+                workarea_height: 3040,
+                scale_factor: dp2_gdk_scale,
+                is_primary: false,
+            },
+        ]
+    }
+
+    fn real_rotated_dp1_dp2_identities() -> Vec<LinuxMonitorIdentity> {
+        vec![
+            LinuxMonitorIdentity {
+                manufacturer: Some("Dell Inc.".to_string()),
+                model: Some("U2723QE".to_string()),
+            },
+            LinuxMonitorIdentity {
+                manufacturer: Some("LG Electronics".to_string()),
+                model: Some("27GN950".to_string()),
+            },
+        ]
+    }
+
+    fn real_rotated_hyprland_snapshot_at(cursor_x: f64, cursor_y: f64) -> HyprlandClickSnapshot {
+        use crate::tray_output_linux::HyprlandLogicalMonitor;
+        HyprlandClickSnapshot {
+            cursor_x,
+            cursor_y,
+            monitors: vec![
+                HyprlandLogicalMonitor {
+                    name: "DP-1".to_string(),
+                    make: "Dell Inc.".to_string(),
+                    model: "U2723QE".to_string(),
+                    x: 0,
+                    y: 1632,
+                    rotated_physical_width: 2560,
+                    rotated_physical_height: 1440,
+                    logical_width: 2560,
+                    logical_height: 1440,
+                    scale: 1.0,
+                },
+                HyprlandLogicalMonitor {
+                    name: "DP-2".to_string(),
+                    make: "LG Electronics".to_string(),
+                    model: "27GN950".to_string(),
+                    x: 2560,
+                    y: 0,
+                    rotated_physical_width: 2160,
+                    rotated_physical_height: 3840,
+                    logical_width: 1728,
+                    logical_height: 3072,
+                    scale: 1.25,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn wayland_absent_anchor_on_second_output_never_pins_main_or_zero_at_open_or_refresh() {
+        let monitors = real_rotated_dp1_dp2_monitors(1.25);
+        let identities = real_rotated_dp1_dp2_identities();
+        let absent_anchor = Some(RawTrayAnchor {
+            click_position: Some(RawCoordinate2D::Physical { x: 0.0, y: 0.0 }),
+            tray_rect: None,
+        });
+        let main_on_dp1 = Some(0);
+        let wl_v4 = WaylandLayerShellSupport::Supported {
+            protocol_version: 4,
+        };
+
+        // Case A: No compositor hint (e.g. generic Wayland / Sway or Dux/Quickshell without
+        // Hyprland IPC): must delegate to compositor (`monitor_index: None`) even though `main`
+        // lives on DP-1 (monitor 0), clear any prior pin to `NULL`, and stay unpinned on refresh.
+        let (plan_unhinted, active_unhinted) = plan_linux_popover_open_for_activation(
+            LinuxDisplayBackend::Wayland,
+            wl_v4,
+            &monitors,
+            &identities,
+            absent_anchor,
+            PopoverActivationSource::TrayIconClick,
+            None,
+            main_on_dp1,
+            (TRAY_POPOVER_WIDTH, TRAY_POPOVER_HEIGHT),
+        );
+        let ls_unhinted = plan_unhinted.layer_shell.expect("layer shell plan");
+        assert_eq!(ls_unhinted.monitor_index, None);
+        assert!(matches!(
+            plan_unhinted.outcome,
+            PopoverPlacementOutcome::FallbackMonitorCorner {
+                reason: UnanchoredPlacementReason::MissingTrayCoordinates,
+                ..
+            }
+        ));
+        assert_eq!(active_unhinted, ActiveLinuxOpenTarget::CompositorDefault);
+        assert!(plan_unhinted.validate_outside_click_plan());
+
+        // Prior pin on monitor 0 MUST clear to NULL (`ClearToCompositorDefault`) on open, and
+        // subsequent `ScaleFactorChanged` refresh (now unpinned) MUST be `NoChange` — never
+        // re-pinning DP-1 or index 0!
+        assert_eq!(
+            resolve_layer_shell_monitor_action(true, ls_unhinted.monitor_index, false),
+            (LayerShellMonitorAction::ClearToCompositorDefault, false)
+        );
+        let refresh_unhinted = plan_linux_popover_refresh(
+            LinuxDisplayBackend::Wayland,
+            wl_v4,
+            &monitors,
+            Some(active_unhinted),
+            Some(1), // popup currently mapped by compositor onto DP-2
+            main_on_dp1,
+            absent_anchor,
+            (TRAY_POPOVER_WIDTH, TRAY_POPOVER_HEIGHT),
+        );
+        assert_eq!(
+            refresh_unhinted.layer_shell.expect("layer").monitor_index,
+            None
+        );
+        assert_eq!(refresh_unhinted.target_monitor.monitor_index, Some(1));
+        assert_eq!(
+            resolve_layer_shell_monitor_action(
+                false,
+                refresh_unhinted.layer_shell.unwrap().monitor_index,
+                false
+            ),
+            (LayerShellMonitorAction::NoChange, false)
+        );
+        assert_eq!(
+            updated_active_target_after_refresh(Some(active_unhinted), &refresh_unhinted),
+            Some(ActiveLinuxOpenTarget::CompositorDefault)
+        );
+
+        // Case B: Confirmed Hyprland click on rotated DP-2 (270deg @ 1.25x, GDK reporting integer
+        // scale 2.0) while `main` remains on DP-1: pins DP-2 (monitor 1) as honest
+        // `FallbackMonitorCorner` (NOT faked `IconAnchored`), survives `ScaleFactorChanged` AND
+        // chained `monitor-added` index shift without ever remapping back to DP-1.
+        let monitors_gdk_int = real_rotated_dp1_dp2_monitors(2.0);
+        let hypr_dp2_click = real_rotated_hyprland_snapshot_at(4190.0, 18.0);
+        let (plan_dp2, active_dp2) = plan_linux_popover_open_for_activation(
+            LinuxDisplayBackend::Wayland,
+            wl_v4,
+            &monitors_gdk_int,
+            &identities,
+            absent_anchor,
+            PopoverActivationSource::TrayIconClick,
+            Some(&hypr_dp2_click),
+            main_on_dp1,
+            (TRAY_POPOVER_WIDTH, TRAY_POPOVER_HEIGHT),
+        );
+        let ls_dp2 = plan_dp2.layer_shell.expect("layer shell plan on DP-2");
+        assert_eq!(ls_dp2.monitor_index, Some(1));
+        assert_eq!(plan_dp2.target_monitor.monitor_index, Some(1));
+        assert!(matches!(
+            plan_dp2.outcome,
+            PopoverPlacementOutcome::FallbackMonitorCorner {
+                reason: UnanchoredPlacementReason::MissingTrayCoordinates,
+                ..
+            }
+        ));
+        assert!(plan_dp2.validate_outside_click_plan());
+        assert_eq!(
+            active_dp2,
+            ActiveLinuxOpenTarget::ActivationHintedMonitor {
+                monitor_index: 1,
+                monitor_geometry: MonitorGeometryFingerprint {
+                    geometry_x: 2560,
+                    geometry_y: 0,
+                    geometry_width: 1728,
+                    geometry_height: 3072,
+                },
+            }
+        );
+
+        // Scale change on DP-2 (1.25 -> 1.5 => logical 1440x2560 at same origin (2560, 0)):
+        let mut monitors_scaled = monitors_gdk_int.clone();
+        monitors_scaled[1].geometry_width = 1440;
+        monitors_scaled[1].geometry_height = 2560;
+        monitors_scaled[1].workarea_width = 1440;
+        monitors_scaled[1].workarea_height = 2528;
+        let refresh_scaled = plan_linux_popover_refresh(
+            LinuxDisplayBackend::Wayland,
+            wl_v4,
+            &monitors_scaled,
+            Some(active_dp2),
+            None,
+            main_on_dp1,
+            absent_anchor,
+            (TRAY_POPOVER_WIDTH, TRAY_POPOVER_HEIGHT),
+        );
+        assert_eq!(
+            refresh_scaled.layer_shell.expect("layer").monitor_index,
+            Some(1)
+        );
+        assert_eq!(refresh_scaled.target_monitor.geometry_width, 1440);
+        let active_after_scale =
+            updated_active_target_after_refresh(Some(active_dp2), &refresh_scaled)
+                .expect("updated active target");
+
+        // Chained `monitor-added` inserting a negative-origin monitor at index 0 shifts DP-1 -> 1
+        // and DP-2 -> 2; refresh must follow DP-2 to index 2, never remapping to DP-1 or index 0!
+        let mut monitors_after_add = vec![LinuxMonitorWorkarea {
+            monitor_index: Some(0),
+            geometry_x: -1920,
+            geometry_y: 1632,
+            geometry_width: 1920,
+            geometry_height: 1080,
+            workarea_x: -1920,
+            workarea_y: 1664,
+            workarea_width: 1920,
+            workarea_height: 1048,
+            scale_factor: 1.0,
+            is_primary: false,
+        }];
+        let mut shifted_dp1 = monitors_scaled[0];
+        shifted_dp1.monitor_index = Some(1);
+        let mut shifted_dp2 = monitors_scaled[1];
+        shifted_dp2.monitor_index = Some(2);
+        monitors_after_add.push(shifted_dp1);
+        monitors_after_add.push(shifted_dp2);
+
+        let refresh_added = plan_linux_popover_refresh(
+            LinuxDisplayBackend::Wayland,
+            wl_v4,
+            &monitors_after_add,
+            Some(active_after_scale),
+            None,
+            Some(1), // main now on shifted DP-1 (index 1)
+            absent_anchor,
+            (TRAY_POPOVER_WIDTH, TRAY_POPOVER_HEIGHT),
+        );
+        assert_eq!(
+            refresh_added.layer_shell.expect("layer").monitor_index,
+            Some(2)
+        );
+        assert!(refresh_added.validate_outside_click_plan());
+    }
+
+    #[test]
+    fn wayland_alternating_reopen_menu_and_hot_unplug_clear_stale_pins_without_guessing_zero() {
+        let monitors = real_rotated_dp1_dp2_monitors(1.25);
+        let identities = real_rotated_dp1_dp2_identities();
+        let wl_v4 = WaylandLayerShellSupport::Supported {
+            protocol_version: 4,
+        };
+        let absent_anchor = Some(RawTrayAnchor {
+            click_position: Some(RawCoordinate2D::Physical { x: 0.0, y: 0.0 }),
+            tray_rect: None,
+        });
+        let main_on_dp1 = Some(0);
+
+        // 1. Open on monitor 2 (DP-2), then reopen on monitor 1 (DP-1), then reopen on monitor 2,
+        //    then invoke via `MenuOpenStatus` (keyboard/menu without pointer): each open targets
+        //    only its own activation output, and `MenuOpenStatus` clears any prior pin back to
+        //    `NULL` instead of leaking DP-2!
+        let snap_dp2 = real_rotated_hyprland_snapshot_at(4200.0, 20.0);
+        let snap_dp1 = real_rotated_hyprland_snapshot_at(2480.0, 1650.0);
+
+        let (open_dp2, _) = plan_linux_popover_open_for_activation(
+            LinuxDisplayBackend::Wayland,
+            wl_v4,
+            &monitors,
+            &identities,
+            absent_anchor,
+            PopoverActivationSource::TrayIconClick,
+            Some(&snap_dp2),
+            main_on_dp1,
+            (TRAY_POPOVER_WIDTH, TRAY_POPOVER_HEIGHT),
+        );
+        assert_eq!(open_dp2.layer_shell.unwrap().monitor_index, Some(1));
+        let (action_1, pinned_1) = resolve_layer_shell_monitor_action(
+            false,
+            open_dp2.layer_shell.unwrap().monitor_index,
+            true,
+        );
+        assert_eq!(action_1, LayerShellMonitorAction::PinMonitor(1));
+        assert!(pinned_1);
+
+        let (open_dp1, _) = plan_linux_popover_open_for_activation(
+            LinuxDisplayBackend::Wayland,
+            wl_v4,
+            &monitors,
+            &identities,
+            absent_anchor,
+            PopoverActivationSource::TrayIconClick,
+            Some(&snap_dp1),
+            main_on_dp1,
+            (TRAY_POPOVER_WIDTH, TRAY_POPOVER_HEIGHT),
+        );
+        assert_eq!(open_dp1.layer_shell.unwrap().monitor_index, Some(0));
+        let (action_2, pinned_2) = resolve_layer_shell_monitor_action(
+            pinned_1,
+            open_dp1.layer_shell.unwrap().monitor_index,
+            true,
+        );
+        assert_eq!(action_2, LayerShellMonitorAction::PinMonitor(0));
+        assert!(pinned_2);
+
+        let (reopen_dp2, active_dp2) = plan_linux_popover_open_for_activation(
+            LinuxDisplayBackend::Wayland,
+            wl_v4,
+            &monitors,
+            &identities,
+            absent_anchor,
+            PopoverActivationSource::TrayIconClick,
+            Some(&snap_dp2),
+            main_on_dp1,
+            (TRAY_POPOVER_WIDTH, TRAY_POPOVER_HEIGHT),
+        );
+        assert_eq!(reopen_dp2.layer_shell.unwrap().monitor_index, Some(1));
+        let (_, pinned_3) = resolve_layer_shell_monitor_action(
+            pinned_2,
+            reopen_dp2.layer_shell.unwrap().monitor_index,
+            true,
+        );
+        assert!(pinned_3);
+
+        let (menu_open, menu_target) = plan_linux_popover_open_for_activation(
+            LinuxDisplayBackend::Wayland,
+            wl_v4,
+            &monitors,
+            &identities,
+            None,
+            PopoverActivationSource::MenuOpenStatus,
+            Some(&snap_dp2), // must be ignored for MenuOpenStatus
+            main_on_dp1,
+            (TRAY_POPOVER_WIDTH, TRAY_POPOVER_HEIGHT),
+        );
+        assert_eq!(menu_open.layer_shell.unwrap().monitor_index, None);
+        assert_eq!(menu_target, ActiveLinuxOpenTarget::CompositorDefault);
+        let (action_menu, pinned_menu) = resolve_layer_shell_monitor_action(
+            pinned_3,
+            menu_open.layer_shell.unwrap().monitor_index,
+            false,
+        );
+        assert_eq!(
+            action_menu,
+            LayerShellMonitorAction::ClearToCompositorDefault
+        );
+        assert!(!pinned_menu);
+
+        // 2. Hot-unplugging DP-2 while `active_dp2` was active (only DP-1 remains) MUST degrade
+        //    to compositor default (`monitor_index: None`) rather than pinning index `0`, and
+        //    requesting a stale missing monitor index (`PinMonitor(99)`) must NEVER fall back to
+        //    pinning `monitors[0]`.
+        let only_dp1 = vec![monitors[0]];
+        let refresh_after_unplug = plan_linux_popover_refresh(
+            LinuxDisplayBackend::Wayland,
+            wl_v4,
+            &only_dp1,
+            Some(active_dp2),
+            None,
+            main_on_dp1,
+            absent_anchor,
+            (TRAY_POPOVER_WIDTH, TRAY_POPOVER_HEIGHT),
+        );
+        assert_eq!(
+            refresh_after_unplug.layer_shell.unwrap().monitor_index,
+            None
+        );
+        assert_eq!(
+            resolve_layer_shell_monitor_action(true, Some(99), false),
+            (LayerShellMonitorAction::ClearToCompositorDefault, false)
+        );
+        let stale_pin_plan = plan_linux_popover_placement_with_policy(
+            LinuxDisplayBackend::Wayland,
+            wl_v4,
+            &only_dp1,
+            None,
+            LinuxFallbackMonitorPolicy::PinMonitor(99),
+            (TRAY_POPOVER_WIDTH, TRAY_POPOVER_HEIGHT),
+        );
+        assert_eq!(stale_pin_plan.layer_shell.unwrap().monitor_index, None);
+    }
+
+    #[test]
+    fn global_anchors_negative_origins_x11_and_gnome_fallback_remain_preserved() {
+        let wl_v4 = WaylandLayerShellSupport::Supported {
+            protocol_version: 4,
+        };
+        let neg_monitors = vec![
+            LinuxMonitorWorkarea {
+                monitor_index: Some(0),
+                geometry_x: -1920,
+                geometry_y: 0,
+                geometry_width: 1920,
+                geometry_height: 1080,
+                workarea_x: -1920,
+                workarea_y: 32,
+                workarea_width: 1920,
+                workarea_height: 1048,
+                scale_factor: 1.0,
+                is_primary: false,
+            },
+            LinuxMonitorWorkarea {
+                monitor_index: Some(1),
+                geometry_x: 0,
+                geometry_y: 0,
+                geometry_width: 1280,
+                geometry_height: 720,
+                workarea_x: 0,
+                workarea_y: 32,
+                workarea_width: 1280,
+                workarea_height: 688,
+                scale_factor: 2.0,
+                is_primary: true,
+            },
+        ];
+        let identities = vec![
+            LinuxMonitorIdentity::default(),
+            LinuxMonitorIdentity::default(),
+        ];
+
+        // 1. Genuine Sway/Waybar global anchor on negative-origin monitor 0 stays `IconAnchored`
+        //    at open and across scale/hotplug refresh.
+        let sway_anchor = Some(RawTrayAnchor {
+            click_position: Some(RawCoordinate2D::Logical { x: -120.0, y: 16.0 }),
+            tray_rect: None,
+        });
+        let (wl_plan, wl_target) = plan_linux_popover_open_for_activation(
+            LinuxDisplayBackend::Wayland,
+            wl_v4,
+            &neg_monitors,
+            &identities,
+            sway_anchor,
+            PopoverActivationSource::TrayIconClick,
+            None,
+            Some(1),
+            (TRAY_POPOVER_WIDTH, TRAY_POPOVER_HEIGHT),
+        );
+        assert_eq!(wl_plan.layer_shell.unwrap().monitor_index, Some(0));
+        assert!(matches!(
+            wl_plan.outcome,
+            PopoverPlacementOutcome::IconAnchored { .. }
+        ));
+        assert!(matches!(
+            wl_target,
+            ActiveLinuxOpenTarget::GlobalAnchor { .. }
+        ));
+        let wl_refresh = plan_linux_popover_refresh(
+            LinuxDisplayBackend::Wayland,
+            wl_v4,
+            &neg_monitors,
+            Some(wl_target),
+            Some(0),
+            Some(1),
+            sway_anchor,
+            (TRAY_POPOVER_WIDTH, TRAY_POPOVER_HEIGHT),
+        );
+        assert_eq!(wl_refresh.layer_shell.unwrap().monitor_index, Some(0));
+        assert!(matches!(
+            wl_refresh.outcome,
+            PopoverPlacementOutcome::IconAnchored { .. }
+        ));
+
+        // 2. X11 absent-anchor fallback still honors `x11_main_window_monitor_index` and produces
+        //    clamped root coordinates on that monitor.
+        let (x11_plan, x11_target) = plan_linux_popover_open_for_activation(
+            LinuxDisplayBackend::X11,
+            WaylandLayerShellSupport::Unsupported(
+                WaylandLayerShellUnsupportedReason::CompositorProtocolUnsupported,
+            ),
+            &neg_monitors,
+            &identities,
+            None,
+            PopoverActivationSource::TrayIconClick,
+            None,
+            Some(0),
+            (TRAY_POPOVER_WIDTH, TRAY_POPOVER_HEIGHT),
+        );
+        assert_eq!(x11_plan.target_monitor.monitor_index, Some(0));
+        assert!(x11_plan.layer_shell.is_none());
+        let (x11_x, _) = x11_plan.gdk_position.expect("X11 root position");
+        assert!((-1920..0).contains(&x11_x));
+        assert!(matches!(
+            x11_target,
+            ActiveLinuxOpenTarget::ActivationHintedMonitor {
+                monitor_index: 0,
+                ..
+            }
+        ));
+
+        // 3. Unsupported Wayland compositor (GNOME / Mutter) preserves honest `CompositorManaged`.
+        let (gnome_plan, gnome_target) = plan_linux_popover_open_for_activation(
+            LinuxDisplayBackend::Wayland,
+            WaylandLayerShellSupport::Unsupported(
+                WaylandLayerShellUnsupportedReason::CompositorProtocolUnsupported,
+            ),
+            &neg_monitors,
+            &identities,
+            None,
+            PopoverActivationSource::TrayIconClick,
+            None,
+            Some(1),
+            (TRAY_POPOVER_WIDTH, TRAY_POPOVER_HEIGHT),
+        );
+        assert!(gnome_plan.layer_shell.is_none());
+        assert!(gnome_plan.gdk_position.is_none());
+        assert!(matches!(
+            gnome_plan.outcome,
+            PopoverPlacementOutcome::CompositorManaged {
+                has_activation_coordinates: false,
+                reason: UnanchoredPlacementReason::WaylandMissingCoordinatesAndCompositorSupport,
+                ..
+            }
+        ));
+        assert_eq!(gnome_target, ActiveLinuxOpenTarget::CompositorDefault);
     }
 }

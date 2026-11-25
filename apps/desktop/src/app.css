@@ -69,8 +69,8 @@ html[data-theme="light"] #app {
   --tl-bg-input: #141418;
   --tl-fg: #f4f4f6;
   --tl-fg-secondary: #d4d4d8;
-  --tl-fg-muted: #9ca3af;
-  --tl-fg-subtle: #71717a;
+  --tl-fg-muted: #b4b4bd;
+  --tl-fg-subtle: #a1a1aa;
   --tl-border: rgba(255, 255, 255, 0.08);
   --tl-border-strong: rgba(255, 255, 255, 0.15);
   --tl-accent: var(--accent-9, #52525b);
@@ -117,8 +117,8 @@ html[data-theme="light"] #app {
   --tl-bg-input: #ffffff;
   --tl-fg: #18181b;
   --tl-fg-secondary: #27272a;
-  --tl-fg-muted: #52525b;
-  --tl-fg-subtle: #71717a;
+  --tl-fg-muted: #43434a;
+  --tl-fg-subtle: #52525b;
   --tl-border: rgba(24, 24, 27, 0.1);
   --tl-border-strong: rgba(24, 24, 27, 0.18);
   --tl-dot-working: #0284c7;
@@ -731,6 +731,15 @@ html[data-theme="light"] #app {
   white-space: nowrap;
 }
 
+.tl-chat-item-row[data-selected="true"] .tl-chat-model-text {
+  border-color: var(--tl-border-strong);
+  color: var(--tl-fg-muted);
+}
+
+.tl-chat-item-row[data-selected="true"] .tl-chat-item-age {
+  color: var(--tl-fg-muted);
+}
+
 .tl-chat-archive-btn {
   flex: none;
   align-self: center;
@@ -1042,10 +1051,37 @@ html[data-theme="light"] #app {
   border-bottom-color: var(--amber-a5, rgba(245, 158, 11, 0.28));
 }
 
+.tl-workspace-alert-bar[data-tone="working"] {
+  color: #7dd3fc;
+  background: rgba(56, 189, 248, 0.11);
+  border-bottom-color: rgba(56, 189, 248, 0.28);
+}
+
+.tl-app-shell[data-theme="light"] .tl-workspace-alert-bar[data-tone="working"] {
+  color: #0369a1;
+  background: rgba(2, 132, 199, 0.1);
+  border-bottom-color: rgba(2, 132, 199, 0.26);
+}
+
+.tl-workspace-alert-bar[data-tone="neutral"] {
+  color: var(--tl-fg);
+  background: var(--tl-bg-elevated);
+  border-bottom-color: var(--tl-border-strong);
+}
+
 .tl-workspace-alert-bar[data-tone="unavailable"] {
   color: var(--tl-fg);
   background: var(--tl-bg-elevated);
   border-bottom-color: var(--tl-border-strong);
+}
+
+.tl-settings-card[data-codex-integration-priority="true"] {
+  border-color: var(--tl-border-strong);
+}
+
+.tl-settings-card:focus-visible {
+  outline: 2px solid var(--tl-dot-working);
+  outline-offset: 2px;
 }
 
 .tl-workspace-alert-copy {

@@ -119,7 +119,8 @@ body,
 }
 
 .tl-tray-pill[data-tone="attention"],
-.tl-tray-pill[data-tone="stale"] {
+.tl-tray-pill[data-tone="stale"],
+.tl-tray-pill[data-tone="unknown"] {
   color: #fcd34d;
   background: rgba(245, 158, 11, 0.12);
   border-color: rgba(245, 158, 11, 0.28);

@@ -6,6 +6,8 @@ mod codex_setup;
 mod host_control;
 mod observation;
 mod tray;
+#[cfg(any(target_os = "linux", test))]
+mod tray_output_linux;
 
 use std::env;
 use std::path::{Path, PathBuf};

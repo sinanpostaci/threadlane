@@ -1,9 +1,10 @@
 # Native Tray Popover Placement, Input Lifecycle, and Acceptance Scope
 
 This document records the implemented native system tray popover architecture in
-`apps/desktop/src-tauri/src/tray.rs` and `apps/desktop/src-tauri/src/tray_linux.rs`,
-the truthfulness boundaries enforced across display backends, and the live qualification
-gates required before claiming end-to-end desktop acceptance.
+`apps/desktop/src-tauri/src/tray.rs`, `apps/desktop/src-tauri/src/tray_linux.rs`, and
+`apps/desktop/src-tauri/src/tray_output_linux.rs`, the truthfulness boundaries enforced across
+display backends, and the live qualification gates required before claiming end-to-end desktop
+acceptance.
 
 ## 1. Scope and Current Verification Boundary
 
@@ -11,7 +12,32 @@ gates required before claiming end-to-end desktop acceptance.
   - Native Linux Wayland icon-anchored popup placement via `gtk-layer-shell = "0.8.2"`
     (`features = ["v0_6"]`, paired with `gtk = "0.18"` and `gdk = "0.18"` using
     `features = ["v3_24"]`) on compositors advertising `zwlr_layer_shell_v1` (Sway, Hyprland,
-    and compatible wlroots compositors).
+    and compatible wlroots compositors), plus absent-coordinate and panel-local multi-monitor
+    disambiguation in `tray_output_linux.rs` and `tray_linux.rs`:
+    - Valid trusted global SNI coordinates continue to anchor directly (`IconAnchored`) on their
+      resolved output (including rotated, fractional/mixed-scale, and negative logical origins).
+    - When Wayland activation coordinates are absent (`Activate(0, 0)`, e.g. Dux/Quickshell
+      `item.activate()`, or context-menu `MenuOpenStatus`), Wayland open and scale/hotplug refresh
+      **never** pin `main`'s monitor or `monitors[0]`; instead they either pin a trustworthy
+      activation-specific monitor hint or clear any prior monitor pin back to `NULL`
+      (`gtk_layer_set_monitor(win, NULL)` via a private Linux-only `#[allow(unsafe_code)]` FFI
+      wrapper `clear_gtk_layer_shell_monitor`) so the compositor selects the active output.
+    - On **confirmed Hyprland** sessions only (`WAYLAND_DISPLAY`, valid
+      `HYPRLAND_INSTANCE_SIGNATURE`, absent `SWAYSOCK`, and `XDG_CURRENT_DESKTOP`/`DESKTOP_SESSION`
+      confirming Hyprland), a single bounded read-only Unix socket query at click time
+      (`j/cursorpos` + `j/monitors` directly over `$XDG_RUNTIME_DIR/hypr/<sig>/.socket.sock`,
+      80ms per-call / 180ms total budget, strict byte caps, symlink/UID checks, zero subprocesses,
+      shell commands, polling, input hooks, background services, or new dependencies) may
+      disambiguate missing or panel-local `TrayIconClick` output on multi-monitor layouts
+      (including rotated 90°/270° and fractional-scale monitors such as `DP-1 (0,1632) 2560x1440@1`
+      + `DP-2 (2560,0) 3840x2160@1.25` rotated 270° -> logical `1728x3072`). Disambiguated
+      missing/panel-local activations always report honest `FallbackMonitorCorner` — never faked
+      `IconAnchored`.
+    - `MenuOpenStatus` and keyboard/menu invocations skip cursor disambiguation and delegate to
+      compositor output choice (`NULL` output), avoiding stale previous-click monitor leakage on
+      alternating activations; generation-scoped `ActiveLinuxOpenTarget` and `TrayState::active_open_anchor`
+      preserve the open generation's output choice across `ScaleFactorChanged` and `monitor-added`
+      refreshes and clear cleanly on hide, unsolicited unmap, and `monitor-removed`.
   - Native Wayland (`zwlr_layer_shell_v1` v4+) empty-workspace and multi-monitor outside-click
     dismissal via bounded, main-thread-owned GTK3 transparent RGBA transient input surfaces
     (`LINUX_TRAY_BACKDROP_WINDOW_ROLE`, at most one per actual `gdk::Monitor`, capped at
@@ -90,8 +116,9 @@ gates required before claiming end-to-end desktop acceptance.
   - Preserved `show_main` / `hide` / `quit` actions, `hide_to_tray` close-behavior persistence,
     single-instance lock and argument-conflict protection, and `main` window reachability
     fallbacks whenever tray creation or presentation fails.
-  - Deterministic unit regression tests in `apps/desktop/src-tauri/src/tray.rs` and
-    `apps/desktop/src-tauri/src/tray_linux.rs` exercising the shared production functions across
+  - Deterministic unit regression tests in `apps/desktop/src-tauri/src/tray.rs`,
+    `apps/desktop/src-tauri/src/tray_linux.rs`, and `apps/desktop/src-tauri/src/tray_output_linux.rs`
+    exercising the shared production functions across
     queued `popover.show()` returning unmapped then admitting via `connect_map` / single idle probe
     on the pre-reserved ticket, `hide` / `quit` / unsolicited `unmap` / newer ticket rejection
     before map, `1000ms` pending-map deadline leaving `0` input surfaces and blocking late map or
@@ -105,11 +132,16 @@ gates required before claiming end-to-end desktop acceptance.
     off-thread / stale / unconfigured / motion / release / missing-device / non-master /
     wrong-window / mismatched-display events, and survival of newer same-generation `Refresh` /
     newer-generation `Open` / `hide` reentry during both `ungrab` and fail-open `release`, explicit
-    empty `cairo::Region` invariants, missing-coordinate fallbacks, `focus_follows_mouse`
+    empty `cairo::Region` invariants, missing-coordinate fallbacks (including the real rotated
+    fractional-scale `DP-1 (0,1632) 2560x1440@1` + `DP-2 (2560,0) 3840x2160@1.25` 270° layout with
+    `main` on `DP-1` and absent or panel-local `DP-2` clicks, compositor-default `NULL`-output
+    unpinning, alternating `2 -> 1 -> 2 -> MenuOpenStatus` opens, `ScaleFactorChanged` +
+    `monitor-added` + hot-unplug refreshes, and bounded mock-Unix-socket Hyprland IPC validation),
+    `TrayState::active_open_anchor` isolation, `focus_follows_mouse`
     pointer-crossing tracking, click debounce, and post-blur reopen suppression. In-process harness
-    tests prove coordinator/tracker state-machine and ordering invariants only; real GTK3/Wayland
-    signal dispatch and compositor behavior require the parent's Linux build and live Sway VM
-    qualification gates below.
+    tests prove coordinator/tracker/planner state-machine and IPC parsing/timeout invariants only;
+    real GTK3/Wayland signal dispatch and live compositor behavior require the parent's Linux build,
+    isolated Sway VM qualification gates below, and separate live Hyprland desktop validation.
 - **Pending live parent qualification and software WebKitGTK refresh-blanking verification (not claimed by source edits alone)**:
   - Running Linux GTK compilation, `cargo fmt --check`, focused behavioral unit tests,
     `python3 -m unittest scripts/test_desktop_acceptance.py`, and `cargo clippy -- -D warnings`
@@ -122,7 +154,17 @@ gates required before claiming end-to-end desktop acceptance.
     pointer-transit dwell survival, empty-workspace outside-click implicit-grab release and
     dismissal, `Escape` dismissal, `10` immediate `1s`-target (`<= 2.5s` actual inter-capture time
     including overhead) `1x` reopen pixel and cross-output measurements over `>= 9.0s`
-    (`refresh_paint_survival`) before `Open Threadlane`, `Quit`, and owned 4-process cleanup.
+    (`refresh_paint_survival`) before `Open Threadlane`, isolated absent-coordinate SNI
+    `Activate(0, 0)` placement onto focused secondary output `HEADLESS-2` (`scale 2.0`) while
+    restored `main` stays open on `HEADLESS-1` (`scale 1.0`) and after prior `HEADLESS-1` pinning
+    (`absent_anchor_secondary_output_placement`), `Quit`, and owned 4-process cleanup.
+  - **Separate live Hyprland desktop verification**: isolated headless Sway VM tests prove real
+    `gtk_layer_set_monitor(win, NULL)` compositor-default output placement on secondary outputs
+    and genuine Waybar global anchoring, while unit tests prove Hyprland env gating, rotated/fractional
+    geometry matching, panel-local disambiguation, and bounded Unix-socket I/O/timeout/symlink
+    rejection against mock sockets. End-to-end Hyprland + Dux/Quickshell `item.activate()`
+    verification on the real multi-monitor desktop (`DP-1` + rotated `DP-2 @ 1.25`) remains a live
+    host/desktop check and is not claimed from unit tests or the Sway VM alone.
   - **Pending software WebKitGTK supplied-buffer backport verification**: while short single-pass
     checks could finish between periodic `4000ms` UI refreshes, sustained mixed-scale reopen across
     multiple refresh cycles exposed blank frames correlating with sparse `13x13` CPU damage updates
@@ -130,7 +172,7 @@ gates required before claiming end-to-end desktop acceptance.
     packaged separately without changing runtime environment flags, DOM/CSS, or reload behavior).
     Full native tray acceptance is **not** claimed until the parent runner executes the strengthened
     NixOS VM gate against the patched WebKitGTK dependency and passes both `refresh_paint_survival`
-    and all 14 checks.
+    and all 15 checks.
 
 ## 2. Implemented Platform Matrix
 
@@ -186,9 +228,16 @@ window instead of calling `show_all()`) and immediately invokes
 - Coordinates from `StatusNotifierItem::Activate(x, y)` and `TrayRect` are matched against each
   `gdk::Monitor`'s own logical geometry and physical span (`derive_physical_spans`), never
   converted upfront using `monitors[0].scale_factor`.
-- Reopening on a different monitor or after `WindowEvent::ScaleFactorChanged` recomputes the
-  target `gdk::Monitor`, updates `LayerShell::set_monitor`, clears all four `Edge` anchors
-  before applying the new perpendicular pair, and updates margins cleanly.
+- Reopening on a different monitor or after `WindowEvent::ScaleFactorChanged` / `monitor-added`
+  recomputes placement using the current open generation's `ActiveLinuxOpenTarget` (and
+  `TrayState::active_open_anchor`, never a stale previous click's `last_raw_anchor`), updates
+  `LayerShell::set_monitor` or clears a prior monitor pin back to `NULL` via
+  `clear_gtk_layer_shell_monitor` (`gtk_layer_set_monitor(win, NULL)`), clears all four `Edge`
+  anchors before applying the new perpendicular pair, and updates margins cleanly without ever
+  remapping an unanchored or secondary-output popup back to `main`'s monitor or `monitors[0]`.
+- On `monitor-removed`, `clear_gtk_layer_shell_monitor` releases any previously pinned
+  `GdkMonitor*` reference on the hidden layer window so subsequent opens cannot pin a removed
+  output.
 
 ### 3.4 Pointer-Follow-Focus (`focus_follows_mouse yes`), Empty-Workspace Root Cause, and Native Outside-Click Dismissal
 Without relying on Sway WM rules (`for_window [all] floating enable` or `focus_follows_mouse no`),
@@ -387,13 +436,18 @@ new WebKit/Tauri webviews, global input hooks, root privileges, or extra tray ba
 
 1. **Missing `StatusNotifierItem` coordinates (`(0, 0)` or context-menu `Open status`)**:
    `tray-icon 0.25.1`'s Linux `ksni` backend forwards `(x, y)` on `StatusNotifierItem::Activate`
-   but always returns `None` from `TrayIcon::rect()`, and `MenuOpenStatus` carries no click
-   point. Threadlane never reuses stale click coordinates from an earlier monitor click and
-   never reports fallback placement as `IconAnchored`; it returns
-   `PopoverPlacementOutcome::FallbackMonitorCorner` with `MISSING_TRAY_COORDINATES_FALLBACK_NOTICE`.
-   On Wayland without an active `main`-window monitor hint, initial fallback leaves
-   `monitor_index: None` so the compositor selects the active output rather than blindly
-   forcing `monitors[0]`.
+   but always returns `None` from `TrayIcon::rect()`, `MenuOpenStatus` carries no click point,
+   and Wayland panels such as Dux / Quickshell (`item.activate()`) invoke `Activate(0, 0)`.
+   Threadlane never reuses stale click coordinates from an earlier monitor click, never pins
+   `main`'s monitor or `monitors[0]` on Wayland open or scale/hotplug refresh, and never reports
+   fallback placement as `IconAnchored`; it returns `PopoverPlacementOutcome::FallbackMonitorCorner`
+   with `MISSING_TRAY_COORDINATES_FALLBACK_NOTICE`. On Wayland `TrayIconClick` without trusted
+   global coordinates, Threadlane uses an activation-specific monitor hint only when trustworthy
+   (on confirmed Hyprland multi-monitor sessions via a single bounded read-only Unix socket query
+   to `$XDG_RUNTIME_DIR/hypr/<sig>/.socket.sock`), and otherwise leaves `monitor_index: None` and
+   clears any prior monitor pin via `gtk_layer_set_monitor(win, NULL)` so the Wayland compositor
+   selects the active output. `MenuOpenStatus` and keyboard/menu invocations skip pointer-based
+   disambiguation and always use compositor-default (`NULL`) output choice.
 2. **Wayland compositors without `zwlr_layer_shell_v1` (GNOME / Mutter)**:
    Standard Wayland `xdg_toplevel` clients cannot position themselves in global output
    coordinates. Threadlane reports `CompositorManaged` (`WAYLAND_COMPOSITOR_PLACEMENT_NOTICE`),
@@ -421,12 +475,23 @@ new WebKit/Tauri webviews, global input hooks, root privileges, or extra tray ba
    Threadlane's own SNI icon toggles via D-Bus `Activate`, whereas clicking inert empty space on
    an external `NONE`-interactivity bar surface inside its reserved exclusive zone produces no
    focus change or client event.
-6. **Secondary-monitor SNI hosts emitting surface-local coordinates**:
+6. **Secondary-monitor SNI hosts emitting surface-local or absent coordinates**:
    The D-Bus `org.kde.StatusNotifierItem.Activate(int x, int y)` method carries no `wl_output`
-   identifier. Panels that emit compositor-global logical or physical coordinates map to the
-   exact target monitor; if a third-party panel on a secondary output emits bar-local `(x, y)`
-   offsets starting near `(0, 0)`, those values are indistinguishable in SNI from primary-output
-   coordinates.
+   identifier. Panels that emit compositor-global logical or physical coordinates (such as Sway /
+   Waybar) map directly to the exact target monitor as `IconAnchored`. On **confirmed Hyprland**
+   multi-monitor sessions, a single bounded click-time `j/cursorpos` + `j/monitors` query directly
+   over the user-owned Hyprland IPC socket disambiguates both absent `(0, 0)` points (such as Dux
+   / Quickshell `item.activate()`) and panel-local edge offsets emitted from another output,
+   placing the popup on the clicked monitor (accounting for 90°/270° rotations, fractional/mixed
+   scales, and negative logical origins) while truthfully reporting `FallbackMonitorCorner` rather
+   than `IconAnchored`. On non-Hyprland Wayland compositors without a compositor cursor-output
+   query, absent `(0, 0)` coordinates delegate cleanly to compositor output choice
+   (`gtk_layer_set_monitor(win, NULL)`), whereas non-zero panel-local `(x, y)` offsets that
+   happen to fall inside primary-output global bounds remain indistinguishable in SNI alone. If
+   a host/compositor lacks cursor disambiguation and a keyboard-only `Activate(0, 0)` occurs while
+   the pointer sits elsewhere, compositor-default output choice applies; on Hyprland, `MenuOpenStatus`
+   avoids pointer queries, whereas a keyboard-triggered SNI `Activate(0, 0)` with a live non-origin
+   cursor would follow the cursor monitor when uniquely matched.
 
 ## 5. Sway VM Harness Verification Notes
 
@@ -458,3 +523,20 @@ new WebKit/Tauri webviews, global input hooks, root privileges, or extra tray ba
      `HEADLESS-2` cross-output cleanliness (`other_output_diff_pixels == 0`), validated fail-closed
      via `verify_vm_acceptance_report` (`_verify_rendered_popup_measurement`) in both the runner
      CLI and the outer NixOS `testScript`.
+  5. Isolated absent-coordinate secondary-output placement
+     (`absent_anchor_secondary_output_placement` / `absent_anchor_secondary_output` in
+     `vm-acceptance-report.json`): after `Open Threadlane` restores `main` visibly on
+     `HEADLESS-1` (`scale 1.0`) and while the layer popup was previously pinned to `HEADLESS-1`,
+     focusing `HEADLESS-2` (`scale 2.0`) and invoking `org.kde.StatusNotifierItem.Activate(0, 0)`
+     directly over the isolated session D-Bus must unpin the prior `HEADLESS-1` monitor
+     (`gtk_layer_set_monitor(win, NULL)`), render the compact `360x320` logical (`720x640`
+     physical) fallback popup in `HEADLESS-2`'s top-right corner with `0` leaked pixels anywhere
+     outside `main` on `HEADLESS-1` (confirming `HEADLESS-1`'s fallback corner is unoccluded),
+     keep the popup on `HEADLESS-2` after a `0.50s` settle dwell across `ScaleFactorChanged` and
+     the `250ms` `Exclusive -> OnDemand` transition. The guest clicks the visible Refresh control
+     and captures both outputs immediately afterwards and after the next four-second poll.
+     Each capture must retain the same popup bounds, visible title and body text, and bright
+     Open Threadlane button. Escape then dismisses the popup before the globally anchored
+     `HEADLESS-2` `Quit` step. Live Hyprland + Dux/Quickshell
+     click-time disambiguation on rotated/fractional host displays remains a separate host
+     verification step beyond this headless Sway VM gate.

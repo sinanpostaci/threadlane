@@ -4197,22 +4197,22 @@ export function buildDefaultCodexSetupFixture(): CodexSetupReport {
   return {
     state: 'unchanged',
     mode: 'check',
-    config_path: null,
+    config_path: '/home/operator/.codex/config.toml',
     registered: true,
     config_modified: false,
     restart_required: false,
-    pairing_required: false,
+    pairing_required: true,
     error_code: null,
-    message: 'Startup Codex setup skipped in acceptance harness (--no-codex-startup-setup).',
+    message: 'Codex already has the Threadlane MCP configuration.',
     skill_setup: {
       state: 'unchanged',
       mode: 'check',
-      skill_path: null,
+      skill_path: '/home/operator/.agents/skills/threadlane',
       version: '0.1.0',
       installed: true,
       files_modified: false,
       error_code: null,
-      message: 'Bundled skill check skipped in acceptance harness.',
+      message: 'The bundled Threadlane skill is installed.',
     },
   };
 }
@@ -4272,6 +4272,8 @@ export interface InstallWorkspaceTauriOptions {
   trayPreferences?: TrayPreferencesResponse;
   initialLocalStorage?: Record<string, string>;
   toolProbeReplies?: Record<string, ToolProbeFixtureReply[]>;
+  codexSetup?: CodexSetupReport;
+  openCodexChatError?: { code: string; message: string } | null;
 }
 
 interface BrowserHarnessWindow extends Window {
@@ -4281,6 +4283,8 @@ interface BrowserHarnessWindow extends Window {
     getWorkspaceSnapshot: () => WorkspaceSnapshot;
     getRegistrySnapshot: () => RegistrySnapshot;
     setWorkspaceSnapshot: (nextSnapshot: WorkspaceSnapshot) => void;
+    setCodexSetupReport: (report: CodexSetupReport) => void;
+    setOpenCodexChatError: (err: { code: string; message: string } | null) => void;
     stallNextWorkspaceSnapshotRead: () => void;
     failNextWorkspaceSnapshotRead: () => void;
     getStalledWorkspaceSnapshotCount: () => number;
@@ -4296,6 +4300,8 @@ export interface WorkspaceTauriController {
   getWorkspaceSnapshot: () => Promise<WorkspaceSnapshot | null>;
   getRegistrySnapshot: () => Promise<RegistrySnapshot | null>;
   setWorkspaceSnapshot: (nextSnapshot: WorkspaceSnapshot) => Promise<void>;
+  setCodexSetupReport: (report: CodexSetupReport) => Promise<void>;
+  setOpenCodexChatError: (err: { code: string; message: string } | null) => Promise<void>;
   stallNextWorkspaceSnapshotRead: () => Promise<void>;
   failNextWorkspaceSnapshotRead: () => Promise<void>;
   getStalledWorkspaceSnapshotCount: () => Promise<number>;
@@ -4327,7 +4333,8 @@ export async function installWorkspaceTauriFixture(
   const registrySnapshot = options.registrySnapshot ?? buildDefaultRegistryFixture();
   const toolVersions = buildDefaultToolVersionsFixture();
   const toolStatus = buildDefaultToolStatusFixture();
-  const codexSetup = buildDefaultCodexSetupFixture();
+  const codexSetup = options.codexSetup ?? buildDefaultCodexSetupFixture();
+  const openCodexChatError = options.openCodexChatError ?? null;
   const desktopBridge = buildDefaultDesktopBridgeFixture();
 
   // Fix browser wall-clock `Date` at the fixture timestamp before first navigation
@@ -4344,6 +4351,7 @@ export async function installWorkspaceTauriFixture(
       toolVersions: DesktopToolVersionsSnapshot;
       toolStatus: ToolStatus[];
       codexSetup: CodexSetupReport;
+      openCodexChatError: { code: string; message: string } | null;
       desktopBridge: DesktopSnapshot;
       toolProbeReplies: Record<string, ToolProbeFixtureReply[]>;
     }) => {
@@ -4361,6 +4369,9 @@ export async function installWorkspaceTauriFixture(
 
       let currentWorkspace: WorkspaceSnapshot = JSON.parse(JSON.stringify(seed.workspace));
       let currentTrayPrefs: TrayPreferencesResponse = { ...seed.trayPrefs };
+      let currentCodexSetup: CodexSetupReport = JSON.parse(JSON.stringify(seed.codexSetup));
+      let currentOpenCodexChatError: { code: string; message: string } | null =
+        seed.openCodexChatError ? JSON.parse(JSON.stringify(seed.openCodexChatError)) : null;
       const invocations: RecordedTauriInvocation[] = [];
       let stallNextWorkspaceRead = false;
       let workspaceReadFailuresRemaining = 0;
@@ -4664,7 +4675,7 @@ export async function installWorkspaceTauriFixture(
               return cloneJson(seed.toolStatus);
             case 'desktop_codex_setup_status':
             case 'desktop_codex_setup_recheck':
-              return cloneJson(seed.codexSetup);
+              return cloneJson(currentCodexSetup);
             case 'desktop_snapshot':
               return cloneJson(seed.desktopBridge);
             case 'desktop_plan_approvals':
@@ -4732,6 +4743,9 @@ export async function installWorkspaceTauriFixture(
                   message: 'Missing verified source_id or thread_uuid for Codex chat navigation.',
                 };
               }
+              if (currentOpenCodexChatError !== null) {
+                throw cloneJson(currentOpenCodexChatError);
+              }
               return null;
             }
             default:
@@ -4752,6 +4766,12 @@ export async function installWorkspaceTauriFixture(
         getRegistrySnapshot: () => cloneJson(currentRegistry),
         setWorkspaceSnapshot: (nextSnapshot: WorkspaceSnapshot) => {
           currentWorkspace = cloneJson(nextSnapshot);
+        },
+        setCodexSetupReport: (report: CodexSetupReport) => {
+          currentCodexSetup = cloneJson(report);
+        },
+        setOpenCodexChatError: (err: { code: string; message: string } | null) => {
+          currentOpenCodexChatError = err ? cloneJson(err) : null;
         },
         stallNextWorkspaceSnapshotRead: () => {
           stallNextWorkspaceRead = true;
@@ -4792,6 +4812,7 @@ export async function installWorkspaceTauriFixture(
       toolVersions,
       toolStatus,
       codexSetup,
+      openCodexChatError,
       desktopBridge,
       toolProbeReplies: options.toolProbeReplies ?? {},
     },
@@ -4830,6 +4851,18 @@ export async function installWorkspaceTauriFixture(
         ).__THREADLANE_TEST_HARNESS__?.setWorkspaceSnapshot(snap);
       }, nextSnapshot);
     },
+    setCodexSetupReport: (report: CodexSetupReport) =>
+      page.evaluate((nextReport) => {
+        (
+          window as unknown as BrowserHarnessWindow
+        ).__THREADLANE_TEST_HARNESS__?.setCodexSetupReport(nextReport);
+      }, report),
+    setOpenCodexChatError: (err: { code: string; message: string } | null) =>
+      page.evaluate((nextErr) => {
+        (
+          window as unknown as BrowserHarnessWindow
+        ).__THREADLANE_TEST_HARNESS__?.setOpenCodexChatError(nextErr);
+      }, err),
     stallNextWorkspaceSnapshotRead: () =>
       page.evaluate(() => {
         (

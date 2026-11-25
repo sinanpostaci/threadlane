@@ -46,6 +46,7 @@ import {
 import {
   DesktopAppCoordinator,
   OBSERVATION_POLL_INTERVAL_MS,
+  isVerifiedNoRunningCodexInstanceError,
   type DesktopCoordinatorState,
 } from './app-data.ts';
 import {
@@ -60,11 +61,13 @@ import {
 } from './app-model.ts';
 import { ProfilesPanel } from './app-profiles.tsx';
 import {
+  hasCodexSetupFailure,
   loadSavedAppearance,
   saveAppearance,
   SettingsPanel,
 } from './app-settings.tsx';
 import { ToolsPanel } from './app-tools.tsx';
+import type { CodexSetupReport } from './codex-setup/types.ts';
 import {
   hasTauriRuntime,
   ipcDesktopToolStatus,
@@ -73,9 +76,11 @@ import {
 import {
   buildChatWorkLivenessIndex,
   formatSidebarLifecycleWaitingLabel,
+  formatSidebarLifecycleWorkingLabel,
   formatSidebarWaitingCounter,
   formatSidebarWorkingCounter,
   readWorkspaceChatWork,
+  resolveSidebarChatActor,
   resolveSidebarChatStatus,
   summarizeChatWorkLiveness,
   type ChatWorkLiveness,
@@ -87,6 +92,10 @@ import {
 } from './registry/ipc.ts';
 import type { RegistrySnapshot } from './registry/types.ts';
 import type { AccentName, AppearancePreferences } from './types.ts';
+import {
+  formatWorkspaceChatIdentityKey,
+  resolveWorkspaceChatLifecycle,
+} from './workspace-contract.ts';
 import { WorkspaceChatWorkSurface } from './workspace-panels.tsx';
 
 export type AppSection = 'projects' | 'tools' | 'profiles' | 'settings';
@@ -152,10 +161,19 @@ function StatusDots({
   );
 }
 
+interface ArchivedChatUndoEntry {
+  readonly identity: WorkspaceChatIdentity;
+  readonly chatKey: string;
+  readonly threadLabel: string;
+  readonly restoreSelectionOnUndo: boolean;
+  readonly selectionAfterArchive: string | null;
+}
+
 interface SidebarContentProps {
   activeSection: AppSection;
   collapsed: boolean;
   workspace: WorkspaceProductionProjection;
+  isHealthyEmpty: boolean;
   visibleProjects: readonly WorkspaceProjectGroupView[];
   selectedChatKey: string | null;
   collapsedProjects: ReadonlySet<string>;
@@ -165,13 +183,15 @@ interface SidebarContentProps {
   needsHumanCount: number;
   activeNeedsHumanCount: number;
   archivedNeedsHumanCount: number;
+  archivedWorkingAgentCount: number;
   onSelectSection: (section: AppSection) => void;
   onSelectLifecycle: (lifecycle: WorkspaceChatLifecycle) => void;
   onSelectChat: (chatKey: string) => void;
   onToggleProject: (projectKey: string) => void;
   onSetChatArchived: (
     identity: WorkspaceChatIdentity,
-    archived: boolean
+    archived: boolean,
+    meta?: { chatKey: string; threadLabel: string }
   ) => void;
 }
 
@@ -179,6 +199,7 @@ function SidebarContent({
   activeSection,
   collapsed,
   workspace,
+  isHealthyEmpty,
   visibleProjects,
   selectedChatKey,
   collapsedProjects,
@@ -188,6 +209,7 @@ function SidebarContent({
   needsHumanCount,
   activeNeedsHumanCount,
   archivedNeedsHumanCount,
+  archivedWorkingAgentCount,
   onSelectSection,
   onSelectLifecycle,
   onSelectChat,
@@ -214,6 +236,10 @@ function SidebarContent({
   const archivedWaitingLabel = formatSidebarLifecycleWaitingLabel(
     'archived',
     archivedNeedsHumanCount
+  );
+  const archivedWorkingLabel = formatSidebarLifecycleWorkingLabel(
+    'archived',
+    archivedWorkingAgentCount
   );
 
   return (
@@ -345,6 +371,14 @@ function SidebarContent({
                     <Archive size={14} aria-hidden="true" />
                     <span className="tl-projects-subnav-label">Archive</span>
                     <span className="tl-projects-subnav-badges">
+                      {archivedWorkingLabel !== null ? (
+                        <span
+                          className="tl-status-dot"
+                          data-tone="working"
+                          data-archived-working-indicator="true"
+                          aria-label={archivedWorkingLabel}
+                        />
+                      ) : null}
                       {archivedWaitingLabel !== null ? (
                         <span
                           className="tl-status-dot"
@@ -380,7 +414,8 @@ function SidebarContent({
                 <Loader2 size={15} className="tl-spin" aria-hidden="true" />
                 <span>Reading workspace…</span>
               </div>
-            ) : workspace.status === 'unavailable' ? (
+            ) : workspace.status === 'unavailable' ||
+              (workspace.status === 'empty' && !isHealthyEmpty) ? (
               <div className="tl-sidebar-empty" role="status">
                 <AlertCircle size={15} aria-hidden="true" />
                 <span>Observation unavailable</span>
@@ -388,10 +423,12 @@ function SidebarContent({
             ) : visibleProjects.length === 0 ? (
               <div className="tl-sidebar-empty" role="status">
                 <span>
-                  {workspace.emptyMessage ??
-                    (workspace.lifecycleFilter === 'archived'
-                      ? 'No archived chats in Projects/Archive.'
-                      : 'No active chats in Projects/Active.')}
+                  {isHealthyEmpty
+                    ? 'No chats yet. Open a Codex project chat.'
+                    : (workspace.emptyMessage ??
+                      (workspace.lifecycleFilter === 'archived'
+                        ? 'No archived chats in Projects/Archive.'
+                        : 'No active chats in Projects/Active.'))}
                 </span>
               </div>
             ) : (
@@ -485,24 +522,23 @@ function SidebarContent({
                             chatWorkLiveness,
                             { suppressed: livenessSuppressed }
                           );
+                          const sidebarActor = resolveSidebarChatActor(
+                            chatWorkLiveness,
+                            { suppressed: livenessSuppressed }
+                          );
                           const chatPrimaryTone: StatusDotTone =
                             chatStatus.tone === 'attention'
                               ? 'attention'
                               : chatStatus.tone === 'working'
                                 ? 'working'
                                 : 'neutral';
-                          const configuredModelLabel =
-                            chat.configuredSelection.evidence ===
-                            'verified_configuration'
-                              ? (chat.configuredSelection.friendlyModelLabel ??
-                                chat.configuredSelection.displayLabel)
-                              : null;
 
                           return (
                             <div
                               key={chat.chatKey}
                               className="tl-chat-item-row"
                               data-selected={selected ? 'true' : 'false'}
+                              data-chat-key={chat.chatKey}
                             >
                               <button
                                 type="button"
@@ -535,9 +571,18 @@ function SidebarContent({
                                       {chatStatus.label}
                                     </span>
                                   )}
-                                  {configuredModelLabel ? (
-                                    <span className="tl-chat-model-text">
-                                      {configuredModelLabel}
+                                  {sidebarActor !== null ? (
+                                    <span
+                                      className="tl-chat-model-text"
+                                      data-sidebar-actor={sidebarActor.kind}
+                                      data-sidebar-actor-role={
+                                        sidebarActor.role ?? 'multiple'
+                                      }
+                                      data-observed-model={
+                                        sidebarActor.observedModelRaw ?? undefined
+                                      }
+                                    >
+                                      {sidebarActor.label}
                                     </span>
                                   ) : null}
                                   {chat.updatedAtMs !== null ? (
@@ -555,7 +600,10 @@ function SidebarContent({
                                   aria-label={`Archive ${chat.threadLabel}`}
                                   title="Archive chat"
                                   onClick={() =>
-                                    onSetChatArchived(chat.identity, true)
+                                    onSetChatArchived(chat.identity, true, {
+                                      chatKey: chat.chatKey,
+                                      threadLabel: chat.threadLabel,
+                                    })
                                   }
                                 >
                                   <Archive size={12} aria-hidden="true" />
@@ -567,7 +615,10 @@ function SidebarContent({
                                   aria-label={`Restore ${chat.threadLabel}`}
                                   title="Restore chat"
                                   onClick={() =>
-                                    onSetChatArchived(chat.identity, false)
+                                    onSetChatArchived(chat.identity, false, {
+                                      chatKey: chat.chatKey,
+                                      threadLabel: chat.threadLabel,
+                                    })
                                   }
                                 >
                                   <RotateCcw size={12} aria-hidden="true" />
@@ -614,6 +665,14 @@ export function ThreadlaneDesktopShell() {
   const navigationTriggerRef = useRef<HTMLButtonElement | null>(null);
   const [activeSection, setActiveSection] = useState<AppSection>('projects');
   const [archiveErrorDismissed, setArchiveErrorDismissed] = useState(false);
+  const [archivedUndo, setArchivedUndo] =
+    useState<ArchivedChatUndoEntry | null>(null);
+  const undoInFlightRef = useRef(false);
+  const [codexFocusNonce, setCodexFocusNonce] = useState(0);
+  const [codexSetupReport, setCodexSetupReport] =
+    useState<CodexSetupReport | null>(null);
+  const [codexSetupAlertDismissed, setCodexSetupAlertDismissed] =
+    useState(false);
   const [collapsedProjects, setCollapsedProjects] = useState<Set<string>>(
     () => new Set()
   );
@@ -884,6 +943,8 @@ export function ThreadlaneDesktopShell() {
   const needsHumanCount = chatWorkState.totals.waitingChatCount;
   const activeNeedsHumanCount = chatWorkState.active.waitingChatCount;
   const archivedNeedsHumanCount = chatWorkState.archived.waitingChatCount;
+  const archivedWorkingAgentCount = chatWorkState.archived.workingAgentCount;
+  const archivedWorkingChatCount = chatWorkState.archived.workingChatCount;
 
   // Keep coordinator's selectedChatKey synchronized with the active lifecycle view
   useEffect(() => {
@@ -998,7 +1059,14 @@ export function ThreadlaneDesktopShell() {
   );
 
   const handleSelectChat = useCallback((chatKey: string) => {
-    coordinatorRef.current?.selectChat(chatKey);
+    const coordinator = coordinatorRef.current;
+    coordinator?.selectChat(chatKey);
+    if (coordinator?.getState().selectedChatKey === chatKey) {
+      // Clicking the automatic fallback is an explicit choice, even if its key stays the same.
+      setArchivedUndo((entry) =>
+        entry?.restoreSelectionOnUndo ? { ...entry, restoreSelectionOnUndo: false } : entry
+      );
+    }
     setActiveSection('projects');
     setMobileDrawerOpen(false);
   }, []);
@@ -1016,9 +1084,89 @@ export function ThreadlaneDesktopShell() {
   }, []);
 
   const handleSetChatArchived = useCallback(
-    (identity: WorkspaceChatIdentity, archived: boolean) => {
+    (
+      identity: WorkspaceChatIdentity,
+      archived: boolean,
+      meta?: { chatKey: string; threadLabel: string }
+    ) => {
       setArchiveErrorDismissed(false);
-      coordinatorRef.current?.setChatArchived(identity, archived);
+      const coordinator = coordinatorRef.current;
+      if (!coordinator) {
+        return;
+      }
+      const targetChatKey =
+        meta?.chatKey ?? formatWorkspaceChatIdentityKey(identity);
+      const previousSelectedChatKey = coordinator.getState().selectedChatKey;
+      const persisted = coordinator.setChatArchived(identity, archived);
+      if (!persisted) {
+        return;
+      }
+      if (archived && targetChatKey !== null) {
+        const nextSelectedChatKey = coordinator.getState().selectedChatKey;
+        setArchivedUndo({
+          identity,
+          chatKey: targetChatKey,
+          threadLabel: meta?.threadLabel?.trim() || 'Codex chat',
+          restoreSelectionOnUndo: previousSelectedChatKey === targetChatKey,
+          selectionAfterArchive: nextSelectedChatKey,
+        });
+      } else if (!archived && targetChatKey !== null) {
+        setArchivedUndo((current) =>
+          current !== null && current.chatKey === targetChatKey ? null : current
+        );
+      }
+    },
+    []
+  );
+
+  const handleUndoArchive = useCallback(() => {
+    if (undoInFlightRef.current || archivedUndo === null) {
+      return;
+    }
+    const coordinator = coordinatorRef.current;
+    if (!coordinator) {
+      return;
+    }
+    const entry = archivedUndo;
+    const currentState = coordinator.getState();
+    if (
+      resolveWorkspaceChatLifecycle(
+        currentState.archivePreferences,
+        entry.identity
+      ) !== 'archived'
+    ) {
+      setArchivedUndo(null);
+      return;
+    }
+    undoInFlightRef.current = true;
+    try {
+      setArchiveErrorDismissed(false);
+      const shouldRestoreSelection =
+        entry.restoreSelectionOnUndo &&
+        currentState.selectedChatKey === entry.selectionAfterArchive;
+      const restored = coordinator.setChatArchived(entry.identity, false, {
+        selectIfVisible: shouldRestoreSelection,
+      });
+      if (restored) {
+        setArchivedUndo(null);
+      }
+    } finally {
+      undoInFlightRef.current = false;
+    }
+  }, [archivedUndo]);
+
+  const handleOpenCodexSettings = useCallback(() => {
+    setActiveSection('settings');
+    setMobileDrawerOpen(false);
+    setCodexFocusNonce((prev) => prev + 1);
+  }, []);
+
+  const handleCodexSetupReportChange = useCallback(
+    (report: CodexSetupReport) => {
+      setCodexSetupReport(report);
+      if (hasCodexSetupFailure(report)) {
+        setCodexSetupAlertDismissed(false);
+      }
     },
     []
   );
@@ -1073,6 +1221,28 @@ export function ThreadlaneDesktopShell() {
   const visibleArchiveError =
     coordState.archiveError && !archiveErrorDismissed
       ? coordState.archiveError
+      : null;
+  const hasAvailableObservationSource =
+    coordState.workspaceSnapshot?.observation.sources.some(
+      (source) => source.availability === 'available'
+    ) ?? false;
+  const isWorkspaceHealthyEmpty =
+    workspace.status === 'empty' &&
+    coordState.observationError === null &&
+    workspace.unavailableSourceCount === 0 &&
+    hasAvailableObservationSource;
+  const isVerifiedNoRunningCodex = isVerifiedNoRunningCodexInstanceError(
+    coordState.codexOpenErrorCode
+  );
+  const codexSetupFailed =
+    hasTauriRuntime() && hasCodexSetupFailure(codexSetupReport);
+  const visibleCodexSetupFailureMessage =
+    codexSetupFailed && !codexSetupAlertDismissed && codexSetupReport !== null
+      ? codexSetupReport.state === 'error' ||
+        codexSetupReport.state === 'conflict' ||
+        codexSetupReport.state === 'disabled'
+        ? codexSetupReport.message
+        : (codexSetupReport.skill_setup?.message ?? codexSetupReport.message)
       : null;
 
   return (
@@ -1280,6 +1450,7 @@ export function ThreadlaneDesktopShell() {
               activeSection={activeSection}
               collapsed={false}
               workspace={workspace}
+              isHealthyEmpty={isWorkspaceHealthyEmpty}
               visibleProjects={visibleProjects}
               selectedChatKey={activeSelectedChat?.chatKey ?? null}
               collapsedProjects={collapsedProjects}
@@ -1289,6 +1460,7 @@ export function ThreadlaneDesktopShell() {
               needsHumanCount={needsHumanCount}
               activeNeedsHumanCount={activeNeedsHumanCount}
               archivedNeedsHumanCount={archivedNeedsHumanCount}
+              archivedWorkingAgentCount={archivedWorkingAgentCount}
               onSelectSection={handleSelectSection}
               onSelectLifecycle={handleSelectLifecycle}
               onSelectChat={handleSelectChat}
@@ -1311,6 +1483,7 @@ export function ThreadlaneDesktopShell() {
                 activeSection={activeSection}
                 collapsed={sidebarCollapsed}
                 workspace={workspace}
+                isHealthyEmpty={isWorkspaceHealthyEmpty}
                 visibleProjects={visibleProjects}
                 selectedChatKey={activeSelectedChat?.chatKey ?? null}
                 collapsedProjects={collapsedProjects}
@@ -1320,6 +1493,7 @@ export function ThreadlaneDesktopShell() {
                 needsHumanCount={needsHumanCount}
                 activeNeedsHumanCount={activeNeedsHumanCount}
                 archivedNeedsHumanCount={archivedNeedsHumanCount}
+                archivedWorkingAgentCount={archivedWorkingAgentCount}
                 onSelectSection={handleSelectSection}
                 onSelectLifecycle={handleSelectLifecycle}
                 onSelectChat={handleSelectChat}
@@ -1358,6 +1532,42 @@ export function ThreadlaneDesktopShell() {
                 </div>
               ) : null}
 
+              {archivedUndo !== null ? (
+                <div
+                  className="tl-workspace-alert-bar"
+                  data-tone="neutral"
+                  data-archive-undo="true"
+                  data-archive-undo-chat-key={archivedUndo.chatKey}
+                  role="status"
+                  aria-live="polite"
+                >
+                  <div className="tl-workspace-alert-copy">
+                    <Archive size={15} aria-hidden="true" />
+                    <span>Archived {archivedUndo.threadLabel}.</span>
+                  </div>
+                  <div className="tl-workspace-alert-actions">
+                    <Button
+                      size="1"
+                      variant="soft"
+                      color="gray"
+                      aria-label={`Undo archiving ${archivedUndo.threadLabel}`}
+                      onClick={handleUndoArchive}
+                    >
+                      <RotateCcw size={13} aria-hidden="true" />
+                      Undo
+                    </Button>
+                    <Button
+                      size="1"
+                      variant="ghost"
+                      color="gray"
+                      onClick={() => setArchivedUndo(null)}
+                    >
+                      Dismiss
+                    </Button>
+                  </div>
+                </div>
+              ) : null}
+
               {coordState.codexOpenError ? (
                 <div
                   className="tl-workspace-alert-bar"
@@ -1368,38 +1578,100 @@ export function ThreadlaneDesktopShell() {
                     <AlertCircle size={15} aria-hidden="true" />
                     <span>{coordState.codexOpenError}</span>
                   </div>
-                  <Button
-                    size="1"
-                    variant="soft"
-                    color="gray"
-                    onClick={() => {
-                      coordinatorRef.current?.clearCodexOpenError();
-                    }}
-                  >
-                    Dismiss
-                  </Button>
+                  <div className="tl-workspace-alert-actions">
+                    {isVerifiedNoRunningCodex ? (
+                      <Button
+                        size="1"
+                        variant="surface"
+                        color="gray"
+                        onClick={handleOpenCodexSettings}
+                      >
+                        Open Codex settings
+                      </Button>
+                    ) : null}
+                    <Button
+                      size="1"
+                      variant="soft"
+                      color="gray"
+                      onClick={() => {
+                        coordinatorRef.current?.clearCodexOpenError();
+                      }}
+                    >
+                      Dismiss
+                    </Button>
+                  </div>
+                </div>
+              ) : null}
+
+              {visibleCodexSetupFailureMessage ? (
+                <div
+                  className="tl-workspace-alert-bar"
+                  data-tone="danger"
+                  data-codex-setup-alert="true"
+                  role="alert"
+                >
+                  <div className="tl-workspace-alert-copy">
+                    <AlertCircle size={15} aria-hidden="true" />
+                    <span>{visibleCodexSetupFailureMessage}</span>
+                  </div>
+                  <div className="tl-workspace-alert-actions">
+                    <Button
+                      size="1"
+                      variant="surface"
+                      color="gray"
+                      onClick={handleOpenCodexSettings}
+                    >
+                      Open Codex settings
+                    </Button>
+                    <Button
+                      size="1"
+                      variant="soft"
+                      color="gray"
+                      onClick={() => setCodexSetupAlertDismissed(true)}
+                    >
+                      Dismiss
+                    </Button>
+                  </div>
                 </div>
               ) : null}
 
               {workspace.lifecycleFilter === 'active' &&
-              archivedNeedsHumanCount > 0 ? (
+              (archivedNeedsHumanCount > 0 || archivedWorkingAgentCount > 0) ? (
                 <div
                   className="tl-workspace-alert-bar"
-                  data-tone="attention"
+                  data-tone={
+                    archivedNeedsHumanCount > 0 ? 'attention' : 'working'
+                  }
+                  data-archived-working-banner={
+                    archivedWorkingAgentCount > 0 ? 'true' : undefined
+                  }
                   role="status"
                 >
                   <div className="tl-workspace-alert-copy">
-                    <AlertCircle size={15} aria-hidden="true" />
+                    {archivedNeedsHumanCount > 0 ? (
+                      <AlertCircle size={15} aria-hidden="true" />
+                    ) : (
+                      <Loader2
+                        size={15}
+                        className="tl-spin"
+                        aria-hidden="true"
+                      />
+                    )}
                     <span>
-                      {archivedNeedsHumanCount === 1
-                        ? '1 archived chat has a Coworker waiting for you in Codex.'
-                        : `${archivedNeedsHumanCount} archived chats have a Coworker waiting for you in Codex.`}
+                      {archivedNeedsHumanCount > 0 &&
+                      archivedWorkingAgentCount > 0
+                        ? `${archivedNeedsHumanCount === 1 ? '1 archived chat has a Coworker waiting for you in Codex' : `${archivedNeedsHumanCount} archived chats have a Coworker waiting for you in Codex`}, and ${archivedWorkingAgentCount === 1 ? '1 working agent is running' : `${archivedWorkingAgentCount} working agents are running`} in Archive.`
+                        : archivedNeedsHumanCount > 0
+                          ? archivedNeedsHumanCount === 1
+                            ? '1 archived chat has a Coworker waiting for you in Codex.'
+                            : `${archivedNeedsHumanCount} archived chats have a Coworker waiting for you in Codex.`
+                          : `${archivedWorkingAgentCount === 1 ? '1 working agent is running in Archive' : `${archivedWorkingAgentCount} working agents are running in Archive`} (${archivedWorkingChatCount === 1 ? '1 archived chat' : `${archivedWorkingChatCount} archived chats`}).`}
                     </span>
                   </div>
                   <Button
                     size="1"
                     variant="soft"
-                    color="amber"
+                    color={archivedNeedsHumanCount > 0 ? 'amber' : 'gray'}
                     onClick={() => handleSelectLifecycle('archived')}
                   >
                     Open Archive
@@ -1407,8 +1679,9 @@ export function ThreadlaneDesktopShell() {
                 </div>
               ) : null}
 
-              {workspace.status === 'unavailable' &&
-              workspace.unavailableReason ? (
+              {(workspace.status === 'unavailable' ||
+                (workspace.status === 'empty' && !isWorkspaceHealthyEmpty)) &&
+              (workspace.unavailableReason || coordState.observationError) ? (
                 <div
                   className="tl-workspace-alert-bar"
                   data-tone="unavailable"
@@ -1416,7 +1689,10 @@ export function ThreadlaneDesktopShell() {
                 >
                   <div className="tl-workspace-alert-copy">
                     <AlertCircle size={15} aria-hidden="true" />
-                    <span>{workspace.unavailableReason}</span>
+                    <span>
+                      {workspace.unavailableReason ??
+                        coordState.observationError}
+                    </span>
                   </div>
                   <div className="tl-workspace-alert-actions">
                     <Button
@@ -1525,8 +1801,18 @@ export function ThreadlaneDesktopShell() {
                   loading={coordState.observationLoading}
                   error={coordState.observationError}
                   isStale={workspace.isStale}
+                  workspaceStatus={workspace.status}
+                  workspaceHealthyEmpty={isWorkspaceHealthyEmpty}
+                  workspaceUnavailableReason={
+                    workspace.unavailableReason ?? coordState.observationError
+                  }
+                  workspaceLifecycle={workspace.lifecycleFilter}
+                  activeChatCount={workspace.activeChatCount}
+                  archivedChatCount={workspace.archivedChatCount}
                   onRefresh={handleWorkspaceRefresh}
                   onOpenCodex={handleOpenCodex}
+                  onOpenCodexSettings={handleOpenCodexSettings}
+                  onOpenArchive={() => handleSelectLifecycle('archived')}
                   codexOpenInFlight={coordState.codexOpenInFlight}
                 />
               )}
@@ -1594,6 +1880,12 @@ export function ThreadlaneDesktopShell() {
                 diagnostics={workspace.diagnostics}
                 warnings={workspace.warnings}
                 onObservationLinked={handleWorkspaceRefresh}
+                isActive={activeSection === 'settings'}
+                focusCodexIntegrationNonce={codexFocusNonce}
+                codexNavigationError={
+                  isVerifiedNoRunningCodex ? coordState.codexOpenError : null
+                }
+                onCodexSetupReportChange={handleCodexSetupReportChange}
               />
             </section>
           </main>

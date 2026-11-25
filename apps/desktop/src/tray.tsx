@@ -92,8 +92,11 @@ function resolveSubbarBanner(
     return null;
   }
   if (projection.refreshError) {
+    const observedSuffix = projection.lastObservedAgeLabel
+      ? ` · Last observed ${projection.lastObservedAgeLabel}`
+      : '';
     return {
-      text: `Showing retained state · ${projection.refreshError}`,
+      text: `Showing retained state${observedSuffix} · ${projection.refreshError}`,
       tone: 'warning',
     };
   }
@@ -170,25 +173,31 @@ export function TrayPopoverCard({
             </span>
           ) : status === 'loading' ? (
             <span className="tl-tray-pill">Loading…</span>
+          ) : workingCount === null || attentionCount === null ? (
+            <span
+              className="tl-tray-pill"
+              data-tone="unknown"
+              data-live-counts="unknown"
+            >
+              {projection.headerStatusLabel}
+            </span>
           ) : (
             <>
               <span
                 className="tl-tray-pill"
-                data-tone={
-                  workingCount && workingCount > 0 ? 'working' : 'idle'
-                }
+                data-tone={workingCount > 0 ? 'working' : 'idle'}
+                data-live-counts="known"
               >
-                {workingCount ?? 0} working
+                {workingCount} working
               </span>
               <span
                 className="tl-tray-pill"
-                data-tone={
-                  attentionCount && attentionCount > 0 ? 'attention' : 'idle'
-                }
+                data-tone={attentionCount > 0 ? 'attention' : 'idle'}
+                data-live-counts="known"
               >
                 {attentionCount === 1
                   ? '1 needs you'
-                  : `${attentionCount ?? 0} need you`}
+                  : `${attentionCount} need you`}
               </span>
             </>
           )}
@@ -234,16 +243,33 @@ export function TrayPopoverCard({
             <Text size="2">Reading workspace snapshot…</Text>
           </div>
         ) : status === 'empty' || rows.length === 0 ? (
-          <div className="tl-tray-state-box" role="status">
-            <CheckCircle2 size={18} aria-hidden="true" />
-            <Text size="2" weight="medium" style={{ color: '#e4e4e7' }}>
-              No active or recent work
-            </Text>
-            <Text size="1" style={{ color: '#a1a1aa' }}>
-              {projection.emptyMessage ??
-                'Observed conversations have no pending questions or active workers.'}
-            </Text>
-          </div>
+          workingCount === null || attentionCount === null ? (
+            <div
+              className="tl-tray-state-box"
+              role="status"
+              data-live-counts="unknown"
+            >
+              <HelpCircle size={18} aria-hidden="true" />
+              <Text size="2" weight="medium" style={{ color: '#f4f4f5' }}>
+                Live status unknown
+              </Text>
+              <Text size="1" style={{ color: '#b4b4bd' }}>
+                {projection.emptyMessage ??
+                  'Live status is unknown until a fresh refresh succeeds.'}
+              </Text>
+            </div>
+          ) : (
+            <div className="tl-tray-state-box" role="status">
+              <CheckCircle2 size={18} aria-hidden="true" />
+              <Text size="2" weight="medium" style={{ color: '#e4e4e7' }}>
+                No active or recent work
+              </Text>
+              <Text size="1" style={{ color: '#b4b4bd' }}>
+                {projection.emptyMessage ??
+                  'Observed conversations have no pending questions or active workers.'}
+              </Text>
+            </div>
+          )
         ) : (
           rows.map((row) => {
             const target = row.codexTarget;

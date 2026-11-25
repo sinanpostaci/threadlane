@@ -188,6 +188,8 @@ export interface TrayProjection {
   historicalReceipts: TrayHistoricalReceiptView[];
   emptyMessage: string | null;
   unavailableReason: string | null;
+  lastObservedAtMs?: number | null;
+  lastObservedAgeLabel?: string | null;
 }
 
 export interface TrayProjectionOptions {
@@ -249,6 +251,40 @@ function formatCompactAgeMs(ms: number): string {
   const minutes = Math.floor(seconds / 60);
   const remSeconds = seconds % 60;
   return remSeconds > 0 ? `${minutes}m ${remSeconds}s` : `${minutes}m`;
+}
+
+function resolveSnapshotLastObservedAtMs(
+  snapshot: WorkspaceSnapshot
+): number | null {
+  let latestProducerMs: number | null = null;
+  const consider = (ts: number | null | undefined): void => {
+    if (typeof ts === 'number' && Number.isFinite(ts) && ts > 0) {
+      const normalized = Math.trunc(ts);
+      if (latestProducerMs === null || normalized > latestProducerMs) {
+        latestProducerMs = normalized;
+      }
+    }
+  };
+
+  for (const sample of snapshot.native_samples) {
+    consider(sample.last_success_at_ms ?? sample.observed_at_ms);
+  }
+  for (const work of snapshot.chat_work) {
+    for (const presence of work.worker_presence) {
+      consider(presence.sampled_at_ms);
+    }
+  }
+  if (latestProducerMs !== null) {
+    return latestProducerMs;
+  }
+  if (
+    typeof snapshot.generated_at_ms === 'number' &&
+    Number.isFinite(snapshot.generated_at_ms) &&
+    snapshot.generated_at_ms > 0
+  ) {
+    return Math.trunc(snapshot.generated_at_ms);
+  }
+  return null;
 }
 
 function formatAgeLabel(atMs: number | null, nowMs: number): string {
@@ -2122,6 +2158,12 @@ export function projectMinimalTrayModel(
   ).length;
   const totalChatCount =
     workspace.activeChatCount + workspace.archivedChatCount;
+  const referenceNowMs = workspace.referenceNowMs;
+  const lastObservedAtMs = resolveSnapshotLastObservedAtMs(normalizedSnapshot);
+  const lastObservedAgeLabel =
+    lastObservedAtMs !== null
+      ? formatAgeLabel(lastObservedAtMs, referenceNowMs)
+      : null;
 
   if (
     workspace.status === 'unavailable' ||
@@ -2132,16 +2174,19 @@ export function projectMinimalTrayModel(
     const firstUnavailableMsg = trimOrNull(
       workspace.unavailableSources[0]?.rawMessage
     );
-    return makeUnavailableProjection(
-      errorText ??
-        firstUnavailableMsg ??
-        workspace.unavailableReason ??
-        'No reachable workspace observation source is currently available.',
-      unavailableSourceCount
-    );
+    return {
+      ...makeUnavailableProjection(
+        errorText ??
+          firstUnavailableMsg ??
+          workspace.unavailableReason ??
+          'No reachable workspace observation source is currently available.',
+        unavailableSourceCount
+      ),
+      lastObservedAtMs,
+      lastObservedAgeLabel,
+    };
   }
 
-  const referenceNowMs = workspace.referenceNowMs;
   const chatMetaByKey = new Map<string, MinimalTrayChatMeta>();
   const addChatMeta = (
     identity: WorkspaceChatIdentity,
@@ -2368,12 +2413,37 @@ export function projectMinimalTrayModel(
     ...sortRawCandidates(resultCandidates),
   ];
   const rows = buildTrayRowViews(orderedCandidates, referenceNowMs);
-  const headerStatusLabel = formatTrayHeaderSummary(
-    workingCount,
-    attentionCount
-  );
-  const isStale = workspace.isStale || hasStaleCoworker;
+  const liveCountsUnknown = errorText !== null;
+  const headerStatusLabel = liveCountsUnknown
+    ? 'Live status unknown'
+    : formatTrayHeaderSummary(workingCount, attentionCount);
+  const isStale = liveCountsUnknown || workspace.isStale || hasStaleCoworker;
   const sourceNotice = buildSourceFailureNotice(workspace.unavailableSources);
+
+  if (liveCountsUnknown) {
+    const unknownMessage =
+      lastObservedAgeLabel !== null
+        ? `Live status is unknown until a fresh refresh succeeds (last observed ${lastObservedAgeLabel}). Live chat indicators are withheld.`
+        : 'Live status is unknown until a fresh refresh succeeds. Live chat indicators are withheld.';
+    return {
+      status: rows.length > 0 ? 'ready' : 'empty',
+      headerStatusLabel,
+      workingCount: null,
+      attentionCount: null,
+      pendingAcceptanceCount: 0,
+      unavailableSourceCount,
+      isStale: true,
+      refreshError: errorText,
+      sourceNotice,
+      coworkerSummary: null,
+      rows,
+      historicalReceipts: [],
+      emptyMessage: rows.length > 0 ? null : unknownMessage,
+      unavailableReason: null,
+      lastObservedAtMs,
+      lastObservedAgeLabel,
+    };
+  }
 
   if (rows.length === 0 && workingCount === 0 && attentionCount === 0) {
     return {
@@ -2396,6 +2466,8 @@ export function projectMinimalTrayModel(
             ? 'Live chat indicators are withheld until a fresh sample arrives.'
             : 'No current human requests or working agents.',
       unavailableReason: null,
+      lastObservedAtMs,
+      lastObservedAgeLabel,
     };
   }
 
@@ -2414,6 +2486,8 @@ export function projectMinimalTrayModel(
     historicalReceipts: [],
     emptyMessage: null,
     unavailableReason: null,
+    lastObservedAtMs,
+    lastObservedAgeLabel,
   };
 }
 
@@ -2457,6 +2531,7 @@ export class TrayObservationCoordinator {
   private requestSeq = 0;
   private activeRequestSeq = 0;
   private latestIssuedSeq = 0;
+  private visibilityEpoch = 0;
   private visible: boolean;
   private focused: boolean;
   private openSessionReadStarted = false;
@@ -2500,9 +2575,13 @@ export class TrayObservationCoordinator {
     if (this.disposed) {
       return;
     }
+    const wasVisible = this.visible;
     this.visible = visible;
     this.focused = focused;
     if (!visible) {
+      if (wasVisible) {
+        this.visibilityEpoch += 1;
+      }
       this.queuedForceRefresh = false;
       this.openSessionReadStarted = false;
       this.activeRequestIsOpenTransition = false;
@@ -2563,6 +2642,7 @@ export class TrayObservationCoordinator {
     }
     this.visible = false;
     this.focused = false;
+    this.visibilityEpoch += 1;
     this.queuedForceRefresh = false;
     this.openSessionReadStarted = false;
     this.activeRequestIsOpenTransition = false;
@@ -2671,6 +2751,7 @@ export class TrayObservationCoordinator {
     this.disposed = true;
     this.visible = false;
     this.focused = false;
+    this.visibilityEpoch += 1;
     this.queuedForceRefresh = false;
     this.openSessionReadStarted = false;
     this.activeRequestIsOpenTransition = false;
@@ -2703,6 +2784,7 @@ export class TrayObservationCoordinator {
 
   private startRequest(isOpenTransition: boolean): Promise<void> {
     const seq = ++this.requestSeq;
+    const epoch = this.visibilityEpoch;
     this.activeRequestSeq = seq;
     this.latestIssuedSeq = seq;
     this.activeRequestIsOpenTransition = isOpenTransition;
@@ -2719,12 +2801,37 @@ export class TrayObservationCoordinator {
       this.emitChange();
     }
 
+    const request: ObservationSnapshotRequest = {
+      limit: WORKSPACE_TRAY_SNAPSHOT_PAGE_LIMIT,
+    };
+
     const run = async (): Promise<void> => {
       try {
-        const snapshot = await this.fetcher({
-          limit: WORKSPACE_TRAY_SNAPSHOT_PAGE_LIMIT,
-        });
-        if (this.disposed || seq !== this.latestIssuedSeq) {
+        let snapshot: WorkspaceSnapshot;
+        try {
+          snapshot = await this.fetcher(request);
+        } catch (firstErr) {
+          // Match main-window single confirmation retry when safe: only on a
+          // visible refresh with a retained snapshot, no prior sustained error,
+          // and an unchanged request/visibility epoch.
+          if (
+            this.disposed ||
+            !this.visible ||
+            this.state.snapshot === null ||
+            this.state.error !== null ||
+            seq !== this.latestIssuedSeq ||
+            epoch !== this.visibilityEpoch ||
+            this.queuedForceRefresh
+          ) {
+            throw firstErr;
+          }
+          snapshot = await this.fetcher(request);
+        }
+        if (
+          this.disposed ||
+          seq !== this.latestIssuedSeq ||
+          epoch !== this.visibilityEpoch
+        ) {
           return;
         }
         this.state = {
@@ -2735,7 +2842,11 @@ export class TrayObservationCoordinator {
         };
         this.emitChange();
       } catch (err) {
-        if (this.disposed || seq !== this.latestIssuedSeq) {
+        if (
+          this.disposed ||
+          seq !== this.latestIssuedSeq ||
+          epoch !== this.visibilityEpoch
+        ) {
           return;
         }
         // Retain any previously loaded WorkspaceSnapshot untouched so producer

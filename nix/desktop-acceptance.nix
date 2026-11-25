@@ -561,6 +561,7 @@ let
     import json
     import os
     import pathlib
+    import re
     import shutil
     import subprocess
     import sys
@@ -608,6 +609,7 @@ let
         "escape_dismiss",
         "reopen_after_dismiss",
         "hide_main_to_tray_and_open_control",
+        "absent_anchor_secondary_output_placement",
         "quit_control",
         "no_codex_startup_setup_preserved",
     )
@@ -1132,6 +1134,295 @@ let
                     f"Popup pixels still visible after Open Threadlane ({remaining_px} non-bg pixels)"
                 )
             return True
+
+
+    def discover_sni_item_target(env: dict[str, str]) -> tuple[str, str]:
+        res = run_checked(
+            [
+                "gdbus",
+                "call",
+                "--session",
+                "--dest",
+                "org.kde.StatusNotifierWatcher",
+                "--object-path",
+                "/StatusNotifierWatcher",
+                "--method",
+                "org.freedesktop.DBus.Properties.Get",
+                "org.kde.StatusNotifierWatcher",
+                "RegisteredStatusNotifierItems",
+            ],
+            env=env,
+        )
+        items = re.findall(r"'([^']+)'", res.stdout)
+        parsed: list[tuple[str, str]] = []
+        for raw in items:
+            entry = raw.strip()
+            if not entry:
+                continue
+            if "/" in entry:
+                dest, rest = entry.split("/", 1)
+                obj_path = "/" + rest
+            else:
+                dest = entry
+                obj_path = "/StatusNotifierItem"
+            if dest:
+                parsed.append((dest, obj_path))
+        if not parsed:
+            raise HarnessFailure(
+                f"No registered StatusNotifierItem found on StatusNotifierWatcher: {res.stdout!r}"
+            )
+        for dest, obj_path in parsed:
+            try:
+                id_res = run_checked(
+                    [
+                        "gdbus",
+                        "call",
+                        "--session",
+                        "--dest",
+                        dest,
+                        "--object-path",
+                        obj_path,
+                        "--method",
+                        "org.freedesktop.DBus.Properties.Get",
+                        "org.kde.StatusNotifierItem",
+                        "Id",
+                    ],
+                    env=env,
+                )
+                if "threadlane" in id_res.stdout.lower():
+                    return (dest, obj_path)
+            except Exception:  # noqa: BLE001
+                continue
+        if len(parsed) == 1:
+            return parsed[0]
+        raise HarnessFailure(
+            f"Unable to identify Threadlane StatusNotifierItem among {parsed!r}"
+        )
+
+
+    def evaluate_absent_anchor_fallback_popup(
+        *,
+        target_output: dict[str, Any],
+        before_target_path: pathlib.Path,
+        after_target_path: pathlib.Path,
+        target_bar_px_h: int,
+        main_output: dict[str, Any],
+        after_main_path: pathlib.Path,
+        main_bar_px_h: int,
+        main_logical_rect: dict[str, Any],
+        env: dict[str, str],
+    ) -> dict[str, Any]:
+        target_name = str(target_output["name"])
+        scale = float(target_output["scale"])
+        out_rect = target_output["rect"]
+        expected_px_w = int(round(float(out_rect["width"]) * scale))
+        expected_px_h = int(round(float(out_rect["height"]) * scale))
+
+        run_checked(["grim", "-o", target_name, str(after_target_path)], env=env)
+        with Image.open(after_target_path) as check_img:
+            if check_img.size != (expected_px_w, expected_px_h):
+                raise HarnessFailure(
+                    f"Expected {target_name} capture {expected_px_w}x{expected_px_h}, got {check_img.size}"
+                )
+
+        changed_pixels, bbox_ws, after_ws = count_workspace_diff_pixels(
+            before_target_path,
+            after_target_path,
+            target_bar_px_h,
+        )
+        if changed_pixels == 0 or bbox_ws is None:
+            raise HarnessFailure(
+                f"No rendered absent-anchor fallback popup pixels detected on {target_name}"
+            )
+
+        left, upper, right, lower = bbox_ws
+        phys_x = int(left)
+        phys_y = int(target_bar_px_h + upper)
+        phys_w = int(right - left)
+        phys_h = int(lower - upper)
+        bbox_area = max(1, phys_w * phys_h)
+        fill_ratio = changed_pixels / float(bbox_area)
+        if fill_ratio < POPUP_MIN_FILL_RATIO:
+            raise HarnessFailure(
+                f"Absent-anchor popup diff bbox on {target_name} too sparse "
+                f"(fill_ratio={fill_ratio:.3f}, changed={changed_pixels})"
+            )
+
+        out_x = float(out_rect["x"])
+        out_y = float(out_rect["y"])
+        out_w = float(out_rect["width"])
+        out_h = float(out_rect["height"])
+        bar_logical_h = target_bar_px_h / scale
+
+        logical_x = out_x + (phys_x / scale)
+        logical_y = out_y + (phys_y / scale)
+        logical_w = phys_w / scale
+        logical_h = phys_h / scale
+
+        if (
+            abs(logical_w - EXPECTED_POPUP_LOGICAL_W) > POPUP_LOGICAL_TOLERANCE
+            or abs(logical_h - EXPECTED_POPUP_LOGICAL_H) > POPUP_LOGICAL_TOLERANCE
+        ):
+            raise HarnessFailure(
+                f"Expected compact absent-anchor fallback popup ~360x320 logical on {target_name} "
+                f"(scale {scale}), measured {logical_w:.2f}x{logical_h:.2f} (physical={phys_w}x{phys_h})"
+            )
+
+        popup_crop = after_ws.crop((left, upper, right, lower))
+        max_stddev = max(ImageStat.Stat(popup_crop).stddev)
+        sample_x = min(phys_w - 1, max(0, int(phys_w * (110.0 / 360.0))))
+        sample_y = min(phys_h - 1, max(0, int(phys_h * (296.0 / 320.0))))
+        sr, sg, sb = popup_crop.getpixel((sample_x, sample_y))
+        footer_luma = (sr + sg + sb) / 3.0
+        if max_stddev < 8.0 or footer_luma <= 130.0:
+            raise HarnessFailure(
+                f"Absent-anchor fallback popup on {target_name} not fully painted "
+                f"(max_stddev={max_stddev:.2f}, footer_luma={footer_luma:.1f})"
+            )
+        text_pixels = {}
+        for region, bounds in (
+            ("title", (34, 5, 140, 30)),
+            ("body", (16, 52, 344, 266)),
+        ):
+            scaled_bounds = tuple(round(value * scale) for value in bounds)
+            histogram = popup_crop.crop(scaled_bounds).convert("L").histogram()
+            text_pixels[region] = sum(histogram[110:])
+            if text_pixels[region] < 20 * scale * scale:
+                raise HarnessFailure(f"Missing {region} content in {after_target_path.name}")
+
+        within_bounds = (
+            logical_x >= out_x - 0.5
+            and logical_y >= out_y + bar_logical_h - 0.5
+            and logical_x + logical_w <= out_x + out_w + 0.5
+            and logical_y + logical_h <= out_y + out_h + 0.5
+        )
+        if not within_bounds:
+            raise HarnessFailure(
+                f"Absent-anchor fallback popup ({logical_x:.2f},{logical_y:.2f} "
+                f"{logical_w:.2f}x{logical_h:.2f}) exceeded {target_name} bounds {out_rect}"
+            )
+
+        expected_right_edge = out_x + out_w - 12.0
+        expected_top_edge = out_y + bar_logical_h + 12.0
+        right_edge_delta = abs((logical_x + logical_w) - expected_right_edge)
+        top_edge_delta = abs(logical_y - expected_top_edge)
+        if right_edge_delta > 24.0 or top_edge_delta > 24.0:
+            raise HarnessFailure(
+                f"Absent-anchor fallback popup did not land in {target_name} top-right fallback "
+                f"corner (right_edge_delta={right_edge_delta:.2f}, top_edge_delta={top_edge_delta:.2f})"
+            )
+
+        # Verify zero leaked popup pixels anywhere on main_output's workspace outside main_logical_rect.
+        main_out_name = str(main_output["name"])
+        main_scale = float(main_output["scale"])
+        main_out_rect = main_output["rect"]
+        main_out_x = float(main_out_rect["x"])
+        main_out_y = float(main_out_rect["y"])
+        main_out_px_w = int(round(float(main_out_rect["width"]) * main_scale))
+        main_out_px_h = int(round(float(main_out_rect["height"]) * main_scale))
+        run_checked(["grim", "-o", main_out_name, str(after_main_path)], env=env)
+        with Image.open(after_main_path) as main_img:
+            main_rgb = main_img.convert("RGB")
+            if main_rgb.size != (main_out_px_w, main_out_px_h):
+                raise HarnessFailure(
+                    f"Expected {main_out_name} capture {main_out_px_w}x{main_out_px_h}, got {main_rgb.size}"
+                )
+            main_ws = main_rgb.crop((0, main_bar_px_h, main_out_px_w, main_out_px_h))
+            ws_w, ws_h = main_ws.size
+            outside_main_mask = Image.new("L", (ws_w, ws_h), 255)
+            mx0 = max(0, int(round((float(main_logical_rect["x"]) - main_out_x) * main_scale)) - 4)
+            my0 = max(
+                0,
+                int(round((float(main_logical_rect["y"]) - main_out_y) * main_scale))
+                - main_bar_px_h
+                - 4,
+            )
+            mx1 = min(
+                ws_w,
+                int(
+                    round(
+                        (
+                            float(main_logical_rect["x"])
+                            + float(main_logical_rect["width"])
+                            - main_out_x
+                        )
+                        * main_scale
+                    )
+                )
+                + 4,
+            )
+            my1 = min(
+                ws_h,
+                int(
+                    round(
+                        (
+                            float(main_logical_rect["y"])
+                            + float(main_logical_rect["height"])
+                            - main_out_y
+                        )
+                        * main_scale
+                    )
+                )
+                - main_bar_px_h
+                + 4,
+            )
+            if mx1 > mx0 and my1 > my0:
+                outside_main_mask.paste(0, (mx0, my0, mx1, my1))
+
+            # Confirm HEADLESS-1's top-right fallback corner is unoccluded by main so the
+            # zero-leak check cannot pass vacuously.
+            corner_x0 = max(0, ws_w - int(round((360.0 + 12.0) * main_scale)))
+            corner_y0 = int(round(12.0 * main_scale))
+            corner_x1 = max(corner_x0 + 1, ws_w - int(round(12.0 * main_scale)))
+            corner_y1 = min(ws_h, corner_y0 + int(round(320.0 * main_scale)))
+            corner_mask = outside_main_mask.crop((corner_x0, corner_y0, corner_x1, corner_y1))
+            corner_area = max(1, (corner_x1 - corner_x0) * (corner_y1 - corner_y0))
+            unoccluded_corner_px = int(corner_mask.histogram()[255])
+            if unoccluded_corner_px < int(0.90 * corner_area):
+                raise HarnessFailure(
+                    f"Main window unexpectedly occluded {main_out_name} fallback corner "
+                    f"({unoccluded_corner_px}/{corner_area} unoccluded px)"
+                )
+
+            solid_bg = Image.new("RGB", (ws_w, ws_h), DESKTOP_BG_RGB)
+            diff = ImageChops.difference(main_ws, solid_bg)
+            r_d, g_d, b_d = diff.split()
+            max_d = ImageChops.lighter(ImageChops.lighter(r_d, g_d), b_d)
+            non_bg = max_d.point(lambda v: 255 if v > 12 else 0)
+            leaked = ImageChops.darker(non_bg, outside_main_mask)
+            leaked_px = int(leaked.histogram()[255])
+            if leaked_px != 0:
+                raise HarnessFailure(
+                    f"Absent-anchor popup leaked onto main output {main_out_name} outside main window: "
+                    f"{leaked_px} non-background pixels at ws bbox {leaked.getbbox()}"
+                )
+
+        return {
+            "measurement_method": "grim_pixel_diff",
+            "output_name": target_name,
+            "output_scale": scale,
+            "physical_rect": {
+                "x": phys_x,
+                "y": phys_y,
+                "width": phys_w,
+                "height": phys_h,
+            },
+            "logical_rect": {
+                "x": round(logical_x, 2),
+                "y": round(logical_y, 2),
+                "width": round(logical_w, 2),
+                "height": round(logical_h, 2),
+            },
+            "changed_pixels": changed_pixels,
+            "fill_ratio": round(fill_ratio, 4),
+            "within_output_bounds": True,
+            "right_edge_delta_logical": round(right_edge_delta, 2),
+            "top_edge_delta_logical": round(top_edge_delta, 2),
+            "main_output_leaked_pixels_outside_main": 0,
+            "text_pixels": text_pixels,
+            "footer_luma": round(footer_luma, 1),
+            "screenshot": after_target_path.name,
+        }
 
 
     def capture_and_evaluate_main_window_painted(
@@ -2021,6 +2312,133 @@ let
             )
             checks["hide_main_to_tray_and_open_control"] = True
 
+            # Verify absent-coordinate SNI Activate(0, 0) (simulating hosts such as Dux/Quickshell
+            # item.activate() that omit click coordinates) opens on focused secondary output
+            # HEADLESS-2 (scale 2.0) while restored main remains open on HEADLESS-1 (scale 1.0)
+            # AND after the popup was previously pinned to HEADLESS-1 — without remapping back on
+            # ScaleFactorChanged / OnDemand settlement.
+            time.sleep(0.25)
+            before_absent_h2 = ARTIFACT_DIR / "09d-before-absent-anchor-headless2.png"
+            bar2_px_h = verify_clean_workspace_background(
+                output_info=out2,
+                screenshot_path=before_absent_h2,
+                env=client_env,
+            )
+            log(
+                "Focusing HEADLESS-2 while main remains visible on HEADLESS-1 and invoking "
+                "absent-coordinate SNI Activate(0, 0)..."
+            )
+            pointer_click(2560, 360, client_env)
+            wait_until(
+                "HEADLESS-2 focused while main remains visible on HEADLESS-1",
+                lambda: any(
+                    o.get("name") == "HEADLESS-2" and o.get("focused") is True
+                    for o in sway_json(["-t", "get_outputs", "-r"], client_env)
+                ),
+                timeout_sec=5.0,
+            )
+            main_still_visible = find_visible_window_by_title(
+                sway_json(["-t", "get_tree", "-r"], client_env),
+                "Threadlane",
+            )
+            if main_still_visible is None:
+                raise HarnessFailure(
+                    "Expected main window 'Threadlane' to stay visible on HEADLESS-1 during "
+                    "absent-anchor secondary-output check."
+                )
+            sni_dest, sni_obj_path = discover_sni_item_target(client_env)
+            run_checked(
+                [
+                    "gdbus",
+                    "call",
+                    "--session",
+                    "--dest",
+                    sni_dest,
+                    "--object-path",
+                    sni_obj_path,
+                    "--method",
+                    "org.kde.StatusNotifierItem.Activate",
+                    "0",
+                    "0",
+                ],
+                env=client_env,
+            )
+            def capture_secondary_popup(stage: str) -> dict[str, Any]:
+                return evaluate_absent_anchor_fallback_popup(
+                    target_output=out2,
+                    before_target_path=before_absent_h2,
+                    after_target_path=ARTIFACT_DIR / f"{stage}-headless2.png",
+                    target_bar_px_h=bar2_px_h,
+                    main_output=out1,
+                    after_main_path=ARTIFACT_DIR / f"{stage}-headless1.png",
+                    main_bar_px_h=bar1_px_h,
+                    main_logical_rect=main_still_visible["rect"],
+                    env=client_env,
+                )
+
+            absent_initial_measurement = wait_until(
+                "absent-anchor 360x320 fallback popup on HEADLESS-2 (scale 2.0) with zero leak on HEADLESS-1",
+                lambda: capture_secondary_popup("09e-absent-anchor-initial"),
+            )
+            # Dwell past ScaleFactorChanged + 250ms Exclusive->OnDemand transition and verify
+            # immediately (no retry) that neither refresh nor delayed set_monitor remapped back
+            # to HEADLESS-1.
+            time.sleep(0.50)
+            if desktop_proc.poll() is not None:
+                raise HarnessFailure(
+                    "Desktop process exited unexpectedly during absent-anchor secondary-output dwell."
+                )
+            absent_settled_measurement = capture_secondary_popup("09f-absent-anchor-settled")
+            popup_rect = absent_settled_measurement["logical_rect"]
+            pointer_click(
+                popup_rect["x"] + popup_rect["width"] - 80,
+                popup_rect["y"] + popup_rect["height"] - 18,
+                client_env,
+            )
+            time.sleep(0.30)
+            after_refresh = capture_secondary_popup("09f-manual-refresh")
+            time.sleep(shared.UI_REFRESH_INTERVAL_MS / 1000 + 0.20)
+            after_poll = capture_secondary_popup("09f-after-refresh-poll")
+            for measurement in (after_refresh, after_poll):
+                if measurement["logical_rect"] != popup_rect:
+                    raise HarnessFailure(f"Refresh moved the secondary tray: {measurement}")
+            run_checked(["wtype", "-k", "Escape"], env=client_env)
+            absent_after_escape_shot = ARTIFACT_DIR / "09g-absent-anchor-after-escape-headless2.png"
+
+            def _absent_popup_dismissed_on_h2() -> bool:
+                run_checked(
+                    ["grim", "-o", "HEADLESS-2", str(absent_after_escape_shot)],
+                    env=client_env,
+                )
+                changed_px, _, _ = count_workspace_diff_pixels(
+                    before_absent_h2,
+                    absent_after_escape_shot,
+                    bar2_px_h,
+                )
+                return changed_px == 0
+
+            wait_until(
+                "absent-anchor secondary-output popup dismissed cleanly via Escape",
+                _absent_popup_dismissed_on_h2,
+            )
+            if desktop_proc.poll() is not None:
+                raise HarnessFailure(
+                    "Escape dismissal of absent-anchor popup must not terminate desktop app."
+                )
+            absent_anchor_secondary_output = {
+                "sni_destination": sni_dest,
+                "sni_object_path": sni_obj_path,
+                "activate_coords": [0, 0],
+                "main_window_output": out1["name"],
+                "main_window_rect": main_still_visible["rect"],
+                "initial_measurement": absent_initial_measurement,
+                "post_settle_measurement": absent_settled_measurement,
+                "manual_refresh_measurement": after_refresh,
+                "next_poll_measurement": after_poll,
+                "escape_dismissed": True,
+            }
+            checks["absent_anchor_secondary_output_placement"] = True
+
             # Reopen tray popup on clean HEADLESS-2 while restored main stays open on HEADLESS-1,
             # then click "Quit" using measured popup bounds.
             time.sleep(0.25)
@@ -2143,6 +2561,7 @@ let
                     "post_dwell_logical_rect": post_dwell_measurement["logical_rect"],
                 },
                 "refresh_paint_survival": refresh_paint_survival,
+                "absent_anchor_secondary_output": absent_anchor_secondary_output,
                 "escape_dismissal": {
                     "interior_click_before_escape": interior_click_before_escape,
                     "dismissed": True,
@@ -2413,12 +2832,40 @@ pkgs.testers.runNixOSTest {
         "escape_dismiss",
         "reopen_after_dismiss",
         "hide_main_to_tray_and_open_control",
+        "absent_anchor_secondary_output_placement",
         "quit_control",
         "no_codex_startup_setup_preserved",
     )
     checks = report.get("checks", {})
     for key in required_checks:
         assert checks.get(key) is True, f"VM check {key} missing or failed: {report}"
+
+    absent_secondary = report.get("absent_anchor_secondary_output")
+    assert isinstance(absent_secondary, dict), (
+        f"Missing absent_anchor_secondary_output proof in passed VM report: {report}"
+    )
+    assert absent_secondary.get("activate_coords") == [0, 0], (
+        f"Unexpected absent_anchor_secondary_output activate_coords: {absent_secondary}"
+    )
+    assert absent_secondary.get("main_window_output") == "HEADLESS-1", (
+        f"Expected main window to remain on HEADLESS-1: {absent_secondary}"
+    )
+    assert absent_secondary.get("escape_dismissed") is True, (
+        f"Expected Escape dismissal for absent-anchor popup: {absent_secondary}"
+    )
+    for phase_key in (
+        "initial_measurement", "post_settle_measurement", "manual_refresh_measurement", "next_poll_measurement"
+    ):
+        phase = absent_secondary.get(phase_key)
+        assert isinstance(phase, dict), (
+            f"Missing {phase_key} in absent_anchor_secondary_output: {absent_secondary}"
+        )
+        assert phase.get("output_name") == "HEADLESS-2", (
+            f"Expected absent-anchor popup on HEADLESS-2 during {phase_key}: {phase}"
+        )
+        assert phase.get("main_output_leaked_pixels_outside_main") == 0, (
+            f"Absent-anchor popup leaked onto HEADLESS-1 during {phase_key}: {phase}"
+        )
 
     guest_input = report.get("guest_input", {})
     assert guest_input.get("seat") == "seat0", f"Unexpected guest_input seat: {guest_input}"

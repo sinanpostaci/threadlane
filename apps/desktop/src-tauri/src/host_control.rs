@@ -1371,7 +1371,7 @@ async fn poll_until_authenticated_ready(
                 {
                     return Ok(ready_summary);
                 }
-            } else if (spawned_by_this_call && child_terminated) || !spawned_by_this_call {
+            } else if !spawned_by_this_call || child_terminated {
                 return Err(AppError::new(
                     "host_startup_failed",
                     "Approved execution host process exited before reaching authenticated ready state.",

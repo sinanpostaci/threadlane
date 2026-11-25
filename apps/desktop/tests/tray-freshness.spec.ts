@@ -9,8 +9,11 @@ import {
 } from '../src/workspace-contract.ts';
 import {
   buildInteractiveWorkspaceSnapshot,
+  buildMinimalChatWorkspaceSnapshot,
   CHAT_ALPHA_IDENTITY,
+  CHAT_BETA_SAME_PROJECT_IDENTITY,
   installWorkspaceTauriFixture,
+  updateNativeActivityFixture,
 } from './fixtures/workspace.ts';
 
 const STALE_ADVANCE_MS = WORKSPACE_SAMPLE_STALE_THRESHOLD_MS + 1_001;
@@ -826,6 +829,132 @@ test.describe('System tray passive sample staleness', () => {
       if (visibility !== null && !page.isClosed()) {
         await runBoundedCleanup(() => visibility!.restore());
       }
+      if (!page.isClosed()) {
+        await runBoundedCleanup(() => page.close());
+      }
+    }
+  });
+
+  test('confirms a single transient rejection once without dropping 1 working / 1 needs you, withholds counts as unknown on sustained failure while retaining durable history, and distinguishes real fresh zero on recovery', async ({
+    page,
+  }) => {
+    test.setTimeout(20_000);
+
+    const liveOneWorkingOneWaiting = updateNativeActivityFixture(
+      buildMinimalChatWorkspaceSnapshot(),
+      CHAT_BETA_SAME_PROJECT_IDENTITY,
+      'waiting_for_input'
+    );
+    const fixedNowMs = liveOneWorkingOneWaiting.generated_at_ms;
+    const baseZero = buildSingleWorkingCoworkerTraySnapshot(fixedNowMs + 4_000);
+    const genuineFreshZeroSnapshot = parseWorkspaceSnapshot({
+      ...baseZero,
+      chats: baseZero.chats.map((chat) => ({ ...chat, activity: 'idle' })),
+      native_samples: baseZero.native_samples.map((sample) => ({
+        ...sample,
+        activity: 'idle',
+      })),
+    });
+
+    const pageErrors: string[] = [];
+    const onPageError = (err: Error) => {
+      pageErrors.push(err.message);
+    };
+    page.on('pageerror', onPageError);
+
+    try {
+      const tauri = await installWorkspaceTauriFixture(page, {
+        workspaceSnapshot: liveOneWorkingOneWaiting,
+        windowLabel: 'tray',
+      });
+      await page.setViewportSize({ width: 360, height: 320 });
+      await page.goto('/?surface=tray');
+      await expect(page.locator('#app')).toHaveAttribute(
+        'data-desktop-surface',
+        'tray'
+      );
+
+      const counts = page.locator('.tl-tray-counts');
+      await expect(counts.locator('[data-tone="working"]')).toHaveText('1 working');
+      await expect(counts.locator('[data-tone="attention"]')).toHaveText(
+        '1 needs you'
+      );
+      await expect(counts.locator('[data-live-counts="known"]')).toHaveCount(2);
+      await expect(counts.locator('[data-live-counts="unknown"]')).toHaveCount(0);
+      await expect(page.locator('.tl-tray-row[data-category="working"]')).toHaveCount(
+        1
+      );
+      await expect(
+        page.locator('.tl-tray-row[data-category="needs_human"]')
+      ).toHaveCount(1);
+      await expect(page.locator('.tl-tray-row[data-category="result"]')).toHaveCount(
+        1
+      );
+
+      const readCount = async () =>
+        (await tauri.getInvocations()).filter(
+          (entry) => entry.cmd === 'desktop_workspace_snapshot'
+        ).length;
+
+      // 1. Single transient read failure confirms once immediately and keeps 1 working / 1 needs you.
+      const beforeTransient = await readCount();
+      await tauri.failNextWorkspaceSnapshotRead();
+      await tauri.emitTauriEvent(TRAY_OPEN_EVENT, null);
+      await expect
+        .poll(readCount, { timeout: 3_000 })
+        .toBeGreaterThanOrEqual(beforeTransient + 2);
+
+      await expect(counts.locator('[data-tone="working"]')).toHaveText('1 working');
+      await expect(counts.locator('[data-tone="attention"]')).toHaveText(
+        '1 needs you'
+      );
+      await expect(counts.locator('[data-live-counts="unknown"]')).toHaveCount(0);
+      await expect(page.locator('.tl-tray-error')).toHaveCount(0);
+
+      // 2. Sustained failure (both initial and confirmation attempts fail):
+      // live counts become unknown ("Live status unknown"), NOT 0 working / 0 need you;
+      // durable result history is retained and last observation time is surfaced.
+      const beforeSustained = await readCount();
+      await tauri.failNextWorkspaceSnapshotRead();
+      await tauri.failNextWorkspaceSnapshotRead();
+      await tauri.emitTauriEvent(TRAY_OPEN_EVENT, null);
+      await expect
+        .poll(readCount, { timeout: 3_000 })
+        .toBeGreaterThanOrEqual(beforeSustained + 2);
+
+      const unknownPill = counts.locator('[data-live-counts="unknown"]');
+      await expect(unknownPill).toHaveCount(1);
+      await expect(unknownPill).toHaveAttribute('data-tone', 'unknown');
+      await expect(unknownPill).toHaveText('Live status unknown');
+      await expect(counts).not.toContainText('0 working');
+      await expect(counts).not.toContainText('0 need you');
+
+      await expect(page.locator('.tl-tray-subbar')).toContainText('Last observed');
+      await expect(page.locator('.tl-tray-row[data-category="working"]')).toHaveCount(
+        0
+      );
+      await expect(
+        page.locator('.tl-tray-row[data-category="needs_human"]')
+      ).toHaveCount(0);
+      await expect(page.locator('.tl-tray-row[data-category="result"]')).toHaveCount(
+        1
+      );
+
+      // 3. Recovery to a genuine fresh zero snapshot restores explicit numeric 0/0 counts.
+      await tauri.setWorkspaceSnapshot(genuineFreshZeroSnapshot);
+      await tauri.emitTauriEvent(TRAY_OPEN_EVENT, null);
+
+      await expect(counts.locator('[data-live-counts="unknown"]')).toHaveCount(0);
+      await expect(counts.locator('[data-live-counts="known"]')).toHaveCount(2);
+      await expect(counts).toContainText('0 working');
+      await expect(counts).toContainText('0 need you');
+      await expect(page.locator('.tl-tray-state-box')).toContainText(
+        'No active or recent work'
+      );
+      await expect(page.locator('.tl-tray-error')).toHaveCount(0);
+      expect(pageErrors).toEqual([]);
+    } finally {
+      page.off('pageerror', onPageError);
       if (!page.isClosed()) {
         await runBoundedCleanup(() => page.close());
       }

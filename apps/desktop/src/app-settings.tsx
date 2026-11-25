@@ -142,12 +142,33 @@ function mapSetupBadgeColor(
   }
 }
 
+export function hasCodexSetupFailure(
+  report: CodexSetupReport | null | undefined
+): boolean {
+  if (!report) {
+    return false;
+  }
+  if (
+    report.state === 'error' ||
+    report.state === 'conflict' ||
+    report.state === 'disabled'
+  ) {
+    return true;
+  }
+  const skillState = report.skill_setup?.state;
+  return skillState === 'error' || skillState === 'conflict';
+}
+
 export interface SettingsPanelProps {
   appearance: AppearancePreferences;
   onAppearanceChange: (next: AppearancePreferences) => void;
   diagnostics: readonly ProjectDiagnosticRowView[];
   warnings: readonly string[];
   onObservationLinked: () => void;
+  isActive?: boolean;
+  focusCodexIntegrationNonce?: number;
+  codexNavigationError?: string | null;
+  onCodexSetupReportChange?: (report: CodexSetupReport) => void;
 }
 
 export function SettingsPanel({
@@ -156,8 +177,17 @@ export function SettingsPanel({
   diagnostics,
   warnings,
   onObservationLinked,
+  isActive = false,
+  focusCodexIntegrationNonce = 0,
+  codexNavigationError = null,
+  onCodexSetupReportChange,
 }: SettingsPanelProps) {
   const nativeAvailable = hasTauriRuntime();
+  const codexCardRef = useRef<HTMLDivElement | null>(null);
+  const codexRecheckBtnRef = useRef<HTMLButtonElement | null>(null);
+  const lastFocusedCodexNonceRef = useRef(0);
+  const onCodexSetupReportChangeRef = useRef(onCodexSetupReportChange);
+  onCodexSetupReportChangeRef.current = onCodexSetupReportChange;
 
   // 1. Tray / Window close preferences (native command + event sync)
   const [trayPrefs, setTrayPrefs] = useState<TrayPreferencesState>(() =>
@@ -308,6 +338,7 @@ export function SettingsPanel({
       .then((report) => {
         if (!cancelled) {
           setCodexReport(report);
+          onCodexSetupReportChangeRef.current?.(report);
         }
       })
       .finally(() => {
@@ -320,6 +351,24 @@ export function SettingsPanel({
     };
   }, []);
 
+  useEffect(() => {
+    if (
+      !isActive ||
+      focusCodexIntegrationNonce <= 0 ||
+      focusCodexIntegrationNonce === lastFocusedCodexNonceRef.current
+    ) {
+      return;
+    }
+    lastFocusedCodexNonceRef.current = focusCodexIntegrationNonce;
+    codexCardRef.current?.scrollIntoView({ block: 'start' });
+    const recheckBtn = codexRecheckBtnRef.current;
+    if (recheckBtn && !recheckBtn.disabled) {
+      recheckBtn.focus({ preventScroll: true });
+    } else {
+      codexCardRef.current?.focus({ preventScroll: true });
+    }
+  }, [isActive, focusCodexIntegrationNonce]);
+
   const handleRecheckCodex = async () => {
     if (codexBusy || !hasTauriRuntime()) {
       return;
@@ -328,6 +377,7 @@ export function SettingsPanel({
     try {
       const next = await recheckCodexSetup();
       setCodexReport(next);
+      onCodexSetupReportChangeRef.current?.(next);
     } finally {
       setCodexBusy(false);
     }
@@ -341,6 +391,7 @@ export function SettingsPanel({
     try {
       const next = await applyCodexSetup();
       setCodexReport(next);
+      onCodexSetupReportChangeRef.current?.(next);
     } finally {
       setCodexBusy(false);
     }
@@ -530,6 +581,138 @@ export function SettingsPanel({
     [AccentName, readonly [string, string]]
   >;
 
+  const codexNeedsDirectAccess =
+    (nativeAvailable &&
+      (hasCodexSetupFailure(codexReport) ||
+        codexReport.state === 'not_registered')) ||
+    codexNavigationError !== null ||
+    focusCodexIntegrationNonce > 0;
+
+  const codexIntegrationCard = (
+    <Card
+      ref={codexCardRef}
+      id="tl-settings-codex-integration"
+      size="2"
+      className="tl-settings-card"
+      tabIndex={-1}
+      aria-label="Codex native integration"
+      data-codex-integration-priority={codexNeedsDirectAccess ? 'true' : 'false'}
+    >
+      <Flex direction="column" gap="3">
+        <Flex align="center" justify="between" gap="3" wrap="wrap">
+          <Flex align="center" gap="2" wrap="wrap">
+            <Text size="2" weight="medium">
+              Codex integration
+            </Text>
+            <Badge
+              size="1"
+              variant="soft"
+              color={mapSetupBadgeColor(setupVm.registrationBadgeTone)}
+            >
+              {setupVm.registrationBadgeLabel}
+            </Badge>
+            <Badge
+              size="1"
+              variant="soft"
+              color={mapSetupBadgeColor(skillVm.badgeTone)}
+            >
+              {skillVm.badgeLabel}
+            </Badge>
+          </Flex>
+
+          <Flex align="center" gap="2" wrap="wrap">
+            <Button
+              ref={codexRecheckBtnRef}
+              size="2"
+              variant="soft"
+              color="gray"
+              disabled={!setupVm.canRecheck}
+              onClick={() => {
+                void handleRecheckCodex();
+              }}
+            >
+              <RefreshCw size={14} aria-hidden="true" />
+              {codexBusy ? 'Checking…' : 'Recheck'}
+            </Button>
+            <Button
+              size="2"
+              variant="solid"
+              color="gray"
+              highContrast
+              disabled={!setupVm.canRetry}
+              onClick={() => {
+                void handleApplyCodex();
+              }}
+            >
+              {codexReport.registered ? 'Retry setup' : 'Apply setup'}
+            </Button>
+          </Flex>
+        </Flex>
+
+        {codexNavigationError ? (
+          <Callout.Root
+            color="red"
+            variant="surface"
+            size="1"
+            role="alert"
+            data-codex-navigation-error="true"
+          >
+            <Callout.Icon>
+              <AlertCircle size={15} />
+            </Callout.Icon>
+            <Callout.Text>{codexNavigationError}</Callout.Text>
+          </Callout.Root>
+        ) : null}
+
+        <Text size="2" color="gray">
+          {setupVm.summaryMessage}
+        </Text>
+
+        {setupVm.actionHint ? (
+          <Text size="1" color="amber">
+            {setupVm.actionHint}
+          </Text>
+        ) : null}
+
+        {setupVm.restartNotice ? (
+          <Callout.Root color="amber" variant="surface" size="1">
+            <Callout.Icon>
+              <AlertCircle size={15} />
+            </Callout.Icon>
+            <Callout.Text>{setupVm.restartNotice}</Callout.Text>
+          </Callout.Root>
+        ) : null}
+
+        <details className="tl-inline-disclosure">
+          <summary className="tl-inline-summary">
+            <ChevronRight
+              size={14}
+              className="tl-disclosure-chevron"
+              aria-hidden="true"
+            />
+            <span>Setup & skill paths</span>
+          </summary>
+          <dl className="tl-kv-grid">
+            <dt>Config path</dt>
+            <dd>{setupVm.configPathLabel}</dd>
+            <dt>Pairing policy</dt>
+            <dd>{setupVm.pairingBadgeLabel}</dd>
+            <dt>Skill status</dt>
+            <dd>{skillVm.message}</dd>
+            <dt>Skill path</dt>
+            <dd>{skillVm.pathLabel}</dd>
+            {skillVm.invocationHint ? (
+              <>
+                <dt>Usage</dt>
+                <dd>{skillVm.invocationHint}</dd>
+              </>
+            ) : null}
+          </dl>
+        </details>
+      </Flex>
+    </Card>
+  );
+
   return (
     <div className="tl-panel-scroll">
       <div className="tl-panel-inner tl-settings-stack">
@@ -541,6 +724,8 @@ export function SettingsPanel({
             Window behavior, neutral appearance, and local Codex integration.
           </Text>
         </div>
+
+        {codexNeedsDirectAccess ? codexIntegrationCard : null}
 
         {/* 1. Window close behavior (Tray preferences) */}
         <Card size="2" className="tl-settings-card" aria-label="Window close behavior">
@@ -801,108 +986,7 @@ export function SettingsPanel({
         </Card>
 
         {/* 3. Codex Native Setup */}
-        <Card
-          size="2"
-          className="tl-settings-card"
-          aria-label="Codex native integration"
-        >
-          <Flex direction="column" gap="3">
-            <Flex align="center" justify="between" gap="3" wrap="wrap">
-              <Flex align="center" gap="2" wrap="wrap">
-                <Text size="2" weight="medium">
-                  Codex integration
-                </Text>
-                <Badge
-                  size="1"
-                  variant="soft"
-                  color={mapSetupBadgeColor(setupVm.registrationBadgeTone)}
-                >
-                  {setupVm.registrationBadgeLabel}
-                </Badge>
-                <Badge
-                  size="1"
-                  variant="soft"
-                  color={mapSetupBadgeColor(skillVm.badgeTone)}
-                >
-                  {skillVm.badgeLabel}
-                </Badge>
-              </Flex>
-
-              <Flex align="center" gap="2" wrap="wrap">
-                <Button
-                  size="2"
-                  variant="soft"
-                  color="gray"
-                  disabled={!setupVm.canRecheck}
-                  onClick={() => {
-                    void handleRecheckCodex();
-                  }}
-                >
-                  <RefreshCw size={14} aria-hidden="true" />
-                  {codexBusy ? 'Checking…' : 'Recheck'}
-                </Button>
-                <Button
-                  size="2"
-                  variant="solid"
-                  color="gray"
-                  highContrast
-                  disabled={!setupVm.canRetry}
-                  onClick={() => {
-                    void handleApplyCodex();
-                  }}
-                >
-                  {codexReport.registered ? 'Retry setup' : 'Apply setup'}
-                </Button>
-              </Flex>
-            </Flex>
-
-            <Text size="2" color="gray">
-              {setupVm.summaryMessage}
-            </Text>
-
-            {setupVm.actionHint ? (
-              <Text size="1" color="amber">
-                {setupVm.actionHint}
-              </Text>
-            ) : null}
-
-            {setupVm.restartNotice ? (
-              <Callout.Root color="amber" variant="surface" size="1">
-                <Callout.Icon>
-                  <AlertCircle size={15} />
-                </Callout.Icon>
-                <Callout.Text>{setupVm.restartNotice}</Callout.Text>
-              </Callout.Root>
-            ) : null}
-
-            <details className="tl-inline-disclosure">
-              <summary className="tl-inline-summary">
-                <ChevronRight
-                  size={14}
-                  className="tl-disclosure-chevron"
-                  aria-hidden="true"
-                />
-                <span>Setup & skill paths</span>
-              </summary>
-              <dl className="tl-kv-grid">
-                <dt>Config path</dt>
-                <dd>{setupVm.configPathLabel}</dd>
-                <dt>Pairing policy</dt>
-                <dd>{setupVm.pairingBadgeLabel}</dd>
-                <dt>Skill status</dt>
-                <dd>{skillVm.message}</dd>
-                <dt>Skill path</dt>
-                <dd>{skillVm.pathLabel}</dd>
-                {skillVm.invocationHint ? (
-                  <>
-                    <dt>Usage</dt>
-                    <dd>{skillVm.invocationHint}</dd>
-                  </>
-                ) : null}
-              </dl>
-            </details>
-          </Flex>
-        </Card>
+        {!codexNeedsDirectAccess ? codexIntegrationCard : null}
 
         {/* 4. Collapsed section: Linked observation sources */}
         <details

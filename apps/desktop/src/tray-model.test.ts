@@ -2158,10 +2158,13 @@ test('minimal tray suppresses live indicators on stale samples, expired presence
     nowMs: NOW_MS,
     error: 'IPC desktop_workspace_snapshot timed out',
   });
-  assert.equal(retainedModel.workingCount, 0);
-  assert.equal(retainedModel.attentionCount, 0);
+  assert.equal(retainedModel.workingCount, null);
+  assert.equal(retainedModel.attentionCount, null);
+  assert.equal(retainedModel.headerStatusLabel, 'Live status unknown');
   assert.deepEqual(retainedModel.rows, []);
   assert.equal(retainedModel.isStale, true);
+  assert.equal(retainedModel.lastObservedAtMs, NOW_MS - 1_000);
+  assert.equal(retainedModel.lastObservedAgeLabel, 'Just now');
   assert.match(retainedModel.emptyMessage ?? '', /withheld/);
   assert.match(retainedModel.refreshError ?? '', /timed out/);
 
@@ -2171,6 +2174,7 @@ test('minimal tray suppresses live indicators on stale samples, expired presence
   assert.equal(emptyModel.status, 'empty');
   assert.equal(emptyModel.workingCount, 0);
   assert.equal(emptyModel.attentionCount, 0);
+  assert.equal(emptyModel.headerStatusLabel, '0 working · 0 need you');
   assert.deepEqual(emptyModel.rows, []);
 });
 
@@ -2407,4 +2411,312 @@ test('minimal tray keeps archived live requests visible while hiding archived te
     model.rows.some((row) => row.title === 'Archived terminal chat'),
     false
   );
+});
+
+test('tray coordinator confirms a single transient read failure once without dropping 1 working / 1 needs you', async () => {
+  const workingIdentity = makeIdentity({
+    binding_id: 'bind-tray-working',
+    thread_uuid: THREAD_UUID_1,
+  });
+  const waitingIdentity = makeIdentity({
+    binding_id: 'bind-tray-waiting',
+    thread_uuid: THREAD_UUID_2,
+  });
+  const liveSnapshot = makeWorkspaceSnapshot({
+    generated_at_ms: NOW_MS,
+    chats: [
+      makeChatSummary(workingIdentity, { thread_label: 'Working worker chat' }),
+      makeChatSummary(waitingIdentity, { thread_label: 'Waiting coworker chat' }),
+    ],
+    native_samples: [
+      makeNativeSample({
+        chat_identity: waitingIdentity,
+        activity: 'waiting_for_input',
+        observed_at_ms: NOW_MS - 1_000,
+        last_success_at_ms: NOW_MS - 1_000,
+      }),
+    ],
+    chat_work: [
+      makeChatWork(workingIdentity, {
+        items: [
+          makeBacklogItem(workingIdentity, {
+            item_id: 'blg-tray-live-worker',
+            current_execution_ref: 'exec-live-1',
+          }),
+        ],
+        worker_presence: [
+          makeWorkerPresence({
+            item_id: 'blg-tray-live-worker',
+            execution_ref: 'exec-live-1',
+            sampled_at_ms: NOW_MS - 800,
+          }),
+        ],
+      }),
+    ],
+  });
+
+  let reads = 0;
+  let failuresRemaining = 0;
+  const seenErrors: Array<string | null> = [];
+  const coordinator = new TrayObservationCoordinator(
+    async () => {
+      reads += 1;
+      if (failuresRemaining > 0) {
+        failuresRemaining -= 1;
+        throw new Error('Transient workspace socket reset');
+      }
+      return liveSnapshot;
+    },
+    (state) => {
+      seenErrors.push(state.error);
+    },
+    { visible: false, focused: false }
+  );
+
+  await coordinator.open();
+  assert.equal(reads, 1);
+  const initialModel = projectMinimalTrayModel(coordinator.getState().snapshot, {
+    loading: coordinator.getState().loading,
+    error: coordinator.getState().error,
+    nowMs: NOW_MS,
+  });
+  assert.equal(initialModel.workingCount, 1);
+  assert.equal(initialModel.attentionCount, 1);
+  assert.equal(initialModel.headerStatusLabel, '1 working · 1 needs you');
+
+  // A single transient rejection confirms once immediately and preserves 1 working / 1 needs you.
+  failuresRemaining = 1;
+  await coordinator.refresh();
+  assert.equal(reads, 3);
+  assert.equal(coordinator.getState().error, null);
+  assert.equal(
+    seenErrors.every((entry) => entry === null),
+    true
+  );
+
+  const afterTransientModel = projectMinimalTrayModel(
+    coordinator.getState().snapshot,
+    {
+      loading: coordinator.getState().loading,
+      error: coordinator.getState().error,
+      nowMs: NOW_MS,
+    }
+  );
+  assert.equal(afterTransientModel.workingCount, 1);
+  assert.equal(afterTransientModel.attentionCount, 1);
+  assert.equal(afterTransientModel.headerStatusLabel, '1 working · 1 needs you');
+  assert.equal(afterTransientModel.isStale, false);
+  coordinator.dispose();
+});
+
+test('minimal tray withholds live counts as unknown on sustained failure, retains durable history and last observation time, and distinguishes real fresh zero on recovery', async () => {
+  const workingIdentity = makeIdentity({
+    binding_id: 'bind-sustained-work',
+    thread_uuid: THREAD_UUID_1,
+  });
+  const historyIdentity = makeIdentity({
+    binding_id: 'bind-sustained-history',
+    thread_uuid: THREAD_UUID_2,
+  });
+  const producerSampleMs = NOW_MS - 120_000;
+  const initialSnapshot = makeWorkspaceSnapshot({
+    generated_at_ms: NOW_MS,
+    chats: [
+      makeChatSummary(workingIdentity, { thread_label: 'Active working chat' }),
+      makeChatSummary(historyIdentity, { thread_label: 'Completed history chat' }),
+    ],
+    native_samples: [
+      makeNativeSample({
+        chat_identity: workingIdentity,
+        activity: 'working',
+        observed_at_ms: producerSampleMs,
+        last_success_at_ms: producerSampleMs,
+      }),
+    ],
+    chat_work: [
+      makeChatWork(historyIdentity, {
+        items: [
+          makeBacklogItem(historyIdentity, {
+            item_id: 'blg-durable-done',
+            title: 'Retained completed item',
+            status: 'done',
+            current_execution_ref: null,
+            completion_note: 'Verified completed delivery.',
+            completion_evidence: 'All checks passed.',
+            completed_at_ms: NOW_MS - 60_000,
+            updated_at_ms: NOW_MS - 60_000,
+          }),
+        ],
+      }),
+    ],
+  });
+  const freshZeroSnapshot = makeWorkspaceSnapshot({
+    generated_at_ms: NOW_MS + 5_000,
+    chats: [
+      makeChatSummary(workingIdentity, {
+        thread_label: 'Active working chat',
+        activity: 'idle',
+      }),
+    ],
+    native_samples: [
+      makeNativeSample({
+        chat_identity: workingIdentity,
+        activity: 'idle',
+        observed_at_ms: NOW_MS + 4_500,
+        last_success_at_ms: NOW_MS + 4_500,
+      }),
+    ],
+  });
+
+  let reads = 0;
+  let failuresRemaining = 0;
+  let nextSnapshot = initialSnapshot;
+  const coordinator = new TrayObservationCoordinator(
+    async () => {
+      reads += 1;
+      if (failuresRemaining > 0) {
+        failuresRemaining -= 1;
+        throw new Error('Backend snapshot socket unreachable');
+      }
+      return nextSnapshot;
+    },
+    undefined,
+    { visible: false, focused: false }
+  );
+
+  await coordinator.open();
+  assert.equal(reads, 1);
+
+  // Sustained failure: confirm once (2 attempts total for this refresh), then enter error state.
+  failuresRemaining = 3;
+  await coordinator.refresh();
+  assert.equal(reads, 3);
+  assert.match(coordinator.getState().error ?? '', /unreachable/);
+  assert.equal(
+    coordinator.getState().snapshot?.native_samples[0]?.last_success_at_ms,
+    producerSampleMs
+  );
+
+  // Subsequent poll while already in error state performs only 1 probe (no double-retry loop).
+  await coordinator.refresh();
+  assert.equal(reads, 4);
+  assert.match(coordinator.getState().error ?? '', /unreachable/);
+
+  const sustainedModel = projectMinimalTrayModel(
+    coordinator.getState().snapshot,
+    {
+      loading: coordinator.getState().loading,
+      error: coordinator.getState().error,
+      nowMs: NOW_MS,
+    }
+  );
+  assert.equal(sustainedModel.status, 'ready');
+  assert.equal(sustainedModel.workingCount, null);
+  assert.equal(sustainedModel.attentionCount, null);
+  assert.equal(sustainedModel.headerStatusLabel, 'Live status unknown');
+  assert.equal(sustainedModel.isStale, true);
+  assert.equal(sustainedModel.lastObservedAtMs, producerSampleMs);
+  assert.equal(sustainedModel.lastObservedAgeLabel, '2m ago');
+  assert.equal(sustainedModel.rows.length, 1);
+  assert.equal(sustainedModel.rows[0]!.category, 'result');
+  assert.equal(sustainedModel.rows[0]!.statusLabel, 'Done');
+  assert.equal(sustainedModel.rows[0]!.title, 'Completed history chat');
+  assert.equal(
+    sustainedModel.rows.some(
+      (row) => row.category === 'working' || row.category === 'needs_human'
+    ),
+    false
+  );
+
+  // Recovery to a genuine fresh zero snapshot restores numeric 0/0 counts.
+  nextSnapshot = freshZeroSnapshot;
+  await coordinator.refresh();
+  assert.equal(reads, 5);
+  assert.equal(coordinator.getState().error, null);
+  const recoveredZeroModel = projectMinimalTrayModel(
+    coordinator.getState().snapshot,
+    {
+      loading: coordinator.getState().loading,
+      error: coordinator.getState().error,
+      nowMs: NOW_MS + 5_000,
+    }
+  );
+  assert.equal(recoveredZeroModel.status, 'empty');
+  assert.equal(recoveredZeroModel.workingCount, 0);
+  assert.equal(recoveredZeroModel.attentionCount, 0);
+  assert.equal(recoveredZeroModel.headerStatusLabel, '0 working · 0 need you');
+  assert.equal(recoveredZeroModel.isStale, false);
+  coordinator.dispose();
+});
+
+test('tray coordinator respects close, hide, reopen, and dispose epochs during transient confirmation', async () => {
+  const initialSnapshot = makeWorkspaceSnapshot({
+    generated_at_ms: NOW_MS,
+    chats: [makeChatSummary(makeIdentity(), { thread_label: 'Epoch chat' })],
+    native_samples: [
+      makeNativeSample({
+        activity: 'working',
+        observed_at_ms: NOW_MS - 500,
+        last_success_at_ms: NOW_MS - 500,
+      }),
+    ],
+  });
+
+  const pending: Array<{
+    resolve: (snapshot: WorkspaceSnapshot) => void;
+    reject: (err: unknown) => void;
+  }> = [];
+  const coordinator = new TrayObservationCoordinator(
+    () =>
+      new Promise<WorkspaceSnapshot>((resolve, reject) => {
+        pending.push({ resolve, reject });
+      }),
+    undefined,
+    { visible: false, focused: false }
+  );
+
+  const openPromise = coordinator.open();
+  assert.equal(pending.length, 1);
+  pending[0]!.resolve(initialSnapshot);
+  await openPromise;
+
+  // 1. Closing while attempt 1 is in flight suppresses the confirmation retry and ignores error.
+  const refreshBeforeClose = coordinator.refresh();
+  assert.equal(pending.length, 2);
+  coordinator.close();
+  pending[1]!.reject(new Error('Late rejection after close'));
+  await refreshBeforeClose;
+  assert.equal(pending.length, 2);
+  assert.equal(coordinator.getState().error, null);
+
+  // 2. Reopen succeeds, then hiding while confirmation attempt 2 is in flight discards attempt 2.
+  const reopenPromise = coordinator.open();
+  assert.equal(pending.length, 3);
+  pending[2]!.resolve(initialSnapshot);
+  await reopenPromise;
+
+  const refreshDuringHide = coordinator.refresh();
+  assert.equal(pending.length, 4);
+  pending[3]!.reject(new Error('Transient failure #1'));
+  await Promise.resolve();
+  assert.equal(pending.length, 5);
+
+  coordinator.setVisibility(false, false);
+  pending[4]!.reject(new Error('Late failure #2 after hide'));
+  await refreshDuringHide;
+  assert.equal(coordinator.getState().error, null);
+
+  // 3. Disposing while attempt 1 is in flight prevents confirmation retry.
+  const reopenAgain = coordinator.open();
+  assert.equal(pending.length, 6);
+  pending[5]!.resolve(initialSnapshot);
+  await reopenAgain;
+
+  const refreshBeforeDispose = coordinator.refresh();
+  assert.equal(pending.length, 7);
+  coordinator.dispose();
+  pending[6]!.reject(new Error('Rejection after dispose'));
+  await refreshBeforeDispose;
+  assert.equal(pending.length, 7);
+  assert.equal(coordinator.getState().error, null);
 });

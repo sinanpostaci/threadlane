@@ -66,6 +66,13 @@ export { parseWorkspaceChatIdentityKey } from './app-model.ts';
 
 export const OBSERVATION_POLL_INTERVAL_MS = 2_000;
 export const REGISTRY_POLL_EVERY_N_TICKS = 15;
+export const CODEX_APP_UNAVAILABLE_ERROR_CODE = 'codex_app_unavailable' as const;
+
+export function isVerifiedNoRunningCodexInstanceError(
+  errorCode: string | null | undefined,
+): boolean {
+  return errorCode === CODEX_APP_UNAVAILABLE_ERROR_CODE;
+}
 
 const NIL_UUID_LOWER = '00000000-0000-0000-0000-000000000000';
 
@@ -136,6 +143,7 @@ export interface DesktopCoordinatorState {
   discoveryError: string | null;
   codexOpenInFlight: boolean;
   codexOpenError: string | null;
+  codexOpenErrorCode: string | null;
 }
 
 interface ObservationTicket {
@@ -161,6 +169,16 @@ function emptyRegistrySnapshot(): RegistrySnapshot {
     schema_version: 1,
     default_profile_id: null,
   };
+}
+
+function extractErrorCode(err: unknown): string | null {
+  if (err && typeof err === 'object' && 'code' in err) {
+    const code = (err as { code?: unknown }).code;
+    if (typeof code === 'string' && code.trim().length > 0) {
+      return code.trim();
+    }
+  }
+  return null;
 }
 
 function formatErrorMessage(err: unknown, fallback: string): string {
@@ -647,6 +665,7 @@ export class DesktopAppCoordinator {
       discoveryError: null,
       codexOpenInFlight: false,
       codexOpenError: null,
+      codexOpenErrorCode: null,
     };
   }
 
@@ -913,6 +932,7 @@ export class DesktopAppCoordinator {
       archiveError: null,
       codexOpenInFlight: false,
       codexOpenError: null,
+      codexOpenErrorCode: null,
     });
   }
 
@@ -976,6 +996,7 @@ export class DesktopAppCoordinator {
         ? {
             codexOpenInFlight: false,
             codexOpenError: null,
+            codexOpenErrorCode: null,
           }
         : {}),
     });
@@ -984,6 +1005,7 @@ export class DesktopAppCoordinator {
   setChatArchived(
     identity: WorkspaceChatIdentity,
     archived: boolean,
+    options: { selectIfVisible?: boolean } = {},
   ): boolean {
     if (this.disposed) {
       return false;
@@ -1052,8 +1074,8 @@ export class DesktopAppCoordinator {
         nextSelectedChatKey = null;
       }
     } else if (
-      nextSelectedChatKey === null &&
-      targetLifecycle === this.state.workspaceLifecycle
+      targetLifecycle === this.state.workspaceLifecycle &&
+      (nextSelectedChatKey === null || options.selectIfVisible === true)
     ) {
       nextSelectedChatKey = targetChatKey;
     }
@@ -1072,6 +1094,7 @@ export class DesktopAppCoordinator {
         ? {
             codexOpenInFlight: false,
             codexOpenError: null,
+            codexOpenErrorCode: null,
           }
         : {}),
     });
@@ -1116,6 +1139,7 @@ export class DesktopAppCoordinator {
       selectedChatKey: nextSelectedChatKey,
       codexOpenInFlight: false,
       codexOpenError: null,
+      codexOpenErrorCode: null,
     });
     void this.refreshWorkspace({ mode: 'replace' });
   }
@@ -1332,6 +1356,7 @@ export class DesktopAppCoordinator {
           ? {
               codexOpenInFlight: false,
               codexOpenError: null,
+              codexOpenErrorCode: null,
             }
           : {}),
       });
@@ -1784,6 +1809,7 @@ export class DesktopAppCoordinator {
     if (!verified.ok) {
       this.updateState({
         codexOpenError: verified.error,
+        codexOpenErrorCode: null,
       });
       return false;
     }
@@ -1791,6 +1817,7 @@ export class DesktopAppCoordinator {
     if (!this.ports.openCodexChat) {
       this.updateState({
         codexOpenError: 'Native desktop bridge is not connected.',
+        codexOpenErrorCode: null,
       });
       return false;
     }
@@ -1805,6 +1832,7 @@ export class DesktopAppCoordinator {
     this.updateState({
       codexOpenInFlight: true,
       codexOpenError: null,
+      codexOpenErrorCode: null,
     });
 
     try {
@@ -1816,6 +1844,7 @@ export class DesktopAppCoordinator {
       this.updateState({
         codexOpenInFlight: false,
         codexOpenError: null,
+        codexOpenErrorCode: null,
       });
       return true;
     } catch (err) {
@@ -1829,14 +1858,18 @@ export class DesktopAppCoordinator {
           err,
           'Unable to open the selected conversation in Codex.',
         ),
+        codexOpenErrorCode: extractErrorCode(err),
       });
       return false;
     }
   }
 
   clearCodexOpenError(): void {
-    if (this.state.codexOpenError !== null) {
-      this.updateState({ codexOpenError: null });
+    if (
+      this.state.codexOpenError !== null ||
+      this.state.codexOpenErrorCode !== null
+    ) {
+      this.updateState({ codexOpenError: null, codexOpenErrorCode: null });
     }
   }
 }
